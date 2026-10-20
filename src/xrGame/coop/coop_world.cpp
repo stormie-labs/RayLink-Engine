@@ -5,6 +5,7 @@
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Monsters.h"
+#include "GameObject.h"
 
 namespace coop
 {
@@ -18,6 +19,13 @@ struct Avatar
 };
 
 xr_map<u16, Avatar> g_avatars;
+
+// Docked once: a section compare is then a pointer compare (the ALife switch asks for every object).
+const shared_str& avatar_section()
+{
+	static const shared_str s("coop_player_avatar");
+	return s;
+}
 } // namespace
 
 void host_scan_proxies()
@@ -49,6 +57,10 @@ void client_mark_host_avatar(u16 id) { g_avatars[id].peer = kHostPeer; }
 void client_mark_avatar(u16 id, PeerId peer) { g_avatars[id].peer = peer; }
 
 bool is_player_proxy(u16 id) { return g_avatars.find(id) != g_avatars.end(); }
+
+bool is_player_character(const CSE_Abstract* e) { return e && e->s_name == avatar_section(); }
+
+bool is_player_character(const CGameObject* obj) { return obj && obj->cNameSect() == avatar_section(); }
 
 PeerId avatar_peer(u16 id)
 {

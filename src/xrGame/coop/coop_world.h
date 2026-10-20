@@ -6,6 +6,9 @@
 
 #include "xrCoop/coop_protocol.h"
 
+class CSE_Abstract;
+class CGameObject;
+
 namespace coop
 {
 namespace world
@@ -23,6 +26,10 @@ void client_mark_avatar(u16 id, PeerId peer);
 
 // Any player avatar / proxy known on this machine.
 bool is_player_proxy(u16 id);
+// W9: the entity / object is a player character (section coop_player_avatar): a proxy on the host, an avatar on
+// clients. Known in and out of a session and before any registry here has its id. Any thread.
+bool is_player_character(const CSE_Abstract* e);
+bool is_player_character(const CGameObject* obj);
 // Peer that drives avatar `id` (host: kHostPeer for the host avatar on clients), kInvalidPeer if none.
 PeerId avatar_peer(u16 id);
 // Avatar id of a peer in local numbering, 0xffff if unknown.

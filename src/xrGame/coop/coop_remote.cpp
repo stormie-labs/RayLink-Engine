@@ -16,6 +16,7 @@
 #include "stalker_movement_manager_smart_cover.h"
 #include "ai/monsters/basemonster/base_monster.h"
 #include "ai/trader/ai_trader.h"
+#include "InventoryOwner.h"
 #include "step_manager.h"
 #include "script_binder.h"
 #include "PhysicsShellHolder.h"
@@ -53,6 +54,19 @@ struct Puppet
 };
 xr_map<u16, Puppet> g_puppets;
 u64 g_made_remote = 0, g_made_local = 0, g_deaths = 0, g_driven = 0;
+
+// W9: nobody talks to a player's character, on any machine: talk off means no "talk" use tip (CActor looks at
+// IsTalkEnabled), OfferTalk refuses, Lua is_talk_enabled() is false. Its Lua binder update is suspended (no
+// meet logic turns it back on); update_cl re-asserts it every frame anyway. A use tip a script sets on purpose
+// (e.g. "help" on a wounded teammate) is left alone.
+void mute_player_character(CGameObject* obj)
+{
+	if (!world::is_player_character(obj))
+		return;
+	CInventoryOwner* io = obj->cast_inventory_owner();
+	if (io && io->IsTalkEnabled())
+		io->DisableTalk();
+}
 
 // Yaw `a` with XFORM rotation == Fmatrix().rotateY(a), the convention of CCustomMonster's
 // m_body (rotateY(a) has k = (sin a, 0, cos a)).
@@ -215,12 +229,14 @@ void on_net_spawn(CObject* o)
 	if (!obj)
 		return;
 	g_puppets.erase(obj->ID()); // a previous object with this id is gone
+	mute_player_character(obj);
 	if (is_remote_creature(obj))
 		make_remote(obj);
 }
 
 bool update_cl(CGameObject* obj)
 {
+	mute_player_character(obj);
 	if (!obj || (!mgr().active() && g_puppets.empty()))
 		return false;
 	if (!is_remote_creature(obj))

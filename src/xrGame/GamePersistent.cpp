@@ -184,6 +184,7 @@ void CGamePersistent::OnAppEnd()
 
 void CGamePersistent::Start(LPCSTR op)
 {
+	coop::on_blocking_work(); // Anomaly Coop: a level load starts, keep the session link alive
 	inherited::Start(op);
 }
 
@@ -983,6 +984,7 @@ void CGamePersistent::OnRenderPPUI_PP()
 
 void CGamePersistent::LoadTitle(bool change_tip, shared_str map_name)
 {
+	coop::on_blocking_work(); // Anomaly Coop: every load stage re-arms the session keep-alive
     {
         xrCriticalSectionGuard g(loadTitleCs);
         pApp->LoadStage();

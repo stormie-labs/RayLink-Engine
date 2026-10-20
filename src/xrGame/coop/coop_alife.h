@@ -4,6 +4,7 @@
 #pragma once
 
 class CALifeSimulator;
+class CSE_ALifeDynamicObject;
 
 namespace coop
 {
@@ -23,4 +24,9 @@ enum class SwitchVote : s8
 };
 // Client: online/offline is decided by the host, never by local distance.
 SwitchVote client_switch_vote(u16 id);
+// Vote for one object (CSE_ALifeDynamicObject::try_switch_online/offline; game thread): a client asks the host
+// (client_switch_vote); anywhere else a player's character (coop_player_avatar) is offline unless its player is
+// in the world right now (W9): on the host only after he finished loading, without a session never (the host
+// playing alone, or a client after the session ended — the host's avatar included). Default otherwise.
+SwitchVote switch_vote(const CSE_ALifeDynamicObject* e);
 } // namespace coop

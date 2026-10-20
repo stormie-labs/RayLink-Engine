@@ -29,12 +29,15 @@ void install(Session& s);
 bool host_can_start(); // in a level with ALife and a living actor
 void on_host_started();
 void on_peer_joined(const PeerInfo& p);
-void on_peer_left(PeerId id); // parks the player's proxy
+void on_peer_left(PeerId id); // parks the player's proxy and takes it out of the world
 
 // Proxy (avatar) of a peer in the host world, 0xffff if none. Host only.
 u16 proxy_of_peer(PeerId id);
 PeerId peer_of_proxy(u16 proxy_id);
 bool is_proxy(u16 id);
+// W9, host: the player of proxy `id` is connected and has finished loading the world (WorldLoaded). Only then is
+// his character in the world: an absent or still loading player's proxy stays offline (coop::switch_vote).
+bool host_player_in_world(u16 proxy_id);
 
 // Host: increments when a load or level change replaces the served world. Requests from
 // peers that have not rejoined the current world must be ignored (see sync::host_peer_joining).

@@ -1656,6 +1656,16 @@ void Session::send_chat(const std::string& text)
 	}
 }
 
+void Session::hold_connection(uint32_t ms)
+{
+	m->m_tp.hold(ms);
+}
+
+uint64_t Session::keepalive_services() const
+{
+	return m->m_tp.keepalive_services();
+}
+
 void Session::set_log(LogFn fn)
 {
 	m->m_log = std::move(fn);

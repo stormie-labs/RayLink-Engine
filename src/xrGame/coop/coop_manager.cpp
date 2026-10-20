@@ -15,6 +15,14 @@ namespace
 {
 void log_line(const char* line) { ::Msg("%s", line); }
 
+// W9: silence before a peer is dropped. A process that stops pumping without a hold (crash dialog, hang) is gone
+// after this; ENet rounds it up to its next retransmission (10-16 s). Was 120 s, which kept a crashed client
+// "connected" for two minutes.
+constexpr u32 kPeerTimeoutMs = 10000;
+// W9: how long one loading activity holds the link (re-armed by every load stage): the longest single stage we
+// wait for, e.g. the texture upload of a big level on a slow disk.
+constexpr u32 kLoadHoldMs = 120000;
+
 // "-key value" from the command line; false if absent. Value is empty if the key has none.
 bool cmd_param(LPCSTR key, xr_string& value)
 {
@@ -227,8 +235,8 @@ SessionConfig Manager::make_config(u16 port)
 	cfg.manifest = manifest();
 	cfg.key = player_key();
 	cfg.nick = nick();
-	// A client loading a level does not pump the network for tens of seconds.
-	cfg.peer_timeout_ms = 120000;
+	// A level load does not pump the network for tens of seconds: on_blocking_work() holds the link meanwhile.
+	cfg.peer_timeout_ms = kPeerTimeoutMs;
 	cfg.connect_timeout_ms = 15000;
 	return cfg;
 }
@@ -439,6 +447,10 @@ void Manager::frame()
 	autostart();
 	if (m_phase == Phase::Off)
 		return;
+	// W9: frames run again and no load step is queued: whatever held the link is over. A crash after this point
+	// must look like silence to the peers.
+	if (g_loading_events.empty())
+		m_session.hold_connection(0);
 	m_session.update(now_ms());
 	join::frame();
 	sync::frame();
@@ -450,6 +462,7 @@ void Manager::print_status() const
 	::Msg("[coop] phase %s, self #%u, nick '%s'", phase_name(m_phase), m_session.self(), nick());
 	if (!active())
 		return;
+	::Msg("[coop] silence timeout %u ms, keep-alive services %llu", kPeerTimeoutMs, m_session.keepalive_services());
 	for (const PeerInfo& p : m_session.peers())
 		::Msg("[coop]   #%u %-16s rtt %4u ms loss %4.1f%% %s %s", p.id, p.nick.c_str(), p.rtt_ms,
 		    p.packet_loss * 100.f, p.state == PeerState::Joined ? "joined" : "connecting", p.address.c_str());
@@ -467,6 +480,13 @@ void Manager::print_status() const
 }
 
 void on_frame() { Manager::get().frame(); }
+
+void on_blocking_work()
+{
+	Manager& m = Manager::get();
+	if (m.active())
+		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread
+}
 
 bool skip_keypress_on_load()
 {

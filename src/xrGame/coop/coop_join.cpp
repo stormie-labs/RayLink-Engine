@@ -178,6 +178,39 @@ void bring_proxy_to_level(CSE_ALifeHumanStalker& proxy, LPCSTR nick)
 	::Msg("[coop] character of '%s' was on another level, moved to the group", nick);
 }
 
+// W9: a player who is not in the session has no character in the world. The proxy keeps its place, inventory
+// and vitals in ALife (and in the save); coop::switch_vote keeps it offline until its player is back in the
+// world. Taking it out now instead of waiting for the switch manager's next pass over it: the EntitySwitch the
+// host sends makes it vanish on every client in the same moment.
+void take_offline(u16 proxy)
+{
+	if (proxy == kNoId || !ai().get_alife())
+		return;
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
+	if (!e || !e->m_bOnline || e->ID_Parent != kNoId)
+		return;
+	alife_rw().switch_offline(e);
+	::Msg("[coop] character %u is out of the world until its player returns", proxy);
+}
+
+// W9: the player has loaded the world: his character comes in now, through the switch manager's own checks
+// (coop::switch_vote lets it, observer_distance keeps it online), instead of on its next pass, so it is there
+// before the player's first request needs it. Until this moment it was offline, also in the save he loaded.
+void bring_online(u16 proxy)
+{
+	if (proxy == kNoId || !ai().get_alife())
+		return;
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
+	if (!e || e->m_bOnline || e->ID_Parent != kNoId)
+		return;
+	const CGameGraph& gg = ai().game_graph();
+	if (!gg.valid_vertex_id(e->m_tGraphID) || gg.vertex(e->m_tGraphID)->level_id() != ai().alife().graph().level().level_id())
+		return; // not on this level (cannot happen after bring_proxy_to_level): ALife keeps it where it is
+	alife_rw().switch_object(e);
+	if (e->m_bOnline)
+		::Msg("[coop] character %u is in the world", proxy);
+}
+
 // --- host: JoinRequest ---
 void host_on_join_request(PeerId from, Reader&)
 {
@@ -205,11 +238,15 @@ void host_on_join_request(PeerId from, Reader&)
 	}
 	HostPeer& hp = g.peers[from];
 	hp.proxy = proxy->ID;
+	hp.loading = true; // W9: not in the world before WorldLoaded: the save he gets has his character offline
 	world::host_mark_proxy(proxy->ID, from);
 
 	// Fresh world save: engine part (.scop) and Anomaly's script part (.scoc).
 	string64 name;
 	xr_sprintf(name, "coop_join_%u", from);
+	// W9: writing and reading back the save blocks this frame (seconds on a big world); the others must not time
+	// us out meanwhile (the save hook arms it too; reading the files back is ours).
+	on_blocking_work();
 	{
 		// save() records every name it writes as the last save; this file is deleted below, and
 		// "load last save" must keep pointing at the host's real one.
@@ -226,13 +263,16 @@ void host_on_join_request(PeerId from, Reader&)
 	save_path(scop, name, ".scop");
 	save_path(scoc, name, ".scoc");
 	std::vector<u8> engine_part, script_part;
-	if (!read_file(scop, engine_part) || engine_part.empty())
+	const bool saved = read_file(scop, engine_part) && !engine_part.empty();
+	if (saved)
+		read_file(scoc, script_part); // absent if Anomaly's script storage is disabled
+	mgr().session().hold_connection(0); // W9: done blocking (Manager::frame would release it next frame anyway)
+	if (!saved)
 	{
 		::Msg("! [coop] world save failed (%s)", scop);
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not save the world");
 		return;
 	}
-	read_file(scoc, script_part); // absent if Anomaly's script storage is disabled
 
 	xr_vector<u16> online;
 	entities::host_collect_online(online);
@@ -270,6 +310,7 @@ void host_on_world_loaded(PeerId from, Reader&)
 	const PeerInfo* p = mgr().session().peer(from);
 	::Msg("[coop] '%s' is in the world (load took %.1f s)", p ? p->nick.c_str() : "?",
 	    float(mgr().now_ms() - it->second.sent_at) / 1000.f);
+	bring_online(it->second.proxy); // W9: his character was kept out of the world while he was away or loading
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
 	players::equip_resend(); // the newcomer needs everybody's look
@@ -342,6 +383,7 @@ void client_load_world(std::vector<u8>& data)
 	::Msg("[coop] world received (%u + %u bytes), my character is proxy %u in host numbering, loading", engine_size,
 	    script_size, proxy);
 
+	on_blocking_work(); // W9: the load below does not pump the network; the engine hooks re-arm it per stage
 	if (g_pGameLevel)
 		Console->Execute("disconnect");
 	// As the stock new game / load do: a pause left by the menu would outlive the load ("Paused" after join)
@@ -464,8 +506,21 @@ void on_peer_left(PeerId id)
 	auto it = g.peers.find(id);
 	if (it == g.peers.end())
 		return;
-	world::host_park_proxy(it->second.proxy);
+	const u16 proxy = it->second.proxy;
+	world::host_park_proxy(proxy);
 	g.peers.erase(it);
+	take_offline(proxy); // W9: gone from the session = gone from the world (stays in the save)
+}
+
+bool host_player_in_world(u16 proxy_id)
+{
+	// A world loaded since the last frame is not served yet (host_watch_world): its ids are not the peers' proxies.
+	if (proxy_id == kNoId || g.world_seen != g_world_generation)
+		return false;
+	for (const auto& it : g.peers)
+		if (it.second.proxy == proxy_id)
+			return !it.second.loading;
+	return false;
 }
 
 u16 proxy_of_peer(PeerId id)
@@ -502,7 +557,14 @@ bool client_loading_world() { return mgr().phase() == Phase::LoadingWorld; }
 
 void on_session_lost(const char*)
 {
+	// W9, host: the session is over, nobody else is in the world. Clients take the avatars out through their own
+	// switch vote (coop::switch_vote: no session = no player in the world).
+	xr_vector<u16> proxies;
+	for (const auto& it : g.peers)
+		proxies.push_back(it.second.proxy);
 	g = State();
+	for (u16 proxy : proxies)
+		take_offline(proxy);
 }
 
 void on_blob_progress(PeerId, u32, u32 kind, u64 done, u64 total)

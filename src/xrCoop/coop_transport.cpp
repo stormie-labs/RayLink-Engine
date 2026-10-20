@@ -9,6 +9,7 @@
 #endif
 #include <enet/enet.h>
 
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
@@ -25,6 +26,20 @@ constexpr size_t kChannels = size_t(Lane::Count);
 
 std::mutex g_enet_mutex;
 int g_enet_refs = 0;
+
+// One lock for all ENet state of the process: the owner thread and keep-alive threads take turns.
+// Recursive: a few wrappers call each other.
+std::recursive_mutex g_io;
+using IoLock = std::lock_guard<std::recursive_mutex>;
+
+constexpr uint32_t kKeepAliveTickMs = 50; // helper thread wake-up period
+constexpr uint64_t kOwnerStallMs = 150; // the owner is "busy" when it has not serviced for this long
+
+uint64_t steady_ms()
+{
+	using namespace std::chrono;
+	return uint64_t(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
 
 bool enet_acquire()
 {
@@ -50,8 +65,12 @@ void ENET_CALLBACK packet_free_cb(ENetPacket* p)
 	p->userData = nullptr;
 	if (*box)
 	{
-		ByteCounter& c = **box;
-		c.bytes = c.bytes >= p->dataLength ? c.bytes - p->dataLength : 0;
+		std::atomic<size_t>& bytes = (*box)->bytes;
+		size_t cur = bytes.load();
+		size_t next;
+		do
+			next = cur >= p->dataLength ? cur - p->dataLength : 0;
+		while (!bytes.compare_exchange_weak(cur, next));
 	}
 	delete box;
 }
@@ -101,6 +120,7 @@ bool Transport::listen(uint16_t port, uint32_t max_peers, std::string* err)
 	m_enet_ref = true;
 	if (max_peers == 0)
 		max_peers = 1;
+	IoLock io(g_io);
 	if (max_peers > ENET_PROTOCOL_MAXIMUM_PEER_ID)
 		max_peers = ENET_PROTOCOL_MAXIMUM_PEER_ID;
 
@@ -115,6 +135,7 @@ bool Transport::listen(uint16_t port, uint32_t max_peers, std::string* err)
 		destroy();
 		return false;
 	}
+	keepalive_start();
 	return true;
 }
 
@@ -136,13 +157,14 @@ PeerHandle Transport::connect(const std::string& address, uint16_t port, std::st
 
 	ENetAddress addr;
 	addr.port = port;
-	if (enet_address_set_host(&addr, address.c_str()) != 0)
+	if (enet_address_set_host(&addr, address.c_str()) != 0) // may block on DNS: outside the ENet lock
 	{
 		if (err)
 			*err = "cannot resolve host '" + address + "'";
 		destroy();
 		return nullptr;
 	}
+	IoLock io(g_io);
 	m_host = enet_host_create(nullptr, 1, kChannels, 0, 0);
 	if (!m_host)
 	{
@@ -159,13 +181,16 @@ PeerHandle Transport::connect(const std::string& address, uint16_t port, std::st
 		destroy();
 		return nullptr;
 	}
+	keepalive_start();
 	return peer;
 }
 
 void Transport::destroy()
 {
+	keepalive_stop(); // before the host goes: the helper must not service a destroyed host
 	if (m_host)
 	{
+		IoLock io(g_io);
 		enet_host_destroy(m_host);
 		m_host = nullptr;
 	}
@@ -182,7 +207,12 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 		return 0;
 	ev = Event();
 	ENetEvent e;
-	const int rc = enet_host_service(m_host, &e, wait_ms);
+	int rc;
+	{
+		IoLock io(g_io);
+		m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
+		rc = enet_host_service(m_host, &e, wait_ms);
+	}
 	if (rc <= 0)
 		return rc;
 
@@ -214,6 +244,7 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 
 void Transport::flush()
 {
+	IoLock io(g_io);
 	if (m_host)
 		enet_host_flush(m_host);
 }
@@ -237,7 +268,7 @@ Packet Transport::make_packet(Lane lane, uint16_t type, const uint8_t* a, size_t
 	if (counter)
 	{
 		ByteCounterPtr* box = new ByteCounterPtr(counter);
-		counter->bytes += p->dataLength;
+		counter->bytes.fetch_add(p->dataLength);
 		p->userData = box;
 		p->freeCallback = packet_free_cb;
 	}
@@ -251,6 +282,7 @@ bool Transport::send(PeerHandle peer, Lane lane, Packet&& packet)
 	packet.m_p = nullptr;
 	if (!p)
 		return false;
+	IoLock io(g_io);
 	if (!m_host || !peer || peer->state != ENET_PEER_STATE_CONNECTED
 		|| enet_peer_send(peer, enet_uint8(lane), p) < 0)
 	{
@@ -264,6 +296,7 @@ void Transport::set_timeouts(PeerHandle peer, uint32_t timeout_ms)
 {
 	if (!peer)
 		return;
+	IoLock io(g_io);
 	// ENet's congestion throttle drops a share of unreliable packets whenever the measured RTT spikes. In a game that
 	// pumps the network from the main thread a frame hitch (level load, GC) looks exactly like that, and snapshot
 	// streams would die for seconds on a perfectly good link. Deceleration 0 switches the throttle off: the
@@ -277,29 +310,34 @@ void Transport::set_timeouts(PeerHandle peer, uint32_t timeout_ms)
 
 void Transport::disconnect_later(PeerHandle peer)
 {
+	IoLock io(g_io);
 	if (peer)
 		enet_peer_disconnect_later(peer, 0);
 }
 
 void Transport::disconnect_now(PeerHandle peer)
 {
+	IoLock io(g_io);
 	if (peer)
 		enet_peer_disconnect_now(peer, 0);
 }
 
 void Transport::reset(PeerHandle peer)
 {
+	IoLock io(g_io);
 	if (peer)
 		enet_peer_reset(peer);
 }
 
 void* Transport::user(PeerHandle peer)
 {
+	IoLock io(g_io);
 	return peer ? peer->data : nullptr;
 }
 
 void Transport::set_user(PeerHandle peer, void* p)
 {
+	IoLock io(g_io);
 	if (peer)
 		peer->data = p;
 }
@@ -308,6 +346,7 @@ bool Transport::outgoing_idle(PeerHandle peer)
 {
 	if (!peer)
 		return true;
+	IoLock io(g_io);
 	return enet_list_empty(&peer->outgoingCommands) && enet_list_empty(&peer->outgoingSendReliableCommands);
 }
 
@@ -315,16 +354,19 @@ bool Transport::all_acked(PeerHandle peer)
 {
 	if (!peer)
 		return true;
+	IoLock io(g_io);
 	return outgoing_idle(peer) && enet_list_empty(&peer->sentReliableCommands);
 }
 
 uint32_t Transport::rtt_ms(PeerHandle peer)
 {
+	IoLock io(g_io);
 	return peer ? peer->roundTripTime : 0;
 }
 
 float Transport::packet_loss(PeerHandle peer)
 {
+	IoLock io(g_io);
 	return peer ? float(peer->packetLoss) / float(ENET_PEER_PACKET_LOSS_SCALE) : 0.f;
 }
 
@@ -332,10 +374,70 @@ std::string Transport::address_of(PeerHandle peer)
 {
 	if (!peer)
 		return std::string();
+	IoLock io(g_io);
 	char ip[64] = {};
 	if (enet_address_get_host_ip(&peer->address, ip, sizeof(ip)) != 0)
 		std::strcpy(ip, "?");
 	return std::string(ip) + ":" + std::to_string(unsigned(peer->address.port));
+}
+
+// ---------------------------------------------------------------- keep-alive
+
+void Transport::hold(uint32_t ms)
+{
+	m_hold_until_ms.store(ms ? steady_ms() + ms : 0, std::memory_order_relaxed);
+}
+
+void Transport::keepalive_start()
+{
+	if (m_ka_thread.joinable())
+		return;
+	{
+		std::lock_guard<std::mutex> lk(m_ka_mutex);
+		m_ka_stop = false;
+	}
+	m_hold_until_ms.store(0, std::memory_order_relaxed);
+	m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
+	m_ka_thread = std::thread(&Transport::keepalive_loop, this);
+}
+
+void Transport::keepalive_stop()
+{
+	if (!m_ka_thread.joinable())
+		return;
+	{
+		std::lock_guard<std::mutex> lk(m_ka_mutex);
+		m_ka_stop = true;
+	}
+	m_ka_cv.notify_all();
+	m_ka_thread.join();
+	m_hold_until_ms.store(0, std::memory_order_relaxed);
+}
+
+void Transport::keepalive_loop()
+{
+	for (;;)
+	{
+		{
+			std::unique_lock<std::mutex> lk(m_ka_mutex);
+			if (m_ka_cv.wait_for(lk, std::chrono::milliseconds(kKeepAliveTickMs), [this] { return m_ka_stop; }))
+				return;
+		}
+		const uint64_t now = steady_ms();
+		const uint64_t until = m_hold_until_ms.load(std::memory_order_relaxed);
+		if (!until || now >= until)
+			continue; // not held: a stalled owner must look dead to its peers
+		if (m_last_service_ms.load(std::memory_order_relaxed) + kOwnerStallMs > now)
+			continue; // the owner pumps by itself
+		// Never wait for the lock: the owner (or another transport's helper) is using ENet right now.
+		std::unique_lock<std::recursive_mutex> io(g_io, std::try_to_lock);
+		if (!io.owns_lock() || !m_host)
+			continue;
+		// No event structure: ENet sends acks and pings, checks timeouts and queues whatever it receives (and any
+		// state change) for the owner's next enet_host_service.
+		enet_host_service(m_host, nullptr, 0);
+		m_ka_services.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 } // namespace net
 } // namespace coop

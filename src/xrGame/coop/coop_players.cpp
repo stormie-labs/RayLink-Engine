@@ -25,6 +25,9 @@ namespace
 constexpr u32 kSendIntervalMs = 50; // 20 Hz
 constexpr u32 kInterpDelayMs = 100; // render this far in the past to hide jitter
 constexpr size_t kMaxSamples = 32;
+// W9: no state for this long = the stream ended (player left, avatar out of the world). The next state starts a
+// new one: its clock may be another process's (the player restarted the game), and old samples are useless.
+constexpr u64 kStreamGapMs = 3000;
 
 struct Sample
 {
@@ -40,6 +43,7 @@ struct Track
 	u32 last_remote_time = 0;
 	u32 applied_legs = 0, applied_torso = 0, applied_head = 0;
 	u64 received = 0, dropped_old = 0;
+	u64 last_rx = 0; // our clock, last state received
 	// W5: what the avatar was last driven with (read by coop_sound, coop_equip)
 	bool driven = false;
 	u32 mstate = 0;
@@ -55,12 +59,21 @@ void push_sample(u16 avatar, const State& s)
 {
 	Track& t = g_tracks[avatar];
 	++t.received;
+	const u64 now = mgr().now_ms();
+	if (t.have_offset && now - t.last_rx > kStreamGapMs)
+	{
+		t.samples.clear();
+		t.have_offset = false;
+		t.applied_legs = t.applied_torso = t.applied_head = 0; // a respawned avatar replays the motions
+		t.driven = false;
+		t.mstate = 0;
+	}
+	t.last_rx = now;
 	if (t.have_offset && s32(s.time_ms - t.last_remote_time) <= 0)
 	{
 		++t.dropped_old; // reordered or duplicate: latest wins (R-12.3)
 		return;
 	}
-	const u64 now = mgr().now_ms();
 	const s64 offset = s64(now) - s64(s.time_ms);
 	if (!t.have_offset || offset < t.clock_offset)
 		t.clock_offset = offset;

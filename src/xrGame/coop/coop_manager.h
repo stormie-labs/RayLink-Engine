@@ -76,6 +76,11 @@ inline Manager& mgr() { return Manager::get(); }
 void register_console_commands();
 // Engine hook, see CGamePersistent::OnFrame.
 void on_frame();
+// Engine hooks (W9): this thread is about to block and will not pump the network for a while: a level is torn
+// down or loaded, a save is written (CLevel::net_Stop, CGamePersistent::Start, every CGamePersistent::LoadTitle
+// stage, CALifeStorageManager::save). In a session the link is held alive from a helper thread until the next
+// normal frame (at most kLoadHoldMs after the last call). Any thread.
+void on_blocking_work();
 // Engine hook: skip the "press any key" screen after a level load (a joining client, or an
 // instance started with -coop_host / -coop_connect for automated tests).
 bool skip_keypress_on_load();

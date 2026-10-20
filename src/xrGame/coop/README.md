@@ -26,6 +26,14 @@ Project root: `D:\Projects\ForEverything\anomaly-coop` (docs: `DESIGN.md` §10, 
   player's inventory as normal world items in the host save. On a client, right after the save is read, the local actor (id 0)
   and the client's own proxy swap data (`coop_join.cpp: on_alife_objects_loaded`). Id mapping: only the pair (0, my_proxy) is
   swapped: `join::to_local(host_id)`, `join::to_host(local_id)`. **All ids on the wire are in host numbering.**
+- **Absent players are not in the world** (W9): a player's character (`coop_player_avatar`, any machine) is online
+  only while its player is in the session: on the host from WorldLoaded until he leaves (`coop::switch_vote`,
+  `join::host_player_in_world`, `join::take_offline/bring_online`), never without a session. It stays in ALife and
+  in the save, offline, with its inventory. Nobody can talk to it (talk off in `coop_remote.cpp`, silent refusal
+  in `dialog::may_start_talk`).
+- **Link liveness** (W9): a silent peer is dropped after 10 s (`coop_manager.cpp kPeerTimeoutMs`). Code that blocks
+  the main thread for long (level teardown/load, writing a save) calls `coop::on_blocking_work()`; the transport
+  then answers ENet from a helper thread (`Session::hold_connection`) until the next normal frame.
 - **Client ALife is frozen** (no offline simulation). Online/offline is decided by the host (`coop_alife.cpp`,
   `entities::client_wants_online`). Host-side switching uses the distance to the nearest player (`observer_distance`).
 - **Only the host creates/destroys server entities** (P7). Clients send requests; the host applies the first valid one and

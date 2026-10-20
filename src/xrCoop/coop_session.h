@@ -104,6 +104,13 @@ public:
 	// Disconnects one client with a reason (host only).
 	void kick(PeerId id, RejectReason reason, const std::string& text);
 
+	// The owner thread is about to block for long (a level load does not call update() for tens of seconds):
+	// keep the connection alive from a helper thread for up to `ms` from now; 0 releases. Without a hold a
+	// silent process is dropped by its peers after peer_timeout_ms (a crash dialog must not look alive).
+	// Thread-safe (the only Session call that is).
+	void hold_connection(uint32_t ms);
+	uint64_t keepalive_services() const; // helper services so far (diagnostics)
+
 	// Bulk transfer of an arbitrary byte blob in chunks over Lane::Bulk, with CRC32 check.
 	// Returns the blob id.
 	uint32_t send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data);

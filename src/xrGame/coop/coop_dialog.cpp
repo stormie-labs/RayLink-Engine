@@ -430,16 +430,17 @@ void on_peer_left(PeerId id)
 
 bool may_start_talk(CInventoryOwner* partner, bool disable_break)
 {
+	// W9: a player's character never talks, in a session or not (its talk is off, there is no "talk" tip): refuse
+	// silently, like any NPC with talk disabled. Checked by section: a client learns other avatars' ids late.
+	if (partner && world::is_player_character(smart_cast<CGameObject*>(partner)))
+		return false;
 	if (!partner || !net::live())
 		return true;
 	const u16 local = id_of(partner);
 	if (local == kNoId || local == 0)
 		return true;
 	if (world::is_player_proxy(local))
-	{
-		notify_denied(Refused);
-		return false;
-	}
+		return false; // (a registered avatar is a player character: caught above)
 	if (mgr().is_host())
 	{
 		const u8 result = host_try_lock(local, kHostPeer);

@@ -16,6 +16,7 @@
 #include "alife_group_registry.h"
 #include "alife_registry_container.h"
 #include "coop/coop_join.h"
+#include "coop/coop_manager.h" // Anomaly Coop
 #include "xrserver.h"
 #include "level.h"
 #include "../xrEngine/x_ray.h"
@@ -47,6 +48,7 @@ CALifeStorageManager::~CALifeStorageManager()
 void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 {
 	PROF_EVENT();
+	coop::on_blocking_work(); // Anomaly Coop: writing a big save blocks the frame, keep the session link alive
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
 
 	string_path save_name;

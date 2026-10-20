@@ -20,6 +20,7 @@
 #include "ui/UIPdaWnd.h"
 #include "../xrNetServer/NET_AuthCheck.h"
 #include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_manager.h" // Anomaly Coop
 
 #include "../xrphysics/physicscommon.h"
 extern ENGINE_API bool g_dedicated_server;
@@ -124,6 +125,7 @@ extern CUISequencer* g_tutorial2;
 void CLevel::net_Stop()
 {
 	Msg("- Disconnect");
+	coop::on_blocking_work(); // Anomaly Coop: tearing the level down blocks the frame, keep the session link alive
 
 	if (CurrentGameUI())
 	{

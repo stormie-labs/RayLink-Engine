@@ -146,8 +146,8 @@ void CSE_ALifeDynamicObject::try_switch_online()
 			alife().scheduled().add(this);
 	}
 
-	// Anomaly Coop: on a client the host decides what is online
-	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	// Anomaly Coop: on a client the host decides what is online; a player's character only while he is in the world
+	const coop::SwitchVote vote = coop::switch_vote(this);
 	if (vote != coop::SwitchVote::Default)
 	{
 		if (vote == coop::SwitchVote::Online)
@@ -180,8 +180,8 @@ void CSE_ALifeDynamicObject::try_switch_online()
 
 void CSE_ALifeDynamicObject::try_switch_offline()
 {
-	// Anomaly Coop: on a client the host decides what is online
-	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	// Anomaly Coop: on a client the host decides what is online; a player's character only while he is in the world
+	const coop::SwitchVote vote = coop::switch_vote(this);
 	if (vote != coop::SwitchVote::Default)
 	{
 		if (vote == coop::SwitchVote::Offline)

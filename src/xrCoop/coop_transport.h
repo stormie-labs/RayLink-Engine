@@ -2,10 +2,14 @@
 // Keeps <enet/enet.h> and the Windows headers out of coop_session.cpp.
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "coop_protocol.h"
@@ -22,9 +26,10 @@ using PeerHandle = _ENetPeer*;
 
 // Bytes of Bulk-lane packets that are alive (queued in Session or in ENet, not yet acknowledged).
 // A packet holds a shared reference, so the counter outlives the connection that owns it.
+// Atomic: ENet may free an acknowledged packet on the keep-alive thread (see Transport::hold).
 struct ByteCounter
 {
-	size_t bytes = 0;
+	std::atomic<size_t> bytes{0};
 };
 using ByteCounterPtr = std::shared_ptr<ByteCounter>;
 
@@ -63,6 +68,8 @@ struct Event
 	std::vector<uint8_t> bytes; // Receive: full packet (u16 type + payload)
 };
 
+// Thread safety: every call that touches ENet state takes one process-wide lock, so the owner thread and the
+// keep-alive thread never run ENet at the same time. Everything else (events, Session) stays on the owner thread.
 class Transport
 {
 public:
@@ -102,9 +109,31 @@ public:
 	static float packet_loss(PeerHandle peer); // 0..1
 	static std::string address_of(PeerHandle peer); // "ip:port"
 
+	// Keep-alive for long blocking work on the owner thread (a level load does not pump the network for tens of
+	// seconds). While held, a helper thread services ENet whenever the owner has not called service() for a
+	// short while: acknowledgements and pings keep flowing, so peers do not time us out; received packets stay
+	// queued in ENet for the owner's next service(); no events are delivered from the helper. hold(ms) holds the
+	// link for `ms` from now (a new call replaces the deadline), hold(0) releases. A process that stops pumping
+	// without a hold (stuck on a crash dialog, hung) goes silent and its peers drop it after the silence timeout.
+	// Safe to call from any thread.
+	void hold(uint32_t ms);
+	uint64_t keepalive_services() const { return m_ka_services.load(std::memory_order_relaxed); }
+
 private:
+	void keepalive_start();
+	void keepalive_stop();
+	void keepalive_loop();
+
 	_ENetHost* m_host = nullptr;
 	bool m_enet_ref = false;
+
+	std::thread m_ka_thread;
+	std::mutex m_ka_mutex; // guards m_ka_stop for the condition variable
+	std::condition_variable m_ka_cv;
+	bool m_ka_stop = false;
+	std::atomic<uint64_t> m_last_service_ms{0}; // steady clock of the owner's last service()
+	std::atomic<uint64_t> m_hold_until_ms{0}; // steady clock; 0 = not held
+	std::atomic<uint64_t> m_ka_services{0};
 };
 } // namespace net
 } // namespace coop

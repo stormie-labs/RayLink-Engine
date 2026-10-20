@@ -44,4 +44,13 @@ SwitchVote client_switch_vote(u16 id)
 		return SwitchVote::Online; // our actor
 	return entities::client_wants_online(id) ? SwitchVote::Online : SwitchVote::Offline;
 }
+
+SwitchVote switch_vote(const CSE_ALifeDynamicObject* e)
+{
+	if (mgr().is_client())
+		return client_switch_vote(e->ID);
+	if (world::is_player_character(e) && !(mgr().is_host() && join::host_player_in_world(e->ID)))
+		return SwitchVote::Offline; // W9: his player is not in the session (or still loading)
+	return SwitchVote::Default;
+}
 } // namespace coop
