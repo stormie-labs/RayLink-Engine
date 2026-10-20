@@ -680,6 +680,10 @@ void CLevel::IR_OnMouseStop(int /**axis/**/, int /**value/**/)
 void CLevel::IR_OnActivate()
 {
 	if (!pInput) return;
+	// Anomaly Coop: IGame_Level::Load captures input before the level is ready; replaying held movement keys
+	// then ran the Lua key hook on a world still loading (access violation in lua_next on a co-op client
+	// whose join started while the player held a key). Nothing to move yet: replay only in a ready level.
+	if (!bReady) return;
 	int i;
 	for (i = 0; i < CInput::COUNT_KB_BUTTONS; i++)
 	{
