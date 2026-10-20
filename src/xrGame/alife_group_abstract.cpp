@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_alife.h"
 #include "xrServer_Objects_ALife.h"
 #include "ai_space.h"
 #include "alife_simulator.h"
@@ -161,9 +162,7 @@ void CSE_ALifeGroupAbstract::try_switch_offline()
 				// to switch offline
 				break;
 
-			if (I->alife().graph().actor()->o_Position.distance_to(tpGroupMember->o_Position) <= I
-			                                                                                     ->alife().
-			                                                                                     offline_distance())
+			if (coop::observer_distance(tpGroupMember->o_Position) <= I->alife().offline_distance()) // Anomaly Coop
 				// so, it is not ready, breaking a cycle, because we can't 
 				// switch group offline since not all the group members are ready
 				// to switch offline

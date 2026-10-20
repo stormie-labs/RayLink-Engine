@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_sync.h"
 #include "alife_update_manager.h"
 #include "alife_simulator_header.h"
 #include "alife_time_manager.h"
@@ -101,6 +102,10 @@ void CALifeUpdateManager::update_switch()
 
 void CALifeUpdateManager::update_scheduled(bool init_ef)
 {
+	// Anomaly Coop: a client has no simulation of its own, the host's world is mirrored
+	if (coop::sync::alife_frozen())
+		return;
+
 	if (init_ef)
 		init_ef_storage();
 

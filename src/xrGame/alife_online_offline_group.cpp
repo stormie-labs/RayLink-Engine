@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_alife.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "ai_space.h"
 #include "alife_simulator.h"
@@ -203,6 +204,17 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_online()
 	if (m_members.empty())
 		return;
 
+	// Anomaly Coop: on a client the host decides what is online
+	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	if (vote != coop::SwitchVote::Default)
+	{
+		if (vote == coop::SwitchVote::Online)
+			alife().switch_online(this);
+		else
+			on_failed_switch_online();
+		return;
+	}
+
 	if (!can_switch_online())
 		return;
 
@@ -223,7 +235,7 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_online()
 		VERIFY3((*I).second->can_switch_offline(),
 		        "Incorrect situation : some of the OnlineOffline group members cannot be switched online due to their personal properties",
 		        (*I).second->name_replace());
-		if (alife().graph().actor()->o_Position.distance_to((*I).second->o_Position) > alife().online_distance())
+		if (coop::observer_distance((*I).second->o_Position) > alife().online_distance()) // Anomaly Coop
 		{
 			continue;
 		}
@@ -237,6 +249,15 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_offline()
 {
 	if (m_members.empty())
 		return;
+
+	// Anomaly Coop: on a client the host decides what is online
+	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	if (vote != coop::SwitchVote::Default)
+	{
+		if (vote == coop::SwitchVote::Offline)
+			alife().switch_offline(this);
+		return;
+	}
 
 	if (!can_switch_offline())
 		return;
@@ -260,7 +281,7 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_offline()
 		        "Incorrect situation : some of the OnlineOffline group members cannot be switched online due to their personal properties",
 		        (*I).second->name_replace());
 
-		if (alife().graph().actor()->o_Position.distance_to((*I).second->o_Position) <= alife().offline_distance())
+		if (coop::observer_distance((*I).second->o_Position) <= alife().offline_distance()) // Anomaly Coop
 			return;
 	}
 

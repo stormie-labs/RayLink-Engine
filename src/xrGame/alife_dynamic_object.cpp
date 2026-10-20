@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_alife.h"
 #include "xrServer_Objects_ALife.h"
 #include "alife_simulator.h"
 #include "alife_schedule_registry.h"
@@ -145,6 +146,17 @@ void CSE_ALifeDynamicObject::try_switch_online()
 			alife().scheduled().add(this);
 	}
 
+	// Anomaly Coop: on a client the host decides what is online
+	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	if (vote != coop::SwitchVote::Default)
+	{
+		if (vote == coop::SwitchVote::Online)
+			alife().switch_online(this);
+		else
+			on_failed_switch_online();
+		return;
+	}
+
 	if (!can_switch_online())
 	{
 		on_failed_switch_online();
@@ -157,7 +169,7 @@ void CSE_ALifeDynamicObject::try_switch_online()
 		return;
 	}
 
-	if (alife().graph().actor()->o_Position.distance_to(o_Position) > alife().online_distance())
+	if (coop::observer_distance(o_Position) > alife().online_distance()) // Anomaly Coop: nearest player
 	{
 		on_failed_switch_online();
 		return;
@@ -168,6 +180,15 @@ void CSE_ALifeDynamicObject::try_switch_online()
 
 void CSE_ALifeDynamicObject::try_switch_offline()
 {
+	// Anomaly Coop: on a client the host decides what is online
+	const coop::SwitchVote vote = coop::client_switch_vote(ID);
+	if (vote != coop::SwitchVote::Default)
+	{
+		if (vote == coop::SwitchVote::Offline)
+			alife().switch_offline(this);
+		return;
+	}
+
 	if (!can_switch_offline())
 		return;
 
@@ -177,7 +198,7 @@ void CSE_ALifeDynamicObject::try_switch_offline()
 		return;
 	}
 
-	if (alife().graph().actor()->o_Position.distance_to(o_Position) <= alife().offline_distance())
+	if (coop::observer_distance(o_Position) <= alife().offline_distance()) // Anomaly Coop: nearest player
 		return;
 
 	alife().switch_offline(this);

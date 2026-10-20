@@ -436,6 +436,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_alife.h" />
+    <ClInclude Include="coop\coop_net.h" />
+    <ClInclude Include="coop\coop_entities.h" />
+    <ClInclude Include="coop\coop_sync.h" />
+    <ClInclude Include="coop\coop_players.h" />
+    <ClInclude Include="coop\coop_world.h" />
+    <ClInclude Include="coop\coop_join.h" />
+    <ClInclude Include="coop\coop_manager.h" />
     <ClInclude Include="..\3rd party\fastdelegate\fastdelegate.h" />
     <ClInclude Include="..\3rd party\fast_dynamic_cast\fast_dynamic_cast.hpp" />
     <ClInclude Include="..\xrCore\ChooseTypes.H" />
@@ -2079,6 +2087,15 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_alife.cpp" />
+    <ClCompile Include="coop\coop_net.cpp" />
+    <ClCompile Include="coop\coop_entities.cpp" />
+    <ClCompile Include="coop\coop_sync.cpp" />
+    <ClCompile Include="coop\coop_players.cpp" />
+    <ClCompile Include="coop\coop_world.cpp" />
+    <ClCompile Include="coop\coop_join.cpp" />
+    <ClCompile Include="coop\coop_console.cpp" />
+    <ClCompile Include="coop\coop_manager.cpp" />
     <ClCompile Include="..\xrServerEntities\alife_human_brain.cpp" />
     <ClCompile Include="..\xrServerEntities\alife_monster_brain.cpp" />
     <ClCompile Include="..\xrServerEntities\alife_space.cpp" />

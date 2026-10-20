@@ -313,6 +313,7 @@ xr_token dead_body_collision_tokens[] =
 };
 
 void register_mp_console_commands();
+#include "coop/coop_manager.h"
 //-----------------------------------------------------------
 
 BOOL g_bCheckTime = FALSE;
@@ -3415,4 +3416,7 @@ void CCC_RegisterCommands()
     CMD1(CCC_Particle_TEST,     "g_ps_test");
     CMD4(CCC_Integer, "show_actor_body", &showActorBody, 0, 2);
     CMD4(CCC_Integer, "disable_actor_body_rotation_delay", &disableActorBodyRotationDelay, 0, 1);
+
+	// Anomaly Coop
+	coop::register_console_commands();
 }

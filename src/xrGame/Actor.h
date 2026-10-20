@@ -310,6 +310,10 @@ protected:
 
 
 public:
+	// Anomaly Coop: read-only orientation for network snapshots (coop/coop_players.cpp)
+	float coop_model_yaw() const { return r_model_yaw; }
+	const SRotation& coop_torso() const { return unaffected_r_torso; }
+
 	SActorMotions* m_anims;
 #ifdef ENABLE_CAR
 	SActorVehicleAnims* m_vehicle_anims;

@@ -1,0 +1,42 @@
+// Anomaly Coop — live world synchronization after join.
+// Players: each machine owns its local actor and streams snapshots; the others drive avatars.
+// World: the host streams online objects (NPCs, monsters) and entity lifecycle; clients only mirror.
+#pragma once
+
+#include "xrCoop/coop_session.h"
+
+class CGameObject;
+class CSE_Abstract;
+
+namespace coop
+{
+namespace sync
+{
+void install(Session& s);
+void on_session_started();
+void on_peer_joined(const PeerInfo& p);
+void on_peer_left(PeerId id);
+void reset();
+void frame();
+void print_status();
+void dump_state(LPCSTR args);
+
+// Client: entering live mode after the world loaded.
+void on_client_live();
+
+// Host: the world save was sent to `id`; world changes for it are queued until it loaded.
+void host_begin_join(PeerId id);
+void host_end_join(PeerId id);
+bool host_peer_joining(PeerId id);
+
+// --- engine hooks ---
+// True if this game object must not think on this machine (remote NPC on a client,
+// player avatar anywhere). Its movement/animation come from snapshots.
+bool is_remote_driven(const CGameObject* obj);
+// True on a coop client: ALife simulation (switching, scheduled updates, spawns) is frozen.
+bool alife_frozen();
+// Client: the local game asked its own server to create an entity. Returns true if the
+// request was forwarded to the host (caller must drop it locally).
+bool intercept_local_spawn(CSE_Abstract* entity);
+} // namespace sync
+} // namespace coop

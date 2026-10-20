@@ -1,5 +1,6 @@
 #include "pch_script.h"
 #include "gamepersistent.h"
+#include "coop/coop_manager.h"
 #include "../xrEngine/fmesh.h"
 #include "../xrEngine/xr_ioconsole.h"
 #include "../xrEngine/gamemtllib.h"
@@ -677,6 +678,7 @@ extern CUISequencer* g_tutorial2;
 void CGamePersistent::OnFrame()
 {
 	PROF_EVENT("CGamePersistent OnFrame");
+	coop::on_frame(); // Anomaly Coop: network pump on the main thread
 	if (Device.dwPrecacheFrame == 5 && m_intro_event.empty())
 	{
 		m_intro_event.bind(this, &CGamePersistent::game_loaded);

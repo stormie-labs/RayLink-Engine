@@ -15,6 +15,7 @@
 #include "alife_graph_registry.h"
 #include "alife_group_registry.h"
 #include "alife_registry_container.h"
+#include "coop/coop_join.h"
 #include "xrserver.h"
 #include "level.h"
 #include "../xrEngine/x_ray.h"
@@ -139,6 +140,7 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 	spawns().load(source, file_name);
 	graph().on_load();
 	objects().load(source);
+	coop::join::on_alife_objects_loaded(objects()); // Anomaly Coop: client role swap before registration
 
 	VERIFY(can_register_objects());
 	can_register_objects(false);
