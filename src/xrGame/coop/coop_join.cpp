@@ -4,6 +4,7 @@
 #include "coop_sync.h"
 #include "coop_world.h"
 #include "coop_entities.h"
+#include "coop_players.h"
 #include "coop_alife.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -226,12 +227,14 @@ void host_on_world_loaded(PeerId from, Reader&)
 	    float(mgr().now_ms() - it->second.sent_at) / 1000.f);
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
+	players::equip_resend(); // the newcomer needs everybody's look
 }
 
 // --- client ---
 void client_on_join_complete(PeerId, Reader&)
 {
 	::Msg("[coop] join complete, live sync on");
+	players::equip_resend();
 }
 
 void client_on_session_reset(PeerId, Reader& r)

@@ -7415,6 +7415,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_equip.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_alife.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

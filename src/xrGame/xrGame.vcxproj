@@ -2087,6 +2087,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_equip.cpp" />
     <ClCompile Include="coop\coop_alife.cpp" />
     <ClCompile Include="coop\coop_net.cpp" />
     <ClCompile Include="coop\coop_entities.cpp" />

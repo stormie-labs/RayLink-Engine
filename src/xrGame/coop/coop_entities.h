@@ -46,5 +46,15 @@ bool is_mirrored(u16 id);
 bool intercept_local_spawn(CSE_Abstract* entity);
 // True while the client applies a host command itself (spawn/release/switch must go through).
 bool client_applying();
+// RAII scope for code that applies host commands on this machine (local events must pass).
+struct ClientApply
+{
+	ClientApply();
+	~ClientApply();
+	ClientApply(const ClientApply&) = delete;
+	ClientApply& operator=(const ClientApply&) = delete;
+};
+// Client: play the host snapshot on a mirrored creature (called by coop_remote).
+bool drive_mirror(CGameObject* obj);
 } // namespace entities
 } // namespace coop

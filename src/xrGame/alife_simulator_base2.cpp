@@ -8,6 +8,7 @@
 
 #include "stdafx.h"
 #include "alife_simulator_base.h"
+#include "coop/coop_entities.h"
 #include "relation_registry.h"
 #include "alife_registry_wrappers.h"
 #include "xrServer_Objects_ALife_Items.h"
@@ -53,6 +54,9 @@ void CALifeSimulatorBase::register_object(CSE_ALifeDynamicObject* object, bool a
 
 	if (can_register_objects())
 		object->on_register();
+
+	if (add_object)
+		coop::entities::host_on_entity_registered(object); // Anomaly Coop: new entity -> clients
 }
 
 void CALifeSimulatorBase::unregister_object(CSE_ALifeDynamicObject* object, bool alife_query)

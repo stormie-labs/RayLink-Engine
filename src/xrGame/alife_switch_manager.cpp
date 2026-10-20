@@ -8,6 +8,7 @@
 
 #include "stdafx.h"
 #include "alife_switch_manager.h"
+#include "coop/coop_entities.h"
 #include "xrServer_Objects_ALife.h"
 #include "alife_graph_registry.h"
 #include "alife_object_registry.h"
@@ -111,6 +112,7 @@ void CALifeSwitchManager::switch_online(CSE_ALifeDynamicObject* object)
 		Msg						("[LSS][%d] Going online [%d][%s][%d] ([%f][%f][%f] : [%f][%f][%f]), on '%s'",Device.dwFrame,Device.dwTimeGlobal,object->name_replace(), object->ID,VPUSH(graph().actor()->o_Position),VPUSH(object->o_Position), "*SERVER*");
 #endif
 		object->switch_online();
+		coop::entities::host_on_switch(object, true); // Anomaly Coop
 	STOP_PROFILE
 }
 
@@ -122,6 +124,7 @@ void CALifeSwitchManager::switch_offline(CSE_ALifeDynamicObject* object)
 		Msg							("[LSS][%d] Going offline [%d][%s][%d] ([%f][%f][%f] : [%f][%f][%f]), on '%s'",Device.dwFrame,Device.dwTimeGlobal,object->name_replace(), object->ID,VPUSH(graph().actor()->o_Position),VPUSH(object->o_Position), "*SERVER*");
 #endif
 		object->switch_offline();
+		coop::entities::host_on_switch(object, false); // Anomaly Coop
 	STOP_PROFILE
 }
 

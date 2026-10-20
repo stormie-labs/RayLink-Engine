@@ -31,6 +31,13 @@ void frame(); // capture & send own state, interpolate avatars
 void print_status();
 void on_peer_left(PeerId id);
 
+// Equipment (visual, item in hands, torch) and vitals of players: coop_equip.cpp.
+void equip_install(Session& s);
+void equip_reset();
+void equip_frame();
+void equip_resend(); // force a full resend (after join)
+void equip_print_status();
+
 // Called every frame for each avatar object from its UpdateCL (see CAI_Stalker hook):
 // moves the visual to the interpolated state. Returns false if no state yet.
 bool drive_avatar(class CAI_Stalker* avatar);

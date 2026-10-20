@@ -10,6 +10,7 @@
 #include "Level.h"
 #include "Actor.h"
 #include "GameObject.h"
+#include "entity_alive.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "ui/UIInventoryUtilities.h"
@@ -121,10 +122,13 @@ bool is_remote_driven(const CGameObject* obj)
 {
 	if (!mgr().active() || !obj)
 		return false;
+	if (smart_cast<const CActor*>(obj))
+		return false; // the local actor is always ours
 	const u16 id = obj->ID();
 	if (world::is_player_proxy(id))
 		return true; // a player character is always driven by its player
-	return mgr().is_client() && entities::is_mirrored(id);
+	// On a client every creature belongs to the host; items, doors, physics stay local.
+	return mgr().is_client() && entities::is_mirrored(id) && smart_cast<const CEntityAlive*>(obj) != nullptr;
 }
 
 bool alife_frozen() { return mgr().is_client(); }

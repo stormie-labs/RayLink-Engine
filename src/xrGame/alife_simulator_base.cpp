@@ -8,6 +8,7 @@
 
 #include "pch_script.h"
 #include "alife_simulator_base.h"
+#include "coop/coop_entities.h"
 #include "alife_simulator_header.h"
 #include "alife_time_manager.h"
 #include "alife_spawn_registry.h"
@@ -275,6 +276,7 @@ void CALifeSimulatorBase::release(CSE_Abstract* abstract, bool alife_query)
 #endif
 	CSE_ALifeDynamicObject* object = objects().object(abstract->ID);
 	VERIFY(object);
+	coop::entities::host_on_entity_released(abstract->ID); // Anomaly Coop: removal -> clients
 
 	if (!object->children.empty())
 	{

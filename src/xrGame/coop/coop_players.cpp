@@ -205,12 +205,17 @@ bool State::read(Reader& r)
 	return r.ok();
 }
 
-void install(Session& s) { s.on(Msg::PlayerState, &on_player_state); }
+void install(Session& s)
+{
+	s.on(Msg::PlayerState, &on_player_state);
+	equip_install(s);
+}
 
 void reset()
 {
 	g_tracks.clear();
 	g_last_send = 0;
+	equip_reset();
 }
 
 void on_peer_left(PeerId id)
@@ -225,6 +230,7 @@ void frame()
 	const bool live = mgr().is_host() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;
+	equip_frame();
 	const u64 now = mgr().now_ms();
 	if (now - g_last_send < kSendIntervalMs)
 		return;
@@ -283,6 +289,7 @@ bool drive_avatar(CAI_Stalker* avatar)
 void print_status()
 {
 	::Msg("[coop]   player states sent: %llu", g_sent);
+	equip_print_status();
 	for (const auto& it : g_tracks)
 		::Msg("[coop]   avatar %u: %llu states (%llu out of order), buffer %u", it.first, it.second.received,
 		    it.second.dropped_old, (u32)it.second.samples.size());

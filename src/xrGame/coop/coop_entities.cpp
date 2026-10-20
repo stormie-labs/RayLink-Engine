@@ -232,7 +232,7 @@ void host_send_snapshots()
 // ---------------------------------------------------------------- client side
 
 xr_set<u16> g_online; // local ids the host has online
-bool g_applying = false; // true while we execute a host command on our ALife
+int g_applying = 0; // > 0 while we execute a host command on our ALife
 
 struct MirrorSample
 {
@@ -256,8 +256,8 @@ u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing
 
 struct ApplyGuard
 {
-	ApplyGuard() { g_applying = true; }
-	~ApplyGuard() { g_applying = false; }
+	ApplyGuard() { ++g_applying; }
+	~ApplyGuard() { --g_applying; }
 };
 
 void read_placement(Reader& r, Fvector& pos, Fvector& ang, u32& node, u16& graph)
@@ -555,7 +555,10 @@ void on_client_live() { g_tracks.clear(); }
 
 bool is_mirrored(u16 id) { return mgr().is_client() && id != 0; }
 
-bool client_applying() { return g_applying; }
+bool client_applying() { return g_applying > 0; }
+
+ClientApply::ClientApply() { ++g_applying; }
+ClientApply::~ClientApply() { --g_applying; }
 
 bool intercept_local_spawn(CSE_Abstract* entity)
 {
