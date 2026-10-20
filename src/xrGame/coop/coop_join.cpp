@@ -289,7 +289,8 @@ void client_on_session_reset(PeerId, Reader& r)
 	g.load_issued = false;
 	g.swap_done = false;
 	sync::reset();
-	mgr().set_phase(Phase::Handshaked);
+	g.receive_started = mgr().now_ms(); // the join time limit starts again
+	mgr().set_phase(Phase::ReceivingWorld);
 	mgr().session().send(kHostPeer, Lane::Reliable, Msg::JoinRequest, Writer());
 }
 
@@ -539,11 +540,41 @@ void host_watch_world()
 	::Msg("[coop] world replaced (epoch %u): %u player(s) rejoin", g.epoch, (u32)mgr().session().peers().size());
 }
 
+constexpr u64 kJoinTimeoutMs = 5 * 60 * 1000; // R-2.3: a join is limited in time
+
+// Host: a client that never finishes loading the world is dropped with a clear reason.
+void host_watch_joins()
+{
+	const u64 now = mgr().now_ms();
+	xr_vector<PeerId> stuck;
+	for (const auto& it : g.peers)
+	{
+		if (!it.second.loading)
+			continue;
+		if (net::host_queue_overflow(it.first) || (it.second.sent_at && now - it.second.sent_at > kJoinTimeoutMs))
+			stuck.push_back(it.first);
+	}
+	for (PeerId id : stuck)
+	{
+		::Msg("! [coop] #%u did not finish loading the world in time, dropping it", id);
+		mgr().session().kick(id, RejectReason::Timeout, "loading the host's world took too long, try to join again");
+	}
+}
+
 void frame()
 {
 	if (mgr().is_host())
 	{
 		host_watch_world();
+		host_watch_joins();
+		return;
+	}
+	// Client: downloading or loading the world must end in time (R-2.3).
+	if ((mgr().phase() == Phase::ReceivingWorld || mgr().phase() == Phase::LoadingWorld) && g.receive_started &&
+	    mgr().now_ms() - g.receive_started > kJoinTimeoutMs)
+	{
+		::Msg("! [coop] joining the host's world took too long");
+		mgr().stop("joining the host's world took too long");
 		return;
 	}
 	if (mgr().phase() != Phase::LoadingWorld || !g.swap_done)

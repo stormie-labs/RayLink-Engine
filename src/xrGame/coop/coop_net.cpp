@@ -16,6 +16,8 @@ struct Queued
 };
 xr_map<PeerId, xr_vector<Queued>> g_queues;
 u64 g_queued_total = 0;
+constexpr size_t kMaxQueued = 50000; // a peer that never finishes loading must not eat the host's memory
+xr_set<PeerId> g_overflow;
 
 void queue(PeerId to, Msg type, const Writer& payload, Lane lane)
 {
@@ -25,7 +27,13 @@ void queue(PeerId to, Msg type, const Writer& payload, Lane lane)
 	q.type = type;
 	q.lane = lane;
 	q.payload.assign(payload.data().begin(), payload.data().end());
-	g_queues[to].push_back(std::move(q));
+	xr_vector<Queued>& queue_of_peer = g_queues[to];
+	if (queue_of_peer.size() >= kMaxQueued)
+	{
+		g_overflow.insert(to);
+		return;
+	}
+	queue_of_peer.push_back(std::move(q));
 	++g_queued_total;
 }
 } // namespace
@@ -80,11 +88,18 @@ void host_flush(PeerId to)
 	g_queues.erase(it);
 }
 
-void host_drop(PeerId to) { g_queues.erase(to); }
+void host_drop(PeerId to)
+{
+	g_queues.erase(to);
+	g_overflow.erase(to);
+}
+
+bool host_queue_overflow(PeerId to) { return g_overflow.count(to) != 0; }
 
 void reset()
 {
 	g_queues.clear();
+	g_overflow.clear();
 	g_queued_total = 0;
 }
 } // namespace net

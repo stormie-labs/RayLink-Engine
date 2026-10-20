@@ -27,6 +27,8 @@ void client_send(Msg type, const Writer& payload, Lane lane = Lane::Reliable);
 void host_flush(PeerId to);
 // Host: drop the queue of a client that left.
 void host_drop(PeerId to);
+// Host: the queue of a loading client hit its cap (the client is stuck): it must be kicked.
+bool host_queue_overflow(PeerId to);
 void reset();
 
 // True if this machine is in a live session (host, or client in the world).
