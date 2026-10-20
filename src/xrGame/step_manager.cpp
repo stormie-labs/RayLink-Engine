@@ -9,6 +9,7 @@
 #include "IKLimbsController.h"
 #include "GameObject.h"
 #include "../../xrServerEntities/script_engine.h"
+#include "coop/coop_sound.h" // Anomaly Coop
 
 #ifdef	DEBUG
 BOOL debug_step_info = FALSE;
@@ -190,6 +191,7 @@ void CStepManager::update(bool b_hud_view)
 				if (!material_picked)
 				{
 					mtl_pair = m_object->material().get_current_pair();
+					mtl_pair = coop::sound::step_pair(m_object, mtl_pair); // Anomaly Coop: puppets pick the ground under them
 
 					material_picked = true;
 				}
@@ -217,6 +219,7 @@ void CStepManager::update(bool b_hud_view)
 					{
 						m_step_sound.play_next(mtl_pair, m_object, m_step_info.params.step[i].power, b_hud_view);
 						object->FootStepCallback(m_step_info.params.step[i].power, b_play, is_on_ground(), b_hud_view);
+						coop::sound::on_step(object, mtl_pair, m_step_info.params.step[i].power); // Anomaly Coop: coop_avatar_step
 					}	
 				}
 

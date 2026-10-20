@@ -14,6 +14,9 @@
 #include "coop_alife.h"
 #include "ai/stalker/ai_stalker.h"
 #include "ai/monsters/basemonster/base_monster.h"
+#include "InventoryOwner.h"
+#include "Inventory.h"
+#include "Torch.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "alife_graph_registry.h"
@@ -180,6 +183,57 @@ bool is_creature(CGameObject* obj)
 	return remote::is_puppet_type(obj); // stalkers, monsters, traders (WP1)
 }
 
+// W5 C2.6: the head torch of an NPC is switched by the host's Lua (sr_light spawns/releases it, story effects
+// enable/disable it as an attachment) and AI actions; a puppet runs none of that. Its state rides in the snapshot.
+CTorch* attached_torch(CGameObject* obj)
+{
+	CInventoryOwner* owner = smart_cast<CInventoryOwner*>(obj);
+	if (!owner)
+		return nullptr;
+	for (CAttachableItem* a : owner->attached_objects())
+		if (CTorch* t = a ? smart_cast<CTorch*>(&a->item()) : nullptr)
+			return t;
+	return nullptr;
+}
+
+u8 creature_flags(CGameObject* obj)
+{
+	u8 flags = 0;
+	if (obj->cast_stalker())
+		if (CTorch* t = attached_torch(obj))
+			if (t->torch_active())
+				flags |= CreatureTorchLit;
+	return flags;
+}
+
+// Client: any torch the puppet has, attached first (an item the host keeps detached is still lit by Switch).
+CTorch* puppet_torch(CGameObject* obj)
+{
+	if (CTorch* t = attached_torch(obj))
+		return t;
+	CInventoryOwner* owner = smart_cast<CInventoryOwner*>(obj);
+	if (!owner)
+		return nullptr;
+	for (PIItem item : owner->inventory().m_all)
+		if (CTorch* t = item ? smart_cast<CTorch*>(item) : nullptr)
+			return t;
+	return nullptr;
+}
+
+// True when the puppet shows what the host reported (or there is nothing to show yet: no torch and none wanted).
+bool apply_creature_flags(CGameObject* obj, u8 flags)
+{
+	if (!obj->cast_stalker())
+		return true;
+	const bool lit = (flags & CreatureTorchLit) != 0;
+	CTorch* t = puppet_torch(obj);
+	if (!t)
+		return !lit; // the torch item has not arrived yet (EntitySpawn): try again later
+	if (t->torch_active() != lit)
+		t->Switch(lit);
+	return true;
+}
+
 void host_send_snapshots()
 {
 	const u64 now = mgr().now_ms();
@@ -220,7 +274,7 @@ void host_send_snapshots()
 		w.u8(u8(clampr(alive ? alive->GetfHealth() : 1.f, 0.f, 1.f) * 255.f));
 		AnimState a;
 		capture_anims(obj, a);
-		w.u8(a.count);
+		w.u8(pack_anim_byte(a.count, creature_flags(obj))); // W5 C2.6: torch state in the high nibble
 		for (u8 k = 0; k < a.count; ++k)
 		{
 			w.u32(a.motion[k]);
@@ -244,6 +298,7 @@ struct MirrorSample
 	float yaw = 0.f;
 	float health = 1.f;
 	AnimState anims;
+	u8 flags = 0; // CreatureFlags (W5 C2.6)
 };
 struct MirrorTrack
 {
@@ -252,6 +307,9 @@ struct MirrorTrack
 	bool have_offset = false;
 	u32 last_remote = 0;
 	u32 applied[kMaxPartitions] = {};
+	u8 flags_shown = 0xff; // W5 C2.6: creature flags the puppet shows; 0xff = not applied yet
+	u64 flags_retry = 0; // a failed apply (torch not here yet) is tried again from this time
+	u64 flags_check = 0; // and the shown state is re-checked from time to time (local engine paths may switch it)
 };
 xr_map<u16, MirrorTrack> g_tracks;
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
@@ -593,7 +651,9 @@ void client_on_snapshot(PeerId, Reader& r)
 		s.pos.set(p[0], p[1], p[2]);
 		s.yaw = r.angle16();
 		s.health = float(r.u8()) / 255.f;
-		s.anims.count = _min<u8>(r.u8(), u8(kMaxPartitions));
+		const u8 packed = r.u8();
+		s.anims.count = _min<u8>(anim_count_of(packed), u8(kMaxPartitions));
+		s.flags = creature_flags_of(packed);
 		for (u8 k = 0; k < s.anims.count; ++k)
 		{
 			s.anims.motion[k] = r.u32();
@@ -812,6 +872,22 @@ bool drive_mirror(CGameObject* obj)
 	xform.c.set(s.pos);
 	obj->XFORM().set(xform);
 	remote::set_health(obj, s.health); // WP1: snapshot health (never kills, see remote::on_host_death)
+
+	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
+	MirrorTrack& track = it->second;
+	const u8 want = track.samples.back().flags;
+	const u64 now = mgr().now_ms();
+	if ((want != track.flags_shown && now >= track.flags_retry) || now >= track.flags_check)
+	{
+		track.flags_check = now + 2000;
+		if (apply_creature_flags(obj, want))
+		{
+			track.flags_shown = want;
+			track.flags_retry = 0;
+		}
+		else
+			track.flags_retry = now + 1000;
+	}
 
 	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
 	if (ka)

@@ -41,5 +41,15 @@ void equip_print_status();
 // Called every frame for each avatar object from its UpdateCL (see CAI_Stalker hook):
 // moves the visual to the interpolated state. Returns false if no state yet.
 bool drive_avatar(class CAI_Stalker* avatar);
+
+// --- read-only views of the last state an avatar was driven with (local numbering; W5) ---
+// Movement flags (actor EMoveCommand, low 16 bits as sent); 0 if the avatar was never driven.
+u32 avatar_mstate(u16 avatar_id);
+// View direction of the player (the owner's torso yaw/pitch as CActor keeps them: direction =
+// Fvector().setHP(yaw, -pitch)). False if the avatar was never driven.
+bool avatar_view(u16 avatar_id, float& yaw, float& pitch);
+// coop_equip.cpp: safe mode (weapon lowered) of the player whose avatar is `avatar_id`, as last reported in
+// PlayerEquip; false if not known.
+bool avatar_safemode(u16 avatar_id, bool& lowered);
 } // namespace players
 } // namespace coop

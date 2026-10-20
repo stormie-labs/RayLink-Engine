@@ -58,6 +58,8 @@ CMapLocation::CMapLocation(LPCSTR type, u16 object_id)
 	LoadSpot(spot_type, false);
 
 	DisablePointer();
+	if (spot_type && !strncmp(spot_type, "coop_ally_", 10)) // Anomaly Coop: allies keep their edge pointer
+		EnablePointer();
 
 	EnableSpot();
 	m_cached.m_Position.set(10000, 10000);

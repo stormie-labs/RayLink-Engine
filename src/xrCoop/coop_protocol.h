@@ -12,7 +12,9 @@
 namespace coop
 {
 // Bump on any incompatible change of any message layout.
-constexpr uint32_t kProtocolVersion = 2; // 2: TradeOp Deal, ReqMoney with deal ledger
+// 2: TradeOp Deal, ReqMoney with deal ledger
+// 3: EntitySound (NPC voices on clients); the EntitySnapshot animation-count byte carries creature flags (W5 C2)
+constexpr uint32_t kProtocolVersion = 3;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -84,6 +86,7 @@ enum class Msg : uint16_t
 	EntityState = 0x0129, // generic CSE state update (doors, physics, zones)
 	EntityLocal = 0x012A, // non-ALife child entity (fake missile, rocket): spawn/destroy with a fixed id
 	ItemState = 0x012B, // owned item state (ammo, condition, addons, upgrades, uses) and unload ammo spawn (WP9)
+	EntitySound = 0x012C, // host -> one client, unreliable: sounds of NPCs/monsters within its hearing range (W5 C2)
 
 	// requests (client -> host) and results
 	ReqSpawn = 0x0140, // section, parent, position; host spawns with its id
@@ -216,4 +219,58 @@ struct PeerListEntry
 	std::string nick;
 	uint32_t key_hash = 0; // short hash of the key (never send other players' keys)
 };
+
+// ---------------------------------------------------------------- W5 C2: creature sounds and flags
+
+// One sound a host creature made, as sent to one client (Msg::EntitySound = u8 count, count x NpcSound).
+// Wire: u16 object (host numbering), u8 flags, str path, u16 delay_ms,
+//       [u16 bone]       if flags & Bone   (bone of the creature's visual the sound follows)
+//       [u32 mask]       if flags & Mask   (CSoundPlayer synchro mask: a newer sound of the same object with an
+//                                           overlapping mask cuts the older one, as on the host)
+//       [vec3 offset]    if flags & Offset (position relative to the object's position when it started)
+//       [u8 volume]      if flags & Volume (volume * 100, 0..255)
+// path: file under $game_sounds$, lowercase, no extension ("characters_voice\\human_01\\...").
+struct NpcSound
+{
+	enum Flags : uint8_t
+	{
+		Bone = 1,
+		Mask = 2,
+		Offset = 4,
+		Volume = 8,
+		Follow = 16, // keep the sound on the object (bone) while it plays: AI voices; else stays where it started
+		Known = Bone | Mask | Offset | Volume | Follow,
+	};
+	static constexpr size_t kMaxPath = 200;
+
+	uint16_t object = 0xFFFF;
+	uint8_t flags = 0;
+	std::string path;
+	uint16_t delay_ms = 0;
+	uint16_t bone = 0xFFFF;
+	uint32_t mask = 0;
+	float offset[3] = {0.f, 0.f, 0.f};
+	uint8_t volume = 100;
+
+	void write(Writer& w) const;
+	// False on overrun, unknown flags, an invalid path or a non-finite offset.
+	bool read(Reader& r);
+};
+
+// A relative sound file name a client may open: 1..kMaxPath chars of [a-z0-9_ .-] and '\\', no "..", does not
+// start with a separator, no drive or alias ('$', ':').
+bool sound_path_valid(const std::string& path);
+
+// EntitySnapshot: the byte that holds the animation partition count (0..15) carries creature flags in its high
+// nibble since protocol 3.
+enum CreatureFlags : uint8_t
+{
+	CreatureTorchLit = 1, // the creature's head torch is on
+};
+constexpr uint8_t pack_anim_byte(uint8_t anim_count, uint8_t creature_flags)
+{
+	return uint8_t((anim_count & 0x0F) | ((creature_flags & 0x0F) << 4));
+}
+constexpr uint8_t anim_count_of(uint8_t packed) { return uint8_t(packed & 0x0F); }
+constexpr uint8_t creature_flags_of(uint8_t packed) { return uint8_t(packed >> 4); }
 } // namespace coop

@@ -20,6 +20,7 @@
 #include "profiler.h"
 #include "sound_collection_storage.h"
 #include "object_broker.h"
+#include "coop/coop_sound.h" // Anomaly Coop
 
 
 CSoundPlayer::CSoundPlayer(CObject* object)
@@ -173,6 +174,7 @@ bool CSoundPlayer::need_bone_data() const
 void CSoundPlayer::play(u32 internal_type, u32 max_start_time, u32 min_start_time, u32 max_stop_time, u32 min_stop_time,
                         u32 id)
 {
+	if (coop::sound::player_sound_blocked(m_object)) return; // Anomaly Coop: host creature sounds come from the host
 	if (!check_sound_legacy(internal_type))
 		return;
 
@@ -240,6 +242,7 @@ void CSoundPlayer::play(u32 internal_type, u32 max_start_time, u32 min_start_tim
 	sound_single.m_stop_time = sound_single.m_start_time + iFloor(sound_single.m_sound->get_length_sec() * 1000.0f) +
 		random_time;
 	m_playing_sounds.push_back(sound_single);
+	coop::sound::on_player_sound(m_object, *sound_single.m_sound, sound_single.m_bone_id, sound.m_synchro_mask, sound_single.m_start_time); // Anomaly Coop
 	string256 name;
 	xr_sprintf(name, "%s%s%i", *sound.m_sound_player_prefix, *sound.m_sound_prefix, (random_id + 1));
 	//Msg("Sound name \"%s\"", name);

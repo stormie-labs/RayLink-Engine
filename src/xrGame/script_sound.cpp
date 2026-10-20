@@ -12,6 +12,7 @@
 #include "gameobject.h"
 #include "ai_space.h"
 #include "script_engine.h"
+#include "coop/coop_sound.h" // Anomaly Coop
 
 // { volume_mult = number } from a sound hook's return. 1.0 (vanilla) when nil, not a table, or not a number.
 static float ambient_hook_volume_mult(const ::luabind::object& output)
@@ -92,6 +93,7 @@ void CScriptSound::Play(CScriptGameObject* object, float delay, int flags)
 	m_sound.play((object) ? &object->object() : NULL, flags, delay);
 	if (volume_mult < 1.0f)
 		m_sound.set_volume(volume_mult);
+	if (object) coop::sound::on_script_sound(&object->object(), m_sound, nullptr, flags, delay, volume_mult); // Anomaly Coop
 }
 
 void CScriptSound::PlayAtPos(CScriptGameObject* object, const Fvector& position, float delay, int flags)
@@ -104,6 +106,7 @@ void CScriptSound::PlayAtPos(CScriptGameObject* object, const Fvector& position,
 	m_sound.play_at_pos((object) ? &object->object() : NULL, position, flags, delay);
 	if (volume_mult < 1.0f)
 		m_sound.set_volume(volume_mult);
+	if (object) coop::sound::on_script_sound(&object->object(), m_sound, &position, flags, delay, volume_mult); // Anomaly Coop
 }
 
 void CScriptSound::PlayNoFeedback(CScriptGameObject* object, u32 flags/*!< Looping */, float delay/*!< Delay */,
@@ -115,4 +118,5 @@ void CScriptSound::PlayNoFeedback(CScriptGameObject* object, u32 flags/*!< Loopi
 		return;
 	vol *= volume_mult;
 	m_sound.play_no_feedback((object) ? &object->object() : NULL, flags, delay, &pos, &vol, &freq);
+	if (object) coop::sound::on_script_sound(&object->object(), m_sound, &pos, flags, delay, vol); // Anomaly Coop
 }

@@ -7,10 +7,13 @@
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_items.h"
+#include "coop_sound.h"
+#include "coop_requests.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
 #include "../../xrEngine/GameFont.h"
+#include "../../xrEngine/GameMtlLib.h"
 #include "../xrServerEntities/ai_sounds.h"
 #include "Level.h"
 #include "Level_Bullet_Manager.h"
@@ -126,6 +129,35 @@ struct Tag
 	u32 color = 0xffffffff;
 };
 xr_vector<Tag> g_tags;
+
+// W5 C2.3: a tag behind static geometry is hidden; one ray per tag every ~150-200 ms.
+constexpr u32 kOcclusionCheckMs = 150;
+constexpr u32 kOcclusionStaggerMs = 10; // + (id % 6) * 10: tags do not all cast in the same frame
+constexpr u32 kOcclusionMaxHits = 4; // see-through surfaces skipped before giving up
+struct Sight
+{
+	bool hidden = false;
+	u64 next = 0;
+};
+xr_map<u16, Sight> g_sight; // by local id of the player character
+
+// W5: shared player palette (W6 "allies UI", system.ltx section [coop_player_colors] in mod_system_coop.ltx):
+// color_0..color_7 = "r,g,b", slot = the player's session peer id % 8 (host 0); optional slot_rule = order (index
+// among the session's players sorted by peer id); down / dead = colors of a wounded / dead player. Read once per
+// session; without the section (or a key) the tags keep their old colors.
+constexpr u32 kTagDefaultRgb = 0xc8f0c8;
+constexpr u32 kTagDownRgb = 0xff9a3c;
+constexpr u32 kTagDeadRgb = 0xa0a0a0;
+constexpr u32 kPaletteSize = 8;
+struct Palette
+{
+	bool loaded = false;
+	bool by_order = false;
+	bool have[kPaletteSize] = {};
+	u32 rgb[kPaletteSize] = {};
+	u32 down = kTagDownRgb;
+	u32 dead = kTagDeadRgb;
+} g_palette;
 
 struct Stats
 {
@@ -373,16 +405,116 @@ void poll_reload()
 
 // ---------------------------------------------------------------- name tags
 
+void load_palette()
+{
+	if (g_palette.loaded)
+		return;
+	g_palette = Palette();
+	g_palette.loaded = true;
+	LPCSTR sect = "coop_player_colors";
+	if (!pSettings->section_exist(sect))
+		return;
+	if (pSettings->line_exist(sect, "slot_rule"))
+	{
+		LPCSTR rule = pSettings->r_string(sect, "slot_rule");
+		g_palette.by_order = rule && (!xr_strcmp(rule, "order") || !xr_strcmp(rule, "join_order") ||
+		    !xr_strcmp(rule, "index"));
+	}
+	auto read = [sect](LPCSTR key, u32& out)
+	{
+		if (!pSettings->line_exist(sect, key))
+			return false;
+		int r = -1, g = -1, b = -1;
+		if (sscanf(pSettings->r_string(sect, key), "%d , %d , %d", &r, &g, &b) != 3 || r < 0 || r > 255 || g < 0 ||
+		    g > 255 || b < 0 || b > 255)
+		{
+			::Msg("! [coop] [coop_player_colors] %s is not \"r,g,b\" (0..255): ignored", key);
+			return false;
+		}
+		out = (u32(r) << 16) | (u32(g) << 8) | u32(b);
+		return true;
+	};
+	for (u32 i = 0; i < kPaletteSize; ++i)
+	{
+		string32 key;
+		xr_sprintf(key, "color_%u", i);
+		g_palette.have[i] = read(key, g_palette.rgb[i]);
+	}
+	read("down", g_palette.down);
+	read("dead", g_palette.dead);
+}
+
+// Color of the player with `peer`; `all` = every player of the session (self included), for slot_rule = order.
+u32 player_rgb(PeerId peer, const xr_vector<survival::PlayerRef>& all)
+{
+	load_palette();
+	if (peer == kInvalidPeer)
+		return kTagDefaultRgb;
+	u32 slot = peer;
+	if (g_palette.by_order)
+	{
+		slot = 0;
+		for (const survival::PlayerRef& p : all)
+			if (p.peer != kInvalidPeer && p.peer < peer)
+				++slot;
+	}
+	slot %= kPaletteSize;
+	return g_palette.have[slot] ? g_palette.rgb[slot] : kTagDefaultRgb;
+}
+
+// True if static geometry that blocks sight is between the camera and `to`. Glass, nets, foliage and other
+// passable or see-through materials do not count.
+bool occluded(const Fvector& from, const Fvector& to)
+{
+	Fvector dir;
+	dir.sub(to, from);
+	float range = dir.magnitude();
+	if (range < 1.f)
+		return false;
+	dir.div(range);
+	Fvector start = from;
+	for (u32 i = 0; i < kOcclusionMaxHits; ++i)
+	{
+		collide::rq_result R;
+		if (!Level().ObjectSpace.RayPick(start, dir, range, collide::rqtStatic, R, nullptr) || R.O || R.element < 0)
+			return false;
+		const CDB::TRI* tri = Level().ObjectSpace.GetStaticTris() + R.element;
+		const SGameMtl* mtl = GMLib.GetMaterialByIdx(u16(tri->material));
+		if (!mtl || !mtl->Flags.test(SGameMtl::flPassable | SGameMtl::flTransparent | SGameMtl::flShootable))
+			return true;
+		const float step = R.range + 0.05f;
+		start.mad(dir, step);
+		range -= step;
+		if (range <= 0.f)
+			return false;
+	}
+	return true; // a stack of see-through layers: treat as a wall
+}
+
+bool tag_hidden(u16 id, const Fvector& from, const Fvector& to)
+{
+	const u64 now = mgr().now_ms();
+	Sight& s = g_sight[id];
+	if (now >= s.next)
+	{
+		s.hidden = occluded(from, to);
+		s.next = now + kOcclusionCheckMs + (id % 6) * kOcclusionStaggerMs;
+	}
+	return s.hidden;
+}
+
 void build_tags()
 {
 	g_tags.clear();
 	if (!g_nametags)
 		return;
 	xr_vector<survival::PlayerRef> players;
-	survival::collect_players(players, false);
+	survival::collect_players(players, true); // self too: slot_rule = order counts every player
 	const Fvector& cam = Device.vCameraPosition;
 	for (const survival::PlayerRef& p : players)
 	{
+		if (p.self)
+			continue;
 		CGameObject* o = object_here(p.local_id);
 		if (!o || !o->getVisible())
 			continue;
@@ -393,6 +525,9 @@ void build_tags()
 		const float dist = cam.distance_to(tag.pos);
 		if (dist > kTagRange)
 			continue;
+		const bool behind_wall = tag_hidden(p.local_id, cam, tag.pos);
+		if (behind_wall && life != survival::Life::Wounded)
+			continue; // a downed player stays findable through walls (revive), dimmed
 		string256 text;
 		xr_strcpy(text, p.nick.c_str());
 		if (g_nametags_dist)
@@ -401,7 +536,7 @@ void build_tags()
 			xr_sprintf(d, "  %.0f m", dist);
 			xr_strcat(text, d);
 		}
-		u32 rgb = 0xc8f0c8;
+		u32 rgb = player_rgb(p.peer, players);
 		switch (life)
 		{
 		case survival::Life::Wounded:
@@ -409,18 +544,18 @@ void build_tags()
 			string64 s;
 			xr_sprintf(s, "  [DOWN %u s]", (survival::bleed_left_ms(p.local_id) + 999) / 1000);
 			xr_strcat(text, s);
-			rgb = 0xff9a3c;
+			rgb = g_palette.down;
 			break;
 		}
 		case survival::Life::Dead:
 		case survival::Life::Spectating:
 		case survival::Life::Respawning:
 			xr_strcat(text, "  [DEAD]");
-			rgb = 0xa0a0a0;
+			rgb = g_palette.dead;
 			break;
 		default: break;
 		}
-		const u32 alpha = dist > 100.f ? 0x90 : 0xf0;
+		const u32 alpha = behind_wall ? 0x70 : dist > 100.f ? 0x90 : 0xf0;
 		tag.color = (alpha << 24) | rgb;
 		tag.text = text;
 		g_tags.push_back(tag);
@@ -461,12 +596,15 @@ void install(Session& s)
 {
 	s.on(Msg::PlayerShot, &on_shot_msg);
 	items::set_weapon_fired_handler(&on_weapon_shot);
+	sound::install(s); // W5 C2: NPC sounds and avatar steps ride on presence (no own line in coop_sync)
 }
 
 void register_console()
 {
 	CMD4(CCC_Integer, "coop_nametags", &g_nametags, 0, 1);
 	CMD4(CCC_Integer, "coop_nametags_dist", &g_nametags_dist, 0, 1);
+	sound::register_console();
+	requests::register_console(); // W5 C2.1 (coop_client_hit_perks)
 }
 
 void reset()
@@ -478,14 +616,19 @@ void reset()
 	g_reload_weapon = 0xffff;
 	g_reload_state = 0;
 	g_tags.clear();
+	g_sight.clear();
+	g_palette = Palette(); // re-read: the next session may run with another mod list
 	xr_delete(g_cache);
+	sound::reset();
 }
 
 void frame()
 {
+	sound::frame();
 	if (!g_pGameLevel || !live())
 	{
 		g_tags.clear();
+		g_sight.clear();
 		return;
 	}
 	send_pending();
@@ -499,6 +642,7 @@ void print_status()
 	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s",
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
 	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off");
+	sound::print_status();
 }
 
 void render_hud()

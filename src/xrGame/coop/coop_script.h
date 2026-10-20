@@ -24,6 +24,16 @@
 //   coop.host(port) / coop.connect("ip[:port]") -> true | false, reason      coop.disconnect() -> bool
 //   coop.host_when_ready(port | nil)  host as soon as the next world is loaded (save, last save, new game);
 //     nil or 0 cancels. Kept by a frame pump that also runs in the main menu.
+//
+// Glue for the W4 scripts (W5 C1):
+//   coop.spot_is_local(type) -> bool            map spot type never replicated (engine-local, prefix "coop_")
+//   coop.story_hold_infos(on) -> bool           client: infos given while on stay on this machine (coop_story.h)
+//   coop.story_local_task(id[, on=true]) -> bool  personal engine task, never routed to / mirrored from the host
+//   coop.life_of(local_id) -> "alive"|"wounded"|"dead"|"spectating"|"respawning"   (0 = me; nil if no session)
+//   coop.bleed_left(local_id) -> ms             bleed-out left of a wounded player, 0 otherwise
+//   coop.player_safemode(peer) -> bool | nil    weapon lowered (Anomaly safe mode); nil if not known yet
+// Engine callbacks fired from frame(): coop_main.on_transition_vote(nick) (host), SendScriptCallback
+// "coop_actor_revived" (reviver_peer, medkit_section) and "coop_on_container_opened" (peer, container_id).
 #pragma once
 
 #include <cstdint>
@@ -62,6 +72,15 @@ void note_start_failed(const char* why);
 void note_user_stop();
 // The session ended (Manager::stop, transport lost). Main thread. Keeps the reason for the menu.
 void on_session_end(const char* reason);
+
+// --- engine events for Lua (W5). Called on the main thread; queued, delivered by frame() in game. ---
+// Host: a client stands at a level exit -> coop_main.on_transition_vote(nick).
+void on_transition_vote(const char* nick);
+// This machine's player was revived -> SendScriptCallback("coop_actor_revived", reviver_peer, medkit_section)
+// (peer id: 0 = host; section nil if unknown).
+void on_actor_revived(uint32_t reviver_peer, const char* medkit_section);
+// Host: a client opened a box or a corpse -> SendScriptCallback("coop_on_container_opened", peer, container_id).
+void on_container_opened(uint32_t peer, u16 container_id);
 } // namespace script
 
 // "1.2.3.4:5678" / "1.2.3.4" / "[::1]:5678" -> address + port (kDefaultPort if none). coop_console.cpp.

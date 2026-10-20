@@ -5,6 +5,7 @@
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_entities.h"
+#include "coop_sound.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -39,6 +40,10 @@ struct Track
 	u32 last_remote_time = 0;
 	u32 applied_legs = 0, applied_torso = 0, applied_head = 0;
 	u64 received = 0, dropped_old = 0;
+	// W5: what the avatar was last driven with (read by coop_sound, coop_equip)
+	bool driven = false;
+	u32 mstate = 0;
+	float view_yaw = 0.f, view_pitch = 0.f;
 };
 
 // Keyed by avatar id in local numbering.
@@ -266,6 +271,14 @@ bool drive_avatar(CAI_Stalker* avatar)
 	xform.rotateY(-s.body_yaw);
 	xform.c.set(s.pos);
 	avatar->XFORM().set(xform);
+	const u32 mstate_before = t.mstate;
+	const bool was_driven = t.driven;
+	t.driven = true;
+	t.mstate = s.mstate;
+	t.view_yaw = s.torso_yaw;
+	t.view_pitch = s.torso_pitch;
+	if (was_driven && mstate_before != s.mstate)
+		sound::on_avatar_move(avatar, mstate_before, s.mstate); // W5 C2.2: jumps and landings
 	if (survival::avatar_pose_override(avatar)) // WP8: wounded / dead pose
 	{
 		t.applied_legs = t.applied_torso = t.applied_head = 0; // replay the owner's motions after standing up
@@ -290,6 +303,22 @@ bool drive_avatar(CAI_Stalker* avatar)
 		play(s.torso, t.applied_torso);
 		play(s.head, t.applied_head);
 	}
+	return true;
+}
+
+u32 avatar_mstate(u16 avatar_id)
+{
+	auto it = g_tracks.find(avatar_id);
+	return it != g_tracks.end() && it->second.driven ? it->second.mstate : 0;
+}
+
+bool avatar_view(u16 avatar_id, float& yaw, float& pitch)
+{
+	auto it = g_tracks.find(avatar_id);
+	if (it == g_tracks.end() || !it->second.driven)
+		return false;
+	yaw = it->second.view_yaw;
+	pitch = it->second.view_pitch;
 	return true;
 }
 

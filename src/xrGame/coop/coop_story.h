@@ -109,6 +109,18 @@ void on_spots_remove_all(u16 id); // before every spot of the object is removed
 // 0xffffffff if no client did (the host's own completion). The host's scripts still run the reward;
 // who receives it is a script-side decision (coop_tasks.script, told through coop_tasks.host_note).
 u32 task_finisher(LPCSTR task_id);
+
+// --- Lua (coop_script.cpp, W5) ---
+// coop.spot_is_local: spot types that never leave this machine (engine-local markers, prefix "coop_").
+bool spot_is_local(LPCSTR type);
+// coop.story_hold_infos (client): while on, info portions this machine's own scripts give apply here only
+// and are not sent to the host (a condlist whose world effect only the host makes keeps its own latch).
+// They stay out of the info hash and survive a resync until the host gives the same info. The hold is
+// dropped every frame (it never outlives the Lua call that set it). False if not a client in a session.
+bool hold_infos(bool on);
+// coop.story_local_task: an engine task with this id is given / finished on this machine only, never
+// routed to the host, mirrored or hashed (addon personal tasks). Kept for the whole process.
+bool set_local_task(LPCSTR id, bool on);
 } // namespace story
 } // namespace coop
 

@@ -318,7 +318,12 @@ void CMapManager::DisableAllPointers()
 	Locations_it it_e = Locations().end();
 
 	for (; it != it_e; ++it)
+	{
+		const LPCSTR t = (*it).location->spot_type;
+		if (t && !strncmp(t, "coop_ally_", 10)) // Anomaly Coop: allies keep their edge pointer (W6)
+			continue;
 		(*it).location->DisablePointer();
+	}
 }
 
 void CMapManager::ReloadSpots()

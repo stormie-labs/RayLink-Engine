@@ -8,6 +8,7 @@
 #include "coop_objects.h"
 #include "coop_alife.h"
 #include "coop_net.h"
+#include "coop_script.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Level.h"
@@ -60,6 +61,7 @@ struct State
 	// host: transition asked by a client (raw M_CHANGE_LEVEL), waiting for coop_accept_transition
 	std::vector<u8> pending_transition;
 	PeerId transition_from = kInvalidPeer;
+	u64 transition_at = 0; // last vote (a repeat within 3 s does not notify Lua again)
 } g;
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
@@ -374,10 +376,15 @@ void host_on_transition_vote(PeerId from, Reader& r)
 		g.pending_transition.clear();
 		return;
 	}
+	const u64 now = mgr().now_ms();
+	const bool repeat = g.transition_from == from && now - g.transition_at < 3000;
 	g.transition_from = from;
+	g.transition_at = now;
 	const PeerInfo* p = mgr().session().peer(from);
 	::Msg("[coop] '%s' stands at a level exit and wants the group to move. Host: coop_accept_transition to go",
 	      p ? p->nick.c_str() : "?");
+	if (!repeat)
+		script::on_transition_vote(p ? p->nick.c_str() : "?"); // the host's Lua (clients get the chat line below)
 	Writer w(128);
 	string256 text;
 	xr_sprintf(text, "%s wants to move the group to the next level", p ? p->nick.c_str() : "a player");

@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_sound.h" />
     <ClInclude Include="coop\coop_objects.h" />
     <ClInclude Include="coop\coop_presence.h" />
     <ClInclude Include="coop\coop_survival.h" />
@@ -2099,6 +2100,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_sound.cpp" />
     <ClCompile Include="coop\coop_objects.cpp" />
     <ClCompile Include="coop\coop_presence.cpp" />
     <ClCompile Include="coop\coop_survival.cpp" />

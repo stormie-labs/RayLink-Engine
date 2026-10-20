@@ -9,6 +9,7 @@
 #include "coop_world.h"
 #include "coop_sync.h"
 #include "coop_requests.h"
+#include "coop_script.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -539,6 +540,15 @@ void host_on_container(PeerId from, Reader& r)
 	OpenView& v = g_open[from];
 	v.kind = kind;
 	v.id = id;
+	if (kind == ContBox || kind == ContCorpse)
+	{
+		// Host Lua (W5, e.g. loot addons): SendScriptCallback("coop_on_container_opened", peer, id).
+		CObject* o = find_object(id);
+		const bool real = o && (kind == ContBox ? smart_cast<CInventoryBox*>(o) != nullptr
+		                                        : (smart_cast<CInventoryOwner*>(o) && !alive(smart_cast<CInventoryOwner*>(o))));
+		if (real && !sync::host_peer_joining(from))
+			script::on_container_opened(from, id);
+	}
 	if (kind == ContTrader)
 	{
 		// The client's copy of the trader's money may be old: send the current one.

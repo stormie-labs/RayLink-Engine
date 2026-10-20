@@ -15,7 +15,7 @@
 //   ReqDrop       u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
 //   ReqTransfer   u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
 //                 flags: 1 = already applied locally (thrown missile, launched rocket), 2 = trade
-//   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit
+//   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit   (power etc. after the client's before-hit Lua, W5)
 //   ReqMoney      u32 seq, u32 money, u32 deals           (the client owns its money, R-6.7; deals = newest
 //                 trade answer already in `money`, the host adds the accepted trades after it: coop_trade.h)
 //   ReqItemEvent  u32 seq, u16 item, u16 ge_type, u16 size, bytes after the GE header
@@ -38,6 +38,12 @@ struct SHit;
 
 // Server option: players can hurt each other (default on, R-5.3). Console var for the lead.
 extern int g_coop_friendly_fire;
+// Client option (W5 C2.1, console coop_client_hit_perks, default on): before a hit of ours on a host creature goes
+// out as ReqHit, the Lua before-hit chain runs here on the puppet (npc_on_before_hit / monster_on_before_hit with
+// this player's belt and skills: PBA, Haru's skills, silent kills...), and the resulting power, impulse, direction
+// and type are sent; a handler that returns false drops the hit. The host runs its own chain as before (its Lua
+// skips the host player's perks for a hit whose draftsman is another player's character) and still checks bounds.
+extern int g_coop_client_hit_perks;
 
 namespace coop
 {
@@ -66,6 +72,7 @@ void install(Session& s);
 void reset();
 void frame();
 void print_status();
+void register_console(); // coop_client_hit_perks (called from coop_presence::register_console, W5)
 
 // --- client: queue requests (any thread; sent from frame() on the main thread) ---
 // Spawn the client game asked its own server for. Forwards it with full state when the parent

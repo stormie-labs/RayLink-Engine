@@ -7,6 +7,9 @@
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_sync.h"
+#include "coop_story.h"
+#include "coop_survival.h"
+#include "coop_players.h" // players::avatar_safemode (coop_equip.cpp)
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -60,6 +63,22 @@ struct ChatLine
 	u64 t_ms = 0;
 };
 
+// Engine facts for Lua (W5), queued by engine code, delivered from frame().
+struct EngineEvent
+{
+	enum Kind : u8
+	{
+		TransitionVote, // coop_main.on_transition_vote(text = nick)
+		ActorRevived, // SendScriptCallback("coop_actor_revived", peer, text = medkit section or nil)
+		ContainerOpened, // SendScriptCallback("coop_on_container_opened", peer, id)
+	} kind = TransitionVote;
+	std::string text;
+	PeerId peer = kInvalidPeer;
+	u16 id = 0xffff;
+	u64 t_ms = 0;
+};
+constexpr size_t kMaxEngineEvents = 64;
+
 struct Stats
 {
 	u64 sent = 0; // events handed to the network (host: per message, not per receiver)
@@ -74,6 +93,7 @@ struct Stats
 	u64 lua_errors = 0; // Lua error inside coop_main.on_event / on_chat / print_status
 	u64 lua_missing = 0; // coop_main or the function is missing
 	u64 chat_delivered = 0;
+	u64 engine_events = 0, engine_delivered = 0, engine_dropped = 0; // W5 engine callbacks
 };
 
 // Host refusal waiting for a dialog (R-1.3, R-1.4). Kept outside Stats: reset() must not drop it.
@@ -124,6 +144,7 @@ Stats g_stats;
 std::deque<Outgoing> g_outbox;
 std::deque<Incoming> g_inbox;
 std::deque<ChatLine> g_chat;
+std::deque<EngineEvent> g_engine;
 Rejection g_reject;
 UiStats g_ui;
 std::map<std::string, std::string> g_stash; // survives reset(): cleared by the pump when the session ends
@@ -248,6 +269,46 @@ template <typename PushArgs>
 bool call_lua(const char* fn, PushArgs push_args)
 {
 	return call_module("coop_main", fn, push_args);
+}
+
+// Protected SendScriptCallback(name, args...) (Anomaly _g.script). A name nobody AddScriptCallback-ed is not
+// fatal there: axr_main.make_callback prints an error with a call stack and returns.
+template <typename PushArgs>
+bool send_script_callback(const char* name, PushArgs push_args)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L)
+		return false;
+	const int top = lua_gettop(L);
+	if (!lua_checkstack(L, 16))
+		return false;
+	lua_pushcfunction(L, &lua_traceback);
+	const int errfunc = lua_gettop(L);
+	lua_getglobal(L, "SendScriptCallback");
+	if (!lua_isfunction(L, -1))
+	{
+		++g_stats.lua_missing;
+		if (log_allowed(g_stats.lua_missing))
+			::Msg("! [coop] lua: SendScriptCallback is missing, '%s' not fired", name);
+		lua_settop(L, top);
+		return false;
+	}
+	lua_pushstring(L, name);
+	const int nargs = 1 + push_args(L);
+	bool ok = true;
+	if (lua_pcall(L, nargs, 0, errfunc) != 0)
+	{
+		ok = false;
+		++g_stats.lua_errors;
+		if (log_allowed(g_stats.lua_errors))
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] lua error in callback %s (#%llu, session continues): %s", name, g_stats.lua_errors,
+			    err ? err : "?");
+		}
+	}
+	lua_settop(L, top);
+	return ok;
 }
 
 // --- network -----------------------------------------------------------------------------------
@@ -415,6 +476,68 @@ void deliver_chat()
 			return 2;
 		}))
 			++g_stats.chat_delivered;
+	}
+}
+
+void push_engine_event(EngineEvent&& e)
+{
+	if (g_engine.size() >= kMaxEngineEvents)
+	{
+		g_engine.pop_front();
+		++g_stats.engine_dropped;
+	}
+	e.t_ms = mgr().now_ms();
+	g_engine.push_back(std::move(e));
+	++g_stats.engine_events;
+}
+
+void deliver_engine()
+{
+	const u64 now = mgr().now_ms();
+	while (!g_engine.empty())
+	{
+		EngineEvent e = std::move(g_engine.front());
+		g_engine.pop_front();
+		if (now - e.t_ms > kStaleMs)
+		{
+			++g_stats.engine_dropped;
+			continue;
+		}
+		bool ok = false;
+		switch (e.kind)
+		{
+		case EngineEvent::TransitionVote:
+			ok = call_lua("on_transition_vote", [&e](lua_State* L)
+			{
+				lua_pushlstring(L, e.text.data(), e.text.size());
+				return 1;
+			});
+			break;
+		case EngineEvent::ActorRevived:
+			ok = send_script_callback("coop_actor_revived", [&e](lua_State* L)
+			{
+				if (e.peer == kInvalidPeer)
+					lua_pushnil(L);
+				else
+					lua_pushnumber(L, lua_Number(e.peer));
+				if (e.text.empty())
+					lua_pushnil(L);
+				else
+					lua_pushlstring(L, e.text.data(), e.text.size());
+				return 2;
+			});
+			break;
+		case EngineEvent::ContainerOpened:
+			ok = send_script_callback("coop_on_container_opened", [&e](lua_State* L)
+			{
+				lua_pushnumber(L, lua_Number(e.peer));
+				lua_pushnumber(L, lua_Number(e.id));
+				return 2;
+			});
+			break;
+		}
+		if (ok)
+			++g_stats.engine_delivered;
 	}
 }
 
@@ -1102,6 +1225,116 @@ int l_disconnect(lua_State* L)
 	return 1;
 }
 
+// --- W5 glue for the W4 scripts ---------------------------------------------------------------
+
+// coop.spot_is_local(type) -> bool
+int l_spot_is_local(lua_State* L)
+{
+	if (lua_type(L, 1) != LUA_TSTRING)
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	lua_pushboolean(L, story::spot_is_local(lua_tostring(L, 1)) ? 1 : 0);
+	return 1;
+}
+
+// coop.story_hold_infos(on) -> bool (false: not a client in the world, nothing is held)
+int l_story_hold_infos(lua_State* L)
+{
+	const int t = lua_type(L, 1);
+	if (t != LUA_TBOOLEAN && t != LUA_TNIL)
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	lua_pushboolean(L, story::hold_infos(lua_toboolean(L, 1) != 0) ? 1 : 0);
+	return 1;
+}
+
+// coop.story_local_task(id[, on = true]) -> bool
+int l_story_local_task(lua_State* L)
+{
+	const int t = lua_type(L, 2);
+	if (lua_type(L, 1) != LUA_TSTRING || (t != LUA_TBOOLEAN && t != LUA_TNIL && t != LUA_TNONE))
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	const bool on = t == LUA_TBOOLEAN ? lua_toboolean(L, 2) != 0 : true;
+	lua_pushboolean(L, story::set_local_task(lua_tostring(L, 1), on) ? 1 : 0);
+	return 1;
+}
+
+bool arg_local_id(lua_State* L, int idx, u16& out)
+{
+	lua_Number v = 0;
+	if (!mgr().active() || !arg_id(L, idx, v) || v >= lua_Number(0xffff))
+		return false;
+	out = u16(v);
+	return true;
+}
+
+// coop.life_of(local_id) -> "alive" | "wounded" | "dead" | "spectating" | "respawning" (0 = me), nil without a session
+int l_life_of(lua_State* L)
+{
+	u16 id = 0;
+	if (!arg_local_id(L, 1, id))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_pushstring(L, survival::life_name(survival::life_of(id)));
+	return 1;
+}
+
+// coop.bleed_left(local_id) -> milliseconds of bleed-out left (0 unless wounded), nil without a session
+int l_bleed_left(lua_State* L)
+{
+	u16 id = 0;
+	if (!arg_local_id(L, 1, id))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_pushnumber(L, lua_Number(survival::bleed_left_ms(id)));
+	return 1;
+}
+} // namespace
+} // namespace script
+
+namespace script
+{
+namespace
+{
+// coop.player_safemode(peer) -> bool (weapon lowered), nil if unknown
+int l_player_safemode(lua_State* L)
+{
+	lua_Number v = 0;
+	if (!mgr().active() || !arg_id(L, 1, v))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const PeerId peer = PeerId(v);
+	if (peer == mgr().self())
+	{
+		CActor* a = g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity()) : nullptr;
+		if (!a)
+			lua_pushnil(L);
+		else
+			lua_pushboolean(L, a->is_safemode() ? 1 : 0);
+		return 1;
+	}
+	bool lowered = false;
+	const u16 avatar = world::avatar_of(peer);
+	if (avatar == 0xffff || !players::avatar_safemode(avatar, lowered))
+		lua_pushnil(L);
+	else
+		lua_pushboolean(L, lowered ? 1 : 0);
+	return 1;
+}
+
 void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -1119,6 +1352,12 @@ void register_raw(lua_State* L)
 		{"host_when_ready", &l_host_when_ready},
 		{"connect", &l_connect},
 		{"disconnect", &l_disconnect},
+		{"spot_is_local", &l_spot_is_local},
+		{"story_hold_infos", &l_story_hold_infos},
+		{"story_local_task", &l_story_local_task},
+		{"life_of", &l_life_of},
+		{"bleed_left", &l_bleed_left},
+		{"player_safemode", &l_player_safemode},
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");
@@ -1145,6 +1384,7 @@ void reset()
 	g_outbox.clear();
 	g_inbox.clear();
 	g_chat.clear();
+	g_engine.clear();
 	g_stats = Stats();
 }
 
@@ -1152,7 +1392,7 @@ void frame()
 {
 	if (!mgr().active())
 	{
-		if (!g_outbox.empty() || !g_inbox.empty() || !g_chat.empty())
+		if (!g_outbox.empty() || !g_inbox.empty() || !g_chat.empty() || !g_engine.empty())
 			reset();
 		return;
 	}
@@ -1161,6 +1401,33 @@ void frame()
 		return;
 	deliver_chat();
 	deliver_inbox();
+	deliver_engine();
+}
+
+void on_transition_vote(const char* nick)
+{
+	EngineEvent e;
+	e.kind = EngineEvent::TransitionVote;
+	e.text = nick && *nick ? nick : "?";
+	push_engine_event(std::move(e));
+}
+
+void on_actor_revived(uint32_t reviver_peer, const char* medkit_section)
+{
+	EngineEvent e;
+	e.kind = EngineEvent::ActorRevived;
+	e.peer = reviver_peer;
+	e.text = medkit_section ? medkit_section : "";
+	push_engine_event(std::move(e));
+}
+
+void on_container_opened(uint32_t peer, u16 container_id)
+{
+	EngineEvent e;
+	e.kind = EngineEvent::ContainerOpened;
+	e.peer = peer;
+	e.id = container_id;
+	push_engine_event(std::move(e));
 }
 
 void on_chat(const char* nick, const char* text)
@@ -1237,6 +1504,8 @@ void print_status()
 	    g_ui.expired, g_reject.pending ? "yes" : "no");
 	::Msg("[coop-lua] menu: port %u, address '%s', host after loading %s, last error [%s] '%s'", u32(g_menu.port),
 	    g_menu.address.c_str(), g_menu.pending ? "pending" : "no", g_menu.last_code.c_str(), g_menu.last_error.c_str());
+	::Msg("[coop-lua] engine callbacks: queued %llu, delivered %llu, dropped %llu, waiting %u", s.engine_events,
+	    s.engine_delivered, s.engine_dropped, (u32)g_engine.size());
 	if (lua_ready())
 	{
 		call_lua("print_status", [](lua_State*) { return 0; });

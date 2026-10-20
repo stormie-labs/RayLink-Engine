@@ -5,6 +5,7 @@
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_net.h"
+#include "coop_script.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -658,7 +659,7 @@ u32 drop_carried_items(CActor* a)
 	return u32(ids.size());
 }
 
-void apply_revive(u16 seq, u16 reviver, float health)
+void apply_revive(u16 seq, u16 reviver, float health, PeerId reviver_peer, const char* medkit)
 {
 	CActor* a = local_actor();
 	if (!a || g_me.life != Life::Wounded || seq != g_me.seq)
@@ -669,6 +670,10 @@ void apply_revive(u16 seq, u16 reviver, float health)
 	++g_stat.revives;
 	stand_up(a, health, false, now());
 	feed("%s revived you.", nick_of(reviver).c_str());
+	if (reviver_peer == kInvalidPeer) // a host without the W5 tail: derive it from the character id
+		reviver_peer = reviver == 0 ? kHostPeer
+			: (mgr().is_host() ? join::peer_of_proxy(reviver) : world::avatar_peer(join::to_local(reviver)));
+	script::on_actor_revived(reviver_peer, medkit); // Lua coop_actor_revived, from the frame queue
 }
 
 void apply_respawn(u16 seq, const Fvector& pos, bool drop)
@@ -746,8 +751,21 @@ void apply_order(u8 op, Reader& r)
 	{
 		const u16 reviver = r.u16();
 		const float health = r.f32();
-		if (r.ok() && _valid(health))
-			apply_revive(seq, reviver, health);
+		if (!r.ok() || !_valid(health))
+			break;
+		PeerId reviver_peer = kInvalidPeer;
+		std::string medkit;
+		if (r.remaining() > 0) // W5 tail; a malformed one does not cancel the revive
+		{
+			const PeerId p = r.u32();
+			std::string s = r.str();
+			if (r.ok() && s.size() <= 128)
+			{
+				reviver_peer = p;
+				medkit = std::move(s);
+			}
+		}
+		apply_revive(seq, reviver, health, reviver_peer, medkit.c_str());
 		break;
 	}
 	case OpRespawn:
@@ -950,12 +968,15 @@ void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u
 	i_obj->DestroyObject(); // the medkit is a world item: only the host removes it, clients follow (P7)
 	h.revive_pending_until = t + kRevivePendingMs;
 	::Msg("[coop] %s revives %s with %s", nick_of(reviver).c_str(), nick_of(target).c_str(), i_obj->cNameSect().c_str());
-	Writer w(16);
+	// W5 tail (readers without it still work): u32 reviver peer, str medkit section -> Lua coop_actor_revived.
+	Writer w(48);
 	w.u8(OpRevive);
 	w.u16(target);
 	w.u16(seq);
 	w.u16(reviver);
 	w.f32(g_rules.revive_health);
+	w.u32(reviver == 0 ? kHostPeer : join::peer_of_proxy(reviver));
+	w.str(i_obj->cNameSect().c_str());
 	host_send_order(target, w);
 }
 

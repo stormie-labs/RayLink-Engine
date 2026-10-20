@@ -2,6 +2,7 @@
 #include "coop_protocol.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 
@@ -74,6 +75,7 @@ const char* msg_name(Msg type)
 	case Msg::StoryHash: return "StoryHash";
 	case Msg::StoryResync: return "StoryResync";
 	case Msg::ItemState: return "ItemState";
+	case Msg::EntitySound: return "EntitySound";
 	case Msg::PlayerRules: return "PlayerRules";
 
 	case Msg::InfoPortion: return "InfoPortion";
@@ -272,5 +274,62 @@ bool RejectMsg::read(Reader& r)
 	if (reason == RejectReason::ContentMismatch && !read_manifest(r, host_manifest))
 		return false;
 	return r.ok();
+}
+// ---------------------------------------------------------------- W5 C2: creature sounds
+
+bool sound_path_valid(const std::string& path)
+{
+	if (path.empty() || path.size() > NpcSound::kMaxPath)
+		return false;
+	if (path[0] == '\\' || path[0] == '.')
+		return false;
+	if (path.find("..") != std::string::npos)
+		return false;
+	for (const char ch : path)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '\\' || c == ' ' ||
+		    c == '.' || c == '-';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+void NpcSound::write(Writer& w) const
+{
+	w.u16(object);
+	w.u8(flags);
+	w.str(path);
+	w.u16(delay_ms);
+	if (flags & Bone)
+		w.u16(bone);
+	if (flags & Mask)
+		w.u32(mask);
+	if (flags & Offset)
+		w.vec3(offset);
+	if (flags & Volume)
+		w.u8(volume);
+}
+
+bool NpcSound::read(Reader& r)
+{
+	object = r.u16();
+	flags = r.u8();
+	path = r.str();
+	delay_ms = r.u16();
+	bone = (flags & Bone) ? r.u16() : uint16_t(0xFFFF);
+	mask = (flags & Mask) ? r.u32() : 0u;
+	if (flags & Offset)
+		r.vec3(offset);
+	else
+		offset[0] = offset[1] = offset[2] = 0.f;
+	volume = (flags & Volume) ? r.u8() : uint8_t(100);
+	if (!r.ok() || (flags & ~uint8_t(Known)) != 0 || !sound_path_valid(path))
+		return false;
+	for (const float v : offset)
+		if (!std::isfinite(v) || std::fabs(v) > 1000.f)
+			return false;
+	return true;
 }
 } // namespace coop

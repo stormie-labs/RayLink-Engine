@@ -3,6 +3,8 @@
 // PlayerEquip (reliable, on change + every 5 s): the owner's visual, item in hands, torch.
 //   Applied to the player's avatar everywhere; on the host the proxy keeps the visual in its
 //   server entity, so the character looks right after a save/load (P4).
+//   W5 tail: handheld flashlight on + its light section (drawn here by our own lights, see HandLight)
+//   and safe mode (weapon lowered, coop.player_safemode).
 // PlayerVitals (reliable, every 2 s, client -> host): health, satiety, radiation, psy, power,
 //   bleeding. The host stores them in the proxy's custom data ([coop] section), i.e. inside the
 //   host save (P4). On join the client restores its actor from there.
@@ -22,6 +24,9 @@
 #include "Inventory.h"
 #include "inventory_item.h"
 #include "Torch.h"
+#include "Flashlight.h"
+#include "../xrEngine/LightAnimLibrary.h"
+#include "../Include/xrRender/Kinematics.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Monsters.h"
@@ -38,28 +43,58 @@ constexpr u32 kEquipCheckMs = 500;
 constexpr u32 kEquipRefreshMs = 5000;
 constexpr u32 kVitalsMs = 2000;
 
+constexpr size_t kMaxLightSection = 64;
+
 struct Equip
 {
 	xr_string visual;
 	u16 active_item = 0xffff; // host numbering
-	bool torch = false;
+	bool torch = false; // head torch (CTorch)
+	// W5 tail: u8 flags (1 hand light, 2 safe mode), str light section. Appended to the old payload:
+	// a sender without it reads as "no hand light, safe mode unknown".
+	bool tail = false;
+	bool hand_light = false; // handheld flashlight (CFlashlight in DETECTOR_SLOT) is on
+	bool safemode = false; // weapon lowered (Anomaly safe mode)
+	xr_string light_section; // the flashlight's light section, as CFlashlight::Load reads it
 
 	bool operator==(const Equip& o) const
 	{
-		return visual == o.visual && active_item == o.active_item && torch == o.torch;
+		return visual == o.visual && active_item == o.active_item && torch == o.torch && tail == o.tail &&
+			hand_light == o.hand_light && safemode == o.safemode && light_section == o.light_section;
 	}
 	void write(Writer& w) const
 	{
 		w.str(visual.c_str());
 		w.u16(active_item);
 		w.boolean(torch);
+		if (!tail)
+			return;
+		w.u8(u8((hand_light ? 1 : 0) | (safemode ? 2 : 0)));
+		w.str(hand_light ? light_section.c_str() : "");
 	}
 	bool read(Reader& r)
 	{
 		visual = r.str().c_str();
 		active_item = r.u16();
 		torch = r.boolean();
-		return r.ok();
+		if (!r.ok())
+			return false;
+		tail = hand_light = safemode = false;
+		light_section.clear();
+		if (r.remaining() > 0)
+		{
+			const u8 flags = r.u8();
+			const std::string sect = r.str();
+			if (r.ok() && sect.size() <= kMaxLightSection)
+			{
+				tail = true;
+				safemode = (flags & 2) != 0;
+				hand_light = (flags & 1) != 0 && !sect.empty();
+				if (hand_light)
+					light_section = sect.c_str();
+			}
+		}
+		return true; // a broken tail does not cost the visual and the item in hands
 	}
 };
 
@@ -92,6 +127,25 @@ bool capture_equip(Equip& e)
 		{
 			e.torch = true;
 			break;
+		}
+	}
+	// W5: the handheld flashlight lights only from our HUD; the others draw it themselves (hand_light_frame).
+	e.tail = true;
+	e.safemode = actor->is_safemode();
+	e.hand_light = false;
+	e.light_section.clear();
+	if (PIItem det = actor->inventory().ItemFromSlot(DETECTOR_SLOT))
+	{
+		CFlashlight* fl = det->cast_flashlight();
+		if (fl && fl->torch_active())
+		{
+			LPCSTR sect = det->object().cNameSect().c_str();
+			LPCSTR light = READ_IF_EXISTS(pSettings, r_string, sect, "light_section", "torch_definition");
+			if (light && *light && xr_strlen(light) <= kMaxLightSection)
+			{
+				e.hand_light = true;
+				e.light_section = light;
+			}
 		}
 	}
 	return true;
@@ -130,6 +184,218 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 
 	g_applied[avatar_id] = e;
 	return true;
+}
+
+// --- handheld flashlight of other players (W5) ---
+// CFlashlight lights only from its owner's HUD (UpdateCL needs a CActor parent and HUD firedeps), so on an
+// avatar it shows nothing. Each machine draws it with its own lights, set up like CFlashlight::net_Spawn from
+// the owner's light section, at the avatar's left hand, pointing where the model faces (the owner's pitch is
+// not available outside coop_players.cpp). Main thread only (equip_frame).
+struct HandLight
+{
+	xr_string section;
+	ref_light spot, omni;
+	ref_glow glow;
+	CLAItem* lanim = nullptr;
+	float brightness = 1.f;
+	const IRenderVisual* visual = nullptr; // `bone` belongs to this visual
+	u16 bone = BI_NONE;
+	bool placed = false;
+	bool dynamic = false; // spot and omni on (the avatar may use dynamic lights)
+};
+// Heap objects: a static map destroyed at process exit must not release render lights after the renderer.
+xr_map<u16, HandLight*> g_lights; // local avatar id -> its hand light
+u32 g_lights_world = 0; // join::world_generation() the lights were made in
+u64 g_lights_made = 0, g_lights_bad = 0;
+
+void destroy_light(HandLight* l)
+{
+	l->spot.destroy();
+	l->omni.destroy();
+	l->glow.destroy();
+	xr_delete(l);
+}
+
+void destroy_lights()
+{
+	for (auto& it : g_lights)
+		destroy_light(it.second);
+	g_lights.clear();
+}
+
+CAI_Stalker* avatar_here(u16 id)
+{
+	if (!g_pGameLevel || id == 0 || id == 0xffff)
+		return nullptr;
+	CAI_Stalker* av = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(id));
+	return av && !av->getDestroy() ? av : nullptr;
+}
+
+// The same keys as CFlashlight::net_Spawn (R2+ variants on R2/R3/R4); every key optional: the section
+// comes from the network.
+HandLight* make_light(const xr_string& section)
+{
+	LPCSTR s = section.c_str();
+	const bool r2 = !!psDeviceFlags.test(rsR2) || !!psDeviceFlags.test(rsR3) || !!psDeviceFlags.test(rsR4);
+	Fcolor white;
+	white.set(1.f, 1.f, 1.f, 1.f);
+	HandLight* l = xr_new<HandLight>();
+	l->section = section;
+	l->spot = ::Render->light_create();
+	l->omni = ::Render->light_create();
+	l->glow = ::Render->glow_create();
+
+	l->lanim = LALib.FindItem(READ_IF_EXISTS(pSettings, r_string, s, "color_animator", ""));
+	const Fcolor clr = READ_IF_EXISTS(pSettings, r_fcolor, s, r2 ? "color_r2" : "color", white);
+	l->brightness = clr.intensity();
+	l->spot->set_type((IRender_Light::LT)(READ_IF_EXISTS(pSettings, r_u8, s, "type", 2)));
+	l->spot->set_color(clr);
+	l->spot->set_range(READ_IF_EXISTS(pSettings, r_float, s, r2 ? "range_r2" : "range", 20.f));
+	l->spot->set_hud_mode(false); // a world light here, never the HUD pass
+	l->spot->set_cone(deg2rad(READ_IF_EXISTS(pSettings, r_float, s, "spot_angle", 60.f)));
+	l->spot->set_texture(READ_IF_EXISTS(pSettings, r_string, s, "spot_texture", (LPCSTR)nullptr));
+	l->spot->set_volumetric(!!READ_IF_EXISTS(pSettings, r_bool, s, "volumetric", FALSE));
+	l->spot->set_volumetric_quality(READ_IF_EXISTS(pSettings, r_float, s, "volumetric_quality", 1.f));
+	l->spot->set_volumetric_intensity(READ_IF_EXISTS(pSettings, r_float, s, "volumetric_intensity", 1.f));
+	l->spot->set_volumetric_distance(READ_IF_EXISTS(pSettings, r_float, s, "volumetric_distance", 1.f));
+	l->spot->set_shadow(true);
+	l->spot->set_is_playerlight(false); // not this machine's player
+
+	l->omni->set_type((IRender_Light::LT)(READ_IF_EXISTS(pSettings, r_u8, s, "omni_type", 1)));
+	l->omni->set_color(READ_IF_EXISTS(pSettings, r_fcolor, s, r2 ? "omni_color_r2" : "omni_color", clr));
+	l->omni->set_range(READ_IF_EXISTS(pSettings, r_float, s, r2 ? "omni_range_r2" : "omni_range", 1.f));
+	l->omni->set_hud_mode(false);
+	l->omni->set_shadow(false);
+	l->omni->set_is_playerlight(false);
+
+	l->glow->set_texture(READ_IF_EXISTS(pSettings, r_string, s, "glow_texture", "glow\\glow_torch_r2"));
+	l->glow->set_color(clr);
+	l->glow->set_radius(READ_IF_EXISTS(pSettings, r_float, s, "glow_radius", 0.2f));
+	++g_lights_made;
+	return l;
+}
+
+void place_light(HandLight* l, CAI_Stalker* av)
+{
+	IKinematics* K = av->Visual() ? smart_cast<IKinematics*>(av->Visual()) : nullptr;
+	if (av->Visual() != l->visual)
+	{
+		l->visual = av->Visual(); // a new visual (GE_CHANGE_VISUAL) has its own bone ids
+		l->bone = BI_NONE;
+		if (K)
+		{
+			l->bone = K->LL_BoneID("bip01_l_hand");
+			if (l->bone == BI_NONE)
+				l->bone = K->LL_BoneID("bip01_head");
+		}
+	}
+	const Fmatrix& X = av->XFORM();
+	Fvector pos;
+	if (K && l->bone != BI_NONE && l->bone < K->LL_BoneCount())
+	{
+		K->CalculateBones(FALSE); // once per frame at most
+		Fmatrix M;
+		M.mul_43(X, K->LL_GetTransform(l->bone));
+		pos = M.c;
+	}
+	else
+	{
+		pos = X.c;
+		pos.y += 1.2f;
+	}
+	Fvector dir = X.k, right = X.i; // model facing (drive_avatar sets it from the owner's body yaw)
+	float view_yaw = 0.f, view_pitch = 0.f;
+	if (avatar_view(av->ID(), view_yaw, view_pitch)) // W5: the beam follows where the player looks
+	{
+		dir.setHP(view_yaw, -view_pitch);
+		right.crossproduct(Fvector().set(0.f, 1.f, 0.f), dir);
+		if (right.square_magnitude() > EPS_S)
+			right.normalize();
+		else
+			right = X.i; // looking straight up or down
+	}
+	pos.mad(dir, 0.1f); // just in front of the hand, not inside the model
+
+	const bool dynamic = av->can_use_dynamic_lights();
+	if (dynamic)
+	{
+		l->spot->set_position(pos);
+		l->spot->set_rotation(dir, right);
+		l->omni->set_position(pos);
+		l->omni->set_rotation(dir, right);
+	}
+	l->glow->set_position(pos);
+	l->glow->set_direction(dir);
+	if (dynamic != l->dynamic || !l->placed)
+	{
+		l->spot->set_active(dynamic); // after the first position: activation registers it where it is
+		l->omni->set_active(dynamic);
+		l->dynamic = dynamic;
+	}
+	if (!l->placed)
+	{
+		l->glow->set_active(true);
+		l->placed = true;
+	}
+
+	if (!l->lanim)
+		return;
+	int frame;
+	const u32 c = l->lanim->CalculateBGR(Device.fTimeGlobal, frame);
+	Fcolor f;
+	f.set(float(color_get_B(c)), float(color_get_G(c)), float(color_get_R(c)), 1.f);
+	f.mul_rgb(l->brightness / 255.f);
+	if (dynamic)
+	{
+		l->spot->set_color(f);
+		l->omni->set_color(f);
+	}
+	l->glow->set_color(f);
+}
+
+// Every frame (main thread): lights follow the avatars, appear and go with the owners' flashlights.
+void hand_light_frame()
+{
+	const u32 world = join::world_generation();
+	if (world != g_lights_world)
+	{
+		destroy_lights(); // a new world: the old avatars and render sectors are gone
+		g_lights_world = world;
+	}
+	for (auto it = g_lights.begin(); it != g_lights.end();)
+	{
+		const auto e = g_applied.find(it->first);
+		if (!avatar_here(it->first) || e == g_applied.end() || !e->second.hand_light ||
+			e->second.light_section != it->second->section)
+		{
+			destroy_light(it->second);
+			it = g_lights.erase(it);
+		}
+		else
+			++it;
+	}
+	if (Device.dwPrecacheFrame)
+		return;
+	for (const auto& it : g_applied)
+	{
+		if (!it.second.hand_light)
+			continue;
+		CAI_Stalker* av = avatar_here(it.first);
+		if (!av)
+			continue;
+		auto l = g_lights.find(it.first);
+		if (l == g_lights.end())
+		{
+			if (!pSettings->section_exist(it.second.light_section.c_str()))
+			{
+				if (++g_lights_bad <= 10)
+					::Msg("! [coop] hand light section '%s' is unknown here (different mods?)", it.second.light_section.c_str());
+				continue;
+			}
+			l = g_lights.emplace(it.first, make_light(it.second.light_section)).first;
+		}
+		place_light(l->second, av);
+	}
 }
 
 void on_equip(PeerId from, Reader& r)
@@ -266,8 +532,15 @@ void client_restore_vitals()
 	if (!at || sscanf(at, "vitals = %f,%f,%f,%f,%f,%f", &v.health, &v.satiety, &v.radiation, &v.psy, &v.power,
 	                  &v.bleeding) != 6)
 	{
-		c.ClearWounds(); // a new character: nothing of the host's state
+		// A new character: nothing of the host's state, fresh values as a new game starts them
+		// (CEntityCondition / CActorCondition::reinit).
+		c.ClearWounds();
 		c.SetRadiation(0.f);
+		c.SetSatiety(1.f);
+		c.SetPsyHealth(1.f);
+		c.SetMaxPower(1.f);
+		c.MaxPower();
+		::Msg("[coop] new character: fresh condition (satiety, psy health, power)");
 		return;
 	}
 	if (v.bleeding <= 0.f)
@@ -291,8 +564,24 @@ void equip_install(Session& s)
 	s.on(Msg::PlayerVitals, &host_on_vitals);
 }
 
+bool avatar_safemode(u16 avatar_id, bool& lowered)
+{
+	auto it = g_applied.find(avatar_id);
+	const Equip* e = it != g_applied.end() ? &it->second : nullptr;
+	if (!e)
+	{
+		auto p = g_pending.find(avatar_id);
+		e = p != g_pending.end() ? &p->second : nullptr;
+	}
+	if (!e || !e->tail)
+		return false; // not reported yet, or a sender without the W5 tail
+	lowered = e->safemode;
+	return true;
+}
+
 void equip_reset()
 {
+	destroy_lights();
 	g_last_sent = Equip();
 	g_pending.clear();
 	g_applied.clear();
@@ -333,6 +622,8 @@ void equip_frame()
 		g_last_vitals = now;
 		client_send_vitals();
 	}
+
+	hand_light_frame();
 }
 
 void equip_resend()
@@ -345,6 +636,9 @@ void equip_print_status()
 {
 	::Msg("[coop]   equipment: %llu out, %llu in, %u pending; vitals: %llu out, %llu in", g_equip_out, g_equip_in,
 	      (u32)g_pending.size(), g_vitals_out, g_vitals_in);
+	::Msg("[coop]   hand lights: %u on, %llu made, %llu unknown sections | my flashlight %s, safe mode %s",
+	      (u32)g_lights.size(), g_lights_made, g_lights_bad, g_last_sent.hand_light ? g_last_sent.light_section.c_str() : "off",
+	      g_last_sent.safemode ? "on" : "off");
 }
 } // namespace players
 } // namespace coop

@@ -261,6 +261,11 @@ xr_vector<Deferred> g_deferred;
 // ------------------------------------------------------------------ info portions
 
 xr_map<std::pair<u8, shared_str>, u64> g_info_requests; // client: (op, id) -> sent at
+// Client (W5): coop.story_hold_infos is on; infos given meanwhile are kept in g_local_infos (this machine
+// only, not hashed, kept by a resync) until the host gives the same info.
+bool g_hold_infos = false;
+xr_set<shared_str> g_local_infos;
+u64 g_infos_held = 0, g_holds_leaked = 0;
 
 KNOWN_INFO_VECTOR* actor_infos()
 {
@@ -276,6 +281,8 @@ DomainHash hash_infos()
 	{
 		for (const shared_str& id : *v)
 		{
+			if (g_local_infos.count(id))
+				continue; // client: held by this machine only (the host does not have it)
 			Fnv f;
 			f.str(id);
 			d.add(f.h);
@@ -289,6 +296,7 @@ void client_apply_info(bool give, const shared_str& id)
 	if (!g_actor || !id.size())
 		return;
 	g_info_requests.erase(std::make_pair(u8(give ? InfoGive : InfoDisable), id));
+	g_local_infos.erase(id); // the host's word: shared from now on
 	Applying guard(Kind::Info, id);
 	if (give)
 		g_actor->OnReceiveInfo(id);
@@ -319,6 +327,8 @@ void client_apply_info_list(Reader& r)
 		host.insert(to_shared(r.str()));
 	if (!r.ok() || !g_actor)
 		return;
+	for (auto it = g_local_infos.begin(); it != g_local_infos.end();)
+		it = host.count(*it) ? g_local_infos.erase(it) : std::next(it); // the host has it now: shared
 	xr_vector<shared_str> drop, add;
 	if (const KNOWN_INFO_VECTOR* v = actor_infos())
 	{
@@ -326,7 +336,7 @@ void client_apply_info_list(Reader& r)
 		for (const shared_str& id : *v)
 			mine.insert(id);
 		for (const shared_str& id : mine)
-			if (!host.count(id))
+			if (!host.count(id) && !g_local_infos.count(id))
 				drop.push_back(id);
 		for (const shared_str& id : host)
 			if (id.size() && !mine.count(id))
@@ -372,6 +382,13 @@ struct TaskRec
 			timer_finish == o.timer_finish;
 	}
 };
+
+// Personal tasks (coop.story_local_task, W5): this machine only. Process lifetime, like addon task ids.
+constexpr size_t kMaxLocalTasks = 1024;
+xr_set<shared_str> g_local_tasks;
+u64 g_local_task_edits = 0; // engine task hooks that let a personal task through locally
+
+bool is_local_task(const shared_str& id) { return id.size() && g_local_tasks.count(id) != 0; }
 
 void capture(const CGameTask* t, TaskRec& r)
 {
@@ -450,7 +467,7 @@ DomainHash hash_tasks()
 	if (!in_game())
 		return d;
 	for (const SGameTaskKey& k : tasks().GetGameTasks())
-		if (k.game_task)
+		if (k.game_task && !is_local_task(k.task_id))
 			d.add(task_item_hash(k.game_task));
 	return d;
 }
@@ -481,7 +498,7 @@ void host_scan_tasks()
 	for (const SGameTaskKey& k : tasks().GetGameTasks())
 	{
 		CGameTask* t = k.game_task;
-		if (!t || !t->m_ID.size())
+		if (!t || !t->m_ID.size() || is_local_task(t->m_ID))
 			continue;
 		TaskRec cur;
 		capture(t, cur);
@@ -524,10 +541,16 @@ void send_task_list(PeerId to)
 	if (!in_game())
 		return;
 	const vGameTasks& v = tasks().GetGameTasks();
+	u32 n = 0;
+	for (const SGameTaskKey& k : v)
+		if (!is_local_task(k.task_id))
+			++n;
 	Writer w(v.size() * 256 + 8);
-	w.u32((u32)v.size());
+	w.u32(n);
 	for (const SGameTaskKey& k : v)
 	{
+		if (is_local_task(k.task_id))
+			continue; // the host's personal task
 		TaskRec r;
 		if (k.game_task)
 			capture(k.game_task, r);
@@ -638,8 +661,8 @@ void host_on_task_give(PeerId from, Reader& r)
 	const u32 timer_ttl = r.u32();
 	TaskRec rec;
 	const bool has_rec = read_task(r, rec);
-	if (!id.size())
-		return;
+	if (!id.size() || is_local_task(id))
+		return; // a personal task of the host is not given out
 	++g_stats.requests_in;
 	CGameTaskManager& m = tasks();
 	if (CGameTask* t = m.HasGameTask(id, true))
@@ -678,7 +701,7 @@ void host_on_task_state(PeerId from, Reader& r)
 	const u64 receive = r.u64();
 	const u8 state = r.u8();
 	const bool explicit_call = r.boolean();
-	if (!r.ok() || !id.size())
+	if (!r.ok() || !id.size() || is_local_task(id))
 		return;
 	++g_stats.requests_in;
 	CGameTask* t = find_task(TaskKey{id, receive});
@@ -844,8 +867,8 @@ void apply_record(TaskRec& rec, bool fresh)
 void client_on_task_upsert(Reader& r)
 {
 	TaskRec rec;
-	if (!read_task(r, rec))
-		return;
+	if (!read_task(r, rec) || is_local_task(rec.id))
+		return; // our personal task id: never mirrored
 	TaskRec& slot = g_client_recs[rec.key()];
 	slot = rec;
 	apply_record(slot, true);
@@ -860,7 +883,7 @@ void client_on_task_list(Reader& r)
 	for (u32 i = 0; i < n && r.ok(); ++i)
 	{
 		TaskRec rec;
-		if (read_task(r, rec))
+		if (read_task(r, rec) && !is_local_task(rec.id))
 			recs.push_back(rec);
 	}
 	if (!r.ok() || !in_game())
@@ -870,7 +893,8 @@ void client_on_task_list(Reader& r)
 		g_client_recs[rec.key()] = rec;
 	xr_vector<CGameTask*> strays;
 	for (const SGameTaskKey& k : tasks().GetGameTasks())
-		if (k.game_task && !g_client_recs.count(TaskKey{k.task_id, k.game_task->m_ReceiveTime}))
+		if (k.game_task && !is_local_task(k.task_id) &&
+			!g_client_recs.count(TaskKey{k.task_id, k.game_task->m_ReceiveTime}))
 			strays.push_back(k.game_task);
 	for (CGameTask* t : strays)
 		detach_task(t);
@@ -1334,12 +1358,13 @@ struct SpotAuthor
 xr_map<SpotKey, SpotAuthor> g_spot_authors; // host: spots placed at a client's request
 xr_map<SpotKey, u64> g_spot_pending; // client: spots sent to the host, not confirmed yet
 
-// Purely local engine spots: own position markers, hit sectors, relation markers, debug.
+// Purely local engine spots: own position markers, hit sectors, relation markers, debug, and every
+// type with the prefix "coop_" (markers the co-op scripts place per machine, e.g. player positions).
 bool spot_type_local(LPCSTR type)
 {
 	static const char* const kLocal[] = {"actor_location", "actor_location_p", "mp_hit_sector_location", "debug_stalker",
 		"deadbody_location", "friend_location", "neutral_location", "enemy_location"};
-	if (!type || !*type)
+	if (!type || !*type || !strncmp(type, "coop_", 5))
 		return true;
 	for (const char* l : kLocal)
 		if (!xr_strcmp(type, l))
@@ -1455,8 +1480,8 @@ void flush_outbox()
 void apply_spot_add(const shared_str& type, u16 host_id, const xr_string& hint, bool ser, PeerId author)
 {
 	const u16 id = local_id_of(host_id);
-	if (!type.size() || id == kNoId)
-		return;
+	if (!type.size() || id == kNoId || spot_type_local(cs(type)))
+		return; // a local type (e.g. "coop_*") is never taken from the network
 	g_spot_pending.erase(SpotKey{type, host_id});
 	Applying guard(Kind::Spot, type, id);
 	CMapLocation* ml = spots().GetMapLocation(type, id);
@@ -2224,6 +2249,8 @@ void reset()
 	g_outbox.clear();
 	g_deferred.clear();
 	g_info_requests.clear();
+	g_hold_infos = false;
+	g_local_infos.clear(); // a new world brings its own infos (personal tasks stay: process lifetime)
 	g_host_sent.clear();
 	g_host_prime = true;
 	g_host_level = nullptr;
@@ -2255,6 +2282,14 @@ void reset()
 void frame()
 {
 	register_commands();
+	if (g_hold_infos)
+	{
+		// coop.story_hold_infos(true) without the matching false (a Lua error between them): never
+		// carry a hold into the next frame. Lua runs synchronously, never across this call.
+		g_hold_infos = false;
+		if (++g_holds_leaked <= 10)
+			::Msg("! [coop] story: info hold left on by a script, released");
+	}
 	if (!mgr().active())
 		return;
 	if (mgr().is_host())
@@ -2309,6 +2344,8 @@ void print_status()
 	    g_stats.resyncs_in, g_stats.deferred);
 	::Msg("[coop] story: player proxies in combat bookkeeping %llu, reputation deltas out %llu in %llu, share rewards %d",
 	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
+	::Msg("[coop] story: held infos %llu (kept here %u, holds left on %llu) | personal tasks %u, local task edits %llu",
+	    g_infos_held, (u32)g_local_infos.size(), g_holds_leaked, (u32)g_local_tasks.size(), g_local_task_edits);
 	for (const auto& it : g_finisher)
 		::Msg("[coop] story:   task '%s' finished at the request of %s", cs(it.first), peer_name(it.second));
 	if (in_game()) // the Lua side of shared tasks (coop_tasks.script, W3c)
@@ -2348,6 +2385,16 @@ bool on_info(const CInventoryOwner* owner, const shared_str& info_id, bool give)
 		++g_stats.derived_dropped;
 		return true;
 	}
+	if (g_hold_infos || g_local_infos.count(info_id))
+	{
+		// Held by a condlist (or one of ours): applied here only, never sent to the host.
+		if (give)
+			g_local_infos.insert(info_id);
+		else
+			g_local_infos.erase(info_id);
+		++g_infos_held;
+		return false;
+	}
 	const auto key = std::make_pair(op, info_id);
 	const u64 now = mgr().now_ms();
 	auto it = g_info_requests.find(key);
@@ -2368,6 +2415,11 @@ bool on_give_task(CGameTask* t, u32 time_to_complete, u32 timer_ttl)
 {
 	if (!t || !t->m_ID.size() || !client_live())
 		return false;
+	if (is_local_task(t->m_ID))
+	{
+		++g_local_task_edits; // personal task: given here, the host never hears of it
+		return false;
+	}
 	if (applying_this(Kind::Task, t->m_ID))
 		return false;
 	if (tasks().HasGameTask(t->m_ID, true))
@@ -2401,6 +2453,11 @@ bool on_task_state(CGameTask* t, int state, bool explicit_call)
 {
 	if (!t || !client_live())
 		return false;
+	if (is_local_task(t->m_ID))
+	{
+		++g_local_task_edits;
+		return false;
+	}
 	if (applying_this(Kind::Task, t->m_ID))
 		return false;
 	if (applying_any())
@@ -2433,6 +2490,8 @@ bool skip_task_check(CGameTask* t)
 		return false;
 	if (!mgr().is_live_client())
 		return true; // still loading the host's world
+	if (is_local_task(t->m_ID))
+		return false; // personal task: its checks run here
 	return g_known.count(TaskKey{t->m_ID, t->m_ReceiveTime}) == 0;
 }
 
@@ -2448,7 +2507,7 @@ bool task_state_silent(CGameTask* t)
 
 bool on_task_map_change(CGameTask* t)
 {
-	if (!t || !mgr().is_live_client())
+	if (!t || !mgr().is_live_client() || is_local_task(t->m_ID))
 		return false;
 	if (applying_this(Kind::Task, t->m_ID))
 		return false;
@@ -2601,6 +2660,45 @@ u32 task_finisher(LPCSTR task_id)
 		return kInvalidPeer;
 	auto it = g_finisher.find(shared_str(task_id));
 	return it == g_finisher.end() ? kInvalidPeer : it->second;
+}
+
+// ------------------------------------------------------------------ Lua (W5)
+
+bool spot_is_local(LPCSTR type) { return spot_type_local(type); }
+
+bool hold_infos(bool on)
+{
+	if (!on)
+	{
+		g_hold_infos = false;
+		return true;
+	}
+	if (!mgr().is_live_client())
+		return false; // the host's infos are the story; a loading client has nothing to hold
+	g_hold_infos = true;
+	return true;
+}
+
+bool set_local_task(LPCSTR id, bool on)
+{
+	if (!id || !*id || xr_strlen(id) > 256)
+		return false;
+	const shared_str key(id);
+	if (!on)
+	{
+		g_local_tasks.erase(key);
+		return true;
+	}
+	if (!g_local_tasks.count(key) && g_local_tasks.size() >= kMaxLocalTasks)
+	{
+		::Msg("! [coop] story: too many personal tasks, '%s' refused", id);
+		return false;
+	}
+	g_local_tasks.insert(key);
+	// A host copy mirrored under this id is not ours to keep in step any more.
+	for (auto it = g_client_recs.begin(); it != g_client_recs.end();)
+		it = it->first.id == key ? g_client_recs.erase(it) : std::next(it);
+	return true;
 }
 } // namespace story
 } // namespace coop

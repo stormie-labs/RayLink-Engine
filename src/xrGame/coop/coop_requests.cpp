@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "pch_script.h"
 #include "coop_requests.h"
 #include "coop_events.h"
 #include "coop_manager.h"
@@ -30,8 +31,16 @@
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "../xrServerEntities/xrMessages.h"
 #include "../Include/xrRender/Kinematics.h"
+#include "../xrEngine/XR_IOConsole.h"
+#include "../xrEngine/xr_ioc_cmd.h"
+#include "ai/monsters/basemonster/base_monster.h"
+#include "script_hit.h"
+#include "script_game_object.h"
+#include "ai_space.h"
+#include "script_engine.h"
 
 int g_coop_friendly_fire = 1;
+int g_coop_client_hit_perks = 1;
 
 namespace coop
 {
@@ -238,6 +247,7 @@ struct ClientCounters
 	u64 sent[16] = {};
 	u64 accepted = 0, rejected = 0, timeouts = 0, not_live = 0, foreign_moves = 0, child_dups = 0, hits_in = 0;
 	u64 lua_forwarded = 0, lua_refused = 0;
+	u64 hits_perked = 0, hits_cancelled = 0, perk_errors = 0; // W5 C2.1
 } g_cl;
 
 void push(Action&& a)
@@ -251,6 +261,80 @@ u32 track(Msg type, u16 item)
 	const u32 seq = ++g_seq;
 	g_inflight[seq] = {type, item, mgr().now_ms()};
 	return seq;
+}
+
+// W5 C2.1: the engine's before-hit Lua entry for the victim's class (as CAI_Stalker::Hit / CBaseMonster::Hit call it).
+LPCSTR before_hit_entry(CGameObject* victim)
+{
+	if (victim->cast_stalker())
+		return "CAI_Stalker__BeforeHitCallback";
+	if (victim->cast_base_monster())
+		return "CBaseMonster__BeforeHitCallback";
+	return nullptr;
+}
+
+// Main thread (client frame). Runs `_G.<entry>(victim, hit, bone)` like the engine does before it applies a hit:
+// the Lua chain (npc_on_before_hit / monster_on_before_hit) may change power, impulse, direction and type, or
+// return false to ignore the hit. Returns false if the hit must not be sent. A missing entry, a missing object or
+// a Lua error leave the hit as it was (logged, never fatal: R-11.4).
+bool client_hit_perks(u16 local_target, SHit& h)
+{
+	if (!g_coop_client_hit_perks || !g_pGameLevel || !g_actor)
+		return true;
+	if (is_player(local_target))
+		return true; // another player: npc_on_before_hit never runs for players (their own actor_on_before_hit does)
+	CGameObject* victim = valid_go(local_target);
+	CEntityAlive* alive = victim ? victim->cast_entity_alive() : nullptr;
+	if (!alive || !alive->g_Alive())
+		return true;
+	LPCSTR entry = before_hit_entry(victim);
+	CGameObject* who = valid_go(h.whoID); // our actor or an item of ours (local numbering)
+	lua_State* L = entry && who ? ai().script_engine().lua() : nullptr;
+	if (!L || !lua_checkstack(L, 8))
+		return true;
+	SHit probe = h;
+	probe.who = who;
+	CScriptHit lua_hit(&probe);
+	const int top = lua_gettop(L);
+	lua_getglobal(L, entry);
+	if (!lua_isfunction(L, -1))
+	{
+		lua_settop(L, top);
+		return true;
+	}
+	::luabind::object(L, victim->lua_game_object()).pushvalue();
+	::luabind::object(L, &lua_hit).pushvalue();
+	lua_pushnumber(L, lua_Number(h.boneID));
+	if (lua_pcall(L, 3, 1, 0) != 0)
+	{
+		++g_cl.perk_errors;
+		if (log_allowed())
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] lua error in %s for our hit on %u (sent unchanged): %s", entry, local_target, err ? err : "?");
+		}
+		lua_settop(L, top);
+		return true;
+	}
+	const bool keep = lua_toboolean(L, -1) != 0;
+	lua_settop(L, top);
+	if (!keep)
+	{
+		++g_cl.hits_cancelled;
+		return false;
+	}
+	// What SHit::ApplyScriptHit copies, minus the attribution: the host decides who and with what (its proxy and
+	// an item of the proxy), so a script that renames the draftsman cannot blame someone else.
+	if (_valid(lua_hit.m_fPower) && lua_hit.m_fPower >= 0.f)
+		h.power = lua_hit.m_fPower;
+	if (_valid(lua_hit.m_fImpulse))
+		h.impulse = lua_hit.m_fImpulse;
+	if (_valid(lua_hit.m_tDirection) && lua_hit.m_tDirection.square_magnitude() > EPS_S)
+		h.dir = lua_hit.m_tDirection;
+	if (lua_hit.m_tHitType >= int(ALife::eHitTypeBurn) && lua_hit.m_tHitType < int(ALife::eHitTypeMax))
+		h.hit_type = ALife::EHitType(lua_hit.m_tHitType);
+	++g_cl.hits_perked;
+	return true;
 }
 
 void send_action(const Action& a)
@@ -308,13 +392,16 @@ void send_action(const Action& a)
 	}
 	case Act::Hit:
 	{
+		SHit hit = a.hit;
+		if (!client_hit_perks(a.item, hit)) // W5 C2.1: our perks and skills, before the host sees the hit
+			break;
 		Writer w(64);
 		w.u32(++g_seq); // the host answers hits only when it refuses them
 		w.u16(to_host_id(a.item));
 		const Fvector me = Actor() ? Actor()->Position() : Fvector().set(0.f, 0.f, 0.f);
 		const float p[3] = {me.x, me.y, me.z};
 		w.vec3(p);
-		write_hit(w, a.hit, to_host_id(a.hit.whoID), to_host_id(a.hit.weaponID));
+		write_hit(w, hit, to_host_id(hit.whoID), to_host_id(hit.weaponID));
 		net::client_send(Msg::ReqHit, w);
 		++g_cl.sent[4];
 		break;
@@ -1144,6 +1231,11 @@ void frame()
 	client_flush();
 }
 
+void register_console()
+{
+	CMD4(CCC_Integer, "coop_client_hit_perks", &g_coop_client_hit_perks, 0, 1);
+}
+
 void print_status()
 {
 	if (mgr().is_host())
@@ -1166,6 +1258,8 @@ void print_status()
 	    g_cl.sent[0], g_cl.sent[1], g_cl.sent[2], g_cl.sent[3], g_cl.sent[4], g_cl.sent[5], g_cl.sent[6],
 	    g_cl.accepted, g_cl.rejected, g_cl.timeouts, (u32)g_inflight.size(), g_cl.not_live, g_cl.foreign_moves,
 	    g_cl.child_dups, g_cl.lua_forwarded, g_cl.lua_refused, g_cl.hits_in);
+	::Msg("[coop]   hit perks (%s): %llu hits through the before-hit Lua, %llu dropped by it, %llu lua errors",
+	    g_coop_client_hit_perks ? "on" : "off", g_cl.hits_perked, g_cl.hits_cancelled, g_cl.perk_errors);
 }
 
 // ---------------------------------------------------------------- client API
