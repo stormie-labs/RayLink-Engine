@@ -634,7 +634,9 @@ bool CLocatorAPI::Recurse(const char* path)
 		{
 			xr_strcpy(fullPath, sizeof(fullPath), path);
 			xr_strcat(fullPath, findData.name);
-			ignore = ignore_name(findData.name) || ignore_path(fullPath);
+			// Anomaly Coop: ignore_path opens with CreateFile without FILE_FLAG_BACKUP_SEMANTICS, which always
+			// fails for a directory, so a checked rescan (Lua file_list_open_ex) dropped every subfolder
+			ignore = ignore_name(findData.name) || (!(findData.attrib & _A_SUBDIR) && ignore_path(fullPath));
 		}
 		else
 		{
