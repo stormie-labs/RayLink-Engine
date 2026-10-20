@@ -59,6 +59,7 @@ public:
 private:
 	Manager();
 	void install_session_callbacks();
+	void autostart();
 	SessionConfig make_config(u16 port);
 
 	Session m_session;
@@ -75,6 +76,9 @@ inline Manager& mgr() { return Manager::get(); }
 void register_console_commands();
 // Engine hook, see CGamePersistent::OnFrame.
 void on_frame();
+// Engine hook: skip the "press any key" screen after a level load (a joining client, or an
+// instance started with -coop_host / -coop_connect for automated tests).
+bool skip_keypress_on_load();
 } // namespace coop
 
 // Player nick shown to others (console var coop_nick, saved in user.ltx).

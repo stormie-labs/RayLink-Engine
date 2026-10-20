@@ -3,6 +3,7 @@
 
 #include "coop_join.h"
 #include "coop_sync.h"
+#include "coop_script.h"
 
 #include <cstdio>
 
@@ -13,6 +14,43 @@ namespace coop
 namespace
 {
 void log_line(const char* line) { ::Msg("%s", line); }
+
+// "-key value" from the command line; false if absent. Value is empty if the key has none.
+bool cmd_param(LPCSTR key, xr_string& value)
+{
+	const char* p = Core.Params ? strstr(Core.Params, key) : nullptr;
+	if (!p)
+		return false;
+	p += xr_strlen(key);
+	if (*p && *p != ' ')
+		return false; // a longer key with the same prefix
+	while (*p == ' ')
+		++p;
+	value.clear();
+	if (*p == '-')
+		return true;
+	while (*p && *p != ' ')
+		value.push_back(*p++);
+	return true;
+}
+
+// Test automation without input devices (P8): flags make an instance host, connect,
+// dump its status and take screenshots on its own.
+struct AutoStart
+{
+	bool parsed = false;
+	bool host = false;
+	u16 host_port = kDefaultPort;
+	bool host_done = false;
+	xr_string connect;
+	u64 next_connect = 0;
+	u32 connect_tries = 0;
+	bool welcomed = false;
+	u32 status_every_s = 0;
+	u64 next_status = 0;
+	u32 shots_every_s = 0;
+	u64 next_shot = 0;
+} g_auto;
 
 u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
 {
@@ -216,7 +254,9 @@ void Manager::install_session_callbacks()
 	m_session.on_chat = [](PeerId from, const std::string& text)
 	{
 		const PeerInfo* p = mgr().session().peer(from);
-		::Msg("[coop] <%s> %s", p ? p->nick.c_str() : (from == kHostPeer ? "host" : "?"), text.c_str());
+		const char* who = p ? p->nick.c_str() : (from == kHostPeer ? "host" : "?");
+		::Msg("[coop] <%s> %s", who, text.c_str());
+		script::on_chat(who, text.c_str()); // HUD line (coop_main.on_chat)
 	};
 	m_session.on_blob_progress = [](PeerId from, u32 id, u32 kind, u64 done, u64 total)
 	{
@@ -290,6 +330,7 @@ void Manager::send_chat(const char* text)
 	}
 	m_session.send_chat(text);
 	::Msg("[coop] <%s> %s", nick(), text);
+	script::on_chat(nick(), text); // our own line in the HUD too
 }
 
 void Manager::set_netsim(const NetSim& sim)
@@ -301,8 +342,73 @@ void Manager::set_netsim(const NetSim& sim)
 		::Msg("[coop] netsim off");
 }
 
+void Manager::autostart()
+{
+	if (!g_auto.parsed)
+	{
+		g_auto.parsed = true;
+		xr_string v;
+		if (cmd_param("-coop_nick", v) && !v.empty())
+			xr_strcpy(g_coop_nick, v.c_str());
+		if (cmd_param("-coop_host", v))
+		{
+			g_auto.host = true;
+			if (!v.empty())
+				g_auto.host_port = (u16)atoi(v.c_str());
+		}
+		if (cmd_param("-coop_connect", v))
+			g_auto.connect = v;
+		if (cmd_param("-coop_autostatus", v))
+			g_auto.status_every_s = (u32)atoi(v.c_str());
+		if (cmd_param("-coop_shots", v))
+			g_auto.shots_every_s = (u32)atoi(v.c_str());
+		if (g_auto.host || !g_auto.connect.empty())
+			::Msg("[coop] autostart: host=%d port=%u connect='%s' status=%us shots=%us", g_auto.host, g_auto.host_port,
+			      g_auto.connect.c_str(), g_auto.status_every_s, g_auto.shots_every_s);
+	}
+	const u64 now = now_ms();
+	const bool level_ready = g_pGameLevel && g_actor && !Device.dwPrecacheFrame && ai().get_alife();
+
+	if (g_auto.host && !g_auto.host_done && !active() && level_ready)
+	{
+		g_auto.host_done = true;
+		start_host(g_auto.host_port);
+	}
+	if (!g_auto.connect.empty() && active() && m_phase != Phase::Connecting)
+		g_auto.welcomed = true;
+	if (!g_auto.connect.empty() && !active() && now >= g_auto.next_connect && g_auto.connect_tries < 120)
+	{
+		// Host not up yet: retry soon. Joined once and failed later: back off, do not hammer the host
+		// (every attempt costs it a world save).
+		g_auto.next_connect = now + (g_auto.welcomed ? 60000 : 5000);
+		++g_auto.connect_tries;
+		xr_string address = g_auto.connect;
+		u16 port = kDefaultPort;
+		const size_t colon = address.rfind(':');
+		if (colon != xr_string::npos)
+		{
+			port = (u16)atoi(address.c_str() + colon + 1);
+			address.erase(colon);
+		}
+		start_client(address.c_str(), port);
+	}
+	if (g_auto.status_every_s && active() && now >= g_auto.next_status)
+	{
+		g_auto.next_status = now + u64(g_auto.status_every_s) * 1000;
+		print_status();
+		if (g_pGameLevel)
+			sync::dump_state("summary");
+	}
+	if (g_auto.shots_every_s && level_ready && now >= g_auto.next_shot)
+	{
+		g_auto.next_shot = now + u64(g_auto.shots_every_s) * 1000;
+		Device.Screenshot();
+	}
+}
+
 void Manager::frame()
 {
+	autostart();
 	if (m_phase == Phase::Off)
 		return;
 	m_session.update(now_ms());
@@ -333,4 +439,11 @@ void Manager::print_status() const
 }
 
 void on_frame() { Manager::get().frame(); }
+
+bool skip_keypress_on_load()
+{
+	if (Manager::get().is_client())
+		return true;
+	return Core.Params && (strstr(Core.Params, "-coop_host") || strstr(Core.Params, "-coop_connect"));
+}
 } // namespace coop

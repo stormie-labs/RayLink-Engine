@@ -11,6 +11,7 @@
 #include "xrServer.h"
 #include "game_object_space.h"
 #include "script_callback_ex.h"
+#include "coop/coop_story.h" // Anomaly Coop
 
 struct FindLocationBySpotID
 {
@@ -127,6 +128,7 @@ CMapLocation* CMapManager::AddMapLocation(const shared_str& spot_type, u16 id)
 	Locations().back().location = l;
 	if (IsGameTypeSingle() && g_actor)
 		Actor()->callback(GameObject::eMapLocationAdded)(spot_type.c_str(), id);
+	coop::story::on_spot_added(spot_type, id); // Anomaly Coop: shared PDA spots
 
 	return l;
 }
@@ -168,6 +170,7 @@ void CMapManager::Destroy(CMapLocation* ml)
 
 void CMapManager::RemoveMapLocation(const shared_str& spot_type, u16 id)
 {
+	coop::story::on_spot_remove(spot_type, id); // Anomaly Coop: shared PDA spots
 	FindLocationBySpotID key(spot_type, id);
 	Locations_it it = std::find_if(Locations().begin(), Locations().end(), key);
 	if (it != Locations().end())
@@ -183,6 +186,7 @@ void CMapManager::RemoveMapLocation(const shared_str& spot_type, u16 id)
 // demonized: remove all map object spots by id
 void CMapManager::RemoveAllMapLocationsById(u16 id)
 {
+	coop::story::on_spots_remove_all(id); // Anomaly Coop: shared PDA spots
 	for (Locations_it it = Locations().begin(); it != Locations().end(); ) {
 		if (it->object_id == id) {
 			if (IsGameTypeSingle())

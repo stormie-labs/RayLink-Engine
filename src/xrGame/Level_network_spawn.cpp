@@ -9,6 +9,7 @@
 #include "client_spawn_manager.h"
 #include "../xrEngine/xr_object.h"
 #include "../xrEngine/IGame_Persistent.h"
+#include "coop/coop_remote.h" // Anomaly Coop
 
 void CLevel::cl_Process_Spawn(NET_Packet& P)
 {
@@ -139,6 +140,7 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 	}
 	else
 	{
+		coop::remote::on_net_spawn(O); // Anomaly Coop: remote-driven creatures become Remote puppets
 
 #ifdef DEBUG_MEMORY_MANAGER
 		mem_alloc_gather_stats	(!!psAI_Flags.test(aiDebugOnFrameAllocs));

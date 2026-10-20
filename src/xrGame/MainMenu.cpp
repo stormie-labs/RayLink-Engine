@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "MainMenu.h"
+#include "coop/coop_manager.h"
 #include "UI/UIDialogWnd.h"
 #include "ui/UIMessageBoxEx.h"
 #include "../xrEngine/xr_IOConsole.h"
@@ -182,7 +183,8 @@ void CMainMenu::Activate(bool bActivate)
 		(m_screenshotFrame == Device.dwFrame + 1))
 		return;
 
-	bool b_is_single = IsGameTypeSingle();
+	// Anomaly Coop: in a session the menu behaves like multiplayer: the world keeps running for everybody
+	bool b_is_single = IsGameTypeSingle() && !coop::mgr().active();
 
 	if (g_dedicated_server && bActivate) return;
 

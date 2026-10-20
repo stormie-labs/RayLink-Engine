@@ -11,6 +11,7 @@
 #include "monster_event_manager.h"
 #include "control_jump.h"
 #include "../../sound_player.h"
+#include "../../coop/coop_remote.h" // Anomaly Coop
 
 // DEBUG purpose only
 char* dbg_action_name_table[] = {
@@ -655,6 +656,7 @@ void CControlAnimationBase::set_animation_speed()
 
 void CControlAnimationBase::check_hit(MotionID motion, float time_perc)
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: no local melee from puppets
 	if (!m_object->EnemyMan.get_enemy()) return;
 	const CEntityAlive* enemy = m_object->EnemyMan.get_enemy();
 

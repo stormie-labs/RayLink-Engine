@@ -6,6 +6,10 @@
 #include "coop_players.h"
 #include "coop_entities.h"
 #include "coop_net.h"
+#include "coop_worldstate.h"
+#include "coop_script.h"
+#include "coop_story.h"
+#include "coop_remote.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -30,12 +34,18 @@ void install(Session& s)
 {
 	players::install(s);
 	entities::install(s);
+	worldstate::install(s);
+	script::install(s);
+	story::install(s);
 }
 
 void on_session_started()
 {
 	players::reset();
 	entities::reset();
+	worldstate::reset();
+	script::reset();
+	story::reset();
 	g_joining.clear();
 }
 
@@ -55,6 +65,9 @@ void reset()
 	entities::reset();
 	world::reset();
 	net::reset();
+	worldstate::reset();
+	script::reset();
+	story::reset();
 	g_joining.clear();
 }
 
@@ -83,6 +96,9 @@ void frame()
 {
 	players::frame();
 	entities::frame();
+	worldstate::frame();
+	script::frame();
+	story::frame();
 }
 
 void print_status()
@@ -90,6 +106,10 @@ void print_status()
 	world::print_status();
 	players::print_status();
 	entities::print_status();
+	remote::print_status();
+	worldstate::print_status();
+	script::print_status();
+	story::print_status();
 }
 
 void dump_state(LPCSTR args)
@@ -99,7 +119,8 @@ void dump_state(LPCSTR args)
 		::Msg("[coop-dump] not in a level");
 		return;
 	}
-	const bool one = args && *args;
+	const bool summary = args && !xr_strcmp(args, "summary");
+	const bool one = args && *args && !summary;
 	const u16 only = one ? u16(atoi(args)) : 0xffff;
 	::Msg("[coop-dump] role %s, game time %s", phase_name(mgr().phase()), *InventoryUtilities::GetGameTimeAsString(InventoryUtilities::etpTimeToMinutes));
 	u32 count = 0;
@@ -109,11 +130,13 @@ void dump_state(LPCSTR args)
 		CGameObject* go = smart_cast<CGameObject*>(o);
 		if (!go || (one && go->ID() != only))
 			continue;
+		++count;
+		if (summary)
+			continue;
 		const u16 host_id = join::to_host(go->ID());
 		const Fvector& p = go->Position();
 		::Msg("[coop-dump] %5u %-32s parent %5u pos [%8.2f %8.2f %8.2f]", host_id, go->cName().c_str(),
 		    go->H_Parent() ? join::to_host(go->H_Parent()->ID()) : 0xffff, p.x, p.y, p.z);
-		++count;
 	}
 	::Msg("[coop-dump] %u online objects (ids in host numbering)", count);
 }

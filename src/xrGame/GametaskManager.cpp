@@ -13,6 +13,7 @@
 #include "ui/UIMapWnd.h"
 #include "..\..\xrEngine\x_ray.h"
 #include "string_table.h"
+#include "coop/coop_story.h" // Anomaly Coop
 
 #pragma warning(push)
 #pragma warning(disable:4995)
@@ -94,6 +95,8 @@ CGameTask* CGameTaskManager::HasGameTask(const shared_str& id, bool only_inproce
 CGameTask* CGameTaskManager::GiveGameTaskToActor(CGameTask* t, u32 timeToComplete, bool bCheckExisting, u32 timer_ttl)
 {
 	t->CommitScriptHelperContents();
+	if (coop::story::on_give_task(t, timeToComplete, timer_ttl)) // Anomaly Coop: a co-op client asks the host instead
+		return NULL;
 	if (/* bCheckExisting &&*/ HasGameTask(t->m_ID, true))
 	{
 		Msg("! task [%s] already inprocess", t->m_ID.c_str());
@@ -134,6 +137,8 @@ CGameTask* CGameTaskManager::GiveGameTaskToActor(CGameTask* t, u32 timeToComplet
 void CGameTaskManager::SetTaskState(CGameTask* t, ETaskState state)
 {
 	PROF_EVENT("CGameTaskManager::SetTaskState");
+	if (coop::story::on_task_state(t, state, false)) // Anomaly Coop: a co-op client asks the host instead
+		return;
 	m_flags.set(eChanged, TRUE);
 
 	t->SetTaskState(state);
@@ -156,6 +161,8 @@ void CGameTaskManager::SetTaskState(const shared_str& id, ETaskState state)
 		Msg("actor does not has task [%s] or it is completed", *id);
 		return;
 	}
+	if (coop::story::on_task_state(t, state, true)) // Anomaly Coop: a co-op client asks the host instead
+		return;
 	SetTaskState(t, state);
 }
 
@@ -184,6 +191,8 @@ void CGameTaskManager::UpdateTasks()
 		{
 			CGameTask* const t = (*I).game_task;
 			if (t->GetTaskState() != eTaskStateInProgress)
+				continue;
+			if (coop::story::skip_task_check(t)) // Anomaly Coop: the host decides tasks this client's scripts do not track
 				continue;
 
 			ETaskState const state = t->UpdateState();

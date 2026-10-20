@@ -13,6 +13,7 @@
 #include "game_object_space.h"
 #include "script_callback_ex.h"
 #include "ai_space.h"
+#include "coop/coop_remote.h" // Anomaly Coop
 
 void CStalkerAnimationManager::script_play_callback(CBlend* blend)
 {
@@ -51,6 +52,7 @@ void CStalkerAnimationManager::script_play_callback(CBlend* blend)
 void CStalkerAnimationManager::add_script_animation(LPCSTR animation, bool hand_usage, Fvector position,
                                                     Fvector rotation, bool local_animation)
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: the host plays it
 	const MotionID& motion = m_skeleton_animated->ID_Cycle_Safe(animation);
 	if (!motion)
 	{
@@ -75,6 +77,7 @@ void CStalkerAnimationManager::add_script_animation(LPCSTR animation, bool hand_
 
 void CStalkerAnimationManager::add_script_animation(LPCSTR animation, bool hand_usage, bool use_movement_controller)
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: the host plays it
 	const MotionID& motion = m_skeleton_animated->ID_Cycle_Safe(animation);
 	if (!motion)
 	{

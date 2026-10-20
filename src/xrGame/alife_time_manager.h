@@ -34,6 +34,9 @@ public:
 	IC float time_factor() const;
 	IC float normal_time_factor() const;
 	IC void change_game_time(u32 value);
+	IC void coop_set_game_time(ALife::_TIME_ID game_time, float time_factor); // Anomaly Coop: follow the host clock
 };
+
+#include "coop/coop_worldstate.h" // Anomaly Coop
 
 #include "alife_time_manager_inline.h"

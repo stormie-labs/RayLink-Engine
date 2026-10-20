@@ -17,6 +17,7 @@
 #include "alife_registry_wrappers.h"
 #include "script_callback_ex.h"
 #include "game_object_space.h"
+#include "coop/coop_story.h" // Anomaly Coop
 
 void CInventoryOwner::OnEvent(NET_Packet& P, u16 type)
 {
@@ -45,6 +46,8 @@ void CInventoryOwner::OnEvent(NET_Packet& P, u16 type)
 bool CInventoryOwner::OnReceiveInfo(shared_str info_id) const
 {
 	VERIFY(info_id.size());
+	if (coop::story::on_info(this, info_id, true)) // Anomaly Coop: a co-op client asks the host instead
+		return false;
 	//добавить запись в реестр
 	KNOWN_INFO_VECTOR& known_info = m_known_info_registry->registry().objects();
 	KNOWN_INFO_VECTOR_IT it = std::find_if(known_info.begin(), known_info.end(), CFindByIDPred(info_id));
@@ -79,6 +82,8 @@ void CInventoryOwner::DumpInfo() const
 void CInventoryOwner::OnDisableInfo(shared_str info_id) const
 {
 	VERIFY(info_id.size());
+	if (coop::story::on_info(this, info_id, false)) // Anomaly Coop: a co-op client asks the host instead
+		return;
 	//удалить запись из реестра
 
 #ifdef DEBUG

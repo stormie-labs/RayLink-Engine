@@ -62,3 +62,12 @@ Project root: `D:\Projects\ForEverything\anomaly-coop` (docs: `DESIGN.md` §10, 
 | WP3 world state | agent | coop_worldstate.*; alife_time_manager*, environment/weather hooks (xrEngine/Environment*.cpp only if unavoidable), game time console |
 | WP4 story & tasks | agent | coop_story.*; GameTaskManager.cpp, GameTask.cpp, Actor_Events / info portion code, relation_registry*.cpp, map_manager.cpp |
 | WP5 Lua & gamedata | agent | coop_script.* (luabind exports), script_engine hooks, `anomaly-coop/gamedata/**` |
+| WP6 dialogs, trade, containers | agent | coop_dialog.*, coop_trade.*; PhraseDialog*.cpp, AI_PhraseDialogManager.cpp, PhraseDialogManager.cpp, ui/UITalkWnd*.cpp, ui/UIActorMenuTrade.cpp, ui/UIActorMenuDeadBodySearch.cpp, ui/UIActorMenu.cpp (open/close hooks only), Trade*.cpp, ai/trader/ai_trader.cpp |
+| WP7 world objects | agent | coop_objects.*; PhysicObject.cpp, BreakableObject.cpp, DestroyablePhysicsObject.cpp, PHDestroyable.cpp, CustomZone.cpp, ZoneCampfire.cpp, Artefact.cpp, artefact_activation.cpp, Explosive.cpp, Missile.cpp, Grenade.cpp, Bolt.cpp, script door / interactable helpers (doors in Anomaly are CPhysicObject + scripts) |
+| WP8 player survival & presentation | agent | coop_survival.*, coop_presence.*; ActorCondition.cpp, HUDManager.cpp, ui/UIHudStatesWnd*.cpp, Spectator.cpp; Actor.cpp hooks are applied by the lead (WP2 owns Actor.cpp now) |
+| WP9 owned item state | agent | coop_items.*; Weapon.cpp, WeaponMagazined.cpp, WeaponMagazinedWGrenade.cpp, WeaponAmmo.cpp, inventory_item.cpp (state/condition only), eatable_item.cpp, ui/UIInvUpgrade.cpp, inventory_upgrade*.cpp |
+
+Notes:
+- `level_script.cpp`: WP2 owns spawn functions, WP3 time/weather functions, WP4 map-spot functions — touch only yours.
+- `Actor.cpp`: WP2 hit section; anything else is requested from the lead.
+- `stalker_animation_script.cpp` belongs to WP1 (stalker animation files).

@@ -66,9 +66,10 @@ enum class Msg : uint16_t
 	PlayerShot = 0x0114, // shot event: weapon, origin, direction
 	PlayerGrenade = 0x0115,
 	PlayerHit = 0x0116, // host -> owner: damage dealt to that player's character
-	PlayerWounded = 0x0117,
-	PlayerRevive = 0x0118,
-	PlayerDied = 0x0119,
+	PlayerWounded = 0x0117, // owner -> host -> all: life state (alive / wounded / dead / spectating), coop_survival
+	PlayerRevive = 0x0118, // revive request / host orders (revive, respawn, spectate, refused)
+	PlayerDied = 0x0119, // owner -> host: bled out, host decides by coop_death_mode
+	PlayerRules = 0x011A, // host -> all: survival rules (death mode, bleed-out, revive health, respawn delay)
 
 	// entities (host -> clients)
 	EntitySpawn = 0x0120, // full CSE state with fixed id
@@ -81,6 +82,8 @@ enum class Msg : uint16_t
 	EntityDied = 0x0127,
 	EntityParent = 0x0128, // ownership change: item -> new parent
 	EntityState = 0x0129, // generic CSE state update (doors, physics, zones)
+	EntityLocal = 0x012A, // non-ALife child entity (fake missile, rocket): spawn/destroy with a fixed id
+	ItemState = 0x012B, // owned item state (ammo, condition, addons, upgrades, uses) and unload ammo spawn (WP9)
 
 	// requests (client -> host) and results
 	ReqSpawn = 0x0140, // section, parent, position; host spawns with its id
@@ -93,12 +96,14 @@ enum class Msg : uint16_t
 	ReqResult = 0x0147, // host -> client: accepted/rejected with request seq
 	ReqMoney = 0x0148,
 	ReqContainer = 0x0149, // open/close container (shared view)
+	ReqItemEvent = 0x014A, // GE_* event on an owned item the host must repeat (upgrade install)
 
 	// world state
 	TimeSync = 0x0160,
 	WeatherSync = 0x0161,
 	Emission = 0x0162,
 	ZoneState = 0x0163,
+	TimeRequest = 0x0164, // client -> host: u32 minutes the player wants to sleep / skip (host decides)
 
 	// quests, story, PDA
 	InfoPortion = 0x0170,
@@ -107,6 +112,8 @@ enum class Msg : uint16_t
 	MapSpot = 0x0173,
 	Relation = 0x0174, // goodwill / community relation change
 	Progress = 0x0175, // rank, reputation, stats
+	StoryHash = 0x0176, // host -> clients every 10 s: count + hash per story domain (P5 drift check)
+	StoryResync = 0x0177, // client -> host: send full lists for a domain mask
 
 	// dialogs and trade
 	DialogLock = 0x0180, // client -> host: request talk lock on npc

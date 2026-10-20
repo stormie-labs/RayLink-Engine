@@ -18,6 +18,7 @@
 #include "game_object_space.h"
 #include "object_broker.h"
 #include "ui/uitexturemaster.h"
+#include "coop/coop_story.h" // Anomaly Coop
 
 
 CGameTask::CGameTask() :
@@ -38,6 +39,8 @@ CGameTask::CGameTask() :
 void CGameTask::SetTaskState(ETaskState state)
 {
 	m_task_state = state;
+	if (coop::story::task_state_silent(this)) // Anomaly Coop: a client applies the host's result; effects ran there
+		return;
 	if ((m_task_state == eTaskStateFail) || (m_task_state == eTaskStateCompleted))
 	{
 		RemoveMapLocations(false);
@@ -113,6 +116,8 @@ void CGameTask::CreateMapLocation(bool on_load)
 
 void CGameTask::RemoveMapLocations(bool notify)
 {
+	if (!notify && coop::story::on_task_map_change(this)) // Anomaly Coop: task spots come from the host
+		return;
 	if (m_linked_map_location && !notify)
 		Level().MapManager().RemoveMapLocation(m_linked_map_location);
 
@@ -123,6 +128,8 @@ void CGameTask::RemoveMapLocations(bool notify)
 
 void CGameTask::ChangeMapLocation(LPCSTR new_map_location, u16 new_map_object_id)
 {
+	if (coop::story::on_task_map_change(this)) // Anomaly Coop: task spots come from the host
+		return;
 	RemoveMapLocations(false);
 
 	m_map_location = new_map_location;

@@ -2,6 +2,7 @@
 #include "control_manager.h"
 #include "control_combase.h"
 #include "BaseMonster/base_monster.h"
+#include "../../coop/coop_remote.h" // Anomaly Coop
 
 // Lain: added
 #ifdef DEBUG
@@ -358,6 +359,7 @@ void CControl_Manager::release_pure(CControl_Com* com)
 
 void CControl_Manager::activate(ControlCom::EControlType type)
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: no abilities on puppets
 	m_control_elems[type]->set_active();
 	check_active_com(m_control_elems[type], eAdd);
 	m_object->on_activate_control(type);
@@ -437,6 +439,7 @@ void CControl_Manager::dir_stop(CControl_Com* com)
 
 bool CControl_Manager::check_start_conditions(ControlCom::EControlType type)
 {
+	if (coop::remote::is_remote_creature(m_object)) return false; // Anomaly Coop: the host decides
 	return m_control_elems[type]->check_start_conditions();
 }
 

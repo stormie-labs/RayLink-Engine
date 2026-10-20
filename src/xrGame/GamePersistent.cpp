@@ -568,6 +568,7 @@ void CGamePersistent::game_loaded()
 			g_pGameLevel->bReady &&
 			(allow_intro() && psDeviceFlags2.test(rsKeypress)) &&
 			load_screen_renderer.b_need_user_input &&
+			!coop::skip_keypress_on_load() && // Anomaly Coop: no "press any key" for a joining client / autotest
 			m_game_params.m_e_game_type == eGameIDSingle)
 		{
 			VERIFY(NULL == m_intro);

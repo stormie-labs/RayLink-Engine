@@ -128,6 +128,14 @@ public:
 	void Info(TInfo& I) override { xr_strcpy(I, "emulate a bad network: coop_netsim <lag_ms> [jitter_ms] [loss_%] | off"); }
 };
 
+class CCC_CoopAcceptTransition : public IConsole_Command
+{
+public:
+	CCC_CoopAcceptTransition(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { join::accept_transition(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "host: move the group through the level exit a player asked for"); }
+};
+
 class CCC_CoopDump : public IConsole_Command
 {
 public:
@@ -146,6 +154,7 @@ void register_console_commands()
 	CMD1(CCC_CoopChat, "coop_chat");
 	CMD1(CCC_CoopNetSim, "coop_netsim");
 	CMD1(CCC_CoopDump, "coop_dump");
+	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));
 }
 } // namespace coop

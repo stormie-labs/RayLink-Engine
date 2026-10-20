@@ -58,6 +58,7 @@
 #include "../../agent_member_manager.h"
 #include "../../location_manager.h"
 #include "smart_cover_animation_selector.h"
+#include "../../coop/coop_remote.h" // Anomaly Coop
 #include "smart_cover_animation_planner.h"
 #include "smart_cover_planner_target_selector.h"
 #include "../../../xrEngine/CameraBase.h"
@@ -1014,6 +1015,7 @@ void CAI_Stalker::UpdateCL()
 	START_PROFILE("stalker")
 		START_PROFILE("stalker/client_update")
 			VERIFY2(PPhysicsShell()||getEnabled(), *cName());
+			const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
 
 			if (g_Alive())
 			{
@@ -1055,6 +1057,7 @@ void CAI_Stalker::UpdateCL()
 
 			if (g_Alive())
 			{
+				if (!coop_remote) // Anomaly Coop: puppets do not look around
 				START_PROFILE("stalker/client_update/sight_manager")
 					VERIFY(!m_pPhysicsShell);
 					try
@@ -1109,6 +1112,7 @@ void CAI_Stalker::shedule_Update(u32 DT)
 	START_PROFILE("stalker")
 		START_PROFILE("stalker/schedule_update")
 			VERIFY2(getEnabled()||PPhysicsShell(), *cName());
+			const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
 
 			if (!CObjectHandler::planner().initialized())
 			{
@@ -1131,7 +1135,7 @@ void CAI_Stalker::shedule_Update(u32 DT)
 
             CScriptEntity::process_sound_callbacks();
 
-			if (g_Alive())
+			if (g_Alive() && !coop_remote) // Anomaly Coop: puppets do not perceive or decide
 			{
 				animation().play_delayed_callbacks();
 

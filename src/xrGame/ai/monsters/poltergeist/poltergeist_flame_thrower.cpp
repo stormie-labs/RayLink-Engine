@@ -9,6 +9,7 @@
 #include "../../../actor.h"
 #include "../../../actorEffector.h"
 #include "../ai_monster_effector.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 CPolterFlame::CPolterFlame(CPoltergeist* polter) : inherited(polter)
 {
@@ -85,6 +86,7 @@ void CPolterFlame::load(LPCSTR section)
 
 void CPolterFlame::create_flame(const CObject* target_object)
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: the host decides
 	Fvector position;
 	if (!get_valid_flame_position(target_object, position)) return;
 
@@ -164,7 +166,7 @@ void CPolterFlame::update_schedule()
 			else
 			{
 				// check if we need test hit to enemy
-				if (elem->time_last_hit + m_hit_delay < time())
+				if (elem->time_last_hit + m_hit_delay < time() && !coop::remote::is_remote_creature(m_object)) // Anomaly Coop: no local damage
 				{
 					// test hit
 					collide::rq_result rq;

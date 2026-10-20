@@ -51,6 +51,7 @@ const char* msg_name(Msg type)
 	case Msg::EntityDied: return "EntityDied";
 	case Msg::EntityParent: return "EntityParent";
 	case Msg::EntityState: return "EntityState";
+	case Msg::EntityLocal: return "EntityLocal";
 
 	case Msg::ReqSpawn: return "ReqSpawn";
 	case Msg::ReqDestroy: return "ReqDestroy";
@@ -62,11 +63,15 @@ const char* msg_name(Msg type)
 	case Msg::ReqResult: return "ReqResult";
 	case Msg::ReqMoney: return "ReqMoney";
 	case Msg::ReqContainer: return "ReqContainer";
+	case Msg::ReqItemEvent: return "ReqItemEvent";
 
 	case Msg::TimeSync: return "TimeSync";
 	case Msg::WeatherSync: return "WeatherSync";
 	case Msg::Emission: return "Emission";
 	case Msg::ZoneState: return "ZoneState";
+	case Msg::TimeRequest: return "TimeRequest";
+	case Msg::StoryHash: return "StoryHash";
+	case Msg::StoryResync: return "StoryResync";
 
 	case Msg::InfoPortion: return "InfoPortion";
 	case Msg::TaskList: return "TaskList";

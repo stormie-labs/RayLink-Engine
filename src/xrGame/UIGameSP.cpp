@@ -1,4 +1,5 @@
 #include "pch_script.h"
+#include "coop/coop_manager.h"
 #include "uigamesp.h"
 #include "actor.h"
 #include "level.h"
@@ -358,12 +359,12 @@ void CChangeLevelWnd::Show()
 
 
 	g_block_pause = true;
-	Device.Pause(TRUE, TRUE, TRUE, "CChangeLevelWnd_show");
+	Device.Pause(TRUE, coop::mgr().active() ? FALSE : TRUE, TRUE, "CChangeLevelWnd_show"); // Anomaly Coop: no world pause in a session
 	bShowPauseString = FALSE;
 }
 
 void CChangeLevelWnd::Hide()
 {
 	g_block_pause = false;
-	Device.Pause(FALSE, TRUE, TRUE, "CChangeLevelWnd_hide");
+	Device.Pause(FALSE, coop::mgr().active() ? FALSE : TRUE, TRUE, "CChangeLevelWnd_hide"); // Anomaly Coop
 }

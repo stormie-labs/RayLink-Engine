@@ -25,6 +25,7 @@
 #include "profiler.h"
 #include "../../../ActorEffector.h"
 #include "../../../../xrEngine/CameraBase.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr user_data, const Fvector& Position,
                                   float power)
@@ -79,6 +80,7 @@ void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr us
 void CBaseMonster::HitEntity(const CEntity* pEntity, float fDamage, float impulse, Fvector& dir,
                              ALife::EHitType hit_type, bool draw_hit_marks)
 {
+	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
 	if (!g_Alive()) return;
 	if (!pEntity || pEntity->getDestroy()) return;
 
@@ -297,6 +299,7 @@ void CBaseMonster::SetAttackEffector()
 
 void CBaseMonster::Hit_Psy(CObject* object, float value)
 {
+	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
 	NET_Packet P;
 	SHit HS;
 	HS.GenHeader(GE_HIT, object->ID()); //					//	u_EventGen		(P,GE_HIT, object->ID());				// 
@@ -314,6 +317,7 @@ void CBaseMonster::Hit_Psy(CObject* object, float value)
 
 void CBaseMonster::Hit_Wound(CObject* object, float value, const Fvector& dir, float impulse)
 {
+	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
 	NET_Packet P;
 	SHit HS;
 	HS.GenHeader(GE_HIT, object->ID()); //	u_EventGen	(P,GE_HIT, object->ID());

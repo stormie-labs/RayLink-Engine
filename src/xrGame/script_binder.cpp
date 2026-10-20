@@ -15,6 +15,7 @@
 #include "script_game_object.h"
 #include "gameobject.h"
 #include "level.h"
+#include "coop/coop_remote.h" // Anomaly Coop
 
 // comment next string when commiting
 //#define DBG_DISABLE_SCRIPTS
@@ -206,6 +207,8 @@ void CScriptBinder::shedule_Update(u32 time_delta)
 	PROF_EVENT("CScriptBinder::shedule_Update");
 	if (m_object)
 	{
+		if (coop::remote::suspend_binder(this)) // Anomaly Coop: no Lua logic for puppets
+			return; // Anomaly Coop
 		try
 		{
 			m_object->shedule_Update(time_delta);

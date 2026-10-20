@@ -12,6 +12,7 @@
 
 #include "memory_manager.h"
 #include "enemy_manager.h"
+#include "coop/coop_story.h" // Anomaly Coop
 
 struct SAttackGoodwillStorage
 {
@@ -61,6 +62,7 @@ void load_attack_goodwill()
 
 void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAction action)
 {
+	coop::story::RelationActionScope coop_scope; // Anomaly Coop: on a client the host computes these changes
 	static CHARACTER_GOODWILL friend_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "friend_kill_goodwill");
 	static CHARACTER_GOODWILL neutral_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "neutral_kill_goodwill");
 	static CHARACTER_GOODWILL enemy_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "enemy_kill_goodwill");

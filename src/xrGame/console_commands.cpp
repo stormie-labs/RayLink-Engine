@@ -314,6 +314,7 @@ xr_token dead_body_collision_tokens[] =
 
 void register_mp_console_commands();
 #include "coop/coop_manager.h"
+#include "coop/coop_worldstate.h" // Anomaly Coop: time_factor gating
 //-----------------------------------------------------------
 
 BOOL g_bCheckTime = FALSE;
@@ -1090,6 +1091,8 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
+		if (coop::mgr().is_client()) // Anomaly Coop: only the host saves the shared world (R-9.2)
+			{ Msg("! [coop] saving is disabled on a co-op client, the host saves the world"); return; }
 #if 0
 		if (!Level().autosave_manager().ready_for_autosave()) {
 			Msg("! Cannot save the game right now!");
@@ -1177,6 +1180,8 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
+		if (coop::mgr().is_client()) // Anomaly Coop: a client cannot load a save inside a session (R-9.2)
+			{ Msg("! [coop] loading is disabled on a co-op client, use coop_disconnect first"); return; }
 		string_path saved_game;
 		strncpy_s(saved_game, sizeof(saved_game), args, _MAX_PATH - 1);
 
@@ -1267,6 +1272,8 @@ public:
 			xr_strcpy(g_last_saved_game, saved_game);
 			return;
 		}
+		if (coop::mgr().is_client()) // Anomaly Coop: quick load is disabled inside a session (R-9.2)
+			{ Msg("! [coop] loading is disabled on a co-op client, use coop_disconnect first"); return; }
 
 		if (!*g_last_saved_game)
 		{
@@ -1980,6 +1987,8 @@ public:
 			return;
 		}
 
+		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // Anomaly Coop: no slow motion in a session
+			return;
 		Device.time_factor(time_factor);
 	}
 
@@ -1999,6 +2008,8 @@ public:
 	{
 		float time_factor = (float)atof(args);
 		clamp(time_factor, EPS, 1000.f);
+		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // Anomaly Coop: no slow motion in a session
+			return;
 		Device.time_factor(time_factor);
 		if (!Core.ParamsData.test(ECoreParams::sound_constant_speed))
 			psSpeedOfSound = time_factor;

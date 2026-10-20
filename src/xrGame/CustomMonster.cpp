@@ -46,6 +46,7 @@
 #include "client_spawn_manager.h"
 #include "moving_object.h"
 #include "level_path_manager.h"
+#include "coop/coop_remote.h" // Anomaly Coop
 
 // Lain: added
 #include "../xrEngine/IGame_Level.h"
@@ -336,7 +337,7 @@ void CCustomMonster::shedule_Update(u32 DT)
     CScriptEntity::process_sound_callbacks();
 
 	// *** general stuff
-	if (g_Alive())
+	if (g_Alive() && !coop::remote::is_remote_creature(this)) // Anomaly Coop: puppets do not perceive
 	{
 		Exec_Visibility();
 		memory().update(dt);
@@ -462,6 +463,14 @@ void CCustomMonster::UpdateCL()
 			START_PROFILE("CustomMonster/client_update/sound_player")
 				update_sound_player();
 			STOP_PROFILE
+		}
+
+		if (coop::remote::update_cl(this)) // Anomaly Coop: puppet, placed and animated from snapshots
+		{
+			if (g_Alive()) // Anomaly Coop
+				eye_pp_s0(); // Anomaly Coop
+			update_animation_movement_controller(); // Anomaly Coop
+			return; // Anomaly Coop
 		}
 
 		START_PROFILE("CustomMonster/client_update/network extrapolation")

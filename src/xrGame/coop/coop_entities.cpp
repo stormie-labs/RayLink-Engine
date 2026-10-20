@@ -5,6 +5,7 @@
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_sync.h"
+#include "coop_remote.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -174,7 +175,7 @@ void capture_anims(CGameObject* obj, AnimState& a)
 
 bool is_creature(CGameObject* obj)
 {
-	return smart_cast<CAI_Stalker*>(obj) || smart_cast<CBaseMonster*>(obj);
+	return remote::is_puppet_type(obj); // stalkers, monsters, traders (WP1)
 }
 
 void host_send_snapshots()
@@ -600,6 +601,7 @@ bool drive_mirror(CGameObject* obj)
 	xform.setHPB(s.yaw, 0.f, 0.f);
 	xform.c.set(s.pos);
 	obj->XFORM().set(xform);
+	remote::set_health(obj, s.health); // WP1: snapshot health (never kills, see remote::on_host_death)
 
 	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
 	if (ka)

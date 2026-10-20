@@ -31,6 +31,7 @@
 #include "physics_world_scripted.h"
 #include "alife_simulator.h"
 #include "alife_time_manager.h"
+#include "coop/coop_worldstate.h" // Anomaly Coop: host-owned clock and weather
 #include "UI/UIGameTutorial.h"
 #include "string_table.h"
 #include "ui/UIInventoryUtilities.h"
@@ -170,11 +171,15 @@ float get_weather_weight()
 
 void set_weather_weight(float weight)
 {
+	if (coop::worldstate::refuse_script_weather("set_weather_weight")) // Anomaly Coop: the host decides the weather
+		return;
     g_pGamePersistent->Environment().set_lerp(weight);
 }
 
 void set_weather(LPCSTR weather_name, bool forced)
 {
+	if (coop::worldstate::refuse_script_weather("set_weather")) // Anomaly Coop: the host decides the weather
+		return;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
 #endif // #ifdef INGAME_EDITOR
@@ -184,6 +189,8 @@ void set_weather(LPCSTR weather_name, bool forced)
 // demonized: Sets weather and force updates next environment so the interpolation will happen between current environment and next weather's environment
 void set_weather_smooth(LPCSTR weather_name)
 {
+	if (coop::worldstate::refuse_script_weather("set_weather_smooth")) // Anomaly Coop: the host decides the weather
+		return;
 #ifdef INGAME_EDITOR
     if (!Device.editor())
 #endif // #ifdef INGAME_EDITOR
@@ -200,6 +207,8 @@ void set_weather_smooth(LPCSTR weather_name)
 
 bool set_weather_fx(LPCSTR weather_name)
 {
+	if (coop::worldstate::refuse_script_weather("set_weather_fx")) // Anomaly Coop: the host decides the weather
+		return false;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
 #endif // #ifdef INGAME_EDITOR
@@ -212,6 +221,8 @@ bool set_weather_fx(LPCSTR weather_name)
 
 bool start_weather_fx_from_time(LPCSTR weather_name, float time)
 {
+	if (coop::worldstate::refuse_script_weather("start_weather_fx_from_time")) // Anomaly Coop: the host decides
+		return false;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
 #endif // #ifdef INGAME_EDITOR
@@ -234,6 +245,8 @@ float get_wfx_time()
 
 void stop_weather_fx()
 {
+	if (coop::worldstate::refuse_script_weather("stop_weather_fx")) // Anomaly Coop: the host decides the weather
+		return;
 	g_pGamePersistent->Environment().StopWFX();
 }
 
@@ -315,6 +328,8 @@ u32 get_time_minutes()
 
 void change_game_time(u32 days, u32 hours, u32 mins)
 {
+	if (coop::worldstate::intercept_time_jump(days, hours, mins)) // Anomaly Coop: a client asks the host instead
+		return;
 	game_sv_Single* tpGame = smart_cast<game_sv_Single *>(Level().Server->game);
 	if (tpGame && ai().get_alife())
 	{

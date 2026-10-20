@@ -22,6 +22,7 @@
 #include "ui/UIActorMenu.h"
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIPdaWnd.h"
+#include "coop/coop_script.h" // Anomaly Coop
 
 void export_classes	(lua_State *L)
 {
@@ -274,6 +275,7 @@ void export_classes	(lua_State *L)
 	CUIActorMenu::script_register(L);
 	//UIHintWindow::script_register(L);
 	CUIListBox::script_register(L);
+	coop_script_registrator::script_register(L); // Anomaly Coop: `coop` namespace
 	//CUIMainIngameWnd::script_register(L);
 	//CUIPdaWnd::script_register(L);
 

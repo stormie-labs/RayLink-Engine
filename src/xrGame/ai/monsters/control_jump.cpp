@@ -23,6 +23,7 @@
 #include "../../../xrPhysics/IPHWorld.h"
 #include "../../../xrPhysics/PHCharacter.h"
 #include "../../../xrCore/_vector3d_ext.h"
+#include "../../coop/coop_remote.h" // Anomaly Coop
 
 void CControlJump::reinit()
 {
@@ -53,6 +54,7 @@ void CControlJump::load(LPCSTR section)
 
 bool CControlJump::check_start_conditions()
 {
+	if (coop::remote::is_remote_creature(m_object)) return false; // Anomaly Coop: the host decides
 	if (is_active()) return false;
 	if (m_man->is_captured_pure()) return false;
 
@@ -512,6 +514,7 @@ void CControlJump::on_event(ControlCom::EEventType type, ControlCom::IEventData*
 
 void CControlJump::hit_test()
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: the host deals puppet damage
 	if (m_object_hitted) return;
 	if (!m_data.target_object) return;
 

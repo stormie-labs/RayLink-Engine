@@ -5,6 +5,7 @@
 #include "../../../actor.h"
 #include "../../../../xrPhysics/icolisiondamageinfo.h"
 #include "inventory_item.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 CPolterTele::CPolterTele(CPoltergeist* polter) : inherited(polter), m_pmt_object_collision_damage(0.5f)
 {
@@ -50,6 +51,7 @@ void CPolterTele::update_schedule()
 {
 	inherited::update_schedule();
 
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: no local tele-throw from puppets
 	if (!m_object->g_Alive() || m_object->get_actor_ignore())
 		return;
 

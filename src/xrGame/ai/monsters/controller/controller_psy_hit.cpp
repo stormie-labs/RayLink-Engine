@@ -13,6 +13,7 @@
 #include "../../../level_debug.h"
 #include "../../../ActorCondition.h"
 #include "../../../HudManager.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 void CControllerPsyHit::load(LPCSTR section)
 {
@@ -50,6 +51,8 @@ bool CControllerPsyHit::tube_ready() const
 
 bool CControllerPsyHit::check_start_conditions()
 {
+	if (coop::remote::is_remote_creature(m_object)) // Anomaly Coop: the host decides
+		return false; // Anomaly Coop
 	if (is_active())
 		return false;
 

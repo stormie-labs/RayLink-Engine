@@ -11,6 +11,7 @@
 #include "xrCoop/coop_session.h"
 
 class CALifeObjectRegistry;
+class NET_Packet;
 
 namespace coop
 {
@@ -35,7 +36,15 @@ u16 proxy_of_peer(PeerId id);
 PeerId peer_of_proxy(u16 proxy_id);
 bool is_proxy(u16 id);
 
+// Host: increments when a load or level change replaces the served world. Requests from
+// peers that have not rejoined the current world must be ignored (see sync::host_peer_joining).
+u32 host_world_epoch();
+// Host: execute a level change a client asked for (console coop_accept_transition).
+bool accept_transition();
+
 // --- client ---
+// Client touched a level exit: the host decides (raw M_CHANGE_LEVEL packet is forwarded).
+void client_request_level_change(NET_Packet& P);
 void on_welcome(const WelcomeMsg& w);
 // Server entity id that represents this client in the host world (our own proxy there).
 // On the client the ids 0 and my_proxy() are swapped against the host numbering.

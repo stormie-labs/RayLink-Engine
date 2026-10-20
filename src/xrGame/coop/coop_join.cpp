@@ -6,6 +6,7 @@
 #include "coop_entities.h"
 #include "coop_players.h"
 #include "coop_alife.h"
+#include "coop_net.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Level.h"
@@ -46,6 +47,13 @@ struct State
 	bool load_issued = false;
 	bool swap_done = false;
 	u64 last_progress_log = 0;
+	// host: the world we serve; a load or a level change replaces it (epoch++)
+	const void* world_ptr = nullptr;
+	u32 epoch = 1;
+	bool reset_pending = false;
+	// host: transition asked by a client (raw M_CHANGE_LEVEL), waiting for coop_accept_transition
+	std::vector<u8> pending_transition;
+	PeerId transition_from = kInvalidPeer;
 } g;
 
 xr_string key_hex(const PlayerKey& k)
@@ -82,12 +90,13 @@ bool read_file(LPCSTR path, std::vector<u8>& out)
 
 bool write_file(LPCSTR path, const u8* data, size_t size)
 {
-	FILE* f = std::fopen(path, "wb");
-	if (!f)
+	// FS writer creates missing folders (a fresh appdata has no savedgames yet).
+	IWriter* w = FS.w_open(path);
+	if (!w)
 		return false;
-	const bool ok = std::fwrite(data, 1, size, f) == size;
-	std::fclose(f);
-	return ok;
+	w->w(data, u32(size));
+	FS.w_close(w);
+	return FS.exist(path) != nullptr;
 }
 
 void save_path(string_path& out, LPCSTR name, LPCSTR ext)
@@ -207,6 +216,7 @@ void host_on_join_request(PeerId from, Reader&)
 	const u32 id = mgr().session().send_blob(from, BlobWorldSave, std::move(blob));
 	hp.loading = true;
 	hp.sent_at = mgr().now_ms();
+	net::host_drop(from); // anything queued before this snapshot is already inside it
 	sync::host_begin_join(from);
 	::Msg("[coop] world for '%s': %u + %u bytes, blob %u", p->nick.c_str(), (u32)engine_part.size(),
 	    (u32)script_part.size(), id);
@@ -311,8 +321,33 @@ void swap_values(T& a, T& b)
 
 } // namespace
 
+void host_on_transition_vote(PeerId from, Reader& r)
+{
+	if (!mgr().is_host())
+		return;
+	const u32 size = r.u32();
+	if (!r.ok() || !size || size > 4096)
+		return;
+	g.pending_transition.resize(size);
+	if (!r.bytes(g.pending_transition.data(), size))
+	{
+		g.pending_transition.clear();
+		return;
+	}
+	g.transition_from = from;
+	const PeerInfo* p = mgr().session().peer(from);
+	::Msg("[coop] '%s' stands at a level exit and wants the group to move. Host: coop_accept_transition to go",
+	      p ? p->nick.c_str() : "?");
+	Writer w(128);
+	string256 text;
+	xr_sprintf(text, "%s wants to move the group to the next level", p ? p->nick.c_str() : "a player");
+	w.str(text);
+	net::host_broadcast(Msg::Chat, w);
+}
+
 void install(Session& s)
 {
+	s.on(Msg::TransitionVote, &host_on_transition_vote);
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
 	s.on(Msg::JoinComplete, &client_on_join_complete);
@@ -337,7 +372,38 @@ bool host_can_start()
 void on_host_started()
 {
 	g = State();
+	g.world_ptr = ai().get_alife();
 	world::host_scan_proxies();
+}
+
+u32 host_world_epoch() { return g.epoch; }
+
+bool accept_transition()
+{
+	if (!mgr().is_host() || g.pending_transition.empty() || !g_pGameLevel)
+	{
+		::Msg("! [coop] no pending transition");
+		return false;
+	}
+	NET_Packet P;
+	P.B.count = (u32)g.pending_transition.size();
+	CopyMemory(P.B.data, g.pending_transition.data(), P.B.count);
+	P.r_pos = 0;
+	g.pending_transition.clear();
+	::Msg("[coop] moving the group to the next level");
+	Level().Send(P, net_flags(TRUE)); // the host's own level change; clients follow via SessionReset
+	return true;
+}
+
+void client_request_level_change(NET_Packet& P)
+{
+	if (!mgr().is_live_client())
+		return;
+	Writer w(P.B.count + 8);
+	w.u32(P.B.count);
+	w.bytes(P.B.data, P.B.count);
+	net::client_send(Msg::TransitionVote, w);
+	::Msg("[coop] level exit: asked the host to move the group");
 }
 
 void on_peer_joined(const PeerInfo&) {}
@@ -405,8 +471,43 @@ void on_blob_complete(PeerId from, u32, u32 kind, std::vector<u8>& data)
 		client_load_world(data);
 }
 
+// Host: a load or a level change replaced the world under the session. Everybody rejoins
+// from a fresh snapshot of the new world; requests made in the old one are dropped (epoch).
+void host_watch_world()
+{
+	const void* now_world = ai().get_alife();
+	if (now_world != g.world_ptr)
+	{
+		g.world_ptr = now_world;
+		if (now_world)
+		{
+			++g.epoch;
+			g.reset_pending = true;
+			for (auto& it : g.peers)
+			{
+				it.second.loading = true;
+				sync::host_begin_join(it.first); // queue/drop world traffic until they rejoin
+			}
+		}
+	}
+	if (!g.reset_pending || !g_pGameLevel || !g_actor || Device.dwPrecacheFrame)
+		return;
+	g.reset_pending = false;
+	world::host_scan_proxies();
+	Writer w(64);
+	w.str("the host loaded a save or changed level");
+	for (const PeerInfo& p : mgr().session().peers())
+		mgr().session().send(p.id, Lane::Reliable, Msg::SessionReset, w);
+	::Msg("[coop] world replaced (epoch %u): %u player(s) rejoin", g.epoch, (u32)mgr().session().peers().size());
+}
+
 void frame()
 {
+	if (mgr().is_host())
+	{
+		host_watch_world();
+		return;
+	}
 	if (mgr().phase() != Phase::LoadingWorld || !g.swap_done)
 		return;
 	// Level is up and the local actor exists: tell the host.

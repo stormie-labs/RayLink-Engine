@@ -14,6 +14,7 @@
 #include "profiler.h"
 #include "stalker_movement_manager_smart_cover.h"
 #include "Inventory.h"
+#include "coop/coop_remote.h" // Anomaly Coop
 
 void CStalkerAnimationManager::play_delayed_callbacks()
 {
@@ -245,6 +246,7 @@ void CStalkerAnimationManager::update_impl()
 
 void CStalkerAnimationManager::update()
 {
+	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: puppets play host motions
 	START_PROFILE("stalker/client_update/animations")
 		try
 		{
