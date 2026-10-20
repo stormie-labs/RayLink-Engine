@@ -202,8 +202,8 @@ bool read_vitals(Reader& r, Vitals& v)
 void store_vitals(u16 proxy, const Vitals& v)
 {
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
-	if (!e)
-		return;
+	if (!e || !world::is_player_proxy(proxy))
+		return; // never rewrite the custom data (logic) of anything but a player character
 	xr_string ini = e->m_ini_string.c_str();
 	const size_t at = ini.find("vitals =");
 	if (at != xr_string::npos)
@@ -258,14 +258,20 @@ void client_restore_vitals()
 		return;
 	const CSE_ALifeDynamicObject* e = ai().alife().objects().object(host_avatar, true);
 	g_vitals_restored = true;
-	if (!e || !e->m_ini_string.size())
-		return;
-	const char* at = strstr(e->m_ini_string.c_str(), "vitals =");
+	CActorCondition& c = actor->conditions();
+	// The actor's client data in the save is the host's: radiation, wounds and the rest of the
+	// host's condition came with it. Only health came from our character (role swap).
+	const char* at = e && e->m_ini_string.size() ? strstr(e->m_ini_string.c_str(), "vitals =") : nullptr;
 	Vitals v;
 	if (!at || sscanf(at, "vitals = %f,%f,%f,%f,%f,%f", &v.health, &v.satiety, &v.radiation, &v.psy, &v.power,
 	                  &v.bleeding) != 6)
+	{
+		c.ClearWounds(); // a new character: nothing of the host's state
+		c.SetRadiation(0.f);
 		return;
-	CActorCondition& c = actor->conditions();
+	}
+	if (v.bleeding <= 0.f)
+		c.ClearWounds();
 	c.SetHealth(clampr(v.health, 0.05f, c.GetMaxHealth()));
 	c.SetSatiety(v.satiety);
 	c.SetRadiation(v.radiation);

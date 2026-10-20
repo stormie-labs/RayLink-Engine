@@ -37,6 +37,7 @@
 #include "pch_script.h"
 #include "script_game_object.h"
 #include "ai/stalker/ai_stalker.h"
+#include "coop/coop_items.h" // Anomaly Coop
 
 #define WEAPON_REMOVE_TIME		60000
 #define ROTATION_TIME			0.25f
@@ -1634,6 +1635,7 @@ void CWeapon::SpawnAmmo(u32 boxCurr, LPCSTR ammoSect, u32 ParentID)
 	if (!m_ammoTypes.size()) return;
 	if (OnClient()) return;
 	m_bAmmoWasSpawned = true;
+	if (coop::items::client_spawn_ammo(this, boxCurr, ammoSect, ParentID)) return; // Anomaly Coop: the host creates the boxes
 
 	int l_type = 0;
 	l_type %= m_ammoTypes.size();

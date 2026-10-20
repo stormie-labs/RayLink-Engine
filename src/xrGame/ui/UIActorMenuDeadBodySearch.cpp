@@ -17,9 +17,11 @@
 #include "../InventoryBox.h"
 #include "../string_table.h"
 #include "../ai/monsters/BaseMonster/base_monster.h"
+#include "../coop/coop_trade.h" // Anomaly Coop
 
 void move_item_from_to(u16 from_id, u16 to_id, u16 what_id)
 {
+	coop::trade::on_container_move(from_id, to_id, what_id); // Anomaly Coop: a refused move refreshes the window
 	NET_Packet P;
 	CGameObject::u_EventGen(P, GE_TRADE_SELL, from_id);
 	P.w_u16(what_id);

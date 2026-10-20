@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "torridZone.h"
+#include "coop/coop_objects.h"
 #include "../xrEngine/objectanimator.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 
@@ -40,7 +41,7 @@ void CTorridZone::net_Destroy()
 void CTorridZone::UpdateWorkload(u32 dt)
 {
 	inherited::UpdateWorkload(dt);
-	m_animator->Update(float(dt) / 1000.f);
+	m_animator->Update(coop::objects::zone_anim_dt(this, m_animator->anim_param(), float(dt) / 1000.f)); // Anomaly Coop: host phase
 	XFORM().set(m_animator->XFORM());
 	OnMove();
 }

@@ -7,6 +7,7 @@
 #endif // DEBUG
 #include "alife_space.h"
 #include "hit.h"
+#include "coop/coop_events.h" // Anomaly Coop
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -551,6 +552,7 @@ struct playing_pred
 
 void CActor::Hit(SHit* pHDS)
 {
+	if (coop::events::client_block_actor_hit(this, pHDS)) return; // Anomaly Coop: the host sends it as PlayerHit
 	bool b_initiated = pHDS->aim_bullet; // physics strike by poltergeist
 
 	pHDS->aim_bullet = false;

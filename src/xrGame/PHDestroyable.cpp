@@ -21,6 +21,7 @@
 #endif
 
 #include "../Include/xrRender/Kinematics.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 
 /*
 [impulse_transition_to_parts]
@@ -148,6 +149,7 @@ void CPHDestroyable::Destroy(u16 source_id/*=u16(-1)*/, LPCSTR section/*="ph_ske
 		m_flags.set(fl_released,FALSE);
 	}
 	xr_vector<shared_str>::iterator i = m_destroyed_obj_visual_names.begin(), e = m_destroyed_obj_visual_names.end();
+	if (coop::objects::ph_destroy(obj, m_fatal_hit)) i = e; // Anomaly Coop: a client gets the host's fragments
 
 	if (IsGameTypeSingle())
 	{
@@ -340,6 +342,8 @@ void CPHDestroyable::NotificatePart(CPHDestroyableNotificate* dn)
 
 void CPHDestroyable::NotificateDestroy(CPHDestroyableNotificate* dn)
 {
+	if (coop::objects::fragment_from_host(PPhysicsShellHolder(), dn->PPhysicsShellHolder())) // Anomaly Coop: part made by the host
+	{ if (PPhysicsShellHolder()->PPhysicsShell()) { NotificatePart(dn); PhysicallyRemoveSelf(); } return; } // Anomaly Coop
 	CPhysicsShellHolder	*obj = PPhysicsShellHolder();
 	obj->setVisible(false);		
 	VERIFY(m_depended_objects);

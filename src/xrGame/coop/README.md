@@ -71,3 +71,12 @@ Notes:
 - `level_script.cpp`: WP2 owns spawn functions, WP3 time/weather functions, WP4 map-spot functions — touch only yours.
 - `Actor.cpp`: WP2 hit section; anything else is requested from the lead.
 - `stalker_animation_script.cpp` belongs to WP1 (stalker animation files).
+
+### Wave 3 (2026-10-20 18:13)
+| WP | Files |
+|---|---|
+| W3a rockets + router bypasses | coop_events.*, coop_requests.* (rocket/launch parts and Lua bypass gates only), RocketLauncher.cpp, CustomRocket.cpp, ExplosiveRocket.cpp, WeaponMagazinedWGrenade.cpp (launch path only), script_game_object3.cpp (attach_vehicle gate), alife_simulator_script.cpp (teleport/kill/switch gates) |
+| W3b barter + money order | coop_trade.*, ui/UIActorMenuTrade.cpp, coop_requests.cpp (money/outbox flush only — coordinate with W3a: touch only ReqMoney/outbox functions) |
+| W3c story follow-ups | coop_story.*, relation_registry_actions.cpp, `gamedata/scripts/coop_main.script` (task routing section only) |
+| W3d host settings + mod diff screen | coop_script.*, `gamedata/scripts/coop_*.script` except coop_main.script task section, `gamedata/configs/**`, new `gamedata/configs/ui/*coop*.xml` |
+| lead (R1 review running) | coop_manager, coop_console, coop_join, coop_world, coop_sync, coop_net, coop_alife, coop_entities, coop_players, coop_equip, alife_* hooks |

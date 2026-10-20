@@ -3,6 +3,7 @@
 #include "xrserver_objects.h"
 #include "xrserver_objects_alife_monsters.h"
 #include "xrServer_svclient_validation.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 void ReplaceOwnershipHeader(NET_Packet& P)
 {
@@ -85,6 +86,7 @@ void xrServer::Process_event_ownership(NET_Packet& P, ClientID sender, u32 time,
 		// Rebuild parentness
 		e_entity->ID_Parent = id_parent;
 		e_parent->children.push_back(id_entity);
+		coop::events::host_on_parent_changed(id_entity, 0xffff, id_parent); // Anomaly Coop: -> clients
 
 		if (bForced)
 		{

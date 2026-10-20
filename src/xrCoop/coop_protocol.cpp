@@ -72,6 +72,8 @@ const char* msg_name(Msg type)
 	case Msg::TimeRequest: return "TimeRequest";
 	case Msg::StoryHash: return "StoryHash";
 	case Msg::StoryResync: return "StoryResync";
+	case Msg::ItemState: return "ItemState";
+	case Msg::PlayerRules: return "PlayerRules";
 
 	case Msg::InfoPortion: return "InfoPortion";
 	case Msg::TaskList: return "TaskList";

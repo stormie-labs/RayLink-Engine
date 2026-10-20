@@ -21,6 +21,7 @@
 #include "UIGameCustom.h"
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIStatic.h"
+#include "coop/coop_survival.h" // Anomaly Coop
 
 #define MAX_SATIETY					1.0f
 #define START_SATIETY				0.5f
@@ -195,6 +196,7 @@ float CActorCondition::GetZoneMaxPower(ALife::EHitType hit_type) const
 
 void CActorCondition::UpdateCondition()
 {
+	coop::survival::actor_condition_hook(*this); // Anomaly Coop: in a session zero health means wounded, not dead
 	float v_alcohol = IsSleeping() ? m_fV_AlcoholSleep : m_fV_Alcohol;
 	
 	if (psActorFlags.test(AF_GODMODE_RT))
@@ -301,11 +303,12 @@ void CActorCondition::UpdateCondition()
 	UpdateBoosters();
 
 	inherited::UpdateCondition();
+	coop::survival::actor_condition_hook(*this); // Anomaly Coop
 
 	if (IsGameTypeSingle())
 		UpdateTutorialThresholds();
 
-	if (GetHealth() < 0.05f && m_death_effector == NULL && IsGameTypeSingle())
+	if (GetHealth() < 0.05f && m_death_effector == NULL && IsGameTypeSingle() && !coop::survival::suppress_death_effector()) // Anomaly Coop
 	{
 		if (pSettings->section_exist("actor_death_effector"))
 			m_death_effector = xr_new<CActorDeathEffector>(this, "actor_death_effector");

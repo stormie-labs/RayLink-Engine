@@ -1,5 +1,6 @@
 #include "pch_script.h"
 #include "helicopter.h"
+#include "coop/coop_objects.h"
 #include "xrserver_objects_alife.h"
 #include "../xrphysics/PhysicsShell.h"
 #include "level.h"
@@ -393,6 +394,14 @@ void CHelicopter::UpdateCL()
 {
 	inherited::UpdateCL();
 	CExplosive::UpdateCL();
+	if (state() != CHelicopter::eDead && coop::objects::client_drive_pose(this)) // Anomaly Coop: the host flies and shoots
+	{
+		if (PPhysicsShell())
+			PPhysicsShell()->SetTransform(XFORM(), mh_unspecified);
+		UpdateHeliParticles();
+		smart_cast<IKinematics*>(Visual())->CalculateBones();
+		return;
+	}
 	if (PPhysicsShell() && (state() == CHelicopter::eDead))
 	{
 		PPhysicsShell()->InterpolateGlobalTransform(&XFORM());

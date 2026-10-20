@@ -25,6 +25,7 @@
 
 #include "../build_config_defines.h"
 #include "WeaponRG6.h"
+#include "coop/coop_items.h" // Anomaly Coop
 
 extern ENGINE_API bool g_dedicated_server;
 ENGINE_API extern float psHUD_FOV_def;
@@ -443,6 +444,7 @@ void CWeaponMagazined::UnloadMagazine(bool spawn_ammo)
 	}
 
 	VERIFY((u32) iAmmoElapsed == m_magazine.size());
+	coop::items::touch(this); // Anomaly Coop
 
 #ifdef	EXTENDED_WEAPON_CALLBACKS
 	if (IsGameTypeSingle() && ParentIsActor())
@@ -463,6 +465,7 @@ void CWeaponMagazined::UnloadMagazine(bool spawn_ammo)
 			CWeaponAmmo* l_pA = smart_cast<CWeaponAmmo*>(m_pInventory->GetAny(l_it->first));
 			if (l_pA)
 			{
+				coop::items::touch(l_pA); // Anomaly Coop
 				u16 l_free = l_pA->m_boxSize - l_pA->m_boxCurr;
 				l_pA->m_boxCurr = l_pA->m_boxCurr + (l_free < l_it->second ? l_free : l_it->second);
 				l_it->second = l_it->second - (l_free < l_it->second ? l_free : l_it->second);
@@ -572,8 +575,10 @@ void CWeaponMagazined::ReloadMagazine()
 	VERIFY((u32) iAmmoElapsed == m_magazine.size());
 
 	//выкинуть коробку патронов, если она пустая
-	if (m_pCurrentAmmo && !m_pCurrentAmmo->m_boxCurr && OnServer())
+	if (m_pCurrentAmmo && !m_pCurrentAmmo->m_boxCurr && OnServer() &&
+		!coop::items::client_keep_empty_box(m_pCurrentAmmo)) // Anomaly Coop: the host destroys it
 		m_pCurrentAmmo->SetDropManual(TRUE);
+	coop::items::touch(this); // Anomaly Coop
 
 	if (iMagazineSize > iAmmoElapsed)
 	{
@@ -892,6 +897,7 @@ void CWeaponMagazined::PlaySoundShot()
 
 void CWeaponMagazined::OnShot()
 {
+	coop::items::on_weapon_fired(this); // Anomaly Coop: shot choke point (WP8)
 	// Shot Sound
 	PlaySoundShot();
 
@@ -1358,6 +1364,7 @@ bool CWeaponMagazined::CanDetach(const char* item_section_name)
 
 bool CWeaponMagazined::Attach(PIItem pIItem, bool b_send_event)
 {
+	coop::items::touch(this); // Anomaly Coop
 	bool result = false;
 
 	CScope* pScope = smart_cast<CScope*>(pIItem);
@@ -1453,6 +1460,7 @@ bool CWeaponMagazined::DetachScope(const char* item_section_name, bool b_spawn_i
 
 bool CWeaponMagazined::Detach(const char* item_section_name, bool b_spawn_item)
 {
+	coop::items::touch(this); // Anomaly Coop
 	if (m_eScopeStatus == ALife::eAddonAttachable &&
 		DetachScope(item_section_name, b_spawn_item))
 	{

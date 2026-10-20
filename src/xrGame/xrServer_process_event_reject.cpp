@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "xrserver.h"
 #include "xrserver_objects.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 bool xrServer::Process_event_reject(NET_Packet& P, const ClientID sender, const u32 time, const u16 id_parent,
                                     const u16 id_entity, bool send_message)
@@ -74,6 +75,7 @@ bool xrServer::Process_event_reject(NET_Packet& P, const ClientID sender, const 
 	//R_ASSERT3(C.end()!=c,e_entity->name_replace(),e_parent->name_replace());
 	e_entity->ID_Parent = 0xffff;
 	C.erase(c);
+	coop::events::host_on_parent_changed(id_entity, id_parent, 0xffff); // Anomaly Coop: -> clients
 
 	// Signal to everyone (including sender)
 	if (send_message)

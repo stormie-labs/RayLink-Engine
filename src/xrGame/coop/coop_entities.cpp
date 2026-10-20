@@ -6,6 +6,7 @@
 #include "coop_world.h"
 #include "coop_sync.h"
 #include "coop_remote.h"
+#include "coop_requests.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -16,6 +17,7 @@
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "alife_graph_registry.h"
+#include "alife_group_registry.h"
 #include "xrServer.h"
 #include "xrServer_Objects_ALife.h"
 #include "xrServer_Objects_ALife_Monsters.h"
@@ -252,6 +254,7 @@ struct MirrorTrack
 	u32 applied[kMaxPartitions] = {};
 };
 xr_map<u16, MirrorTrack> g_tracks;
+xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
 
@@ -274,8 +277,11 @@ void read_placement(Reader& r, Fvector& pos, Fvector& ang, u32& node, u16& graph
 
 void place(CSE_ALifeDynamicObject* e, const Fvector& pos, const Fvector& ang, u32 node, u16 graph_id)
 {
-	if (!e->m_bOnline && e->ID_Parent == kNoId && e->m_tGraphID != graph_id &&
-	    ai().game_graph().valid_vertex_id(graph_id))
+	// Only objects that live in the graph registry move between its vertices (graph().change
+	// requires used_ai_locations: a squad that is not bound to its members here has none and must
+	// not be added to the level registry, see apply_group_switch).
+	if (!e->m_bOnline && e->ID_Parent == kNoId && e->used_ai_locations() && e->m_tGraphID != graph_id &&
+	    ai().game_graph().valid_vertex_id(graph_id) && ai().game_graph().valid_vertex_id(e->m_tGraphID))
 		alife_rw().graph().change(e, e->m_tGraphID, graph_id);
 	e->o_Position = pos;
 	e->o_Angle = ang;
@@ -285,15 +291,155 @@ void place(CSE_ALifeDynamicObject* e, const Fvector& pos, const Fvector& ang, u3
 
 void apply_update(CSE_ALifeDynamicObject* e, NET_Packet& update)
 {
+	update.r_pos = 0;
 	u16 type;
 	update.r_begin(type);
 	if (type == M_UPDATE)
 		e->UPDATE_Read(update);
 }
 
+// A squad lists its members by id. A squad from the save has them bound by the engine
+// (on_after_game_load); a squad that came over the wire has null member pointers, which
+// switch_online/offline and on_failed_switch_online dereference.
+bool group_bound(const CSE_ALifeOnlineOfflineGroup& g)
+{
+	for (const auto& m : g.squad_members())
+		if (!m.second)
+			return false;
+	return true;
+}
+
+// The host switches squad members only together with their squad. A member that the host
+// switches (or removes) on its own has left its squad there (death, script): do the same here,
+// otherwise the squad keeps a raw pointer to it.
+void leave_group(CSE_ALifeDynamicObject* e)
+{
+	CSE_ALifeMonsterAbstract* m = smart_cast<CSE_ALifeMonsterAbstract*>(e);
+	if (!m || m->m_group_id == kNoId)
+		return;
+	const CALifeGroupRegistry::OBJECTS& groups = ai().alife().groups().objects();
+	auto it = groups.find(m->m_group_id);
+	if (it == groups.end() || !it->second->member(m->ID, true))
+	{
+		m->m_group_id = kNoId;
+		return;
+	}
+	it->second->unregister_member(m->ID);
+}
+
+// Client: a squad is going away; its bound members become ordinary objects first.
+void disband(CSE_ALifeOnlineOfflineGroup& g)
+{
+	xr_vector<u16> bound;
+	for (const auto& m : g.squad_members())
+		if (m.second)
+			bound.push_back(m.first);
+	for (u16 id : bound)
+		g.unregister_member(id);
+}
+
+void apply_switch(CSE_ALifeDynamicObject* e, bool online, const Fvector& pos, const Fvector& ang, u32 node,
+                  u16 graph_id, NET_Packet* update)
+{
+	if (online)
+	{
+		if (e->m_bOnline)
+			return;
+		place(e, pos, ang, node, graph_id);
+		if (update)
+			apply_update(e, *update);
+		alife_rw().switch_online(e);
+		return;
+	}
+	if (e->m_bOnline)
+		alife_rw().switch_offline(e);
+	place(e, pos, ang, node, graph_id);
+	if (update)
+		apply_update(e, *update);
+}
+
+void apply_group_switch(CSE_ALifeOnlineOfflineGroup& g, bool online, const Fvector& pos, const Fvector& ang,
+                        u32 node, u16 graph_id, NET_Packet& update)
+{
+	xr_vector<u16> members;
+	for (const auto& m : g.squad_members())
+		members.push_back(m.first);
+	// Members follow their squad: keep their votes in step for the local switch manager.
+	for (u16 id : members)
+	{
+		if (online)
+			g_online.insert(id);
+		else
+		{
+			g_online.erase(id);
+			g_tracks.erase(id);
+		}
+	}
+
+	if (group_bound(g))
+	{
+		if (online && !g.m_bOnline)
+		{
+			place(&g, pos, ang, node, graph_id);
+			apply_update(&g, update);
+			// Offline members stand where their squad is (CSE_ALifeOnlineOfflineGroup::update on the host).
+			for (const auto& m : g.squad_members())
+			{
+				if (m.second->m_bOnline)
+					continue;
+				m.second->o_Position = pos;
+				m.second->m_tNodeID = node;
+				m.second->m_tGraphID = graph_id;
+			}
+			alife_rw().switch_online(&g);
+		}
+		else if (!online)
+		{
+			if (g.m_bOnline)
+				alife_rw().switch_offline(&g);
+			place(&g, pos, ang, node, graph_id);
+			apply_update(&g, update);
+		}
+		return;
+	}
+
+	// The squad came over the wire: its members are ordinary top-level objects here, switch them
+	// one by one and leave the squad itself alone.
+	place(&g, pos, ang, node, graph_id);
+	apply_update(&g, update);
+	for (u16 id : members)
+	{
+		CSE_ALifeMonsterAbstract* m = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(id, true));
+		if (m && m->ID_Parent == kNoId && m->m_group_id == kNoId)
+			apply_switch(m, online, pos, ang, node, graph_id, nullptr);
+	}
+}
+
+// The holder is online here, so the item must be too: on the host it was created online (like
+// alife():create with an online parent). Same steps as add_online_impl takes for each child.
+void bring_child_online(CSE_ALifeDynamicObject* e)
+{
+	xrServer& server = alife_rw().server();
+	CSE_ALifeDynamicObject* holder = ai().alife().objects().object(e->ID_Parent, true);
+	if (!holder || !holder->m_bOnline || !server.ID_to_entity(e->ID_Parent))
+		return; // stays offline in its holder, comes online with it
+	ClientID client;
+	client.set(server.GetServerClient() ? server.GetServerClient()->ID.value() : 0);
+	NET_Packet packet;
+	e->s_flags.or(M_SPAWN_UPDATE);
+	CSE_Abstract* abstract = e;
+	server.entity_Destroy(abstract); // frees the id; ALife keeps the entity (m_bALifeControl)
+	e->o_Position = holder->o_Position;
+	e->m_tNodeID = holder->m_tNodeID;
+	server.Process_spawn(packet, client, FALSE, e);
+	e->s_flags.and(u16(-1) ^ M_SPAWN_UPDATE);
+	e->m_bOnline = true;
+}
+
 void client_on_spawn(PeerId, Reader& r)
 {
-	const u16 id = join::to_local(r.u16());
+	const u16 id_host = r.u16();
+	const u16 id = join::to_local(id_host);
 	const u16 parent_host = r.u16();
 	const u16 parent = parent_host == kNoId ? kNoId : join::to_local(parent_host);
 	const bool online = r.boolean();
@@ -302,10 +448,32 @@ void client_on_spawn(PeerId, Reader& r)
 	u16 graph_id;
 	read_placement(r, pos, ang, node, graph_id);
 	NET_Packet spawn, update;
-	if (!read_packet(r, spawn) || !read_packet(r, update))
+	if (!read_packet(r, spawn) || !read_packet(r, update) || !ai().get_alife())
 		return;
 	if (ai().alife().objects().object(id, true))
 		return; // already have it (P6: repeat is harmless)
+	if (alife_rw().server().ID_to_entity(id))
+	{
+		// A local non-ALife object (EntityLocal, bolt...) holds the id: PerformIDgen would assert.
+		++g_missing;
+		::Msg("! [coop] id %u is taken here by a local object, mirrored entity skipped", id_host);
+		return;
+	}
+	if (parent != kNoId && !ai().alife().objects().object(parent, true))
+	{
+		// Its holder is not here (P6): fetch the holder, then this entity again (once).
+		++g_missing;
+		if (g_refetched.insert(id).second)
+		{
+			Writer w(8);
+			w.u16(parent_host);
+			net::client_send(Msg::StateDumpRequest, w);
+			Writer w2(4);
+			w2.u16(id_host);
+			net::client_send(Msg::StateDumpRequest, w2);
+		}
+		return;
+	}
 
 	u16 type;
 	spawn.r_begin(type);
@@ -323,26 +491,26 @@ void client_on_spawn(PeerId, Reader& r)
 	e->Spawn_Read(spawn);
 	apply_update(e, update);
 	ApplyGuard guard;
-	e->ID = alife_rw().server().PerformIDgen(id);
-	if (e->ID != id)
-	{
-		::Msg("! [coop] id %u is taken locally, mirrored entity [%s] got %u", id, section, e->ID);
-		alife_rw().release(e, false);
-		return;
-	}
+	e->ID = alife_rw().server().PerformIDgen(id); // free: checked above
 	e->ID_Parent = parent;
-	place(e, pos, ang, node, graph_id);
+	// Not registered yet: set the placement only, register_object puts it into the registries.
+	e->o_Position = pos;
+	e->o_Angle = ang;
+	e->m_tNodeID = node;
+	e->m_tGraphID = graph_id;
 	e->m_bOnline = false;
 	alife_rw().register_object(e, true);
 	if (online && parent == kNoId)
 		g_online.insert(id);
+	else if (online)
+		bring_child_online(e);
 	++g_client_spawns;
 }
 
 void client_on_destroy(PeerId, Reader& r)
 {
 	const u16 id = join::to_local(r.u16());
-	if (id == 0)
+	if (id == 0 || !ai().get_alife())
 		return;
 	g_online.erase(id);
 	g_tracks.erase(id);
@@ -350,7 +518,26 @@ void client_on_destroy(PeerId, Reader& r)
 	if (!e)
 		return;
 	ApplyGuard guard;
-	alife_rw().release(e, true); // the standard chain: also destroys the game object (E3)
+	leave_group(e); // on the host scripts unregister a member before releasing it
+	if (CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e))
+	{
+		disband(*g);
+		if (!g->m_bOnline && !ai().game_graph().valid_vertex_id(g->m_tGraphID))
+			g->m_tGraphID = ai().alife().graph().actor()->m_tGraphID; // never placed: unregister reads its vertex
+		alife_rw().release(e, true); // a squad has no game object, even when online
+	}
+	else if (e->m_bOnline)
+	{
+		// Online: the standard event chain destroys the game object and then the entity (E3).
+		NET_Packet packet;
+		packet.w_begin(M_EVENT);
+		packet.w_u32(Level().timeServer());
+		packet.w_u16(GE_DESTROY);
+		packet.w_u16(id);
+		Level().Send(packet, net_flags(TRUE, TRUE));
+	}
+	else
+		alife_rw().release(e, true);
 	++g_client_releases;
 }
 
@@ -363,7 +550,7 @@ void client_on_switch(PeerId, Reader& r)
 	u16 graph_id;
 	read_placement(r, pos, ang, node, graph_id);
 	NET_Packet update;
-	if (!read_packet(r, update) || id == 0)
+	if (!read_packet(r, update) || id == 0 || !ai().get_alife())
 		return;
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	if (!e)
@@ -376,25 +563,20 @@ void client_on_switch(PeerId, Reader& r)
 	}
 	ApplyGuard guard;
 	if (online)
-	{
 		g_online.insert(id);
-		if (!e->m_bOnline)
-		{
-			place(e, pos, ang, node, graph_id);
-			apply_update(e, update);
-			alife_rw().switch_online(e);
-		}
-	}
 	else
 	{
 		g_online.erase(id);
 		g_tracks.erase(id);
-		if (e->m_bOnline)
-			alife_rw().switch_offline(e);
-		place(e, pos, ang, node, graph_id);
-		apply_update(e, update);
 	}
 	++g_client_switches;
+	if (e->ID_Parent != kNoId)
+		return; // held by something here: it goes online/offline with its holder only
+	leave_group(e);
+	if (CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e))
+		apply_group_switch(*g, online, pos, ang, node, graph_id, update);
+	else
+		apply_switch(e, online, pos, ang, node, graph_id, &update);
 }
 
 void client_on_snapshot(PeerId, Reader& r)
@@ -488,9 +670,12 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 
 void install(Session& s)
 {
-	s.on(Msg::EntitySpawn, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_spawn(from, r); });
-	s.on(Msg::EntityDestroy, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_destroy(from, r); });
-	s.on(Msg::EntitySwitch, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_switch(from, r); });
+	// Live only: before that the client is still in its own world (or the menu). The host queues
+	// world changes for a loading client and flushes them after WorldLoaded (P6); what arrives
+	// earlier predates the snapshot and is already inside it.
+	s.on(Msg::EntitySpawn, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_spawn(from, r); });
+	s.on(Msg::EntityDestroy, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_destroy(from, r); });
+	s.on(Msg::EntitySwitch, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_switch(from, r); });
 	s.on(Msg::EntitySnapshot, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_snapshot(from, r); });
 	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (mgr().is_host()) host_on_entity_request(from, r); });
 }
@@ -500,6 +685,7 @@ void reset()
 	g_host_events.clear();
 	g_online.clear();
 	g_tracks.clear();
+	g_refetched.clear();
 	g_last_snapshot = 0;
 }
 
@@ -513,10 +699,12 @@ void host_collect_online(xr_vector<u16>& out)
 	out.clear();
 	if (!ai().get_alife())
 		return;
+	// The host actor (0) is included: on the client it is our proxy, the host's avatar, and it
+	// gets no EntitySwitch ever (host_on_switch skips 0), so without this it stays offline there.
 	for (const auto& it : ai().alife().objects().objects())
 	{
 		const CSE_ALifeDynamicObject* e = it.second;
-		if (e && e->m_bOnline && e->ID_Parent == kNoId && e->ID != 0)
+		if (e && e->m_bOnline && e->ID_Parent == kNoId)
 			out.push_back(e->ID);
 	}
 }
@@ -576,17 +764,26 @@ bool intercept_local_spawn(CSE_Abstract* entity)
 	}
 	if (owner == 0)
 	{
-		Writer w(64);
-		w.str(entity->s_name.c_str());
-		w.u16(join::to_host(entity->ID_Parent));
-		float pos[3] = {entity->o_Position.x, entity->o_Position.y, entity->o_Position.z};
-		w.vec3(pos);
-		net::client_send(Msg::ReqSpawn, w);
+		// Full state (ammo count, condition, flags) so nothing is created or lost by the round trip.
+		requests::client_forward_spawn(entity);
 		++g_forwarded_spawns;
 	}
 	else
 		++g_blocked_spawns;
 	return true;
+}
+
+bool motion_valid(IKinematicsAnimated* ka, u32 motion)
+{
+	if (!ka || !motion)
+		return false;
+	MotionID m;
+	m.val = motion;
+	if (m.slot >= ka->LL_MotionsSlotCount())
+		return false;
+	// Read-only: shared_motions gives its definition table through a non-const accessor only.
+	const MotionDefVec* defs = const_cast<shared_motions&>(ka->LL_MotionsSlot(m.slot)).motion_defs();
+	return defs && m.idx < defs->size();
 }
 
 bool drive_mirror(CGameObject* obj)
@@ -611,10 +808,10 @@ bool drive_mirror(CGameObject* obj)
 			const u32 value = s.anims.motion[part];
 			if (!value || value == it->second.applied[part])
 				continue;
+			if (!motion_valid(ka, value))
+				continue;
 			MotionID m;
 			m.val = value;
-			if (m.slot >= ka->LL_MotionsSlotCount())
-				continue;
 			if (CBlend* b = ka->LL_PlayCycle(u16(part), m, TRUE, nullptr, nullptr))
 				b->timeCurrent = float(s.anims.time_ms[part]) / 1000.f;
 			it->second.applied[part] = value;

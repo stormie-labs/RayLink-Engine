@@ -5,6 +5,7 @@
 #include "coop_world.h"
 #include "coop_entities.h"
 #include "coop_players.h"
+#include "coop_objects.h"
 #include "coop_alife.h"
 #include "coop_net.h"
 
@@ -17,8 +18,12 @@
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "xrServer_Objects_ALife_Items.h"
 #include "../xrServerEntities/xrMessages.h"
+#include "game_graph.h"
+#include "character_community.h"
 
 #include <cstdio>
+
+extern string_path g_last_saved_game;
 
 namespace coop
 {
@@ -47,14 +52,17 @@ struct State
 	bool load_issued = false;
 	bool swap_done = false;
 	u64 last_progress_log = 0;
-	// host: the world we serve; a load or a level change replaces it (epoch++)
-	const void* world_ptr = nullptr;
+	// host: the world we serve (world_generation() when it was seen); a load or a level change
+	// replaces it (epoch++)
+	u32 world_seen = 0;
 	u32 epoch = 1;
 	bool reset_pending = false;
 	// host: transition asked by a client (raw M_CHANGE_LEVEL), waiting for coop_accept_transition
 	std::vector<u8> pending_transition;
 	PeerId transition_from = kInvalidPeer;
 } g;
+
+u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
 
 xr_string key_hex(const PlayerKey& k)
 {
@@ -151,6 +159,23 @@ CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p)
 	return proxy;
 }
 
+// The group lives on one level. A character left behind (its player was away when the host
+// changed level) is moved next to the host: the client loads the level of its character.
+void bring_proxy_to_level(CSE_ALifeHumanStalker& proxy, LPCSTR nick)
+{
+	CSE_ALifeCreatureActor* actor = ai().alife().graph().actor();
+	if (!actor || proxy.ID_Parent != kNoId)
+		return;
+	const CGameGraph& gg = ai().game_graph();
+	if (!gg.valid_vertex_id(proxy.m_tGraphID) ||
+	    gg.vertex(proxy.m_tGraphID)->level_id() == gg.vertex(actor->m_tGraphID)->level_id())
+		return;
+	Fvector pos = actor->o_Position;
+	pos.x += 1.5f;
+	alife_rw().teleport_object(proxy.ID, actor->m_tGraphID, actor->m_tNodeID, pos);
+	::Msg("[coop] character of '%s' was on another level, moved to the group", nick);
+}
+
 // --- host: JoinRequest ---
 void host_on_join_request(PeerId from, Reader&)
 {
@@ -165,7 +190,10 @@ void host_on_join_request(PeerId from, Reader&)
 
 	CSE_ALifeHumanStalker* proxy = find_proxy_by_key(p->key);
 	if (proxy)
+	{
 		::Msg("[coop] '%s' returns to character proxy id %u", p->nick.c_str(), proxy->ID);
+		bring_proxy_to_level(*proxy, p->nick.c_str());
+	}
 	else
 		proxy = create_proxy(*p);
 	if (!proxy)
@@ -181,11 +209,16 @@ void host_on_join_request(PeerId from, Reader&)
 	string64 name;
 	xr_sprintf(name, "coop_join_%u", from);
 	{
+		// save() records every name it writes as the last save; this file is deleted below, and
+		// "load last save" must keep pointing at the host's real one.
+		string_path last_save;
+		xr_strcpy(last_save, g_last_saved_game);
 		NET_Packet packet;
 		packet.w_begin(M_SAVE_GAME);
 		packet.w_stringZ(name);
 		packet.w_u8(0); // keep the host's own current save name
 		Level().Send(packet, net_flags(TRUE));
+		xr_strcpy(g_last_saved_game, last_save);
 	}
 	string_path scop, scoc;
 	save_path(scop, name, ".scop");
@@ -238,6 +271,7 @@ void host_on_world_loaded(PeerId from, Reader&)
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
 	players::equip_resend(); // the newcomer needs everybody's look
+	objects::host_on_peer_ready(from); // zone phases, door/physics poses: not all of it is in the save
 }
 
 // --- client ---
@@ -372,11 +406,15 @@ bool host_can_start()
 void on_host_started()
 {
 	g = State();
-	g.world_ptr = ai().get_alife();
+	g.world_seen = g_world_generation;
 	world::host_scan_proxies();
 }
 
 u32 host_world_epoch() { return g.epoch; }
+
+void on_world_created() { ++g_world_generation; }
+
+u32 world_generation() { return g_world_generation; }
 
 bool accept_transition()
 {
@@ -475,22 +513,22 @@ void on_blob_complete(PeerId from, u32, u32 kind, std::vector<u8>& data)
 // from a fresh snapshot of the new world; requests made in the old one are dropped (epoch).
 void host_watch_world()
 {
-	const void* now_world = ai().get_alife();
-	if (now_world != g.world_ptr)
+	// A generation counter, not the simulator pointer: a same-level quick load deletes and
+	// recreates the simulator in one call, usually at the same address.
+	if (g.world_seen != g_world_generation)
 	{
-		g.world_ptr = now_world;
-		if (now_world)
+		g.world_seen = g_world_generation;
+		objects::reset(); // per-world state of physics/zones belongs to the old world
+		++g.epoch;
+		g.reset_pending = true;
+		for (auto& it : g.peers)
 		{
-			++g.epoch;
-			g.reset_pending = true;
-			for (auto& it : g.peers)
-			{
-				it.second.loading = true;
-				sync::host_begin_join(it.first); // queue/drop world traffic until they rejoin
-			}
+			it.second.loading = true;
+			it.second.proxy = kNoId; // an id of the old world: set again by their JoinRequest
+			sync::host_begin_join(it.first); // queue/drop world traffic until they rejoin
 		}
 	}
-	if (!g.reset_pending || !g_pGameLevel || !g_actor || Device.dwPrecacheFrame)
+	if (!g.reset_pending || !g_pGameLevel || !g_actor || Device.dwPrecacheFrame || !ai().get_alife())
 		return;
 	g.reset_pending = false;
 	world::host_scan_proxies();
@@ -543,9 +581,12 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 		return;
 	}
 
-	// Where we stand and what we look like.
+	// Where we stand and what we look like. CActor::net_Spawn takes its view (r_model_yaw, camera)
+	// from o_torso, not from o_Angle.
 	swap_values(actor->o_Position, proxy->o_Position);
 	swap_values(actor->o_Angle, proxy->o_Angle);
+	swap_values(actor->o_model, proxy->o_model);
+	swap_values(actor->o_torso, proxy->o_torso);
 	swap_values(actor->m_tNodeID, proxy->m_tNodeID);
 	swap_values(actor->m_tGraphID, proxy->m_tGraphID);
 	{
@@ -553,6 +594,8 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 		actor->set_health(proxy->get_health());
 		proxy->set_health(h);
 	}
+	// The host may sit in a vehicle; our character does not (net_Spawn would seat us in it).
+	actor->m_holderID = u16(-1);
 
 	// Who we are: money, community, rank, reputation, name.
 	swap_values(actor->m_dwMoney, proxy->m_dwMoney);
@@ -560,6 +603,21 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	swap_values(actor->CSE_ALifeTraderAbstract::m_rank, proxy->CSE_ALifeTraderAbstract::m_rank);
 	swap_values(actor->m_reputation, proxy->m_reputation);
 	swap_values(actor->m_character_name, proxy->m_character_name);
+	// The proxy is an NPC of community X; a player character uses actor_X (game_relations.ltx has
+	// both, relations and scripts tell them apart).
+	if (actor->m_community_index != NO_COMMUNITY_INDEX)
+	{
+		const shared_str npc = CHARACTER_COMMUNITY::IndexToId(actor->m_community_index, shared_str(), true);
+		if (npc.size() && strncmp(npc.c_str(), "actor", 5))
+		{
+			string128 player;
+			xr_sprintf(player, "actor_%s", npc.c_str());
+			const CHARACTER_COMMUNITY_INDEX index =
+			    CHARACTER_COMMUNITY::IdToIndex(shared_str(player), NO_COMMUNITY_INDEX, true);
+			if (index != NO_COMMUNITY_INDEX)
+				actor->m_community_index = index;
+		}
+	}
 
 	// What we carry: items keep their ids, only parents swap. Children lists are rebuilt from
 	// ID_Parent when ALife registers the loaded objects right after this hook.

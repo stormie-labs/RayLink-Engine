@@ -13,6 +13,7 @@
 #include "inventory_upgrade_root.h"
 #include "inventory_upgrade_group.h"
 #include "inventory_upgrade_property.h"
+#include "coop/coop_items.h" // Anomaly Coop
 
 extern int g_upgrades_log = 0;
 
@@ -383,6 +384,8 @@ void Manager::test_all_upgrades( CInventoryItem& item )
 				{
 					upgrade->run_effects(loading);
 					item.add_upgrade(upgrade_id, loading);
+					if (!loading)
+						coop::items::touch(&item); // Anomaly Coop: owner's upgrade -> host
 
 					if (g_upgrades_log == 1)
 					{

@@ -7,6 +7,7 @@
 #include "game_cl_base.h"
 #include "ai_space.h"
 #include "alife_object_registry.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 xr_string xrServer::ent_name_safe(u16 eid)
 {
@@ -106,5 +107,6 @@ void xrServer::Process_event_destroy(NET_Packet& P, ClientID sender, u32 time, u
 	if (game)
 		game->OnDestroyObject(e_dest->ID);
 
+	coop::events::host_on_destroy(e_dest); // Anomaly Coop: non-ALife children -> clients
 	entity_Destroy(e_dest);
 }

@@ -19,6 +19,7 @@
 #include "InventoryOwner.h"
 #include "UIGameCustom.h"
 #include "ui/UIActorMenu.h"
+#include "coop/coop_items.h" // Anomaly Coop
 
 CEatableItem::CEatableItem()
 {
@@ -171,6 +172,7 @@ bool CEatableItem::UseBy(CEntityAlive* entity_alive)
 			SetCondition(0);
 	}
 
+	coop::items::touch(this); // Anomaly Coop: portions changed
 	return true;
 }
 

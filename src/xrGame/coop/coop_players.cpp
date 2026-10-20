@@ -3,6 +3,8 @@
 #include "coop_manager.h"
 #include "coop_join.h"
 #include "coop_world.h"
+#include "coop_survival.h"
+#include "coop_entities.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -264,6 +266,11 @@ bool drive_avatar(CAI_Stalker* avatar)
 	xform.rotateY(-s.body_yaw);
 	xform.c.set(s.pos);
 	avatar->XFORM().set(xform);
+	if (survival::avatar_pose_override(avatar)) // WP8: wounded / dead pose
+	{
+		t.applied_legs = t.applied_torso = t.applied_head = 0; // replay the owner's motions after standing up
+		return true;
+	}
 
 	// Exact motions the owner's character plays (same visual => same MotionIDs).
 	IKinematicsAnimated* ka = smart_cast<IKinematicsAnimated*>(avatar->Visual());
@@ -275,7 +282,7 @@ bool drive_avatar(CAI_Stalker* avatar)
 				return;
 			MotionID m;
 			m.val = value;
-			if (m.slot < ka->LL_MotionsSlotCount())
+			if (entities::motion_valid(ka, value)) // the avatar's visual may not be the owner's yet
 				ka->PlayCycle(m);
 			applied = value;
 		};

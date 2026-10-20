@@ -8,6 +8,7 @@
 //#include "Physics.h"
 #include "../xrEngine/xr_collide_form.h"
 #include "../Include/xrRender/Kinematics.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
@@ -221,6 +222,7 @@ void CBreakableObject::Split()
 void CBreakableObject::Break()
 {
 	if (m_pPhysicsShell)return;
+	coop::objects::on_break(this); // Anomaly Coop: the host relays the break
 	DestroyUnbroken();
 	CreateBroken();
 	ActivateBroken();
@@ -239,6 +241,7 @@ void CBreakableObject::Break()
 
 void CBreakableObject::SendDestroy()
 {
+	if (coop::objects::host_destroys(this)) { bRemoved = true; return; } // Anomaly Coop: the host removes it
 	if (Local()) DestroyObject();
 	//	NET_Packet		P;
 	//	u_EventGen		(P,GE_DESTROY,ID());

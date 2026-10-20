@@ -19,6 +19,7 @@
 #include "UI/UIGameTutorial.h"
 #include "ui/UIPdaWnd.h"
 #include "../xrNetServer/NET_AuthCheck.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 #include "../xrphysics/physicscommon.h"
 extern ENGINE_API bool g_dedicated_server;
@@ -296,6 +297,7 @@ extern BOOL g_SV_Disable_Auth_Check;
 void CLevel::Send(NET_Packet& P, u32 dwFlags, u32 dwTimeout)
 {
 	if (IsDemoPlayStarted() || IsDemoPlayFinished()) return;
+	if (coop::events::client_filter(P)) return; // Anomaly Coop: on a client world changes go through the host
 	// optimize the case when server located in our memory
 	if (psNET_direct_connect)
 	{

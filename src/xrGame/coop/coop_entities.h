@@ -11,6 +11,7 @@ class CGameObject;
 class CSE_Abstract;
 class CSE_ALifeDynamicObject;
 class NET_Packet;
+class IKinematicsAnimated;
 
 namespace coop
 {
@@ -56,5 +57,9 @@ struct ClientApply
 };
 // Client: play the host snapshot on a mirrored creature (called by coop_remote).
 bool drive_mirror(CGameObject* obj);
+// True if a MotionID value from another machine exists in this visual's motion set. Same visual
+// means same ids; a different one may have fewer motions, and playing a missing one reads past
+// the motion table.
+bool motion_valid(IKinematicsAnimated* ka, u32 motion);
 } // namespace entities
 } // namespace coop

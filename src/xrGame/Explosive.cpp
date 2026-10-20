@@ -37,6 +37,7 @@
 #include "profiler.h"
 
 #include "../Include/xrRender/Kinematics.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 #define EFFECTOR_RADIUS 30.f
 const u16 TEST_RAYS_PER_OBJECT = 5;
 const u16 BLASTED_OBJ_PROCESSED_PER_FRAME = 3;
@@ -408,6 +409,7 @@ void CExplosive::Explode()
 	bool SendHits = false;
 	if (OnServer()) SendHits = true;
 	else SendHits = false;
+	if (coop::objects::explosion_visual_only(cast_game_object())) SendHits = false; // Anomaly Coop: the host deals the damage
 
 
 	for (int i = 0; i < m_iFragsNum; ++i)
@@ -455,6 +457,7 @@ void CExplosive::Explode()
 		if (pGameObject && cast_game_object()->ID() != pGameObject->ID())
 			m_blasted_objects.push_back(pGameObject);
 	}
+	if (coop::objects::explosion_visual_only(cast_game_object())) m_blasted_objects.clear(); // Anomaly Coop: no local blast wave
 
 	GetExplosionBox(m_vExplodeSize);
 	START_PROFILE("explosive/activate explosion box")
@@ -574,6 +577,7 @@ void CExplosive::OnAfterExplosion()
 		m_pExpParticle = NULL;
 	}
 	//ликвидировать сам объект 
+	if (coop::objects::host_destroys(cast_game_object())) return; // Anomaly Coop: the host removes it
 	if (cast_game_object()->Local()) cast_game_object()->DestroyObject();
 
 	//	NET_Packet			P;
@@ -631,6 +635,7 @@ void CExplosive::OnEvent(NET_Packet& P, u16 type)
 			P.r_u16(parent_id);
 			P.r_vec3(pos);
 			P.r_vec3(normal);
+			coop::objects::on_explode(cast_game_object(), parent_id, pos, normal); // Anomaly Coop: the host relays its detonation
 
 			SetInitiator(parent_id);
 			ExplodeParams(pos, normal);
@@ -654,6 +659,7 @@ void CExplosive::ExplodeParams(const Fvector& pos,
 void CExplosive::GenExplodeEvent(const Fvector& pos, const Fvector& normal)
 {
 	if (OnClient() || cast_game_object()->Remote()) return;
+	if (coop::objects::explode_blocked(cast_game_object())) return; // Anomaly Coop: only the host detonates
 
 	//	if( m_bExplodeEventSent ) 
 	//		return;

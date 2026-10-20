@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "coop/coop_survival.h"
 #include <dinput.h>
 #include "Actor.h"
 #include "Torch.h"
@@ -533,6 +534,9 @@ void CActor::ActorUse()
 		CGameObject::u_EventSend(P);
 		return;
 	}
+
+	if (m_pPersonWeLookingAt && coop::survival::on_use_person(m_pPersonWeLookingAt)) // Anomaly Coop: revive a wounded teammate
+		return;
 
 	if (!psActorFlags.test(AF_MULTI_ITEM_PICKUP))
 		m_bPickupMode = true;

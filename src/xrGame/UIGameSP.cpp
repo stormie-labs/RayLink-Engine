@@ -345,6 +345,7 @@ bool CChangeLevelWnd::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 }
 
 bool g_block_pause = false;
+static BOOL g_coop_change_level_timer = TRUE; // Anomaly Coop: Show paused the game timer (no session when it opened)
 
 void CChangeLevelWnd::Show()
 {
@@ -359,12 +360,13 @@ void CChangeLevelWnd::Show()
 
 
 	g_block_pause = true;
-	Device.Pause(TRUE, coop::mgr().active() ? FALSE : TRUE, TRUE, "CChangeLevelWnd_show"); // Anomaly Coop: no world pause in a session
+	g_coop_change_level_timer = coop::mgr().active() ? FALSE : TRUE; // Anomaly Coop: no world pause in a session
+	Device.Pause(TRUE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_show"); // Anomaly Coop
 	bShowPauseString = FALSE;
 }
 
 void CChangeLevelWnd::Hide()
 {
 	g_block_pause = false;
-	Device.Pause(FALSE, coop::mgr().active() ? FALSE : TRUE, TRUE, "CChangeLevelWnd_hide"); // Anomaly Coop
+	Device.Pause(FALSE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_hide"); // Anomaly Coop: undo what Show did
 }

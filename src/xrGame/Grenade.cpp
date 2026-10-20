@@ -17,6 +17,7 @@
 #include "../xrphysics/ExtendedGeom.h"
 #include "../xrphysics/CalculateTriangle.h"
 #include "../xrphysics/tri-colliderknoopc/dctriangle.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 #endif
 
 #define GRENADE_REMOVE_TIME		30000
@@ -183,6 +184,9 @@ void CGrenade::Throw()
 {
 	if (m_thrown)
 		return;
+
+	if (coop::objects::client_throw(this)) // Anomaly Coop: the host spawns, throws and detonates the grenade
+	{ m_thrown = true; return; } // Anomaly Coop
 
 	if (!m_fake_missile)
 		return;

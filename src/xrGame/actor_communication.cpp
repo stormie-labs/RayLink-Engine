@@ -1,4 +1,5 @@
 #include "pch_script.h"
+#include "coop/coop_dialog.h"
 #include "actor.h"
 #include "UIGameSP.h"
 #include "PDA.h"
@@ -122,6 +123,8 @@ void CActor::TryToTalk()
 
 void CActor::RunTalkDialog(CInventoryOwner* talk_partner, bool disable_break)
 {
+	if (!coop::dialog::may_start_talk(talk_partner, disable_break)) // Anomaly Coop: one talker per NPC
+		return;
 	//предложить поговорить с нами
 	if (talk_partner->OfferTalk(this))
 	{

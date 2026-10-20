@@ -4,6 +4,9 @@
 #include "coop_manager.h"
 #include "coop_join.h"
 #include "coop_sync.h"
+#include "coop_requests.h"
+#include "coop_survival.h"
+#include "coop_presence.h"
 
 #include <cstdlib>
 
@@ -156,5 +159,8 @@ void register_console_commands()
 	CMD1(CCC_CoopDump, "coop_dump");
 	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));
+	CMD4(CCC_Integer, "coop_friendly_fire", &g_coop_friendly_fire, 0, 1); // host setting
+	survival::register_console();
+	presence::register_console();
 }
 } // namespace coop

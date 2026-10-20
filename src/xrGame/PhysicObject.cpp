@@ -13,6 +13,7 @@
 //#include "../xrphysics/PhysicsShellAnimator.h"
 #include "moving_bones_snd_player.h"
 #include "../xrphysics/extendedgeom.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 #ifdef	DEBUG
 #include "phdebug.h"
 #include "../xrengine/objectdump.h"
@@ -400,6 +401,7 @@ void CPhysicObject::UpdateCL()
 	}
 
 	m_anim_script_callback.update(*this);
+	coop::objects::physic_anim(this, m_anim_blend); // Anomaly Coop: animated doors/gates follow the host's phase
 	PHObjectPositionUpdate();
 
 #ifdef	DEBUG

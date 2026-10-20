@@ -24,6 +24,8 @@
 #include "script_attachment_manager.h"
 
 #include "GametaskManager.h"
+#include "coop/coop_presence.h" // Anomaly Coop
+#include "coop/coop_survival.h" // Anomaly Coop
 
 extern CUIGameCustom* CurrentGameUI()
 {
@@ -293,6 +295,8 @@ void CHUDManager::RenderUI()
 			xrCriticalSectionGuard guard(&ui_lock);
 			pUIGame->Render();
 		}
+		coop::presence::render_hud(); // Anomaly Coop: name tags over other players
+		coop::survival::render_hud(); // Anomaly Coop: wounded / dead / spectator hints
 
 		UI().RenderFont();
 	}

@@ -39,6 +39,12 @@ bool is_proxy(u16 id);
 // Host: increments when a load or level change replaces the served world. Requests from
 // peers that have not rejoined the current world must be ignored (see sync::host_peer_joining).
 u32 host_world_epoch();
+// Engine hook (end of the CALifeSimulator constructor, main thread): a world was created
+// (save loaded, level changed, new game). A same-level quick load deletes and recreates the
+// simulator in one call, often at the same address, so the pointer cannot tell worlds apart.
+void on_world_created();
+// Number of worlds created in this process (any role).
+u32 world_generation();
 // Host: execute a level change a client asked for (console coop_accept_transition).
 bool accept_transition();
 

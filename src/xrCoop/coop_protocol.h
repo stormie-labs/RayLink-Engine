@@ -68,7 +68,7 @@ enum class Msg : uint16_t
 	PlayerHit = 0x0116, // host -> owner: damage dealt to that player's character
 	PlayerWounded = 0x0117, // owner -> host -> all: life state (alive / wounded / dead / spectating), coop_survival
 	PlayerRevive = 0x0118, // revive request / host orders (revive, respawn, spectate, refused)
-	PlayerDied = 0x0119, // owner -> host: bled out, host decides by coop_death_mode
+	PlayerDied = 0x0119, // engine death of a player character (coop_events relay)
 	PlayerRules = 0x011A, // host -> all: survival rules (death mode, bleed-out, revive health, respawn delay)
 
 	// entities (host -> clients)

@@ -9,6 +9,14 @@
 #include "coop_worldstate.h"
 #include "coop_script.h"
 #include "coop_story.h"
+#include "coop_events.h"
+#include "coop_requests.h"
+#include "coop_dialog.h"
+#include "coop_trade.h"
+#include "coop_survival.h"
+#include "coop_presence.h"
+#include "coop_items.h"
+#include "coop_objects.h"
 #include "coop_remote.h"
 
 #include "Level.h"
@@ -37,6 +45,14 @@ void install(Session& s)
 	worldstate::install(s);
 	script::install(s);
 	story::install(s);
+	events::install(s);
+	requests::install(s);
+	dialog::install(s);
+	trade::install(s);
+	survival::install(s);
+	presence::install(s);
+	items::install(s);
+	objects::install(s);
 }
 
 void on_session_started()
@@ -46,6 +62,14 @@ void on_session_started()
 	worldstate::reset();
 	script::reset();
 	story::reset();
+	events::reset();
+	requests::reset();
+	dialog::reset();
+	trade::reset();
+	survival::reset();
+	presence::reset();
+	items::reset();
+	objects::reset();
 	g_joining.clear();
 }
 
@@ -55,6 +79,8 @@ void on_peer_left(PeerId id)
 {
 	players::on_peer_left(id);
 	entities::on_peer_left(id);
+	dialog::on_peer_left(id);
+	trade::on_peer_left(id);
 	net::host_drop(id);
 	g_joining.erase(id);
 }
@@ -68,6 +94,14 @@ void reset()
 	worldstate::reset();
 	script::reset();
 	story::reset();
+	events::reset();
+	requests::reset();
+	dialog::reset();
+	trade::reset();
+	survival::reset();
+	presence::reset();
+	items::reset();
+	objects::reset();
 	g_joining.clear();
 }
 
@@ -95,7 +129,15 @@ void on_client_live()
 void frame()
 {
 	players::frame();
+	survival::frame();
+	presence::frame();
+	items::frame();
 	entities::frame();
+	events::frame(); // after entities: a spawn goes out before its parent change
+	objects::frame();
+	requests::frame();
+	dialog::frame();
+	trade::frame();
 	worldstate::frame();
 	script::frame();
 	story::frame();
@@ -110,6 +152,14 @@ void print_status()
 	worldstate::print_status();
 	script::print_status();
 	story::print_status();
+	events::print_status();
+	requests::print_status();
+	dialog::print_status();
+	trade::print_status();
+	survival::print_status();
+	presence::print_status();
+	items::print_status();
+	objects::print_status();
 }
 
 void dump_state(LPCSTR args)
@@ -143,10 +193,15 @@ void dump_state(LPCSTR args)
 
 bool is_remote_driven(const CGameObject* obj)
 {
-	if (!mgr().active() || !obj)
-		return false;
-	if (smart_cast<const CActor*>(obj))
+	if (!obj || smart_cast<const CActor*>(obj))
 		return false; // the local actor is always ours
+	// A player character never thinks on its own, in a session or not: outside a session (host plays
+	// alone, or after the session ended) it must stay inert and unharmable, or it would wander off
+	// with the player's inventory and end up dead in the next save.
+	if (!xr_strcmp(obj->cNameSect(), "coop_player_avatar"))
+		return true;
+	if (!mgr().active())
+		return false;
 	const u16 id = obj->ID();
 	if (world::is_player_proxy(id))
 		return true; // a player character is always driven by its player

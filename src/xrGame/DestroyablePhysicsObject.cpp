@@ -13,6 +13,7 @@
 #include "script_callback_ex.h"
 #include "script_game_object.h"
 #include "../xrphysics/PhysicsShell.h"
+#include "coop/coop_objects.h" // Anomaly Coop
 #ifdef DEBUG
 #include "../xrphysics/IPHWorld.h"
 //#include "PHWorld.h"
@@ -79,6 +80,7 @@ BOOL CDestroyablePhysicsObject::net_Spawn(CSE_Abstract* DC)
 //void CDestroyablePhysicsObject::Hit							(float P,Fvector &dir,CObject *who,s16 element,Fvector p_in_object_space, float impulse,  ALife::EHitType hit_type)
 void CDestroyablePhysicsObject::Hit(SHit* pHDS)
 {
+	if (coop::objects::world_hit_blocked(this)) return; // Anomaly Coop: the host decides destruction
 	SHit HDS = *pHDS;
 	callback(GameObject::eHit)(
 		lua_game_object(),

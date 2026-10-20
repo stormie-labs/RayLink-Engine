@@ -174,6 +174,11 @@ extern bool IsGameTypeSingle();
 
 #include "..\..\xrEngine\x_ray.h"
 
+// Anomaly Coop: true while the open menu left the level in seqFrame (co-op session when it opened). Decided
+// when the menu opens and kept until it closes: a session may start or end meanwhile, and the close and the
+// save screenshot must undo exactly what the open did.
+static bool g_coop_menu_world_running = false; // Anomaly Coop
+
 void CMainMenu::Activate(bool bActivate)
 {
 	if (!!m_Flags.test(flActive) == bActivate) return;
@@ -184,7 +189,9 @@ void CMainMenu::Activate(bool bActivate)
 		return;
 
 	// Anomaly Coop: in a session the menu behaves like multiplayer: the world keeps running for everybody
-	bool b_is_single = IsGameTypeSingle() && !coop::mgr().active();
+	if (bActivate) // Anomaly Coop
+		g_coop_menu_world_running = coop::mgr().active(); // Anomaly Coop
+	bool b_is_single = IsGameTypeSingle() && !g_coop_menu_world_running; // Anomaly Coop
 
 	if (g_dedicated_server && bActivate) return;
 
@@ -510,7 +517,8 @@ void CMainMenu::OnFrame()
 
 		if (g_pGameLevel && m_Flags.test(flActive))
 		{
-			Device.seqFrame.Remove(g_pGameLevel);
+			if (!g_coop_menu_world_running) // Anomaly Coop: in a session the level never left seqFrame
+				Device.seqFrame.Remove(g_pGameLevel);
 			Device.seqRender.Remove(g_pGameLevel);
 		};
 
@@ -559,7 +567,8 @@ void CMainMenu::Screenshot(IRender_interface::ScreenshotMode mode, LPCSTR name)
 		xr_strcpy(m_screenshot_name, name);
 		if (g_pGameLevel && m_Flags.test(flActive))
 		{
-			Device.seqFrame.Add(g_pGameLevel);
+			if (!g_coop_menu_world_running) // Anomaly Coop: a second entry, then the Remove above would freeze the world
+				Device.seqFrame.Add(g_pGameLevel);
 			Device.seqRender.Add(g_pGameLevel);
 		};
 		m_screenshotFrame = Device.dwFrame + 1;

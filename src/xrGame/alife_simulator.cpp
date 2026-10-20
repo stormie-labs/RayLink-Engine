@@ -8,6 +8,7 @@
 
 #include "pch_script.h"
 #include "alife_simulator.h"
+#include "coop/coop_join.h"
 #include "xrServer_Objects_ALife.h"
 #include "ai_space.h"
 #include "../xrEngine/IGame_Persistent.h"
@@ -77,6 +78,7 @@ CALifeSimulator::CALifeSimulator(xrServer* server, shared_str* command_line) :
 	functor();
 
 	load(p.m_game_or_spawn, !xr_strcmp(p.m_new_or_load, "load") ? false : true, !xr_strcmp(p.m_new_or_load, "new"));
+	coop::join::on_world_created(); // Anomaly Coop: a new world (load, level change, new game)
 }
 
 CALifeSimulator::~CALifeSimulator()

@@ -9,6 +9,7 @@
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Items.h"
 #include "xrServer_Objects_ALife_Monsters.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 void xrServer::Process_event(NET_Packet& P, ClientID sender)
 {
@@ -226,6 +227,7 @@ void xrServer::Process_event(NET_Packet& P, ClientID sender)
 #endif // #ifndef MASTER_GOLD
 
 			game->on_death(e_dest, e_src);
+			coop::events::host_on_death(id_dest, id_src); // Anomaly Coop: -> clients
 
 			xrClientData* c_src = e_src->owner; // клиент, чей юнит убил
 
