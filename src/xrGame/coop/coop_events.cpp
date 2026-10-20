@@ -634,6 +634,7 @@ void client_on_entity_parent(PeerId, Reader& r)
 	t.parent = new_h == kNoId ? kNoId : join::to_local(new_h);
 	t.pos.set(p[0], p[1], p[2]);
 	t.since = mgr().now_ms();
+	entities::client_on_holder_changed(item, t.parent, t.online); // a dropped item stays online here
 	g_parent_targets[item] = t; // latest wins (state, not events: P5)
 	client_step_parents();
 }

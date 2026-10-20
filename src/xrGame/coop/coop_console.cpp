@@ -7,14 +7,13 @@
 #include "coop_requests.h"
 #include "coop_survival.h"
 #include "coop_presence.h"
+#include "coop_script.h"
 
 #include <cstdlib>
 
 namespace coop
 {
-namespace
-{
-// "1.2.3.4:5678" / "1.2.3.4" / "[::1]:5678" -> address + port.
+// "1.2.3.4:5678" / "1.2.3.4" / "[::1]:5678" -> address + port. Also used by coop.connect (coop_script.cpp).
 bool parse_endpoint(LPCSTR args, xr_string& address, u16& port)
 {
 	xr_string s = args;
@@ -44,6 +43,8 @@ bool parse_endpoint(LPCSTR args, xr_string& address, u16& port)
 	return !address.empty() && port != 0;
 }
 
+namespace
+{
 class CCC_CoopHost : public IConsole_Command
 {
 public:
@@ -58,7 +59,10 @@ public:
 			::Msg("! usage: coop_host [port]");
 			return;
 		}
-		mgr().start_host(port);
+		if (mgr().start_host(port))
+			script::note_start(nullptr, port); // co-op menu shows the port (W4)
+		else if (!mgr().active())
+			script::note_start_failed("coop_host failed, see the log");
 	}
 	void Info(TInfo& I) override { xr_strcpy(I, "host a co-op session for the current game: coop_host [port]"); }
 };
@@ -76,7 +80,8 @@ public:
 			::Msg("! usage: coop_connect <ip>[:port]");
 			return;
 		}
-		mgr().start_client(address.c_str(), port);
+		if (mgr().start_client(address.c_str(), port))
+			script::note_start(address.c_str(), port); // co-op menu shows the address (W4)
 	}
 	void Info(TInfo& I) override { xr_strcpy(I, "join a co-op session: coop_connect <ip>[:port]"); }
 };
@@ -85,7 +90,12 @@ class CCC_CoopDisconnect : public IConsole_Command
 {
 public:
 	CCC_CoopDisconnect(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
-	void Execute(LPCSTR) override { mgr().stop("left the session"); }
+	void Execute(LPCSTR) override
+	{
+		if (mgr().active())
+			script::note_user_stop(); // co-op menu: not an error (W4)
+		mgr().stop("left the session");
+	}
 	void Info(TInfo& I) override { xr_strcpy(I, "leave or close the co-op session"); }
 };
 

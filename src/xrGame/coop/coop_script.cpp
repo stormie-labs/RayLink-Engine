@@ -96,6 +96,30 @@ struct UiStats
 	u64 stash_cleared = 0; // session ended with stashed values
 };
 
+// Co-op menu (W4): what the window shows besides the live session, and "host when the next world is loaded".
+// Survives reset(); main thread only (console, menu callbacks, frame pump).
+struct MenuMemo
+{
+	u16 port = 0; // host: listen port, client: target port (0 = unknown, e.g. the -coop_host autostart)
+	std::string address; // client: target address
+	std::string last_error; // why the last session ended or could not start ("" = nothing to show)
+	std::string last_code; // RejectReason name for refusals, else "start" / "lost" / "left"
+	bool last_by_user = false;
+	u64 last_ms = 0;
+	u64 rejected_ms = 0; // a refusal is more precise than the disconnect that follows it
+	bool user_stop = false; // the next on_session_end was asked for by the player
+	bool pending = false; // host as soon as a world newer than pending_gen is up
+	u16 pending_port = 0;
+	u32 pending_gen = 0;
+	u64 pending_ms = 0;
+	u64 ready_since = 0;
+};
+constexpr u64 kPendingMaxMs = 15 * 60 * 1000; // a forgotten "host after loading" must not open a port hours later
+constexpr u64 kPendingSettleMs = 2000; // a new game changes level right after its first frame
+constexpr u64 kRejectShadowMs = 3000;
+
+MenuMemo g_menu;
+
 Stats g_stats;
 std::deque<Outgoing> g_outbox;
 std::deque<Incoming> g_inbox;
@@ -613,7 +637,7 @@ bool g_pump_on = false;
 
 void pump_sync()
 {
-	const bool need = g_reject.pending || !g_stash.empty();
+	const bool need = g_reject.pending || !g_stash.empty() || g_menu.pending;
 	if (need && !g_pump_on)
 	{
 		Device.seqFrame.Add(&g_pump, REG_PRIORITY_LOW);
@@ -765,8 +789,110 @@ void deliver_rejection()
 		++g_ui.failed; // logged by call_module; the log already has the full diff
 }
 
+// --- co-op menu (W4) -----------------------------------------------------------------------------
+
+void menu_error(const char* code, const std::string& text, bool by_user)
+{
+	g_menu.last_error = text;
+	g_menu.last_code = code ? code : "";
+	g_menu.last_by_user = by_user;
+	g_menu.last_ms = mgr().now_ms();
+}
+
+void menu_clear_error()
+{
+	g_menu.last_error.clear();
+	g_menu.last_code.clear();
+	g_menu.last_by_user = false;
+	g_menu.last_ms = 0;
+	g_menu.rejected_ms = 0;
+}
+
+void menu_cancel_pending(const char* why)
+{
+	if (!g_menu.pending)
+		return;
+	g_menu.pending = false;
+	g_menu.ready_since = 0;
+	if (why)
+		::Msg("[coop] hosting after loading cancelled: %s", why);
+	pump_sync();
+}
+
+// In a level with ALife and a living actor; quiet version of join::host_can_start (that one logs).
+bool level_ready_for_host()
+{
+	if (!g_pGameLevel || !g_actor || Device.dwPrecacheFrame || !ai().get_alife())
+		return false;
+	return g_actor->g_Alive();
+}
+
+bool menu_start_host(u16 port, std::string& why)
+{
+	if (mgr().active())
+	{
+		why = "already in a co-op session";
+		return false;
+	}
+	if (!level_ready_for_host())
+	{
+		why = "no game is loaded: load a save or start a new game first";
+		return false;
+	}
+	menu_clear_error();
+	if (!mgr().start_host(port))
+	{
+		string256 text;
+		xr_sprintf(text, "could not host on port %u (is it used by another program?), see the log", u32(port));
+		why = text;
+		menu_error("start", why, false);
+		return false;
+	}
+	note_start(nullptr, port);
+	return true;
+}
+
+// Frame pump part: host once a world newer than the request is up and has settled.
+void menu_pending_frame()
+{
+	if (!g_menu.pending)
+		return;
+	const u64 now = mgr().now_ms();
+	if (mgr().active())
+	{
+		menu_cancel_pending("a session is already running");
+		return;
+	}
+	if (now - g_menu.pending_ms > kPendingMaxMs)
+	{
+		menu_cancel_pending("no game was loaded within 15 minutes");
+		return;
+	}
+	if (join::world_generation() == g_menu.pending_gen || !level_ready_for_host())
+	{
+		g_menu.ready_since = 0;
+		return;
+	}
+	if (!g_menu.ready_since)
+	{
+		g_menu.ready_since = now;
+		return;
+	}
+	if (now - g_menu.ready_since < kPendingSettleMs)
+		return;
+	const u16 port = g_menu.pending_port;
+	g_menu.pending = false;
+	g_menu.ready_since = 0;
+	std::string why;
+	if (menu_start_host(port, why))
+		::Msg("[coop] the game is loaded: hosting on port %u as requested from the menu", u32(port));
+	else
+		::Msg("! [coop] hosting after loading failed: %s", why.c_str());
+}
+
 void _BCL UiPump::OnFrame()
 {
+	menu_pending_frame();
 	if (!g_stash.empty() && !mgr().active())
 	{
 		stash_clear();
@@ -793,6 +919,189 @@ void copy_capped(const std::vector<std::string>& from, std::vector<std::string>&
 	to.assign(from.begin(), from.begin() + ptrdiff_t(from.size() < kMaxListed ? from.size() : kMaxListed));
 }
 
+// --- co-op menu: Lua side (W4) -------------------------------------------------------------------
+
+void set_bool(lua_State* L, const char* name, bool v)
+{
+	lua_pushboolean(L, v ? 1 : 0);
+	lua_setfield(L, -2, name);
+}
+
+// Port argument: nil/none -> kDefaultPort, else an integer 1..65535; false if invalid.
+bool arg_port(lua_State* L, int idx, u16& port)
+{
+	if (lua_isnoneornil(L, idx))
+	{
+		port = kDefaultPort;
+		return true;
+	}
+	if (lua_type(L, idx) != LUA_TNUMBER)
+		return false;
+	const lua_Number v = lua_tonumber(L, idx);
+	if (v < 1 || v > 65535 || v != lua_Number(s32(v)))
+		return false;
+	port = u16(v);
+	return true;
+}
+
+int fail2(lua_State* L, const char* why)
+{
+	lua_pushboolean(L, 0);
+	lua_pushstring(L, why);
+	return 2;
+}
+
+// coop.session_info() -> table (see coop_script.h). Never fails, works in the main menu.
+int l_session_info(lua_State* L)
+{
+	const Manager& m = mgr();
+	const u64 now = m.now_ms();
+	lua_newtable(L);
+	set_field(L, "phase", std::string(phase_name(m.phase())));
+	set_bool(L, "active", m.active());
+	set_bool(L, "host", m.is_host());
+	set_bool(L, "client", m.is_client());
+	set_bool(L, "live", m.is_host() || m.is_live_client());
+	set_field(L, "self_id", m.active() && m.self() != kInvalidPeer ? lua_Number(m.self()) : lua_Number(-1));
+	set_field(L, "nick", std::string(m.nick()));
+	set_field(L, "max_players", lua_Number(kMaxPlayers));
+	set_field(L, "default_port", lua_Number(kDefaultPort));
+	if (m.active() && g_menu.port)
+		set_field(L, "port", lua_Number(g_menu.port));
+	if (m.is_client() && !g_menu.address.empty())
+		set_field(L, "address", g_menu.address);
+	if (!g_menu.last_error.empty())
+	{
+		set_field(L, "last_error", g_menu.last_error);
+		set_field(L, "last_error_code", g_menu.last_code);
+		set_field(L, "last_error_age", lua_Number(now - g_menu.last_ms));
+		set_bool(L, "last_by_user", g_menu.last_by_user);
+	}
+	if (g_menu.pending)
+	{
+		set_field(L, "pending_host", lua_Number(g_menu.pending_port));
+		set_field(L, "pending_age", lua_Number(now - g_menu.pending_ms));
+	}
+
+	// players: this machine first, then the session's peers (client: host + the PeerList)
+	lua_newtable(L);
+	int index = 0;
+	auto push_player = [L, &index](PeerId id, const char* nick, u32 rtt, float loss, bool joined, bool self,
+	                       const char* address)
+	{
+		lua_newtable(L);
+		set_field(L, "id", lua_Number(id));
+		set_field(L, "nick", std::string(nick ? nick : ""));
+		set_field(L, "rtt", lua_Number(rtt));
+		set_field(L, "loss", lua_Number(loss));
+		set_bool(L, "joined", joined);
+		set_bool(L, "is_self", self);
+		set_bool(L, "is_host", id == kHostPeer);
+		if (address && *address)
+			set_field(L, "address", std::string(address));
+		lua_rawseti(L, -2, ++index);
+	};
+	if (m.active())
+	{
+		const PeerId self = m.self();
+		if (self != kInvalidPeer)
+			push_player(self, m.nick(), 0, 0.f, true, true, nullptr);
+		for (const PeerInfo& p : m.session().peers())
+		{
+			if (p.id == self)
+				continue;
+			push_player(p.id, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
+			    m.is_host() ? p.address.c_str() : nullptr);
+		}
+	}
+	lua_setfield(L, -2, "players");
+	return 1;
+}
+
+// coop.host(port) -> true | false, reason. Hosts the game that is loaded now.
+int l_host(lua_State* L)
+{
+	u16 port = 0;
+	if (!arg_port(L, 1, port))
+		return fail2(L, "bad port (1..65535)");
+	menu_cancel_pending(nullptr);
+	std::string why;
+	if (!menu_start_host(port, why))
+		return fail2(L, why.c_str());
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// coop.host_when_ready(port) -> true | false, reason. nil or 0 cancels a pending request.
+int l_host_when_ready(lua_State* L)
+{
+	if (lua_isnoneornil(L, 1) || (lua_type(L, 1) == LUA_TNUMBER && lua_tonumber(L, 1) == 0))
+	{
+		menu_cancel_pending("cancelled from the menu");
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+	u16 port = 0;
+	if (!arg_port(L, 1, port))
+		return fail2(L, "bad port (1..65535)");
+	if (mgr().active())
+		return fail2(L, "already in a co-op session");
+	menu_clear_error();
+	g_menu.pending = true;
+	g_menu.pending_port = port;
+	g_menu.pending_gen = join::world_generation();
+	g_menu.pending_ms = mgr().now_ms();
+	g_menu.ready_since = 0;
+	pump_sync();
+	::Msg("[coop] will host on port %u as soon as a game is loaded", u32(port));
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// coop.connect("ip[:port]") -> true | false, reason. The result arrives later (session_info().phase).
+int l_connect(lua_State* L)
+{
+	if (lua_type(L, 1) != LUA_TSTRING)
+		return fail2(L, "address must be a string");
+	size_t len = 0;
+	const char* s = lua_tolstring(L, 1, &len);
+	if (len == 0 || len > 255)
+		return fail2(L, "bad address");
+	xr_string address;
+	u16 port = 0;
+	if (!parse_endpoint(s, address, port))
+		return fail2(L, "bad address (ip or ip:port)");
+	if (mgr().active())
+		return fail2(L, "already in a co-op session");
+	menu_cancel_pending(nullptr);
+	menu_clear_error();
+	if (!mgr().start_client(address.c_str(), port))
+	{
+		std::string why = "could not start connecting to ";
+		why += address.c_str();
+		why += ", see the log";
+		menu_error("start", why, false);
+		return fail2(L, why.c_str());
+	}
+	note_start(address.c_str(), port);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// coop.disconnect() -> true if a session was running. Also drops a pending "host after loading".
+int l_disconnect(lua_State* L)
+{
+	menu_cancel_pending("cancelled from the menu");
+	const bool was = mgr().active();
+	if (was)
+	{
+		note_user_stop();
+		mgr().stop("left the session");
+	}
+	lua_pushboolean(L, was ? 1 : 0);
+	return 1;
+}
+
 void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -805,6 +1114,11 @@ void register_raw(lua_State* L)
 		{"send_chat", &l_send_chat},
 		{"stash_set", &l_stash_set},
 		{"stash_get", &l_stash_get},
+		{"session_info", &l_session_info},
+		{"host", &l_host},
+		{"host_when_ready", &l_host_when_ready},
+		{"connect", &l_connect},
+		{"disconnect", &l_disconnect},
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");
@@ -877,6 +1191,35 @@ void on_rejected(RejectReason reason, const char* text, const ManifestDiff& diff
 	copy_capped(diff.differ, g_reject.differ, g_reject.differ_total);
 	g_reject.t_ms = mgr().now_ms();
 	pump_sync();
+	// co-op menu: the refusal is the last error until the next attempt
+	std::string why = text && *text ? text : reject_reason_name(reason);
+	menu_error(reject_reason_name(reason), why, false);
+	g_menu.rejected_ms = g_menu.last_ms;
+}
+
+void note_start(const char* address, u16 port)
+{
+	g_menu.port = port;
+	g_menu.address = address ? address : "";
+	g_menu.user_stop = false;
+	if (!address)
+		menu_cancel_pending(nullptr);
+}
+
+void note_start_failed(const char* why) { menu_error("start", why ? why : "could not start the session", false); }
+
+void note_user_stop() { g_menu.user_stop = true; }
+
+void on_session_end(const char* reason)
+{
+	const bool by_user = g_menu.user_stop;
+	g_menu.user_stop = false;
+	g_menu.port = 0;
+	g_menu.address.clear();
+	// A refusal (on_rejected) is followed by the transport closing: keep the precise one.
+	if (!by_user && g_menu.rejected_ms && mgr().now_ms() - g_menu.rejected_ms < kRejectShadowMs)
+		return;
+	menu_error(by_user ? "left" : "lost", reason && *reason ? reason : "the session ended", by_user);
 }
 
 void print_status()
@@ -892,6 +1235,8 @@ void print_status()
 	      "expired %llu, waiting %s",
 	    (u32)g_stash.size(), (u32)g_stash_bytes, g_ui.stash_cleared, g_ui.rejections, g_ui.shown, g_ui.failed,
 	    g_ui.expired, g_reject.pending ? "yes" : "no");
+	::Msg("[coop-lua] menu: port %u, address '%s', host after loading %s, last error [%s] '%s'", u32(g_menu.port),
+	    g_menu.address.c_str(), g_menu.pending ? "pending" : "no", g_menu.last_code.c_str(), g_menu.last_error.c_str());
 	if (lua_ready())
 	{
 		call_lua("print_status", [](lua_State*) { return 0; });

@@ -40,6 +40,10 @@ void host_collect_online(xr_vector<u16>& out);
 void client_set_initial_online(const xr_vector<u16>& host_ids);
 // ALife switching vote on a client (local numbering): true = keep/bring online.
 bool client_wants_online(u16 id);
+// The host changed the holder of `id` (local numbering, EntityParent). The online set holds only free
+// objects: a dropped item the host keeps online joins it (no EntitySwitch comes, it never switched there),
+// otherwise the local switch manager takes it offline at once; an item put into an inventory leaves it.
+void client_on_holder_changed(u16 id, u16 new_parent, bool host_online);
 void on_client_live();
 // True if `id` is an object whose behaviour comes from the host (any creature on a client).
 bool is_mirrored(u16 id);

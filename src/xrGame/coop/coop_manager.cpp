@@ -133,6 +133,10 @@ void Manager::set_phase(Phase p)
 		return;
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
+	// G18: a session world never stands still. A pause from before the session (new game, menu) is lifted
+	// when this machine starts hosting or enters the world; in the session CanBePaused() refuses new ones.
+	if ((p == Phase::Hosting || p == Phase::Live) && Device.Paused())
+		Device.Pause(FALSE, TRUE, TRUE, "coop_session");
 }
 
 const char* Manager::build_id()
@@ -269,6 +273,7 @@ void Manager::install_session_callbacks()
 	m_session.on_disconnected = [this](const std::string& reason)
 	{
 		::Msg("! [coop] disconnected: %s", reason.c_str());
+		script::on_session_end(reason.c_str()); // W4 menu: last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
 		set_phase(Phase::Off);
@@ -338,6 +343,7 @@ void Manager::stop(const char* reason)
 	if (!active())
 		return;
 	m_session.shutdown(reason);
+	script::on_session_end(reason); // W4 menu: last error in the co-op window
 	join::on_session_lost(reason);
 	sync::reset();
 	set_phase(Phase::Off);

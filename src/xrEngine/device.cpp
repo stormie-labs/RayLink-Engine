@@ -753,6 +753,8 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 
 		if (bTimer && (!g_pGamePersistent || g_pGamePersistent->CanBePaused()))
 		{
+			if (!g_pauseMngr().Paused()) // Anomaly Coop: diagnostics, who stops the game clock
+				Msg("~ device pause on: %s", reason ? reason : "?");
 			g_pauseMngr().Pause(true);
 #ifdef DEBUG
             if (!xr_strcmp(reason, "li_pause_key_no_clip"))
@@ -772,6 +774,7 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 	{
 		if (bTimer && g_pauseMngr().Paused())
 		{
+			Msg("~ device pause off: %s", reason ? reason : "?"); // Anomaly Coop: diagnostics
 			fTimeDelta = EPS_S + EPS_S;
 			g_pauseMngr().Pause(false);
 		}

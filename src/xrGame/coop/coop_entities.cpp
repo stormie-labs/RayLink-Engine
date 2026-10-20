@@ -740,6 +740,19 @@ void client_set_initial_online(const xr_vector<u16>& host_ids)
 
 bool client_wants_online(u16 id) { return g_online.count(id) != 0; }
 
+void client_on_holder_changed(u16 id, u16 new_parent, bool host_online)
+{
+	if (id == 0 || id == kNoId)
+		return;
+	if (new_parent == kNoId && host_online)
+		g_online.insert(id);
+	else
+	{
+		g_online.erase(id); // in a holder it follows the holder; a free offline item stays offline
+		g_tracks.erase(id);
+	}
+}
+
 void on_client_live() { g_tracks.clear(); }
 
 bool is_mirrored(u16 id) { return mgr().is_client() && id != 0; }

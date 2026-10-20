@@ -16,6 +16,14 @@
 //     across level loads and Lua state rebuilds (coop_settings keeps the host's settings there).
 //   on_rejected() -> coop_ui.on_rejected(info): the host's refusal (mod-list diff, duplicate key, ...)
 //     shown in a window in the main menu or in game (R-1.3, R-1.4).
+//
+// Co-op menu (W4 menu, scripts\coop_menu.script):
+//   coop.session_info() -> { phase, active, host, client, live, self_id, nick, port, address, players = {...},
+//     max_players, default_port, last_error, last_error_code, last_error_age, last_by_user, pending_host,
+//     pending_age }
+//   coop.host(port) / coop.connect("ip[:port]") -> true | false, reason      coop.disconnect() -> bool
+//   coop.host_when_ready(port | nil)  host as soon as the next world is loaded (save, last save, new game);
+//     nil or 0 cancels. Kept by a frame pump that also runs in the main menu.
 #pragma once
 
 #include <cstdint>
@@ -44,7 +52,20 @@ void on_chat(const char* nick, const char* text);
 // pump shows them through coop_ui.on_rejected as soon as a dialog can be opened (main menu or in game).
 // Main thread (Session callback). Survives reset(); a newer refusal replaces an unshown one.
 void on_rejected(RejectReason reason, const char* text, const ManifestDiff& diff);
+
+// --- co-op menu (W4) ---
+// A session was started from the console or Lua: remembered for coop.session_info (address nullptr = host).
+void note_start(const char* address, u16 port);
+// Starting a session failed before it existed (port busy, no game loaded...): shown as the last error.
+void note_start_failed(const char* why);
+// The next on_session_end comes from the player (coop_disconnect / the menu): not shown as an error.
+void note_user_stop();
+// The session ended (Manager::stop, transport lost). Main thread. Keeps the reason for the menu.
+void on_session_end(const char* reason);
 } // namespace script
+
+// "1.2.3.4:5678" / "1.2.3.4" / "[::1]:5678" -> address + port (kDefaultPort if none). coop_console.cpp.
+bool parse_endpoint(LPCSTR args, xr_string& address, u16& port);
 } // namespace coop
 
 // Script export entry (export_classes).
