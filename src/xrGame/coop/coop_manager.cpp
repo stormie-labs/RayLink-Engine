@@ -63,6 +63,25 @@ u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
 	return h;
 }
 
+// Files under gamedata that Anomaly (and addons like MCM) write at run time: user options, caches,
+// logs. Two players with identical content have different copies of them, so they are not content.
+bool is_runtime_written(LPCSTR name)
+{
+	string_path low;
+	xr_strcpy(low, name);
+	xr_strlwr(low);
+	for (char* c = low; *c; ++c)
+		if (*c == '/')
+			*c = '\\';
+	static const char* exact[] = {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx.bak"};
+	for (const char* e : exact)
+		if (!xr_strcmp(low, e))
+			return true;
+	const size_t n = xr_strlen(low);
+	auto ends = [&](const char* ext) { const size_t k = xr_strlen(ext); return n >= k && !xr_strcmp(low + n - k, ext); };
+	return ends(".log") || ends(".txt") || ends(".bak") || ends(".tmp");
+}
+
 // Path relative to the game root, lowercase, backslashes.
 xr_string relative_to_root(LPCSTR full)
 {
@@ -182,6 +201,8 @@ const Manifest& Manager::manifest()
 	{
 		if (f.attrib & FS_File::flVFS)
 			continue;
+		if (is_runtime_written(f.name.c_str()))
+			continue; // per-player settings and caches the game rewrites while running: not content
 		ManifestEntry e;
 		e.path = xr_string("gamedata\\").append(f.name).c_str();
 		const long size = f.size;

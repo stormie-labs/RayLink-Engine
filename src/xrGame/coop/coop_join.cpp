@@ -278,6 +278,8 @@ void host_on_world_loaded(PeerId from, Reader&)
 void client_on_join_complete(PeerId, Reader&)
 {
 	::Msg("[coop] join complete, live sync on");
+	if (Device.Paused()) // a pause from before the session; in a session nothing can pause (G18)
+		Device.Pause(FALSE, TRUE, TRUE, "coop_live");
 	players::equip_resend();
 }
 
@@ -340,6 +342,9 @@ void client_load_world(std::vector<u8>& data)
 
 	if (g_pGameLevel)
 		Console->Execute("disconnect");
+	// As the stock new game / load do: a pause left by the menu would outlive the load ("Paused" after join)
+	if (Device.Paused())
+		Device.Pause(FALSE, TRUE, TRUE, "coop_join_load");
 	string256 cmd;
 	xr_sprintf(cmd, "start server(%s/single/alife/load) client(localhost)", kClientSaveName);
 	Console->Execute(cmd);

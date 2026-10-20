@@ -1023,7 +1023,8 @@ void CGamePersistent::LoadTitle(bool change_tip, shared_str map_name)
 
 bool CGamePersistent::CanBePaused()
 {
-	return IsGameTypeSingle() || (g_pGameLevel && Level().IsDemoPlay());
+	// Anomaly Coop (G18): in a session the world never pauses, the host's pause would freeze everybody
+	return (IsGameTypeSingle() && !coop::mgr().active()) || (g_pGameLevel && Level().IsDemoPlay());
 }
 
 void CGamePersistent::SetPickableEffectorDOF(bool bSet)
