@@ -12,9 +12,13 @@
 #include "script_engine.h"
 #include "Level.h"
 #include "Actor.h"
+#include "MainMenu.h"
+#include "UIGameCustom.h"
 
 #include <deque>
+#include <map>
 #include <string>
+#include <vector>
 
 using namespace luabind;
 
@@ -32,6 +36,10 @@ constexpr size_t kMaxChat = 64;
 constexpr u32 kDeliverPerFrame = 64;
 constexpr u64 kStaleMs = 120000; // an event older than this is not delivered any more
 constexpr s32 kTargetAll = -1;
+constexpr size_t kMaxStashKeys = 32;
+constexpr size_t kMaxStashValue = 256 * 1024;
+constexpr size_t kMaxListed = 300; // diff entries per category handed to Lua (the log has all of them)
+constexpr u64 kRejectWaitMs = 300000; // a refusal that found no usable UI for 5 minutes is dropped
 
 struct Outgoing
 {
@@ -68,10 +76,34 @@ struct Stats
 	u64 chat_delivered = 0;
 };
 
+// Host refusal waiting for a dialog (R-1.3, R-1.4). Kept outside Stats: reset() must not drop it.
+struct Rejection
+{
+	bool pending = false;
+	RejectReason reason = RejectReason::None;
+	std::string text;
+	std::vector<std::string> missing, extra, differ; // first kMaxListed of each
+	u32 missing_total = 0, extra_total = 0, differ_total = 0;
+	u64 t_ms = 0;
+};
+
+struct UiStats
+{
+	u64 rejections = 0; // refusals received
+	u64 shown = 0; // coop_ui.on_rejected calls that returned normally
+	u64 failed = 0; // coop_ui missing or Lua error
+	u64 expired = 0; // no usable UI in time
+	u64 stash_cleared = 0; // session ended with stashed values
+};
+
 Stats g_stats;
 std::deque<Outgoing> g_outbox;
 std::deque<Incoming> g_inbox;
 std::deque<ChatLine> g_chat;
+Rejection g_reject;
+UiStats g_ui;
+std::map<std::string, std::string> g_stash; // survives reset(): cleared by the pump when the session ends
+size_t g_stash_bytes = 0;
 
 // First lines in full, then every 100th, so a broken addon cannot flood the log.
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
@@ -132,10 +164,10 @@ int lua_traceback(lua_State* L)
 	return 1;
 }
 
-// Pushes coop_main.<fn>; false (stack unchanged) if the script or the function does not exist.
-bool push_handler(lua_State* L, const char* fn)
+// Pushes <module>.<fn>; false (stack unchanged) if the script or the function does not exist.
+bool push_handler(lua_State* L, const char* module, const char* fn)
 {
-	lua_getglobal(L, "coop_main"); // _G.__index auto-loads gamedata/scripts/coop_main.script
+	lua_getglobal(L, module); // _G.__index auto-loads gamedata/scripts/<module>.script
 	if (!lua_istable(L, -1))
 	{
 		lua_pop(L, 1);
@@ -151,9 +183,9 @@ bool push_handler(lua_State* L, const char* fn)
 	return true;
 }
 
-// Protected call of coop_main.<fn>(args pushed by push_args). Never throws, never leaves the stack dirty.
+// Protected call of <module>.<fn>(args pushed by push_args). Never throws, never leaves the stack dirty.
 template <typename PushArgs>
-bool call_lua(const char* fn, PushArgs push_args)
+bool call_module(const char* module, const char* fn, PushArgs push_args)
 {
 	lua_State* L = ai().script_engine().lua();
 	if (!L)
@@ -163,11 +195,11 @@ bool call_lua(const char* fn, PushArgs push_args)
 		return false;
 	lua_pushcfunction(L, &lua_traceback);
 	const int errfunc = lua_gettop(L);
-	if (!push_handler(L, fn))
+	if (!push_handler(L, module, fn))
 	{
 		++g_stats.lua_missing;
 		if (log_allowed(g_stats.lua_missing))
-			::Msg("! [coop] lua: coop_main.%s is missing (gamedata/scripts/coop_main.script not installed?)", fn);
+			::Msg("! [coop] lua: %s.%s is missing (gamedata/scripts/%s.script not installed?)", module, fn, module);
 		lua_settop(L, top);
 		return false;
 	}
@@ -180,12 +212,18 @@ bool call_lua(const char* fn, PushArgs push_args)
 		if (log_allowed(g_stats.lua_errors))
 		{
 			const char* err = lua_tostring(L, -1);
-			::Msg("! [coop] lua error in coop_main.%s (#%llu, session continues): %s", fn, g_stats.lua_errors,
+			::Msg("! [coop] lua error in %s.%s (#%llu, session continues): %s", module, fn, g_stats.lua_errors,
 			    err ? err : "?");
 		}
 	}
 	lua_settop(L, top);
 	return ok;
+}
+
+template <typename PushArgs>
+bool call_lua(const char* fn, PushArgs push_args)
+{
+	return call_module("coop_main", fn, push_args);
 }
 
 // --- network -----------------------------------------------------------------------------------
@@ -558,6 +596,203 @@ int l_send_chat(lua_State* L)
 	return 1;
 }
 
+// --- session stash and the refusal window (W3d) ---------------------------------------------------
+
+constexpr size_t kMaxStashTotal = 1024 * 1024;
+
+// Frame pump for work that must go on while the manager is Off (it does not run Manager::frame then):
+// showing a refusal in the main menu and dropping the stash once the session has ended.
+class UiPump : public pureFrame
+{
+public:
+	void _BCL OnFrame() override;
+};
+
+UiPump g_pump;
+bool g_pump_on = false;
+
+void pump_sync()
+{
+	const bool need = g_reject.pending || !g_stash.empty();
+	if (need && !g_pump_on)
+	{
+		Device.seqFrame.Add(&g_pump, REG_PRIORITY_LOW);
+		g_pump_on = true;
+	}
+	else if (!need && g_pump_on)
+	{
+		Device.seqFrame.Remove(&g_pump); // deferred by CRegistrator when called from inside OnFrame
+		g_pump_on = false;
+	}
+}
+
+void stash_clear()
+{
+	g_stash.clear();
+	g_stash_bytes = 0;
+}
+
+// coop.stash_set(key, value) -> bool. Keeps a string for this machine until the co-op session ends (level
+// loads and Lua state rebuilds included). value nil removes the key. Key: 1..64 printable characters.
+int l_stash_set(lua_State* L)
+{
+	size_t key_len = 0;
+	const char* key = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &key_len) : nullptr;
+	if (!key || !valid_name(key, key_len) || !mgr().active())
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	const std::string k(key, key_len);
+	auto it = g_stash.find(k);
+	if (lua_isnoneornil(L, 2))
+	{
+		if (it != g_stash.end())
+		{
+			g_stash_bytes -= it->second.size();
+			g_stash.erase(it);
+		}
+		pump_sync();
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+	if (lua_type(L, 2) != LUA_TSTRING)
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	size_t len = 0;
+	const char* value = lua_tolstring(L, 2, &len);
+	const size_t old = it != g_stash.end() ? it->second.size() : 0;
+	if (len > kMaxStashValue || (it == g_stash.end() && g_stash.size() >= kMaxStashKeys) ||
+	    g_stash_bytes - old + len > kMaxStashTotal)
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	g_stash[k].assign(value, len);
+	g_stash_bytes = g_stash_bytes - old + len;
+	pump_sync();
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// coop.stash_get(key) -> string or nil (always nil outside a session).
+int l_stash_get(lua_State* L)
+{
+	size_t key_len = 0;
+	const char* key = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &key_len) : nullptr;
+	if (!key || !mgr().active())
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const auto it = g_stash.find(std::string(key, key_len));
+	if (it == g_stash.end())
+		lua_pushnil(L);
+	else
+		lua_pushlstring(L, it->second.data(), it->second.size());
+	return 1;
+}
+
+// A dialog can be opened: CurrentDialogHolder() is the main menu when it is active, else the game HUD.
+bool ui_ready()
+{
+	if (!g_pGamePersistent || Device.dwPrecacheFrame)
+		return false;
+	CMainMenu* menu = MainMenu();
+	if (menu && menu->IsActive())
+		return true;
+	return g_pGameLevel && g_actor && CurrentGameUI();
+}
+
+void set_field(lua_State* L, const char* name, const std::string& v)
+{
+	lua_pushlstring(L, v.data(), v.size());
+	lua_setfield(L, -2, name);
+}
+
+void set_field(lua_State* L, const char* name, lua_Number v)
+{
+	lua_pushnumber(L, v);
+	lua_setfield(L, -2, name);
+}
+
+void set_list(lua_State* L, const char* name, const std::vector<std::string>& v)
+{
+	lua_newtable(L);
+	int i = 0;
+	for (const std::string& s : v)
+	{
+		lua_pushlstring(L, s.data(), s.size());
+		lua_rawseti(L, -2, ++i);
+	}
+	lua_setfield(L, -2, name);
+}
+
+// coop_ui.on_rejected{ reason, code, text, missing, extra, differ, missing_total, extra_total, differ_total,
+//   key_path, log_path }
+void deliver_rejection()
+{
+	Rejection r = std::move(g_reject);
+	g_reject = Rejection();
+	string_path key_path;
+	FS.update_path(key_path, "$app_data_root$", "coop_player.key");
+	const std::string key(key_path);
+	const std::string log_path(xrLogger::GetLogPath());
+	const bool ok = call_module("coop_ui", "on_rejected", [&r, &key, &log_path](lua_State* L)
+	{
+		lua_newtable(L);
+		set_field(L, "reason", std::string(reject_reason_name(r.reason)));
+		set_field(L, "code", lua_Number(u8(r.reason)));
+		set_field(L, "text", r.text);
+		set_list(L, "missing", r.missing);
+		set_list(L, "extra", r.extra);
+		set_list(L, "differ", r.differ);
+		set_field(L, "missing_total", lua_Number(r.missing_total));
+		set_field(L, "extra_total", lua_Number(r.extra_total));
+		set_field(L, "differ_total", lua_Number(r.differ_total));
+		set_field(L, "key_path", key);
+		set_field(L, "log_path", log_path);
+		return 1;
+	});
+	if (ok)
+	{
+		++g_ui.shown;
+		::Msg("[coop] host refusal (%s) shown on screen", reject_reason_name(r.reason));
+	}
+	else
+		++g_ui.failed; // logged by call_module; the log already has the full diff
+}
+
+void _BCL UiPump::OnFrame()
+{
+	if (!g_stash.empty() && !mgr().active())
+	{
+		stash_clear();
+		++g_ui.stash_cleared;
+	}
+	if (g_reject.pending)
+	{
+		if (mgr().now_ms() - g_reject.t_ms > kRejectWaitMs)
+		{
+			++g_ui.expired;
+			::Msg("! [coop] host refusal (%s) was not shown: no menu or game screen for %u s",
+			    reject_reason_name(g_reject.reason), u32(kRejectWaitMs / 1000));
+			g_reject = Rejection();
+		}
+		else if (ui_ready())
+			deliver_rejection();
+	}
+	pump_sync();
+}
+
+void copy_capped(const std::vector<std::string>& from, std::vector<std::string>& to, u32& total)
+{
+	total = u32(from.size());
+	to.assign(from.begin(), from.begin() + ptrdiff_t(from.size() < kMaxListed ? from.size() : kMaxListed));
+}
+
 void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -568,6 +803,8 @@ void register_raw(lua_State* L)
 		{"to_local_id", &l_to_local_id},
 		{"send_event", &l_send_event},
 		{"send_chat", &l_send_chat},
+		{"stash_set", &l_stash_set},
+		{"stash_get", &l_stash_get},
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");
@@ -628,6 +865,20 @@ void on_chat(const char* nick, const char* text)
 	g_chat.push_back(std::move(c));
 }
 
+void on_rejected(RejectReason reason, const char* text, const ManifestDiff& diff)
+{
+	++g_ui.rejections;
+	g_reject = Rejection();
+	g_reject.pending = true;
+	g_reject.reason = reason;
+	g_reject.text = text ? text : "";
+	copy_capped(diff.missing_here, g_reject.missing, g_reject.missing_total);
+	copy_capped(diff.extra_here, g_reject.extra, g_reject.extra_total);
+	copy_capped(diff.differ, g_reject.differ, g_reject.differ_total);
+	g_reject.t_ms = mgr().now_ms();
+	pump_sync();
+}
+
 void print_status()
 {
 	const Stats& s = g_stats;
@@ -637,8 +888,15 @@ void print_status()
 	    s.send_rejected, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale);
 	::Msg("[coop-lua] lua errors %llu, missing handlers %llu, chat lines shown %llu | queued: out %u, in %u, chat %u",
 	    s.lua_errors, s.lua_missing, s.chat_delivered, (u32)g_outbox.size(), (u32)g_inbox.size(), (u32)g_chat.size());
+	::Msg("[coop-lua] stash %u keys / %u bytes (dropped at session end %llu) | refusals %llu: shown %llu, failed %llu, "
+	      "expired %llu, waiting %s",
+	    (u32)g_stash.size(), (u32)g_stash_bytes, g_ui.stash_cleared, g_ui.rejections, g_ui.shown, g_ui.failed,
+	    g_ui.expired, g_reject.pending ? "yes" : "no");
 	if (lua_ready())
+	{
 		call_lua("print_status", [](lua_State*) { return 0; });
+		call_module("coop_settings", "print_status", [](lua_State*) { return 0; }); // host-owned settings (W3d)
+	}
 }
 } // namespace script
 } // namespace coop

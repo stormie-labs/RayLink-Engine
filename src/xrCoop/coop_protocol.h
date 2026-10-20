@@ -12,7 +12,7 @@
 namespace coop
 {
 // Bump on any incompatible change of any message layout.
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2; // 2: TradeOp Deal, ReqMoney with deal ledger
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -97,6 +97,7 @@ enum class Msg : uint16_t
 	ReqMoney = 0x0148,
 	ReqContainer = 0x0149, // open/close container (shared view)
 	ReqItemEvent = 0x014A, // GE_* event on an owned item the host must repeat (upgrade install)
+	ReqLaunch = 0x014B, // rocket / launcher grenade fired: launcher, rocket, launch transform and velocity (W3a)
 
 	// world state
 	TimeSync = 0x0160,

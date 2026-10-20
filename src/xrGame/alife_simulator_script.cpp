@@ -19,6 +19,7 @@
 #include "alife_registry_container.h"
 #include "xrServer.h"
 #include "level.h"
+#include "coop/coop_requests.h" // Anomaly Coop
 
 #include <luabind/iterator_policy.hpp>
 #include <luabind/iterator_pair_policy.hpp>
@@ -120,12 +121,33 @@ void generate_story_ids(
 
 void kill_entity0(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, const GameGraph::_GRAPH_ID& game_vertex_id)
 {
+	if (coop::requests::lua_client_refuse("alife():kill_entity")) return; // Anomaly Coop: deaths are the host's
 	alife->kill_entity(monster, game_vertex_id, 0);
 }
 
 void kill_entity1(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster)
 {
+	if (coop::requests::lua_client_refuse("alife():kill_entity")) return; // Anomaly Coop
 	alife->kill_entity(monster, monster->m_tGraphID, 0);
+}
+
+// Anomaly Coop: wrappers so a coop client can refuse these (bound as members before)
+void kill_entity2(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, const GameGraph::_GRAPH_ID& game_vertex_id, CSE_ALifeSchedulable* schedulable)
+{
+	if (coop::requests::lua_client_refuse("alife():kill_entity")) return;
+	alife->kill_entity(monster, game_vertex_id, schedulable);
+}
+
+void CALifeSimulator__set_switch_online(CALifeSimulator* self, ALife::_OBJECT_ID id, bool value)
+{
+	if (coop::requests::lua_client_refuse("alife():set_switch_online")) return; // the host switches objects
+	self->set_switch_online(id, value);
+}
+
+void CALifeSimulator__set_switch_offline(CALifeSimulator* self, ALife::_OBJECT_ID id, bool value)
+{
+	if (coop::requests::lua_client_refuse("alife():set_switch_offline")) return;
+	self->set_switch_offline(id, value);
 }
 
 void add_in_restriction(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, ALife::_OBJECT_ID id)
@@ -155,6 +177,7 @@ u32 get_level_id(CALifeSimulator* self)
 
 CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_SPAWN_ID spawn_id)
 {
+	if (coop::requests::lua_client()) { coop::requests::lua_refuse("alife():create(spawn_id)"); return nullptr; } // Anomaly Coop
 	const CALifeSpawnRegistry::SPAWN_GRAPH::CVertex* vertex = ai().alife().spawns().spawns().vertex(spawn_id);
 	THROW2(vertex, "Invalid spawn id!");
 
@@ -169,12 +192,14 @@ CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_S
 
 CSE_Abstract* CALifeSimulator__spawn_item(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1), true); // Anomaly Coop
 	THROW(self);
 	return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1)));
 }
 
 CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true); // Anomaly Coop: player items via the host
 	if (id_parent == ALife::_OBJECT_ID(-1))
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
@@ -209,6 +234,7 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 //Alundaio: Allows to call alife():register(se_obj) manually afterward so that packet editing can be done safely when spawning object with a parent
 CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, bool reg = true)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, reg); // Anomaly Coop: no id until the host creates it
 	if (reg == true)
 		return CALifeSimulator__spawn_item2(self, section, position, level_vertex_id, game_vertex_id, id_parent);
 
@@ -232,6 +258,7 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 
 CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, int ammo_to_spawn)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true, ammo_to_spawn); // Anomaly Coop
 	//	if (id_parent == ALife::_OBJECT_ID(-1))
 	//		return							(self->spawn_item(section,position,level_vertex_id,game_vertex_id,id_parent));
 	CSE_ALifeDynamicObject* object = 0;
@@ -288,6 +315,7 @@ ALife::_SPAWN_ID CALifeSimulator__spawn_id(CALifeSimulator* self, ALife::_SPAWN_
 
 void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 {
+	if (coop::requests::lua_client()) { coop::requests::lua_release(object); return; } // Anomaly Coop: the host releases
 	VERIFY(self);
 	//	self->release						(object,true);
 
@@ -390,6 +418,7 @@ void AlifeRemoveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, 
 void teleport_object(CALifeSimulator* alife, ALife::_OBJECT_ID id, GameGraph::_GRAPH_ID game_vertex_id,
                      u32 level_vertex_id, const Fvector& position)
 {
+	if (coop::requests::lua_client_refuse("alife():teleport_object")) return; // Anomaly Coop: the host moves objects
 	alife->teleport_object(id, game_vertex_id, level_vertex_id, position);
 }
 
@@ -407,6 +436,7 @@ void IterateInfo(const CALifeSimulator* alife, const ALife::_OBJECT_ID& id, cons
 
 CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_register_spawn(object); // Anomaly Coop
 	NET_Packet packet;
 	packet.w_begin(M_SPAWN);
 	packet.w_stringZ(object->s_name);
@@ -428,6 +458,7 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
                                   u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent,
                                   bool bRegister = true)
 {
+	if (coop::requests::lua_client()) return coop::requests::lua_clone(object, section, position, level_vertex_id, game_vertex_id, id_parent, bRegister); // Anomaly Coop
 	CSE_ALifeItemWeaponMagazined* wpnmag = smart_cast<CSE_ALifeItemWeaponMagazined*>(object);
 	if (wpnmag)
 	{
@@ -625,10 +656,10 @@ void CALifeSimulator::script_register(lua_State* L)
 		.def("object", (CSE_ALifeDynamicObject *(*)(const CALifeSimulator*, ALife::_OBJECT_ID))(alife_object))
 		.def("object", (CSE_ALifeDynamicObject *(*)(const CALifeSimulator*, ALife::_OBJECT_ID, bool))(alife_object))
 		.def("story_object", (CSE_ALifeDynamicObject *(*)(const CALifeSimulator*, ALife::_STORY_ID))(alife_story_object))
-		.def("set_switch_online", (void (CALifeSimulator::*)(ALife::_OBJECT_ID, bool))(&CALifeSimulator::set_switch_online))
-		.def("set_switch_offline", (void (CALifeSimulator::*)(ALife::_OBJECT_ID, bool))(&CALifeSimulator::set_switch_offline))
+		.def("set_switch_online", &CALifeSimulator__set_switch_online) // Anomaly Coop: gated wrapper
+		.def("set_switch_offline", &CALifeSimulator__set_switch_offline) // Anomaly Coop: gated wrapper
 		.def("set_interactive", (void (CALifeSimulator::*)(ALife::_OBJECT_ID, bool))(&CALifeSimulator::set_interactive))
-		.def("kill_entity", &CALifeSimulator::kill_entity)
+		.def("kill_entity", &kill_entity2) // Anomaly Coop: gated wrapper
 		.def("kill_entity", &kill_entity0)
 		.def("kill_entity", &kill_entity1)
 		.def("add_in_restriction", &add_in_restriction)

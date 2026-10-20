@@ -2502,6 +2502,42 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_objects.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_presence.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_survival.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_items.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_requests.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_events.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_trade.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_dialog.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_story.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_script.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_remote.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_worldstate.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_alife.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7415,6 +7451,42 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_objects.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_presence.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_survival.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_items.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_requests.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_events.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_trade.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_dialog.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_story.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_script.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_remote.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_worldstate.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_equip.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

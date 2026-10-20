@@ -64,6 +64,7 @@ const char* msg_name(Msg type)
 	case Msg::ReqMoney: return "ReqMoney";
 	case Msg::ReqContainer: return "ReqContainer";
 	case Msg::ReqItemEvent: return "ReqItemEvent";
+	case Msg::ReqLaunch: return "ReqLaunch";
 
 	case Msg::TimeSync: return "TimeSync";
 	case Msg::WeatherSync: return "WeatherSync";

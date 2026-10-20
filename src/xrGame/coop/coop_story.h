@@ -16,7 +16,9 @@
 //   - Task texts, targets and spots are computed by the host only (R-7.3): a client's own script
 //     updates of an existing task are dropped and overwritten with the host values.
 //   - A client evaluates task completion only for tasks its own scripts track (tasks it had at join or
-//     asked for itself); the result goes to the host as a request.
+//     asked for itself); the result goes to the host as a request. With coop_tasks.script installed (W3c)
+//     the client's Lua never completes a task itself: task_manager calls are routed to the host and the
+//     host's Lua task state (stage, status, giver, task vars) is mirrored into the client's task_manager.
 // Every 10 s the host sends a count + hash per domain; a client that differs asks for the full list
 // (P5). Ids on the wire are in host numbering (join::to_host / join::to_local).
 //
@@ -26,6 +28,7 @@
 
 class CInventoryOwner;
 class CGameTask;
+class CEntityAlive;
 
 namespace coop
 {
@@ -77,13 +80,25 @@ bool on_community_goodwill(int community, u16 to, int value, GoodwillOp op);
 bool on_community_relation(int community_from, int community_to, int value);
 // Engine combat bookkeeping (RELATION_REGISTRY::Action): its goodwill changes are computed by the host
 // from the replicated hit/kill, so a client drops its own.
+// Host (W3c, R-3.4): a player proxy is treated like the actor inside Action() (acts_as_actor), so NPC
+// goodwill toward that player changes from its attacks too. The reputation the engine changes on the proxy
+// for an attack / fight help (not a kill: the player's own machine counts kills) is sent to that player.
+// `action` is RELATION_REGISTRY::ERelationAction.
 struct RelationActionScope
 {
-	RelationActionScope();
+	RelationActionScope(CEntityAlive* from, int action);
 	~RelationActionScope();
 	RelationActionScope(const RelationActionScope&) = delete;
 	RelationActionScope& operator=(const RelationActionScope&) = delete;
+
+private:
+	CInventoryOwner* m_owner = nullptr; // host: proxy whose reputation is watched (outermost scope only)
+	u16 m_id = 0xffff;
+	int m_reputation = 0;
 };
+// A player character that is not the local actor (a proxy on the host, another player's avatar on a client).
+// RELATION_REGISTRY::Action treats it like the actor: same goodwill rules and attack throttle, keyed to it.
+bool acts_as_actor(const CEntityAlive* who);
 
 // --- PDA map spots (map_manager.cpp) ---
 void on_spot_added(const shared_str& spot_type, u16 id); // after the spot is in the list
@@ -92,7 +107,12 @@ void on_spots_remove_all(u16 id); // before every spot of the object is removed
 
 // R-7.6 support for reward routing (host): the client peer whose request finished the task last,
 // 0xffffffff if no client did (the host's own completion). The host's scripts still run the reward;
-// who receives it is a script-side decision.
+// who receives it is a script-side decision (coop_tasks.script, told through coop_tasks.host_note).
 u32 task_finisher(LPCSTR task_id);
 } // namespace story
 } // namespace coop
+
+// Host setting (console coop_share_rewards 0/1, R-7.6): 0 = task money goes to the player who turned the
+// task in, 1 = money is split equally among the online players. Items always go to the finisher.
+// Read by gamedata/scripts/coop_tasks.script through get_console():get_integer.
+extern int g_coop_share_rewards;

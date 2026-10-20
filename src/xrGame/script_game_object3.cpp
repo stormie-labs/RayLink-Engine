@@ -59,6 +59,7 @@
 
 #include "Torch.h"
 #include "Flashlight.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 namespace MemorySpace
 {
@@ -1755,6 +1756,7 @@ void CScriptGameObject::SetArtefactAdditionalInventoryWeight(float value)
 
 void CScriptGameObject::AttachVehicle(CScriptGameObject* veh, bool bForce)
 {
+	if (veh && coop::events::client_refuse_vehicle(&veh->object())) return; // Anomaly Coop: the host drives cars
 	CActor* actor = smart_cast<CActor*>(&object());
 	if (actor)
 	{

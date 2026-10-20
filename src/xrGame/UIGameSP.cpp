@@ -1,5 +1,6 @@
 #include "pch_script.h"
 #include "coop/coop_manager.h"
+#include "coop/coop_trade.h"
 #include "uigamesp.h"
 #include "actor.h"
 #include "level.h"
@@ -171,7 +172,8 @@ void CUIGameSP::StartTrade(CInventoryOwner* pActorInv, CInventoryOwner* pOtherOw
 
 	//---- before trade mode ---------------------------
 	::luabind::functor<bool> funct1;
-	if (ai().script_engine().functor("actor_menu_inventory.CUIActorMenu_OnMode_Trade", funct1))
+	// Anomaly Coop: on a client the engine trade window is used: Anomaly's Lua window moves money locally
+	if (coop::trade::lua_trade_window_allowed() && ai().script_engine().functor("actor_menu_inventory.CUIActorMenu_OnMode_Trade", funct1))
 	{
 		CGameObject* GO = smart_cast<CGameObject*>(pOtherOwner);
 		if (funct1(GO->lua_game_object()))

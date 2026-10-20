@@ -8,6 +8,7 @@
 #include "../../xrEngine/xr_ioc_cmd.h"
 #include "Level.h"
 #include "Actor.h"
+#include "entity_alive.h"
 #include "InventoryOwner.h"
 #include "GameTaskManager.h"
 #include "GameTask.h"
@@ -24,6 +25,11 @@
 #include "UIGameCustom.h"
 #include "ai_space.h"
 #include "script_engine.h"
+#include "ui/xrUIXmlParser.h"
+
+extern CUIXml* g_uiSpotXml; // map_location.cpp: map_spots.xml, loaded on the first map spot
+
+int g_coop_share_rewards = 0; // console coop_share_rewards (host setting, read by coop_tasks.script)
 
 namespace coop
 {
@@ -74,6 +80,7 @@ enum : u8
 	RelCommunity = 2, // host -> client: {i32 community, u16 to, i32 value} absolute
 	RelCommRelation = 3, // host -> client: {i32 from, i32 to, i32 value} absolute
 	RelFull = 4, // host -> client: {u32 n, personal...}{u32 n, community...}{u32 n, n*n table}
+	RelReputationDelta = 5, // host -> owning client: {u16 who (host id of its proxy), i32 delta} (W3c)
 	RelReqPersonalSet = 11, // client -> host: {u16 from, u16 to, i32 value}
 	RelReqPersonalChange = 12, // {u16 from, u16 to, i32 delta}
 	RelReqPersonalForce = 13, // {u16 from, u16 to, i32 value}
@@ -158,6 +165,8 @@ struct Stats
 	u64 task_edits_dropped = 0; // client: own script edits of task spots (the host owns them)
 	u64 hashes = 0, mismatches = 0, resyncs_out = 0, resyncs_in = 0;
 	u64 deferred = 0;
+	u64 proxy_actions = 0; // host: RELATION_REGISTRY::Action calls with a player proxy as the actor (R-3.4)
+	u64 rep_deltas_out = 0, rep_deltas_in = 0; // reputation from host-side combat bookkeeping
 } g_stats;
 
 // ------------------------------------------------------------------ applying guard
@@ -458,6 +467,7 @@ CGameTask* find_task(const TaskKey& key)
 xr_map<TaskKey, TaskRec> g_host_sent; // last broadcast state per task
 bool g_host_prime = true; // record the current list without broadcasting (after hosting start / load)
 const void* g_host_level = nullptr;
+u32 g_host_epoch = 0; // join::host_world_epoch() of g_host_level
 u64 g_host_last_scan = 0;
 xr_map<shared_str, PeerId> g_finisher; // task id -> peer whose request finished it
 
@@ -560,6 +570,31 @@ xr_string run_lua(LPCSTR name, LPCSTR chunk, LPCSTR arg, int num, bool has_num)
 	return res;
 }
 
+// Tells coop_tasks.script (W3c) which player took (kind "taker") or finished (kind "finisher") a task that
+// a client asked for through these engine requests, so the reward goes to that player (R-7.6).
+// Missing script or function: nothing happens.
+constexpr LPCSTR kLuaNote = "local id, kind, peer = ...\n"
+							"local ok, m = pcall(function() return coop_tasks end)\n"
+							"if ok and type(m) == 'table' and type(m.host_note) == 'function' then pcall(m.host_note, id, kind, peer) end\n"
+							"return 'ok'\n";
+
+void lua_note(LPCSTR kind, const shared_str& task_id, PeerId peer)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !task_id.size())
+		return;
+	const int top = lua_gettop(L);
+	if (luaL_loadbuffer(L, kLuaNote, xr_strlen(kLuaNote), "@coop_story_note") == 0)
+	{
+		lua_pushstring(L, cs(task_id));
+		lua_pushstring(L, kind);
+		lua_pushnumber(L, lua_Number(peer));
+		if (lua_pcall(L, 3, 1, 0))
+			::Msg("! [coop] story: task note failed: %s", lua_tostring(L, -1));
+	}
+	lua_settop(L, top);
+}
+
 // The host runs Anomaly's own task manager for a client's request, so its scripts track the task
 // (texts, targets, completion) exactly as if the host had taken it.
 constexpr LPCSTR kLuaGiveTask = "local id, giver = ...\n"
@@ -614,6 +649,7 @@ void host_on_task_give(PeerId from, Reader& r)
 	}
 	{
 		ExecFor ef(from);
+		lua_note("taker", id, from);
 		const xr_string res = run_lua("@coop_story_give_task", kLuaGiveTask, cs(id), giver, giver != kNoId);
 		if (res == "nolua" && has_rec)
 		{
@@ -658,6 +694,7 @@ void host_on_task_state(PeerId from, Reader& r)
 	if (state != eTaskStateCompleted && state != eTaskStateFail)
 		return;
 	g_finisher[id] = from;
+	lua_note("finisher", id, from); // the reward goes to this player (R-7.6)
 	const PeerInfo* p = mgr().session().peer(from);
 	::Msg("[coop] story: '%s' %s task '%s'", p ? p->nick.c_str() : "?", state == eTaskStateCompleted ? "completed" : "failed",
 	    cs(id));
@@ -889,6 +926,7 @@ struct RelKey
 	}
 };
 xr_set<RelKey> g_rel_dirty; // host: keys whose current value must be broadcast
+xr_map<u16, int> g_rep_delta; // host: proxy -> reputation change from attacks / fight help (sent in frame)
 
 RELATION_DATA& rel_data(u16 id) { return RELATION_REGISTRY::relation_registry().registry().objects(id); }
 
@@ -939,6 +977,31 @@ void host_flush_relations()
 		w.i32(rel_value(k));
 		net::host_broadcast(Msg::Relation, w);
 		++g_stats.rel_out;
+	}
+}
+
+void host_add_reported_reputation(PeerId peer, int delta); // progress section
+
+// Host: the engine changed a player's reputation on its proxy (Action: attack, fight help). The player's
+// machine owns its reputation (the proxy's value is put back from its reports), so the change goes to it.
+void host_flush_rep_deltas()
+{
+	if (g_rep_delta.empty())
+		return;
+	xr_map<u16, int> list;
+	list.swap(g_rep_delta);
+	for (const auto& it : list)
+	{
+		const PeerId peer = join::peer_of_proxy(it.first);
+		if (peer == kInvalidPeer || peer == kHostPeer || !it.second)
+			continue;
+		host_add_reported_reputation(peer, it.second);
+		Writer w(16);
+		w.u8(RelReputationDelta);
+		w.u16(it.first);
+		w.i32(it.second);
+		net::host_send(peer, Msg::Relation, w);
+		++g_stats.rep_deltas_out;
 	}
 }
 
@@ -1284,6 +1347,23 @@ bool spot_type_local(LPCSTR type)
 	return false;
 }
 
+// CMapLocation R_ASSERTs on a spot type that map_spots.xml does not have (another mod set, a bad request):
+// check before AddMapLocation for anything that came from the network.
+bool spot_type_known(const shared_str& type)
+{
+	if (!type.size())
+		return false;
+	if (!g_uiSpotXml)
+	{
+		g_uiSpotXml = xr_new<CUIXml>(); // the same lazy load as CMapLocation::LoadSpot
+		g_uiSpotXml->Load(CONFIG_PATH, UI_PATH, "map_spots.xml");
+	}
+	if (g_uiSpotXml->NavigateToNode(type.c_str(), 0))
+		return true;
+	::Msg("! [coop] story: map spot type '%s' is unknown here (different mods?), ignored", type.c_str());
+	return false;
+}
+
 // Spots that belong to the shared PDA: not task-linked (tasks carry their own), not relation markers.
 bool spot_replicable(CMapLocation* ml, const shared_str& type)
 {
@@ -1381,7 +1461,11 @@ void apply_spot_add(const shared_str& type, u16 host_id, const xr_string& hint, 
 	Applying guard(Kind::Spot, type, id);
 	CMapLocation* ml = spots().GetMapLocation(type, id);
 	if (!ml)
+	{
+		if (!spot_type_known(type))
+			return;
 		ml = spots().AddMapLocation(type, id);
+	}
 	const xr_string text = tagged_hint(shared_str(hint.c_str()), author);
 	if (!text.empty())
 		ml->SetHint(shared_str(text.c_str()));
@@ -1523,6 +1607,8 @@ void host_on_spot_request(PeerId from, u8 op, Reader& r)
 				ml->SetSerializable(true);
 			return; // the host has it already (both ran the same script)
 		}
+		if (!spot_type_known(type))
+			return;
 		SpotAuthor& a = g_spot_authors[SpotKey{type, id}];
 		a.author = from;
 		a.hint = shared_str(hint.c_str());
@@ -1563,6 +1649,15 @@ struct Progress
 Progress g_own_sent; // last own progress sent
 u64 g_last_progress = 0;
 xr_map<PeerId, Progress> g_reported; // host: last values reported by each client
+
+// The proxy already carries the change: keep it when the reported values are put back, until the
+// player's next report (which includes it) arrives.
+void host_add_reported_reputation(PeerId peer, int delta)
+{
+	auto it = g_reported.find(peer);
+	if (it != g_reported.end())
+		it->second.reputation += delta;
+}
 
 Progress own_progress()
 {
@@ -1814,11 +1909,13 @@ bool ready()
 	{
 		if (!in_game())
 			return false;
-		if (g_host_level != g_pGameLevel)
+		if (g_host_level != g_pGameLevel || g_host_epoch != join::host_world_epoch())
 		{
 			// Hosting started or the world was replaced (clients get that one from a fresh save):
 			// remember the current task list without broadcasting it, before any request runs.
+			// (The epoch also catches a reloaded level that got the old CLevel's address.)
 			g_host_level = g_pGameLevel;
+			g_host_epoch = join::host_world_epoch();
 			g_host_sent.clear();
 			g_host_prime = true;
 			host_scan_tasks();
@@ -1988,6 +2085,19 @@ void handle_client(Msg type, Reader& r)
 			if (r.ok())
 				client_set_comm_relation(a, b, v);
 		}
+		else if (op == RelReputationDelta)
+		{
+			// The host counted an attack / fight help of ours (R-3.4): our own reputation changes here,
+			// and the next progress report tells everybody.
+			const u16 who = r.u16();
+			const int delta = r.i32();
+			if (r.ok() && delta && g_actor && local_id_of(who) == 0)
+			{
+				g_actor->ChangeReputation(delta);
+				++g_stats.rep_deltas_in;
+			}
+			return;
+		}
 		++g_stats.rel_in;
 		break;
 	}
@@ -2085,6 +2195,8 @@ void register_commands()
 		return;
 	g_commands_registered = true;
 	CMD1(CCC_CoopTasksResync, "coop_tasks_resync");
+	// Host setting (R-7.6): 0 = task money to the finisher, 1 = split among online players.
+	CMD4(CCC_Integer, "coop_share_rewards", &g_coop_share_rewards, 0, 1);
 }
 
 const char* peer_name(PeerId id)
@@ -2115,6 +2227,7 @@ void reset()
 	g_host_sent.clear();
 	g_host_prime = true;
 	g_host_level = nullptr;
+	g_host_epoch = 0;
 	g_host_last_scan = 0;
 	g_finisher.clear();
 	g_client_recs.clear();
@@ -2123,6 +2236,7 @@ void reset()
 	g_state_requests.clear();
 	g_last_reconcile = 0;
 	g_rel_dirty.clear();
+	g_rep_delta.clear();
 	g_spot_authors.clear();
 	g_spot_pending.clear();
 	g_own_sent = Progress();
@@ -2150,6 +2264,7 @@ void frame()
 		replay_deferred();
 		flush_outbox();
 		host_flush_relations();
+		host_flush_rep_deltas();
 		if (mgr().now_ms() - g_host_last_scan >= kTaskScanIntervalMs)
 			host_scan_tasks();
 		progress_frame();
@@ -2192,8 +2307,16 @@ void print_status()
 	    g_stats.tasks_created, g_stats.tasks_detached, (u32)g_known.size(), (u32)g_pending.size(), g_stats.derived_dropped,
 	    g_stats.action_dropped, g_stats.task_edits_dropped, g_stats.hashes, g_stats.mismatches, g_stats.resyncs_out,
 	    g_stats.resyncs_in, g_stats.deferred);
+	::Msg("[coop] story: player proxies in combat bookkeeping %llu, reputation deltas out %llu in %llu, share rewards %d",
+	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
 	for (const auto& it : g_finisher)
 		::Msg("[coop] story:   task '%s' finished at the request of %s", cs(it.first), peer_name(it.second));
+	if (in_game()) // the Lua side of shared tasks (coop_tasks.script, W3c)
+		run_lua("@coop_story_status",
+		    "local ok, m = pcall(function() return coop_tasks end)\n"
+		    "if ok and type(m) == 'table' and type(m.print_status) == 'function' then pcall(m.print_status) end\n"
+		    "return 'ok'\n",
+		    "", 0, false);
 }
 
 bool applying() { return applying_any(); }
@@ -2335,8 +2458,35 @@ bool on_task_map_change(CGameTask* t)
 
 // ------------------------------------------------------------------ hooks: relations
 
-RelationActionScope::RelationActionScope() { ++g_action_depth; }
-RelationActionScope::~RelationActionScope() { --g_action_depth; }
+bool acts_as_actor(const CEntityAlive* who)
+{
+	// Section check, like sync::is_remote_driven: the same answer on every machine, in a session or not.
+	return who && !smart_cast<const CActor*>(who) && !xr_strcmp(who->cNameSect(), kAvatarSection);
+}
+
+RelationActionScope::RelationActionScope(CEntityAlive* from, int action)
+{
+	// Only the outermost call (ATTACK may call itself for FIGHT_HELP) measures the whole change. A kill is
+	// counted by the killer's own machine (its CEntityAlive::Die runs Action for its actor).
+	if (g_action_depth++ != 0 || action == RELATION_REGISTRY::KILL || !mgr().is_host() || !acts_as_actor(from))
+		return;
+	m_owner = smart_cast<CInventoryOwner*>(from);
+	if (!m_owner)
+		return;
+	m_id = from->ID();
+	m_reputation = m_owner->Reputation();
+	++g_stats.proxy_actions;
+}
+
+RelationActionScope::~RelationActionScope()
+{
+	--g_action_depth;
+	if (!m_owner)
+		return;
+	const int delta = m_owner->Reputation() - m_reputation;
+	if (delta)
+		g_rep_delta[m_id] += delta; // sent from frame() (this may run on the game thread)
+}
 
 bool on_personal_goodwill(u16 from, u16 to, int value, GoodwillOp op)
 {

@@ -82,6 +82,8 @@ public:
 	virtual void SetLaunchParams(const Fmatrix& xform,
 	                             const Fvector& vel,
 	                             const Fvector& angular_vel);
+	// Anomaly Coop: the launch set by the launcher (a client sends it, the host repeats it on its copy)
+	void coop_launch_params(Fmatrix& xform, Fvector& vel, Fvector& angular_vel) const { xform = m_LaunchXForm; vel = m_vLaunchVelocity; angular_vel = m_vLaunchAngularVelocity; }
 
 	virtual void OnEvent(NET_Packet& P, u16 type);
 	bool m_bLaunched;

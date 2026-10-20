@@ -436,6 +436,18 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_objects.h" />
+    <ClInclude Include="coop\coop_presence.h" />
+    <ClInclude Include="coop\coop_survival.h" />
+    <ClInclude Include="coop\coop_items.h" />
+    <ClInclude Include="coop\coop_requests.h" />
+    <ClInclude Include="coop\coop_events.h" />
+    <ClInclude Include="coop\coop_trade.h" />
+    <ClInclude Include="coop\coop_dialog.h" />
+    <ClInclude Include="coop\coop_story.h" />
+    <ClInclude Include="coop\coop_script.h" />
+    <ClInclude Include="coop\coop_remote.h" />
+    <ClInclude Include="coop\coop_worldstate.h" />
     <ClInclude Include="coop\coop_alife.h" />
     <ClInclude Include="coop\coop_net.h" />
     <ClInclude Include="coop\coop_entities.h" />
@@ -2087,6 +2099,18 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_objects.cpp" />
+    <ClCompile Include="coop\coop_presence.cpp" />
+    <ClCompile Include="coop\coop_survival.cpp" />
+    <ClCompile Include="coop\coop_items.cpp" />
+    <ClCompile Include="coop\coop_requests.cpp" />
+    <ClCompile Include="coop\coop_events.cpp" />
+    <ClCompile Include="coop\coop_trade.cpp" />
+    <ClCompile Include="coop\coop_dialog.cpp" />
+    <ClCompile Include="coop\coop_story.cpp" />
+    <ClCompile Include="coop\coop_script.cpp" />
+    <ClCompile Include="coop\coop_remote.cpp" />
+    <ClCompile Include="coop\coop_worldstate.cpp" />
     <ClCompile Include="coop\coop_equip.cpp" />
     <ClCompile Include="coop\coop_alife.cpp" />
     <ClCompile Include="coop\coop_net.cpp" />

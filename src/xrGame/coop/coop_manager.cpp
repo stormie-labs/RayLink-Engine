@@ -241,6 +241,7 @@ void Manager::install_session_callbacks()
 			for (const auto& s : diff.extra_here) ::Msg("!   extra here:   %s", s.c_str());
 			for (const auto& s : diff.differ) ::Msg("!   different:    %s", s.c_str());
 		}
+		script::on_rejected(r.reason, r.text.c_str(), diff); // W3d: refusal window (R-1.3, R-1.4)
 		join::on_session_lost(r.text.c_str());
 		set_phase(Phase::Off);
 	};
