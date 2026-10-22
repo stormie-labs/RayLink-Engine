@@ -134,6 +134,8 @@ struct State
 	bool char_window = false;
 	CharOfferMsg char_offer;
 	u64 char_next_try = 0;
+	// client, protocol 8: the branch of client_char_frame the log named last (char_note): one line per change
+	std::string char_note = "idle";
 } g;
 
 constexpr u32 kRefusalsLogged = 5;
@@ -1069,15 +1071,41 @@ void client_on_char_offer(PeerId from, Reader& r)
 	    m.refusal.c_str());
 }
 
+// Protocol 8, client: names the branch client_char_frame took when it is not the one named last, so every exit is in
+// the log once per change and not once per frame (the frames between two tries keep the branch of the last try). Night
+// run 1 (2026-10-23): the offer sat for 15 min and nothing in the log told where it stood.
+void char_note(const char* key, const char* text)
+{
+	if (g.char_note == key)
+		return;
+	g.char_note = key;
+	::Msg("[coop] new character: %s", text);
+}
+
 // Protocol 8, client (join::frame): the offer to the window, the window's choice to the host.
 void client_char_frame()
 {
-	if (g.char_step == State::CharStep::None || g.char_step == State::CharStep::Sent ||
-	    mgr().phase() != Phase::ReceivingWorld)
+	if (g.char_step == State::CharStep::None)
+	{
+		char_note("idle", "no offer to answer (none came, or it was closed)"); // silent until a first offer
 		return;
+	}
+	if (g.char_step == State::CharStep::Sent)
+	{
+		char_note("sent", "choice sent, waiting for the world"); // named by "character chosen" already
+		return;
+	}
+	if (mgr().phase() != Phase::ReceivingWorld)
+	{
+		string256 key, text;
+		xr_sprintf(key, "held %s", phase_name(mgr().phase()));
+		xr_sprintf(text, "the offer waits: phase %s (it is answered in receiving-world only)", phase_name(mgr().phase()));
+		char_note(key, text);
+		return;
+	}
 	const u64 now = mgr().now_ms();
 	if (now < g.char_next_try)
-		return;
+		return; // between two tries: the branch of the last try stands
 	if (g.char_step == State::CharStep::Offered)
 	{
 		g.char_next_try = now + 500; // no dialog can be opened yet (precache, no menu): again soon
@@ -1105,9 +1133,14 @@ void client_char_frame()
 		}
 		if (shown)
 		{
+			char_note("taken", "coop_menu_char.join_offer took the offer (the window is open, or -coop_autochoose "
+			                   "answered it)");
 			g.char_step = State::CharStep::Shown;
 			g.char_next_try = now;
 		}
+		else
+			char_note("not shown", "coop_menu_char.join_offer returned false: no window yet, tried again every 500 ms "
+			                       "(the [coop-char] lines say why)");
 		return;
 	}
 	g.char_next_try = now + 100;
@@ -1120,15 +1153,21 @@ void client_char_frame()
 	});
 	if (call != LuaCall::Done)
 	{
+		if (call == LuaCall::Missing)
+			::Msg("! [coop] %s.join_choice is missing: cannot choose a character", kCharScript);
 		mgr().stop("the co-op character window failed, see the log");
 		return;
 	}
 	if (!chose)
+	{
+		char_note("waiting", "waiting for the window's choice (coop_menu_char.join_choice gives none yet)");
 		return;
+	}
 	CharChoiceMsg m;
 	if (!newchar::make_choice(faction, buy, m))
 	{
 		::Msg("! [coop] the character window gave a choice the host cannot read ('%s'): not sent", faction.c_str());
+		g.char_note = "unreadable"; // the next try of the offer is named again
 		g.char_offer.refusal = "items";
 		g.char_step = State::CharStep::Offered;
 		return;
@@ -1137,6 +1176,7 @@ void client_char_frame()
 	m.write(w);
 	mgr().session().send(kHostPeer, Lane::Reliable, Msg::CharChoice, w);
 	g.char_step = State::CharStep::Sent;
+	g.char_note = "sent";
 	g.receive_started = now; // the join time limit starts again: the world follows the choice
 	::Msg("[coop] character chosen: %s, %u item(s) bought; waiting for the world", m.faction.c_str(), u32(m.buy.size()));
 }
