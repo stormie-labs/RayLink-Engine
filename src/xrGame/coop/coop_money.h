@@ -37,7 +37,9 @@ void on_session_started();
 void frame(); // main thread, every frame: the client sends its queued changes
 void on_peer_left(PeerId id); // the connection's numbering goes; the character keeps its allowances
 // Host (sync::host_end_join): player `id` has loaded the world and is live. Sends him his balance once: the client
-// drops MoneyBalance until it is live, and the save it loaded may be older than its balance.
+// drops MoneyBalance until it is live, and the save it loaded may be older than its balance. His character's
+// allowances start refilling here, not at its first income (Ruling F2-20): a new character starts empty, a returning one
+// keeps its frozen tokens, a saved one that was not here yet this session is full at its first income.
 void host_on_peer_in_world(PeerId id);
 // Client: live in the host's world. The actor's money came from the host's save (role swap): it is the balance.
 void on_client_live();

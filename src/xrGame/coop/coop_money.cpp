@@ -150,8 +150,9 @@ const char* nick_of(PeerId id)
 }
 
 // ---------------------------------------------------------------- host state
-// Per connection the newest answered change, per character (proxy id) the allowances for the whole session: leaving
-// and joining again refills nothing (fix round 1). Rules: xrCoop/coop_ledger.h HostBook.
+// Per connection the newest answered change, per character (its player key) the allowances for the whole session:
+// leaving and joining again refills nothing (fix round 1); they refill from the moment the character is live
+// (host_on_peer_in_world, Ruling F2-20). Rules: xrCoop/coop_ledger.h HostBook.
 ledger::HostBook g_book;
 
 struct HostCounters
@@ -629,6 +630,9 @@ void host_on_peer_in_world(PeerId id)
 	u32 balance = 0;
 	if (holder == kNoId || !read_balance(holder, balance))
 		return;
+	// Ruling F2-20: the character is live. Its allowances refill from now (a new one starts empty, a returning one
+	// keeps what it had), not from its first income; the time away pays nothing. money_set / host_set never touch them.
+	g_book.peer_online(id, character_key_of(holder), mgr().now_ms());
 	++g_h.joins;
 	send_balance(id, balance);
 }

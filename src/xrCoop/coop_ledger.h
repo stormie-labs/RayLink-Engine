@@ -10,7 +10,7 @@
 //     bucket (Policy::dialog_gain_cap in a row, dialog_gain_per_min per minute), anything else and the rest of a
 //     payout from the script bucket (script_gain_burst in a row, script_gain_per_min per minute). Changing the NPC
 //     or leaving the session refills nothing; a character made in this session (a new player key) starts with both
-//     buckets empty (Ruling F2-10);
+//     buckets empty (Ruling F2-10), and they refill from the moment it is live in the game (Ruling F2-20);
 //   - no balance goes above Policy::max_money;
 //   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer);
 //   - a change of zero is malformed: a client never sends one.
@@ -269,7 +269,8 @@ inline std::string character_key(std::string custom_data)
 // joins again (a new connection, maybe a new peer id) finds them as he left them. A character that was in the save
 // when the session started gets full allowances at its first change; one made in this session (a new player key)
 // starts empty and only gets the refills (Ruling F2-10). They refill only while the character is in the game: its
-// player leaving freezes them, the first gain after he is back starts the clock again (Ruling F2-13).
+// player leaving freezes them (Ruling F2-13), and the clock runs from the moment he is live again — his join is complete,
+// peer_online — not from his first gain: the time in the game before it is credited, the time away is not (Ruling F2-20).
 struct CharacterAllowances
 {
 	Allowance script;
@@ -349,6 +350,21 @@ public:
 		return d;
 	}
 
+	// Connection `peer` is live in the world with `character` (its join is complete; Ruling F2-20): the refill clock of
+	// the character runs from now, not from its first income.
+	//   - a character made in this session: both buckets exist now, empty, clock at `now_ms`;
+	//   - a character from the save that has not been here yet this session: full at its first income (a full bucket
+	//     does not refill, so its clock cannot matter until then);
+	//   - a character that is back: its tokens as it left them, clock at `now_ms` (nothing for the time away);
+	//   - a character already in the game: nothing changes.
+	// The connection is bound to the character from here, so that peer_left freezes it even if he never asked for money.
+	// A connection that is never marked (no join hook ran) still works: its buckets are made at its first income.
+	void peer_online(uint32_t peer, const std::string& character, uint64_t now_ms)
+	{
+		m_character_of[peer] = character;
+		allowances_of(character, now_ms);
+	}
+
 	// MoneyBalance::acked_seq for connection `peer` (0: nothing answered yet).
 	uint32_t acked(uint32_t peer) const
 	{
@@ -378,6 +394,9 @@ public:
 	const std::map<uint32_t, uint32_t>& connections() const { return m_acked; }
 
 private:
+	// The allowances of `character`, made if there are none yet. Called when the character goes live (peer_online, the
+	// normal way: Ruling F2-20) and by a request (the fallback for a connection that was never marked online). The
+	// clock of a character that is back starts now, so what was spent away stays spent and the time away pays nothing.
 	CharacterAllowances& allowances_of(const std::string& character, uint64_t now_ms)
 	{
 		const auto found = m_characters.find(character);
@@ -395,12 +414,13 @@ private:
 			return a;
 		}
 		CharacterAllowances& a = m_characters[character];
+		a.script.at = a.dialog.at = now_ms;
 		if (!from_save(character))
 		{
 			// Ruling F2-10: made in this session. Started and empty: refill() gives no burst, only the refills from now.
 			a.script.started = a.dialog.started = true;
-			a.script.at = a.dialog.at = now_ms;
 		}
+		// else: from the save, not started: the first refill() makes it full (Ruling F2-10), whatever `at` is.
 		return a;
 	}
 
