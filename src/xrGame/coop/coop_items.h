@@ -32,6 +32,7 @@
 #pragma once
 
 #include "xrCoop/coop_session.h"
+#include "coop_money.h" // F2 T5: UpgradePurchase holds a money::ClientSpendScope
 
 #include <vector>
 
@@ -89,5 +90,39 @@ enum class AddedUpgrade : u8
 	Refused,
 };
 AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why);
+
+// --- F2 T5: an upgrade a client buys at a mechanic ---
+// requests::client_item_event, the client's GE_INSTALL_UPGRADE of `local_item`: inside an UpgradePurchase of that item,
+// its mechanic (local numbering) and what the actor paid since the last claim, which the client now holds out of the
+// money it shows until the host answers (money::client_hold; `hold` is the key, 0 if nothing was paid). False outside
+// a purchase: mechanic 0xffff, nothing paid (a script's upgrade). Main thread.
+bool claim_upgrade_payment(u16 local_item, u16& mechanic, u32& paid, u32& hold);
+// Client: the actor's talk partner (local numbering), 0xffff if he talks to nobody. The mechanic of an upgrade Lua
+// installs (Anomaly's upgrade window, ui_inventory.script, runs inside the mechanic's dialog).
+u16 actor_talk_partner();
+
+// RAII around Manager::upgrade_install on the client's upgrade paths: the engine window
+// (CUIInventoryUpgradeWnd::OnMesBoxYes; the mechanic is the menu's partner) and Lua obj:install_upgrade
+// (CScriptGameObject::InstallUpgrade, used by ui_inventory.script; the mechanic is actor_talk_partner()). What the actor
+// pays meanwhile (inventory_upgrades.effect_functor_a: give_money(-price)) is summed by a money::ClientSpendScope, not
+// sent as a money change; the upgrade's GE_INSTALL_UPGRADE inside it takes the mechanic and the sum to the host
+// (ReqItemEvent, claim_upgrade_payment), which checks the mechanic and the price and charges the player. A sum no
+// upgrade event took goes to the host as an ordinary change at the end. Main thread; purchases nest (the innermost one
+// takes the events). Off a live client nothing is summed or sent.
+struct UpgradePurchase
+{
+	UpgradePurchase(CInventoryItem* item, u16 mechanic); // mechanic: local numbering, 0xffff: none
+	~UpgradePurchase();
+	UpgradePurchase(const UpgradePurchase&) = delete;
+	UpgradePurchase& operator=(const UpgradePurchase&) = delete;
+
+private:
+	friend bool claim_upgrade_payment(u16 local_item, u16& mechanic, u32& paid, u32& hold);
+	money::ClientSpendScope m_scope; // first: alive for the whole purchase
+	UpgradePurchase* m_outer = nullptr;
+	u16 m_item = 0xffff; // local numbering
+	u16 m_mechanic = 0xffff;
+	u32 m_carried = 0; // what upgrade events took of m_scope.spent()
+};
 } // namespace items
 } // namespace coop

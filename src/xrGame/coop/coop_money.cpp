@@ -48,6 +48,7 @@ int g_dialog_per_min = int(ledger::Policy().dialog_gain_per_min);
 int g_max_money = int(ledger::Policy().max_money);
 // 1.7 (the lowest stock mech_discount) x 1.3 (the lowest `upgrade` factor of plugins\difficulty.ltx), for F2 T5.
 float g_upgrade_min_percent = 2.21f;
+bool g_scripted_upgrades = false; // F2 T5: upgrades that name no mechanic (a script's) are refused
 
 ledger::Policy policy()
 {
@@ -99,6 +100,8 @@ void load_settings()
 		if (_valid(f) && f >= 0.f && f <= 100.f)
 			g_upgrade_min_percent = f;
 	}
+	if (ini.line_exist(kSection, "scripted_upgrades"))
+		g_scripted_upgrades = !!ini.r_bool(kSection, "scripted_upgrades"); // F2 T5
 }
 
 void register_console()
@@ -370,16 +373,19 @@ struct ClientState
 	u32 host_balance = 0, acked = 0; // the newest MoneyBalance
 	std::vector<ledger::Pending> pending; // changes sent (or queued) that the host has not answered
 	xr_vector<ledger::MoneyReq> outbox; // queued for frame()
+	ledger::UpgradeHolds holds; // F2 T5: payments requests carry, until their answers (client_hold)
 };
 // GE_MONEY may come from the game thread; the answers come with the network pump on the main thread.
 xrCriticalSection g_cl_lock;
 ClientState g_cl;
 u32 g_cl_seq = 0; // process lifetime: an answer from an older world never covers a newer change
+u32 g_hold_seq = 0; // F2 T5, process lifetime: a request of an older world never releases a newer hold
 ClientSpendScope* g_scope = nullptr; // the innermost alive ClientSpendScope (main thread)
 
 struct ClientCounters
 {
 	u64 sent = 0, balances = 0, set_by_host = 0, scoped = 0, gives = 0, malformed = 0;
+	u64 holds = 0, unclaimed = 0; // F2 T5
 } g_c;
 
 // Under g_cl_lock.
@@ -411,7 +417,8 @@ void client_on_balance(PeerId from, Reader& r)
 		ledger::forget_acked(g_cl.pending, m.acked_seq);
 		g_cl.host_balance = m.balance;
 		g_cl.acked = m.acked_seq;
-		view = ledger::client_view(m.balance, m.acked_seq, g_cl.pending, policy().max_money);
+		// F2 T5: an upgrade paid here whose request is not answered yet stays out of it (T1 concern 3)
+		view = ledger::client_view(m.balance, m.acked_seq, g_cl.pending, policy().max_money, g_cl.holds.sum());
 	}
 	++g_c.balances;
 	const u32 shown = a->get_money();
@@ -659,9 +666,9 @@ void print_status()
 		    g_h.bad_receiver, g_h.stale, g_h.no_character, g_h.dropped_joining, g_h.gain_script, g_h.gain_dialog,
 		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins);
 		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u in a row + %u per minute, max %u, "
-		      "upgrades from %.2f x cost",
+		      "upgrades from %.2f x cost, upgrades without a mechanic %s",
 		    p.script_gain_burst, p.script_gain_per_min, p.dialog_gain_cap, p.dialog_gain_per_min, p.max_money,
-		    g_upgrade_min_percent);
+		    g_upgrade_min_percent, g_scripted_upgrades ? "taken" : "refused");
 		for (const auto& it : g_book.connections())
 		{
 			const u16 holder = holder_of(it.first);
@@ -681,14 +688,17 @@ void print_status()
 		return;
 	xrCriticalSectionGuard guard(g_cl_lock);
 	::Msg("[coop]   money: %llu changes sent, %u waiting (last #%u); host balance %u RU (answered #%u), %llu balances in, "
-	      "%llu set by the host; %llu spends in scopes, %llu gives",
+	      "%llu set by the host; %llu spends in scopes, %llu gives; upgrades paid here %llu (%u unanswered, %llu RU), "
+	      "%llu scope spends sent as changes",
 	    g_c.sent, (u32)g_cl.pending.size(), g_cl_seq, g_cl.host_balance, g_cl.acked, g_c.balances, g_c.set_by_host,
-	    g_c.scoped, g_c.gives);
+	    g_c.scoped, g_c.gives, g_c.holds, (u32)g_cl.holds.size(), g_cl.holds.sum(), g_c.unclaimed);
 }
 
 u32 max_money() { return policy().max_money; }
 
 float upgrade_min_percent() { return g_upgrade_min_percent; }
+
+bool scripted_upgrades() { return g_scripted_upgrades; }
 
 u32 host_balance(PeerId peer)
 {
@@ -724,6 +734,14 @@ bool host_set(PeerId peer, u32 amount, const char* why)
 		write_balance(holder, next);
 	send_balance(peer, next);
 	return true;
+}
+
+void host_send_balance(PeerId peer)
+{
+	u32 balance = 0;
+	const u16 holder = mgr().is_host() ? holder_of(peer) : kNoId;
+	if (holder != kNoId && read_balance(holder, balance))
+		send_balance(peer, balance);
 }
 
 void client_on_actor_money(u32 money)
@@ -772,6 +790,37 @@ void client_flush()
 ClientSpendScope::ClientSpendScope() : m_outer(g_scope) { g_scope = this; }
 
 ClientSpendScope::~ClientSpendScope() { g_scope = m_outer; }
+
+u32 client_hold(u32 amount)
+{
+	if (!amount || !mgr().is_live_client())
+		return 0;
+	xrCriticalSectionGuard guard(g_cl_lock);
+	if (++g_hold_seq == 0)
+		++g_hold_seq; // 0 is "nothing held"
+	g_cl.holds.hold(g_hold_seq, amount);
+	++g_c.holds;
+	return g_hold_seq;
+}
+
+void client_release(u32 key)
+{
+	if (!key)
+		return;
+	xrCriticalSectionGuard guard(g_cl_lock);
+	g_cl.holds.release(key); // the money shown stays until the balance that follows the answer
+}
+
+void client_spend(u32 amount)
+{
+	if (!amount || !mgr().is_live_client() || entities::client_applying())
+		return;
+	xrCriticalSectionGuard guard(g_cl_lock);
+	if (!g_cl.anchored)
+		return; // the next balance from the host is the truth anyway
+	++g_c.unclaimed;
+	queue_change(-s64(amount), dialog::client_partner() != kNoId ? Cause::Dialog : Cause::Script, 0);
+}
 
 void register_lua(lua_State* L)
 {

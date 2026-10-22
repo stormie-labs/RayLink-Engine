@@ -313,6 +313,10 @@ struct Action
 	SHit hit;
 	xr_vector<u8> bytes; // ItemEvent: event bytes; Spawn: item state (coop_items blob)
 	xr_string section; // Spawn
+	// ItemEvent (F2 T5): the upgrade's mechanic (local numbering, kNoId: none), what was paid for it, and the key of
+	// that payment held out of the money shown until the host answers (money::client_hold, 0: none)
+	u16 mechanic = kNoId;
+	u32 paid = 0, hold = 0;
 };
 
 struct Inflight
@@ -320,6 +324,7 @@ struct Inflight
 	Msg type;
 	u16 item;
 	u64 sent;
+	u32 hold = 0; // F2 T5: released by the answer (or the timeout)
 };
 
 // The router may run on the game thread; sending happens in frame() on the main thread.
@@ -493,12 +498,16 @@ void send_action(const Action& a)
 	}
 	case Act::ItemEvent:
 	{
-		Writer w(a.bytes.size() + 16);
-		w.u32(++g_seq);
+		// F2 T5: tracked, so that the host's answer releases the payment held out of the money shown
+		const u32 seq = track(Msg::ReqItemEvent, a.item);
+		g_inflight[seq].hold = a.hold;
+		Writer w(a.bytes.size() + 16 + ledger::kUpgradePaymentSize);
+		w.u32(seq);
 		w.u16(to_host_id(a.item));
 		w.u16(a.ge_type);
 		w.u16(u16(a.bytes.size()));
 		w.bytes(a.bytes.data(), a.bytes.size());
+		ledger::write(w, ledger::UpgradePayment{to_host_id(a.mechanic), a.paid}); // F2 T5
 		net::client_send(Msg::ReqItemEvent, w);
 		++g_cl.sent[6];
 		break;
@@ -533,6 +542,7 @@ void client_flush()
 		if (now - it->second.sent > kResultTimeoutMs)
 		{
 			++g_cl.timeouts;
+			money::client_release(it->second.hold); // F2 T5: the next balance from the host decides
 			it = g_inflight.erase(it);
 		}
 		else
@@ -553,6 +563,9 @@ void client_on_result(PeerId, Reader& r)
 	if (it != g_inflight.end())
 	{
 		type = it->second.type;
+		// F2 T5: an upgrade's answer. The host sends the balance right after it (charged or not), so the money shown
+		// stays as it is until then.
+		money::client_release(it->second.hold);
 		g_inflight.erase(it);
 	}
 	if (accepted)
@@ -1432,6 +1445,163 @@ void host_on_hit(PeerId from, Reader& r)
 		reply(q, why, target);
 }
 
+// ---------------------------------------------------------------- upgrades at a mechanic (F2 T5)
+// A client's upgrade is bought at a mechanic: the request names him and what the client's game charged for it
+// (ledger::UpgradePayment), the host checks both (ledger::judge_upgrade) and charges the player's balance itself.
+// Settings the stock upgrade scripts read (inventory_upgrades.script ini_file), each opened once per process like the
+// Lua ones (CInifile: their DLTX mod files apply the same way) and kept for it.
+
+struct UpgradeCounters
+{
+	u64 verdicts[ledger::kUpgradeVerdictCount] = {};
+	u64 without_mechanic = 0; // requests that named no mechanic (a script installed the upgrade)
+	u64 bought = 0, charged = 0, already = 0, engine = 0, no_cost = 0, not_his = 0, not_alive = 0, not_mechanic = 0;
+} g_upgrades;
+
+CInifile* open_game_config(LPCSTR name)
+{
+	string_path path;
+	FS.update_path(path, "$game_config$", name);
+	if (!FS.exist(path))
+	{
+		::Msg("! [coop] configs\\%s not found: client upgrades at a mechanic are refused", name);
+		return nullptr;
+	}
+	return xr_new<CInifile>(path, TRUE, TRUE, FALSE);
+}
+
+// Mechanics: [<section>] (discount, tiers) and [<section>_upgr] (his own upgrade conditions).
+CInifile* upgrade_info_ini()
+{
+	static CInifile* ini = open_game_config("misc\\stalkers_upgrade_info.ltx");
+	return ini;
+}
+
+// Upgrade prices as the Lua price reads them (char_ini): item_upgrades.ltx is not part of system.ltx.
+CInifile* item_upgrades_ini()
+{
+	static CInifile* ini = open_game_config("item_upgrades.ltx");
+	return ini;
+}
+
+// A mechanic's section: the stock scripts read his discount and tiers from [<section>] of
+// misc\stalkers_upgrade_info.ltx and his own conditions from [<section>_upgr]. Either one names him: the twelve
+// Warfare mechanics (sim_default_*_mechanic) have only the first.
+bool is_mechanic_section(const shared_str& section)
+{
+	CInifile* ini = upgrade_info_ini();
+	if (!ini || !section.size() || section.size() > 200)
+		return false;
+	string256 upgr;
+	xr_sprintf(upgr, "%s_upgr", section.c_str());
+	return ini->section_exist(section) || ini->section_exist(upgr);
+}
+
+// `cost` of upgrade `upgrade` ([upgrade] section = <settings section>), read as the stock price does: from
+// item_upgrades.ltx, else from the game settings. False: none (the stock price would fail on it).
+bool upgrade_cost(const shared_str& upgrade, u32& cost)
+{
+	cost = 0;
+	if (!pSettings->section_exist(upgrade) || !pSettings->line_exist(upgrade, "section"))
+		return false;
+	const LPCSTR sect = pSettings->r_string(upgrade, "section");
+	if (!sect || !sect[0])
+		return false;
+	CInifile* ini = item_upgrades_ini();
+	if (ini && ini->section_exist(sect) && ini->line_exist(sect, "cost"))
+	{
+		cost = ini->r_u32(sect, "cost");
+		return true;
+	}
+	if (pSettings->section_exist(sect) && pSettings->line_exist(sect, "cost"))
+	{
+		cost = pSettings->r_u32(sect, "cost");
+		return true;
+	}
+	return false;
+}
+
+// `mechanic` (host numbering) sells upgrades to player `from` now: he holds that NPC's talk lock (the stock upgrade
+// windows run inside the mechanic's dialog; coop_dialog), it is a live stalker, and the mechanics' settings name it.
+bool host_his_mechanic(PeerId from, u16 mechanic, const char*& why)
+{
+	if (dialog::host_lock_of(from) != mechanic)
+	{
+		++g_upgrades.not_his;
+		why = "he does not talk to him";
+		return false;
+	}
+	CAI_Stalker* s = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(mechanic));
+	if (!s || s->getDestroy() || !s->g_Alive())
+	{
+		++g_upgrades.not_alive;
+		why = "not a live stalker";
+		return false;
+	}
+	if (!is_mechanic_section(s->cNameSect()))
+	{
+		++g_upgrades.not_mechanic;
+		why = "not a mechanic";
+		return false;
+	}
+	return true;
+}
+
+const char* upgrade_verdict_name(ledger::UpgradeVerdict v)
+{
+	switch (v)
+	{
+	case ledger::UpgradeVerdict::Ok: return "ok";
+	case ledger::UpgradeVerdict::Scripted: return "no mechanic named (scripted_upgrades = false)";
+	case ledger::UpgradeVerdict::NoMechanic: return "no mechanic";
+	case ledger::UpgradeVerdict::TooFar: return "too far from the mechanic";
+	case ledger::UpgradeVerdict::Underpaid: return "underpaid";
+	case ledger::UpgradeVerdict::Insufficient: return "not enough money on the host";
+	}
+	return "?";
+}
+
+// The brief's checks before the upgrade's own (host_check_added_upgrade): a mechanic, within kTradeReach of the
+// player's character, paid at least floor(cost x upgrade_min_percent), and the player's balance on the host covers it.
+// Refusals are NotAllowed on the wire, counted by cause.
+Reason host_sell_upgrade(const Req& q, const shared_str& upgrade, const ledger::UpgradePayment& pay)
+{
+	ledger::UpgradeFacts f;
+	f.mechanic_named = pay.mechanic != kNoId;
+	f.scripted_allowed = money::scripted_upgrades();
+	const char* not_mechanic = nullptr;
+	f.mechanic_ok = f.mechanic_named && host_his_mechanic(q.from, pay.mechanic, not_mechanic);
+	f.distance = f.mechanic_ok ? talk_distance(pay.mechanic, q.proxy) : flt_max;
+	f.reach = trade::kTradeReach;
+	f.paid = pay.paid;
+	if (f.mechanic_named && !upgrade_cost(upgrade, f.cost))
+		++g_upgrades.no_cost; // host_check_added_upgrade judges such a name next
+	f.min_percent = money::upgrade_min_percent();
+	f.balance = money::host_balance(q.from);
+	if (!f.mechanic_named)
+		++g_upgrades.without_mechanic;
+	const ledger::UpgradeVerdict v = ledger::judge_upgrade(f);
+	++g_upgrades.verdicts[u32(v)];
+	if (v == ledger::UpgradeVerdict::Ok)
+		return Reason::Ok;
+	if (log_allowed())
+		::Msg("! [coop] upgrade [%s] from player #%u refused: %s%s%s (mechanic %u, %.1f m; paid %u RU, cost %u RU x %.2f; "
+		      "balance %u RU)",
+		    upgrade.c_str(), q.from, upgrade_verdict_name(v), not_mechanic ? ": " : "", not_mechanic ? not_mechanic : "",
+		    pay.mechanic, f.mechanic_ok ? double(f.distance) : -1.0, f.paid, f.cost, double(f.min_percent), f.balance);
+	return Reason::NotAllowed;
+}
+
+// Every upgrade request is answered, and when the client's game paid for it the player's balance follows the answer:
+// his client holds the payment out of the money it shows until the answer (money::client_hold), so the next balance
+// is exactly the host's, charged or not.
+void answer_upgrade(const Req& q, Reason why, u16 item, u32 paid)
+{
+	reply(q, why, item);
+	if (paid)
+		money::host_send_balance(q.from);
+}
+
 void host_on_item_event(PeerId from, Reader& r)
 {
 	Req q;
@@ -1441,48 +1611,68 @@ void host_on_item_event(PeerId from, Reader& r)
 	const u16 type = r.u16();
 	const u16 size = r.u16();
 	u8 data[512];
-	if (!r.ok() || size > sizeof(data) || !r.bytes(data, size))
+	ledger::UpgradePayment pay; // F2 T5: the event bytes are followed by the payment
+	if (!r.ok() || size > sizeof(data) || !r.bytes(data, size) || !ledger::read(r, pay))
 		return reply(q, Reason::Malformed, kNoId);
 	if (!allow(from, CatMisc))
 		return reply(q, Reason::RateLimited, item);
+	const auto answer = [&q, item, &pay](Reason why) { answer_upgrade(q, why, item, pay.paid); };
 	if (type != GE_INSTALL_UPGRADE)
-		return reply(q, Reason::NotAllowed, item);
+		return answer(Reason::NotAllowed);
 	if (!events::find_entity(item))
-		return reply(q, Reason::Missing, item);
+		return answer(Reason::Missing);
 	if (events::root_of(item) != q.proxy)
-		return reply(q, Reason::NotOwner, item);
+		return answer(Reason::NotOwner);
+	// R3 В6 (task 10b): the upgrade id ends inside the event bytes (r_stringZ reads up to a zero) and is a name.
+	if (!size || !std::memchr(data, 0, size))
+		return answer(Reason::Malformed);
+	shared_str upgrade;
 	{
-		// R3 В6 (task 10b): the upgrade id ends inside the event bytes (r_stringZ reads up to a zero) and is a name.
-		if (!size || !std::memchr(data, 0, size))
-			return reply(q, Reason::Malformed, item);
 		NET_Packet probe;
 		probe.B.count = size;
 		CopyMemory(probe.B.data, data, size);
 		probe.r_pos = 0;
-		shared_str upgrade;
 		probe.r_stringZ(upgrade);
-		if (!validate::resource_name_ok(upgrade.c_str(), spawn::kMaxSection))
-			return reply(q, Reason::Malformed, item);
-		// The server entity keeps it in the host save, and its next net_Spawn from scratch installs the section
-		// defaults, its list, then it with loading = true: FATAL on a taken group or a missing parent group. A
-		// repeat must not reach CSE_ALifeInventoryItem::add_upgrade either (FATAL on duplicates).
-		CSE_Abstract* e = ai().alife().objects().object(item, true);
-		const char* why = nullptr;
-		switch (items::host_check_added_upgrade(e, upgrade, why))
-		{
-		case items::AddedUpgrade::AlreadyThere: return;
-		case items::AddedUpgrade::Refused:
-			if (note_bad(BadUpgrade))
-				::Msg("! [coop] upgrade [%s] of item %u from player #%u refused: %s", upgrade.c_str(), item, from,
-				    why ? why : "?");
-			return reply(q, Reason::NotAllowed, item);
-		case items::AddedUpgrade::Relay: break;
-		}
+	}
+	if (!validate::resource_name_ok(upgrade.c_str(), spawn::kMaxSection))
+		return answer(Reason::Malformed);
+	// F2 T5: bought at a mechanic nearby and paid enough, with the money on the host
+	const Reason sold = host_sell_upgrade(q, upgrade, pay);
+	if (sold != Reason::Ok)
+		return answer(sold);
+	// The server entity keeps it in the host save, and its next net_Spawn from scratch installs the section
+	// defaults, its list, then it with loading = true: FATAL on a taken group or a missing parent group. A
+	// repeat must not reach CSE_ALifeInventoryItem::add_upgrade either (FATAL on duplicates).
+	CSE_Abstract* e = ai().alife().objects().object(item, true);
+	const char* why = nullptr;
+	switch (items::host_check_added_upgrade(e, upgrade, why))
+	{
+	case items::AddedUpgrade::AlreadyThere:
+		++g_upgrades.already;
+		return answer(Reason::Ok); // nothing to do, nothing charged: the balance tells his client
+	case items::AddedUpgrade::Refused:
+		if (note_bad(BadUpgrade))
+			::Msg("! [coop] upgrade [%s] of item %u from player #%u refused: %s", upgrade.c_str(), item, from,
+			    why ? why : "?");
+		return answer(Reason::NotAllowed);
+	case items::AddedUpgrade::Relay: break;
 	}
 	NET_Packet P;
 	CGameObject::u_EventGen(P, type, item);
 	P.w(data, size);
-	CGameObject::u_EventSend(P); // the server entity keeps the upgrade in the host save
+	CGameObject::u_EventSend(P); // the server entity keeps the upgrade in the host save (local server: at once)
+	// F2 T5: charged only for what the entity took; an engine refusal costs nothing.
+	CSE_ALifeInventoryItem* ii = smart_cast<CSE_ALifeInventoryItem*>(e);
+	if (!ii || !ii->has_upgrade(upgrade))
+	{
+		++g_upgrades.engine;
+		return answer(Reason::Engine);
+	}
+	++g_upgrades.bought;
+	// The answer first, then the charge, whose MoneyBalance is the first after it (one reliable lane).
+	reply(q, Reason::Ok, item);
+	if (pay.paid && money::host_adjust(from, -s64(pay.paid), "upgrade"))
+		g_upgrades.charged += pay.paid;
 }
 
 // ---------------------------------------------------------------- rockets (W3a)
@@ -1751,6 +1941,17 @@ void print_status()
 		    u32(spawn::kMaxQueued));
 		::Msg("[coop]   quest allowed in dialog %llu (quest items a player's talk gave his own character, F2-16)",
 		    g_spawn_quest_gifts);
+		using ledger::UpgradeVerdict;
+		const auto upgrade_refused = [](UpgradeVerdict v) { return g_upgrades.verdicts[u32(v)]; };
+		::Msg("[coop]   upgrades at a mechanic (F2 T5): %llu bought (%llu RU charged), %llu already there, refused: no "
+		      "mechanic %llu (not his talk %llu, not a live stalker %llu, not a mechanic %llu), too far %llu, underpaid "
+		      "%llu, not enough money %llu, engine %llu; upgrades without a mechanic %llu (%llu refused, "
+		      "scripted_upgrades %s); %llu without a cost",
+		    g_upgrades.bought, g_upgrades.charged, g_upgrades.already, upgrade_refused(UpgradeVerdict::NoMechanic),
+		    g_upgrades.not_his, g_upgrades.not_alive, g_upgrades.not_mechanic, upgrade_refused(UpgradeVerdict::TooFar),
+		    upgrade_refused(UpgradeVerdict::Underpaid), upgrade_refused(UpgradeVerdict::Insufficient),
+		    g_upgrades.engine, g_upgrades.without_mechanic, upgrade_refused(UpgradeVerdict::Scripted),
+		    money::scripted_upgrades() ? "true" : "false", g_upgrades.no_cost);
 		return;
 	}
 	// sent[5] was ReqMoney (now coop_money, F2 T1)
@@ -1913,6 +2114,9 @@ void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)
 	a.item = local_item;
 	a.ge_type = ge_type;
 	a.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
+	// F2 T5: an upgrade bought at a mechanic carries him and its price (items::UpgradePurchase); else none, nothing
+	if (ge_type == GE_INSTALL_UPGRADE)
+		items::claim_upgrade_payment(local_item, a.mechanic, a.paid, a.hold);
 	push(std::move(a));
 }
 

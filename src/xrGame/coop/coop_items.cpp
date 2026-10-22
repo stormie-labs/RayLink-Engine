@@ -1922,5 +1922,51 @@ AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& up
 		return AddedUpgrade::Refused;
 	}
 }
+
+// ---------------------------------------------------------------- F2 T5: an upgrade bought at a mechanic (client)
+namespace
+{
+UpgradePurchase* g_purchase = nullptr; // the innermost alive purchase (main thread)
+} // namespace
+
+UpgradePurchase::UpgradePurchase(CInventoryItem* item, u16 mechanic)
+	: m_outer(g_purchase), m_item(item ? item->object_id() : kNoId), m_mechanic(mechanic)
+{
+	g_purchase = this;
+}
+
+UpgradePurchase::~UpgradePurchase()
+{
+	g_purchase = m_outer;
+	// Spent here and taken by no upgrade event (the install failed, the event did not leave): an ordinary change, so
+	// the host's balance follows what the actor paid. m_scope is still alive: this is not summed again.
+	const u32 spent = m_scope.spent();
+	if (spent > m_carried)
+		money::client_spend(spent - m_carried);
+}
+
+bool claim_upgrade_payment(u16 local_item, u16& mechanic, u32& paid, u32& hold)
+{
+	mechanic = kNoId;
+	paid = 0;
+	hold = 0;
+	UpgradePurchase* p = g_purchase;
+	if (!p || p->m_item != local_item)
+		return false; // a script's upgrade, or another item's: no mechanic, nothing paid
+	const u32 spent = p->m_scope.spent();
+	mechanic = p->m_mechanic;
+	paid = spent > p->m_carried ? spent - p->m_carried : 0;
+	p->m_carried = spent;
+	hold = money::client_hold(paid);
+	return true;
+}
+
+u16 actor_talk_partner()
+{
+	CActor* a = Actor();
+	CInventoryOwner* partner = a && a->IsTalking() ? a->GetTalkPartner() : nullptr;
+	CGameObject* go = partner ? smart_cast<CGameObject*>(partner) : nullptr;
+	return go ? go->ID() : kNoId;
+}
 } // namespace items
 } // namespace coop

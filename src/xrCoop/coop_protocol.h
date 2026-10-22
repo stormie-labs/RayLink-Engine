@@ -23,7 +23,9 @@ namespace coop
 //    change with a cause (coop_ledger.h MoneyReq) instead of an absolute amount and goes client -> host only;
 //    MoneyBalance 0x0190 (host -> the player it belongs to); TradeOp Deal lost `applied` and `client_money`
 // 8 (owner, live test 2026-10-23): a player whose key has no character chooses faction and gear before the world:
-//    CharOffer (host -> client, answers JoinRequest), CharChoice (client -> host); the world follows the choice
+//    CharOffer (host -> client, answers JoinRequest), CharChoice (client -> host); the world follows the choice.
+//    Also in 8 (F2 T5): ReqItemEvent ends with `u16 mechanic` and `u32 paid` (an upgrade is bought from a mechanic and
+//    charged by the host); F3 Msg 0x01C0-0x01C6
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients

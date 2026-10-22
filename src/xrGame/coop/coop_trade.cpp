@@ -51,9 +51,7 @@ constexpr u64 kSettleMs = 1500; // after a successful deal, one consistency rebu
 constexpr u64 kPendingWarnMs = 15000; // client: a deal without answer is logged
 constexpr s64 kMaxMoney = 0xffffffffll;
 constexpr u8 kDealDonate = 1;
-// R4 2: player character <-> trader on the host. The stock trade window closes beyond 3 m
-// (CUIActorMenu::CheckDistance); twice that for the lag of the player's character on the host.
-constexpr float kTradeReach = 6.f;
+// kTradeReach: coop_trade.h (F2 T5: also a mechanic's reach)
 
 enum class Op : u8
 {

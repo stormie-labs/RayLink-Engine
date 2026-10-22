@@ -65,6 +65,7 @@
 
 #include "Flashlight.h"
 #include "CharacterPhysicsSupport.h"
+#include "coop/coop_items.h" // Anomaly Coop (F2 T5): an upgrade bought at a mechanic
 
 bool CScriptGameObject::GiveInfoPortion(LPCSTR info_id)
 {
@@ -2360,6 +2361,9 @@ bool CScriptGameObject::InstallUpgrade(LPCSTR upgrade)
 	if (!pSettings->section_exist(upgrade))
 		return false;
 
+	// Anomaly Coop (F2 T5): Anomaly's own upgrade window (ui_inventory.script, inside the mechanic's dialog) installs
+	// with this; on a client the price goes to the host with the upgrade, bought from the actor's talk partner.
+	coop::items::UpgradePurchase purchase(item, coop::items::actor_talk_partner());
 	return ai().alife().inventory_upgrade_manager().upgrade_install(*item, upgrade, false);
 }
 

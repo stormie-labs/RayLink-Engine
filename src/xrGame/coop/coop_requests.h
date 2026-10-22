@@ -21,7 +21,12 @@
 //                 position; the host checks the reach whatever the flags say (R3 В8)
 //   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit   (power etc. after the client's before-hit Lua, W5)
 //   ReqMoney      a change of the actor's money with a cause, not an amount: coop_money.h (F2 T1, R4 7)
-//   ReqItemEvent  u32 seq, u16 item, u16 ge_type, u16 size, bytes after the GE header
+//   ReqItemEvent  u32 seq, u16 item, u16 ge_type, u16 size, bytes after the GE header, u16 mechanic, u32 paid
+//                 (F2 T5, ledger::UpgradePayment): only GE_INSTALL_UPGRADE, bought from `mechanic` (0xffff: a script's
+//                 upgrade, refused unless scripted_upgrades) for `paid` RU the client's game charged. The host checks the
+//                 mechanic (his talk lock, a live stalker with mechanic settings, within 6 m), the price
+//                 (paid >= floor(cost x upgrade_min_percent)) and the balance, relays the upgrade, answers (always),
+//                 then charges `paid` — the MoneyBalance follows the answer, also after a refusal of a paid one.
 //   ReqLaunch     u32 seq, u16 launcher, u16 rocket, vec3 pos, vec3 dir, vec3 vel, vec3 angular_vel (W3a)
 //                 the client already launched its copy (a visual that never detonates there); the host
 //                 checks it, launches its own copy (it flies, detonates, is removed for everybody) and

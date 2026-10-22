@@ -49,6 +49,9 @@ void print_status();
 u32 max_money();
 // configs\coop_money.ltx upgrade_min_percent (for the upgrade price check, F2 T5).
 float upgrade_min_percent();
+// configs\coop_money.ltx scripted_upgrades (F2 T5): the host takes a client's upgrade that names no mechanic (a script
+// installed it). Default false.
+bool scripted_upgrades();
 
 // --- host ---
 // The balance of `peer`'s character, 0 if he has none.
@@ -59,6 +62,9 @@ u32 host_balance(PeerId peer);
 bool host_adjust(PeerId peer, s64 delta, const char* why);
 // Sets the balance (up to max_money) and sends it to its player. False if he has no character.
 bool host_set(PeerId peer, u32 amount, const char* why);
+// Sends `peer` his balance as it is (F2 T5: after the answer to an upgrade he paid for on his machine, which the host
+// refused or did not charge). Nothing if he has no character.
+void host_send_balance(PeerId peer);
 
 // --- client ---
 // GE_MONEY of the local actor (any thread). Skipped while host commands are applied (entities::client_applying).
@@ -66,7 +72,8 @@ void client_on_actor_money(u32 money);
 // Main thread: sends the queued changes now.
 void client_flush();
 // While alive, decreases of the actor's money are added up here and not sent: the request they belong to carries
-// the sum (F2 T5: an upgrade paid by one request). Main thread; scopes nest (the innermost one counts).
+// the sum (F2 T5: an upgrade paid by one request, items::UpgradePurchase). Main thread; scopes nest (the innermost one
+// counts).
 struct ClientSpendScope
 {
 	ClientSpendScope();
@@ -80,6 +87,15 @@ private:
 	ClientSpendScope* m_outer = nullptr;
 	u32 m_spent = 0;
 };
+// F2 T5 (T1 concern 3), main thread. A payment a request carries to the host (an upgrade's price): until the host
+// answers that request it is held out of the money shown (ledger::UpgradeHolds), so a balance the host sent before it
+// charged the payment does not show the money from before it; the host sends the balance after its answer. Returns the
+// key to release it with (0: nothing held — not a live client, or nothing paid).
+u32 client_hold(u32 amount);
+// The host answered the request of `key` (or it timed out): the hold goes; the money shown follows the next balance.
+void client_release(u32 key);
+// A spend a ClientSpendScope summed that no request carried after all: it goes to the host as an ordinary change.
+void client_spend(u32 amount);
 
 // Adds the Lua functions above to the `coop` table (coop_script.cpp register_raw).
 void register_lua(lua_State* L);

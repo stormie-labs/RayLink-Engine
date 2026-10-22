@@ -53,6 +53,11 @@ class Session;
 
 namespace trade
 {
+// R4 2: player character <-> trader on the host. The stock trade window closes beyond 3 m
+// (CUIActorMenu::CheckDistance); twice that for the lag of the player's character on the host. Also the reach of a
+// mechanic who sells a client an upgrade (F2 T5, coop_requests).
+constexpr float kTradeReach = 6.f;
+
 void install(Session& s);
 void frame(); // main thread, every frame
 void reset(); // session started / ended / world replaced

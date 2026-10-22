@@ -37,6 +37,7 @@
 #include "../ActorHelmet.h"
 #include "script_game_object.h" //Alundaio
 #include "ActorBackpack.h"
+#include "../coop/coop_items.h" // Anomaly Coop (F2 T5): an upgrade bought at a mechanic
 
  //Alundaio
 // -----
@@ -345,7 +346,16 @@ void CUIInventoryUpgradeWnd::AskUsing(LPCSTR text, LPCSTR upgrade_name)
 
 void CUIInventoryUpgradeWnd::OnMesBoxYes()
 {
-	if (get_manager().upgrade_install(*m_inv_item, m_cur_upgrade_id, false))
+	bool installed = false;
+	{
+		// Anomaly Coop (F2 T5): on a client the price the upgrade's effect charges goes to the host with the upgrade,
+		// bought from the menu's partner (the mechanic); the host checks and charges it.
+		CUIActorMenu* menu = smart_cast<CUIActorMenu*>(m_pParentWnd);
+		CGameObject* mechanic = menu && menu->GetPartner() ? smart_cast<CGameObject*>(menu->GetPartner()) : nullptr;
+		coop::items::UpgradePurchase purchase(m_inv_item, mechanic ? mechanic->ID() : u16(0xffff));
+		installed = get_manager().upgrade_install(*m_inv_item, m_cur_upgrade_id, false);
+	}
+	if (installed)
 	{
 		VERIFY(m_pParentWnd);
 		CUIActorMenu* parent_wnd = smart_cast<CUIActorMenu*>(m_pParentWnd);

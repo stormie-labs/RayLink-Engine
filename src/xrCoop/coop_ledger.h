@@ -20,10 +20,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "coop_session.h" // find_key_value, migrate_key_value: the player key line of a character
@@ -177,14 +179,16 @@ struct Pending
 inline bool seq_newer(uint32_t a, uint32_t b) { return int32_t(a - b) > 0; }
 
 // What the client shows: the host's balance plus its changes the host has not answered yet (seq newer than
-// `acked_seq`), within [0, max(max_money, host_balance)] — the host's own figure is never cut.
+// `acked_seq`), less `held` (F2 T5: upgrades it paid whose requests the host has not answered, UpgradeHolds), within
+// [0, max(max_money, host_balance)] — the host's own figure is never cut.
 inline uint32_t client_view(uint32_t host_balance, uint32_t acked_seq, const std::vector<Pending>& pending,
-    uint32_t max_money = Policy().max_money)
+    uint32_t max_money = Policy().max_money, uint64_t held = 0)
 {
 	int64_t v = int64_t(host_balance);
 	for (const Pending& p : pending)
 		if (seq_newer(p.seq, acked_seq))
 			v += p.delta;
+	v -= int64_t(std::min<uint64_t>(held, uint64_t(INT64_MAX) / 2)); // at most 64 x u32 in practice
 	const int64_t hi = std::max<int64_t>(int64_t(max_money), int64_t(host_balance));
 	return uint32_t(std::min<int64_t>(std::max<int64_t>(v, 0), hi));
 }
@@ -440,5 +444,137 @@ void settle_transfer(Balances& b, uint32_t giver, uint32_t giver_balance, uint32
 	b.set(giver, giver_balance);
 	b.add(receiver, credit);
 }
+
+// ---------------------------------------------------------------- upgrades at a mechanic (F2 T5)
+// A client installs an upgrade on its machine; the stock Lua effect pays for it there
+// (inventory_upgrades.effect_functor_a: give_money(-price), price = floor(cost x mech_discount x eco `upgrade`)). That
+// spend is not sent as a ReqMoney: the upgrade's request (Msg::ReqItemEvent GE_INSTALL_UPGRADE) carries it with the
+// mechanic (UpgradePayment), and the host checks both (judge_upgrade) and charges the player's balance itself. The
+// client counts the payment until the host answers that request (UpgradeHolds, client_view `held`); the host answers
+// first and sends the balance after the answer.
+
+// The least a mechanic takes: paid >= floor(cost x min_percent). min_percent is a host setting with a few decimals
+// (configs\coop_money.ltx upgrade_min_percent); it counts to 6 decimals in whole numbers, so a float's error (2.21f is
+// 2.2100000381) never asks one RU more than the stock price of a large cost. A broken setting (NaN, infinite, below 0)
+// refuses.
+inline bool upgrade_price_ok(uint32_t paid, uint32_t cost, float min_percent)
+{
+	if (!(min_percent >= 0.f) || !std::isfinite(min_percent))
+		return false;
+	const double micro = std::min(std::round(double(min_percent) * 1e6), 4e9); // u32 cost x 4e9 fits in u64
+	const uint64_t need = uint64_t(cost) * uint64_t(micro) / 1000000u;
+	return uint64_t(paid) >= need;
+}
+
+// Why the host refuses a client's upgrade.
+enum class UpgradeVerdict : uint8_t
+{
+	Ok,
+	Scripted, // no mechanic named (a script installed it) and the host does not take those (scripted_upgrades)
+	NoMechanic, // not a live stalker whose talk lock the player holds, or not a mechanic (stalkers_upgrade_info)
+	TooFar, // the player's character on the host stands farther than the reach from the mechanic
+	Underpaid, // paid less than floor(cost x upgrade_min_percent)
+	Insufficient, // the player's balance on the host does not cover what he paid
+};
+constexpr uint8_t kUpgradeVerdictCount = uint8_t(UpgradeVerdict::Insufficient) + 1;
+
+// What the host knows about one upgrade request.
+struct UpgradeFacts
+{
+	bool mechanic_named = false; // the request names a mechanic (not 0xffff)
+	bool scripted_allowed = false; // host setting scripted_upgrades
+	bool mechanic_ok = false; // see UpgradeVerdict::NoMechanic
+	float distance = 0.f; // player character <-> mechanic on the host
+	float reach = 6.f;
+	uint32_t paid = 0; // what the client's game charged for it
+	uint32_t cost = 0; // `cost` of the upgrade's section
+	float min_percent = 0.f;
+	uint32_t balance = 0; // the player's balance on the host
+};
+
+// The checks in order: a mechanic, within reach, paid enough, has the money. An upgrade without a mechanic (a script's)
+// has no price: if the host takes those, it only needs the money it paid.
+inline UpgradeVerdict judge_upgrade(const UpgradeFacts& f)
+{
+	if (!f.mechanic_named)
+	{
+		if (!f.scripted_allowed)
+			return UpgradeVerdict::Scripted;
+		return f.paid > f.balance ? UpgradeVerdict::Insufficient : UpgradeVerdict::Ok;
+	}
+	if (!f.mechanic_ok)
+		return UpgradeVerdict::NoMechanic;
+	if (!(f.distance <= f.reach)) // NaN is never near
+		return UpgradeVerdict::TooFar;
+	if (!upgrade_price_ok(f.paid, f.cost, f.min_percent))
+		return UpgradeVerdict::Underpaid;
+	if (f.paid > f.balance)
+		return UpgradeVerdict::Insufficient;
+	return UpgradeVerdict::Ok;
+}
+
+// Msg::ReqItemEvent ends with this (F2 T5), after the event bytes. Wire: u16 mechanic, u32 paid (6 bytes).
+struct UpgradePayment
+{
+	uint16_t mechanic = 0xFFFF; // host numbering; 0xffff: none (an upgrade a script installed)
+	uint32_t paid = 0; // RU the client's game charged for it
+};
+constexpr size_t kUpgradePaymentSize = 6;
+
+inline void write(Writer& w, const UpgradePayment& m)
+{
+	w.u16(m.mechanic);
+	w.u32(m.paid);
+}
+
+// False on overrun.
+inline bool read(Reader& r, UpgradePayment& m)
+{
+	m.mechanic = r.u16();
+	m.paid = r.u32();
+	return r.ok();
+}
+
+// Client: upgrades paid on this machine whose requests the host has not answered yet, by a key of the client's (one per
+// request, never 0). Their sum is held out of the view (client_view `held`), so a balance the host sent before it
+// charged the upgrade does not show the money from before the payment. The answer releases it (accepted or refused:
+// the host sends the balance right after its answer). At most kMax: the oldest goes first (its request timed out).
+class UpgradeHolds
+{
+public:
+	static constexpr size_t kMax = 64;
+
+	void hold(uint32_t key, uint32_t amount)
+	{
+		if (!key || !amount)
+			return;
+		if (m_items.size() >= kMax)
+			m_items.erase(m_items.begin());
+		m_items.push_back({key, amount});
+	}
+	// False if `key` holds nothing (answered already, dropped, never held).
+	bool release(uint32_t key)
+	{
+		for (auto it = m_items.begin(); it != m_items.end(); ++it)
+			if (it->first == key)
+			{
+				m_items.erase(it);
+				return true;
+			}
+		return false;
+	}
+	uint64_t sum() const
+	{
+		uint64_t s = 0;
+		for (const auto& it : m_items)
+			s += it.second;
+		return s;
+	}
+	size_t size() const { return m_items.size(); }
+	void clear() { m_items.clear(); }
+
+private:
+	std::vector<std::pair<uint32_t, uint32_t>> m_items; // key, RU; oldest first
+};
 } // namespace ledger
 } // namespace coop
