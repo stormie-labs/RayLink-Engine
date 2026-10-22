@@ -75,6 +75,7 @@ const char* reason_name(Reason r);
 
 void install(Session& s);
 void reset();
+void on_peer_left(PeerId id); // host: the player's spawn requests waiting for his budget go (F2-21)
 void frame();
 void print_status();
 void register_console(); // coop_client_hit_perks (called from coop_presence::register_console, W5)

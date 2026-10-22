@@ -85,6 +85,7 @@ void on_peer_left(PeerId id)
 	dialog::on_peer_left(id);
 	trade::on_peer_left(id);
 	money::on_peer_left(id); // F2 T1
+	requests::on_peer_left(id); // F2 T2: his queued spawn requests (F2-21)
 	net::host_drop(id);
 	g_joining.erase(id);
 }

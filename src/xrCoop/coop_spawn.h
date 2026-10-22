@@ -884,23 +884,46 @@ inline bool quest_gift(bool holds_talk_lock, float npc_distance, uint16_t parent
 	return holds_talk_lock && npc_distance <= kTalkReach && own_character != 0xffff && parent == own_character;
 }
 
+// How many children of its own an item may hold (review round 4, Important 1): a grenade or bolt one fake missile, a
+// launcher one rocket; a revolver grenade launcher (WeaponRocket: CWeaponRG6, CWeaponSSRS spawn a rocket for every
+// loaded round, WeaponRG6.cpp:31-37, :155-162, WeaponSSRS.cpp:203-212) up to `ammo_mag_size` of its section, 1 if the
+// section shows none.
+inline size_t child_room(GameClass parent, long long mag_size)
+{
+	return parent == GameClass::WeaponRocket && mag_size > 1 ? size_t(mag_size) : 1;
+}
+
 // Review round 2, Important 1: what may be created inside one of the player's items (the parent is not his character).
 // The host gives the parent the new entity with GE_OWNERSHIP_TAKE, and the items whose handler takes a child cast it
 // unchecked: CRocketLauncher::AttachRocket (RocketLauncher.cpp:56-57) to CCustomRocket, CMissile::OnEvent
 // (Missile.cpp:606-608) to CMissile. So: a rocket into a weapon with a rocket launcher, a missile into a missile of the
-// same section (its fake missile, CMissile::spawn_fake_missile); nothing else into an item.
+// same section (its fake missile, CMissile::spawn_fake_missile); nothing else into an item. Round 4 (Important 1):
+// only while the parent has room (`children` it holds now, child_room): a second "fake missile" overwrote the
+// grenade's m_fake_missile and the first came out by ReqDrop as a whole grenade (CMissile::OnEvent's reject does not
+// destroy it, Missile.cpp:612-631) - real grenades for free.
 inline bool child_allowed(GameClass parent, std::string_view parent_section, GameClass child,
-    std::string_view child_section)
+    std::string_view child_section, size_t children, long long mag_size)
 {
+	bool takes = false;
 	switch (parent)
 	{
 	case GameClass::WeaponMagazinedWGrenade:
 	case GameClass::WeaponRocket:
-	case GameClass::WeaponRPG7: return child == GameClass::ExplosiveRocket;
+	case GameClass::WeaponRPG7: takes = child == GameClass::ExplosiveRocket;
+		break;
 	case GameClass::Missile:
-	case GameClass::Grenade: return child == parent && child_section == parent_section;
-	default: return false;
+	case GameClass::Grenade: takes = child == parent && child_section == parent_section;
+		break;
+	default: break;
 	}
+	return takes && children < child_room(parent, mag_size);
+}
+
+// Round 4 minor: what may be created straight into the player's character: any item but a launcher's rocket
+// (CSE_Temporary): a fair client asks for one only as its launcher's child.
+inline bool character_takes(GameClass child)
+{
+	return child != GameClass::ExplosiveRocket;
 }
 
 // Cost budget (host settings, configs\coop_spawn.ltx [coop_spawn]): the sum of `cost` a character may have created
@@ -1022,8 +1045,61 @@ private:
 // Ruling F2-21 (2): a request over its character's budget is not refused: it waits on the host, first in first out
 // per character (budget key), and is created when the budget has refilled for it. Otherwise a fair mass disassembly
 // or craft would lose items: the inputs are already spent, the outputs refused. At most kMaxQueued wait per
-// character; more is refused. `Item` has `uint32_t cost`; the host keeps the built entity in it.
+// character; more is refused.
 constexpr size_t kMaxQueued = 256;
+
+// What the queue keeps of a request: data only, never a built entity (review round 4, Important 2: the server entity of
+// a script class holds Lua references, and a save load closes the Lua state under it). The host builds and checks the
+// entity again when its turn comes (judge_queued, child_allowed, the world epoch).
+struct QueuedRequest
+{
+	uint32_t seq = 0;
+	uint32_t peer = 0; // PeerId of the asker
+	uint16_t character = 0xffff; // his proxy id in the host world
+	uint16_t parent = 0xffff;
+	float pos[3] = {0.f, 0.f, 0.f};
+	std::string section;
+	std::vector<uint8_t> state; // its own copy of the item state blob (coop_items), checked again at its turn
+	uint32_t epoch = 0; // the host world it was asked in
+	bool quest_gift = false; // Ruling F2-16, decided when asked: the talk may be over by its turn
+};
+
+inline QueuedRequest queued_request(uint32_t seq, uint32_t peer, uint16_t character, uint16_t parent,
+    const float pos[3], std::string_view section, const uint8_t* state, size_t state_size, uint32_t epoch,
+    bool quest_gift)
+{
+	QueuedRequest r;
+	r.seq = seq;
+	r.peer = peer;
+	r.character = character;
+	r.parent = parent;
+	for (int i = 0; i < 3; ++i)
+		r.pos[i] = pos[i];
+	r.section.assign(section.data(), section.size());
+	if (state && state_size)
+		r.state.assign(state, state + state_size);
+	r.epoch = epoch;
+	r.quest_gift = quest_gift;
+	return r;
+}
+
+// The verdict at a waiting request's turn: judge with what the host knows now (`facts` from its configs, the parent
+// checked again), the quest gift decided when it was asked, and no queue ahead of it (it is the front).
+inline SpawnVerdict judge_queued(const ClassRule* rule, const char* missing_line, SectionFacts facts,
+    const QueuedRequest& request, CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms)
+{
+	facts.in_dialog_to_own_actor = request.quest_gift;
+	facts.queue_waiting = false;
+	return judge(rule, missing_line, facts, budget, policy, now_ms);
+}
+
+// What became of the front request at its turn.
+enum class Turn : uint8_t
+{
+	Created,
+	Refused, // answered with the refusal; whatever was charged went back
+	Wait, // the budget does not hold it yet: it stays in front
+};
 
 template <class Item>
 class SpawnQueue
@@ -1063,24 +1139,23 @@ public:
 		q.push_back(std::move(item));
 		return true;
 	}
-	// Creates in order what the budget holds now: `create(item)` true = created; false = refused or no longer possible,
-	// its charge goes back and the next one is tried. Returns the number created.
-	template <class Create>
-	size_t pump(const std::string& key, CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms, Create&& create)
+	// Gives the requests their turns in order (`turn(item)`: judged again, charged, created, see Turn) until one has to
+	// wait. Returns the number created.
+	template <class TurnOf>
+	size_t pump(const std::string& key, TurnOf&& turn)
 	{
 		const auto it = m_queues.find(key);
 		if (it == m_queues.end())
 			return 0;
 		size_t created = 0;
 		std::deque<Item>& q = it->second;
-		while (!q.empty() && charge(budget, q.front().cost, policy, now_ms))
+		while (!q.empty())
 		{
-			Item item = std::move(q.front());
+			const Turn t = turn(q.front());
+			if (t == Turn::Wait)
+				break;
+			created += t == Turn::Created ? 1 : 0;
 			q.pop_front();
-			if (create(item))
-				++created;
-			else
-				refund(budget, item.cost, policy);
 		}
 		if (q.empty())
 			m_queues.erase(it);

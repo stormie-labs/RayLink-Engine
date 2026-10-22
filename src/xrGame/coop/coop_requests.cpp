@@ -954,7 +954,19 @@ bool parent_takes(u16 parent, const spawn::ClassRule& child, const char* child_s
 	    !pSettings->line_exist(holder->s_name, "class"))
 		return false;
 	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(holder->s_name, "class"));
-	return rule && spawn::child_allowed(rule->game, holder->s_name.c_str(), child.game, child_section);
+	// Round 4 (Important 1): only while it has room - the children it holds now, the magazine of its section.
+	return rule &&
+	    spawn::child_allowed(rule->game, holder->s_name.c_str(), child.game, child_section, holder->children.size(),
+	        SectionIni{holder->s_name.c_str()}.number("ammo_mag_size"));
+}
+
+// Whether `parent` takes a new entity of `rule`'s class: the asker's character any item but a launcher's rocket
+// (round 4 minor), one of his items only what it takes (parent_takes). No rule: the class check refuses first.
+bool parent_ok_for(const Req& q, u16 parent, const spawn::ClassRule* rule, const char* section)
+{
+	if (!rule)
+		return true;
+	return parent == q.proxy ? spawn::character_takes(rule->game) : parent_takes(parent, *rule, section);
 }
 
 // Round 2 minor (Ruling F2-16): how far the asker's character stands from the NPC of his talk lock, as host_try_lock
@@ -972,59 +984,121 @@ float talk_distance(u16 npc, u16 proxy)
 	return me->Position().distance_to(them->Position());
 }
 
-// ---------------------------------------------------------------- Ruling F2-21: requests waiting for the budget
-// A request over its character's budget waits here (xrCoop/coop_spawn.h SpawnQueue) and is created and answered when
-// the budget has refilled for it. Its player leaving, or the world replaced (SessionReset), drops it unanswered.
-struct QueuedSpawn
+// Builds the entity of a section that passed the class and line checks, from the host's section with the client's item
+// state (WP9 ItemState checks: counts, upgrades in an order the engine takes, ammo types). nullptr: refused, `why` says
+// how (logged here).
+CSE_Abstract* build_spawn(const Req& q, u16 parent, const char* section, const float pos[3], const u8* state,
+    size_t state_size, Reason& why)
 {
-	CSE_Abstract* entity = nullptr; // built from the host's section with the checked item state; the queue owns it
-	Req q;
-	u16 parent = kNoId;
-	u32 cost = 0; // `cost` of the section; SpawnQueue charges charge_of(cost)
-	u32 epoch = 0; // join::host_world_epoch() when it was asked
-};
-spawn::SpawnQueue<QueuedSpawn> g_spawn_queue;
+	// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
+	if (!items::section_defaults_ok(shared_str(section)))
+	{
+		if (note_bad(BadSection))
+			::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has default upgrades its own upgrade tree "
+			      "refuses (broken data)",
+			    q.seq, q.from, section);
+		why = Reason::BadSection;
+		return nullptr;
+	}
+	CSE_Abstract* e =
+	    make_temp(section, Fvector().set(pos[0], pos[1], pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1), parent);
+	if (!e)
+	{
+		why = Reason::Engine;
+		return nullptr;
+	}
+	const char* bad = nullptr;
+	if (state_size && !items::host_apply_spawn_state(e, state, state_size, bad))
+	{
+		if (note_bad(BadSpawnState))
+			::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section, q.from,
+			    bad ? bad : "item state");
+		F_entity_Destroy(e);
+		why = Reason::Malformed;
+		return nullptr;
+	}
+	return e;
+}
+
+// ---------------------------------------------------------------- Ruling F2-21: requests waiting for the budget
+// A request over its character's budget waits here (xrCoop/coop_spawn.h SpawnQueue) as data only (QueuedRequest: no
+// entity - review round 4, Important 2: a script class's server entity holds Lua references that a save load closes),
+// and is judged, built, created and answered when its turn comes. Its player leaving (on_peer_left), or the world
+// replaced (SessionReset: another epoch), drops it unanswered.
+spawn::SpawnQueue<spawn::QueuedRequest> g_spawn_queue;
 u64 g_spawn_queued = 0, g_spawn_dequeued = 0, g_spawn_queue_dropped = 0;
 
-void drop_queued(QueuedSpawn& s)
-{
-	F_entity_Destroy(s.entity);
-	s.entity = nullptr;
-	++g_spawn_queue_dropped;
-}
+void drop_queued(spawn::QueuedRequest&) { ++g_spawn_queue_dropped; }
 
-// A waiting request the budget holds now: its holder is checked again (the player may have moved or dropped the
-// parent meanwhile), then it is created and answered. False: refused, its charge goes back.
-bool create_queued(QueuedSpawn& s)
+// The turn of the front request of `key`: everything checked again from what the host knows now (the section, its
+// class and lines, the parent and what it holds, the lists, the item state), the budget charged by judge; Wait while it
+// does not hold it. A refusal after the charge gives it back.
+spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 {
-	const Reason holder = host_spawn_holder(s.q, s.parent);
-	if (holder != Reason::Ok)
+	Req q;
+	q.from = PeerId(r.peer);
+	q.seq = r.seq;
+	q.proxy = r.character;
+	q.type = Msg::ReqSpawn;
+	const char* section = r.section.c_str();
+	if (!spawnable_section(section))
 	{
-		F_entity_Destroy(s.entity);
-		s.entity = nullptr;
-		reply(s.q, holder, s.parent);
-		return false;
+		reply(q, Reason::BadSection, r.parent);
+		return spawn::Turn::Refused;
 	}
+	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(section, "class"));
+	const spawn::Missing missing = rule ? missing_item_line(section, *rule) : spawn::Missing();
+	spawn::SectionFacts facts = spawn_facts(section);
+	facts.parent_ok = parent_ok_for(q, r.parent, rule, section);
+	facts.launch_child = r.parent != q.proxy && rule != nullptr && facts.parent_ok;
+	spawn::CostBudget& budget = g_spawn_budgets.of(key);
+	const spawn::SpawnVerdict verdict =
+	    spawn::judge_queued(rule, missing.line, facts, r, budget, g_spawn_policy, mgr().now_ms());
+	if (verdict == spawn::SpawnVerdict::OverBudget)
+		return spawn::Turn::Wait;
+	if (verdict != spawn::SpawnVerdict::Allow)
+	{
+		refuse_spawn(q, verdict, section, missing, r.parent, budget.tokens);
+		return spawn::Turn::Refused;
+	}
+	const auto refuse = [&](Reason why)
+	{
+		if (!spawn::budget_free(facts))
+			spawn::refund(budget, facts.cost, g_spawn_policy); // Ruling F2-21 (3)
+		reply(q, why, r.parent);
+		return spawn::Turn::Refused;
+	};
+	// The player may have moved or dropped the parent meanwhile.
+	const Reason holder = host_spawn_holder(q, r.parent);
+	if (holder != Reason::Ok)
+		return refuse(holder);
+	Reason why = Reason::Ok;
+	CSE_Abstract* e = build_spawn(q, r.parent, section, r.pos, r.state.data(), r.state.size(), why);
+	if (!e)
+		return refuse(why);
 	u16 created = kNoId;
-	const Reason why = host_spawn(s.entity, s.parent, created); // consumes the entity
-	s.entity = nullptr;
-	reply(s.q, why, why == Reason::Ok ? created : s.parent);
-	return why == Reason::Ok;
+	why = host_spawn(e, r.parent, created); // consumes the entity
+	if (why != Reason::Ok)
+		return refuse(why);
+	g_spawn_quest_gifts += facts.quest_item && !facts.allow_listed ? 1 : 0;
+	reply(q, Reason::Ok, created);
+	return spawn::Turn::Created;
 }
 
-// Host frame: drops what belongs to a player who left or to a replaced world, creates what the budgets hold now.
+// Host frame: drops what belongs to a replaced world (or to a player who left, should on_peer_left have missed it),
+// gives the front requests their turns.
 void host_pump_spawns()
 {
 	if (!g_spawn_queue.total() || !g_pGameLevel || !ai().get_alife() || !Level().Server || Device.dwPrecacheFrame)
 		return;
 	const u32 epoch = join::host_world_epoch();
-	const u64 now = mgr().now_ms();
-	const auto gone = [epoch](const QueuedSpawn& s)
-	{ return s.epoch != epoch || join::proxy_of_peer(s.q.from) != s.q.proxy; };
+	const auto gone = [epoch](const spawn::QueuedRequest& r)
+	{ return r.epoch != epoch || join::proxy_of_peer(PeerId(r.peer)) != r.character; };
 	for (const std::string& key : g_spawn_queue.keys())
 	{
 		g_spawn_queue.drop_if(key, gone, drop_queued);
-		g_spawn_dequeued += g_spawn_queue.pump(key, g_spawn_budgets.of(key), g_spawn_policy, now, create_queued);
+		g_spawn_dequeued +=
+		    g_spawn_queue.pump(key, [&key](spawn::QueuedRequest& r) { return create_queued(key, r); });
 	}
 }
 
@@ -1073,39 +1147,17 @@ void host_on_spawn(PeerId from, Reader& r)
 	CSE_Abstract* e = nullptr;
 	if (rule && !missing.line)
 	{
-		// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
-		if (!items::section_defaults_ok(shared_str(section)))
-		{
-			if (note_bad(BadSection))
-				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has default upgrades its own upgrade tree "
-				      "refuses (broken data)",
-				    q.seq, from, section);
-			return reply(q, Reason::BadSection, s.parent);
-		}
-		e = make_temp(section, Fvector().set(s.pos[0], s.pos[1], s.pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1),
-		    s.parent);
+		Reason why = Reason::Ok;
+		e = build_spawn(q, s.parent, section, s.pos, s.state, s.state_size, why);
 		if (!e)
-			return reply(q, Reason::Engine, s.parent);
-		if (s.state_size)
-		{
-			// The item state goes through the ItemState checks (WP9): counts, upgrades in an order the engine takes,
-			// ammo types.
-			const char* why = nullptr;
-			if (!items::host_apply_spawn_state(e, s.state, s.state_size, why))
-			{
-				if (note_bad(BadSpawnState))
-					::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section, from,
-					    why ? why : "item state");
-				F_entity_Destroy(e);
-				return reply(q, Reason::Malformed, s.parent);
-			}
-		}
+			return reply(q, why, s.parent);
 	}
 	// F2 T2: deny/allow lists, quest items, the character's cost budget; after the item state, so a malformed one
 	// costs nothing. No rule or a missing line ends here too (judge steps 1-2, nothing was constructed).
 	spawn::SectionFacts facts = spawn_facts(section);
-	// Review round 2, Important 1: into one of his items only what that item takes.
-	facts.parent_ok = s.parent == q.proxy || !rule || parent_takes(s.parent, *rule, section);
+	// Review round 2 (Important 1), round 4: into his character any item but a launcher's rocket; into one of his items
+	// only what that item takes, while it has room.
+	facts.parent_ok = parent_ok_for(q, s.parent, rule, section);
 	// Ruling F2-22: what an item of his takes is a shot (a rocket, a fake missile): no budget, no queue.
 	facts.launch_child = s.parent != q.proxy && rule != nullptr && facts.parent_ok;
 	// Ruling F2-16: a quest item into his own character while he holds a talk lock (the stock dialogs give it there)
@@ -1118,17 +1170,22 @@ void host_on_spawn(PeerId from, Reader& r)
 	spawn::CostBudget& budget = g_spawn_budgets.of(key);
 	const spawn::SpawnVerdict verdict = spawn::judge(rule, missing.line, facts, budget, g_spawn_policy, mgr().now_ms());
 	const bool gift = facts.quest_item && !facts.allow_listed; // a quest item past judge is a quest gift
-	// Ruling F2-21: over the budget it waits (`e` was built: OverBudget needs a rule and no missing line); answered
-	// when it is created (host_pump_spawns). Refused only when his queue is full.
-	if (verdict == spawn::SpawnVerdict::OverBudget && e &&
-	    g_spawn_queue.push(key, QueuedSpawn{e, q, s.parent, facts.cost, join::host_world_epoch()}))
+	// Ruling F2-21: over the budget it waits (OverBudget needs a rule and no missing line: `e` was built and its state
+	// checked). The queue keeps data only (round 4): the entity goes now and is built again at its turn, answered then
+	// (host_pump_spawns). Refused only when his queue is full.
+	if (verdict == spawn::SpawnVerdict::OverBudget && e)
 	{
-		g_spawn_quest_gifts += gift ? 1 : 0;
-		if (++g_spawn_queued <= kSpawnLogFirst)
-			::Msg("[coop] ReqSpawn #%u of [%s] from player #%u waits for the cost budget of character %u (%u in his "
-			      "queue): answered when created",
-			    q.seq, section, from, q.proxy, u32(g_spawn_queue.size(key)));
-		return;
+		F_entity_Destroy(e);
+		e = nullptr;
+		if (g_spawn_queue.push(key, spawn::queued_request(q.seq, q.from, q.proxy, s.parent, s.pos, s.section,
+		                                s.state, s.state_size, join::host_world_epoch(), facts.in_dialog_to_own_actor)))
+		{
+			if (++g_spawn_queued <= kSpawnLogFirst)
+				::Msg("[coop] ReqSpawn #%u of [%s] from player #%u waits for the cost budget of character %u (%u in "
+				      "his queue): answered when created",
+				    q.seq, section, from, q.proxy, u32(g_spawn_queue.size(key)));
+			return;
+		}
 	}
 	if (verdict != spawn::SpawnVerdict::Allow)
 	{
@@ -1633,6 +1690,14 @@ void reset()
 		F_entity_Destroy(e);
 	g_lua_temps.clear();
 	g_lua_forwarded.clear();
+}
+
+void on_peer_left(PeerId id)
+{
+	// Ruling F2-21, review round 4 minor: his waiting spawn requests go at once, unanswered.
+	const auto his = [id](const spawn::QueuedRequest& r) { return PeerId(r.peer) == id; };
+	for (const std::string& key : g_spawn_queue.keys())
+		g_spawn_queue.drop_if(key, his, drop_queued);
 }
 
 void frame()
