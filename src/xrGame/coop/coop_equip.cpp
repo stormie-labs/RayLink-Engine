@@ -190,6 +190,7 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 		P.w_stringZ(e.visual.c_str());
 		av->u_EventSend(P); // server entity keeps the visual (saved with the host world)
 		av->ChangeVisual(e.visual.c_str());
+		on_avatar_visual_changed(avatar_id); // R3 В4: the new visual stands in a T-pose until its motions replay
 	}
 
 	CGameObject* in_hands = nullptr;

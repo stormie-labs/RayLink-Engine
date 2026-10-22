@@ -58,6 +58,15 @@ struct Track
 xr_map<u16, Track> g_tracks;
 u64 g_last_send = 0;
 u64 g_sent = 0;
+// Ruling 14: PlayerState refused by State::read (the R3 K1 checks) is counted and the first ones are logged.
+u64 g_state_bad = 0;
+
+bool refuse_state(const char* why)
+{
+	if (++g_state_bad <= 10)
+		::Msg("! [coop] player state refused: %s", why);
+	return false;
+}
 
 void push_sample(u16 avatar, const State& s)
 {
@@ -227,14 +236,21 @@ bool State::read(Reader& r)
 	active_slot = r.u8();
 	active_item = r.u16();
 	// R3 K1: finite numbers, a sane speed, a position inside the level's box grown by kLevelMargin.
-	if (!r.ok() || !validate::finite3(p) || !validate::speed_ok(v, kMaxSpeed))
-		return false;
+	// Ruling 14: each refusal says why (counter + first log lines); the checks themselves are unchanged.
+	if (!r.ok())
+		return refuse_state("truncated packet");
+	if (!validate::finite3(p))
+		return refuse_state("position is not a finite number");
+	if (!validate::speed_ok(v, kMaxSpeed))
+		return refuse_state("speed too high or velocity is not a finite number");
 	if (!g_pGameLevel)
-		return false;
+		return false; // nothing to check the position against yet: not the peer's fault, not counted
 	const Fbox& box = Level().ObjectSpace.GetBoundingVolume();
 	const float lo[3] = {box.x1, box.y1, box.z1};
 	const float hi[3] = {box.x2, box.y2, box.z2};
-	return validate::in_box(p, lo, hi, kLevelMargin);
+	if (!validate::in_box(p, lo, hi, kLevelMargin))
+		return refuse_state("position outside the level");
+	return true;
 }
 
 void install(Session& s)
@@ -318,10 +334,11 @@ bool drive_avatar(CAI_Stalker* avatar)
 		{
 			if (!value || value == applied)
 				return;
+			if (!entities::motion_valid(ka, value)) // the avatar's visual may not be the owner's yet
+				return; // R3 В4: `applied` keeps only what was really played, so the motion is retried later
 			MotionID m;
 			m.val = value;
-			if (entities::motion_valid(ka, value)) // the avatar's visual may not be the owner's yet
-				ka->PlayCycle(m);
+			ka->PlayCycle(m);
 			applied = value;
 		};
 		play(s.legs, t.applied_legs);
@@ -329,6 +346,17 @@ bool drive_avatar(CAI_Stalker* avatar)
 		play(s.head, t.applied_head);
 	}
 	return true;
+}
+
+void on_avatar_visual_changed(u16 avatar_id)
+{
+	auto it = g_tracks.find(avatar_id);
+	if (it == g_tracks.end())
+		return;
+	Track& t = it->second;
+	// R3 В4: ChangeVisual gives the avatar a fresh skeleton with no cycle playing. The owner's MotionIDs are often
+	// the same numbers on the new visual, so `applied == value` would skip them for good: the avatar froze in a T-pose.
+	t.applied_legs = t.applied_torso = t.applied_head = 0;
 }
 
 u32 avatar_mstate(u16 avatar_id)
@@ -349,7 +377,7 @@ bool avatar_view(u16 avatar_id, float& yaw, float& pitch)
 
 void print_status()
 {
-	::Msg("[coop]   player states sent: %llu", g_sent);
+	::Msg("[coop]   player states sent: %llu, %llu refused", g_sent, g_state_bad);
 	equip_print_status();
 	for (const auto& it : g_tracks)
 		::Msg("[coop]   avatar %u: %llu states (%llu out of order), buffer %u", it.first, it.second.received,

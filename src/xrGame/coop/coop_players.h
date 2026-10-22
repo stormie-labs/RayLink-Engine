@@ -41,6 +41,9 @@ void equip_print_status();
 // Called every frame for each avatar object from its UpdateCL (see CAI_Stalker hook):
 // moves the visual to the interpolated state. Returns false if no state yet.
 bool drive_avatar(class CAI_Stalker* avatar);
+// coop_equip.cpp calls it right after ChangeVisual on an avatar (R3 В4): the new visual plays nothing, so the
+// motions applied so far are forgotten and drive_avatar plays the owner's current ones again.
+void on_avatar_visual_changed(u16 avatar_id);
 
 // --- read-only views of the last state an avatar was driven with (local numbering; W5) ---
 // Movement flags (actor EMoveCommand, low 16 bits as sent); 0 if the avatar was never driven.
