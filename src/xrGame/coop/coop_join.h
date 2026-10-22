@@ -13,6 +13,10 @@
 class CALifeObjectRegistry;
 class NET_Packet;
 
+// Host setting (console coop_max_new_characters, Ruling F2-10 b, F2 T3 fix round 1): how many new player characters
+// (a player key the world has no character for) a session makes; default and range in xrCoop/coop_limits.h.
+extern int g_coop_max_new_characters;
+
 namespace coop
 {
 // F0 final review (task 14 diagnostics): CGameObject::lua_game_object prints a C++ stack for the first

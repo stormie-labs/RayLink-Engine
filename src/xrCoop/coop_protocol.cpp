@@ -111,7 +111,12 @@ const char* msg_name(Msg type)
 
 // F2 T3: every game message has a direction, from its senders in the game layer (net::host_send / host_broadcast
 // against net::client_send); one without a sender yet takes the direction of its comment in coop_protocol.h. A new
-// message needs its row here: tests/test_session_limits.cpp game_messages_have_direction fails without it.
+// message needs its row here: tests/test_session_limits.cpp game_messages_have_direction fails without it, and
+// (F2 T3 fix round 1) MSVC does not build it: an enumerator the switch misses is error C4062 (off by default).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#endif
 MsgSender msg_sender(Msg type)
 {
 	switch (type)
@@ -203,6 +208,9 @@ MsgSender msg_sender(Msg type)
 	}
 	return MsgSender::Either; // not a message of the protocol: no handler takes it
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 const char* reject_reason_name(RejectReason r)
 {

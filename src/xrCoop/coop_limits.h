@@ -53,15 +53,20 @@ constexpr RateRule kClientRateRules[] = {
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
 // new keys farmed the starting kit and money, and every such character stays in the save for good. A session makes
-// at most this many (host setting later). A player whose key has a character in the world costs nothing.
-constexpr uint32_t kMaxNewCharacters = 8;
+// at most the host setting coop_max_new_characters of them (g_coop_max_new_characters, coop_join; F2 T3 fix round 1:
+// a host whose session ran out raises it without a restart). A player whose key has a character in the world costs
+// nothing.
+constexpr uint32_t kNewCharactersDefault = 8;
+constexpr uint32_t kNewCharactersMin = 1;
+constexpr uint32_t kNewCharactersMax = 64;
 // The refusal of a new key over the limit: the nearest reason of the protocol (no room in this session for one more
 // new character), and why.
 constexpr RejectReason kNoNewCharacterReason = RejectReason::SessionFull;
-inline std::string no_new_character_text()
+inline std::string no_new_character_text(uint32_t max)
 {
-	return "this session has made all " + std::to_string(kMaxNewCharacters) +
-		" new characters it allows; players who have a character in the host's world can still join";
+	return "this session has made all " + std::to_string(max) +
+		" new characters the host allows (coop_max_new_characters); players who have a character in the host's world "
+		"can still join";
 }
 
 // Host: the player keys (digests) a session made a new character for. A key that got one already costs nothing
@@ -69,14 +74,15 @@ inline std::string no_new_character_text()
 class NewCharacters
 {
 public:
-	// A player asks for the world, which has no character for his key: true if he may get one.
-	bool admits(const std::string& key) const { return m_keys.count(key) != 0 || m_keys.size() < kMaxNewCharacters; }
+	// A player asks for the world, which has no character for his key: true if he may get one while the session
+	// allows `max` new characters (the setting now: lowering it refuses new keys only).
+	bool admits(const std::string& key, uint32_t max) const { return m_keys.count(key) != 0 || m_keys.size() < max; }
 	// The host made a character for `key`.
 	void add(const std::string& key) { m_keys.insert(key); }
 	size_t count() const { return m_keys.size(); }
 
 private:
-	std::set<std::string> m_keys; // at most kMaxNewCharacters
+	std::set<std::string> m_keys; // at most kNewCharactersMax (admits)
 };
 } // namespace limits
 } // namespace coop

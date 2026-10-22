@@ -8,6 +8,7 @@
 #include "coop_survival.h"
 #include "coop_presence.h"
 #include "coop_script.h"
+#include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
 
@@ -170,6 +171,8 @@ void register_console_commands()
 	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));
 	CMD4(CCC_Integer, "coop_friendly_fire", &g_coop_friendly_fire, 0, 1); // host setting
+	CMD4(CCC_Integer, "coop_max_new_characters", &g_coop_max_new_characters, int(limits::kNewCharactersMin),
+	    int(limits::kNewCharactersMax)); // host setting (Ruling F2-10 b, F2 T3 fix round 1)
 	survival::register_console();
 	presence::register_console();
 }

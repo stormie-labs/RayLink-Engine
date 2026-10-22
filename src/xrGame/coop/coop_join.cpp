@@ -30,6 +30,8 @@
 
 extern string_path g_last_saved_game;
 
+int g_coop_max_new_characters = int(coop::limits::kNewCharactersDefault);
+
 namespace coop
 {
 namespace diag
@@ -88,8 +90,8 @@ struct State
 	bool reset_pending = false;
 	// host: R1 I4, R2 I4: one join in flight per player, one per 5 s
 	JoinGate gate;
-	// host: Ruling F2-10 b: the keys this session made a new character for (kMaxNewCharacters); a new session starts
-	// over (on_host_started)
+	// host: Ruling F2-10 b: the keys this session made a new character for (coop_max_new_characters); a new session
+	// starts over (on_host_started)
 	limits::NewCharacters new_characters;
 	u32 characters_refused = 0; // diagnostics: new keys refused over the limit (the first few logged)
 	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
@@ -321,13 +323,16 @@ bool host_send_world(PeerId from)
 	else
 	{
 		// Ruling F2-10 b: the client picks its key; every new one used to get a character (starting kit, money) that
-		// stays in the save for good. A session makes kMaxNewCharacters; a returning player costs nothing.
-		if (!g.new_characters.admits(key_digest))
+		// stays in the save for good. A session makes coop_max_new_characters (F2 T3 fix round 1: a host setting, read
+		// at each join); a returning player costs nothing.
+		const u32 max_new = u32(g_coop_max_new_characters);
+		if (!g.new_characters.admits(key_digest, max_new))
 		{
 			if (++g.characters_refused <= kRefusalsLogged)
-				::Msg("! [coop] '%s' has no character in this world, and this session has made all %u new ones: refused",
-				    p->nick.c_str(), limits::kMaxNewCharacters);
-			mgr().session().kick(from, limits::kNoNewCharacterReason, limits::no_new_character_text());
+				::Msg("! [coop] '%s' has no character in this world, and this session has made %u new characters "
+				      "(coop_max_new_characters %u): refused",
+				    p->nick.c_str(), u32(g.new_characters.count()), max_new);
+			mgr().session().kick(from, limits::kNoNewCharacterReason, limits::no_new_character_text(max_new));
 			return false;
 		}
 		proxy = create_proxy(*p, key_digest);
@@ -1041,8 +1046,8 @@ void print_status()
 		for (const limits::RateRule& rule : limits::kClientRateRules)
 			::Msg("[coop]   rate limit %s: %llu dropped (more than %u in a row, then one per %u ms)", msg_name(rule.type),
 			    mgr().session().stats(u16(rule.type)).rate_dropped, rule.burst, rule.refill_ms);
-		::Msg("[coop]   new characters this session: %u of %u, %u new key(s) refused", u32(g.new_characters.count()),
-		    limits::kMaxNewCharacters, g.characters_refused);
+		::Msg("[coop]   new characters this session: %u of %u (coop_max_new_characters), %u new key(s) refused",
+		    u32(g.new_characters.count()), u32(g_coop_max_new_characters), g.characters_refused);
 		if (g.pending_changer != kNoId)
 			::Msg("[coop]   level exit %u asked for by #%u, waiting for coop_accept_transition", g.pending_changer,
 			    g.transition_from);
