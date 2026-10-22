@@ -122,6 +122,14 @@ void host_process_events()
 {
 	if (g_host_events.empty())
 		return;
+	// Review R2 C2: KERNEL:disconnect/start run earlier in the same FrameMove (CApplication::OnFrame has a
+	// higher priority than coop::on_frame): the simulator is gone, the events belong to the old world, and the
+	// clients rejoin through SessionReset anyway.
+	if (!ai().get_alife())
+	{
+		g_host_events.clear();
+		return;
+	}
 	xr_vector<HostEvent> events;
 	events.swap(g_host_events);
 	for (const HostEvent& ev : events)
@@ -682,6 +690,8 @@ void client_on_snapshot(PeerId, Reader& r)
 void host_on_entity_request(PeerId from, Reader& r)
 {
 	const u16 id = r.u16();
+	if (!r.ok() || !ai().get_alife()) // review R2 C2: no world between levels / in the main menu
+		return;
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	if (!e)
 		return;
@@ -914,7 +924,7 @@ void frame()
 	if (mgr().is_host())
 	{
 		host_process_events();
-		if (g_pGameLevel)
+		if (g_pGameLevel && ai().get_alife()) // R2 C2: the level may outlive the simulator for a frame
 			host_send_snapshots();
 	}
 }

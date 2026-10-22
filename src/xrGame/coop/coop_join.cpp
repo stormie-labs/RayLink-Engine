@@ -599,6 +599,7 @@ void host_watch_world()
 		for (auto& it : g.peers)
 		{
 			it.second.loading = true;
+			it.second.sent_at = 0; // review R2 C1: the join timer restarts at SessionReset, not at the first join
 			it.second.proxy = kNoId; // an id of the old world: set again by their JoinRequest
 			sync::host_begin_join(it.first); // queue/drop world traffic until they rejoin
 		}
@@ -609,8 +610,14 @@ void host_watch_world()
 	world::host_scan_proxies();
 	Writer w(64);
 	w.str("the host loaded a save or changed level");
+	const u64 now = mgr().now_ms();
 	for (const PeerInfo& p : mgr().session().peers())
+	{
 		mgr().session().send(p.id, Lane::Reliable, Msg::SessionReset, w);
+		auto it = g.peers.find(p.id);
+		if (it != g.peers.end())
+			it->second.sent_at = now; // the rejoin into the new world is what the timeout measures
+	}
 	::Msg("[coop] world replaced (epoch %u): %u player(s) rejoin", g.epoch, (u32)mgr().session().peers().size());
 }
 
