@@ -1948,6 +1948,11 @@ void Session::hold_connection(uint32_t ms)
 	m->m_tp.hold(ms);
 }
 
+void Session::seal_connection_hold()
+{
+	m->m_tp.seal_hold();
+}
+
 uint64_t Session::keepalive_services() const
 {
 	return m->m_tp.keepalive_services();

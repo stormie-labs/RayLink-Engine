@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "coop_link_hold.h"
 #include "coop_protocol.h"
 
 struct _ENetHost;
@@ -120,6 +121,10 @@ public:
 	// without a hold (stuck on a crash dialog, hung) goes silent and its peers drop it after the silence timeout.
 	// Safe to call from any thread.
 	void hold(uint32_t ms);
+	// A crash: the hold is released at once and every later hold() is refused, for the life of this transport (a new
+	// listen/connect does not lift it). Atomic with hold() (link_hold::HoldWord): a hold racing with it cannot re-arm.
+	// Safe to call from any thread, also mid-crash.
+	void seal_hold() { m_hold.seal(); }
 	uint64_t keepalive_services() const { return m_ka_services.load(std::memory_order_relaxed); }
 
 private:
@@ -135,7 +140,7 @@ private:
 	std::condition_variable m_ka_cv;
 	bool m_ka_stop = false;
 	std::atomic<uint64_t> m_last_service_ms{0}; // steady clock of the owner's last service()
-	std::atomic<uint64_t> m_hold_until_ms{0}; // steady clock; 0 = not held
+	link_hold::HoldWord m_hold; // steady clock deadline; released; or sealed by a crash
 	std::atomic<uint64_t> m_ka_services{0};
 };
 } // namespace net

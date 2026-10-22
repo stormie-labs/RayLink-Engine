@@ -12,6 +12,7 @@
 #include "coop_script.h"
 #include "xrCoop/coop_shapes.h"
 #include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_link_hold.h"
 #include "xrCoop/coop_newchar.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -98,6 +99,8 @@ struct State
 	JoinGate gate;
 	// host: JoinRequests that came while the host's own level was still coming up (host_precaching), sent after it
 	xr_vector<PeerId> precache_wait;
+	// host: how long they wait for it (review of protocol 8: the precache of an unfocused window never ends)
+	link_hold::PrecacheWait precache_clock;
 	// host: Ruling F2-10 b: the keys this session made a new character for (coop_max_new_characters); a new session
 	// starts over (on_host_started)
 	limits::NewCharacters new_characters;
@@ -125,6 +128,10 @@ struct State
 		Shown, // the window is open: its choice is taken by join_choice
 		Sent, // the CharChoice is on its way: the world, or the offer again with a refusal
 	} char_step = CharStep::None;
+	// client, protocol 8: join_offer ran (the window may be open) and join_closed has not since. Apart from char_step:
+	// a SessionReset voids the offer (char_step None) and leaves the window open for the host's next offer, but the
+	// world or the end of the session may come instead (review of protocol 8).
+	bool char_window = false;
 	CharOfferMsg char_offer;
 	u64 char_next_try = 0;
 } g;
@@ -182,8 +189,25 @@ int char_traceback(lua_State* L)
 	return 1;
 }
 
+// coop_menu_char.<name at 1>, or nil. Run in a protected call (call_char): the first lookup loads the script through
+// _G.__index (gamedata/scripts/<name>.script), the function's lookup goes through the module's __index to _G, and
+// anything on that way (a script that fails to load, an addon's strict _G metatable) may raise. Review of protocol 8:
+// the lookup ran unprotected on the host for every new key.
+int char_lookup(lua_State* L)
+{
+	const char* fn = lua_tostring(L, 1);
+	lua_getglobal(L, kCharScript);
+	if (!fn || !lua_istable(L, -1))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_getfield(L, -1, fn);
+	return 1;
+}
+
 // Protected call of coop_menu_char.<fn>(what `push` pushes; it returns how many) with `nres` results, which
-// `read(L, index of the first)` reads. Never throws, leaves the stack as it was.
+// `read(L, index of the first)` reads. Never throws, leaves the stack as it was; the module's lookup is protected too.
 template <typename Push, typename Read>
 LuaCall call_char(const char* fn, Push push, int nres, Read read)
 {
@@ -193,11 +217,14 @@ LuaCall call_char(const char* fn, Push push, int nres, Read read)
 	const int top = lua_gettop(L);
 	lua_pushcfunction(L, &char_traceback);
 	const int errfunc = lua_gettop(L);
-	lua_getglobal(L, kCharScript); // _G.__index loads gamedata/scripts/<name>.script
-	if (lua_istable(L, -1))
+	lua_pushcfunction(L, &char_lookup);
+	lua_pushstring(L, fn);
+	if (lua_pcall(L, 1, 1, errfunc) != 0)
 	{
-		lua_getfield(L, -1, fn);
-		lua_remove(L, -2);
+		const char* err = lua_tostring(L, -1);
+		::Msg("! [coop] lua error looking up %s.%s: %s", kCharScript, fn, err ? err : "?");
+		lua_settop(L, top);
+		return LuaCall::Failed;
 	}
 	if (!lua_isfunction(L, -1))
 	{
@@ -843,8 +870,18 @@ bool host_send_save(PeerId from, const PeerInfo& p_ref, CSE_ALifeHumanStalker& p
 }
 
 // The host's own level is still coming up (precache frames, the first update of every script): a world save now
-// would stall those frames further, and they are held by the link hold of that load (Manager::frame).
-bool host_precaching() { return g_pGameLevel && Device.dwPrecacheFrame != 0; }
+// would stall those frames further, and they are held by the link hold of that load (Manager::frame). For
+// link_hold::PrecacheWait::kLimitMs at most: precache counts down only in the focused window and starts again on a
+// device reset, and an unfocused host served no join (review of protocol 8: the client dropped after 5 min).
+bool host_precaching()
+{
+	const bool precaching = g_pGameLevel && Device.dwPrecacheFrame != 0;
+	const bool waits = g.precache_clock.waiting(precaching, mgr().now_ms());
+	if (g.precache_clock.take_gave_up())
+		::Msg("! [coop] the host's level is still precaching after %u s (window without focus?): joins go on",
+		    u32(link_hold::PrecacheWait::kLimitMs / 1000));
+	return waits;
+}
 
 // The gate for a JoinRequest of `from` that arrives now (or waited for the host's load, host_due_joins).
 void host_join_request(PeerId from, const PeerInfo& peer)
@@ -912,7 +949,12 @@ void host_on_world_loaded(PeerId from, Reader&)
 	auto it = g.peers.find(from);
 	// R2 I4: only the end of a join in flight. A repeated, unasked-for or old world's WorldLoaded would run the
 	// catch-up again (or bring an id of the old world online).
-	if (!g.gate.loaded(from) || it == g.peers.end() || !it->second.loading || it->second.proxy == kNoId)
+	// Review of protocol 8: whether a world was sent to him is checked before the gate, since gate.loaded ends his join
+	// in flight. A forged WorldLoaded while he chooses his character (no world sent yet) ended it, and his JoinRequest
+	// was admitted again, with a new CharOffer, every 5 s.
+	const bool world_sent = it != g.peers.end() && it->second.loading && it->second.proxy != kNoId &&
+	    !g.choosers.in_choice(from);
+	if (!world_sent || !g.gate.loaded(from))
 	{
 		if (++g.loaded_ignored <= kRefusalsLogged)
 			::Msg("! [coop] #%u says it loaded the world, but no world is being sent to it: ignored", from);
@@ -1051,6 +1093,8 @@ void client_char_frame()
 			    return 5;
 		    },
 		    1, [&shown](lua_State* L, int at) { shown = lua_toboolean(L, at) != 0; });
+		if (call != LuaCall::Missing)
+			g.char_window = true; // shown, filled, or broken half-way: join_closed closes whatever is there
 		if (call != LuaCall::Done)
 		{
 			::Msg("! [coop] %s.join_offer %s: cannot choose a character", kCharScript,
@@ -1097,12 +1141,15 @@ void client_char_frame()
 	::Msg("[coop] character chosen: %s, %u item(s) bought; waiting for the world", m.faction.c_str(), u32(m.buy.size()));
 }
 
-// Protocol 8, client: the world arrives or the session ends: the choice window closes.
+// Protocol 8, client: the world arrives or the session ends: the choice window closes. Every time, also after a
+// SessionReset voided the offer (char_window): before, only the window's own FollowSession closed it then.
 void client_char_closed(const char* why)
 {
-	if (g.char_step == State::CharStep::None)
-		return;
+	const bool open = g.char_window || g.char_step != State::CharStep::None;
 	g.char_step = State::CharStep::None;
+	g.char_window = false;
+	if (!open)
+		return;
 	call_char("join_closed",
 	    [why](lua_State* L) {
 		    lua_pushstring(L, why);
@@ -1490,6 +1537,7 @@ void on_session_lost(const char*)
 	// it, the host takes the characters of its players out below). Called before the phase goes Off.
 	if (mgr().is_live_client() || (mgr().is_host() && !g.peers.empty()))
 		diag::arm_destroyed_object_stacks();
+	client_char_closed("session"); // protocol 8: a choice window of this session closes with it (none: nothing)
 	// W9, host: the session is over, nobody else is in the world. Clients take the avatars out through their own
 	// switch vote (coop::switch_vote: no session = no player in the world).
 	xr_vector<u16> proxies;
@@ -1549,7 +1597,8 @@ void host_watch_world()
 			sync::host_begin_join(it.first); // queue/drop world traffic until they rejoin
 		}
 	}
-	if (!g.reset_pending || !g_pGameLevel || !g_actor || Device.dwPrecacheFrame || !ai().get_alife())
+	// The same "level is up" as for joins (host_precaching): an unfocused host sent no SessionReset either.
+	if (!g.reset_pending || !g_pGameLevel || !g_actor || host_precaching() || !ai().get_alife())
 		return;
 	g.reset_pending = false;
 	// F0 final review (task 12): a join admitted since the world changed (a player who connected meanwhile) is void

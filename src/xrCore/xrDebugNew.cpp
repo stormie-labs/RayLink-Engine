@@ -238,6 +238,10 @@ void xrDebug::gather_info(const char* expression, const char* description, const
 
 void xrDebug::do_exit(const std::string& message)
 {
+	// Anomaly Coop: CHECK_OR_EXIT is a crash too (a broken save, a missing level file): the crash handlers run as on
+	// every other crash path (a co-op session lets its link go at once, the console dumps its variables).
+	if (handler)
+		handler();
 	xrLogger::FlushLog();
 	MessageBox(NULL, message.c_str(), "Error", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
 	TerminateProcess(GetCurrentProcess(), 1);
@@ -248,6 +252,11 @@ void xrDebug::do_exit(const std::string& message)
 void xrDebug::backend(const char* expression, const char* description, const char* argument0, const char* argument1,
                       const char* file, int line, const char* function, bool& ignore_always)
 {
+	// Anomaly Coop: the crash handlers before the crash save. That save is a level save, and its hook armed the co-op
+	// link hold again (coop::on_blocking_work) while the handler that releases the hold for good had not run yet.
+	if (handler)
+		handler();
+
     // we save first
     crash_saving::save();
     
@@ -268,9 +277,6 @@ void xrDebug::backend(const char* expression, const char* description, const cha
 	LPSTR buffer = assertion_info + xr_strlen(assertion_info);
 	buffer += xr_sprintf(buffer, sizeof(assertion_info) - u32(buffer - &assertion_info[0]),
 	                     "%sPress OK to abort execution%s", endline, endline);
-
-	if (handler)
-		handler();
 
 	xrLogger::FlushLog();
 

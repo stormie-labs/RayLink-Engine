@@ -35,12 +35,16 @@ crashhandler* g_next_crash_handler = nullptr;
 bool g_crash_hook_exit_registered = false;
 // Set by on_crash (any thread), never cleared: no frame and no load stage holds the link after a crash (review of the
 // live fixes: the next frame of the main thread armed the hold again for kLoadHoldMs; link_hold::FrameState::crashed).
+// The flag only spares the work: the guarantee is the sealed hold (Session::seal_connection_hold), since a caller that
+// read the flag just before on_crash still arms (review of protocol 8).
 std::atomic<bool> g_crashed{false};
 
+// Every crash path of xrDebug runs it: FATAL / R_ASSERT (backend, before the crash save), an access violation
+// (UnhandledFilter), CHECK_OR_EXIT (do_exit).
 void on_crash()
 {
 	g_crashed.store(true);
-	Manager::get().session().hold_connection(0); // atomics only: fine from any thread, also mid-crash
+	Manager::get().session().seal_connection_hold(); // atomics only: fine from any thread, also mid-crash
 	if (g_next_crash_handler)
 		g_next_crash_handler();
 }
@@ -511,7 +515,8 @@ void Manager::frame()
 	// frames after a load (precache, the first update of every script, a client's way to live) can each stall longer
 	// than the silence timeout (live check 2026-10-23: a GAMMA client was dropped there). Until then every frame
 	// re-arms the hold, so a hang still goes silent kLoadHoldMs after its last frame; a crash releases it at once and
-	// for good (on_crash, g_crashed). Afterwards a stall must look like silence to the peers.
+	// for good (on_crash seals it: this arm is refused even if the crash came after the read of g_crashed). Afterwards a
+	// stall must look like silence to the peers.
 	link_hold::FrameState fs;
 	fs.load_steps_queued = !g_loading_events.empty();
 	fs.precache_frames = g_pGameLevel && Device.dwPrecacheFrame != 0;
@@ -552,7 +557,7 @@ void on_blocking_work()
 {
 	Manager& m = Manager::get();
 	if (m.active() && link_hold::may_arm(g_crashed.load()))
-		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread
+		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread; refused after a crash
 }
 
 bool skip_keypress_on_load()

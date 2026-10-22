@@ -113,8 +113,11 @@ public:
 	// The owner thread is about to block for long (a level load does not call update() for tens of seconds):
 	// keep the connection alive from a helper thread for up to `ms` from now; 0 releases. Without a hold a
 	// silent process is dropped by its peers after peer_timeout_ms (a crash dialog must not look alive).
-	// Thread-safe (the only Session call that is).
+	// Thread-safe (the only Session calls that are: this and seal_connection_hold).
 	void hold_connection(uint32_t ms);
+	// This process crashed: the hold goes at once and no hold_connection takes any more, for the life of this Session
+	// (atomic with hold_connection: one racing with it cannot re-arm). Thread-safe, also mid-crash.
+	void seal_connection_hold();
 	uint64_t keepalive_services() const; // helper services so far (diagnostics)
 
 	// Bulk transfer of an arbitrary byte blob in chunks over Lane::Bulk, with CRC32 check.

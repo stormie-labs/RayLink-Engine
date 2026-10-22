@@ -395,7 +395,7 @@ std::string Transport::address_of(PeerHandle peer)
 
 void Transport::hold(uint32_t ms)
 {
-	m_hold_until_ms.store(ms ? steady_ms() + ms : 0, std::memory_order_relaxed);
+	m_hold.arm(ms ? steady_ms() + ms : 0); // refused after seal_hold()
 }
 
 void Transport::keepalive_start()
@@ -406,7 +406,7 @@ void Transport::keepalive_start()
 		std::lock_guard<std::mutex> lk(m_ka_mutex);
 		m_ka_stop = false;
 	}
-	m_hold_until_ms.store(0, std::memory_order_relaxed);
+	m_hold.release(); // a seal stays
 	m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
 	m_ka_thread = std::thread(&Transport::keepalive_loop, this);
 }
@@ -421,7 +421,7 @@ void Transport::keepalive_stop()
 	}
 	m_ka_cv.notify_all();
 	m_ka_thread.join();
-	m_hold_until_ms.store(0, std::memory_order_relaxed);
+	m_hold.release(); // a seal stays
 }
 
 void Transport::keepalive_loop()
@@ -434,9 +434,8 @@ void Transport::keepalive_loop()
 				return;
 		}
 		const uint64_t now = steady_ms();
-		const uint64_t until = m_hold_until_ms.load(std::memory_order_relaxed);
-		if (!until || now >= until)
-			continue; // not held: a stalled owner must look dead to its peers
+		if (!m_hold.held(now))
+			continue; // not held (released, expired, sealed by a crash): a stalled owner must look dead to its peers
 		if (m_last_service_ms.load(std::memory_order_relaxed) + kOwnerStallMs > now)
 			continue; // the owner pumps by itself
 		// Never wait for the lock: the owner (or another transport's helper) is using ENet right now.
