@@ -22,13 +22,17 @@
 // TradeOp payload, first byte is the sub-operation (ids in host numbering, reliable lane):
 //   4 Deal         client -> host  u32 seq, u32 applied, u16 trader, u8 flags (1 donate),
 //                                  u32 client_money,
-//                                  u32 sell_total, u16 n, n x u16 item   (player -> trader)
-//                                  u32 buy_total,  u16 n, n x u16 item   (trader -> player)
+//                                  u16 n, n x u16 item   (player -> trader)
+//                                  u16 n, n x u16 item   (trader -> player)
 //   2 Result       host -> client  u32 seq, u16 trader, u8 TradeResult (0 ok), i32 money_delta
 //                                  (sell_total - buy_total), u32 trader_money
 //   3 TraderMoney  host -> all     u16 trader, u32 money   (after any trade; answer to an open)
 //   1 (retired single-direction request; ignored)
 // A repeated Deal (same seq) gets the stored answer again and changes nothing.
+// Prices (review R4 2): the host prices every item with the stock CTrade::GetItemPrice for the
+// player's character (its relations, rank, reputation, faction) as for the actor, and checks that
+// the trader trades now, stands by that character and trades each item; the client's own prices
+// only fill its window.
 //
 // Containers (boxes, stashes, corpses) have one content for all players. Takes and puts are
 // ownership events that the item layer (WP2) turns into host requests. Here: the open window

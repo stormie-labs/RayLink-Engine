@@ -104,7 +104,15 @@ void CMapLocation::LoadSpot(LPCSTR type, bool bReload)
 	XML_NODE* node = NULL;
 	string512 path_base, path;
 	xr_strcpy(path_base, type);
-	R_ASSERT3(g_uiSpotXml->NavigateToNode(path_base,0), "XML node not found in file map_spots.xml", path_base);
+	// Anomaly Coop (review R4 5): a type that this machine's map_spots.xml lacks (another mod set: a spot in the
+	// host's save, a DXML type behind an MCM option) leaves the location without spots instead of a fatal error.
+	if (!g_uiSpotXml->NavigateToNode(path_base, 0))
+	{
+		static xr_set<shared_str> s_logged; // once per type: spots are reloaded and re-created
+		if (s_logged.insert(shared_str(path_base)).second)
+			Msg("! map spot type '%s' is not in map_spots.xml (different mods?), its spots are not shown", path_base);
+		return;
+	}
 	LPCSTR s = g_uiSpotXml->ReadAttrib(path_base, 0, "hint", "no hint");
 	SetHint(s);
 

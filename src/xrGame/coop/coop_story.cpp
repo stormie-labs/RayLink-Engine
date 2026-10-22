@@ -167,6 +167,7 @@ struct Stats
 	u64 derived_dropped = 0; // client: script reactions to a host broadcast (the host sends its own)
 	u64 action_dropped = 0; // client: combat goodwill bookkeeping (the host computes it)
 	u64 task_edits_dropped = 0; // client: own script edits of task spots (the host owns them)
+	u64 spot_removes_refused = 0; // host: client removals of spots it did not place (R4 3)
 	u64 hashes = 0, mismatches = 0, resyncs_out = 0, resyncs_in = 0;
 	u64 deferred = 0;
 	u64 proxy_actions = 0; // host: RELATION_REGISTRY::Action calls with a player proxy as the actor (R-3.4)
@@ -670,6 +671,23 @@ void fix_spot_timer(CGameTask* t)
 			spot->SetTimerFinish(t->m_timer_finish);
 }
 
+bool spot_type_known(const shared_str& type); // map spots section below
+
+// R4 5: a task spot type that this machine's map_spots.xml does not have (another mod set, a DXML type behind an MCM
+// option) would R_ASSERT in CMapLocation::LoadSpot when the task creates its spot. Such a task is kept without its
+// spot (spot_type_known logs the type once); the record keeps the host's type.
+shared_str task_spot_type(const shared_str& type)
+{
+	return (!type.size() || spot_type_known(type)) ? type : shared_str();
+}
+
+// Where a task's spot is set (not on every retry): a task left without its spot is logged.
+void note_spotless_task(const shared_str& task_id, const shared_str& type, const shared_str& spot)
+{
+	if (spot != type)
+		::Msg("! [coop] story: task '%s' is shown without its map spot: type '%s' is unknown here", cs(task_id), cs(type));
+}
+
 void host_on_task_give(PeerId from, Reader& r)
 {
 	const shared_str id = to_shared(r.str());
@@ -698,7 +716,8 @@ void host_on_task_give(PeerId from, Reader& r)
 			t->m_ID = id;
 			set_task_texts(t, rec);
 			t->m_map_hint = rec.hint;
-			t->m_map_location = rec.map_location;
+			t->m_map_location = task_spot_type(rec.map_location); // R4 5: the client's type may be unknown here
+			note_spotless_task(id, rec.map_location, t->m_map_location);
 			t->m_map_object_id = rec.map_object_id;
 			if (!m.GiveGameTaskToActor(t, time_to_complete, false, timer_ttl))
 				xr_delete(t);
@@ -814,7 +833,8 @@ void apply_record(TaskRec& rec, bool fresh)
 		}
 		set_task_texts(t, rec);
 		t->m_map_hint = rec.hint;
-		t->m_map_location = rec.map_location;
+		t->m_map_location = task_spot_type(rec.map_location); // R4 5: no spot of a type unknown here
+		note_spotless_task(rec.id, rec.map_location, t->m_map_location);
 		t->m_map_object_id = obj;
 		if (rec.state == eTaskStateInProgress)
 		{
@@ -859,11 +879,14 @@ void apply_record(TaskRec& rec, bool fresh)
 	rec.next_map_retry = now + kMapRetryMs;
 	if (rec.state == eTaskStateInProgress)
 	{
-		const bool moved = t->m_map_location != rec.map_location || t->m_map_object_id != obj;
+		// R4 5: compared with what this machine can show: a task without its (unknown) spot is not redone each retry.
+		const shared_str spot = task_spot_type(rec.map_location);
+		const bool moved = t->m_map_location != spot || t->m_map_object_id != obj;
 		if (t->GetTaskState() != eTaskStateInProgress || moved)
 		{
 			t->m_map_hint = rec.hint;
-			t->ChangeMapLocation(rec.map_location.c_str(), obj); // also brings it back in progress
+			note_spotless_task(rec.id, rec.map_location, spot);
+			t->ChangeMapLocation(spot.c_str(), obj); // also brings it back in progress
 			fix_spot_timer(t);
 		}
 		else if (t->m_map_hint != rec.hint)
@@ -1402,7 +1425,10 @@ bool spot_type_known(const shared_str& type)
 	}
 	if (g_uiSpotXml->NavigateToNode(type.c_str(), 0))
 		return true;
-	::Msg("! [coop] story: map spot type '%s' is unknown here (different mods?), ignored", type.c_str());
+	static xr_set<shared_str> s_logged; // R4 5: tasks and resyncs ask again every few seconds; once per type
+	if (s_logged.insert(type).second)
+		::Msg("! [coop] story: map spot type '%s' is unknown here (different mods?), its spots and task spots are skipped",
+		    type.c_str());
 	return false;
 }
 
@@ -1412,6 +1438,16 @@ bool spot_replicable(CMapLocation* ml, const shared_str& type)
 	if (!ml || spot_type_local(cs(type)) || ml->m_owner_task_id.size())
 		return false;
 	return smart_cast<CRelationMapLocation*>(ml) == nullptr;
+}
+
+// R4 3, host: a client may remove only a shared spot that the host placed at its own request (g_spot_authors):
+// never a task spot, nor a spot of the host's or another player's scripts (both ran the same script: the host's).
+bool spot_placed_by(PeerId peer, CMapLocation* ml, const shared_str& type, u16 id)
+{
+	if (!spot_replicable(ml, type))
+		return false;
+	auto it = g_spot_authors.find(SpotKey{type, id});
+	return it != g_spot_authors.end() && it->second.author == peer;
 }
 
 xr_string tagged_hint(const shared_str& hint, PeerId author)
@@ -1651,10 +1687,11 @@ void host_on_spot_request(PeerId from, u8 op, Reader& r)
 		}
 		if (!spot_type_known(type))
 			return;
+		CMapLocation* ml = spots().AddMapLocation(type, id); // the hook broadcasts it (at the next flush)
+		// R4 3: after AddMapLocation, whose hook clears a stale author of this key.
 		SpotAuthor& a = g_spot_authors[SpotKey{type, id}];
 		a.author = from;
 		a.hint = shared_str(hint.c_str());
-		CMapLocation* ml = spots().AddMapLocation(type, id); // the hook broadcasts it
 		const xr_string text = tagged_hint(a.hint, from);
 		if (!text.empty())
 			ml->SetHint(shared_str(text.c_str()));
@@ -1664,8 +1701,13 @@ void host_on_spot_request(PeerId from, u8 op, Reader& r)
 	{
 		const shared_str type = to_shared(r.str());
 		const u16 id = r.u16();
-		if (!r.ok() || !type.size())
+		if (!r.ok() || !type.size() || id == kNoId)
 			return;
+		if (!spot_placed_by(from, spots().GetMapLocation(type, id), type, id))
+		{
+			++g_stats.spot_removes_refused; // the next spot resync gives it back to the client
+			return;
+		}
 		spots().RemoveMapLocation(type, id); // the hook broadcasts it
 	}
 	else if (op == SpotRemoveAll)
@@ -1673,7 +1715,20 @@ void host_on_spot_request(PeerId from, u8 op, Reader& r)
 		const u16 id = r.u16();
 		if (!r.ok() || id == kNoId)
 			return;
-		spots().RemoveAllMapLocationsById(id);
+		// R4 3: only the client's own spots of the object, one by one (each removal is broadcast by the hook).
+		xr_vector<CMapLocation*> list;
+		spots().GetMapLocations(id, list);
+		xr_vector<shared_str> own;
+		for (CMapLocation* ml : list)
+		{
+			const shared_str type = ml->spot_type;
+			if (spot_placed_by(from, ml, type, id))
+				own.push_back(type);
+			else
+				++g_stats.spot_removes_refused;
+		}
+		for (const shared_str& type : own)
+			spots().RemoveMapLocation(type, id);
 	}
 }
 
@@ -2357,10 +2412,11 @@ void print_status()
 	    g_stats.infos_out, g_stats.tasks_out, g_stats.rel_out, g_stats.spots_out, g_stats.progress_out, g_stats.requests_out,
 	    g_stats.infos_in, g_stats.tasks_in, g_stats.rel_in, g_stats.spots_in, g_stats.progress_in, g_stats.requests_in);
 	::Msg("[coop] story: tasks created %llu detached %llu, known %u, pending %u | dropped: reactions %llu, combat goodwill %llu, "
-	      "task spot edits %llu | hashes %llu, mismatches %llu, resyncs out %llu in %llu, deferred %llu",
+	      "task spot edits %llu, foreign spot removals %llu | hashes %llu, mismatches %llu, resyncs out %llu in %llu, "
+	      "deferred %llu",
 	    g_stats.tasks_created, g_stats.tasks_detached, (u32)g_known.size(), (u32)g_pending.size(), g_stats.derived_dropped,
-	    g_stats.action_dropped, g_stats.task_edits_dropped, g_stats.hashes, g_stats.mismatches, g_stats.resyncs_out,
-	    g_stats.resyncs_in, g_stats.deferred);
+	    g_stats.action_dropped, g_stats.task_edits_dropped, g_stats.spot_removes_refused, g_stats.hashes,
+	    g_stats.mismatches, g_stats.resyncs_out, g_stats.resyncs_in, g_stats.deferred);
 	::Msg("[coop] story: player proxies in combat bookkeeping %llu, reputation deltas out %llu in %llu, share rewards %d",
 	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
 	::Msg("[coop] story: held infos %llu (kept here %u, holds left on %llu) | personal tasks %u, local task edits %llu",
@@ -2617,7 +2673,9 @@ void on_spot_added(const shared_str& spot_type, u16 id)
 {
 	if (!mgr().active() || spot_type_local(cs(spot_type)))
 		return;
-	if (!mgr().is_host())
+	if (mgr().is_host())
+		g_spot_authors.erase(SpotKey{spot_type, id}); // R4 3: a new spot has no author until a client's request sets it
+	else
 	{
 		if (!client_live())
 			return;
@@ -2670,7 +2728,11 @@ void on_spots_remove_all(u16 id)
 	w.u16(host_id_of(id));
 	push_out(Msg::MapSpot, std::move(w));
 	if (mgr().is_host())
+	{
+		for (auto it = g_spot_authors.begin(); it != g_spot_authors.end();) // R4 3: authors go with the spots
+			it = it->first.id == id ? g_spot_authors.erase(it) : std::next(it);
 		++g_stats.spots_out;
+	}
 	else
 		++g_stats.requests_out;
 }

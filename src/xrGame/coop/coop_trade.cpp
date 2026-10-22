@@ -19,7 +19,10 @@
 #include "InventoryBox.h"
 #include "entity_alive.h"
 #include "trade.h"
+#include "trade_parameters.h"
+#include "eatable_item.h"
 #include "ai/trader/ai_trader.h"
+#include "ai/stalker/ai_stalker.h"
 #include "ai_space.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
@@ -48,6 +51,9 @@ constexpr u64 kPendingWarnMs = 15000; // client: a deal without answer is logged
 constexpr u32 kMaxOpenDeals = 64; // host: accepted deals a client has not confirmed yet
 constexpr s64 kMaxMoney = 0xffffffffll;
 constexpr u8 kDealDonate = 1;
+// R4 2: player character <-> trader on the host. The stock trade window closes beyond 3 m
+// (CUIActorMenu::CheckDistance); twice that for the lag of the player's character on the host.
+constexpr float kTradeReach = 6.f;
 
 enum class Op : u8
 {
@@ -62,11 +68,13 @@ enum TradeResult : u8
 	Ok = 0,
 	NotReady = 1, // the player is still joining, or has too many deals unconfirmed
 	NoPlayer = 2, // the player's proxy is not online on the host
-	NoTrader = 3, // trader missing, dead or not a trader
+	NoTrader = 3, // trader missing, dead, not a trader or not trading now
 	ItemGone = 4, // an item is no longer where the client saw it
 	NoMoney = 5, // the player cannot pay, after what the trader pays him
 	TraderNoMoney = 6, // the trader cannot pay, after what the player pays him
 	Malformed = 7,
+	TooFar = 8, // the player's character is not by the trader on the host (R4 2)
+	NotTraded = 9, // the trader does not buy / sell one of the items (R4 2)
 };
 
 const char* result_name(u8 r)
@@ -81,6 +89,8 @@ const char* result_name(u8 r)
 	case NoMoney: return "no money";
 	case TraderNoMoney: return "trader has no money";
 	case Malformed: return "malformed";
+	case TooFar: return "too far from the trader";
+	case NotTraded: return "item not traded";
 	default: return "?";
 	}
 }
@@ -126,6 +136,13 @@ u16 id_of(CInventoryOwner* io)
 {
 	CGameObject* go = io ? smart_cast<CGameObject*>(io) : nullptr;
 	return go ? go->ID() : kNoId;
+}
+
+bool within_reach(CInventoryOwner* a, CInventoryOwner* b, float reach)
+{
+	CGameObject* ga = a ? smart_cast<CGameObject*>(a) : nullptr;
+	CGameObject* gb = b ? smart_cast<CGameObject*>(b) : nullptr;
+	return ga && gb && ga->Position().distance_to(gb->Position()) <= reach;
 }
 
 // Host: parent of an entity in the server state (updated synchronously by every ownership event,
@@ -223,10 +240,11 @@ struct Deal
 	u16 trader = kNoId;
 	bool donate = false;
 	u32 client_money = 0;
-	u32 sell_total = 0; // the trader pays the player
-	u32 buy_total = 0; // the player pays the trader
 	xr_vector<u16> sell; // player -> trader
 	xr_vector<u16> buy; // trader -> player
+	// Priced by the host (R4 2), not sent by the client.
+	u32 sell_total = 0; // the trader pays the player
+	u32 buy_total = 0; // the player pays the trader
 };
 
 struct OpenView
@@ -373,11 +391,52 @@ void host_send_result(PeerId to, const LastResult& r)
 	net::host_send(to, Msg::TradeOp, w);
 }
 
+// R4 2: may the player offer `item` to the trader? As the stock window decides (CUIActorMenu::CanMoveToPartner):
+// tradable at all, and in a state the trader takes. CInventoryItem::CanTrade() does not fit here: on the host the
+// item's owner is the player's character, a stalker whose AllowItemToTrade keeps the weapons it would use itself.
+bool trader_takes(CInventoryOwner* trader, CInventoryItem* item)
+{
+	LPCSTR section = item->object().cNameSect().c_str();
+	if (item->IsQuestItem() || !READ_IF_EXISTS(pSettings, r_bool, section, "can_trade", TRUE))
+		return false;
+	const CEatableItem* eatable = item->cast_eatable_item();
+	if (eatable && eatable->GetMaxUses())
+		return true;
+	return item->GetCondition() >= trader->trade_parameters().buy_item_condition_factor;
+}
+
+// R4 2: the price of a list with the stock formula, as the player's own machine shows it to its actor:
+// `pricing` is the trader's CTrade with the player's character as the actor (the trader's trade parameters, its
+// attitude to that character, the scripted discounts). `trader_buys`: the player sells the list. A price of 0 is an
+// item the trader's trade parameters do not allow in that direction. What the trader sells is what the stock trade
+// window offers (CInventory::AddAvailableItems: CanTrade, with the trader as the owner).
+u8 price_list(CTrade& pricing, CInventoryOwner* trader, const xr_vector<u16>& list, bool trader_buys, u32& total)
+{
+	u64 sum = 0;
+	for (u16 id : list)
+	{
+		CInventoryItem* item = smart_cast<CInventoryItem*>(find_object(id));
+		if (!item)
+			return ItemGone;
+		if (trader_buys ? !trader_takes(trader, item) : !item->CanTrade())
+			return NotTraded;
+		const u32 price = pricing.GetItemPrice(item, trader_buys);
+		if (!price)
+			return NotTraded;
+		sum += price;
+	}
+	if (sum > u64(kMaxMoney))
+		return Malformed;
+	total = u32(sum);
+	return Ok;
+}
+
 // One deal, everything or nothing. `p` is the player's ledger, already pruned with d.applied.
 // Money: the trader's is the host's; the player's stays his own (the client applies `delta`), the
 // proxy keeps the copy that goes into the host save. Both sides are checked after the whole deal,
-// so what the player sells pays for what he buys and the other way round.
-u8 host_apply(PeerId from, const Deal& d, const PeerTrade& p, s64& delta)
+// so what the player sells pays for what he buys and the other way round. The host prices the
+// deal (d.sell_total, d.buy_total); the client sends item ids only (R4 2).
+u8 host_apply(PeerId from, Deal& d, const PeerTrade& p, s64& delta)
 {
 	delta = 0;
 	if (sync::host_peer_joining(from) || Device.dwPrecacheFrame) // precaching: a deal from the old world
@@ -392,10 +451,18 @@ u8 host_apply(PeerId from, const Deal& d, const PeerTrade& p, s64& delta)
 	CInventoryOwner* trader = find_owner(trader_id);
 	if (!trader || trader == proxy || trader_id == 0 || world::is_player_proxy(trader_id) || !alive(trader))
 		return NoTrader;
+	if (!smart_cast<CAI_Trader*>(trader) && !smart_cast<CAI_Stalker*>(trader))
+		return NoTrader; // CTrade (pricing below) knows traders and stalkers only
+	// R4 2: the counterparty is one the player trades with now: its trade flag is on (the stock talk window
+	// offers trade only then; wounded NPCs and meet logic turn it off) and it stands by the player's character.
+	if (!trader->IsTradeEnabled())
+		return NoTrader;
+	if (!trader->NeedOsoznanieMode() && !within_reach(proxy, trader, kTradeReach))
+		return TooFar;
 	const size_t n = d.sell.size() + d.buy.size();
 	if (!n || n > kMaxDealItems)
 		return Malformed;
-	if (d.donate && (!d.buy.empty() || d.sell_total || d.buy_total))
+	if (d.donate && !d.buy.empty())
 		return Malformed;
 
 	// Every item once, and still where the client saw it.
@@ -418,6 +485,19 @@ u8 host_apply(PeerId from, const Deal& d, const PeerTrade& p, s64& delta)
 		return c;
 	if (const u8 c = check(d.buy, trader_id))
 		return c;
+
+	// R4 2: the host's prices. A temporary CTrade: the trader's own one may hold the host actor's trade with him.
+	// A gift is free, as the stock DonateCurrentItem (TransferItem with b_free).
+	d.sell_total = d.buy_total = 0;
+	if (!d.donate)
+	{
+		CTrade pricing(trader);
+		pricing.SetActorPartner(proxy);
+		if (const u8 c = price_list(pricing, trader, d.sell, true, d.sell_total))
+			return c;
+		if (const u8 c = price_list(pricing, trader, d.buy, false, d.buy_total))
+			return c;
+	}
 
 	// The player's money now: his snapshot plus the accepted deals it does not contain yet.
 	const s64 net = s64(d.sell_total) - s64(d.buy_total); // to the player
@@ -458,9 +538,8 @@ u8 host_apply(PeerId from, const Deal& d, const PeerTrade& p, s64& delta)
 	return Ok;
 }
 
-bool read_list(Reader& r, xr_vector<u16>& out, u32& total)
+bool read_list(Reader& r, xr_vector<u16>& out)
 {
-	total = r.u32();
 	const u16 n = r.u16();
 	if (!r.ok() || n > kMaxDealItems)
 		return false;
@@ -481,7 +560,7 @@ void host_on_deal(PeerId from, Reader& r)
 	if (!r.ok())
 		return; // no seq to answer
 	d.donate = (flags & kDealDonate) != 0;
-	const bool parsed = read_list(r, d.sell, d.sell_total) && read_list(r, d.buy, d.buy_total);
+	const bool parsed = read_list(r, d.sell) && read_list(r, d.buy);
 
 	host_sync_world();
 	PeerTrade& p = g_peers[from];
@@ -571,9 +650,8 @@ u32 list_total(const xr_vector<DealItem>& list)
 	return u32(sum > u64(kMaxMoney) ? u64(kMaxMoney) : sum);
 }
 
-void write_list(Writer& w, u32 total, const xr_vector<DealItem>& list)
+void write_list(Writer& w, const xr_vector<DealItem>& list)
 {
-	w.u32(total);
 	w.u16(u16(list.size()));
 	for (const DealItem& it : list)
 		w.u16(join::to_host(it.id));
@@ -585,6 +663,7 @@ void client_send_deal(u16 trader_local, PendingDeal& deal)
 	// Money snapshots (ReqMoney) and item moves made before the deal go out first: on the one
 	// reliable lane the host then sees the client's money changes in the order they happened.
 	requests::client_flush_outbox();
+	// Our own prices stay here (the money pre-checks of the trade buttons); the host prices the deal (R4 2).
 	deal.sell_total = list_total(deal.sell);
 	deal.buy_total = list_total(deal.buy);
 	CActor* a = Actor();
@@ -600,8 +679,8 @@ void client_send_deal(u16 trader_local, PendingDeal& deal)
 	w.u16(deal.trader);
 	w.u8(deal.donate ? kDealDonate : 0);
 	w.u32(a ? a->get_money() : 0);
-	write_list(w, deal.sell_total, deal.sell);
-	write_list(w, deal.buy_total, deal.buy);
+	write_list(w, deal.sell);
+	write_list(w, deal.buy);
 	net::client_send(Msg::TradeOp, w);
 	g_pending[seq] = std::move(deal);
 	++g_cl_deals;
@@ -634,6 +713,11 @@ void client_on_result(Reader& r)
 	if (code == Ok)
 	{
 		++g_cl_ok;
+		// R4 2: the money moved is the host's price; ours only showed it. A difference means the trader's
+		// profile or the relations differ between the machines.
+		const s64 shown = s64(deal.sell_total) - s64(deal.buy_total);
+		if (shown != delta)
+			::Msg("[coop] trade #%u: the host priced it %d RU, this window showed %lld RU", seq, delta, shown);
 		if (a)
 		{
 			const s64 money = s64(a->get_money()) + delta;
@@ -647,7 +731,8 @@ void client_on_result(Reader& r)
 				    -money);
 			}
 			a->set_money(clamp_money(money), true); // GE_MONEY -> ReqMoney (money, applied = seq)
-			// Lua sees the trade of the local actor as in single player (actor_on_trade), see frame().
+			// Lua sees the trade of the local actor as in single player (actor_on_trade), see frame(),
+			// with the item prices this window showed.
 			const u64 deadline = now_ms() + kCallbackWaitMs;
 			const u16 trader_local = join::to_local(trader_host);
 			for (const DealItem& di : deal.sell)
@@ -667,6 +752,12 @@ void client_on_result(Reader& r)
 			dialog::hud_message("st_coop_trade_no_money", "Trade failed: not enough money");
 		else if (code == TraderNoMoney)
 			dialog::hud_message("st_coop_trade_trader_no_money", "Trade failed: the trader has not enough money");
+		else if (code == TooFar)
+			dialog::hud_message("st_coop_trade_too_far", "Trade failed: you are too far from the trader");
+		else if (code == NoTrader)
+			dialog::hud_message("st_coop_trade_no_trader", "Trade failed: the trader does not trade now");
+		else if (code == NotTraded)
+			dialog::hud_message("st_coop_trade_not_traded", "Trade failed: the trader does not trade this item");
 		else
 			dialog::hud_message("st_coop_trade_failed", "Trade failed: the goods are no longer available");
 		request_rebuild(now_ms()); // undo the optimistic move of the cells

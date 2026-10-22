@@ -51,6 +51,8 @@ public:
 	bool CanTrade();
 
 	void StartTradeEx(CInventoryOwner* pInvOwner);
+	// Anomaly Coop: price a trade for a player's proxy as for the actor
+	void SetActorPartner(CInventoryOwner* player);
 	void StartTrade();
 	void StopTrade();
 	bool IsInTradeState() { return TradeState; }

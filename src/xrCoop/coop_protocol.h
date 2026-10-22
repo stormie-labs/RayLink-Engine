@@ -14,7 +14,9 @@ namespace coop
 // Bump on any incompatible change of any message layout.
 // 2: TradeOp Deal, ReqMoney with deal ledger
 // 3: EntitySound (NPC voices on clients); the EntitySnapshot animation-count byte carries creature flags (W5 C2)
-constexpr uint32_t kProtocolVersion = 3;
+// 4: TradeOp Deal carries item ids only, the host prices the deal (review R4 2);
+//    ReqSpawn carries the section and an ItemState blob instead of raw spawn bytes, marker 0xC6 (review R3 V6)
+constexpr uint32_t kProtocolVersion = 4;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
