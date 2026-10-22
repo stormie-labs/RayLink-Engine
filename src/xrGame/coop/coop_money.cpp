@@ -409,8 +409,13 @@ void client_on_balance(PeerId from, Reader& r)
 		++g_c.malformed;
 		return;
 	}
+	// Live first: Actor() asserts on GameID(), which has no level in the main menu. Protocol 8 makes a new player's
+	// character before his world, so the host's money_set reaches him there (night run 2, 2026-10-23: client crash);
+	// host_on_peer_in_world sends the balance again once he is live.
+	if (!mgr().is_live_client())
+		return;
 	CActor* a = Actor();
-	if (!mgr().is_live_client() || !a)
+	if (!a)
 		return;
 	u32 view = 0;
 	{
