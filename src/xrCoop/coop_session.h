@@ -61,6 +61,7 @@ struct MsgStats
 {
 	uint64_t sent_count = 0, sent_bytes = 0;
 	uint64_t recv_count = 0, recv_bytes = 0;
+	uint64_t rate_dropped = 0; // host: received but dropped by limit_rate, from all clients (T12 review, Ruling 18)
 };
 
 // Network condition emulation for tests (applied on send and receive inside Session).
@@ -127,8 +128,8 @@ public:
 	void accept_client_blob(uint32_t kind);
 
 	// R2 I4, host: a client may send `type` at most `burst` times in a row, and once more every `refill_ms` (a token
-	// bucket per client). What exceeds it is dropped before its handler (logged once per client and type, the
-	// sender is not kicked: a burst may be honest). burst or refill_ms 0 removes the limit.
+	// bucket per client). What exceeds it is dropped before its handler (logged once per client and type, counted in
+	// stats(type).rate_dropped; the sender is not kicked: a burst may be honest). burst or refill_ms 0 removes the limit.
 	void limit_rate(Msg type, uint32_t burst, uint32_t refill_ms);
 
 	// R2 I1: the world epoch. A load or a level change on the host replaces the world under the session; nothing

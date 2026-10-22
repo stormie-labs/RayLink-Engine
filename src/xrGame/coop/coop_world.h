@@ -24,6 +24,11 @@ void client_mark_host_avatar(u16 id);
 // Client: another player's avatar (id in local numbering).
 void client_mark_avatar(u16 id, PeerId peer);
 
+// R3 В3, client: the host's table (Msg::AvatarList, see join) replaces what this machine knows about who plays which
+// character. Every character listed gets its player; every other one known here gets none (its player left or is
+// loading). Ids in local numbering, our own character (0) not among them.
+void client_set_owners(const xr_vector<AvatarOwner>& local_owners);
+
 // Any player avatar / proxy known on this machine.
 bool is_player_proxy(u16 id);
 // W9: the entity / object is a player character (section coop_player_avatar): a proxy on the host, an avatar on

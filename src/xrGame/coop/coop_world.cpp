@@ -56,6 +56,14 @@ void client_mark_host_avatar(u16 id) { g_avatars[id].peer = kHostPeer; }
 
 void client_mark_avatar(u16 id, PeerId peer) { g_avatars[id].peer = peer; }
 
+void client_set_owners(const xr_vector<AvatarOwner>& local_owners)
+{
+	for (auto& it : g_avatars)
+		it.second.peer = kInvalidPeer;
+	for (const AvatarOwner& o : local_owners)
+		g_avatars[o.avatar].peer = o.peer;
+}
+
 bool is_player_proxy(u16 id) { return g_avatars.find(id) != g_avatars.end(); }
 
 bool is_player_character(const CSE_Abstract* e) { return e && e->s_name == avatar_section(); }

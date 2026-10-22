@@ -18,7 +18,8 @@ namespace coop
 //    ReqSpawn carries the section and an ItemState blob instead of raw spawn bytes, marker 0xC6 (review R3 V6)
 // 5: world epoch: Welcome and BlobBegin carry it, core WorldEpoch (client -> host), SessionReset carries the new one;
 //    TransitionVote carries a level changer id instead of a raw M_CHANGE_LEVEL packet (review R1 I3-I4, R2 I1, I3, I4)
-constexpr uint32_t kProtocolVersion = 5;
+// 6: AvatarList (host -> clients): the owner of every player character (review R3 В3)
+constexpr uint32_t kProtocolVersion = 6;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -64,6 +65,7 @@ enum class Msg : uint16_t
 	SessionReset = 0x0104, // host -> clients: world replaced (host load): str reason, u32 new world epoch; rejoin
 	LevelChange = 0x0105, // host -> clients: group transition, rejoin after
 	TransitionVote = 0x0106, // client -> host: u16 level changer (host numbering) the client stands in
+	AvatarList = 0x0107, // host -> clients: AvatarListMsg, who plays each player character in the world (R3 В3)
 
 	// players
 	PlayerState = 0x0110, // unreliable movement snapshot (owner -> host -> others)
@@ -224,6 +226,28 @@ struct PeerListEntry
 	PeerId slot = kInvalidPeer;
 	std::string nick;
 	uint32_t key_hash = 0; // short hash of the key (never send other players' keys)
+};
+
+// R3 В3: the player who plays a character, as Msg::AvatarList carries it (host numbering).
+struct AvatarOwner
+{
+	uint16_t avatar = 0xFFFF; // the character's object id; 0 = the host's own actor
+	PeerId peer = kInvalidPeer;
+};
+
+// Host -> clients, sent whole whenever it changes (a player has loaded the world, a player left): the host's own
+// actor (0, kHostPeer) and the character of every player in the world; one whose player is away or still loading is
+// not listed. Nick and colour are not repeated: every machine has them by peer (PeerList nick, colour slot from the
+// peer id).
+// Wire: u8 count (<= kMaxPlayers), count x (u16 avatar, u32 peer).
+struct AvatarListMsg
+{
+	std::vector<AvatarOwner> owners;
+
+	void write(Writer& w) const;
+	// False (owners cleared) on overrun, more rows than kMaxPlayers, avatar 0xFFFF, a peer that is no player slot
+	// (>= kMaxPlayers), a character or a player listed twice, id 0 for anybody but the host or the host with another id.
+	bool read(Reader& r);
 };
 
 // ---------------------------------------------------------------- W5 C2: creature sounds and flags

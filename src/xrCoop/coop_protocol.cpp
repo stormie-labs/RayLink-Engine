@@ -31,6 +31,7 @@ const char* msg_name(Msg type)
 	case Msg::SessionReset: return "SessionReset";
 	case Msg::LevelChange: return "LevelChange";
 	case Msg::TransitionVote: return "TransitionVote";
+	case Msg::AvatarList: return "AvatarList";
 
 	case Msg::PlayerState: return "PlayerState";
 	case Msg::PlayerVitals: return "PlayerVitals";
@@ -277,6 +278,46 @@ bool RejectMsg::read(Reader& r)
 	if (reason == RejectReason::ContentMismatch && !read_manifest(r, host_manifest))
 		return false;
 	return r.ok();
+}
+
+// ---------------------------------------------------------------- R3 В3: who plays each player character
+
+void AvatarListMsg::write(Writer& w) const
+{
+	const size_t count = std::min<size_t>(owners.size(), kMaxPlayers);
+	w.u8(uint8_t(count));
+	for (size_t i = 0; i < count; ++i)
+	{
+		w.u16(owners[i].avatar);
+		w.u32(owners[i].peer);
+	}
+}
+
+bool AvatarListMsg::read(Reader& r)
+{
+	owners.clear();
+	const uint8_t count = r.u8();
+	if (!r.ok() || count > kMaxPlayers)
+		return false;
+	std::vector<AvatarOwner> rows;
+	rows.reserve(count);
+	for (uint8_t i = 0; i < count; ++i)
+	{
+		AvatarOwner o;
+		o.avatar = r.u16();
+		o.peer = r.u32();
+		if (!r.ok() || o.avatar == 0xFFFF || o.peer >= kMaxPlayers)
+			return false;
+		// id 0 is the host's own actor, and the host plays nothing else
+		if ((o.avatar == 0) != (o.peer == kHostPeer))
+			return false;
+		for (const AvatarOwner& seen : rows)
+			if (seen.avatar == o.avatar || seen.peer == o.peer)
+				return false;
+		rows.push_back(o);
+	}
+	owners = std::move(rows);
+	return true;
 }
 // ---------------------------------------------------------------- W5 C2: creature sounds
 

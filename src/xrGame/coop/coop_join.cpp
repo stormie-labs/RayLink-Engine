@@ -9,6 +9,7 @@
 #include "coop_alife.h"
 #include "coop_net.h"
 #include "coop_script.h"
+#include "xrCoop/coop_shapes.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Level.h"
@@ -64,11 +65,13 @@ struct State
 	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
 	u32 loaded_ignored = 0;
 	u32 votes_refused = 0;
+	u32 owners_bad = 0; // client: malformed AvatarList (R3 В3)
 	// host: level exit asked by a client (R2 I3: the id of a level changer of the host's own level), waiting for
 	// coop_accept_transition
 	u16 pending_changer = kNoId;
 	PeerId transition_from = kInvalidPeer;
-	u64 transition_at = 0; // last vote (a repeat within 3 s does not notify Lua or the chat again)
+	// host: when each player's vote last reached Lua and the chat (kVoteNoticeMs)
+	xr_map<PeerId, u64> vote_noticed;
 } g;
 
 constexpr u32 kRefusalsLogged = 5;
@@ -76,6 +79,32 @@ constexpr u32 kRefusalsLogged = 5;
 // world in a loop, each answer a full spawn packet.
 constexpr u32 kStateDumpBurst = 64;
 constexpr u32 kStateDumpRefillMs = 50; // 20 per second after a burst
+// T12 review (Ruling 18): an honest client votes when it touches a level exit (once, or each time the player says yes
+// to the stock dialog, which comes back every 5 s while he stays inside).
+constexpr u32 kVoteBurst = 4;
+constexpr u32 kVoteRefillMs = 2000; // one per 2 s after a burst
+
+struct RateRule
+{
+	Msg type;
+	u32 burst;
+	u32 refill_ms;
+};
+// Host: what the session drops when a client sends too much of it (Session::limit_rate, per client); coop_status
+// shows how many of each were dropped.
+constexpr RateRule kRateRules[] = {
+	{Msg::StateDumpRequest, kStateDumpBurst, kStateDumpRefillMs},
+	{Msg::TransitionVote, kVoteBurst, kVoteRefillMs},
+};
+
+// T12 review (Ruling 18): a player's vote reaches the host's Lua and the chat at most once per 10 s, whatever exit he
+// stands at: two exits side by side, or a modified client alternating them, do not flood the chat.
+constexpr u64 kVoteNoticeMs = 10000;
+// T12 review (Ruling 18): how near a player must be to a level exit to vote for it, metres from its nearest shape.
+// Stock: an exit takes the actor when its shapes touch his bounding sphere (CCF_Shape::Contact, about 1 m around the
+// middle of the body). The host sees the player's character where the player was 0.1-0.3 s ago (interpolation delay
+// and one-way latency): 2-3 m back at a sprint. 5 m covers both.
+constexpr float kVoteReachM = 5.f;
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
 
@@ -217,6 +246,38 @@ void bring_online(u16 proxy)
 	alife_rw().switch_object(e);
 	if (e->m_bOnline)
 		::Msg("[coop] character %u is in the world", proxy);
+}
+
+// R3 В3, host: every client learns who plays each character in the world (Msg::AvatarList): the host's own actor and
+// the character of every player who has loaded the world. Sent whole whenever that changes (a player is in the
+// world, a player left); a client that is still loading gets it queued (net::host_broadcast) or ignores it, and the
+// table of its own WorldLoaded follows.
+void host_send_owners()
+{
+	AvatarListMsg m;
+	AvatarOwner host;
+	host.avatar = 0;
+	host.peer = kHostPeer;
+	m.owners.push_back(host);
+	const bool served = g.world_seen == g_world_generation; // else the proxies are ids of the old world
+	for (const auto& it : g.peers)
+	{
+		const u16 proxy = it.second.proxy;
+		if (!served || it.second.loading || proxy == kNoId || proxy == 0)
+			continue;
+		bool listed = false;
+		for (const AvatarOwner& o : m.owners)
+			listed = listed || o.avatar == proxy;
+		if (listed || it.first == kHostPeer || it.first >= kMaxPlayers || m.owners.size() >= kMaxPlayers)
+			continue; // cannot happen (one character per player key, slots 1..7): clients would refuse the whole table
+		AvatarOwner o;
+		o.avatar = proxy;
+		o.peer = it.first;
+		m.owners.push_back(o);
+	}
+	Writer w(1 + m.owners.size() * 6);
+	m.write(w);
+	net::host_broadcast(Msg::AvatarList, w);
 }
 
 // --- host: JoinRequest ---
@@ -370,6 +431,7 @@ void host_on_world_loaded(PeerId from, Reader&)
 	bring_online(it->second.proxy); // W9: his character was kept out of the world while he was away or loading
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
+	host_send_owners(); // R3 В3: everybody learns whose character this is, the newcomer who plays the others
 	players::equip_resend(); // the newcomer needs everybody's look
 	objects::host_on_peer_ready(from); // zone phases, door/physics poses: not all of it is in the save
 }
@@ -404,6 +466,34 @@ void client_on_session_reset(PeerId, Reader& r)
 	// still on its way is dropped when it completes.
 	mgr().session().set_world_epoch(epoch);
 	mgr().session().send(kHostPeer, Lane::Reliable, Msg::JoinRequest, Writer());
+}
+
+// R3 В3, client: who plays each player character, from the host (host numbering). With it every machine knows the
+// owner of every avatar, not only of the host's: coop.players() avatar_id, coop.peer_of_avatar, map markers, colours,
+// nick tags, giving items.
+void client_on_avatar_list(PeerId from, Reader& r)
+{
+	if (from != kHostPeer || !mgr().is_live_client())
+		return; // not in the world yet: the table of our own join comes after WorldLoaded
+	AvatarListMsg m;
+	if (!m.read(r))
+	{
+		if (++g.owners_bad <= kRefusalsLogged)
+			::Msg("! [coop] malformed AvatarList from the host: ignored");
+		return;
+	}
+	const PeerId self = mgr().self();
+	xr_vector<AvatarOwner> owners;
+	for (const AvatarOwner& o : m.owners)
+	{
+		const u16 local = to_local(o.avatar);
+		if (local == 0 || o.peer == self)
+			continue; // our own character is the local actor
+		AvatarOwner mine = o;
+		mine.avatar = local;
+		owners.push_back(mine);
+	}
+	world::client_set_owners(owners);
 }
 
 void client_load_world(std::vector<u8>& data)
@@ -520,6 +610,41 @@ u16 level_changer_of(NET_Packet& P)
 	return kNoId;
 }
 
+// T12 review (Ruling 18), host: metres from `p` to the nearest shape of a level exit (shapes::kFar if it has none).
+// The exit's transform is built as CGameObject::net_Spawn builds its XFORM, each box as CCF_Shape::Contact does.
+float distance_to_exit(const CSE_ALifeLevelChanger& lc, const Fvector& p)
+{
+	Fmatrix xf;
+	xf.setXYZ(lc.o_Angle);
+	xf.c.set(lc.o_Position);
+	const float at[3] = {p.x, p.y, p.z};
+	float best = shapes::kFar;
+	for (const CShapeData::shape_def& s : lc.shapes)
+	{
+		float d = shapes::kFar;
+		if (s.type == CShapeData::cfSphere)
+		{
+			Fvector center;
+			xf.transform_tiny(center, s.data.sphere.P);
+			const float c[3] = {center.x, center.y, center.z};
+			d = shapes::to_sphere(at, c, s.data.sphere.R);
+		}
+		else if (s.type == CShapeData::cfBox)
+		{
+			Fmatrix box;
+			box.mul_43(xf, s.data.box);
+			const float i[3] = {box.i.x, box.i.y, box.i.z};
+			const float j[3] = {box.j.x, box.j.y, box.j.z};
+			const float k[3] = {box.k.x, box.k.y, box.k.z};
+			const float c[3] = {box.c.x, box.c.y, box.c.z};
+			d = shapes::to_box(at, i, j, k, c);
+		}
+		if (d < best)
+			best = d;
+	}
+	return best;
+}
+
 } // namespace
 
 void host_on_transition_vote(PeerId from, Reader& r)
@@ -532,19 +657,39 @@ void host_on_transition_vote(PeerId from, Reader& r)
 	const PeerInfo* p = mgr().session().peer(from);
 	const char* nick = p ? p->nick.c_str() : "?";
 	// R2 I3: the client names a level exit; the host goes only through a level changer of its own level.
-	if (!level_changer_here(changer))
+	const CSE_ALifeLevelChanger* lc = level_changer_here(changer);
+	if (!lc)
 	{
 		if (++g.votes_refused <= kRefusalsLogged)
 			::Msg("! [coop] '%s' asks to leave through object %u, which is no level exit here: ignored", nick, changer);
 		return;
 	}
-	const u64 now = mgr().now_ms();
-	const bool repeat = g.transition_from == from && g.pending_changer == changer && now - g.transition_at < 3000;
+	// T12 review (Ruling 18): only a player who is in the world votes, and only at that exit. A vote that passes
+	// replaces the one before it, whoever cast that.
+	const u16 proxy = proxy_of_peer(from);
+	const bool in_world = !sync::host_peer_joining(from) && host_player_in_world(proxy);
+	CObject* body = in_world ? Level().Objects.net_Find(proxy) : nullptr;
+	if (!body)
+	{
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' asks to leave through level exit %u but is not in the world: ignored", nick, changer);
+		return;
+	}
+	const float away = distance_to_exit(*lc, body->Position());
+	if (!(away <= kVoteReachM))
+	{
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' asks to leave through level exit %u from %.1f m away (at most %.0f m): ignored", nick,
+			    changer, away, kVoteReachM);
+		return;
+	}
 	g.pending_changer = changer;
 	g.transition_from = from;
-	g.transition_at = now;
-	if (repeat)
-		return; // the same player at the same exit again: Lua and the chat know already
+	const u64 now = mgr().now_ms();
+	const auto noticed = g.vote_noticed.find(from);
+	if (noticed != g.vote_noticed.end() && now - noticed->second < kVoteNoticeMs)
+		return; // Lua and the chat know already (this exit or the one next to it)
+	g.vote_noticed[from] = now;
 	::Msg("[coop] '%s' stands at a level exit (%u) and wants the group to move. Host: coop_accept_transition to go",
 	      nick, changer);
 	script::on_transition_vote(nick); // the host's Lua (clients get the chat line below)
@@ -557,12 +702,14 @@ void host_on_transition_vote(PeerId from, Reader& r)
 
 void install(Session& s)
 {
-	s.limit_rate(Msg::StateDumpRequest, kStateDumpBurst, kStateDumpRefillMs); // R2 I4 (host only, per client)
+	for (const RateRule& rule : kRateRules)
+		s.limit_rate(rule.type, rule.burst, rule.refill_ms); // R2 I4, T12 review (host only, per client)
 	s.on(Msg::TransitionVote, &host_on_transition_vote);
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
 	s.on(Msg::JoinComplete, &client_on_join_complete);
 	s.on(Msg::SessionReset, &client_on_session_reset);
+	s.on(Msg::AvatarList, &client_on_avatar_list); // R3 В3
 }
 
 bool host_can_start()
@@ -653,14 +800,23 @@ void on_peer_joined(const PeerInfo&) {}
 
 void on_peer_left(PeerId id)
 {
+	// T12 review (Ruling 18): before the lookup below. A player who got Later and left before his world was sent has
+	// no entry in g.peers; his waiting request must not outlive him (the next player in his slot would be Refused).
+	g.gate.forget(id);
+	g.vote_noticed.erase(id);
+	if (g.transition_from == id)
+	{
+		g.pending_changer = kNoId; // nobody stands at that exit any more
+		g.transition_from = kInvalidPeer;
+	}
 	auto it = g.peers.find(id);
 	if (it == g.peers.end())
 		return;
 	const u16 proxy = it->second.proxy;
 	world::host_park_proxy(proxy);
 	g.peers.erase(it);
-	g.gate.forget(id);
 	take_offline(proxy); // W9: gone from the session = gone from the world (stays in the save)
+	host_send_owners(); // R3 В3: nobody plays that character now
 }
 
 bool host_player_in_world(u16 proxy_id)
@@ -837,6 +993,13 @@ void print_status()
 	{
 		::Msg("[coop]   world epoch %u; refused: %u join(s), %u WorldLoaded, %u level exit(s)", g.epoch,
 		    g.joins_refused, g.loaded_ignored, g.votes_refused);
+		// T12 review (Ruling 18): the log names a dropped type once per client; the count is here every time
+		for (const RateRule& rule : kRateRules)
+			::Msg("[coop]   rate limit %s: %llu dropped (more than %u in a row, then one per %u ms)", msg_name(rule.type),
+			    mgr().session().stats(u16(rule.type)).rate_dropped, rule.burst, rule.refill_ms);
+		if (g.pending_changer != kNoId)
+			::Msg("[coop]   level exit %u asked for by #%u, waiting for coop_accept_transition", g.pending_changer,
+			    g.transition_from);
 		for (const auto& it : g.peers)
 			::Msg("[coop]   peer #%u proxy %u%s%s", it.first, it.second.proxy, it.second.loading ? " (loading)" : "",
 			    g.gate.waiting(it.first) ? " (join waits for its turn)" : "");

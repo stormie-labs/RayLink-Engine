@@ -618,6 +618,7 @@ struct Session::Impl
 			b.tokens -= 1.;
 			return true;
 		}
+		++m_stats[type].rate_dropped; // T12 review (Ruling 18): every drop counts (coop_status), the log line is once
 		if (!b.logged)
 		{
 			b.logged = true;
