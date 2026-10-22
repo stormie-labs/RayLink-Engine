@@ -4,6 +4,7 @@
 #include "coop_join.h"
 #include "coop_sync.h"
 #include "coop_script.h"
+#include "coop_autosave.h" // F3
 #include "xrCoop/coop_link_hold.h"
 
 #include <atomic>
@@ -414,6 +415,7 @@ void Manager::stop(const char* reason)
 {
 	if (!active())
 		return;
+	autosave::host_on_session_end(); // F3: the host's last world save of the session, while the level still runs
 	m_session.shutdown(reason);
 	script::on_session_end(reason); // W4 menu: last error in the co-op window
 	join::on_session_lost(reason);
