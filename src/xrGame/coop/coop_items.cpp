@@ -278,34 +278,63 @@ const char* verdict_name(upgrades::Verdict v)
 	}
 }
 
-// R3 В6 (review): the upgrades of `wanted` the engine can install on an item of `section` in this order, after
-// `installed`. A loading install (net_Spawn of a new entity, ItemState) is FATAL on a missing parent group or a
-// taken group (inventory::upgrade::Group::can_install), so those are dropped here, like unknown ones; already
-// installed ones are left out. `report`: count and log the first 10 dropped ones.
-UpgradeList installable_upgrades(
-    const shared_str& section, const UpgradeList& installed, const UpgradeList& wanted, bool report)
+// The section's installed_upgrades, read like Manager::init_install does (only for an item with an upgrade tree).
+UpgradeList section_default_upgrades(inventory::upgrade::Manager& um, const shared_str& section)
+{
+	UpgradeList out;
+	if (!um.get_root(section) || !pSettings->line_exist(section, "installed_upgrades"))
+		return out;
+	LPCSTR list = pSettings->r_string(section, "installed_upgrades");
+	if (!list)
+		return out;
+	string256 item;
+	for (int i = 0, n = _GetItemCount(list); i < n; ++i)
+		out.push_back(shared_str(_GetItem(list, i, item)));
+	return out;
+}
+
+// R3 В6 (review): the upgrades of `wanted` the engine can install on an item of `section` in this order. A loading
+// install (net_Spawn of a new entity, ItemState) is FATAL on a missing parent group or a taken group
+// (inventory::upgrade::Group::can_install), so those are dropped here, like unknown ones. `report`: count and log
+// the first 10 dropped ones.
+//   fresh = false: `installed` is what the item has; the result is what is left to install.
+//   fresh = true:  the list goes onto a new entity, whose net_Spawn puts the section's installed_upgrades on first
+//                  (Manager::init_install): those count, and the ones the list names stay in it (a game object's
+//                  list has them, an entity's does not); a repeat is dropped.
+UpgradeList checked_upgrades(
+    const shared_str& section, const UpgradeList& installed, const UpgradeList& wanted, bool fresh, bool report)
 {
 	UpgradeList out;
 	if (!ai().get_alife())
 		return out;
 	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
 	inventory::upgrade::Root* root = um.get_root(section);
-	std::vector<upgrades::Upgrade> have, want;
+	std::vector<upgrades::Upgrade> have, want, defaults;
 	for (const shared_str& id : installed)
 		have.push_back(describe_upgrade(um, root, id));
 	for (const shared_str& id : wanted)
 		want.push_back(describe_upgrade(um, root, id));
-	const std::vector<upgrades::Verdict> verdicts = upgrades::plan(have, want);
+	if (fresh)
+		for (const shared_str& id : section_default_upgrades(um, section))
+			defaults.push_back(describe_upgrade(um, root, id));
+	const std::vector<upgrades::Verdict> verdicts = upgrades::plan(have, want, defaults);
 	for (size_t i = 0; i < verdicts.size(); ++i)
 	{
-		if (verdicts[i] == upgrades::Verdict::Install)
+		const upgrades::Verdict v = verdicts[i];
+		if (v == upgrades::Verdict::Install || v == upgrades::Verdict::Default)
 			out.push_back(wanted[i]);
-		else if (verdicts[i] != upgrades::Verdict::Installed && report && ++g_stats.upgrades_dropped <= 10)
+		else if (v != upgrades::Verdict::Installed && report && ++g_stats.upgrades_dropped <= 10)
 			::Msg("! [coop] upgrade [%s] of [%s] dropped: %s",
 			    validate::resource_name_ok(want[i].id.c_str(), 64) ? want[i].id.c_str() : "<bad name>",
-			    section.c_str(), verdict_name(verdicts[i]));
+			    section.c_str(), verdict_name(v));
 	}
 	return out;
+}
+
+// A list for a new entity of `section` (its net_Spawn installs it after the section defaults).
+UpgradeList spawn_upgrade_list(const shared_str& section, const UpgradeList& wanted, bool report)
+{
+	return checked_upgrades(section, {}, wanted, true, report);
 }
 
 // ---------------------------------------------------------------- blob
@@ -644,7 +673,7 @@ void install_upgrades(CInventoryItem* item, const UpgradeList& list)
 	const shared_str& section = item->object().cNameSect();
 	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
 	// R3 В6: only what Group::can_install accepts in this order — a loading install is FATAL otherwise
-	for (const shared_str& id : installable_upgrades(section, item->get_upgrades(), list, true))
+	for (const shared_str& id : checked_upgrades(section, item->get_upgrades(), list, false, true))
 		um.upgrade_install(*item, id, true); // "loading": no unload/detach, no event
 }
 
@@ -760,7 +789,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
 		if (d.has_upgrades && !mgr().is_host())
-			ii->m_upgrades = installable_upgrades(e->s_name, {}, d.upgrades, false); // net_Spawn installs them
+			ii->m_upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
 		if (CSE_ALifeItemAmmo* a = smart_cast<CSE_ALifeItemAmmo*>(e))
@@ -1130,8 +1159,9 @@ bool host_validate_counts(CSE_Abstract* e, CInventoryItem* item, const ItemData&
 // refused state would leave the host with stale round counts.
 void host_sanitize(CSE_Abstract* e, CInventoryItem* item, ItemData& d)
 {
-	if (d.has_upgrades) // the owner's list is its install order from scratch (R3 В6: in an order the engine takes)
-		d.upgrades = installable_upgrades(e->s_name, {}, d.upgrades, false);
+	// The owner's list is its item's, from the spawn on: section defaults first (R3 В6: an order the engine takes).
+	if (d.has_upgrades)
+		d.upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false);
 	CSE_ALifeItemWeapon* we = smart_cast<CSE_ALifeItemWeapon*>(e);
 	if (!we)
 		return;
@@ -1412,7 +1442,9 @@ void host_on_spawn_ammo(PeerId from, Reader& r)
 		return;
 	}
 	CInventoryItem* item = find_item(weapon_id);
-	if (!rounds || !is_ammo_section(sect.c_str()) || !weapon_takes(we, item, sect.c_str()))
+	// R3 В6 (review): the weapon's own ammo_class / grenade_class first — only one of those is ever constructed
+	// as a probe (F_entity_Create is FATAL on lines a peer's section may lack).
+	if (!rounds || !weapon_takes(we, item, sect.c_str()) || !is_ammo_section(sect.c_str()))
 	{
 		reject(Reason::Section, from, weapon_id, sect.c_str());
 		return;
@@ -1820,10 +1852,10 @@ bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, c
 	}
 	if (!host_validate_kind(entity, d, why) || !host_validate_counts(entity, nullptr, d, why))
 		return false;
-	// The new object installs these on its spawn with loading = true (FATAL on a missing parent group, a taken
-	// group): only an order the engine takes, each once. Dropped ones are counted and logged here.
+	// The new object installs these on its spawn with loading = true after the section defaults (FATAL on a missing
+	// parent group, a taken group): only an order the engine takes, each once. Dropped ones are counted and logged.
 	if (d.has_upgrades)
-		d.upgrades = installable_upgrades(entity->s_name, {}, d.upgrades, true);
+		d.upgrades = spawn_upgrade_list(entity->s_name, d.upgrades, true);
 	host_sanitize(entity, nullptr, d); // ammo types in range
 	apply_entity(entity, d, false);
 	// apply_entity leaves upgrades to GE_INSTALL_UPGRADE on the host; a fresh entity has none yet.
