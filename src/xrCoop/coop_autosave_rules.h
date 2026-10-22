@@ -4,6 +4,7 @@
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -95,6 +96,54 @@ inline uint32_t next_slot(const std::vector<SlotInfo>& existing, uint32_t count)
 		if (!oldest || r.file_time < oldest->file_time || (r.file_time == oldest->file_time && r.index < oldest->index))
 			oldest = &r;
 	return oldest ? oldest->index : 1;
+}
+
+// The slots to delete after a save so that no more than `count` slot files stay: the oldest beyond that, oldest first.
+// `existing` lists the slots on disk with the save just made (slot `keep`) in it. The slot just written is the newest by
+// definition and always stays; the others are ordered by file time, equal times with the higher index as the newer (the
+// reverse of the order next_slot overwrites in). Slots above `count` are not special: they leave when they are older than
+// `count` others, so a host that keeps fewer than before drops the surplus over the next saves, newest worlds last.
+// Index 0 is not a slot (never listed for deletion). count < 1 is taken as 1.
+inline std::vector<uint32_t> slots_to_prune(const std::vector<SlotInfo>& existing, uint32_t count, uint32_t keep)
+{
+	if (count < 1)
+		count = 1;
+
+	// One entry per slot; a slot listed twice keeps its newer time.
+	std::vector<SlotInfo> slots;
+	for (const SlotInfo& s : existing)
+	{
+		if (s.index < 1)
+			continue;
+		bool merged = false;
+		for (SlotInfo& r : slots)
+			if (r.index == s.index)
+			{
+				if (s.file_time > r.file_time)
+					r.file_time = s.file_time;
+				merged = true;
+				break;
+			}
+		if (!merged)
+			slots.push_back(s);
+	}
+	if (slots.size() <= size_t(count))
+		return {};
+
+	// Newest first: the slot just written, then by file time, equal times the higher index first.
+	std::sort(slots.begin(), slots.end(), [keep](const SlotInfo& a, const SlotInfo& b)
+	{
+		if ((a.index == keep) != (b.index == keep))
+			return a.index == keep;
+		if (a.file_time != b.file_time)
+			return a.file_time > b.file_time;
+		return a.index > b.index;
+	});
+
+	std::vector<uint32_t> gone;
+	for (size_t i = slots.size(); i > size_t(count); --i)
+		gone.push_back(slots[i - 1].index); // from the oldest
+	return gone;
 }
 
 // Why a save is written.

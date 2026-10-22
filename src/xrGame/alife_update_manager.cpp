@@ -225,7 +225,8 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	}
 
 	string256 autoave_name;
-	if (LPCSTR coop_name = coop::autosave::level_change_name()) // Anomaly Coop: the host's coop_auto_N in a session
+	LPCSTR coop_name = coop::autosave::level_change_name(); // Anomaly Coop: the host's coop_auto_N in a session
+	if (coop_name)
 		xr_strcpy(autoave_name, coop_name);
 	else
 		strconcat(sizeof(autoave_name), autoave_name, Core.UserName, " - ", "autosave");
@@ -234,7 +235,22 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	string256 temp;
 	*m_server_command_line = strconcat(sizeof(temp), temp, autoave_name, temp0);
 
-	save(autoave_name);
+	if (coop_name)
+	{
+		// Anomaly Coop: the world is written to a temporary name and moved over coop_auto_N when it is whole, so a crash
+		// in the middle of the write leaves no cut-off slot (the Restore list opens every slot).
+		LPCSTR coop_temp_name = coop::autosave::level_change_temp_name();
+		save(coop_temp_name, false);
+		if (!coop::autosave::level_change_commit())
+		{
+			// The move failed: the world is in the temporary file only, the new level loads from there.
+			LPCSTR suffix = strstr(**m_server_command_line, "/");
+			VERIFY(suffix);
+			*m_server_command_line = strconcat(sizeof(temp), temp, coop_temp_name, suffix);
+		}
+	}
+	else
+		save(autoave_name);
 
 	graph().actor()->m_tGraphID = safe_graph_vertex_id;
 	graph().actor()->m_tNodeID = safe_level_vertex_id;

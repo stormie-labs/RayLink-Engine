@@ -55,6 +55,7 @@ struct Pending
 } g_pending;
 
 bool g_saving = false; // inside a save: nothing starts another
+uint32_t g_level_slot = 0; // the slot level_change_name took for the save of a level change in progress (0 = none)
 
 struct Stats
 {
@@ -190,9 +191,20 @@ void send_save(LPCSTR stem)
 	xr_strcpy(g_last_saved_game, last_save);
 }
 
-// Writes the world as coop_auto_<slot>: to coop_auto_tmp first, then the finished files go over the slot. true when the
-// slot holds the new save; on false the slot is as it was (or, when the second file could not be moved, see below).
-bool write_slot(uint32_t slot)
+// What an earlier crash or a failed save left of coop_auto_tmp must not pass for the save that is about to be written.
+void begin_temp()
+{
+	string_path tmp_scop, tmp_scoc;
+	save_path(tmp_scop, kTempStem, SAVE_EXTENSION);
+	save_path(tmp_scoc, kTempStem, ".scoc");
+	remove_file(tmp_scop);
+	remove_file(tmp_scoc);
+}
+
+// coop_auto_tmp holds a finished save: moves it over coop_auto_<slot>. true when the slot holds the new save. On false
+// the slot is as it was (or, when the second file could not be moved, see below) and coop_auto_tmp is still the way to
+// the new world.
+bool commit_temp(uint32_t slot)
 {
 	const std::string name = slot_name(slot);
 	string_path tmp_scop, tmp_scoc, to_scop, to_scoc;
@@ -200,12 +212,6 @@ bool write_slot(uint32_t slot)
 	save_path(tmp_scoc, kTempStem, ".scoc");
 	save_path(to_scop, name.c_str(), SAVE_EXTENSION);
 	save_path(to_scoc, name.c_str(), ".scoc");
-
-	// What an earlier crash left must not pass for this save.
-	remove_file(tmp_scop);
-	remove_file(tmp_scoc);
-
-	send_save(kTempStem);
 
 	if (FS.file_length(tmp_scop) < kMinSaveBytes) // -1 = no file
 	{
@@ -215,7 +221,8 @@ bool write_slot(uint32_t slot)
 
 	// Anomaly's Lua part goes first, the .scop (the file the Restore list looks for) last. When the script storage is
 	// off there is no .scoc, and an old one in the slot must not be loaded together with this world.
-	if (file_present(tmp_scoc))
+	const bool has_scoc = file_present(tmp_scoc);
+	if (has_scoc)
 	{
 		if (!move_over(tmp_scoc, to_scoc))
 			return false;
@@ -229,13 +236,44 @@ bool write_slot(uint32_t slot)
 	if (!move_over(tmp_scop, to_scop))
 	{
 		// The slot now has the new script part and the old world: loadable, but the two do not belong together. Only a
-		// failure of the second move gets here, after the first one worked.
+		// failure of the second move gets here, after the first one worked. The script part is copied back next to the
+		// new world in coop_auto_tmp, which a level change falls back to.
 		::Msg("! [coop] autosave: %s keeps its older world with the new script data", name.c_str());
+		if (has_scoc)
+			CopyFileA(to_scoc, tmp_scoc, FALSE);
 		return false;
 	}
 	rescan_saves(); // the index must see the slot (load, FS.exist) and not the temporary files
 	xr_strcpy(g_last_saved_game, name.c_str()); // "Continue" goes to the newest world, as after a stock autosave
 	return true;
+}
+
+// The host keeps coop_autosave_count slot files: after a save the oldest beyond that go (the rules: slots_to_prune). A
+// host that lowered the count drops the surplus over its next saves.
+void prune_surplus(uint32_t written)
+{
+	std::vector<SlotInfo> slots;
+	list_slots(slots); // with the new slot at its real time
+	for (const uint32_t index : slots_to_prune(slots, uint32_t(g_count), written))
+	{
+		const std::string name = slot_name(index);
+		for (LPCSTR ext : {SAVE_EXTENSION, ".scoc", ".dds"})
+		{
+			string_path file;
+			save_path(file, name.c_str(), ext);
+			remove_file(file);
+		}
+		::Msg("[coop] autosave: %s removed, the host keeps %d", name.c_str(), g_count);
+	}
+}
+
+// Writes the world as coop_auto_<slot>: to coop_auto_tmp first, then the finished files go over the slot. true when the
+// slot holds the new save.
+bool write_slot(uint32_t slot)
+{
+	begin_temp();
+	send_save(kTempStem);
+	return commit_temp(slot);
 }
 
 // One more save counted: the interval of the timer starts from here, and a request waiting for this save is served.
@@ -273,7 +311,21 @@ bool save(Reason why)
 	const std::string name = slot_name(slot);
 	note_saved(why, name);
 	::Msg("[coop] autosave %s (%s) written in %u ms", name.c_str(), reason_name(why), u32(mgr().now_ms() - started));
+	prune_surplus(slot);
 	return true;
+}
+
+// The last save of a host who is done with the world: the session ends or its level closes. At once, whatever the host is
+// doing; only a level that cannot be saved at all skips it.
+void save_at_end(const char* what)
+{
+	g_pending = Pending(); // the save below covers it
+	if (!can_write())
+	{
+		::Msg("[coop] autosave at %s skipped: the host has no running level to save", what);
+		return;
+	}
+	save(Reason::SessionEnd);
 }
 
 // ---------------------------------------------------------------- console
@@ -309,6 +361,7 @@ void reset()
 	g_schedule.last_ms = mgr().now_ms(); // the interval counts from the start of the session
 	g_pending = Pending();
 	g_saving = false;
+	g_level_slot = 0;
 }
 
 void register_console()
@@ -383,26 +436,51 @@ const char* level_change_name()
 {
 	if (!mgr().is_host() || g_saving)
 		return nullptr;
-	// change_level writes the save itself, under this name, right after this call (the new level is loaded from it).
+	// change_level has the world written to level_change_temp_name() and calls level_change_commit(), which moves it
+	// over this slot; the new level is loaded from the slot.
 	static string64 name;
-	const std::string slot = slot_name(next_free_slot());
-	xr_strcpy(name, slot.c_str());
-	note_saved(Reason::LevelChange, slot);
-	::Msg("[coop] autosave %s (%s)", name, reason_name(Reason::LevelChange));
+	g_level_slot = next_free_slot();
+	xr_strcpy(name, slot_name(g_level_slot).c_str());
+	begin_temp();
 	return name;
+}
+
+const char* level_change_temp_name() { return g_level_slot ? kTempStem : nullptr; }
+
+bool level_change_commit()
+{
+	const uint32_t slot = g_level_slot;
+	g_level_slot = 0;
+	if (!slot)
+		return false;
+	if (!commit_temp(slot))
+	{
+		++g_stat.failed;
+		::Msg("! [coop] autosave (%s) to %s failed: the new level loads from %s", reason_name(Reason::LevelChange),
+		    slot_name(slot).c_str(), kTempStem);
+		return false;
+	}
+	const std::string name = slot_name(slot);
+	note_saved(Reason::LevelChange, name);
+	::Msg("[coop] autosave %s (%s)", name.c_str(), reason_name(Reason::LevelChange));
+	prune_surplus(slot);
+	return true;
 }
 
 void host_on_session_end()
 {
 	if (!mgr().is_host())
 		return;
-	g_pending = Pending(); // the save below covers it
-	if (!can_write())
-	{
-		::Msg("[coop] autosave at the end of the session skipped: the host has no running level to save");
+	save_at_end("the end of the session");
+}
+
+void host_on_level_exit()
+{
+	// A level that closes to open another (a level change, a load, a new game) queues KERNEL:start behind this
+	// disconnect (CApplication::OnEvent, the same test as for the main menu): its world is saved by its own path.
+	if (!mgr().is_host() || Engine.Event.Peek("KERNEL:start"))
 		return;
-	}
-	save(Reason::SessionEnd);
+	save_at_end("the close of the host's level");
 }
 
 void print_status()
