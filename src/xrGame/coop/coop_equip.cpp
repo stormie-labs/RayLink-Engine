@@ -16,6 +16,7 @@
 #include "coop_entities.h"
 #include "coop_net.h"
 #include "coop_alife.h"
+#include "xrCoop/coop_validate.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -44,6 +45,23 @@ constexpr u32 kEquipRefreshMs = 5000;
 constexpr u32 kVitalsMs = 2000;
 
 constexpr size_t kMaxLightSection = 64;
+constexpr size_t kMaxVisual = 200;
+u64 g_visual_bad = 0;
+
+// R3 K2: a peer's visual is loaded on every machine (no file = FATAL "Can't find model file") and goes into the
+// proxy's server entity, so into the host save. The name is checked first (printable ASCII, no "..", no ':'), then
+// the same lookup as CModelPool::Instance_Load.
+bool visual_exists(const xr_string& visual)
+{
+	if (!validate::resource_name_ok(visual.c_str(), kMaxVisual))
+		return false;
+	string_path name, fn;
+	if (strext(visual.c_str()))
+		xr_strcpy(name, visual.c_str());
+	else
+		strconcat(sizeof(name), name, visual.c_str(), ".ogf");
+	return FS.exist(fn, "$level$", name) || FS.exist(fn, "$game_meshes$", name);
+}
 
 struct Equip
 {
@@ -79,6 +97,12 @@ struct Equip
 		torch = r.boolean();
 		if (!r.ok())
 			return false;
+		if (!visual.empty() && !visual_exists(visual))
+		{
+			if (++g_visual_bad <= 10)
+				::Msg("! [coop] player visual refused (no such model here or bad name), %u chars", (u32)visual.size());
+			visual.clear(); // keep the item in hands and the lights
+		}
 		tail = hand_light = safemode = false;
 		light_section.clear();
 		if (r.remaining() > 0)
@@ -634,8 +658,8 @@ void equip_resend()
 
 void equip_print_status()
 {
-	::Msg("[coop]   equipment: %llu out, %llu in, %u pending; vitals: %llu out, %llu in", g_equip_out, g_equip_in,
-	      (u32)g_pending.size(), g_vitals_out, g_vitals_in);
+	::Msg("[coop]   equipment: %llu out, %llu in, %u pending, %llu visuals refused; vitals: %llu out, %llu in",
+	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_visual_bad, g_vitals_out, g_vitals_in);
 	::Msg("[coop]   hand lights: %u on, %llu made, %llu unknown sections | my flashlight %s, safe mode %s",
 	      (u32)g_lights.size(), g_lights_made, g_lights_bad, g_last_sent.hand_light ? g_last_sent.light_section.c_str() : "off",
 	      g_last_sent.safemode ? "on" : "off");

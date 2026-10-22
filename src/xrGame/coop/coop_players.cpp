@@ -6,6 +6,7 @@
 #include "coop_survival.h"
 #include "coop_entities.h"
 #include "coop_sound.h"
+#include "xrCoop/coop_validate.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -28,6 +29,9 @@ constexpr size_t kMaxSamples = 32;
 // W9: no state for this long = the stream ended (player left, avatar out of the world). The next state starts a
 // new one: its clock may be another process's (the player restarted the game), and old samples are useless.
 constexpr u64 kStreamGapMs = 3000;
+// R3 K1: a peer's numbers reach XFORM, the proxy's physics and o_Position in the host save.
+constexpr float kMaxSpeed = 100.f; // m/s; a sprinting actor is ~8, a vehicle well under this
+constexpr float kLevelMargin = 50.f; // m around the level's geometry box (falling, jumping off the edge)
 
 struct Sample
 {
@@ -222,7 +226,15 @@ bool State::read(Reader& r)
 	head = r.u32();
 	active_slot = r.u8();
 	active_item = r.u16();
-	return r.ok();
+	// R3 K1: finite numbers, a sane speed, a position inside the level's box grown by kLevelMargin.
+	if (!r.ok() || !validate::finite3(p) || !validate::speed_ok(v, kMaxSpeed))
+		return false;
+	if (!g_pGameLevel)
+		return false;
+	const Fbox& box = Level().ObjectSpace.GetBoundingVolume();
+	const float lo[3] = {box.x1, box.y1, box.z1};
+	const float hi[3] = {box.x2, box.y2, box.z2};
+	return validate::in_box(p, lo, hi, kLevelMargin);
 }
 
 void install(Session& s)
