@@ -6,6 +6,7 @@
 #include "coop_script.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 string64 g_coop_nick = "";
 
@@ -22,6 +23,40 @@ constexpr u32 kPeerTimeoutMs = 10000;
 // W9: how long one loading activity holds the link (re-armed by every load stage): the longest single stage we
 // wait for, e.g. the texture upload of a big level on a slow disk.
 constexpr u32 kLoadHoldMs = 120000;
+
+// R1 I2: a crash (FATAL dialog, access violation) must look like silence to the peers at once. Without it a client
+// that crashed while loading stays "connected", his character in the world, until the load hold runs out
+// (kLoadHoldMs), and his restarted game cannot take his place before. Installed while a session runs (only a session
+// holds the link), in front of the handler that was there (the console's cvar dump).
+crashhandler* g_next_crash_handler = nullptr;
+bool g_crash_hook_exit_registered = false;
+
+void on_crash()
+{
+	Manager::get().session().hold_connection(0); // atomics only: fine from any thread, also mid-crash
+	if (g_next_crash_handler)
+		g_next_crash_handler();
+}
+
+// Main thread. Idempotent; leaves alone a handler someone installed after ours.
+void set_crash_hook(bool on)
+{
+	if (on == (Debug.get_crashhandler() == &on_crash))
+		return;
+	if (on)
+	{
+		g_next_crash_handler = Debug.get_crashhandler();
+		Debug.set_crashhandler(&on_crash);
+	}
+	else
+	{
+		Debug.set_crashhandler(g_next_crash_handler);
+		g_next_crash_handler = nullptr;
+	}
+}
+
+// At exit with a session still running: off before Manager (and its Session) is destroyed.
+void remove_crash_hook() { set_crash_hook(false); }
 
 // "-key value" from the command line; false if absent. Value is empty if the key has none.
 bool cmd_param(LPCSTR key, xr_string& value)
@@ -141,6 +176,12 @@ void Manager::set_phase(Phase p)
 		return;
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
+	set_crash_hook(p != Phase::Off); // R1 I2: a crash releases the link hold
+	if (p != Phase::Off && !g_crash_hook_exit_registered)
+	{
+		g_crash_hook_exit_registered = true;
+		std::atexit(&remove_crash_hook); // registered after Manager's construction: runs before its destructor
+	}
 	// G18: a session world never stands still. A pause from before the session (new game, menu) is lifted
 	// when this machine starts hosting or enters the world; in the session CanBePaused() refuses new ones.
 	if ((p == Phase::Hosting || p == Phase::Live) && Device.Paused())

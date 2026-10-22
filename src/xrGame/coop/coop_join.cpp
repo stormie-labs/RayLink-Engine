@@ -66,18 +66,9 @@ struct State
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
 
-xr_string key_hex(const PlayerKey& k)
-{
-	static const char* digits = "0123456789abcdef";
-	xr_string s;
-	s.reserve(k.size() * 2);
-	for (u8 b : k)
-	{
-		s.push_back(digits[b >> 4]);
-		s.push_back(digits[b & 15]);
-	}
-	return s;
-}
+// R1 I1: a player's character keeps in its custom data the SHA-256 of its player's key, never the key itself: the
+// world save goes to every client, and a key is all it takes to play someone's character. Format, strict parse
+// and migration of saves from before: coop::find_key_value / migrate_key_value (xrCoop/coop_session.h).
 
 bool read_file(LPCSTR path, std::vector<u8>& out)
 {
@@ -116,27 +107,31 @@ void save_path(string_path& out, LPCSTR name, LPCSTR ext)
 	FS.update_path(out, "$game_saves$", file);
 }
 
-// Key stored in the proxy's custom data: "[coop]\nkey = <hex>\nnick = <nick>\n".
-bool proxy_has_key(const CSE_Abstract* e, const xr_string& hex)
+// The character of the player whose key has this digest, nullptr if he has none yet. On the way every character
+// from an older save gets the digest of its key instead of the key (R1 I1): the world save made for the joining
+// player right after carries nobody's key.
+CSE_ALifeHumanStalker* find_proxy_by_key(const std::string& digest)
 {
-	return e->m_ini_string.size() && strstr(e->m_ini_string.c_str(), hex.c_str()) != nullptr;
-}
-
-CSE_ALifeHumanStalker* find_proxy_by_key(const PlayerKey& key)
-{
-	const xr_string hex = key_hex(key);
+	CSE_ALifeHumanStalker* found = nullptr;
 	for (const auto& it : ai().alife().objects().objects())
 	{
 		CSE_ALifeDynamicObject* e = it.second;
-		if (!e || xr_strcmp(e->s_name, kProxySection))
+		if (!e || xr_strcmp(e->s_name, kProxySection) || !e->m_ini_string.size())
 			continue;
-		if (proxy_has_key(e, hex))
-			return smart_cast<CSE_ALifeHumanStalker*>(e);
+		std::string ini = e->m_ini_string.c_str();
+		if (migrate_key_value(ini))
+		{
+			e->m_ini_string = ini.c_str();
+			::Msg("[coop] character %u: the player key in its custom data is replaced by its digest (older save)", e->ID);
+		}
+		size_t at = 0, len = 0;
+		if (!found && find_key_value(ini, at, len) && ini.compare(at, len, digest) == 0)
+			found = smart_cast<CSE_ALifeHumanStalker*>(e);
 	}
-	return nullptr;
+	return found;
 }
 
-CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p)
+CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_digest)
 {
 	CSE_ALifeCreatureActor* actor = ai().alife().graph().actor();
 	if (!actor)
@@ -153,7 +148,7 @@ CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p)
 		return nullptr;
 	}
 	string512 ini;
-	xr_sprintf(ini, "[coop]\nkey = %s\nnick = %s\n", key_hex(p.key).c_str(), p.nick.c_str());
+	xr_sprintf(ini, "[coop]\nkey = %s\nnick = %s\n", key_digest.c_str(), p.nick.c_str()); // R1 I1: the digest
 	proxy->m_ini_string = ini;
 	proxy->m_character_name = p.nick.c_str();
 	::Msg("[coop] new character for '%s': proxy id %u at [%.1f %.1f %.1f]", p.nick.c_str(), proxy->ID, pos.x, pos.y,
@@ -223,14 +218,21 @@ void host_on_join_request(PeerId from, Reader&)
 		return;
 	}
 
-	CSE_ALifeHumanStalker* proxy = find_proxy_by_key(p->key);
+	std::string key_digest;
+	if (!key_digest_hex(p->key, key_digest))
+	{
+		::Msg("! [coop] cannot hash the player key of '%s' (BCrypt)", p->nick.c_str());
+		mgr().session().kick(from, RejectReason::HostNotReady, "host could not check your player key");
+		return;
+	}
+	CSE_ALifeHumanStalker* proxy = find_proxy_by_key(key_digest);
 	if (proxy)
 	{
 		::Msg("[coop] '%s' returns to character proxy id %u", p->nick.c_str(), proxy->ID);
 		bring_proxy_to_level(*proxy, p->nick.c_str());
 	}
 	else
-		proxy = create_proxy(*p);
+		proxy = create_proxy(*p, key_digest);
 	if (!proxy)
 	{
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");

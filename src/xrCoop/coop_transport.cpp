@@ -8,6 +8,7 @@
 #define NOMINMAX
 #endif
 #include <enet/enet.h>
+#include <enet/time.h> // ENET_TIME_DIFFERENCE
 
 #include <chrono>
 #include <cstring>
@@ -368,6 +369,15 @@ float Transport::packet_loss(PeerHandle peer)
 {
 	IoLock io(g_io);
 	return peer ? float(peer->packetLoss) / float(ENET_PEER_PACKET_LOSS_SCALE) : 0.f;
+}
+
+uint32_t Transport::ms_since_receive(PeerHandle peer)
+{
+	IoLock io(g_io);
+	// lastReceiveTime is stamped on every acknowledgement the peer sends (0 = none yet).
+	if (!peer || !peer->lastReceiveTime)
+		return UINT32_MAX;
+	return ENET_TIME_DIFFERENCE(enet_time_get(), peer->lastReceiveTime);
 }
 
 std::string Transport::address_of(PeerHandle peer)

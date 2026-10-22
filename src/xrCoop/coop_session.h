@@ -145,6 +145,31 @@ private:
 PlayerKey generate_player_key();
 // Short stable hash of a key for display and PeerList.
 uint32_t player_key_hash(const PlayerKey& key);
+// R1 I1: SHA-256 (BCrypt). A host keeps only the digest of a player's key in its saves: the world save goes to every
+// client, and the key is all it takes to play that player's character. false (out zeroed) if BCrypt failed.
+using Sha256 = std::array<uint8_t, 32>;
+bool sha256(const void* data, size_t size, Sha256& out);
+
+// R1 I1: the player key in the custom data of the player's character on the host, as text:
+//   [coop]
+//   key = <kKeyDigestHexDigits: sha256 of the key>
+//   nick = <nick>
+// Saves made before kept the key itself (kPlayerKeyHexDigits). Pure functions, no engine.
+constexpr size_t kPlayerKeyHexDigits = sizeof(PlayerKey) * 2;
+constexpr size_t kKeyDigestHexDigits = sizeof(Sha256) * 2;
+// Lowercase hex of the bytes.
+std::string to_hex(const uint8_t* data, size_t size);
+// The digest of a key as the custom data keeps it. false if BCrypt failed.
+bool key_digest_hex(const PlayerKey& key, std::string& out);
+// The value of the "key" line of the [coop] section, by a strict parse of lines (not a search in the whole text: the
+// nick line could hold another player's key). The line is "key = <value>", blanks around '=' optional; the value is
+// kPlayerKeyHexDigits (legacy) or kKeyDigestHexDigits lowercase hex digits. Found at [begin, begin + len).
+bool find_key_value(const std::string& ini, size_t& begin, size_t& len);
+// Exactly kPlayerKeyHexDigits lowercase hex digits back to the key; false (out zeroed) otherwise.
+bool key_from_hex(const std::string& hex, PlayerKey& out);
+// A key line that still holds the key itself (a save from before) gets the key's digest in its place; every other
+// line stays as it is. true if `ini` was changed.
+bool migrate_key_value(std::string& ini);
 // CRC32 (IEEE) used by blob transfer, exposed for tests.
 uint32_t crc32(const void* data, size_t size, uint32_t seed = 0);
 } // namespace coop

@@ -40,6 +40,10 @@ constexpr int kMaxEventsPerUpdate = 8192;
 constexpr uint32_t kShutdownMaxMs = 200;
 constexpr uint32_t kDefaultConnectTimeoutMs = 10000;
 constexpr uint32_t kDefaultPeerTimeoutMs = 15000;
+// R1 I2 (ruling 10): a joined player's link that has not acknowledged anything for this long may be replaced by a
+// new connection with the same key. A live link is pinged every 500 ms (Transport::ms_since_receive), a game that
+// crashed or was closed is silent; restarting a game takes longer than this.
+constexpr uint32_t kReplaceSilentLinkMs = 3000;
 
 uint64_t steady_ms()
 {
@@ -710,18 +714,40 @@ struct Session::Impl
 				&m_cfg.manifest);
 			return;
 		}
-		bool duplicate = (h.key == m_cfg.key);
-		for (const auto& kv : m_joined)
-			if (kv.second->info.key == h.key)
-				duplicate = true;
-		if (duplicate)
+		// R1 I2: DuplicateKey = the host's own key (a game folder copied from the host) or a joined player's key whose
+		// link is alive (below). No advice to delete the key: a player who follows it on the wrong PC loses his
+		// character.
+		if (h.key == m_cfg.key)
 		{
 			reject_conn(c, RejectReason::DuplicateKey,
-				"Your player key is already used in this session. The game folder was probably copied from "
-				"another player. To get a new identity, close the game, delete appdata\\coop_player.key in your "
-				"game folder and start the game again.",
+				"Your player key (appdata\\coop_player.key) is the same as the host's: your game folder was "
+				"probably copied from the host's. The host and every player need keys of their own.",
 				nullptr);
 			return;
+		}
+		// R1 I2 (ruling 10): a joined player's key again. His old link silent for kReplaceSilentLinkMs = that player
+		// back before the link timed out (his game crashed or was restarted): the new connection replaces the old
+		// one, his character stays his. A live old link keeps its place and the new one is refused (a second game
+		// with the same key folder). Before the size check: a returning player takes his own place in a full session.
+		Conn* previous = nullptr;
+		for (const auto& kv : m_joined)
+			if (kv.second->info.key == h.key)
+				previous = kv.second;
+		if (previous)
+		{
+			const uint32_t silent_ms = net::Transport::ms_since_receive(previous->peer);
+			if (silent_ms < kReplaceSilentLinkMs)
+			{
+				reject_conn(c, RejectReason::DuplicateKey,
+					"A player with your player key (appdata\\coop_player.key) is in this session right now. If that "
+					"is your other game, close it and connect again. If your game folder is a copy of that player's, "
+					"the copy needs a key of its own: characters belong to keys.",
+					nullptr);
+				return;
+			}
+			logf("host: peer %u '%s' silent for %u ms connects again from %s: the old link is replaced",
+				unsigned(previous->info.id), previous->info.nick.c_str(), unsigned(silent_ms), c.info.address.c_str());
+			kick_conn(*previous, RejectReason::Kicked, "connection replaced: the same player key reconnected");
 		}
 		if (m_joined.size() + 1 >= m_max_players)
 		{
@@ -1730,6 +1756,144 @@ uint32_t player_key_hash(const PlayerKey& key)
 		h *= 16777619u;
 	}
 	return h;
+}
+
+bool sha256(const void* data, size_t size, Sha256& out)
+{
+	out.fill(0);
+	BCRYPT_ALG_HANDLE alg = nullptr;
+	if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+		return false;
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	bool ok = BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0));
+	// BCryptHashData takes a non-const buffer: the input goes through a stack block, wiped after (it is a key).
+	uint8_t block[64];
+	const uint8_t* p = static_cast<const uint8_t*>(data);
+	for (size_t left = size; ok && left > 0;)
+	{
+		const size_t n = std::min(left, sizeof(block));
+		std::memcpy(block, p, n);
+		ok = BCRYPT_SUCCESS(BCryptHashData(hash, block, ULONG(n), 0));
+		p += n;
+		left -= n;
+	}
+	SecureZeroMemory(block, sizeof(block));
+	if (ok)
+		ok = BCRYPT_SUCCESS(BCryptFinishHash(hash, out.data(), ULONG(out.size()), 0));
+	if (hash)
+		BCryptDestroyHash(hash);
+	BCryptCloseAlgorithmProvider(alg, 0);
+	if (!ok)
+		out.fill(0);
+	return ok;
+}
+
+namespace
+{
+bool is_blank(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+// Lowercase hex digit value, -1 for anything else.
+int hex_digit(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	return -1;
+}
+} // namespace
+
+std::string to_hex(const uint8_t* data, size_t size)
+{
+	static const char* digits = "0123456789abcdef";
+	std::string s;
+	s.reserve(size * 2);
+	for (size_t i = 0; i < size; ++i)
+	{
+		s.push_back(digits[data[i] >> 4]);
+		s.push_back(digits[data[i] & 15]);
+	}
+	return s;
+}
+
+bool key_digest_hex(const PlayerKey& key, std::string& out)
+{
+	Sha256 d;
+	if (!sha256(key.data(), key.size(), d))
+		return false;
+	out = to_hex(d.data(), d.size());
+	return true;
+}
+
+bool find_key_value(const std::string& ini, size_t& begin, size_t& len)
+{
+	bool in_coop = false;
+	for (size_t pos = 0; pos < ini.size();)
+	{
+		size_t eol = ini.find('\n', pos);
+		if (eol == std::string::npos)
+			eol = ini.size();
+		size_t a = pos, b = eol;
+		pos = eol + 1;
+		while (a < b && is_blank(ini[a]))
+			++a;
+		while (b > a && is_blank(ini[b - 1]))
+			--b;
+		if (a < b && ini[a] == '[')
+		{
+			in_coop = ini.compare(a, b - a, "[coop]") == 0;
+			continue;
+		}
+		if (!in_coop || ini.compare(a, 3, "key") != 0)
+			continue;
+		size_t v = a + 3;
+		while (v < b && is_blank(ini[v]))
+			++v;
+		if (v == b || ini[v] != '=')
+			continue; // another name that starts with "key"
+		++v;
+		while (v < b && is_blank(ini[v]))
+			++v;
+		if (b - v != kPlayerKeyHexDigits && b - v != kKeyDigestHexDigits)
+			return false;
+		for (size_t i = v; i < b; ++i)
+			if (hex_digit(ini[i]) < 0)
+				return false;
+		begin = v;
+		len = b - v;
+		return true;
+	}
+	return false;
+}
+
+bool key_from_hex(const std::string& hex, PlayerKey& out)
+{
+	out.fill(0);
+	if (hex.size() != kPlayerKeyHexDigits)
+		return false;
+	PlayerKey key{};
+	for (size_t i = 0; i < key.size(); ++i)
+	{
+		const int hi = hex_digit(hex[2 * i]), lo = hex_digit(hex[2 * i + 1]);
+		if (hi < 0 || lo < 0)
+			return false;
+		key[i] = uint8_t((hi << 4) | lo);
+	}
+	out = key;
+	return true;
+}
+
+bool migrate_key_value(std::string& ini)
+{
+	size_t at = 0, len = 0;
+	if (!find_key_value(ini, at, len) || len != kPlayerKeyHexDigits)
+		return false;
+	PlayerKey key{};
+	std::string digest;
+	if (!key_from_hex(ini.substr(at, len), key) || !key_digest_hex(key, digest))
+		return false;
+	ini.replace(at, len, digest);
+	return true;
 }
 
 uint32_t crc32(const void* data, size_t size, uint32_t seed)

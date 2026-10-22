@@ -107,6 +107,9 @@ public:
 	static bool all_acked(PeerHandle peer); // idle and no reliable command awaiting acknowledgement
 	static uint32_t rtt_ms(PeerHandle peer);
 	static float packet_loss(PeerHandle peer); // 0..1
+	// Milliseconds since the peer last acknowledged anything; UINT32_MAX if it never did. ENet pings an idle link
+	// every 500 ms, so a live peer stays under a second plus its RTT; a process that is gone or stuck goes silent.
+	static uint32_t ms_since_receive(PeerHandle peer);
 	static std::string address_of(PeerHandle peer); // "ip:port"
 
 	// Keep-alive for long blocking work on the owner thread (a level load does not pump the network for tens of
