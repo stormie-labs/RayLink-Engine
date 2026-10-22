@@ -298,6 +298,8 @@ void notify_denied(u8 result)
 		hud_message("st_coop_talk_busy", "Busy: talking to another player");
 	else if (result == Refused)
 		hud_message("st_coop_talk_refused", "You cannot talk to another player this way");
+	else if (result == TooFar) // F2 T6b: the host sees the player's character far from the NPC
+		hud_message("st_coop_talk_too_far", "You are too far away to talk");
 	else
 		::Msg("[coop] talk refused by the host: %s", result_name(result));
 }

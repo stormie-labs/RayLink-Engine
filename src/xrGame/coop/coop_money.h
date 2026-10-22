@@ -12,10 +12,17 @@
 // by client_flush() before a trade deal and before a talk lock is released.
 // Settings (host): configs\coop_money.ltx [coop_money], read once; console coop_money_gain_burst,
 // coop_money_gain_per_min, coop_money_dialog_cap, coop_money_dialog_per_min, coop_money_max (Ruling 21, F2-1).
+// F2 T6b (Ruling F2-19): the session's rules for money between players (money_transfer, max_money_transfer) come from the
+// host's Lua, coop.money_set_rules; the ledger refuses a transfer against them (a client's Lua checks them too, but only
+// the host's answer counts). A MoneyBalance carries a note (ledger::MoneyNote): a refusal of the host's goes to the player
+// whose change it was, a gift to the receiver. Each is told by the Lua callback coop_money_note on the machine of that
+// player (the host's own too, for a gift to him): ("received", giver_peer, amount) or
+// ("refused", receiver_peer | -1, change, why, cause).
 // Lua (coop.*):
 //   money_give(peer, amount) -> ok, why    any machine: our money to another player (the host checks it)
 //   money_grant(peer, amount) -> ok, why   host: adds (or, negative, takes) money, never below 0
 //   money_set(peer, amount) -> ok, why     host: sets the balance
+//   money_set_rules(enabled, max) -> ok, why  host: the transfer rules between players (F2 T6b); `max` per transfer
 //   money_of(peer) -> RU | nil             host
 //   talk_lock_of(peer) -> npc id | nil     host: the NPC whose talk lock the player holds (host numbering)
 // The host-only ones also work for a character without a game object (its player is loading the world).

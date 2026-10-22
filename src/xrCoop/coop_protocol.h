@@ -28,6 +28,8 @@ namespace coop
 //    charged by the host); F3 Msg 0x01C0-0x01C6
 //    Also in 8 (F2 T14): coop.sync SyncSet / SyncFull / SyncRequest / SyncResult / SyncCast 0x0191-0x0195
 //    (xrCoop/coop_syncnet.h)
+//    Also in 8 (F2 T6b): MoneyBalance ends with a note (u8 kind, u8 cause, u8 verdict, u32 peer, i32 amount): 19 bytes
+//    instead of 8 (coop_ledger.h MoneyNote: a refusal of the host's, a gift to the receiver)
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
@@ -146,7 +148,7 @@ enum class Msg : uint16_t
 	TradeOp = 0x0185,
 
 	// F2 mod layer (0x0190-0x019F)
-	MoneyBalance = 0x0190, // host -> the player it belongs to: u32 balance, u32 acked seq (coop_ledger.h; F2 T1)
+	MoneyBalance = 0x0190, // host -> the player it belongs to: u32 balance, u32 acked seq, a note (coop_ledger.h; F2 T1/T6b)
 	// F2 T14 coop.sync (SYNC_SPEC §6.1-6.3; layouts: coop_syncnet.h). All of them on Lane::Reliable: one ordered lane.
 	SyncSet = 0x0191, // client -> host: a change of his own player / object data; host -> clients: every change, answers
 	SyncFull = 0x0192, // host -> client: the full copy of what goes to him, in parts, before his world (join)

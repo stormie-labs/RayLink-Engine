@@ -12,10 +12,13 @@
 //     or leaving the session refills nothing; a character made in this session (a new player key) starts with both
 //     buckets empty (Ruling F2-10), and they refill from the moment it is live in the game (Ruling F2-20);
 //   - no balance goes above Policy::max_money;
-//   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer);
+//   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer), and only while
+//     the host's session rules allow it: money_transfer on, at most max_money_transfer at a time (F2 T6b: the host's Lua
+//     pushes them into Policy with coop.money_set_rules; a client's own Lua checks them too, but the host's answer counts);
 //   - a change of zero is malformed: a client never sends one.
 // Trades, transfers and host grants change the balance on the host itself (coop_money host_adjust). The client shows
-// the host's balance plus its own changes the host has not answered yet (client_view).
+// the host's balance plus its own changes the host has not answered yet (client_view). F2 T6b: an answer may carry a note
+// (MoneyNote): what the host refused and why, or who gave this player money; the client tells its player.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -53,6 +56,10 @@ struct Policy
 	// gains no more than 1.2 M RU an hour on top of the cap
 	uint32_t dialog_gain_per_min = 20000;
 	uint32_t max_money = 100000000; // no balance goes above this
+	// F2 T6b, the session's transfer rules between players (options money_transfer, max_money_transfer). Set by the host's
+	// Lua; before it has, transfers are on and have no limit but the giver's balance.
+	bool transfer_on = true;
+	uint64_t transfer_max = UINT64_MAX; // the most one transfer may give (no limit by default: more than a balance holds)
 };
 
 // An allowance: a bucket of money, full at its first use, refilled per minute up to its size.
@@ -70,7 +77,10 @@ enum class Verdict : uint8_t
 	NoAllowance, // a gain above what the allowances hold now
 	OverMax, // the balance (the giver's or a transfer's receiver's) would go above max_money
 	Malformed, // unknown cause, a change of zero, a transfer that gives nothing or to nobody
+	TransfersOff, // F2 T6b: money_transfer is off in this session
+	OverTransferLimit, // F2 T6b: a transfer above max_money_transfer
 };
+constexpr uint8_t kVerdictCount = uint8_t(Verdict::OverTransferLimit) + 1;
 
 // Refills `a` (size `burst`, `per_min` a minute) up to `now_ms`; the first call fills it. A clock that goes back
 // refills nothing.
@@ -149,7 +159,8 @@ struct Receiver
 
 // The giver's side of a transfer of -delta from player `from` (balance `balance`) to `to`. Applied: `balance` is the
 // giver's new balance and `credit` what the receiver gets; else both stay. Malformed: no receiver (nobody, himself) or
-// nothing given.
+// nothing given. In this order (F2 T6b): the form, the session's rules (TransfersOff, OverTransferLimit), then the
+// state (Insufficient, OverMax): a player over the limit is told about the limit, not about his purse.
 inline Verdict check_transfer(uint32_t from, const Receiver& to, int64_t delta, uint32_t& balance, uint32_t& credit,
     const Policy& p)
 {
@@ -158,7 +169,11 @@ inline Verdict check_transfer(uint32_t from, const Receiver& to, int64_t delta, 
 		return Verdict::Malformed;
 	if (delta >= 0)
 		return Verdict::Malformed;
+	if (!p.transfer_on)
+		return Verdict::TransfersOff;
 	const uint64_t give = uint64_t(-(delta + 1)) + 1u;
+	if (give > p.transfer_max)
+		return Verdict::OverTransferLimit;
 	if (give > balance)
 		return Verdict::Insufficient;
 	if (uint64_t(to.balance) + give > uint64_t(p.max_money))
@@ -213,14 +228,92 @@ struct MoneyReq
 };
 constexpr size_t kMoneyReqSize = 13;
 
-// Msg::MoneyBalance, host -> the player it belongs to. Wire: u32 balance, u32 acked_seq (8 bytes).
+// What the host tells the player besides his balance (F2 T6b). The protocol is 8 and not released: the note is part of
+// the balance message, not a message of its own.
+enum class NoteKind : uint8_t
+{
+	None = 0, // only a balance
+	Received = 1, // another player gave this one `amount` RU (`peer` is the giver)
+	Refused = 2, // the host refused a change of his (`cause`, `verdict`, `amount`; a transfer: `peer` is the receiver)
+};
+constexpr uint8_t kNoteKindCount = 3;
+
+struct MoneyNote
+{
+	NoteKind kind = NoteKind::None;
+	Cause cause = Cause::Script; // Refused: the cause of the change
+	Verdict verdict = Verdict::Applied; // Refused: why
+	uint32_t peer = 0; // Received: the giver; Refused with Cause::Transfer: the receiver; else 0
+	int32_t amount = 0; // Received: RU credited; Refused: the change asked for (negative: a spend or a transfer)
+};
+
+// The note of a transfer for its receiver. A credit past what a note holds is cut, never wrapped.
+inline MoneyNote note_received(uint32_t giver, uint32_t credit)
+{
+	MoneyNote n;
+	n.kind = NoteKind::Received;
+	n.peer = giver;
+	n.amount = int32_t(std::min<uint32_t>(credit, uint32_t(INT32_MAX)));
+	return n;
+}
+
+// The note of a change `q` the host refused with `v`. No note for a change no honest client sends (a change of zero,
+// an unknown cause: Malformed): only a transfer to nobody is told, the player gave to someone who left.
+inline MoneyNote note_refused(const MoneyReq& q, Verdict v)
+{
+	MoneyNote n;
+	if (v == Verdict::Applied || (v == Verdict::Malformed && q.cause != Cause::Transfer))
+		return n;
+	n.kind = NoteKind::Refused;
+	n.cause = q.cause;
+	n.verdict = v;
+	n.peer = q.cause == Cause::Transfer ? q.ref : 0u;
+	n.amount = q.delta;
+	return n;
+}
+
+// Client: how often a refusal is told to the player. A mod that changes the money in a loop gets one refusal for every
+// change; the player hears the first and then one in `gap_ms` (the rest are only counted).
+class NoticeGate
+{
+public:
+	explicit NoticeGate(uint64_t gap_ms = 3000) : m_gap(gap_ms) {}
+	bool allow(uint64_t now_ms)
+	{
+		if (m_told && now_ms >= m_at && now_ms - m_at < m_gap)
+		{
+			++m_dropped;
+			return false;
+		}
+		m_told = true; // a clock that went back starts over
+		m_at = now_ms;
+		return true;
+	}
+	uint64_t dropped() const { return m_dropped; }
+	void reset()
+	{
+		m_told = false;
+		m_at = 0;
+		m_dropped = 0;
+	}
+
+private:
+	uint64_t m_gap;
+	uint64_t m_at = 0;
+	bool m_told = false;
+	uint64_t m_dropped = 0;
+};
+
+// Msg::MoneyBalance, host -> the player it belongs to. Wire: u32 balance, u32 acked_seq, then the note: u8 kind, u8 cause,
+// u8 verdict, u32 peer, i32 amount (19 bytes).
 // acked_seq: the newest ReqMoney of that player the host has applied or refused (0: none yet).
 struct MoneyBalanceMsg
 {
 	uint32_t balance = 0;
 	uint32_t acked_seq = 0;
+	MoneyNote note;
 };
-constexpr size_t kMoneyBalanceSize = 8;
+constexpr size_t kMoneyBalanceSize = 19;
 
 inline void write(Writer& w, const MoneyReq& m)
 {
@@ -247,14 +340,29 @@ inline void write(Writer& w, const MoneyBalanceMsg& m)
 {
 	w.u32(m.balance);
 	w.u32(m.acked_seq);
+	w.u8(uint8_t(m.note.kind));
+	w.u8(uint8_t(m.note.cause));
+	w.u8(uint8_t(m.note.verdict));
+	w.u32(m.note.peer);
+	w.i32(m.note.amount);
 }
 
-// False on overrun.
+// False on overrun or a note that names nothing (unknown kind, cause or verdict).
 inline bool read(Reader& r, MoneyBalanceMsg& m)
 {
 	m.balance = r.u32();
 	m.acked_seq = r.u32();
-	return r.ok();
+	const uint8_t kind = r.u8();
+	const uint8_t cause = r.u8();
+	const uint8_t verdict = r.u8();
+	m.note.peer = r.u32();
+	m.note.amount = r.i32();
+	if (!r.ok() || kind >= kNoteKindCount || cause >= kCauseCount || verdict >= kVerdictCount)
+		return false;
+	m.note.kind = NoteKind(kind);
+	m.note.cause = Cause(cause);
+	m.note.verdict = Verdict(verdict);
+	return true;
 }
 // ---------------------------------------------------------------- host book
 
@@ -291,6 +399,7 @@ struct Decision
 	uint32_t credit = 0; // a transfer applied: what the receiver gets
 	uint32_t acked = 0; // MoneyBalance::acked_seq of the answer
 	uint32_t gain_script = 0, gain_dialog = 0; // an applied gain, by the allowance that paid it
+	MoneyNote note; // F2 T6b: what the answer tells the player about a refused change (none for a repeat or an applied one)
 };
 
 // The host's state of the players' money changes: per connection (peer id) the newest answered change, per character
@@ -317,40 +426,9 @@ public:
 	Decision on_request(uint32_t peer, const std::string& character, const MoneyReq& q, uint32_t balance,
 	    bool dialog_lock, const Receiver& to, const Policy& p, uint64_t now_ms)
 	{
-		Decision d;
-		d.balance = balance;
-		m_character_of[peer] = character;
-		uint32_t& acked = m_acked[peer];
-		if (!seq_newer(q.seq, acked))
-		{
-			d.stale = true; // a repeat or an old change: the answer only says where we are
-			d.acked = acked;
-			return d;
-		}
-		acked = q.seq;
-		d.acked = q.seq;
-		if (q.cause == Cause::Transfer)
-		{
-			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
-			return d;
-		}
-		// Ruling F2-13: the form first. A request refused by it, and a spend, touch no allowance and start no clock.
-		if (uint8_t(q.cause) >= kCauseCount || q.delta <= 0)
-		{
-			Allowance untouched_dialog, untouched_script; // a spend never draws on them
-			d.verdict = apply_client_delta(d.balance, q.delta, q.cause, false, untouched_dialog, untouched_script, p,
-			    now_ms);
-			return d;
-		}
-		CharacterAllowances& a = allowances_of(character, now_ms);
-		uint32_t from_dialog = 0;
-		d.verdict = apply_client_delta(d.balance, q.delta, q.cause, dialog_lock, a.dialog, a.script, p, now_ms,
-		    &from_dialog);
-		if (d.verdict == Verdict::Applied && q.delta > 0)
-		{
-			d.gain_dialog = from_dialog;
-			d.gain_script = uint32_t(q.delta) - from_dialog;
-		}
+		Decision d = decide(peer, character, q, balance, dialog_lock, to, p, now_ms);
+		if (!d.stale)
+			d.note = note_refused(q, d.verdict);
 		return d;
 	}
 
@@ -398,6 +476,47 @@ public:
 	const std::map<uint32_t, uint32_t>& connections() const { return m_acked; }
 
 private:
+	// The verdict on `q` (on_request adds the note). Everything or nothing, as apply_client_delta.
+	Decision decide(uint32_t peer, const std::string& character, const MoneyReq& q, uint32_t balance, bool dialog_lock,
+	    const Receiver& to, const Policy& p, uint64_t now_ms)
+	{
+		Decision d;
+		d.balance = balance;
+		m_character_of[peer] = character;
+		uint32_t& acked = m_acked[peer];
+		if (!seq_newer(q.seq, acked))
+		{
+			d.stale = true; // a repeat or an old change: the answer only says where we are
+			d.acked = acked;
+			return d;
+		}
+		acked = q.seq;
+		d.acked = q.seq;
+		if (q.cause == Cause::Transfer)
+		{
+			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
+			return d;
+		}
+		// Ruling F2-13: the form first. A request refused by it, and a spend, touch no allowance and start no clock.
+		if (uint8_t(q.cause) >= kCauseCount || q.delta <= 0)
+		{
+			Allowance untouched_dialog, untouched_script; // a spend never draws on them
+			d.verdict = apply_client_delta(d.balance, q.delta, q.cause, false, untouched_dialog, untouched_script, p,
+			    now_ms);
+			return d;
+		}
+		CharacterAllowances& a = allowances_of(character, now_ms);
+		uint32_t from_dialog = 0;
+		d.verdict = apply_client_delta(d.balance, q.delta, q.cause, dialog_lock, a.dialog, a.script, p, now_ms,
+		    &from_dialog);
+		if (d.verdict == Verdict::Applied && q.delta > 0)
+		{
+			d.gain_dialog = from_dialog;
+			d.gain_script = uint32_t(q.delta) - from_dialog;
+		}
+		return d;
+	}
+
 	// The allowances of `character`, made if there are none yet. Called when the character goes live (peer_online, the
 	// normal way: Ruling F2-20) and by a request (the fallback for a connection that was never marked online). The
 	// clock of a character that is back starts now, so what was spent away stays spent and the time away pays nothing.

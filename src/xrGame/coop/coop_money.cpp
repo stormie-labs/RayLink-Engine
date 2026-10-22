@@ -9,6 +9,7 @@
 #include "coop_entities.h"
 #include "coop_events.h"
 #include "coop_dialog.h"
+#include "coop_script.h"
 #include "coop_world.h"
 #include "xrCoop/coop_ledger.h"
 
@@ -36,7 +37,7 @@ using ledger::Cause;
 using ledger::Verdict;
 
 constexpr u16 kNoId = 0xffff;
-constexpr u32 kVerdictCount = u32(Verdict::Malformed) + 1;
+constexpr u32 kVerdictCount = ledger::kVerdictCount;
 constexpr int kMaxSetting = 2000000000; // console and ltx values are ints
 constexpr LPCSTR kSection = "coop_money";
 
@@ -50,10 +51,17 @@ int g_max_money = int(ledger::Policy().max_money);
 // ui_options.script starts at 1.0; plugins\difficulty.ltx 1.3 is only a preset's value).
 float g_upgrade_min_percent = 1.7f;
 bool g_scripted_upgrades = false; // F2 T5: upgrades that name no mechanic (a script's) are refused
+// F2 T6b (Ruling F2-19): the session's transfer rules, pushed by the host's Lua (coop.money_set_rules). Kept for the
+// process: a new session or a world load does not widen them, the host's Lua says so when they change. Before it has
+// said anything: transfers on, no limit but the giver's balance.
+bool g_transfer_on = true;
+u64 g_transfer_max = UINT64_MAX;
 
 ledger::Policy policy()
 {
 	ledger::Policy p;
+	p.transfer_on = g_transfer_on;
+	p.transfer_max = g_transfer_max;
 	p.script_gain_burst = u32(_max(g_gain_burst, 0));
 	p.script_gain_per_min = u32(_max(g_gain_per_min, 0));
 	p.dialog_gain_cap = u32(_max(g_dialog_cap, 0));
@@ -130,6 +138,8 @@ const char* verdict_name(Verdict v)
 	case Verdict::NoAllowance: return "over the allowance";
 	case Verdict::OverMax: return "over the maximum";
 	case Verdict::Malformed: return "malformed";
+	case Verdict::TransfersOff: return "transfers are off";
+	case Verdict::OverTransferLimit: return "over the transfer limit";
 	}
 	return "?";
 }
@@ -162,6 +172,7 @@ ledger::HostBook g_book;
 struct HostCounters
 {
 	u64 changes = 0, malformed = 0, no_character = 0, stale = 0, dropped_joining = 0, bad_receiver = 0;
+	u64 notes_sent = 0; // F2 T6b: answers that carried a refusal, gifts told to the receiver
 	u64 verdicts[kVerdictCount] = {};
 	u64 gain_script = 0, gain_dialog = 0; // RU
 	u64 grants = 0, trades = 0, transfers = 0, capped = 0, joins = 0;
@@ -228,11 +239,36 @@ std::string character_key_of(u16 holder)
 	return key;
 }
 
-void send_balance(PeerId to, u32 balance)
+// Tells this machine's player what a note says (the Lua callback coop_money_note, coop_economy_money.script):
+//   coop_money_note("received", giver_peer, amount, nil, nil)
+//   coop_money_note("refused", receiver_peer | -1, change (negative: a spend or a transfer), why, cause)
+// `why` and `cause` are the English names verdict_name / cause_name give.
+void fire_note(const ledger::MoneyNote& n)
 {
+	using namespace script;
+	if (n.kind == ledger::NoteKind::Received)
+		queue_callback("coop_money_note", {cb_str("received"), cb_int(n.peer), cb_int(n.amount), cb_nil(), cb_nil()});
+	else if (n.kind == ledger::NoteKind::Refused)
+		queue_callback("coop_money_note", {cb_str("refused"), cb_int(n.cause == Cause::Transfer ? s64(n.peer) : s64(-1)),
+		    cb_int(n.amount), cb_str(verdict_name(n.verdict)), cb_str(cause_name(n.cause))});
+}
+
+// The player's balance (and a note about it). The host's own balance is on his screen already, so only the note is
+// told, on this machine (a gift to the host).
+void send_balance(PeerId to, u32 balance, const ledger::MoneyNote& note = ledger::MoneyNote())
+{
+	if (note.kind != ledger::NoteKind::None)
+		++g_h.notes_sent;
 	if (to == kHostPeer)
+	{
+		if (note.kind == ledger::NoteKind::Received)
+			fire_note(note);
 		return;
-	const ledger::MoneyBalanceMsg m{balance, g_book.acked(to)};
+	}
+	ledger::MoneyBalanceMsg m;
+	m.balance = balance;
+	m.acked_seq = g_book.acked(to);
+	m.note = note;
 	Writer w(ledger::kMoneyBalanceSize);
 	ledger::write(w, m);
 	net::host_send(to, Msg::MoneyBalance, w); // queued while he loads the world
@@ -245,8 +281,9 @@ enum class Source : u8
 	Transfer, // the receiver's side of a transfer (counted with the transfer)
 };
 
-// Host: changes a balance by `delta` within [0, max(max_money, balance)] and tells its player.
-bool adjust(PeerId peer, s64 delta, const char* why, Source source)
+// Host: changes a balance by `delta` within [0, max(max_money, balance)] and tells its player (with `note`).
+bool adjust(PeerId peer, s64 delta, const char* why, Source source,
+    const ledger::MoneyNote& note = ledger::MoneyNote())
 {
 	if (!mgr().is_host())
 		return false;
@@ -269,21 +306,25 @@ bool adjust(PeerId peer, s64 delta, const char* why, Source source)
 	}
 	if (next != balance)
 		write_balance(holder, next);
-	send_balance(peer, next);
+	send_balance(peer, next, note);
 	return true;
 }
 
 // The world's balances by peer for ledger::settle_transfer: set writes a giver's balance, add credits a receiver (and
-// sends him his balance).
+// sends him his balance, with the giver's name: F2 T6b).
 struct WorldBalances
 {
+	PeerId giver = kInvalidPeer;
 	void set(uint32_t peer, uint32_t value)
 	{
 		const u16 holder = holder_of(PeerId(peer));
 		if (holder != kNoId)
 			write_balance(holder, value);
 	}
-	void add(uint32_t peer, uint32_t credit) { adjust(PeerId(peer), s64(credit), "transfer", Source::Transfer); }
+	void add(uint32_t peer, uint32_t credit)
+	{
+		adjust(PeerId(peer), s64(credit), "transfer", Source::Transfer, ledger::note_received(giver, credit));
+	}
 };
 
 // A transfer's receiver as the ledger wants it: another player of the session (joined, or the host) who has a
@@ -350,6 +391,7 @@ void host_on_req(PeerId from, Reader& r)
 		if (d.credit)
 		{
 			WorldBalances world;
+			world.giver = from;
 			ledger::settle_transfer(world, from, d.balance, q.ref, d.credit); // giver first (review round 2)
 			++g_h.transfers;
 		}
@@ -363,7 +405,7 @@ void host_on_req(PeerId from, Reader& r)
 		    cause_name(q.cause), verdict_name(d.verdict), d.balance);
 	u32 now_holds = d.balance; // what the character holds after it all (the same unless a transfer went to himself)
 	read_balance(holder, now_holds);
-	send_balance(from, now_holds);
+	send_balance(from, now_holds, d.note); // F2 T6b: a refusal is told to the player with the answer
 }
 
 // ---------------------------------------------------------------- client state
@@ -375,6 +417,7 @@ struct ClientState
 	std::vector<ledger::Pending> pending; // changes sent (or queued) that the host has not answered
 	xr_vector<ledger::MoneyReq> outbox; // queued for frame()
 	ledger::UpgradeHolds holds; // F2 T5: payments requests carry, until their answers (client_hold)
+	ledger::NoticeGate refusals; // F2 T6b: how often a refusal of the host is told to the player
 };
 // GE_MONEY may come from the game thread; the answers come with the network pump on the main thread.
 xrCriticalSection g_cl_lock;
@@ -387,6 +430,7 @@ struct ClientCounters
 {
 	u64 sent = 0, balances = 0, set_by_host = 0, scoped = 0, gives = 0, malformed = 0;
 	u64 holds = 0, unclaimed = 0; // F2 T5
+	u64 gifts = 0, refusals = 0, refusals_muted = 0; // F2 T6b: notes told to the player (gifts, refusals), and the muted
 } g_c;
 
 // Under g_cl_lock.
@@ -436,9 +480,24 @@ void client_on_balance(PeerId from, Reader& r)
 		entities::ClientApply apply; // our own GE_MONEY below is not a change of ours
 		a->set_money(view, true);
 	}
-	xrCriticalSectionGuard guard(g_cl_lock);
-	g_cl.anchored = true;
-	g_cl.last = a->get_money();
+	bool tell = false;
+	{
+		xrCriticalSectionGuard guard(g_cl_lock);
+		g_cl.anchored = true;
+		g_cl.last = a->get_money();
+		// F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a loop is
+		// refused over and over: only one refusal in a few seconds is told.
+		if (m.note.kind == ledger::NoteKind::Refused)
+			tell = g_cl.refusals.allow(mgr().now_ms());
+		else
+			tell = m.note.kind == ledger::NoteKind::Received;
+	}
+	if (m.note.kind == ledger::NoteKind::Received && tell)
+		++g_c.gifts;
+	else if (m.note.kind == ledger::NoteKind::Refused)
+		++(tell ? g_c.refusals : g_c.refusals_muted);
+	if (tell)
+		fire_note(m.note);
 }
 
 // ---------------------------------------------------------------- Lua
@@ -492,6 +551,7 @@ int host_give(lua_State* L, PeerId to, u32 amount)
 	if (v != Verdict::Applied)
 		return refuse(L, v == Verdict::Malformed ? "no such player" : verdict_name(v));
 	WorldBalances world;
+	world.giver = kHostPeer;
 	ledger::settle_transfer(world, kHostPeer, balance, to, credit); // giver first (review round 2)
 	++g_h.transfers;
 	return done(L);
@@ -563,6 +623,23 @@ int l_money_set(lua_State* L)
 	return host_set(peer, u32(amount), "set") ? done(L) : refuse(L, "no character");
 }
 
+// coop.money_set_rules(enabled, max_transfer) -> ok, why: host. The session's rules for money between players
+// (money_transfer, max_money_transfer; F2 T6b): the host's Lua pushes them, the ledger holds a client to them.
+int l_money_set_rules(lua_State* L)
+{
+	if (!mgr().is_host())
+		return refuse(L, "host only");
+	s64 limit = 0;
+	if (lua_type(L, 1) != LUA_TBOOLEAN || !arg_int(L, 2, 0.0, double(UINT32_MAX), limit))
+		return refuse(L, "bad arguments");
+	const bool on = lua_toboolean(L, 1) != 0;
+	if (on != g_transfer_on || u64(limit) != g_transfer_max)
+		::Msg("[coop] money transfers between players: %s, at most %lld RU at a time", on ? "on" : "off", limit);
+	g_transfer_on = on;
+	g_transfer_max = u64(limit);
+	return done(L);
+}
+
 // coop.money_of(peer) -> RU | nil: host.
 int l_money_of(lua_State* L)
 {
@@ -602,6 +679,7 @@ void install(Session& s)
 void reset()
 {
 	g_book.reset(); // a new session (or none): nothing is kept
+	// except the transfer rules (g_transfer_*): the host's Lua says when they change, and says them again every 2 s
 	xrCriticalSectionGuard guard(g_cl_lock);
 	g_cl = ClientState(); // g_cl_seq goes on: see its comment
 }
@@ -664,17 +742,22 @@ void print_status()
 	const ledger::Policy p = policy();
 	if (mgr().is_host())
 	{
-		::Msg("[coop]   money: changes in %llu, refused insufficient/allowance/max %llu/%llu/%llu (%llu malformed, %llu "
-		      "to nobody, %llu stale, %llu without a character, %llu dropped while rejoining), gains script %llu dialog "
-		      "%llu RU, grants %llu, trades %llu (%llu capped), transfers %llu, %llu balances sent on joining",
+		char limit[40] = "no limit";
+		if (p.transfer_max != UINT64_MAX)
+			xr_sprintf(limit, "at most %llu RU", p.transfer_max);
+		::Msg("[coop]   money: changes in %llu, refused insufficient/allowance/max %llu/%llu/%llu, by the transfer rules "
+		      "off/limit %llu/%llu (%llu malformed, %llu to nobody, %llu stale, %llu without a character, %llu dropped "
+		      "while rejoining), gains script %llu dialog %llu RU, grants %llu, trades %llu (%llu capped), transfers "
+		      "%llu, %llu balances sent on joining, %llu notes sent",
 		    g_h.changes, g_h.verdicts[u32(Verdict::Insufficient)], g_h.verdicts[u32(Verdict::NoAllowance)],
-		    g_h.verdicts[u32(Verdict::OverMax)], g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
+		    g_h.verdicts[u32(Verdict::OverMax)], g_h.verdicts[u32(Verdict::TransfersOff)],
+		    g_h.verdicts[u32(Verdict::OverTransferLimit)], g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
 		    g_h.bad_receiver, g_h.stale, g_h.no_character, g_h.dropped_joining, g_h.gain_script, g_h.gain_dialog,
-		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins);
+		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins, g_h.notes_sent);
 		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u in a row + %u per minute, max %u, "
-		      "upgrades from %.2f x cost, upgrades without a mechanic %s",
+		      "upgrades from %.2f x cost, upgrades without a mechanic %s, transfers between players %s (%s)",
 		    p.script_gain_burst, p.script_gain_per_min, p.dialog_gain_cap, p.dialog_gain_per_min, p.max_money,
-		    g_upgrade_min_percent, g_scripted_upgrades ? "taken" : "refused");
+		    g_upgrade_min_percent, g_scripted_upgrades ? "taken" : "refused", p.transfer_on ? "on" : "off", limit);
 		for (const auto& it : g_book.connections())
 		{
 			const u16 holder = holder_of(it.first);
@@ -695,9 +778,10 @@ void print_status()
 	xrCriticalSectionGuard guard(g_cl_lock);
 	::Msg("[coop]   money: %llu changes sent, %u waiting (last #%u); host balance %u RU (answered #%u), %llu balances in, "
 	      "%llu set by the host; %llu spends in scopes, %llu gives; upgrades paid here %llu (%u unanswered, %llu RU), "
-	      "%llu scope spends sent as changes",
+	      "%llu scope spends sent as changes; told: %llu gifts, %llu refusals (%llu muted)",
 	    g_c.sent, (u32)g_cl.pending.size(), g_cl_seq, g_cl.host_balance, g_cl.acked, g_c.balances, g_c.set_by_host,
-	    g_c.scoped, g_c.gives, g_c.holds, (u32)g_cl.holds.size(), g_cl.holds.sum(), g_c.unclaimed);
+	    g_c.scoped, g_c.gives, g_c.holds, (u32)g_cl.holds.size(), g_cl.holds.sum(), g_c.unclaimed, g_c.gifts,
+	    g_c.refusals, g_c.refusals_muted);
 }
 
 u32 max_money() { return policy().max_money; }
@@ -834,6 +918,7 @@ void register_lua(lua_State* L)
 		{"money_give", &l_money_give},
 		{"money_grant", &l_money_grant},
 		{"money_set", &l_money_set},
+		{"money_set_rules", &l_money_set_rules},
 		{"money_of", &l_money_of},
 		{"talk_lock_of", &l_talk_lock_of},
 		{nullptr, nullptr},
