@@ -26,6 +26,7 @@
 #include "movement_manager.h"
 #include "agent_manager.h"
 #include "agent_enemy_manager.h"
+#include "coop/coop_ai.h" // Anomaly Coop
 
 u32 ENEMY_INERTIA_TIME_TO_SOMEBODY = 3000;
 u32 ENEMY_INERTIA_TIME_TO_ACTOR = 0;
@@ -173,8 +174,13 @@ float CEnemyManager::evaluate(const CEntityAlive* object) const
 		penalty -= 1000.f;
 
 	// if object is actor and he/she sees us
+	bool coop_player_sees = false; // Anomaly Coop
 	if (actor) {
 		if (actor->memory().visual().visible_now(m_object))
+			penalty -= (m_visible_enemy_bias_actor >= 0.f) ? m_visible_enemy_bias_actor : 900.f;
+	}
+	else if (coop::npc_ai::player_sees(object, m_object, coop_player_sees)) { // Anomaly Coop: a remote player weighs like the actor
+		if (coop_player_sees)
 			penalty -= (m_visible_enemy_bias_actor >= 0.f) ? m_visible_enemy_bias_actor : 900.f;
 	}
 	else {
@@ -305,10 +311,10 @@ bool CEnemyManager::change_from_wounded(const CEntityAlive* current, const CEnti
 
 IC bool CEnemyManager::enemy_inertia(const CEntityAlive* previous_enemy) const
 {
-	if (smart_cast<CActor const*>(m_selected))
+	if (coop::npc_ai::is_player(m_selected)) // Anomaly Coop: every player, was smart_cast<CActor const*>
 		return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_TO_ACTOR));
 
-	if (previous_enemy && smart_cast<CActor const*>(previous_enemy))
+	if (previous_enemy && coop::npc_ai::is_player(previous_enemy)) // Anomaly Coop: every player
 		return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_FROM_ACTOR));
 
 	return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_TO_SOMEBODY));

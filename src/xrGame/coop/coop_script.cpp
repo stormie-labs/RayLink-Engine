@@ -10,6 +10,7 @@
 #include "coop_story.h"
 #include "coop_survival.h"
 #include "coop_players.h" // players::avatar_safemode (coop_equip.cpp)
+#include "coop_dialog.h" // W11: dialog::host_talk_holder
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -1335,6 +1336,24 @@ int l_player_safemode(lua_State* L)
 	return 1;
 }
 
+// W11: coop.talk_holder(npc_id) -> peer id of the player talking to that NPC (host only; 0 = the host
+// himself), nil if nobody, on a client or without a session.
+int l_talk_holder(lua_State* L)
+{
+	lua_Number v = 0;
+	if (!mgr().is_host() || !arg_id(L, 1, v) || v >= lua_Number(0xffff))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const PeerId holder = dialog::host_talk_holder(u16(v));
+	if (holder == kInvalidPeer)
+		lua_pushnil(L);
+	else
+		lua_pushnumber(L, lua_Number(holder));
+	return 1;
+}
+
 void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -1358,6 +1377,7 @@ void register_raw(lua_State* L)
 		{"life_of", &l_life_of},
 		{"bleed_left", &l_bleed_left},
 		{"player_safemode", &l_player_safemode},
+		{"talk_holder", &l_talk_holder}, // W11
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

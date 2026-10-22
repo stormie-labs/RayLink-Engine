@@ -27,6 +27,7 @@
 #include "client_spawn_manager.h"
 #include "memory_manager.h"
 #include "ai/monsters/basemonster/base_monster.h"
+#include "coop/coop_ai.h" // Anomaly Coop
 
 float g_ai_vision_speed_boost = 1.0f;
 
@@ -322,7 +323,9 @@ float CVisualMemoryManager::object_luminocity(const CGameObject* game_object) co
 {
 	if (!smart_cast<CEntityAlive const*>(game_object)) //Alundaio
 		return (1.f);
-	float luminocity = const_cast<CGameObject*>(game_object)->ROS()->get_luminocity();
+	float luminocity;
+	if (!coop::npc_ai::player_luminocity(game_object, luminocity)) // Anomaly Coop: a remote player's render light is stale off the host's screen
+		luminocity = const_cast<CGameObject*>(game_object)->ROS()->get_luminocity();
 	float power = log(luminocity > .001f ? luminocity : .001f) * current_state().m_luminocity_factor;
 	return (exp(power));
 }

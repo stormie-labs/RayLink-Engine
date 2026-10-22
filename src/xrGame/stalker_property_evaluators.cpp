@@ -28,6 +28,7 @@
 #include "actor_memory.h"
 #include "stalker_movement_manager_smart_cover.h"
 #include "agent_manager.h"
+#include "coop/coop_ai.h" // Anomaly Coop
 #include "agent_enemy_manager.h"
 #include "agent_member_manager.h"
 #include "cover_point.h"
@@ -145,6 +146,10 @@ _value_type CStalkerPropertyEvaluatorEnemySeeMe::evaluate()
 	const CEntityAlive* enemy = m_object->memory().enemy().selected();
 	if (!enemy)
 		return (false);
+
+	bool coop_player_sees = false; // Anomaly Coop: a remote player's character has no vision of its own
+	if (coop::npc_ai::player_sees(enemy, m_object, coop_player_sees)) // Anomaly Coop
+		return (coop_player_sees); // Anomaly Coop
 
 	const CCustomMonster* enemy_monster = smart_cast<const CCustomMonster*>(enemy);
 	if (enemy_monster)
@@ -414,6 +419,9 @@ _value_type CStalkerPropertyEvaluatorPlayerOnThePath::evaluate()
 	const CEntityAlive* enemy = object().memory().enemy().selected();
 	if (!enemy)
 		return (false);
+
+	if (coop::npc_ai::player_on_the_path(m_object)) // Anomaly Coop: the remote players count like the actor
+		return (true); // Anomaly Coop
 
 	if (!object().is_relation_enemy(Actor()))
 		return (false);

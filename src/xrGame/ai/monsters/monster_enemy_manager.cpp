@@ -7,6 +7,7 @@
 #include "../../visual_memory_manager.h"
 #include "../../actor.h"
 #include "../../actor_memory.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop
 
 CMonsterEnemyManager::CMonsterEnemyManager()
 {
@@ -242,6 +243,10 @@ bool CMonsterEnemyManager::see_enemy_recently(const CEntityAlive* enemy)
 
 bool CMonsterEnemyManager::enemy_see_me_now()
 {
+	bool coop_player_sees = false; // Anomaly Coop: a remote player's character has no vision of its own
+	if (coop::npc_ai::player_sees(enemy, monster, coop_player_sees)) // Anomaly Coop
+		return (coop_player_sees); // Anomaly Coop
+
 	if (Actor() == enemy)
 	{
 		return (Actor()->memory().visual().visible_right_now(monster));

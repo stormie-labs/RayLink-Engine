@@ -523,6 +523,14 @@ void hud_message(const char* string_id, const char* fallback)
 		s->wnd()->TextItemControl()->SetText(text);
 }
 
+PeerId host_talk_holder(u16 npc) // W11
+{
+	if (!mgr().is_host())
+		return kInvalidPeer;
+	auto it = g_locks.find(npc);
+	return it == g_locks.end() ? kInvalidPeer : it->second.holder;
+}
+
 void print_status()
 {
 	if (mgr().is_host())

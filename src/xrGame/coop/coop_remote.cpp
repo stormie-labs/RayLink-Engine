@@ -5,6 +5,7 @@
 #include "coop_world.h"
 #include "coop_entities.h"
 #include "coop_players.h"
+#include "coop_ai.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -286,7 +287,10 @@ bool apply(CGameObject* obj)
 			track_legs(obj, ka, it->second);
 	}
 	if (mgr().is_host() && world::is_player_proxy(obj->ID()))
+	{
 		sync_server_entity(obj);
+		npc_ai::on_proxy_frame(obj); // W11: light and view for the NPCs that look at this player
+	}
 	++g_driven;
 	return true;
 }
@@ -330,6 +334,7 @@ void print_status()
 {
 	::Msg("[coop]   puppets: %u now, %llu made remote, %llu made local, %llu driven updates, %llu host deaths applied",
 	    (u32)g_puppets.size(), g_made_remote, g_made_local, g_driven, g_deaths);
+	npc_ai::print_status();
 }
 } // namespace remote
 } // namespace coop

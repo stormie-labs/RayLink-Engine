@@ -1,0 +1,61 @@
+// Anomaly Coop — every player is a real participant for the NPC AI (W11).
+//
+// On the host every other player is a stalker proxy (section coop_player_avatar) driven by network
+// snapshots (coop_remote). The stock AI perceives it like any stalker, but a few engine pieces only
+// know the local actor or read state a puppet never has:
+//   - vision: CVisualMemoryManager::object_luminocity reads the object's render lighting (ROS), which
+//     the renderer refreshes every frame only for the camera entity and, round robin, for one object in
+//     the camera view. A proxy outside the host's view stays at 0 (seen ~180 times slower than lit).
+//     Here: a light estimate from the weather (ambient, sun and sky visibility by ray, headlamp).
+//   - "the enemy sees me" (stalker combat planner, monster enemy manager, enemy priority bias) reads
+//     the enemy's own visual memory, empty on a puppet. Here: the player's reported view direction
+//     plus the line of sight the NPC itself has to the player.
+//   - "player on my path" (stalker combat) looks at the actor only. Here: every remote player.
+//   - NPC head turning to the player (CAI_Stalker::LookAtActor) on a client: the NPC there is a puppet
+//     without perception. Here: distance and a line-of-sight ray to this machine's player.
+//
+// Threading: on_proxy_frame runs on the main thread (UpdateCL, FrameMove); the queries run on the
+// game thread (schedule) or in bone callbacks. The game thread never runs during FrameMove, so the
+// per-proxy records written there are read without locks.
+#pragma once
+
+class CObject;
+class CGameObject;
+class CEntityAlive;
+class CCustomMonster;
+class CAI_Stalker;
+
+namespace coop
+{
+namespace npc_ai
+{
+// The local actor or any player character (proxy / avatar, section coop_player_avatar).
+bool is_player(const CObject* obj);
+// A player character that is not this machine's actor, while a session runs (on the host: a client's proxy).
+bool is_remote_player(const CObject* obj);
+
+// Host, main thread, every frame of a driven player proxy (remote::apply): refreshes its light estimate
+// (twice a second) and its view direction.
+void on_proxy_frame(CGameObject* proxy);
+
+// Vision: true (and `lum` 0..1 set) for a remote player's character with a fresh light estimate; the
+// caller then uses it instead of the render lighting.
+bool player_luminocity(const CGameObject* obj, float& lum);
+
+// "Does player `player` see `observer` now?" for a remote player's character (false = not one, use the
+// stock answer). `sees`: `observer` sees the player (line of sight is mutual) and is inside the player's
+// view cone; an unknown view direction counts as seeing.
+bool player_sees(const CEntityAlive* player, const CCustomMonster* observer, bool& sees);
+
+// Stalker combat "player on my path" for the remote players: a hostile player the NPC sees right now
+// stands within 2 m of its path.
+bool player_on_the_path(CAI_Stalker* npc);
+
+// Client side of CAI_Stalker::LookAtActor for an NPC puppet (game thread): this machine's player is
+// alive, closer than `max_distance`, the Lua hook allows it and no static geometry is in between.
+// Always false for player characters (their heads follow their players).
+bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance);
+
+void print_status();
+} // namespace npc_ai
+} // namespace coop

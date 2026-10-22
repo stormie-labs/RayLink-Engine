@@ -59,6 +59,7 @@
 #include "../../location_manager.h"
 #include "smart_cover_animation_selector.h"
 #include "../../coop/coop_remote.h" // Anomaly Coop
+#include "../../coop/coop_ai.h" // Anomaly Coop
 #include "smart_cover_animation_planner.h"
 #include "smart_cover_planner_target_selector.h"
 #include "../../../xrEngine/CameraBase.h"
@@ -1170,6 +1171,8 @@ void CAI_Stalker::shedule_Update(u32 DT)
 
 				STOP_PROFILE
 			}
+			else if (g_Alive()) // Anomaly Coop: a puppet NPC still turns its head to this machine's player
+				LookAtActorLuaResult = coop::npc_ai::puppet_may_look_at_actor(this, NPCsLookAtActorMinDistance); // Anomaly Coop
 
 			START_PROFILE("stalker/schedule_update/inherited")
 				inherited::inherited::shedule_Update(DT);
@@ -1648,7 +1651,12 @@ void CAI_Stalker::LookAtActor(CBoneInstance* headBone) {
 		return LookAtActorSoftReset(headBone);
 
 	// soft reset if can't see actor
-	if (!memory().visual().visible_right_now(Actor()))
+	if (coop::remote::is_remote_creature(this)) // Anomaly Coop: a puppet has no visual memory, LookAtActorLuaResult carries its line of sight
+	{
+		if (coop::npc_ai::is_player(this)) // Anomaly Coop: a player character's head follows its player
+			return LookAtActorSoftReset(headBone);
+	}
+	else if (!memory().visual().visible_right_now(Actor()))
 		return LookAtActorSoftReset(headBone);
 
 	// soft reset if lua callback returned false

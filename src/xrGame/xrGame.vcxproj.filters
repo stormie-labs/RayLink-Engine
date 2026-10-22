@@ -2502,6 +2502,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_ai.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_sound.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7454,6 +7457,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_ai.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_sound.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

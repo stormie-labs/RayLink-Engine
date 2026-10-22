@@ -44,6 +44,11 @@ void print_status();
 // Also usable as an early hook in CActor::RunTalkDialog (before OfferTalk) by the core.
 bool may_start_talk(CInventoryOwner* partner, bool disable_break);
 
+// W11, host: the player holding the talk lock of NPC `npc` (host numbering), kHostPeer for the host's own
+// talk, kInvalidPeer if nobody (or not the host). The NPC meet logic (Lua coop.talk_holder) stands the NPC
+// still and turns it to a client that talks to it on his machine.
+PeerId host_talk_holder(u16 npc);
+
 // --- engine hooks (ui/UITalkWnd.cpp) ---
 // CUITalkWnd::Show(true), before InitTalkDialog. false: do not initialize; the talk state of both
 // sides is stopped here and the window hides itself on its next Update (talk_window_refused).
