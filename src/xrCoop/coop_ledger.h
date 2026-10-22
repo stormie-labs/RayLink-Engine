@@ -46,6 +46,10 @@ enum class Cause : uint8_t
 };
 constexpr uint8_t kCauseCount = 3;
 
+// The most one transfer may give before the host's Lua says otherwise (F2 T6b review M1): keep it equal to the default of
+// the option max_money_transfer (coop_economy_core.script RULES.max_money_transfer).
+constexpr uint32_t kDefaultTransferMax = 1000000;
+
 // Host settings (configs\coop_money.ltx [coop_money], console coop_money_*; Ruling 21, Ruling F2-1).
 struct Policy
 {
@@ -57,9 +61,14 @@ struct Policy
 	uint32_t dialog_gain_per_min = 20000;
 	uint32_t max_money = 100000000; // no balance goes above this
 	// F2 T6b, the session's transfer rules between players (options money_transfer, max_money_transfer). Set by the host's
-	// Lua; before it has, transfers are on and have no limit but the giver's balance.
+	// Lua; before it has, the options' defaults hold: transfers on, kDefaultTransferMax at a time.
 	bool transfer_on = true;
-	uint64_t transfer_max = UINT64_MAX; // the most one transfer may give (no limit by default: more than a balance holds)
+	uint64_t transfer_max = kDefaultTransferMax; // the most one transfer may give
+	// T6b review I1: how fast one character may give money away. Each transfer the host applies is a news line for its
+	// receiver, and a modified client could send 1 RU transfers without end. transfer_burst in a row, then
+	// transfer_per_min a minute (a token bucket per character). A player at the inventory menu gives a few times a minute.
+	uint32_t transfer_burst = 10;
+	uint32_t transfer_per_min = 30;
 };
 
 // An allowance: a bucket of money, full at its first use, refilled per minute up to its size.
@@ -79,8 +88,9 @@ enum class Verdict : uint8_t
 	Malformed, // unknown cause, a change of zero, a transfer that gives nothing or to nobody
 	TransfersOff, // F2 T6b: money_transfer is off in this session
 	OverTransferLimit, // F2 T6b: a transfer above max_money_transfer
+	TransferRate, // T6b review I1: this character has given money away too fast (Policy::transfer_burst)
 };
-constexpr uint8_t kVerdictCount = uint8_t(Verdict::OverTransferLimit) + 1;
+constexpr uint8_t kVerdictCount = uint8_t(Verdict::TransferRate) + 1;
 
 // Refills `a` (size `burst`, `per_min` a minute) up to `now_ms`; the first call fills it. A clock that goes back
 // refills nothing.
@@ -304,6 +314,29 @@ private:
 	uint64_t m_dropped = 0;
 };
 
+// Client: one NoticeGate per cause (T6b review M2): a refusal of a transfer the player asked for is not muted by a refusal
+// of a mod's income a second ago, and a mod's loop is muted without silencing his transfers.
+class RefusalGate
+{
+public:
+	bool allow(Cause c, uint64_t now_ms) { return m_gate[uint8_t(c) % kCauseCount].allow(now_ms); }
+	uint64_t dropped() const
+	{
+		uint64_t n = 0;
+		for (const NoticeGate& g : m_gate)
+			n += g.dropped();
+		return n;
+	}
+	void reset()
+	{
+		for (NoticeGate& g : m_gate)
+			g.reset();
+	}
+
+private:
+	NoticeGate m_gate[kCauseCount];
+};
+
 // Msg::MoneyBalance, host -> the player it belongs to. Wire: u32 balance, u32 acked_seq, then the note: u8 kind, u8 cause,
 // u8 verdict, u32 peer, i32 amount (19 bytes).
 // acked_seq: the newest ReqMoney of that player the host has applied or refused (0: none yet).
@@ -414,6 +447,7 @@ public:
 		m_acked.clear();
 		m_character_of.clear();
 		m_characters.clear();
+		m_transfer_rate.clear();
 		m_from_save.clear();
 		for (const std::string& key : from_save)
 			if (!key.empty())
@@ -427,7 +461,8 @@ public:
 	    bool dialog_lock, const Receiver& to, const Policy& p, uint64_t now_ms)
 	{
 		Decision d = decide(peer, character, q, balance, dialog_lock, to, p, now_ms);
-		if (!d.stale)
+		// No note for a repeat, and none for a transfer to himself (T6b review M7): that is his own mistake.
+		if (!d.stale && !(q.cause == Cause::Transfer && q.ref == peer))
 			d.note = note_refused(q, d.verdict);
 		return d;
 	}
@@ -494,7 +529,18 @@ private:
 		d.acked = q.seq;
 		if (q.cause == Cause::Transfer)
 		{
-			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
+			uint32_t after = balance, credit = 0;
+			d.verdict = check_transfer(peer, to, q.delta, after, credit, p);
+			if (d.verdict != Verdict::Applied)
+				return d; // refused for what it is: it costs no token
+			// T6b review I1: only a transfer that would be applied counts against the rate, and a refusal changes nothing
+			if (!take_transfer_token(character, p, now_ms))
+			{
+				d.verdict = Verdict::TransferRate;
+				return d;
+			}
+			d.balance = after;
+			d.credit = credit;
 			return d;
 		}
 		// Ruling F2-13: the form first. A request refused by it, and a spend, touch no allowance and start no clock.
@@ -515,6 +561,18 @@ private:
 			d.gain_script = uint32_t(q.delta) - from_dialog;
 		}
 		return d;
+	}
+
+	// One token of the transfer bucket of `character` (by key, like the allowances: another connection of the same
+	// character finds it as it left it). The first call fills it; the time away refills it like any other time.
+	bool take_transfer_token(const std::string& character, const Policy& p, uint64_t now_ms)
+	{
+		Allowance& a = m_transfer_rate[character];
+		refill(a, p.transfer_burst, p.transfer_per_min, now_ms);
+		if (a.tokens + kSlack < 1.0)
+			return false;
+		a.tokens = std::max(0.0, a.tokens - 1.0);
+		return true;
 	}
 
 	// The allowances of `character`, made if there are none yet. Called when the character goes live (peer_online, the
@@ -550,6 +608,7 @@ private:
 	std::map<uint32_t, uint32_t> m_acked; // peer -> newest answered seq
 	std::map<uint32_t, std::string> m_character_of; // peer -> the key of his character (its last request)
 	std::map<std::string, CharacterAllowances> m_characters; // character key -> allowances
+	std::map<std::string, Allowance> m_transfer_rate; // character key -> its transfer bucket (T6b review I1)
 	std::set<std::string> m_from_save; // keys of the characters in the world when the session started
 };
 

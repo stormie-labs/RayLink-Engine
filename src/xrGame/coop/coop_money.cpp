@@ -52,16 +52,23 @@ int g_max_money = int(ledger::Policy().max_money);
 float g_upgrade_min_percent = 1.7f;
 bool g_scripted_upgrades = false; // F2 T5: upgrades that name no mechanic (a script's) are refused
 // F2 T6b (Ruling F2-19): the session's transfer rules, pushed by the host's Lua (coop.money_set_rules). Kept for the
-// process: a new session or a world load does not widen them, the host's Lua says so when they change. Before it has
-// said anything: transfers on, no limit but the giver's balance.
+// process: a new session or a world load does not widen them (a host that played a session with transfers off starts the
+// next one with them off until its Lua has pushed again), the host's Lua says so when they change. Before it has said
+// anything: the options' defaults (T6b review M1), transfers on, kDefaultTransferMax at a time. Not fail-closed: a mod that
+// calls coop.money_give on a host without the economy script keeps working.
 bool g_transfer_on = true;
-u64 g_transfer_max = UINT64_MAX;
+u64 g_transfer_max = ledger::kDefaultTransferMax;
+// T6b review I1: how fast one character may give money away (Policy::transfer_burst, transfer_per_min).
+int g_transfer_burst = int(ledger::Policy().transfer_burst);
+int g_transfer_per_min = int(ledger::Policy().transfer_per_min);
 
 ledger::Policy policy()
 {
 	ledger::Policy p;
 	p.transfer_on = g_transfer_on;
 	p.transfer_max = g_transfer_max;
+	p.transfer_burst = u32(_max(g_transfer_burst, 0));
+	p.transfer_per_min = u32(_max(g_transfer_per_min, 0));
 	p.script_gain_burst = u32(_max(g_gain_burst, 0));
 	p.script_gain_per_min = u32(_max(g_gain_per_min, 0));
 	p.dialog_gain_cap = u32(_max(g_dialog_cap, 0));
@@ -103,6 +110,8 @@ void load_settings()
 	g_dialog_cap = read_setting(ini, "dialog_gain_cap", g_dialog_cap, 0);
 	g_dialog_per_min = read_setting(ini, "dialog_gain_per_min", g_dialog_per_min, 0);
 	g_max_money = read_setting(ini, "max_money", g_max_money, 1);
+	g_transfer_burst = read_setting(ini, "transfer_burst", g_transfer_burst, 0);
+	g_transfer_per_min = read_setting(ini, "transfer_per_min", g_transfer_per_min, 0);
 	if (ini.line_exist(kSection, "upgrade_min_percent"))
 	{
 		const float f = ini.r_float(kSection, "upgrade_min_percent");
@@ -124,6 +133,8 @@ void register_console()
 	CMD4(CCC_Integer, "coop_money_dialog_cap", &g_dialog_cap, 0, kMaxSetting);
 	CMD4(CCC_Integer, "coop_money_dialog_per_min", &g_dialog_per_min, 0, kMaxSetting);
 	CMD4(CCC_Integer, "coop_money_max", &g_max_money, 1, kMaxSetting);
+	CMD4(CCC_Integer, "coop_money_transfer_burst", &g_transfer_burst, 0, kMaxSetting);
+	CMD4(CCC_Integer, "coop_money_transfer_per_min", &g_transfer_per_min, 0, kMaxSetting);
 }
 
 u64 g_log_count = 0;
@@ -140,6 +151,7 @@ const char* verdict_name(Verdict v)
 	case Verdict::Malformed: return "malformed";
 	case Verdict::TransfersOff: return "transfers are off";
 	case Verdict::OverTransferLimit: return "over the transfer limit";
+	case Verdict::TransferRate: return "too many transfers";
 	}
 	return "?";
 }
@@ -417,7 +429,7 @@ struct ClientState
 	std::vector<ledger::Pending> pending; // changes sent (or queued) that the host has not answered
 	xr_vector<ledger::MoneyReq> outbox; // queued for frame()
 	ledger::UpgradeHolds holds; // F2 T5: payments requests carry, until their answers (client_hold)
-	ledger::NoticeGate refusals; // F2 T6b: how often a refusal of the host is told to the player
+	ledger::RefusalGate refusals; // F2 T6b: how often a refusal of the host is told to the player (per cause)
 };
 // GE_MONEY may come from the game thread; the answers come with the network pump on the main thread.
 xrCriticalSection g_cl_lock;
@@ -451,6 +463,9 @@ void client_on_balance(PeerId from, Reader& r)
 	if (!ledger::read(r, m))
 	{
 		++g_c.malformed;
+		// T6b review M6: the layout of MoneyBalance grew inside protocol 8; a host of an older build sends 8 bytes
+		if (log_allowed())
+			::Msg("! [coop] malformed MoneyBalance from the host: is its build of the game different from ours?");
 		return;
 	}
 	// Live first: Actor() asserts on GameID(), which has no level in the main menu. Protocol 8 makes a new player's
@@ -486,9 +501,9 @@ void client_on_balance(PeerId from, Reader& r)
 		g_cl.anchored = true;
 		g_cl.last = a->get_money();
 		// F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a loop is
-		// refused over and over: only one refusal in a few seconds is told.
+		// refused over and over: only one refusal of a cause in a few seconds is told.
 		if (m.note.kind == ledger::NoteKind::Refused)
-			tell = g_cl.refusals.allow(mgr().now_ms());
+			tell = g_cl.refusals.allow(m.note.cause, mgr().now_ms());
 		else
 			tell = m.note.kind == ledger::NoteKind::Received;
 	}
@@ -742,22 +757,22 @@ void print_status()
 	const ledger::Policy p = policy();
 	if (mgr().is_host())
 	{
-		char limit[40] = "no limit";
-		if (p.transfer_max != UINT64_MAX)
-			xr_sprintf(limit, "at most %llu RU", p.transfer_max);
 		::Msg("[coop]   money: changes in %llu, refused insufficient/allowance/max %llu/%llu/%llu, by the transfer rules "
-		      "off/limit %llu/%llu (%llu malformed, %llu to nobody, %llu stale, %llu without a character, %llu dropped "
+		      "off/limit/rate %llu/%llu/%llu (%llu malformed, %llu to nobody, %llu stale, %llu without a character, %llu dropped "
 		      "while rejoining), gains script %llu dialog %llu RU, grants %llu, trades %llu (%llu capped), transfers "
 		      "%llu, %llu balances sent on joining, %llu notes sent",
 		    g_h.changes, g_h.verdicts[u32(Verdict::Insufficient)], g_h.verdicts[u32(Verdict::NoAllowance)],
 		    g_h.verdicts[u32(Verdict::OverMax)], g_h.verdicts[u32(Verdict::TransfersOff)],
-		    g_h.verdicts[u32(Verdict::OverTransferLimit)], g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
+		    g_h.verdicts[u32(Verdict::OverTransferLimit)], g_h.verdicts[u32(Verdict::TransferRate)],
+		    g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
 		    g_h.bad_receiver, g_h.stale, g_h.no_character, g_h.dropped_joining, g_h.gain_script, g_h.gain_dialog,
 		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins, g_h.notes_sent);
 		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u in a row + %u per minute, max %u, "
-		      "upgrades from %.2f x cost, upgrades without a mechanic %s, transfers between players %s (%s)",
+		      "upgrades from %.2f x cost, upgrades without a mechanic %s, transfers between players %s (at most %llu RU "
+		      "each, %u in a row + %u per minute)",
 		    p.script_gain_burst, p.script_gain_per_min, p.dialog_gain_cap, p.dialog_gain_per_min, p.max_money,
-		    g_upgrade_min_percent, g_scripted_upgrades ? "taken" : "refused", p.transfer_on ? "on" : "off", limit);
+		    g_upgrade_min_percent, g_scripted_upgrades ? "taken" : "refused", p.transfer_on ? "on" : "off", p.transfer_max,
+		    p.transfer_burst, p.transfer_per_min);
 		for (const auto& it : g_book.connections())
 		{
 			const u16 holder = holder_of(it.first);

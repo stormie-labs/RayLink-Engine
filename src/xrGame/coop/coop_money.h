@@ -14,7 +14,10 @@
 // coop_money_gain_per_min, coop_money_dialog_cap, coop_money_dialog_per_min, coop_money_max (Ruling 21, F2-1).
 // F2 T6b (Ruling F2-19): the session's rules for money between players (money_transfer, max_money_transfer) come from the
 // host's Lua, coop.money_set_rules; the ledger refuses a transfer against them (a client's Lua checks them too, but only
-// the host's answer counts). A MoneyBalance carries a note (ledger::MoneyNote): a refusal of the host's goes to the player
+// the host's answer counts). Until the Lua has said, the options' defaults hold (on, 1 000 000 at a time). T6b review I1: a
+// character also gives money away at a bounded rate (transfer_burst in a row, transfer_per_min a minute; coop_money.ltx,
+// console coop_money_transfer_*), so that nobody can fill another player's news with 1 RU gifts.
+// A MoneyBalance carries a note (ledger::MoneyNote): a refusal of the host's goes to the player
 // whose change it was, a gift to the receiver. Each is told by the Lua callback coop_money_note on the machine of that
 // player (the host's own too, for a gift to him): ("received", giver_peer, amount) or
 // ("refused", receiver_peer | -1, change, why, cause).
