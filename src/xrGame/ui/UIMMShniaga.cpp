@@ -14,8 +14,19 @@
 #include "../saved_game_wrapper.h"
 #include "../login_manager.h"
 #include "MainMenu.h"
+#include "../coop/coop_manager.h" // Anomaly Coop
 
 extern string_path g_last_saved_game;
+
+// Anomaly Coop (F3): in a co-op session nobody saves or loads from the menu, the host included (the host restores
+// from the emergency autosaves in the co-op window). The buttons of the save/load entries are not created.
+// The names are the same in stock Anomaly and in GAMMA (ui_mm_main_16.xml, MCM copy).
+static bool coop_hidden_menu_button(LPCSTR name)
+{
+	if (!name || !coop::mgr().active())
+		return false;
+	return !xr_strcmp(name, "btn_save") || !xr_strcmp(name, "btn_load") || !xr_strcmp(name, "btn_lastsave");
+}
 
 CUIMMShniaga::CUIMMShniaga()
 {
@@ -130,6 +141,8 @@ void CUIMMShniaga::CreateList(xr_vector<CUITextWnd*>& lst, CUIXml& xml_doc, LPCS
 
 	for (int i = 0; i < nodes_num; ++i)
 	{
+		if (coop_hidden_menu_button(xml_doc.ReadAttrib("btn", i, "name"))) // Anomaly Coop
+			continue;
 		st = xr_new<CUITextWnd>();
 		st->SetWndPos(Fvector2().set(0, 0));
 		st->SetWndSize(Fvector2().set(m_view->GetDesiredChildWidth(), button_height));
