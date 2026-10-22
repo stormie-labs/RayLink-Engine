@@ -239,14 +239,15 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	{
 		// Anomaly Coop: the world is written to a temporary name and moved over coop_auto_N when it is whole, so a crash
 		// in the middle of the write leaves no cut-off slot (the Restore list opens every slot).
-		LPCSTR coop_temp_name = coop::autosave::level_change_temp_name();
-		save(coop_temp_name, false);
-		if (!coop::autosave::level_change_commit())
+		save(coop::autosave::level_change_temp_name(), false);
+		// The name the new level loads from: coop_auto_N (the next slot if the first one could not take the save),
+		// coop_auto_tmp when no slot did, nullptr when nothing was written (the command line stays as it is).
+		LPCSTR load_from = coop::autosave::level_change_commit();
+		if (load_from && xr_strcmp(load_from, autoave_name))
 		{
-			// The move failed: the world is in the temporary file only, the new level loads from there.
 			LPCSTR suffix = strstr(**m_server_command_line, "/");
 			VERIFY(suffix);
-			*m_server_command_line = strconcat(sizeof(temp), temp, coop_temp_name, suffix);
+			*m_server_command_line = strconcat(sizeof(temp), temp, load_from, suffix);
 		}
 	}
 	else

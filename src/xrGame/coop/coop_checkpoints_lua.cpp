@@ -2,10 +2,12 @@
 #include "pch_script.h"
 #include "coop_checkpoints.h"
 #include "coop_rest.h"
+#include "coop_autosave.h"
 
 #include <cmath>
 
-// Lua side of the F3 modules: coop.checkpoint (here, F3 Tasks 6 and 7) and coop.rest (coop_rest.cpp, F3 Task 11).
+// Lua side of the F3 modules: coop.checkpoint (here, F3 Tasks 6 and 7), coop.rest (coop_rest.cpp, F3 Task 11) and
+// coop.autosave (coop_autosave.cpp, F3 Task 12).
 // Functions with arguments are plain C functions, as in coop_script.cpp: a wrong argument from an addon returns
 // nil / false instead of a luabind "no matching overload" error, which is fatal in this engine (R-11.4).
 
@@ -135,4 +137,5 @@ void coop_checkpoints_script_registrator::script_register(lua_State* L)
 	}
 	coop::checkpoints::register_lua(L);
 	coop::rest::register_lua(L);
+	coop::autosave::register_lua(L); // F3 T12: coop.autosave.suspend (the Restore window, coop_saves.script)
 }

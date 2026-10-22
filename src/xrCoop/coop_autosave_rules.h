@@ -98,6 +98,28 @@ inline uint32_t next_slot(const std::vector<SlotInfo>& existing, uint32_t count)
 	return oldest ? oldest->index : 1;
 }
 
+// next_slot, except the slots in `skip` (the old files of a slot could not be replaced: read-only, held by another
+// process). A skipped slot counts as taken by the newest file there is, so the free slot or the oldest of the rest is
+// chosen. 0 when nothing is left. Numbers outside 1..count in `skip` change nothing.
+inline uint32_t next_slot_skipping(const std::vector<SlotInfo>& existing, uint32_t count, const std::vector<uint32_t>& skip)
+{
+	if (count < 1)
+		count = 1;
+	auto skipped = [&skip](uint32_t index)
+	{
+		return std::find(skip.begin(), skip.end(), index) != skip.end();
+	};
+	std::vector<SlotInfo> seen;
+	for (const SlotInfo& s : existing)
+		if (!skipped(s.index))
+			seen.push_back(s);
+	for (uint32_t k = 1; k <= count; ++k)
+		if (skipped(k))
+			seen.push_back({k, UINT64_MAX});
+	const uint32_t chosen = next_slot(seen, count);
+	return skipped(chosen) ? 0 : chosen; // every place is one that failed
+}
+
 // The slots to delete after a save so that no more than `count` slot files stay: the oldest beyond that, oldest first.
 // `existing` lists the slots on disk with the save just made (slot `keep`) in it. The slot just written is the newest by
 // definition and always stays; the others are ordered by file time, equal times with the higher index as the newer (the
@@ -144,6 +166,47 @@ inline std::vector<uint32_t> slots_to_prune(const std::vector<SlotInfo>& existin
 	for (size_t i = slots.size(); i > size_t(count); --i)
 		gone.push_back(slots[i - 1].index); // from the oldest
 	return gone;
+}
+
+// A pause of the autosaves that has to be renewed (F3 T12 fix round 1, review I1). The Restore window holds it while it
+// is open, so the timer cannot write into the slot the host is about to pick; the window renews it every frame, so a
+// window closed in any way (a button, Escape, the main menu switched off) ends the pause by itself a lease later.
+struct Pause
+{
+	bool held = false;
+	uint64_t renewed_ms = 0;
+	uint32_t lease_ms = 0;
+};
+
+// Holds the pause (or renews it) until `lease_ms` after now_ms.
+inline void pause_hold(Pause& p, uint64_t now_ms, uint32_t lease_ms)
+{
+	p.held = true;
+	p.renewed_ms = now_ms;
+	p.lease_ms = lease_ms;
+}
+
+// True while the pause is held and its lease is fresh. A clock that went back ends it.
+inline bool pause_holds(const Pause& p, uint64_t now_ms)
+{
+	return p.held && now_ms >= p.renewed_ms && now_ms - p.renewed_ms < p.lease_ms;
+}
+
+// A held pause whose lease ran out: cleared, and true once, so the caller can start afresh.
+inline bool pause_lapsed(Pause& p, uint64_t now_ms)
+{
+	if (!p.held || pause_holds(p, now_ms))
+		return false;
+	p.held = false;
+	return true;
+}
+
+// Lets the pause go on purpose; true if it was held.
+inline bool pause_release(Pause& p)
+{
+	const bool was = p.held;
+	p.held = false;
+	return was;
 }
 
 // Why a save is written.
