@@ -884,39 +884,27 @@ inline bool quest_gift(bool holds_talk_lock, float npc_distance, uint16_t parent
 	return holds_talk_lock && npc_distance <= kTalkReach && own_character != 0xffff && parent == own_character;
 }
 
-// How many children of its own an item may hold (review round 4, Important 1): a grenade or bolt one fake missile, a
-// launcher one rocket; a revolver grenade launcher (WeaponRocket: CWeaponRG6, CWeaponSSRS spawn a rocket for every
-// loaded round, WeaponRG6.cpp:31-37, :155-162, WeaponSSRS.cpp:203-212) up to `ammo_mag_size` of its section, 1 if the
-// section shows none.
-inline size_t child_room(GameClass parent, long long mag_size)
-{
-	return parent == GameClass::WeaponRocket && mag_size > 1 ? size_t(mag_size) : 1;
-}
-
 // Review round 2, Important 1: what may be created inside one of the player's items (the parent is not his character).
 // The host gives the parent the new entity with GE_OWNERSHIP_TAKE, and the items whose handler takes a child cast it
 // unchecked: CRocketLauncher::AttachRocket (RocketLauncher.cpp:56-57) to CCustomRocket, CMissile::OnEvent
-// (Missile.cpp:606-608) to CMissile. So: a rocket into a weapon with a rocket launcher, a missile into a missile of the
-// same section (its fake missile, CMissile::spawn_fake_missile); nothing else into an item. Round 4 (Important 1):
-// only while the parent has room (`children` it holds now, child_room): a second "fake missile" overwrote the
-// grenade's m_fake_missile and the first came out by ReqDrop as a whole grenade (CMissile::OnEvent's reject does not
-// destroy it, Missile.cpp:612-631) - real grenades for free.
-inline bool child_allowed(GameClass parent, std::string_view parent_section, GameClass child,
-    std::string_view child_section, size_t children, long long mag_size)
+// (Missile.cpp:606-608) to CMissile. So only a rocket into a weapon with a rocket launcher; nothing else into an item.
+// Round 5 (Ruling F2-23):
+// - a launcher takes its rocket whatever it holds: the host itself loads a rocket into its copy of a loaded launcher
+//   (CWeaponRPG7::net_Spawn, CWeaponRG6::net_Spawn a rocket per round, the grenade launcher), so round 4's "room"
+//   refused every honest shot after a join or a load. A rocket is a CSE_Temporary (not saved, cheap), and the
+//   ReqSpawn rate limit bounds a flood;
+// - a grenade or bolt takes no child from a client: a fair client never asks for a fake missile (coop_objects.cpp
+//   skip_fake_missile = is_client()), and a fake missile is a whole ALife grenade that ReqDrop takes out (free grenades).
+inline bool child_allowed(GameClass parent, std::string_view /*parent_section*/, GameClass child,
+    std::string_view /*child_section*/, size_t /*children*/, long long /*mag_size*/)
 {
-	bool takes = false;
 	switch (parent)
 	{
 	case GameClass::WeaponMagazinedWGrenade:
 	case GameClass::WeaponRocket:
-	case GameClass::WeaponRPG7: takes = child == GameClass::ExplosiveRocket;
-		break;
-	case GameClass::Missile:
-	case GameClass::Grenade: takes = child == parent && child_section == parent_section;
-		break;
-	default: break;
+	case GameClass::WeaponRPG7: return child == GameClass::ExplosiveRocket;
+	default: return false;
 	}
-	return takes && children < child_room(parent, mag_size);
 }
 
 // Round 4 minor: what may be created straight into the player's character: any item but a launcher's rocket
