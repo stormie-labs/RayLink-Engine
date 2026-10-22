@@ -9,6 +9,7 @@
 #include "coop_entities.h"
 #include "coop_events.h"
 #include "coop_alife.h"
+#include "xrCoop/coop_validate.h"
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -72,6 +73,7 @@ constexpr u32 kConsumeAfterMs = 3000;
 constexpr u32 kPacketBudget = 1100;
 constexpr u16 kMaxElements = 64;
 constexpr float kMaxThrowSpeed = 45.f;
+constexpr float kMaxThrowDir = 2.f; // a throw direction is a unit vector (slack for float noise)
 constexpr float kMaxReach = 4.5f; // request validation: player character to object
 
 enum class StateKind : u8
@@ -163,7 +165,8 @@ struct Counters
 	// host
 	u64 sample_packets = 0, sample_entries = 0, rests_sent = 0, zone_msgs = 0, anim_msgs = 0, destroyed_sent = 0,
 	    broken_sent = 0, explode_sent = 0, fragments_relayed = 0, uses = 0, pushes = 0, throws_ok = 0,
-	    throws_refused = 0, activations = 0, consumed = 0, zone_hits_dropped = 0, projectiles = 0;
+	    throws_refused = 0, activations = 0, consumed = 0, zone_hits_dropped = 0, projectiles = 0,
+	    throws_malformed = 0, consume_forced = 0; // R3 В7
 	// client
 	u64 samples_in = 0, rests_in = 0, poses_applied = 0, rests_applied = 0, mismatch = 0, zones_applied = 0,
 	    explode_applied = 0, explode_fallback = 0, destroyed_applied = 0, broken_applied = 0, uses_sent = 0,
@@ -457,6 +460,7 @@ struct Consume
 {
 	u16 proxy = kNoId;
 	u64 deadline = 0;
+	const CSE_Abstract* entity = nullptr; // R3 В7: the thrown item itself (its id may be reused once it is gone)
 };
 xr_map<u16, Consume> g_consume; // thrown hand item -> host removes it if the owner did not
 xr_map<PeerId, u64> g_last_throw;
@@ -1408,8 +1412,17 @@ void host_on_throw(PeerId from, Reader& r)
 	t.dir = get_vec(r);
 	t.vel = get_vec(r);
 	t.flags = r.u8();
-	if (!r.ok() || !_valid(t.pos) || !_valid(t.dir) || !_valid(t.vel))
-		return; // malformed: nothing from the wire reaches the physics world unchecked
+	// Malformed: nothing from the wire reaches the physics world unchecked (R3: through coop::validate). The
+	// direction is a unit vector: a huge one normalizes to zero and the throw matrix to NaN.
+	const float d3[3] = {t.dir.x, t.dir.y, t.dir.z};
+	const float p3[3] = {t.pos.x, t.pos.y, t.pos.z};
+	const float v3[3] = {t.vel.x, t.vel.y, t.vel.z};
+	if (!r.ok() || !validate::finite3(p3) || !validate::speed_ok(d3, kMaxThrowDir) || !validate::finite3(v3))
+	{
+		if (r.ok() && ++g_c.throws_malformed <= 10)
+			::Msg("! [coop] throw of item %u by #%u refused: a vector is not a number", hand, from);
+		return;
+	}
 	auto refuse = [&](const char* why)
 	{
 		++g_c.throws_refused;
@@ -1420,20 +1433,30 @@ void host_on_throw(PeerId from, Reader& r)
 	if (!who)
 		return refuse("no character");
 	const u64 now = now_ms();
-	if ((t.flags & TfConsume) && g_consume.count(hand))
-		return refuse("already thrown"); // a grenade leaves the hand once
+	// R3 В7: the missile is taken from the character's own inventory on the host, and the host decides what the
+	// throw uses up: a grenade (any missile but a bolt) always leaves the inventory, the client's "consume" flag is
+	// ignored (a client that keeps it loses it after kConsumeAfterMs). A bolt follows the thrower's limited-bolts
+	// option (CBolt__State runs on its machine): a bolt that stays is what stock gives anyway.
 	CSE_Abstract* he = events::find_entity(hand);
-	if (!he || events::root_of(hand) != proxy)
-		return refuse("not in the player's hands");
+	if (!he || he->ID_Parent != proxy)
+		return refuse("not in the player's inventory");
 	LPCSTR section = he->s_name.c_str();
 	if (!pSettings->line_exist(section, "destroy_time") || !pSettings->line_exist(section, "throw_point"))
 		return refuse("not a missile");
+	if (!smart_cast<CSE_ALifeItemBolt*>(he))
+	{
+		if (!(t.flags & TfConsume) && ++g_c.consume_forced <= 10)
+			::Msg("! [coop] throw of [%s] %u by #%u: the client keeps it, the host uses it up", section, hand, from);
+		t.flags |= TfConsume;
+	}
+	if ((t.flags & TfConsume) && g_consume.count(hand))
+		return refuse("already thrown"); // a grenade leaves the hand once
 	u64& last = g_last_throw[from];
 	if (now - last < 150)
 		return refuse("rate");
 	if (!in_reach(who, t.pos, 4.f))
 		t.pos.set(who->Position()).y += 1.5f;
-	if (t.vel.magnitude() > kMaxThrowSpeed)
+	if (!validate::speed_ok(v3, kMaxThrowSpeed))
 		t.vel.normalize_safe().mul(kMaxThrowSpeed);
 	if (t.dir.magnitude() < EPS_L)
 		t.dir.set(0.f, 0.f, 1.f);
@@ -1458,6 +1481,7 @@ void host_on_throw(PeerId from, Reader& r)
 		Consume& c = g_consume[hand];
 		c.proxy = proxy;
 		c.deadline = now + kConsumeAfterMs;
+		c.entity = he;
 	}
 	++g_c.throws_ok;
 }
@@ -1566,8 +1590,9 @@ void host_apply_throws()
 			++it;
 			continue;
 		}
+		// R3 В7: wherever the thrown item went meanwhile (dropped, stashed, handed over), it was thrown.
 		CSE_Abstract* e = events::find_entity(it->first);
-		if (e && events::root_of(it->first) == it->second.proxy)
+		if (e && e == it->second.entity)
 		{
 			host_destroy_entity(e); // the owner never removed the thrown item itself
 			++g_c.consumed;
@@ -2004,10 +2029,10 @@ void print_status()
 		::Msg("[coop]   objects out: %llu explosions, %llu destroyed, %llu broken, %llu fragments relayed, "
 		    "%llu zone hits on players dropped",
 		    g_c.explode_sent, g_c.destroyed_sent, g_c.broken_sent, g_c.fragments_relayed, g_c.zone_hits_dropped);
-		::Msg("[coop]   objects req: %llu uses, %llu pushes, %llu throws ok / %llu refused, %llu projectiles, "
-		    "%llu consumed, %llu artefact activations, %u throws pending",
-		    g_c.uses, g_c.pushes, g_c.throws_ok, g_c.throws_refused, g_c.projectiles, g_c.consumed,
-		    g_c.activations, (u32)g_pending_throws.size());
+		::Msg("[coop]   objects req: %llu uses, %llu pushes, %llu throws ok / %llu refused / %llu malformed, "
+		    "%llu projectiles, %llu consumed (%llu kept by the client), %llu artefact activations, %u throws pending",
+		    g_c.uses, g_c.pushes, g_c.throws_ok, g_c.throws_refused, g_c.throws_malformed, g_c.projectiles,
+		    g_c.consumed, g_c.consume_forced, g_c.activations, (u32)g_pending_throws.size());
 	}
 	else if (mgr().is_client())
 	{

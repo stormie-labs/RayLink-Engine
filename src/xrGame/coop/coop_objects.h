@@ -35,6 +35,8 @@
 //     1 Use       u16 object
 //     2 Push      u16 object, u8 element, vec3 dir, f32 speed
 //     3 Throw     u16 hand_item, vec3 pos, vec3 dir, vec3 velocity, u8 flags (1 consume, 2 can_take, 4 random spin)
+//                 hand_item is in the character's inventory on the host; a grenade is always used up there, the
+//                 consume flag only matters for a bolt (limited-bolts option of the thrower, R3 В7)
 //     4 Activate  u16 artefact
 //   quat16 = 4 x s16 (component * 32767); lin16/ang16 = 3 x s16 (value * 100).
 //

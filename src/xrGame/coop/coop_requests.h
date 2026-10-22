@@ -7,14 +7,17 @@
 // same result as everybody else, with the same ids.
 //
 // Wire layouts (client -> host, ids in host numbering, every request starts with u32 seq):
-//   ReqSpawn      u32 seq, u8 0xC5, u16 parent, vec3 pos, u16 size, M_SPAWN bytes (full state)
+//   ReqSpawn      u32 seq, u8 0xC6, u16 parent, vec3 pos, str section, varu n, n bytes item state (coop_items blob)
 //                 legacy (no seq): str section, u16 parent, vec3 pos  (entities::intercept_local_spawn)
+//                 The host builds the entity from its own section (it must have `class`) and applies the item state
+//                 with the ItemState checks; raw M_SPAWN bytes (old marker 0xC5) are refused (R3 В6).
 //   ReqDestroy    u32 seq, u16 item
 //   ReqUse        u32 seq, u16 item                       (eatables; effect already applied)
 //   ReqTake       u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
 //   ReqDrop       u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
 //   ReqTransfer   u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
-//                 flags: 1 = already applied locally (thrown missile, launched rocket), 2 = trade
+//                 flags: 1 = already applied locally (thrown missile, launched rocket), 2 = trade, 4 = exact drop
+//                 position; the host checks the reach whatever the flags say (R3 В8)
 //   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit   (power etc. after the client's before-hit Lua, W5)
 //   ReqMoney      u32 seq, u32 money, u32 deals           (the client owns its money, R-6.7; deals = newest
 //                 trade answer already in `money`, the host adds the accepted trades after it: coop_trade.h)
@@ -75,7 +78,7 @@ void print_status();
 void register_console(); // coop_client_hit_perks (called from coop_presence::register_console, W5)
 
 // --- client: queue requests (any thread; sent from frame() on the main thread) ---
-// Spawn the client game asked its own server for. Forwards it with full state when the parent
+// Spawn the client game asked its own server for. Forwards its section and item state when the parent
 // chain ends at our actor; otherwise it is the host's business and is dropped.
 // Returns true if forwarded. `entity` stays owned by the caller.
 bool client_forward_spawn(CSE_Abstract* entity);

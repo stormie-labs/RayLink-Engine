@@ -33,9 +33,12 @@
 
 #include "xrCoop/coop_session.h"
 
+#include <vector>
+
 class CInventoryItem;
 class CWeapon;
 class CWeaponAmmo;
+class CSE_Abstract;
 
 namespace coop
 {
@@ -64,5 +67,13 @@ bool client_keep_empty_box(CWeaponAmmo* box);
 void on_weapon_fired(CWeapon* weapon);
 using WeaponFiredFn = void (*)(CWeapon* weapon);
 void set_weapon_fired_handler(WeaponFiredFn fn);
+
+// --- ReqSpawn (WP2, R3 В6): the state of an item a client asks the host to create travels as the blob above,
+// never as raw spawn bytes; the host builds the entity from its own section and applies the blob. ---
+// Client: the blob of an entity that is not created yet. False = not an inventory item (nothing to carry).
+bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob);
+// Host: applies a client's blob to a fresh entity (not spawned yet) with the ItemState checks: kind, counts,
+// known upgrades and ammo types. False = refused (`why` says why); the entity may be half changed: discard it.
+bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, const char*& why);
 } // namespace items
 } // namespace coop

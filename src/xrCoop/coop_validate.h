@@ -62,5 +62,15 @@ inline bool resource_name_ok(const char* s, std::size_t max_len)
 	}
 	return true;
 }
+
+// The engine's "no bone" (BI_NONE = u16(-1)): the default of SHit, every hit path handles it.
+constexpr unsigned kNoBone = 0xffffu;
+
+// R3 В5: a hit's bone from a peer indexes the target's skeleton unchecked (CPHShell::applyImpulseTrace,
+// LL_GetBoneInstance, hit scales, wounds): it is a bone of that skeleton or "no bone".
+inline bool bone_ok(unsigned bone, unsigned bone_count)
+{
+	return bone == kNoBone || bone < bone_count;
+}
 } // namespace validate
 } // namespace coop

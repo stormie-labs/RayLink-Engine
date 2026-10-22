@@ -1676,5 +1676,49 @@ void on_weapon_fired(CWeapon* weapon)
 }
 
 void set_weapon_fired_handler(WeaponFiredFn fn) { g_fired = fn; }
+
+// R3 В6: what a ReqSpawn carries instead of raw M_SPAWN bytes (the host never Spawn_Read's a peer's packet).
+bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob)
+{
+	blob.clear();
+	ItemData d;
+	if (!entity || !capture_entity(entity, d))
+		return false;
+	write_data(d, blob);
+	return true;
+}
+
+// R3 В6: the checks of host_on_state for an entity the host is about to create from its own section.
+bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, const char*& why)
+{
+	why = nullptr;
+	ItemData d;
+	if (!entity || size > kMaxBlob || !read_data(data, size, d))
+	{
+		why = "malformed state";
+		return false;
+	}
+	CSE_ALifeInventoryItem* ii = smart_cast<CSE_ALifeInventoryItem*>(entity);
+	if (!ii)
+	{
+		why = "item state for a non-item";
+		return false;
+	}
+	if (!host_validate_kind(entity, d, why) || !host_validate_counts(entity, nullptr, d, why))
+		return false;
+	host_sanitize(entity, nullptr, d); // unknown upgrades dropped, ammo types in range
+	apply_entity(entity, d, false);
+	// apply_entity leaves upgrades to GE_INSTALL_UPGRADE on the host. A fresh entity has none: the new object
+	// installs these on its spawn. One of each (CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate).
+	if (d.has_upgrades)
+	{
+		UpgradeList unique;
+		for (const shared_str& id : d.upgrades)
+			if (std::find(unique.begin(), unique.end(), id) == unique.end())
+				unique.push_back(id);
+		ii->m_upgrades = unique;
+	}
+	return true;
+}
 } // namespace items
 } // namespace coop
