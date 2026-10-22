@@ -157,6 +157,7 @@ u32 g_epoch = 0xffffffff; // join::host_world_epoch() the pending work belongs t
 struct Stats
 {
 	u64 deaths = 0, dropped = 0, moved = 0, destroyed = 0, stashes = 0, stash_fallbacks = 0, stash_lost = 0;
+	u64 stash_abandoned = 0; // released empty at the end of a session or on a new world (review minor 5)
 	u64 markers_sent = 0, markers_in = 0, markers_refused = 0, markers_dropped = 0;
 	u64 money_taken = 0;
 };
@@ -214,9 +215,6 @@ bool player_character(u16 character, CGameObject*& body, CInventoryOwner*& owner
 
 xr_string nick(u16 character) { return mgr().active() ? survival::nick_of(character) : xr_string("me"); }
 
-// The host's actor sees its own slots and belt; a proxy does not show where its player keeps his things.
-bool layout_known(u16 character) { return character == 0; }
-
 // The facts of the backpack (m_ruck) or of everything the character carries (m_all).
 std::vector<ItemFacts> collect(CInventoryOwner* io, bool everything)
 {
@@ -252,6 +250,54 @@ const char* section_of(u16 id)
 {
 	CGameObject* go = game_object(id);
 	return go ? go->cNameSect().c_str() : "?";
+}
+
+// What the host knows of the things of one character and what it may choose from (F3 T8b, Ruling F3-4).
+struct Carried
+{
+	std::vector<ItemFacts> items;
+	bool layout_known = false; // the host's own actor, or a client's proxy whose owner reported what he has on
+	bool reported = false; // the second case: `items` is everything the proxy carries and `worn` of them are on him
+	bool everything = false; // a hardcore retirement: all of it goes, worn or not
+	size_t worn = 0;
+};
+
+// The host's own actor: its backpack (m_ruck) is exact, its slots and belt are not in it.
+// A client's proxy is a CAI_Stalker: it cannot wear an outfit, has no belt and fills its slots in the order it took
+// the items, so m_ruck says nothing of what the player has on. With the list his Dead report brought (seq: the death,
+// survival::host_worn_items) the proxy offers everything it carries (m_all: the NPC's slots hold part of his backpack)
+// except what the list names, and the layout counts as known. Without it (an old client, a report whose tail was
+// refused, no seq): the backpack only, and nothing the player may have on is offered.
+// `everything` (a hardcore retirement) takes all of it, so the list is not asked for.
+Carried carried_of(u16 character, CInventoryOwner* io, bool everything, u16 seq)
+{
+	Carried c;
+	c.layout_known = character == 0;
+	c.everything = everything;
+	xr_vector<u16> reported;
+	if (!everything && character != 0 && seq != kNoSeq && survival::host_worn_items(character, seq, reported))
+	{
+		c.items = collect(io, true);
+		c.worn = mark_worn(c.items, std::vector<u16>(reported.begin(), reported.end()));
+		c.layout_known = true;
+		c.reported = true;
+		return c;
+	}
+	c.items = collect(io, everything);
+	return c;
+}
+
+// For the log: how the layout of a client's proxy was known; nothing for the host's actor.
+xr_string layout_note(const Carried& c, u16 character)
+{
+	if (character == 0 || c.everything)
+		return xr_string();
+	char buf[112];
+	if (c.reported)
+		xr_sprintf(buf, " [his list: %u on him stay]", u32(c.worn));
+	else
+		xr_strcpy(buf, " [no list from his machine: what he may wear stays]");
+	return buf;
 }
 
 // Where the things of a dead character go (Review Focus 4) and the level / game vertex a stash is spawned on.
@@ -420,14 +466,15 @@ void send_markers()
 
 // Spawns the stash and queues the move; falls back to dropping. Returns the stash id (kNoId if none); `count`: items
 // on their way to the stash or dropped.
-u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everything, u32& count)
+u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everything, u16 seq, u32& count)
 {
 	count = 0;
-	const std::vector<ItemFacts> facts = collect(io, everything);
-	const std::vector<u16> picked = stash_ids(facts, g_set.kinds, everything, layout_known(character));
+	const Carried carried = carried_of(character, io, everything, seq);
+	const std::vector<u16> picked = stash_ids(carried.items, g_set.kinds, everything, carried.layout_known);
 	if (picked.empty())
 	{
-		::Msg("[coop] death: %s has nothing for a stash", nick(character).c_str());
+		::Msg("[coop] death: %s has nothing for a stash%s", nick(character).c_str(),
+		    layout_note(carried, character).c_str());
 		return kNoId;
 	}
 	const BodyPlace place = body_place(body);
@@ -470,9 +517,9 @@ u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everyt
 	count = u32(p.items.size());
 	g_stashes.push_back(std::move(p));
 	++g_st.stashes;
-	::Msg("[coop] death stash %u for %s at (%.1f, %.1f, %.1f): %u items go in when it is online%s", e->ID,
+	::Msg("[coop] death stash %u for %s at (%.1f, %.1f, %.1f): %u items go in when it is online%s%s", e->ID,
 	    nick(character).c_str(), place.drop.at.x, place.drop.at.y, place.drop.at.z, count,
-	    everything ? " (everything he has)" : "");
+	    everything ? " (everything he has)" : "", layout_note(carried, character).c_str());
 	return e->ID;
 }
 
@@ -584,16 +631,40 @@ void give_up(PendingStash& p, bool owner_same, Presence character)
 	release_stash(p.stash);
 }
 
+// Review minor 5 (T9): stashes still waiting for their items when the session ends or the world is replaced are empty
+// entities nobody will fill. They are released while the world still has them. After a load the id may name something
+// else, so the entity under it must still be a coop_death_stash with nothing in it; without a world they are forgotten.
+void abandon_stashes(const char* why)
+{
+	if (g_stashes.empty())
+		return;
+	const bool world = mgr().is_host() && g_pGameLevel && ai().get_alife();
+	u32 released = 0;
+	if (world)
+		for (const PendingStash& p : g_stashes)
+		{
+			const CSE_Abstract* e = events::find_entity(p.stash);
+			if (!e || xr_strcmp(e->s_name, kStashSection) || !e->children.empty())
+				continue;
+			release_stash(p.stash);
+			++released;
+		}
+	g_st.stash_abandoned += released;
+	::Msg("[coop] death: %s, %u stashes were waiting: %u released empty, %u forgotten (the items stay with their "
+	      "characters)",
+	    why, u32(g_stashes.size()), released, u32(g_stashes.size()) - released);
+	g_stashes.clear();
+}
+
 void host_frame()
 {
 	const u32 epoch = join::host_world_epoch();
 	if (epoch != g_epoch)
 	{
-		if (g_epoch != 0xffffffff && (!g_stashes.empty() || !g_markers.empty()))
-			::Msg("[coop] death: a new world, %u stashes and %u markers of the old one dropped", u32(g_stashes.size()),
-			    u32(g_markers.size()));
+		if (g_epoch != 0xffffffff && !g_markers.empty())
+			::Msg("[coop] death: a new world, %u markers of the old one dropped", u32(g_markers.size()));
 		g_epoch = epoch;
-		g_stashes.clear();
+		abandon_stashes("a new world");
 		g_markers.clear();
 	}
 	if (!g_stashes.empty() && ai().get_alife())
@@ -652,21 +723,36 @@ public:
 	void Execute(LPCSTR args) override
 	{
 		unsigned long id = 0;
+		unsigned long seq = kNoSeq;
+		bool bad = false;
 		if (args && *args)
 		{
 			char* end = nullptr;
 			id = strtoul(args, &end, 10);
-			if (end == args || id >= kNoId)
+			bad = end == args || id >= kNoId;
+			if (!bad)
 			{
-				::Msg("! [coop] coop_death_preview [character id]: 0 = the host, a player's proxy id otherwise");
-				return;
+				while (*end == ' ' || *end == '\t')
+					++end;
+				if (*end)
+				{
+					char* end2 = nullptr;
+					seq = strtoul(end, &end2, 10);
+					bad = end2 == end || *end2 || seq >= kNoSeq;
+				}
 			}
 		}
-		host_preview(u16(id));
+		if (bad)
+		{
+			::Msg("! [coop] coop_death_preview [character id [death seq]]: 0 = the host, a player's proxy id otherwise; "
+			      "the seq of a death he reported applies his list of what he had on");
+			return;
+		}
+		host_preview(u16(id), u16(seq));
 	}
 	void Info(TInfo& I) override
 	{
-		xr_strcpy(I, "host: log what a death of character N (default 0, the host) would take now; moves nothing");
+		xr_strcpy(I, "host: log what a death of character N [report seq S] (default 0, the host) would take now; moves nothing");
 	}
 };
 } // namespace
@@ -690,19 +776,19 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode)
 	if (mode == Drop::Corpse)
 	{
 		u32 count = 0;
-		stash_for(character, body, io, false, count);
+		stash_for(character, body, io, false, seq, count);
 		return count;
 	}
 
-	const std::vector<Candidate> candidates =
-	    loss_candidates(collect(io, false), g_set.kinds, layout_known(character));
+	const Carried carried = carried_of(character, io, false, seq);
+	const std::vector<Candidate> candidates = loss_candidates(carried.items, g_set.kinds, carried.layout_known);
 	const u64 game_time = ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0;
 	const u32 seed = loss_seed(character, seq, game_time);
 	const std::vector<u16> picked = pick_losses(candidates, g_set.shares, seed);
 	if (picked.empty())
 	{
-		::Msg("[coop] death of %s (seq %u): nothing of %u backpack items is lost", nick(character).c_str(), seq,
-		    u32(candidates.size()));
+		::Msg("[coop] death of %s (seq %u): nothing of %u backpack items is lost%s", nick(character).c_str(), seq,
+		    u32(candidates.size()), layout_note(carried, character).c_str());
 		return 0;
 	}
 
@@ -720,20 +806,20 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode)
 			++count;
 		}
 		g_st.destroyed += count;
-		::Msg("[coop] death of %s (seq %u): %u of %u backpack items are gone", nick(character).c_str(), seq, count,
-		    u32(candidates.size()));
+		::Msg("[coop] death of %s (seq %u): %u of %u backpack items are gone%s", nick(character).c_str(), seq, count,
+		    u32(candidates.size()), layout_note(carried, character).c_str());
 		return count;
 	}
 
 	u32 count = 0;
 	const u16 first = drop_all(character, body, picked, count);
-	::Msg("[coop] death of %s (seq %u): %u of %u backpack items dropped", nick(character).c_str(), seq, count,
-	    u32(candidates.size()));
+	::Msg("[coop] death of %s (seq %u): %u of %u backpack items dropped%s", nick(character).c_str(), seq, count,
+	    u32(candidates.size()), layout_note(carried, character).c_str());
 	queue_marker(character, first, Drop::Drop);
 	return count;
 }
 
-u16 host_move_to_stash(u16 character, bool everything)
+u16 host_move_to_stash(u16 character, bool everything, u16 seq)
 {
 	if (!mgr().is_host())
 		return kNoId;
@@ -746,7 +832,7 @@ u16 host_move_to_stash(u16 character, bool everything)
 	}
 	ensure_settings();
 	u32 count = 0;
-	return stash_for(character, body, io, everything, count);
+	return stash_for(character, body, io, everything, seq, count);
 }
 
 bool host_stash_pending(u16 character)
@@ -778,7 +864,7 @@ u32 host_take_money(u16 character, u8 pct)
 	return take;
 }
 
-void host_preview(u16 character)
+void host_preview(u16 character, u16 seq)
 {
 	if (mgr().is_client())
 	{
@@ -793,16 +879,23 @@ void host_preview(u16 character)
 		return;
 	}
 	ensure_settings();
-	const bool known = layout_known(character);
-	const std::vector<ItemFacts> backpack = collect(io, false);
+	const Carried carried = carried_of(character, io, false, seq);
+	const bool known = carried.layout_known;
+	const std::vector<ItemFacts>& backpack = carried.items;
 	const std::vector<Candidate> candidates = loss_candidates(backpack, g_set.kinds, known);
 	const u64 game_time = ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0;
 	const u32 seed = loss_seed(character, 0, game_time);
 	const std::vector<u16> picked = pick_losses(candidates, g_set.shares, seed);
-	::Msg("[coop] death preview of %s (character %u): %u backpack items, %u may be lost (the rest: quest items, the "
-	      "PDA%s)",
-	    nick(character).c_str(), character, u32(backpack.size()), u32(candidates.size()),
-	    known ? "" : ", what the player may have on: the host does not see his slots and belt");
+	if (carried.reported)
+		::Msg("[coop] death preview of %s (character %u): %u items carried, %u may be lost (the rest: %u on him by the "
+		      "list of death %u, quest items, the PDA)",
+		    nick(character).c_str(), character, u32(backpack.size()), u32(candidates.size()), u32(carried.worn), u32(seq));
+	else
+		::Msg("[coop] death preview of %s (character %u): %u backpack items, %u may be lost (the rest: quest items, the "
+		      "PDA%s)",
+		    nick(character).c_str(), character, u32(backpack.size()), u32(candidates.size()),
+		    known ? "" : ", what the player may have on: the host does not see his slots and belt; give the seq of a "
+		                 "death he reported to use his list");
 	::Msg("[coop]   drop / lose now (seed %u): %u items", seed, u32(picked.size()));
 	for (u8 c = 0; c < kCategories; ++c)
 	{
@@ -849,7 +942,7 @@ void install(Session& s) { s.on(Msg::DeathMarker, &on_marker_msg); }
 
 void reset()
 {
-	g_stashes.clear(); // a stash spawned but not filled stays empty; the items stay with their character
+	abandon_stashes("the session ended"); // review minor 5: an unfilled stash is released, not left empty in the world
 	g_markers.clear();
 	g_epoch = 0xffffffff;
 	g_st = Stats();
@@ -868,10 +961,10 @@ void print_status()
 	if (mgr().is_host())
 	{
 		::Msg("[coop]   death: %llu deaths charged; items %llu dropped, %llu destroyed, %llu into stashes; %llu stashes "
-		      "(%llu fell back to dropping, %llu given up: items stayed), %u waiting; %llu markers sent (%llu not), "
-		      "%llu RU taken",
+		      "(%llu fell back to dropping, %llu given up: items stayed, %llu released empty on a new world), %u "
+		      "waiting; %llu markers sent (%llu not), %llu RU taken",
 		    g_st.deaths, g_st.dropped, g_st.destroyed, g_st.moved, g_st.stashes, g_st.stash_fallbacks, g_st.stash_lost,
-		    u32(g_stashes.size()), g_st.markers_sent, g_st.markers_dropped, g_st.money_taken);
+		    g_st.stash_abandoned, u32(g_stashes.size()), g_st.markers_sent, g_st.markers_dropped, g_st.money_taken);
 		for (const PendingStash& p : g_stashes)
 			::Msg("[coop]     stash %u of %s: %u items, %lld ms left", p.stash, nick(p.character).c_str(),
 			    u32(p.items.size()), s64(p.deadline) - s64(now_ms()));

@@ -86,6 +86,7 @@ struct ItemFacts
 	bool helper = false; // is_helper_item(): the engine's own, never a world object
 	bool world = true; // an ALife entity: in the save and on every machine (false: host only, e.g. an NPC's supply bolt)
 	bool wearable = false; // its owner can have it in a slot or on the belt (a base slot, or the `belt` flag)
+	bool worn = false; // F3 T8b: the owner reported it in a slot or on the belt (mark_worn): never lost
 };
 
 // At most this many items are offered (the lowest ids): the whole set goes to pick_losses in one vector.
@@ -129,11 +130,32 @@ void sort_unique_bounded(std::vector<T>& v, Id id_of)
 }
 } // namespace detail
 
+// F3 T8b (Ruling F3-4): applies the list of what the owner of a client's proxy reported on him (his slots and belt, host
+// numbering, as survival::host_worn_items gives it) to the proxy's items: `worn` is set on the items named in it and
+// cleared on all the others, so a second list replaces the first. The order of the list, repeated ids and ids the proxy
+// does not carry do not matter; 0xffff is no id. Returns how many items are marked.
+inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_t>& worn)
+{
+	std::vector<uint16_t> ids(worn);
+	std::sort(ids.begin(), ids.end());
+	size_t marked = 0;
+	for (ItemFacts& f : items)
+	{
+		f.worn = f.id != 0xffff && std::binary_search(ids.begin(), ids.end(), f.id);
+		if (f.worn)
+			++marked;
+	}
+	return marked;
+}
+
 // The candidates of pick_losses (its contract: no quest items, a stable order). The caller passes the backpack; the
 // items never lost are left out, the rest go by id ascending, each id once, at most kMaxCandidates.
-// `layout_known` false: the character is a client's proxy. The host does not see where its player keeps his things —
-// an NPC cannot wear an outfit, has no belt and fills its slots in the order it took the items — so whatever the
+// `layout_known` false: the character is a client's proxy and the host does not know where its player keeps his things
+// — an NPC cannot wear an outfit, has no belt and fills its slots in the order it took the items — so whatever the
 // player may have on (wearable) stays with him.
+// `layout_known` true: the host's own actor (`items` is its exact backpack), or a client's proxy whose owner reported
+// what he has on (F3 T8b: `items` is everything the proxy carries, mark_worn has set `worn`); the items marked `worn`
+// stay with him, the rest — wearable or not — can be taken.
 inline std::vector<Candidate> loss_candidates(const std::vector<ItemFacts>& items, const KindTable& kinds,
 	bool layout_known)
 {
@@ -141,7 +163,7 @@ inline std::vector<Candidate> loss_candidates(const std::vector<ItemFacts>& item
 	out.reserve(items.size() < kMaxCandidates ? items.size() : kMaxCandidates);
 	for (const ItemFacts& f : items)
 	{
-		if (never_lost(f) || (!layout_known && f.wearable))
+		if (never_lost(f) || f.worn || (!layout_known && f.wearable))
 			continue;
 		out.push_back(Candidate{f.id, category_of(f, kinds)});
 	}
@@ -279,14 +301,18 @@ struct StashOwner
 	std::string key; // the player key digest on the character's custom data ([coop] key), empty if none
 };
 
-// Still the same character: the same player still plays it, or it still carries the same key. Either is enough:
-// a hardcore retirement (Task 10) rewrites the key while its player is still there (review I1), and a player who leaves
-// keeps the key on his parked character but not his peer (review minor 1).
+// Still the same character. Both sides have a key: the same key (R1). Otherwise the same player still plays it. So a
+// hardcore retirement (Task 10) can rewrite the key while its player is still there (review I1: the key is gone, the
+// peer stays), and a player who leaves keeps the key on his parked character but not his peer (review minor 1: the key
+// stays, the peer is gone).
 inline bool same_owner(const StashOwner& then, const StashOwner& now)
 {
-	const bool peer = then.peer != 0xffffffffu && then.peer == now.peer;
-	const bool key = !then.key.empty() && then.key == now.key;
-	return peer || key;
+	// T8b, review R1: two keys decide alone. A different key is another character even when the peer number matches
+	// (the id was released and given to a new proxy of a player who took the same number).
+	if (!then.key.empty() && !now.key.empty())
+		return then.key == now.key;
+	// A side without a key (Task 10 took it away, or it never had one): the peer is all there is.
+	return then.peer != 0xffffffffu && then.peer == now.peer;
 }
 
 // Where an object is on the host. Gone: no entity. Online: its game object is in the level (the stash: as an
