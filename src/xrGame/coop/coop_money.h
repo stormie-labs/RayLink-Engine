@@ -30,7 +30,10 @@ namespace coop
 namespace money
 {
 void install(Session& s);
-void reset(); // session started / ended / world replaced
+void reset(); // session ended, client's world replaced: nothing kept
+// Host started a session (sync::on_session_started): reset, and the player characters in the world now count as "from
+// the save" — they keep full allowances; one made later in this session starts empty (Ruling F2-10).
+void on_session_started();
 void frame(); // main thread, every frame: the client sends its queued changes
 void on_peer_left(PeerId id); // the connection's numbering goes; the character keeps its allowances
 // Host (sync::host_end_join): player `id` has loaded the world and is live. Sends him his balance once: the client

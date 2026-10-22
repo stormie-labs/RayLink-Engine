@@ -9,7 +9,8 @@
 //     session (HostBook): a dialog payout while the player talks to an NPC (holds its talk lock) from the dialog
 //     bucket (Policy::dialog_gain_cap in a row, dialog_gain_per_min per minute), anything else and the rest of a
 //     payout from the script bucket (script_gain_burst in a row, script_gain_per_min per minute). Changing the NPC
-//     or leaving the session refills nothing;
+//     or leaving the session refills nothing; a character made in this session (a new player key) starts with both
+//     buckets empty (Ruling F2-10);
 //   - no balance goes above Policy::max_money;
 //   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer);
 //   - a change of zero is malformed: a client never sends one.
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "coop_wire.h"
@@ -251,7 +253,9 @@ inline bool read(Reader& r, MoneyBalanceMsg& m)
 // ---------------------------------------------------------------- host book
 
 // The allowances of one character (its id in the host world). Kept for the whole session: a player who leaves and
-// joins again (a new connection, maybe a new peer id) finds them as he left them.
+// joins again (a new connection, maybe a new peer id) finds them as he left them. A character that was in the save
+// when the session started gets full allowances at its first change; one made in this session (a new player key)
+// starts empty and only gets the refills (Ruling F2-10).
 struct CharacterAllowances
 {
 	Allowance script;
@@ -274,6 +278,18 @@ struct Decision
 class HostBook
 {
 public:
+	// A new session: nothing is kept. `from_save`: the characters in the world when it started (a player key the host
+	// has not seen makes a new one later, which then starts with empty allowances).
+	void start_session(const std::vector<uint32_t>& from_save)
+	{
+		m_acked.clear();
+		m_characters.clear();
+		m_from_save.clear();
+		for (uint32_t id : from_save)
+			m_from_save.insert(id);
+	}
+	bool from_save(uint32_t character) const { return m_from_save.count(character) != 0; }
+
 	// ReqMoney `q` of connection `peer` whose character is `character` and has `balance`. `dialog_lock`: he holds an
 	// NPC's talk lock now; `to`: the receiver of a transfer (looked up from q.ref; ignored for other causes).
 	Decision on_request(uint32_t peer, uint32_t character, const MoneyReq& q, uint32_t balance, bool dialog_lock,
@@ -295,7 +311,7 @@ public:
 			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
 			return d;
 		}
-		CharacterAllowances& a = m_characters[character];
+		CharacterAllowances& a = allowances_of(character, now_ms);
 		uint32_t from_dialog = 0;
 		d.verdict = apply_client_delta(d.balance, q.delta, q.cause, dialog_lock, a.dialog, a.script, p, now_ms,
 		    &from_dialog);
@@ -315,12 +331,8 @@ public:
 	}
 	// A connection ended: its numbering goes (a new one starts at 1), the character's allowances stay.
 	void peer_left(uint32_t peer) { m_acked.erase(peer); }
-	// A new session: nothing is kept.
-	void reset()
-	{
-		m_acked.clear();
-		m_characters.clear();
-	}
+	// Nothing is kept, no character counts as one from the save.
+	void reset() { start_session({}); }
 	const CharacterAllowances* allowances(uint32_t character) const
 	{
 		const auto it = m_characters.find(character);
@@ -329,8 +341,35 @@ public:
 	const std::map<uint32_t, uint32_t>& connections() const { return m_acked; }
 
 private:
+	CharacterAllowances& allowances_of(uint32_t character, uint64_t now_ms)
+	{
+		const auto found = m_characters.find(character);
+		if (found != m_characters.end())
+			return found->second;
+		CharacterAllowances& a = m_characters[character];
+		if (!from_save(character))
+		{
+			// Ruling F2-10: made in this session. Started and empty: refill() gives no burst, only the refills from now.
+			a.script.started = a.dialog.started = true;
+			a.script.at = a.dialog.at = now_ms;
+		}
+		return a;
+	}
+
 	std::map<uint32_t, uint32_t> m_acked; // peer -> newest answered seq
 	std::map<uint32_t, CharacterAllowances> m_characters; // character id -> allowances
+	std::set<uint32_t> m_from_save; // characters in the world when the session started
 };
+
+// Settles an applied transfer (Decision::balance, Decision::credit) in `b`, which has set(peer, RU) and add(peer, RU):
+// the giver's new balance first, then the receiver gets the credit on top of what he holds at that moment. So two
+// connections on one character (a fair game never has them) keep exactly the money they had: crediting first and then
+// writing the giver's figure, taken before, would lose the credit. Nothing ever prints money (review round 2).
+template <class Balances>
+void settle_transfer(Balances& b, uint32_t giver, uint32_t giver_balance, uint32_t receiver, uint32_t credit)
+{
+	b.set(giver, giver_balance);
+	b.add(receiver, credit);
+}
 } // namespace ledger
 } // namespace coop

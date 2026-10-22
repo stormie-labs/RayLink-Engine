@@ -9,6 +9,7 @@
 #include "coop_entities.h"
 #include "coop_events.h"
 #include "coop_dialog.h"
+#include "coop_world.h"
 #include "xrCoop/coop_ledger.h"
 
 #include <cmath>
@@ -19,6 +20,9 @@
 #include "GameObject.h"
 #include "InventoryOwner.h"
 #include "xrServer_Objects_ALife.h"
+#include "ai_space.h"
+#include "alife_simulator.h"
+#include "alife_object_registry.h"
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
 
@@ -244,6 +248,19 @@ bool adjust(PeerId peer, s64 delta, const char* why, Source source)
 	return true;
 }
 
+// The world's balances by peer for ledger::settle_transfer: set writes a giver's balance, add credits a receiver (and
+// sends him his balance).
+struct WorldBalances
+{
+	void set(uint32_t peer, uint32_t value)
+	{
+		const u16 holder = holder_of(PeerId(peer));
+		if (holder != kNoId)
+			write_balance(holder, value);
+	}
+	void add(uint32_t peer, uint32_t credit) { adjust(PeerId(peer), s64(credit), "transfer", Source::Transfer); }
+};
+
 // A transfer's receiver as the ledger wants it: another player of the session (joined, or the host) who has a
 // character, with his balance.
 ledger::Receiver receiver_of(PeerId to)
@@ -306,10 +323,11 @@ void host_on_req(PeerId from, Reader& r)
 		g_h.gain_dialog += d.gain_dialog;
 		if (d.credit)
 		{
-			adjust(PeerId(q.ref), s64(d.credit), "transfer", Source::Transfer); // the receiver first
+			WorldBalances world;
+			ledger::settle_transfer(world, from, d.balance, q.ref, d.credit); // giver first (review round 2)
 			++g_h.transfers;
 		}
-		if (d.balance != balance)
+		else if (d.balance != balance)
 			write_balance(holder, d.balance);
 	}
 	else if (q.cause == Cause::Transfer && (!to.present || to.peer == from))
@@ -317,7 +335,9 @@ void host_on_req(PeerId from, Reader& r)
 	if (d.verdict != Verdict::Applied && log_allowed())
 		::Msg("[coop] money change #%u of <%s> refused: %+d RU (%s), %s; balance %u RU", q.seq, nick_of(from), q.delta,
 		    cause_name(q.cause), verdict_name(d.verdict), d.balance);
-	send_balance(from, d.balance);
+	u32 now_holds = d.balance; // what the character holds after it all (the same unless a transfer went to himself)
+	read_balance(holder, now_holds);
+	send_balance(from, now_holds);
 }
 
 // ---------------------------------------------------------------- client state
@@ -436,9 +456,9 @@ int host_give(lua_State* L, PeerId to, u32 amount)
 	const Verdict v = ledger::check_transfer(kHostPeer, receiver_of(to), -s64(amount), balance, credit, policy());
 	if (v != Verdict::Applied)
 		return refuse(L, v == Verdict::Malformed ? "no such player" : verdict_name(v));
-	adjust(to, s64(credit), "transfer", Source::Transfer);
+	WorldBalances world;
+	ledger::settle_transfer(world, kHostPeer, balance, to, credit); // giver first (review round 2)
 	++g_h.transfers;
-	write_balance(holder_of(kHostPeer), balance);
 	return done(L);
 }
 
@@ -551,6 +571,22 @@ void reset()
 	g_cl = ClientState(); // g_cl_seq goes on: see its comment
 }
 
+void on_session_started()
+{
+	reset();
+	if (!mgr().is_host() || !ai().get_alife())
+		return;
+	// Ruling F2-10: the player characters in the world now are "from the save" (returning players keep full
+	// allowances). One the host makes later in this session for a player key it has not seen starts empty.
+	std::vector<uint32_t> from_save;
+	for (const auto& it : ai().alife().objects().objects())
+		if (it.second && world::is_player_character(it.second))
+			from_save.push_back(it.first);
+	g_book.start_session(from_save);
+	::Msg("[coop] money: %u player character(s) from the save keep their allowances; new ones start empty",
+	    (u32)from_save.size());
+}
+
 void frame()
 {
 	if (mgr().is_live_client())
@@ -600,10 +636,13 @@ void print_status()
 		{
 			const u16 holder = holder_of(it.first);
 			const ledger::CharacterAllowances* a = holder != kNoId ? g_book.allowances(holder) : nullptr;
-			::Msg("[coop]     #%u <%s>: %u RU, answered #%u, character %u, allowances script %.0f / dialog %.0f RU",
-			    it.first, nick_of(it.first), host_balance(it.first), it.second, holder,
-			    a && a->script.started ? a->script.tokens : double(p.script_gain_burst),
-			    a && a->dialog.started ? a->dialog.tokens : double(p.dialog_gain_cap));
+			const bool saved = holder != kNoId && g_book.from_save(holder);
+			// Not used yet: full for a character from the save, empty for a new one (F2-10).
+			const auto shown = [saved](const ledger::Allowance* x, u32 burst)
+			{ return x && x->started ? x->tokens : (saved ? double(burst) : 0.0); };
+			::Msg("[coop]     #%u <%s>: %u RU, answered #%u, character %u (%s), allowances script %.0f / dialog %.0f RU",
+			    it.first, nick_of(it.first), host_balance(it.first), it.second, holder, saved ? "from the save" : "new",
+			    shown(a ? &a->script : nullptr, p.script_gain_burst), shown(a ? &a->dialog : nullptr, p.dialog_gain_cap));
 		}
 		return;
 	}

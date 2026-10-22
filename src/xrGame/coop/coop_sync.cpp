@@ -68,7 +68,7 @@ void on_session_started()
 	requests::reset();
 	dialog::reset();
 	trade::reset();
-	money::reset(); // F2 T1
+	money::on_session_started(); // F2 T1 (round 2: characters from the save keep full allowances, Ruling F2-10)
 	survival::reset();
 	presence::reset();
 	items::reset();
