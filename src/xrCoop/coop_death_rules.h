@@ -1,10 +1,12 @@
 // Anomaly Coop — death rules (F3, CHECKPOINTS_DEATH.md §3): the host's death settings and their wire form, which items
 // a death takes from the character, the wipe test and the per-player tracker that makes sure one death is handled once
-// (also across a leave/return and a world reload). The host decides everything here; the engine layer only feeds in
-// what it sees and carries out the answer.
+// (also across a leave/return and a world reload), and the decisions of the host's death flow around it (F3 Task 8: the
+// respawn debt, the answer to an Alive report, the worn-items tail of a client's Dead report, the HUD format check).
+// The host decides everything here; the engine layer only feeds in what it sees and carries out the answer.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -344,6 +346,108 @@ inline void on_alive(Tracker& t)
 	t.respawn_at = 0;
 	t.respawn_due = false;
 	t.decided_seq = 0xffff;
+}
+
+// ---------------------------------------------------------------- the host's death flow (F3 Task 8, fix round 1 I-2)
+
+// survival::Life numbers (coop_survival.h), as is_wipe takes them.
+constexpr uint8_t kLifeAlive = 0, kLifeWounded = 1, kLifeDead = 2, kLifeSpectating = 3, kLifeRespawning = 4;
+
+// The respawn a character is owed in his world (fix round 1, M-1 and M-3). The engine keeps it with the character (his
+// custom data), so a save written while he is dead or evacuated carries it to the world loaded from that save (a level
+// change, an autosave restore), and a new game or another save does not have it. Set when the host decides a checkpoint
+// death; paid when the owner reports Respawning: the order reached him and he applied it (the wear included), so a
+// respawn that crossed a leave or a world change is not given twice. A hardcore death owes nothing. `decided` is what
+// on_died answered to this report (None for every report that is not a death).
+inline bool debt_after_report(bool debt, uint8_t life, Action decided)
+{
+	if (decided == Action::LossesAndEvacuate)
+		return true;
+	if (life == kLifeRespawning)
+		return false;
+	return debt;
+}
+
+// What the host does when the owner of a character reports him alive.
+enum class AliveStep : uint8_t
+{
+	None,
+	Respawn, // put him on his checkpoint: he came back (a leave, a world change) and a respawn is still owed
+	Spectate // out of a hardcore run: watch again
+};
+
+// The owner reports `t`'s character alive. A respawn is owed when the tracker waited for his return (on_returned) or
+// the world keeps a debt for him (`debt`, debt_after_report); `ordered`: a respawn order for this report's seq is out
+// already (an Alive that crossed it on the wire must not get a second one). on_returned runs before on_alive, which
+// forgets the death. Ruling F3-7: until F3 Task 10 a character out of a hardcore run stays out whatever the mode is now
+// and however often he rejoins: Spectate, never a respawn.
+inline AliveStep on_alive_report(Tracker& t, bool debt, bool ordered)
+{
+	const bool returned = on_returned(t);
+	on_alive(t);
+	if (t.hardcore_out)
+		return AliveStep::Spectate;
+	return (returned || debt) && !ordered ? AliveStep::Respawn : AliveStep::None;
+}
+
+// Ruling F3-4: the tail of a client's Dead report, {u8 n, n x u16 item}: the items in his slots and on his belt, host
+// numbering. A proxy (an NPC: no outfit, no belt) cannot show them to the host.
+constexpr uint8_t kMaxWornIds = 40; // 18 slots at most, a belt of a few artefacts: more is a modified client
+
+// Writes the tail: the first kMaxWornIds of `ids` (the caller gives each id once).
+inline void write_worn(Writer& w, const std::vector<uint16_t>& ids)
+{
+	const size_t n = ids.size() < kMaxWornIds ? ids.size() : size_t(kMaxWornIds);
+	w.u8(static_cast<uint8_t>(n));
+	for (size_t i = 0; i < n; ++i)
+		w.u16(ids[i]);
+}
+
+enum class WornTail : uint8_t
+{
+	Absent, // no bytes left: the report has no list, the layout stays unknown
+	Bad,    // n over kMaxWornIds or fewer bytes than n ids: the whole list is dropped
+	Ok
+};
+
+// Reads the tail. Ok: `out` holds the ids sorted, each once (whether the proxy still carries them is the engine's
+// check). Absent / Bad: `out` is empty. Bytes after the list are left unread.
+inline WornTail read_worn(Reader& r, std::vector<uint16_t>& out)
+{
+	out.clear();
+	if (r.remaining() == 0)
+		return WornTail::Absent;
+	const uint8_t n = r.u8();
+	if (!r.ok() || n > kMaxWornIds || r.remaining() < size_t(n) * 2)
+		return WornTail::Bad;
+	out.reserve(n);
+	for (uint8_t i = 0; i < n; ++i)
+		out.push_back(r.u16());
+	if (!r.ok())
+	{
+		out.clear();
+		return WornTail::Bad;
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return WornTail::Ok;
+}
+
+// HUD: a translated format string the engine fills with one value is used only if it has exactly one '%' and that one
+// is followed by `conv` ('d', 's'); a broken translation must not reach sprintf with the wrong arguments.
+inline bool one_conversion(const char* fmt, char conv)
+{
+	if (!fmt)
+		return false;
+	unsigned percents = 0;
+	bool ok = false;
+	for (const char* p = fmt; *p; ++p)
+		if (*p == '%')
+		{
+			++percents;
+			ok = p[1] == conv;
+		}
+	return percents == 1 && ok;
 }
 } // namespace death
 } // namespace coop

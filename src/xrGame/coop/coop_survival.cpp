@@ -33,6 +33,10 @@
 #include "ai_space.h"
 #include "level_graph.h"
 #include "ai_object_location.h"
+#include "alife_simulator.h"
+#include "alife_object_registry.h"
+#include "alife_graph_registry.h"
+#include "xrServer_Objects_ALife_Monsters.h"
 #include "../Include/xrRender/Kinematics.h"
 #include "../Include/xrRender/KinematicsAnimated.h"
 #include "../Include/xrRender/animation_blend.h"
@@ -40,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
+#include <string>
 #include <vector>
 
 namespace coop
@@ -66,10 +71,10 @@ constexpr u32 kGuardMs = 1000;
 constexpr float kCamDrop = 1.1f; // eye height drop while lying
 constexpr float kOverheadHeight = 6.f; // evacuated with nobody alive: camera this high above the body
 constexpr float kOverheadTurn = 0.08f; // ... turning this many radians a second
-// Ruling F3-4: slot and belt ids in a client's Dead report. The stock slots are 1..LAST_SLOT (18 with
-// MORE_INVENTORY_SLOTS), a belt holds a few artefacts: 40 is more than any loadout, and caps what a modified
-// client can claim as worn.
-constexpr u8 kMaxWornIds = 40;
+// The respawn a character is owed lives with him in the world (fix round 1, M-1 / M-3): [coop_death] respawn = 1 in his
+// custom data, saved with him like his checkpoint slot (coop_checkpoints). death::debt_after_report decides it.
+const char* const kDebtSection = "coop_death";
+const char* const kDebtKey = "respawn";
 
 enum Op : u8
 {
@@ -233,14 +238,12 @@ struct HostRec
 	Fvector anchor{}; // where the player was first seen alive in this world (respawn fallback)
 	// Ruling F3-4: the slot and belt items of the owner's Dead report of death `worn_seq`
 	bool has_worn = false;
-	u16 worn_seq = 0xffff;
+	u16 worn_seq = death::kNoSeq;
 	xr_vector<u16> worn;
+	u16 ordered_seq = death::kNoSeq; // a respawn order for this fall is out (cleared by any report but Alive, and by a leave)
+	bool debt = false; // the respawn debt as last read / written (coop_status only: the world keeps the real one)
 };
 xr_map<u16, HostRec> g_host;
-// Characters to put on their checkpoint as soon as they report Alive (Review Focus 1 and 2): dead when they left
-// after the respawn order went out (the tracker no longer waits then), or dead / evacuated when the host's world was
-// replaced. Survives the world change (g_host does not); cleared with the session.
-xr_set<u16> g_camp_on_return;
 bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
 u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
@@ -342,20 +345,12 @@ xr_string tr(const char* id, const char* fallback)
 	return s.size() && xr_strcmp(s.c_str(), id) != 0 ? xr_string(s.c_str()) : xr_string(fallback);
 }
 
-// A translated format with exactly one conversion `conv` (%d, %s) and no other '%': a broken translation must not
-// reach xr_sprintf with the wrong arguments.
+// A translated format with exactly one conversion `conv` (%d, %s) and no other '%' (death::one_conversion): a broken
+// translation must not reach xr_sprintf with the wrong arguments.
 xr_string tr_format(const char* id, const char* fallback, char conv)
 {
-	xr_string f = tr(id, fallback);
-	u32 percents = 0;
-	bool ok = false;
-	for (size_t i = 0; i < f.size(); ++i)
-		if (f[i] == '%')
-		{
-			++percents;
-			ok = i + 1 < f.size() && f[i + 1] == conv;
-		}
-	return percents == 1 && ok ? f : xr_string(fallback);
+	const xr_string f = tr(id, fallback);
+	return death::one_conversion(f.c_str(), conv) ? f : xr_string(fallback);
 }
 
 bool action_down(EGameActions a)
@@ -606,14 +601,14 @@ void write_state(Writer& w, u16 host_id, Life life, u16 seq, u32 left, const cha
 	w.str(nick ? nick : "");
 }
 
-// Ruling F3-4: the tail of a client's Dead report, {u8 n, n x u16 item}: the items in its slots and on its belt in
-// host numbering, each once, at most kMaxWornIds. The host's proxy cannot show them (an NPC has no outfit or belt).
+// Ruling F3-4: the tail of a client's Dead report (death::write_worn): the items in its slots and on its belt in host
+// numbering, each once. The host's proxy cannot show them (an NPC has no outfit or belt).
 void write_worn(Writer& w, CActor& a)
 {
-	xr_vector<u16> ids;
+	std::vector<u16> ids;
 	const auto add = [&ids](PIItem it)
 	{
-		if (!it || it->object().getDestroy() || ids.size() >= kMaxWornIds)
+		if (!it || it->object().getDestroy())
 			return;
 		const u16 id = join::to_host(it->object().ID());
 		if (id != 0xffff && std::find(ids.begin(), ids.end(), id) == ids.end())
@@ -624,9 +619,7 @@ void write_worn(Writer& w, CActor& a)
 		add(inv.ItemFromSlot(slot));
 	for (PIItem it : inv.m_belt)
 		add(it);
-	w.u8(u8(ids.size()));
-	for (u16 id : ids)
-		w.u16(id);
+	death::write_worn(w, ids); // the first death::kMaxWornIds
 }
 
 void host_on_state(u16 id, Life life, u16 seq);
@@ -986,6 +979,49 @@ Fvector ground_point(CGameObject* o)
 	return p;
 }
 
+// The server entity that carries a character's custom data: the host's actor (0) or a player character (as
+// coop_checkpoints keeps the slot); nullptr without ALife or for anything else.
+CSE_Abstract* character_entity(u16 character)
+{
+	if (!ai().get_alife())
+		return nullptr;
+	if (character == 0)
+		return ai().alife().graph().actor();
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(character, true);
+	return e && world::is_player_character(e) ? e : nullptr;
+}
+
+// Fix round 1 (M-1 / M-3): the respawn debt lives with the character in the world, so it reaches exactly the worlds
+// saved while he owed it (a level change, an autosave) and no new game, no other save, no other entity under his id.
+bool debt_read(u16 character)
+{
+	const CSE_Abstract* e = character_entity(character);
+	if (!e || !e->m_ini_string.size())
+		return false;
+	std::string v;
+	return checkpoint::ini_get(e->m_ini_string.c_str(), kDebtSection, kDebtKey, v) && v == "1";
+}
+
+void debt_write(u16 character, bool owed)
+{
+	CSE_Abstract* e = character_entity(character);
+	if (!e)
+	{
+		if (owed)
+			::Msg("! [coop] respawn debt of %u not kept: no character entity (a world change will not bring it back)",
+			    character);
+		return;
+	}
+	std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
+	const std::string before = text;
+	if (owed)
+		checkpoint::ini_set(text, kDebtSection, kDebtKey, "1");
+	else
+		checkpoint::ini_erase(text, kDebtSection, kDebtKey);
+	if (text != before)
+		e->m_ini_string = text.c_str();
+}
+
 // F3 Task 8 step 3: after a decision, the lives of everybody present in the host's world (the host, the players that
 // report, without the parked characters of players who left). Every one of them down for good: coop_group_wipe, once
 // until somebody stands up again (host_on_state Alive).
@@ -1012,7 +1048,8 @@ bool host_order_respawn(u16 id, u16 seq)
 	CGameObject* body = object_here(id);
 	if (!body)
 		return false;
-	const HostRec& h = g_host[id];
+	HostRec& h = g_host[id];
+	h.ordered_seq = seq; // before the order: the host's own Respawning comes back inside host_send_order and clears it
 	Fvector pos;
 	checkpoint::Kind kind = checkpoint::Kind::None;
 	if (!checkpoints::host_respawn_point(id, h.has_anchor ? &h.anchor : nullptr, body->Position(), pos, kind))
@@ -1034,12 +1071,13 @@ bool host_order_respawn(u16 id, u16 seq)
 // The host's answer to a death (death::Tracker: once per death). Checkpoint: the items (coop_death, by
 // coop_death_drop) and the money go now, the owner is evacuated for coop_respawn_delay, host_frame respawns him.
 // Hardcore: he is out and watches. The host's own actor (0) takes the same path: host_send_order applies to itself.
-void host_on_died(u16 id, u16 seq)
+death::Action host_on_died(u16 id, u16 seq)
 {
 	HostRec& h = g_host[id];
-	switch (death::on_died(h.tracker, seq, now(), g_rules))
+	const death::Action a = death::on_died(h.tracker, seq, now(), g_rules);
+	switch (a)
 	{
-	case death::Action::None: return; // decided already (state repeats are normal)
+	case death::Action::None: return a; // decided already (state repeats are normal)
 	case death::Action::Spectate: host_order_spectate(id, seq); break;
 	case death::Action::LossesAndEvacuate:
 	{
@@ -1052,42 +1090,43 @@ void host_on_died(u16 id, u16 seq)
 	}
 	}
 	host_check_wipe();
+	return a;
 }
 
+// Every life report of a character's owner (the host's own too). The respawn debt follows the report
+// (death::debt_after_report) and is kept in the world; an Alive report is answered by death::on_alive_report: a respawn
+// owed after a leave or a world change (Review Focus 1 / 2), a hardcore spectator sent back to watching (Ruling F3-7).
 void host_on_state(u16 id, Life life, u16 seq)
 {
 	HostRec& h = g_host[id];
-	switch (life)
+	const death::Action decided = life == Life::Dead ? host_on_died(id, seq) : death::Action::None;
+	const bool before = debt_read(id);
+	const bool owed = death::debt_after_report(before, u8(life), decided);
+	if (owed != before)
+		debt_write(id, owed);
+	h.debt = owed;
+	if (life != Life::Alive)
 	{
-	case Life::Alive:
-	{
-		h.revive_pending_until = 0;
-		g_wipe_fired = false; // somebody stands: the next wipe is a new one
-		if (!h.has_anchor)
-			if (CGameObject* o = object_here(id))
-			{
-				h.anchor = ground_point(o);
-				h.has_anchor = true;
-			}
-		// Review Focus 1 and 2: a respawn owed to a player who came back to the world while dead. on_returned
-		// before on_alive, which forgets the death (the new actor counts its falls from 0 again, F3 R1 finding 1).
-		const bool returned = death::on_returned(h.tracker);
-		const bool camp = g_camp_on_return.erase(id) != 0;
-		death::on_alive(h.tracker);
-		h.has_worn = false;
-		if (h.tracker.hardcore_out)
-		{
-			if (g_rules.mode == death::Mode::Hardcore)
-				host_order_spectate(id, seq); // rejoined after dying: still out in this world
-			else
-				h.tracker.hardcore_out = false; // the host left hardcore: he plays on (and leaves / returns as anyone)
-		}
-		else if ((returned || camp) && !host_order_respawn(id, seq))
-			g_camp_on_return.insert(id); // no body here yet: his next Alive report (5 s) tries again
-		break;
+		h.ordered_seq = death::kNoSeq; // a new fall, or the order arrived (Respawning)
+		return;
 	}
-	case Life::Dead: host_on_died(id, seq); break;
-	default: break;
+	h.revive_pending_until = 0;
+	g_wipe_fired = false; // somebody stands: the next wipe is a new one
+	if (!h.has_anchor)
+		if (CGameObject* o = object_here(id))
+		{
+			h.anchor = ground_point(o);
+			h.has_anchor = true;
+		}
+	h.has_worn = false;
+	switch (death::on_alive_report(h.tracker, owed, h.ordered_seq == seq))
+	{
+	case death::AliveStep::Spectate: host_order_spectate(id, seq); break; // still out (rejoined, or the mode changed)
+	case death::AliveStep::Respawn:
+		if (!host_order_respawn(id, seq))
+			::Msg("[coop] respawn of %s waits: no body here yet (the next report tries again)", nick_of(id).c_str());
+		break;
+	case death::AliveStep::None: break;
 	}
 }
 
@@ -1153,31 +1192,17 @@ void host_broadcast_rules()
 	net::host_broadcast(Msg::PlayerRules, w);
 }
 
-// Review Focus 2: a load / level change replaces the host's world. Whoever was dead or evacuated comes back on his
-// checkpoint (the arrival point Task 6 set on a level change) once he reports alive in the new world; the losses of
-// that death were taken already. Dead after the respawn order went out (the tracker no longer waits then): the same.
-// Hardcore's out players are not brought back here. Runs before the host's books (g_host) are dropped.
-void host_mark_world_replaced()
-{
-	for (auto& it : g_host)
-	{
-		const bool ordered = !it.second.tracker.hardcore_out && life_by_host_id(it.first) == Life::Dead;
-		if (death::on_world_replaced(it.second.tracker) || ordered)
-			g_camp_on_return.insert(it.first);
-	}
-}
-
 void host_frame(u64 t)
 {
 	const u32 epoch = join::host_world_epoch();
 	if (epoch != g_epoch)
 	{
 		if (g_epoch != 0xffffffff)
-		{
 			g_me.actor = nullptr; // the new actor may reuse the old one's address: frame() must still start it over
-			host_mark_world_replaced();
-		}
-		g_epoch = epoch; // deaths and anchors start over (the new actors count their falls from 0)
+		// A load / level change replaced the world: deaths and anchors start over (the new actors count their falls
+		// from 0). Review Focus 2: whoever was dead or evacuated when this world was saved carries his respawn debt in
+		// it (debt_read) and is put on his checkpoint at his first Alive report here; the losses were taken already.
+		g_epoch = epoch;
 		g_host.clear();
 		g_wipe_fired = false;
 	}
@@ -1193,15 +1218,15 @@ void host_frame(u64 t)
 	}
 
 	// players that left: their characters are parked. Dead or evacuated: the countdown stops and the respawn waits for
-	// their return (death::on_left, Review Focus 1); dead with the respawn order already out: the same, by life state.
+	// their return (death::on_left, Review Focus 1); dead with the respawn order already out but not applied: the debt
+	// in the world brings it on the return. An order of the fall he left at is void.
 	for (auto it = g_players.begin(); it != g_players.end();)
 	{
 		if (world::is_parked(it->first) || join::peer_of_proxy(it->first) == kInvalidPeer)
 		{
 			HostRec& h = g_host[it->first];
 			death::on_left(h.tracker); // hardcore_out stays: leaving does not bring a dead player back
-			if (it->second.life == Life::Dead && !h.tracker.hardcore_out && !h.tracker.respawn_due)
-				g_camp_on_return.insert(it->first);
+			h.ordered_seq = death::kNoSeq;
 			h.revive_pending_until = 0;
 			it = g_players.erase(it);
 		}
@@ -1237,9 +1262,9 @@ void host_frame(u64 t)
 
 // ---------------------------------------------------------------- handlers
 
-// Host, Ruling F3-4: the slot / belt tail of a client's Dead report (write_worn). Checked as anything from the
-// network: at most kMaxWornIds, a short or longer list is dropped whole; of the ids only items the proxy carries
-// right now stay (each once, sorted). Kept per death: the losses of that death read it (host_worn_items).
+// Host, Ruling F3-4: the slot / belt tail of a client's Dead report (death::read_worn: at most kMaxWornIds, a short
+// packet or a longer count drops the list whole). Of the ids only items the proxy carries right now stay (each once,
+// sorted). Kept per death: the losses of that death read it (host_worn_items).
 void host_read_worn(u16 proxy, u16 seq, Reader& r)
 {
 	if (r.remaining() == 0)
@@ -1247,23 +1272,12 @@ void host_read_worn(u16 proxy, u16 seq, Reader& r)
 	HostRec& h = g_host[proxy];
 	if (h.has_worn && h.worn_seq == seq)
 		return; // the 5 s repeat of the same death: the first list counts
-	const u8 n = r.u8();
-	if (!r.ok() || n > kMaxWornIds)
+	std::vector<u16> ids;
+	if (death::read_worn(r, ids) != death::WornTail::Ok)
 	{
 		++g_stat.worn_refused;
 		return;
 	}
-	xr_vector<u16> ids;
-	ids.reserve(n);
-	for (u8 i = 0; i < n; ++i)
-		ids.push_back(r.u16());
-	if (!r.ok())
-	{
-		++g_stat.worn_refused;
-		return;
-	}
-	std::sort(ids.begin(), ids.end());
-	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 	ids.erase(std::remove_if(ids.begin(), ids.end(), [proxy](u16 id)
 	{
 		CGameObject* o = object_here(id);
@@ -1271,7 +1285,7 @@ void host_read_worn(u16 proxy, u16 seq, Reader& r)
 	}), ids.end());
 	h.has_worn = true;
 	h.worn_seq = seq;
-	h.worn = std::move(ids);
+	h.worn.assign(ids.begin(), ids.end());
 	++g_stat.worn_reports;
 }
 
@@ -1686,7 +1700,7 @@ void leave_session()
 	else if (a && a == g_me.actor)
 		release_controls(a);
 	forget_local();
-	g_host.clear(); // g_camp_on_return stays: a host frame without a level is a world change (reset() clears it)
+	g_host.clear(); // the respawn debts stay in the world (custom data), not here
 	g_wipe_fired = false;
 	g_rules_from_host = false;
 	g_hud.clear();
@@ -1846,7 +1860,6 @@ void register_console()
 void reset()
 {
 	leave_session();
-	g_camp_on_return.clear();
 	g_rules = console_rules();
 	g_epoch = 0xffffffff;
 	g_last_roster = g_last_guard = 0;
@@ -1859,11 +1872,7 @@ void frame()
 	if (!g_pGameLevel || !live())
 	{
 		if (g_me.actor || !g_players.empty() || !g_host.empty())
-		{
-			if (live() && mgr().is_host())
-				host_mark_world_replaced(); // the host's world is going away mid-session: a load / level change
 			leave_session();
-		}
 		return;
 	}
 	const u64 t = now();
@@ -1923,13 +1932,12 @@ void print_status()
 	for (const auto& it : g_host)
 	{
 		const death::Tracker& k = it.second.tracker;
-		if (k.respawn_at || k.respawn_due || k.hardcore_out)
-			::Msg("[coop]   host: character %u%s%s%s", it.first,
+		if (k.respawn_at || k.respawn_due || k.hardcore_out || it.second.debt)
+			::Msg("[coop]   host: character %u%s%s%s%s", it.first,
 			    k.respawn_at ? (k.respawn_at > t ? " evacuated" : " respawn due") : "",
-			    k.respawn_due ? " respawn on return" : "", k.hardcore_out ? " out (hardcore)" : "");
+			    k.respawn_due ? " respawn on return" : "", k.hardcore_out ? " out (hardcore)" : "",
+			    it.second.debt ? " owed a respawn (custom data)" : "");
 	}
-	for (u16 id : g_camp_on_return)
-		::Msg("[coop]   host: character %u goes to his checkpoint when he reports alive", id);
 }
 
 void render_hud()

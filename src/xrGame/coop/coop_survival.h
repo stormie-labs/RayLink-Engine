@@ -18,8 +18,12 @@
 // after somebody stood up.
 //
 // The death is counted once (death::Tracker): a player who leaves while dead or evacuated comes back alive
-// at his checkpoint, and so does every dead player when the host's world is replaced (level change, load);
-// nothing is taken from him a second time. The host's actor (character 0) takes the same path.
+// at his checkpoint; nothing is taken from him a second time. The respawn a checkpoint death owes is kept with
+// the character in the world ([coop_death] respawn = 1 in his custom data, death::debt_after_report) until the
+// owner reports Respawning, so a world saved while he owed it (a level change, an autosave) puts him on his
+// checkpoint at his first Alive there, and a new game or another save does not. Ruling F3-7: until F3 Task 10
+// a character out of a hardcore run stays a spectator at every Alive, whatever the mode is now.
+// The host's actor (character 0) takes the same path.
 //
 // The engine actor never dies during a session, in either mode: while the player is down its health is
 // pinned just above zero (CActorCondition hook) and every kill of it is intercepted (CEntity::KillEntity),
