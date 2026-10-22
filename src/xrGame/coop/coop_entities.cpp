@@ -323,6 +323,7 @@ xr_map<u16, MirrorTrack> g_tracks;
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
+u64 g_unbound_dropped = 0; // member ids forgotten by squads from the wire (released, dead, switched alone, disbanded)
 
 struct ApplyGuard
 {
@@ -366,7 +367,9 @@ void apply_update(CSE_ALifeDynamicObject* e, NET_Packet& update)
 
 // A squad lists its members by id. A squad from the save has them bound by the engine
 // (on_after_game_load); a squad that came over the wire has null member pointers, which
-// switch_online/offline and on_failed_switch_online dereference.
+// switch_online/offline and on_failed_switch_online dereference. Its members are ordinary
+// objects here (m_group_id free), so the stock on_unregister never takes them out of it:
+// unregister_member only forgets such an id (alife_online_offline_group.cpp).
 bool group_bound(const CSE_ALifeOnlineOfflineGroup& g)
 {
 	for (const auto& m : g.squad_members())
@@ -375,14 +378,38 @@ bool group_bound(const CSE_ALifeOnlineOfflineGroup& g)
 	return true;
 }
 
+// Client: forget `id` in every squad that lists it unbound. On the host the creature has left its
+// squad (release, death, a switch of its own); here nothing else would drop the id, and a stale id
+// makes the squad switch whatever creature reuses it later.
+void drop_unbound(u16 id)
+{
+	const CALifeGroupRegistry::OBJECTS& groups = ai().alife().groups().objects();
+	for (const auto& it : groups)
+	{
+		CSE_ALifeOnlineOfflineGroup* g = it.second;
+		const CSE_ALifeOnlineOfflineGroup::MEMBERS& members = g->squad_members();
+		const auto found = members.find(id);
+		if (found != members.end() && !found->second)
+		{
+			g->unregister_member(id);
+			++g_unbound_dropped;
+		}
+	}
+}
+
 // The host switches squad members only together with their squad. A member that the host
 // switches (or removes) on its own has left its squad there (death, script): do the same here,
-// otherwise the squad keeps a raw pointer to it.
+// otherwise the squad keeps a raw pointer to it (bound) or a stale id (from the wire).
 void leave_group(CSE_ALifeDynamicObject* e)
 {
 	CSE_ALifeMonsterAbstract* m = smart_cast<CSE_ALifeMonsterAbstract*>(e);
-	if (!m || m->m_group_id == kNoId)
+	if (!m)
 		return;
+	if (m->m_group_id == kNoId)
+	{
+		drop_unbound(m->ID);
+		return;
+	}
 	const CALifeGroupRegistry::OBJECTS& groups = ai().alife().groups().objects();
 	auto it = groups.find(m->m_group_id);
 	if (it == groups.end() || !it->second->member(m->ID, true))
@@ -393,15 +420,37 @@ void leave_group(CSE_ALifeDynamicObject* e)
 	it->second->unregister_member(m->ID);
 }
 
-// Client: a squad is going away; its bound members become ordinary objects first.
+// Client: a squad is going away. As on the host (remove_squad) it is empty when released: bound
+// members become ordinary objects, unbound ids are forgotten (a destructor never meets them).
 void disband(CSE_ALifeOnlineOfflineGroup& g)
 {
-	xr_vector<u16> bound;
+	xr_vector<u16> ids;
 	for (const auto& m : g.squad_members())
-		if (m.second)
-			bound.push_back(m.first);
-	for (u16 id : bound)
+	{
+		ids.push_back(m.first);
+		if (!m.second)
+			++g_unbound_dropped;
+	}
+	for (u16 id : ids)
 		g.unregister_member(id);
+}
+
+// Client, a squad from the wire: the host took its dead out of it at death (on_death ->
+// notify_on_member_death), nothing tells the squad here. Forget them, or its next switch drags
+// the bodies offline while the host keeps them where they fell.
+void drop_dead_unbound(CSE_ALifeOnlineOfflineGroup& g)
+{
+	xr_vector<u16> dead;
+	for (const auto& m : g.squad_members())
+	{
+		CSE_ALifeMonsterAbstract* c =
+		    m.second ? nullptr : smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(m.first, true));
+		if (c && !c->g_Alive())
+			dead.push_back(m.first);
+	}
+	for (u16 id : dead)
+		g.unregister_member(id);
+	g_unbound_dropped += dead.size();
 }
 
 void apply_switch(CSE_ALifeDynamicObject* e, bool online, const Fvector& pos, const Fvector& ang, u32 node,
@@ -427,6 +476,9 @@ void apply_switch(CSE_ALifeDynamicObject* e, bool online, const Fvector& pos, co
 void apply_group_switch(CSE_ALifeOnlineOfflineGroup& g, bool online, const Fvector& pos, const Fvector& ang,
                         u32 node, u16 graph_id, NET_Packet& update)
 {
+	const bool bound = group_bound(g);
+	if (!bound)
+		drop_dead_unbound(g); // before the votes: a body's own vote is the host's (EntitySwitch of its own)
 	xr_vector<u16> members;
 	for (const auto& m : g.squad_members())
 		members.push_back(m.first);
@@ -442,7 +494,7 @@ void apply_group_switch(CSE_ALifeOnlineOfflineGroup& g, bool online, const Fvect
 		}
 	}
 
-	if (group_bound(g))
+	if (bound)
 	{
 		if (online && !g.m_bOnline)
 		{
@@ -935,10 +987,25 @@ void print_status()
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);
 	else
+	{
 		::Msg("[coop]   world in: %u online, %u tracked, %llu spawns, %llu releases, %llu switches, %llu missing, "
 		    "local spawns %llu forwarded / %llu blocked",
 		    (u32)g_online.size(), (u32)g_tracks.size(), g_client_spawns, g_client_releases, g_client_switches,
 		    g_missing, g_forwarded_spawns, g_blocked_spawns);
+		u32 wire_squads = 0, wire_ids = 0;
+		if (ai().get_alife())
+			for (const auto& it : ai().alife().groups().objects())
+			{
+				u32 n = 0;
+				for (const auto& m : it.second->squad_members())
+					if (!m.second)
+						++n;
+				wire_squads += n ? 1 : 0;
+				wire_ids += n;
+			}
+		::Msg("[coop]   squads from the wire: %u now (%u unbound member ids), %llu ids forgotten", wire_squads, wire_ids,
+		    g_unbound_dropped);
+	}
 }
 } // namespace entities
 } // namespace coop

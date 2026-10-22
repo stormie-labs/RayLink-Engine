@@ -150,6 +150,20 @@ void CSE_ALifeOnlineOfflineGroup::register_member(ALife::_OBJECT_ID member_id)
 
 void CSE_ALifeOnlineOfflineGroup::unregister_member(ALife::_OBJECT_ID member_id)
 {
+	// Anomaly Coop: an id read from a packet (STATE_Read) and never bound to its object (on_after_game_load did
+	// not run: a squad mirrored on a coop client, a temporary entity) has no member state to restore, only the id
+	// to forget. Without this the destructor writes through the null pointer (AV at unload / release).
+	{
+		MEMBERS::iterator U = m_members.find(member_id);
+		if (U != m_members.end() && !(*U).second)
+		{
+			m_members.erase(U);
+			if (m_members.empty())
+				m_flags.set(flUsedAI_Locations,FALSE);
+			return;
+		}
+	}
+
 	CALifeGraphRegistry& graph = alife().graph();
 	//	CALifeLevelRegistry			&level = graph.level();
 
