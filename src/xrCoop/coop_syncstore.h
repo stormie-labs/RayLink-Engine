@@ -14,18 +14,30 @@
 // Values (Value): nil, number (a finite double), string, bool, vector (3 finite floats), a flat table (string keys,
 // values number / string / bool / vector). Setting nil removes the key.
 //
-// Versions. Every change carries a version; a change is applied only if it is newer than the key's last change, or,
-// for a key that is not there, than the last removal in its scope (else Stale). The contract for syncapi: versions are
-// stamped by the host from one counter that only grows (top_version() + 1 for the next change, carried on in the host
-// save), so every change in a scope is newer than every change before it; versions start at 1. A client's store holds
-// only what the host sent. A full copy (encode_scope / decode_scope) carries the versions, so after a client takes it,
-// a change from before the copy is Stale (Review Focus 2).
+// Versions. Every change carries a version, 1..kMaxVersion (a higher one is refused, here, on the wire and in a copy:
+// it would leave no room for the next). A change is applied only if it is newer than the key's last change, or, for a
+// key that is not there, than the last removal in its scope (else Stale). The contract for syncapi: versions are
+// stamped by the host from one counter that only grows (top_version() + 1 for the next change), so every change in a
+// scope is newer than every change before it. F2 T13 fix 1: the counter is not saved by itself. After the host loads
+// its save (clear(), then decode_scope of every saved scope) top_version() is the newest version in the save and the
+// counter goes on from there; that is safe because every client starts again from the host's copies too (clear() at
+// join) and the session drops changes of the old epoch. A client's store holds only what the host sent. A full copy
+// (encode_scope / decode_scope) carries the versions, so after a client takes it, a change from before the copy is
+// Stale (Review Focus 2).
+//
+// Scope lifetime (F2 T13 fix 1). A scope exists while it holds a key: removing its last key frees it, its slot among
+// kMaxPlayerScopes / kMaxObjectScopes too. The version of that removal (and of a nil set on a scope that is not there)
+// stays in a small table of at most kMaxFreedScopes scopes, so that an older change does not bring a key back; the
+// oldest record goes first, counted in Stats::freed_evicted. syncapi calls drop() when an object is destroyed: its
+// scope and its record go.
 //
 // Limits (every container is bounded; an overflow is refused, never silent, and counted in Stats):
 //   - a key: 1..kMaxKey bytes (a table's keys: 0..kMaxKey); a value: kMaxValueBytes encoded;
 //   - a scope: World 4 MiB, Session 1 MiB, Player 1 MiB, Object 64 KiB, in entry_bytes(): the encoded entry plus a fixed
 //     cost per key and per table field (what it takes in memory beyond its bytes), so many tiny keys or fields cannot
-//     outgrow the limit in memory;
+//     outgrow the limit in memory. So an Object scope holds at most about 1 800 table fields in all (each costs
+//     kFieldOverhead plus its 4 or more encoded bytes), fewer than one 16 KiB table could carry (over 3 000); in the
+//     bigger scopes kMaxValueBytes is the limit of a table;
 //   - scopes: at most kMaxPlayerScopes players and kMaxObjectScopes objects, all of them together at most kMaxPoolBytes
 //     (the pool); World and Session have their own room outside it, so clients filling the pool cannot starve the host.
 // Everything from the network is checked by type, size and finiteness before it is used (read_set, read_value,
@@ -40,6 +52,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -195,6 +208,11 @@ constexpr size_t kEntryOverhead = 64;
 constexpr size_t kFieldOverhead = 32;
 // A player key digest: sha256 as lowercase hex (coop::kKeyDigestHexDigits).
 constexpr size_t kPlayerKeyDigits = 64;
+// F2 T13 fix 1: versions are 1..kMaxVersion. The host's counter never gets there (2^62 changes); a version above it
+// from a peer or a copy would leave no room for the next change (top_version() + 1), so it is refused.
+constexpr uint64_t kMaxVersion = uint64_t(1) << 62;
+// F2 T13 fix 1: removal versions of freed scopes kept (see "Scope lifetime").
+constexpr size_t kMaxFreedScopes = 4096;
 
 inline size_t scope_limit(ScopeId::Kind kind)
 {
@@ -235,7 +253,8 @@ enum class SetResult : uint8_t
 	Ok, // changed
 	Same, // newer, but the value is the one already there (or nil for a missing key): nothing changed
 	BadKey, // the key is empty or longer than kMaxKey, or the scope is not well formed (scope_ok)
-	BadValue, // unknown type, NaN / inf, a table in a table, nil in a table, a repeated or too long table key
+	BadValue, // unknown type, NaN / inf, a table in a table, nil in a table, a repeated or too long table key; a version
+	          // above kMaxVersion
 	TooBig, // more than kMaxValueBytes encoded
 	ScopeFull, // over the scope's limit, the pool, or the number of scopes (Stats says which)
 	NotAllowed, // this machine may not write the scope (may_set)
@@ -414,6 +433,26 @@ inline bool same(const Value& a, const Value& b)
 		return true;
 	}
 	return false;
+}
+
+// F2 T13 fix 1: clears the members a value's type does not use, in its table's fields too. A Number that also carried an
+// 8 MiB string would keep it in the store outside every limit (encoded_size counts only the members of the type).
+// Called on a value check_value accepted (so a table's fields are scalars: no deeper recursion).
+inline void strip(Value& v)
+{
+	if (v.type != ValueType::Number)
+		v.num = 0;
+	if (v.type != ValueType::Bool)
+		v.b = false;
+	if (v.type != ValueType::Vec3)
+		v.v[0] = v.v[1] = v.v[2] = 0.f;
+	if (v.type != ValueType::String)
+		std::string().swap(v.str);
+	if (v.type != ValueType::Table)
+		std::vector<std::pair<std::string, Value>>().swap(v.table);
+	else
+		for (auto& f : v.table)
+			strip(f.second);
 }
 
 // What one entry counts in its scope: its encoded bytes (key, version, value) plus kEntryOverhead, plus kFieldOverhead
@@ -599,8 +638,8 @@ inline bool read_scope(Reader& r, ScopeId& out)
 	return true;
 }
 
-// One change from the network, checked: the scope's form, the key (1..kMaxKey), the value (read_value). false on
-// anything else or a short packet; the outputs are then as they were. The caller counts refusals.
+// One change from the network, checked: the scope's form, the key (1..kMaxKey), the version (1..kMaxVersion), the value
+// (read_value). false on anything else or a short packet; the outputs are then as they were. The caller counts refusals.
 inline bool read_set(Reader& r, ScopeId& scope, std::string& key, Value& value, uint64_t& version)
 {
 	ScopeId s;
@@ -609,7 +648,7 @@ inline bool read_set(Reader& r, ScopeId& scope, std::string& key, Value& value, 
 	if (!read_scope(r, s) || !detail::read_text(r, kMaxKey, k) || !key_ok(k))
 		return false;
 	const uint64_t ver = r.u64();
-	if (!r.ok() || !read_value(r, v))
+	if (!r.ok() || ver == 0 || ver > kMaxVersion || !read_value(r, v))
 		return false;
 	scope = std::move(s);
 	key = std::move(k);
@@ -630,6 +669,7 @@ struct Stats
 	uint64_t decoded = 0; // full copies taken
 	uint64_t decode_bad = 0; // full copies refused: malformed, short, a bad key or value
 	uint64_t decode_full = 0; // full copies refused: over a limit
+	uint64_t freed_evicted = 0; // removal versions of freed scopes forgotten for room (kMaxFreedScopes)
 };
 
 class Store
@@ -683,9 +723,11 @@ public:
 		return out;
 	}
 
-	// The scope goes with everything in it (an object destroyed; a reset before a full copy).
+	// The scope goes with everything in it, its removal record too (an object destroyed: syncapi calls it; a reset
+	// before a full copy).
 	void drop(const ScopeId& scope)
 	{
+		take_freed(scope);
 		const auto it = m_scopes.find(scope);
 		if (it == m_scopes.end())
 			return;
@@ -699,6 +741,8 @@ public:
 	void clear()
 	{
 		m_scopes.clear();
+		m_freed.clear();
+		m_freed_order.clear();
 		m_pool = 0;
 		for (size_t& c : m_count)
 			c = 0;
@@ -715,14 +759,15 @@ public:
 	// All Player and Object scopes together.
 	size_t pool_bytes() const { return m_pool; }
 
-	// The full copy of a scope (an empty one for a scope the store does not have: taking it removes the scope).
+	// The full copy of a scope (an empty one, with its removal record, for a scope the store does not have: taking it
+	// removes the scope).
 	void encode_scope(Writer& w, const ScopeId& scope) const
 	{
 		write_scope(w, scope);
 		const auto it = m_scopes.find(scope);
 		if (it == m_scopes.end())
 		{
-			w.u64(0);
+			w.u64(freed_version(scope));
 			w.varu(0);
 			return;
 		}
@@ -753,7 +798,7 @@ public:
 		}
 		const auto it = m_scopes.find(id);
 		const size_t old = it == m_scopes.end() ? 0 : it->second.bytes;
-		const bool keep = !fresh.entries.empty() || fresh.removed != 0;
+		const bool keep = !fresh.entries.empty(); // F2 T13 fix 1: a scope without keys is not kept, its record is
 		if ((pooled(id.kind) && m_pool - old + fresh.bytes > kMaxPoolBytes) ||
 		    (keep && it == m_scopes.end() && m_count[size_t(id.kind)] >= max_scopes(id.kind)))
 		{
@@ -762,6 +807,10 @@ public:
 		}
 		if (pooled(id.kind))
 			m_pool = m_pool - old + fresh.bytes;
+		// The copy is exact: its removal version replaces whatever the store had for the scope.
+		take_freed(id);
+		if (!keep && fresh.removed != 0)
+			note_freed(id, fresh.removed);
 		if (it != m_scopes.end())
 		{
 			if (keep)
@@ -822,20 +871,68 @@ private:
 		return e == it->second.entries.end() ? nullptr : &e->second;
 	}
 
+	// The removal version kept for a scope the store does not have; 0 if none.
+	uint64_t freed_version(const ScopeId& scope) const
+	{
+		const auto it = m_freed.find(scope);
+		return it == m_freed.end() ? 0 : it->second;
+	}
+
+	// Keeps (or raises) the removal version of a scope the store does not have. Room for kMaxFreedScopes: the oldest
+	// record goes first (counted).
+	void note_freed(const ScopeId& scope, uint64_t version)
+	{
+		auto it = m_freed.find(scope);
+		if (it != m_freed.end())
+		{
+			if (version <= it->second)
+				return;
+			m_freed_order.erase(std::make_pair(it->second, scope));
+			it->second = version;
+		}
+		else
+		{
+			if (m_freed.size() >= kMaxFreedScopes)
+			{
+				const auto oldest = m_freed_order.begin();
+				m_freed.erase(oldest->second);
+				m_freed_order.erase(oldest);
+				++m_stats.freed_evicted;
+			}
+			m_freed.emplace(scope, version);
+		}
+		m_freed_order.emplace(version, scope);
+	}
+
+	// Takes the record of a scope out (the scope is made again, dropped, or replaced by a copy); its version, 0 if none.
+	uint64_t take_freed(const ScopeId& scope)
+	{
+		const auto it = m_freed.find(scope);
+		if (it == m_freed.end())
+			return 0;
+		const uint64_t version = it->second;
+		m_freed_order.erase(std::make_pair(version, scope));
+		m_freed.erase(it);
+		return version;
+	}
+
 	SetResult apply(const ScopeId& scope, std::string_view key, Value value, uint64_t version)
 	{
 		if (!scope_ok(scope) || !key_ok(key))
 			return SetResult::BadKey;
+		if (version > kMaxVersion)
+			return SetResult::BadValue; // F2 T13 fix 1: no room for the next change after it
 		canonicalize(value);
 		const SetResult form = check_value(value);
 		if (form != SetResult::Ok)
 			return form;
+		strip(value);
 
 		const auto sit = m_scopes.find(scope);
 		Scope* sc = sit == m_scopes.end() ? nullptr : &sit->second;
 		const auto eit = sc ? sc->entries.find(key) : decltype(sc->entries.end())();
 		Entry* e = sc && eit != sc->entries.end() ? &eit->second : nullptr;
-		if (version <= (e ? e->version : sc ? sc->removed : 0))
+		if (version <= (e ? e->version : sc ? sc->removed : freed_version(scope)))
 			return SetResult::Stale;
 
 		if (value.type == ValueType::Nil)
@@ -843,16 +940,25 @@ private:
 			m_top = std::max(m_top, version);
 			if (!e)
 			{
+				// F2 T13 fix 1: a missing key remembers the removal too, in a scope that is not there as well.
 				if (sc)
 					sc->removed = std::max(sc->removed, version);
+				else
+					note_freed(scope, version);
 				return SetResult::Same;
 			}
-			// The scope stays, empty or not: it keeps the version of the removal until it is dropped.
 			sc->bytes -= e->cost;
 			if (pooled(scope.kind))
 				m_pool -= e->cost;
 			sc->removed = std::max(sc->removed, version);
 			sc->entries.erase(eit);
+			if (sc->entries.empty())
+			{
+				// F2 T13 fix 1: the last key went: the scope is freed (its slot too), its removal version is kept.
+				note_freed(scope, sc->removed);
+				m_scopes.erase(sit);
+				--m_count[size_t(scope.kind)];
+			}
 			return SetResult::Ok;
 		}
 		if (e && same(e->value, value))
@@ -885,6 +991,7 @@ private:
 		{
 			sc = &m_scopes[scope];
 			++m_count[size_t(scope.kind)];
+			sc->removed = take_freed(scope);
 		}
 		if (e)
 		{
@@ -917,7 +1024,7 @@ private:
 			return false;
 		sc.removed = r.u64();
 		const uint64_t count = r.varu();
-		if (!r.ok() || count > r.remaining() / kMinEntryWire)
+		if (!r.ok() || sc.removed > kMaxVersion || count > r.remaining() / kMinEntryWire)
 			return false;
 		top = sc.removed;
 		const std::string* prev = nullptr;
@@ -928,7 +1035,8 @@ private:
 			if (!detail::read_text(r, kMaxKey, key) || !key_ok(key) || (prev && !(*prev < key)))
 				return false;
 			e.version = r.u64();
-			if (!r.ok() || e.version == 0 || !read_value(r, e.value) || e.value.type == ValueType::Nil)
+			if (!r.ok() || e.version == 0 || e.version > kMaxVersion || !read_value(r, e.value) ||
+			    e.value.type == ValueType::Nil)
 				return false;
 			e.cost = entry_bytes(key, e.value);
 			sc.bytes += e.cost;
@@ -943,7 +1051,10 @@ private:
 		return r.ok();
 	}
 
-	std::map<ScopeId, Scope> m_scopes;
+	std::map<ScopeId, Scope> m_scopes; // every scope here holds at least one key
+	// Removal versions of scopes the store does not have (freed, or a nil set on a missing scope), by scope and by age.
+	std::map<ScopeId, uint64_t> m_freed;
+	std::set<std::pair<uint64_t, ScopeId>> m_freed_order;
 	size_t m_count[kKindCount] = {}; // scopes by kind
 	size_t m_pool = 0; // bytes of all Player and Object scopes
 	uint64_t m_top = 0;
