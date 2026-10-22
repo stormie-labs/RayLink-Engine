@@ -122,6 +122,11 @@ inline bool defaults_ok(const std::vector<Upgrade>& defaults)
 inline Verdict verdict_of_added(
     const std::vector<Upgrade>& entity, const Upgrade& added, const std::vector<Upgrade>& defaults)
 {
+	// F0 final review (task 10b): one the list names is there, whatever the replay makes of that mention (it may
+	// refuse an earlier mention and take this one): CSE add_upgrade is FATAL on a duplicate id.
+	for (const Upgrade& u : entity)
+		if (u.id == added.id)
+			return Verdict::Installed;
 	std::vector<Upgrade> list = entity;
 	list.push_back(added);
 	return plan({}, list, defaults).back();

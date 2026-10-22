@@ -111,6 +111,10 @@ void CMapLocation::LoadSpot(LPCSTR type, bool bReload)
 		static xr_set<shared_str> s_logged; // once per type: spots are reloaded and re-created
 		if (s_logged.insert(shared_str(path_base)).second)
 			Msg("! map spot type '%s' is not in map_spots.xml (different mods?), its spots are not shown", path_base);
+		// F0 final review (task 13): as the stock end of LoadSpot when the type has no spots. A reload into an unknown
+		// type keeps the spots of the type before (stock LoadSpot never enables a spot again).
+		if (m_minimap_spot == NULL && m_level_spot == NULL && m_complex_spot == NULL)
+			DisableSpot();
 		return;
 	}
 	LPCSTR s = g_uiSpotXml->ReadAttrib(path_base, 0, "hint", "no hint");
@@ -860,7 +864,8 @@ bool CRelationMapLocation::Update()
 			vis_res = false;
 	}
 
-	if (m_b_visible == false && vis_res == true)
+	// Anomaly Coop (F0 final review, task 13): a relation location of a spot type unknown here has no minimap spot
+	if (m_b_visible == false && vis_res == true && m_minimap_spot)
 		m_minimap_spot->ResetXformAnimation();
 
 	m_b_visible = vis_res;

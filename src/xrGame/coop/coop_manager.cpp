@@ -297,6 +297,8 @@ void Manager::install_session_callbacks()
 		sync::on_peer_left(id);
 		if (is_host())
 			join::on_peer_left(id);
+		else
+			diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his avatar leaves this world too
 	};
 	m_session.on_welcome = [this](const WelcomeMsg& w)
 	{

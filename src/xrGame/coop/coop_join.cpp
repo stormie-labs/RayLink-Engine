@@ -24,12 +24,37 @@
 #include "game_graph.h"
 #include "character_community.h"
 
+#include <atomic>
 #include <cstdio>
 
 extern string_path g_last_saved_game;
 
 namespace coop
 {
+namespace diag
+{
+namespace
+{
+std::atomic<u32> g_destroyed_object_stacks{0}; // armed and not printed yet
+} // namespace
+
+void arm_destroyed_object_stacks()
+{
+	g_destroyed_object_stacks.store(kDestroyedObjectStacks, std::memory_order_relaxed);
+	::Msg("[coop] diagnostics: the next %u accesses to a destroyed object print a C++ stack (a player left)",
+	    kDestroyedObjectStacks);
+}
+
+bool take_destroyed_object_stack()
+{
+	u32 left = g_destroyed_object_stacks.load(std::memory_order_relaxed);
+	while (left != 0 && !g_destroyed_object_stacks.compare_exchange_weak(left, left - 1, std::memory_order_relaxed))
+	{
+	}
+	return left != 0;
+}
+} // namespace diag
+
 namespace join
 {
 namespace
@@ -382,6 +407,8 @@ bool host_send_world(PeerId from)
 
 void host_on_join_request(PeerId from, Reader&)
 {
+	if (!mgr().is_host())
+		return; // F0 final review: the session drops it on a client already (msg_sender); handlers check it too
 	const PeerInfo* p = mgr().session().peer(from);
 	if (!p)
 		return;
@@ -415,6 +442,8 @@ void host_due_joins()
 // --- host: WorldLoaded ---
 void host_on_world_loaded(PeerId from, Reader&)
 {
+	if (!mgr().is_host())
+		return; // F0 final review: as host_on_join_request
 	auto it = g.peers.find(from);
 	// R2 I4: only the end of a join in flight. A repeated, unasked-for or old world's WorldLoaded would run the
 	// catch-up again (or bring an id of the old world online).
@@ -437,16 +466,23 @@ void host_on_world_loaded(PeerId from, Reader&)
 }
 
 // --- client ---
-void client_on_join_complete(PeerId, Reader&)
+void client_on_join_complete(PeerId from, Reader&)
 {
+	if (from != kHostPeer || !mgr().is_client())
+		return; // F0 final review: only the host sends it (the session kicks a client that does, msg_sender)
 	::Msg("[coop] join complete, live sync on");
 	if (Device.Paused()) // a pause from before the session; in a session nothing can pause (G18)
 		Device.Pause(FALSE, TRUE, TRUE, "coop_live");
 	players::equip_resend();
 }
 
-void client_on_session_reset(PeerId, Reader& r)
+void client_on_session_reset(PeerId from, Reader& r)
 {
+	// F0 final review (Critical): from a client this wiped the host's sync state (avatars included), made the host a
+	// client in ReceivingWorld with the client's epoch, and a 2-byte one stopped the session for everybody. The session
+	// kicks a client that sends it (msg_sender); the handler checks it as well.
+	if (from != kHostPeer || !mgr().is_client())
+		return;
 	const std::string why = r.str();
 	const u32 epoch = r.u32();
 	if (!r.ok())
@@ -812,6 +848,7 @@ void on_peer_left(PeerId id)
 	auto it = g.peers.find(id);
 	if (it == g.peers.end())
 		return;
+	diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his character and its items leave the world now
 	const u16 proxy = it->second.proxy;
 	world::host_park_proxy(proxy);
 	g.peers.erase(it);
@@ -864,6 +901,10 @@ bool client_loading_world() { return mgr().phase() == Phase::LoadingWorld; }
 
 void on_session_lost(const char*)
 {
+	// F0 final review (task 14): the players leave with the session (a client that was in the host's world leaves
+	// it, the host takes the characters of its players out below). Called before the phase goes Off.
+	if (mgr().is_live_client() || (mgr().is_host() && !g.peers.empty()))
+		diag::arm_destroyed_object_stacks();
 	// W9, host: the session is over, nobody else is in the world. Clients take the avatars out through their own
 	// switch vote (coop::switch_vote: no session = no player in the world).
 	xr_vector<u16> proxies;
@@ -924,6 +965,9 @@ void host_watch_world()
 	if (!g.reset_pending || !g_pGameLevel || !g_actor || Device.dwPrecacheFrame || !ai().get_alife())
 		return;
 	g.reset_pending = false;
+	// F0 final review (task 12): a join admitted since the world changed (a player who connected meanwhile) is void
+	// as well: he rejoins after this SessionReset, and a join left in flight would refuse his JoinRequest.
+	g.gate.world_replaced();
 	world::host_scan_proxies();
 	Writer w(64);
 	w.str("the host loaded a save or changed level");

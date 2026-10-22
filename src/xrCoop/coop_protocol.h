@@ -145,6 +145,18 @@ enum class Msg : uint16_t
 const char* msg_name(Msg type);
 inline const char* msg_name(uint16_t type) { return msg_name(static_cast<Msg>(type)); }
 
+// F0 final review: who may send a game message. The join lifecycle goes one way: a Session drops a message that
+// comes the other way before its handler, and a host kicks the client that sent it as malformed (as it does for a
+// core message the wrong way, Welcome from a client). Core messages are checked by the Session's own dispatch; the
+// other game messages go both ways (requests, relays, events), their handlers check the sender.
+enum class MsgSender : uint8_t
+{
+	Either,
+	HostOnly, // host -> clients: WorldBlob, JoinComplete, SessionReset, LevelChange, AvatarList
+	ClientOnly, // client -> host: JoinRequest, WorldLoaded, TransitionVote
+};
+MsgSender msg_sender(Msg type);
+
 enum class RejectReason : uint8_t
 {
 	None = 0,

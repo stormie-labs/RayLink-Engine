@@ -107,6 +107,22 @@ const char* msg_name(Msg type)
 	return buf;
 }
 
+MsgSender msg_sender(Msg type)
+{
+	switch (type)
+	{
+	case Msg::WorldBlob:
+	case Msg::JoinComplete:
+	case Msg::SessionReset:
+	case Msg::LevelChange:
+	case Msg::AvatarList: return MsgSender::HostOnly;
+	case Msg::JoinRequest:
+	case Msg::WorldLoaded:
+	case Msg::TransitionVote: return MsgSender::ClientOnly;
+	default: return MsgSender::Either;
+	}
+}
+
 const char* reject_reason_name(RejectReason r)
 {
 	switch (r)

@@ -640,6 +640,14 @@ int l_peer_of_avatar(lua_State* L)
 	return 1;
 }
 
+// F0 final review (task 8): coop.owners_known() -> true once avatar_id / peer_of_avatar cover every player in the
+// world (host: always; client: after the host's first AvatarList since it joined), false before and outside a session.
+int l_owners_known(lua_State* L)
+{
+	lua_pushboolean(L, mgr().active() && world::owners_known());
+	return 1;
+}
+
 // Ids on the wire are in host numbering; only the pair (0, my proxy) differs on a client.
 int l_to_host_id(lua_State* L)
 {
@@ -1361,6 +1369,7 @@ void register_raw(lua_State* L)
 		{"players", &l_players},
 		{"avatar_of", &l_avatar_of},
 		{"peer_of_avatar", &l_peer_of_avatar},
+		{"owners_known", &l_owners_known},
 		{"to_host_id", &l_to_host_id},
 		{"to_local_id", &l_to_local_id},
 		{"send_event", &l_send_event},

@@ -19,6 +19,7 @@ struct Avatar
 };
 
 xr_map<u16, Avatar> g_avatars;
+bool g_owners_known = false; // client: an AvatarList was applied since reset() (F0 final review, task 8)
 
 // Docked once: a section compare is then a pointer compare (the ALife switch asks for every object).
 const shared_str& avatar_section()
@@ -62,7 +63,10 @@ void client_set_owners(const xr_vector<AvatarOwner>& local_owners)
 		it.second.peer = kInvalidPeer;
 	for (const AvatarOwner& o : local_owners)
 		g_avatars[o.avatar].peer = o.peer;
+	g_owners_known = true;
 }
+
+bool owners_known() { return mgr().is_host() || g_owners_known; }
 
 bool is_player_proxy(u16 id) { return g_avatars.find(id) != g_avatars.end(); }
 
@@ -90,7 +94,11 @@ bool is_parked(u16 id)
 	return it != g_avatars.end() && it->second.peer == kInvalidPeer;
 }
 
-void reset() { g_avatars.clear(); }
+void reset()
+{
+	g_avatars.clear();
+	g_owners_known = false;
+}
 
 void print_status()
 {

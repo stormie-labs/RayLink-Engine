@@ -559,10 +559,16 @@ std::string describe_tag(itemtags::Bit bit, const ItemData& d)
 // is retried with every new state of the owner: the log must not repeat). Forgotten when the item leaves g_owned.
 void log_diverged(u16 id, const char* section, u32 mask, const ItemData& cur, const ItemData& owner)
 {
+	bool headed = false;
 	for (u32 bit = 1; bit <= itemtags::Uses; bit <<= 1)
 	{
 		if (!(mask & bit) || !g_logged_tags.insert((u32(id) << 8) | bit).second)
 			continue;
+		if (!headed) // F0 final review (task 6): the item's line only with a tag not reported yet, not on every retry
+		{
+			headed = true;
+			::Msg("! [coop] item %u [%s]: the host copy does not take its owner's state", u32(id), section);
+		}
 		::Msg("! [coop] item %u [%s]: the host copy keeps its own %s after the owner's state was applied: host %s, owner %s",
 		    u32(id), section, itemtags::name(itemtags::Bit(bit)), describe_tag(itemtags::Bit(bit), cur).c_str(),
 		    describe_tag(itemtags::Bit(bit), owner).c_str());
@@ -1594,8 +1600,6 @@ void host_enforce(u64 now)
 				if (const u32 left = diverged_tags(cur, it->second.data))
 				{
 					it->second.stuck = true;
-					::Msg("! [coop] item %u [%s]: the host copy does not take its owner's state", it->first,
-					    item->object().cNameSect().c_str());
 					log_diverged(it->first, item->object().cNameSect().c_str(), left, cur, it->second.data); // R3 В1
 				}
 			}
@@ -1885,6 +1889,10 @@ AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& up
 		why = "not an inventory item";
 		return AddedUpgrade::Refused;
 	}
+	// F0 final review (task 10b): the FATAL's own condition first (CSE add_upgrade on an id the entity has), before
+	// any replay of the rules.
+	if (ii->has_upgrade(upgrade))
+		return AddedUpgrade::AlreadyThere;
 	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
 	inventory::upgrade::Root* root = um.get_root(entity->s_name);
 	std::vector<upgrades::Upgrade> list, defaults;

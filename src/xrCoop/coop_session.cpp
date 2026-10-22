@@ -563,6 +563,17 @@ struct Session::Impl
 				malformed(c, "game message before handshake");
 			return;
 		}
+		// F0 final review: the join lifecycle goes one way (msg_sender). A SessionReset from a client reached the
+		// host's handler: it wiped the host's sync state and made it a client. The host kicks the sender, a client
+		// logs and ignores it (malformed).
+		const bool host = m_role == Role::Host;
+		if (msg_sender(static_cast<Msg>(type)) == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
+		{
+			const std::string what =
+				std::string("unexpected ") + msg_name(type) + (host ? " from a client" : " from the host");
+			malformed(c, what.c_str());
+			return;
+		}
 		if (m_role == Role::Host)
 		{
 			// R2 I1: made in a world that is gone (the client has not rejoined yet): not for this one.

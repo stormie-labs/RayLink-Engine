@@ -15,6 +15,19 @@ class NET_Packet;
 
 namespace coop
 {
+// F0 final review (task 14 diagnostics): CGameObject::lua_game_object prints a C++ stack for the first
+// kDestroyedObjectStacks accesses to a destroyed object after a player left a co-op session, not since the process
+// started (single player and loads spent them, and every stack stalls the thread that prints it).
+namespace diag
+{
+constexpr u32 kDestroyedObjectStacks = 3;
+// A player left: the next kDestroyedObjectStacks accesses print a stack (armed again by every departure). Host:
+// join::on_peer_left; client: another player left (Manager), or it left the host's world itself (on_session_lost).
+void arm_destroyed_object_stacks();
+// An access to a destroyed object: true if it is to print its C++ stack (takes one of the armed ones). Any thread.
+bool take_destroyed_object_stack();
+} // namespace diag
+
 namespace join
 {
 // Blob kinds sent with Session::send_blob.

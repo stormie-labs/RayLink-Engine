@@ -28,6 +28,9 @@ void client_mark_avatar(u16 id, PeerId peer);
 // character. Every character listed gets its player; every other one known here gets none (its player left or is
 // loading). Ids in local numbering, our own character (0) not among them.
 void client_set_owners(const xr_vector<AvatarOwner>& local_owners);
+// F0 final review (task 8): this machine knows who plays each character. Host: always. Client: from the host's first
+// AvatarList since its join (until then only the host's avatar is known); reset() forgets it.
+bool owners_known();
 
 // Any player avatar / proxy known on this machine.
 bool is_player_proxy(u16 id);

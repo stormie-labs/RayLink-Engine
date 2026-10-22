@@ -34,13 +34,13 @@
 #include "../xrengine/xr_collide_form.h"
 #include "script_attachment_manager.h"
 #include "player_hud.h"
+#include "coop/coop_join.h" // Anomaly Coop
 extern MagicBox3 MagicMinBox(int iQuantity, const Fvector* akPoint);
 
 #pragma warning(push)
 #pragma warning(disable:4995)
 #include <malloc.h>
 #pragma warning(pop)
-#include <atomic>
 #include <mutex>
 
 #ifdef DEBUG
@@ -1061,12 +1061,14 @@ CScriptGameObject* CGameObject::lua_game_object() const
 		Msg("! you are trying to use a destroyed object [%i]", ID());
 		ai().script_engine().print_stack();
 		// Anomaly Coop: who still holds a destroyed object (F0 task 14): C++ stack for the first 3 hits
-		static std::atomic<u32> s_destroyed_hits{0};
-		if (s_destroyed_hits.fetch_add(1, std::memory_order_relaxed) < 3)
+		// F0 final review: the first 3 hits after a player left a co-op session (coop::diag), not since the process
+		// started: single player and loads spent them, and every stack stalls the thread that prints it
+		if (coop::diag::take_destroyed_object_stack())
 		{
 			static std::mutex s_stack_lock; // DbgHelp behind the stack walker is single-threaded
 			std::lock_guard<std::mutex> lock(s_stack_lock);
-			LogStackTrace("! [coop] C++ stack of the access to a destroyed object (first 3 hits):", true);
+			LogStackTrace("! [coop] C++ stack of the access to a destroyed object (first 3 hits after a player left):",
+			    true);
 		}
 		return NULL;
 	}
