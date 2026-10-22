@@ -203,6 +203,26 @@ void write_balance(u16 holder, u32 value)
 		t->m_dwMoney = value;
 }
 
+// The player key a character is bound to (ledger::character_key of its custom data), empty if none.
+std::string custom_data_key(const CSE_Abstract* e)
+{
+	return e && e->m_ini_string.size() ? ledger::character_key(e->m_ini_string.c_str()) : std::string();
+}
+
+// The key the money book knows a character by (Ruling F2-13). A character without a key line (none of coop_join's)
+// gets one of its id that no save snapshot holds: it counts as made in this session.
+std::string character_key_of(u16 holder)
+{
+	std::string key = custom_data_key(events::find_entity(holder));
+	if (key.empty())
+	{
+		char id[16];
+		xr_sprintf(id, "#%u", u32(holder));
+		key = id;
+	}
+	return key;
+}
+
 void send_balance(PeerId to, u32 balance)
 {
 	if (to == kHostPeer)
@@ -309,7 +329,8 @@ void host_on_req(PeerId from, Reader& r)
 		to = receiver_of(PeerId(q.ref));
 	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's (F2-1).
 	const bool talking = dialog::host_lock_of(from) != kNoId;
-	const ledger::Decision d = g_book.on_request(from, holder, q, balance, talking, to, policy(), mgr().now_ms());
+	const ledger::Decision d =
+	    g_book.on_request(from, character_key_of(holder), q, balance, talking, to, policy(), mgr().now_ms());
 	if (d.stale)
 	{
 		++g_h.stale; // a repeat or an old change: the answer says where we are
@@ -577,11 +598,16 @@ void on_session_started()
 	if (!mgr().is_host() || !ai().get_alife())
 		return;
 	// Ruling F2-10: the player characters in the world now are "from the save" (returning players keep full
-	// allowances). One the host makes later in this session for a player key it has not seen starts empty.
-	std::vector<uint32_t> from_save;
+	// allowances). One the host makes later in this session for a player key it has not seen starts empty. Known by
+	// the key they are bound to their players by, not by id (F2-13).
+	std::vector<std::string> from_save;
 	for (const auto& it : ai().alife().objects().objects())
 		if (it.second && world::is_player_character(it.second))
-			from_save.push_back(it.first);
+		{
+			std::string key = custom_data_key(it.second);
+			if (!key.empty())
+				from_save.push_back(std::move(key));
+		}
 	g_book.start_session(from_save);
 	::Msg("[coop] money: %u player character(s) from the save keep their allowances; new ones start empty",
 	    (u32)from_save.size());
@@ -635,8 +661,9 @@ void print_status()
 		for (const auto& it : g_book.connections())
 		{
 			const u16 holder = holder_of(it.first);
-			const ledger::CharacterAllowances* a = holder != kNoId ? g_book.allowances(holder) : nullptr;
-			const bool saved = holder != kNoId && g_book.from_save(holder);
+			const std::string key = holder != kNoId ? character_key_of(holder) : std::string();
+			const ledger::CharacterAllowances* a = key.empty() ? nullptr : g_book.allowances(key);
+			const bool saved = !key.empty() && g_book.from_save(key);
 			// Not used yet: full for a character from the save, empty for a new one (F2-10).
 			const auto shown = [saved](const ledger::Allowance* x, u32 burst)
 			{ return x && x->started ? x->tokens : (saved ? double(burst) : 0.0); };

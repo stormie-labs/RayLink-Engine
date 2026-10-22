@@ -23,8 +23,10 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 
+#include "coop_session.h" // find_key_value, migrate_key_value: the player key line of a character
 #include "coop_wire.h"
 
 namespace coop
@@ -252,14 +254,27 @@ inline bool read(Reader& r, MoneyBalanceMsg& m)
 }
 // ---------------------------------------------------------------- host book
 
-// The allowances of one character (its id in the host world). Kept for the whole session: a player who leaves and
+// The key the host knows a character by: the digest on the "key" line of its custom data ([coop] key = <sha256 hex>),
+// the line by which coop_join binds the character to its player (find_proxy_by_key). A save from before R1 I1 still
+// holds the key itself: its digest is returned, as coop_join migrates it (here on a copy). Empty if there is none.
+// Not the entity id: an id freed and given to another character later says nothing about who plays it (F2-13).
+inline std::string character_key(std::string custom_data)
+{
+	migrate_key_value(custom_data);
+	size_t at = 0, len = 0;
+	return find_key_value(custom_data, at, len) ? custom_data.substr(at, len) : std::string();
+}
+
+// The allowances of one character (by its key, character_key). Kept for the whole session: a player who leaves and
 // joins again (a new connection, maybe a new peer id) finds them as he left them. A character that was in the save
 // when the session started gets full allowances at its first change; one made in this session (a new player key)
-// starts empty and only gets the refills (Ruling F2-10).
+// starts empty and only gets the refills (Ruling F2-10). They refill only while the character is in the game: its
+// player leaving freezes them, the first gain after he is back starts the clock again (Ruling F2-13).
 struct CharacterAllowances
 {
 	Allowance script;
 	Allowance dialog;
+	bool away = false; // its player left: no refill until he is back
 };
 
 // What the host does with one ReqMoney.
@@ -280,23 +295,26 @@ class HostBook
 public:
 	// A new session: nothing is kept. `from_save`: the characters in the world when it started (a player key the host
 	// has not seen makes a new one later, which then starts with empty allowances).
-	void start_session(const std::vector<uint32_t>& from_save)
+	void start_session(const std::vector<std::string>& from_save)
 	{
 		m_acked.clear();
+		m_character_of.clear();
 		m_characters.clear();
 		m_from_save.clear();
-		for (uint32_t id : from_save)
-			m_from_save.insert(id);
+		for (const std::string& key : from_save)
+			if (!key.empty())
+				m_from_save.insert(key);
 	}
-	bool from_save(uint32_t character) const { return m_from_save.count(character) != 0; }
+	bool from_save(const std::string& character) const { return m_from_save.count(character) != 0; }
 
 	// ReqMoney `q` of connection `peer` whose character is `character` and has `balance`. `dialog_lock`: he holds an
 	// NPC's talk lock now; `to`: the receiver of a transfer (looked up from q.ref; ignored for other causes).
-	Decision on_request(uint32_t peer, uint32_t character, const MoneyReq& q, uint32_t balance, bool dialog_lock,
-	    const Receiver& to, const Policy& p, uint64_t now_ms)
+	Decision on_request(uint32_t peer, const std::string& character, const MoneyReq& q, uint32_t balance,
+	    bool dialog_lock, const Receiver& to, const Policy& p, uint64_t now_ms)
 	{
 		Decision d;
 		d.balance = balance;
+		m_character_of[peer] = character;
 		uint32_t& acked = m_acked[peer];
 		if (!seq_newer(q.seq, acked))
 		{
@@ -309,6 +327,14 @@ public:
 		if (q.cause == Cause::Transfer)
 		{
 			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
+			return d;
+		}
+		// Ruling F2-13: the form first. A request refused by it, and a spend, touch no allowance and start no clock.
+		if (uint8_t(q.cause) >= kCauseCount || q.delta <= 0)
+		{
+			Allowance untouched_dialog, untouched_script; // a spend never draws on them
+			d.verdict = apply_client_delta(d.balance, q.delta, q.cause, false, untouched_dialog, untouched_script, p,
+			    now_ms);
 			return d;
 		}
 		CharacterAllowances& a = allowances_of(character, now_ms);
@@ -329,11 +355,22 @@ public:
 		const auto it = m_acked.find(peer);
 		return it == m_acked.end() ? 0u : it->second;
 	}
-	// A connection ended: its numbering goes (a new one starts at 1), the character's allowances stay.
-	void peer_left(uint32_t peer) { m_acked.erase(peer); }
+	// A connection ended: its numbering goes (a new one starts at 1); the character's allowances stay, frozen until
+	// he is back (Ruling F2-13).
+	void peer_left(uint32_t peer)
+	{
+		m_acked.erase(peer);
+		const auto who = m_character_of.find(peer);
+		if (who == m_character_of.end())
+			return;
+		const auto it = m_characters.find(who->second);
+		if (it != m_characters.end())
+			it->second.away = true;
+		m_character_of.erase(who);
+	}
 	// Nothing is kept, no character counts as one from the save.
 	void reset() { start_session({}); }
-	const CharacterAllowances* allowances(uint32_t character) const
+	const CharacterAllowances* allowances(const std::string& character) const
 	{
 		const auto it = m_characters.find(character);
 		return it == m_characters.end() ? nullptr : &it->second;
@@ -341,11 +378,22 @@ public:
 	const std::map<uint32_t, uint32_t>& connections() const { return m_acked; }
 
 private:
-	CharacterAllowances& allowances_of(uint32_t character, uint64_t now_ms)
+	CharacterAllowances& allowances_of(const std::string& character, uint64_t now_ms)
 	{
 		const auto found = m_characters.find(character);
 		if (found != m_characters.end())
-			return found->second;
+		{
+			CharacterAllowances& a = found->second;
+			if (a.away)
+			{
+				// Ruling F2-13: back in the game. The clock goes on from now; the time away pays nothing.
+				a.away = false;
+				for (Allowance* x : {&a.script, &a.dialog})
+					if (x->started && now_ms > x->at)
+						x->at = now_ms;
+			}
+			return a;
+		}
 		CharacterAllowances& a = m_characters[character];
 		if (!from_save(character))
 		{
@@ -357,8 +405,9 @@ private:
 	}
 
 	std::map<uint32_t, uint32_t> m_acked; // peer -> newest answered seq
-	std::map<uint32_t, CharacterAllowances> m_characters; // character id -> allowances
-	std::set<uint32_t> m_from_save; // characters in the world when the session started
+	std::map<uint32_t, std::string> m_character_of; // peer -> the key of his character (its last request)
+	std::map<std::string, CharacterAllowances> m_characters; // character key -> allowances
+	std::set<std::string> m_from_save; // keys of the characters in the world when the session started
 };
 
 // Settles an applied transfer (Decision::balance, Decision::credit) in `b`, which has set(peer, RU) and add(peer, RU):
