@@ -32,6 +32,7 @@
 #include "../xrServerEntities/xrServer_Objects.h"
 #include "../xrServerEntities/xrMessages.h"
 #include "xrCoop/coop_item_tags.h"
+#include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_upgrades.h"
 #include "xrCoop/coop_validate.h"
@@ -132,6 +133,7 @@ struct Stats
 	u64 enforced = 0, boxes_released = 0, spawns_ok = 0, spawn_rounds = 0, spawns_repeat = 0;
 	u64 rejected[u32(Reason::Count)] = {};
 	u64 upgrades_dropped = 0; // R3 В6: unknown / out-of-order / clashing upgrades never reach a loading install
+	u64 dropped_before_live = 0; // R2 I2: client, ItemState that came before we were live
 };
 Stats g_stats;
 
@@ -1636,7 +1638,14 @@ void install(Session& s)
 				host_on_spawn_ammo(from, r);
 		}
 		else if (mgr().is_client() && op == Op::State)
-			client_on_state(r);
+		{
+			// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
+			// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
+			if (rules::live_only(Msg::ItemState) && !mgr().is_live_client())
+				++g_stats.dropped_before_live;
+			else
+				client_on_state(r);
+		}
 	});
 }
 
@@ -1768,6 +1777,8 @@ void print_status()
 	}
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
+	if (mgr().is_client())
+		::Msg("[coop]   items in: %llu states dropped before live (R2 I2)", s.dropped_before_live);
 }
 
 void touch(CInventoryItem* item)

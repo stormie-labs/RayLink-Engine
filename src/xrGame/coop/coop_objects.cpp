@@ -9,6 +9,7 @@
 #include "coop_entities.h"
 #include "coop_events.h"
 #include "coop_alife.h"
+#include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 
 #include "ai_space.h"
@@ -171,6 +172,7 @@ struct Counters
 	    explode_applied = 0, explode_fallback = 0, destroyed_applied = 0, broken_applied = 0, uses_sent = 0,
 	    pushes_sent = 0, throws_sent = 0, activations_sent = 0, forced_online = 0, explode_blocked = 0,
 	    switches_blocked = 0;
+	u64 dropped_before_live = 0; // R2 I2: EntityState / ZoneState that came before we were live
 };
 
 xrCriticalSection g_lock;
@@ -187,6 +189,16 @@ u32 hash_str(const char* s)
 }
 
 u64 now_ms() { return mgr().now_ms(); }
+
+// R2 I2: a world message that comes before we are live is dropped (rules::live_only): it is from the window between
+// Welcome and JoinRequest or from a world we have left. Kept, it would be applied to the world we load.
+bool before_live(Msg type)
+{
+	if (!rules::live_only(type) || mgr().is_live_client())
+		return false;
+	++g_c.dropped_before_live;
+	return true;
+}
 
 CGameObject* find_go(u16 id)
 {
@@ -1211,12 +1223,16 @@ void client_on_state(PeerId, Reader& r)
 {
 	if (!mgr().is_client())
 		return;
+	// Every kind waits for Live: samples, rests and animations of the old world or our own would be applied to the
+	// bodies of the world we load (pending until then), destroyed / broken / explosions are stale visuals (the
+	// release itself arrives as EntityDestroy).
+	if (before_live(Msg::EntityState))
+		return;
 	const StateKind kind = StateKind(r.u8());
 	switch (kind)
 	{
 	case StateKind::Samples:
-		if (mgr().is_live_client())
-			client_on_samples(r);
+		client_on_samples(r);
 		break;
 	case StateKind::Rest:
 		client_on_rest(r);
@@ -1241,8 +1257,6 @@ void client_on_state(PeerId, Reader& r)
 	}
 	case StateKind::Destroyed:
 	{
-		if (!mgr().is_live_client())
-			break; // queued while we loaded: a stale visual; the release itself arrives as EntityDestroy
 		DestroyedEntry d;
 		d.id = r.u16();
 		d.bone = r.u16();
@@ -1259,8 +1273,6 @@ void client_on_state(PeerId, Reader& r)
 	}
 	case StateKind::Broken:
 	{
-		if (!mgr().is_live_client())
-			break; // stale visual, see Destroyed
 		const u16 id = r.u16();
 		if (r.ok())
 			g_broken_pending[join::to_local(id)] = now_ms();
@@ -1268,8 +1280,6 @@ void client_on_state(PeerId, Reader& r)
 	}
 	case StateKind::Explode:
 	{
-		if (!mgr().is_live_client())
-			break; // an explosion from before we were in the world
 		PendingExplode p;
 		p.x.id = r.u16();
 		p.x.initiator = r.u16();
@@ -1292,6 +1302,8 @@ void client_on_zones(PeerId, Reader& r)
 {
 	if (!mgr().is_client())
 		return;
+	if (before_live(Msg::ZoneState))
+		return; // a zone phase of another world: the host sends ours when we are in (host_on_peer_ready)
 	if (ZoneKind(r.u8()) != ZoneKind::Zones)
 		return;
 	const u16 count = r.u16();
@@ -2047,6 +2059,7 @@ void print_status()
 		    g_c.destroyed_applied, g_c.broken_applied, g_c.explode_blocked, g_c.switches_blocked);
 		::Msg("[coop]   objects req: %llu uses, %llu pushes, %llu throws, %llu artefact activations sent",
 		    g_c.uses_sent, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent);
+		::Msg("[coop]   objects in: %llu state / zone messages dropped before live (R2 I2)", g_c.dropped_before_live);
 	}
 }
 
