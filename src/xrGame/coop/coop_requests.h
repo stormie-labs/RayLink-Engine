@@ -38,6 +38,7 @@
 
 class CSE_Abstract;
 class CAI_Stalker;
+class CActor;
 struct SHit;
 
 // Server option: players can hurt each other (default on, R-5.3). Console var for the lead.
@@ -117,8 +118,12 @@ bool lua_client_refuse(const char* what);
 
 // --- damage (R-5.1) ---
 // CAI_Stalker::Hit hook. true = do not apply here. Host: a player character never takes damage
-// itself; creature hits go to its player as PlayerHit. Client: host-driven stalkers and avatars
-// never take local damage.
+// itself; hits of creatures and every explosion (R3 В2, whoever set it off) go to its player as
+// PlayerHit (rules: xrCoop/coop_hits.h). Client: host-driven stalkers and avatars never take local damage.
 bool stalker_hit(CAI_Stalker* npc, SHit* hit);
+// Host side of the CActor::Hit hook (events::client_block_actor_hit). true = the host's player does not take this
+// hit: another player's damage with friendly fire off. Its shots and blows are refused as ReqHit; its grenade, rocket
+// or the barrel it shot explode here and hit the host's actor directly (R3 minor).
+bool host_actor_hit_dropped(const CActor* actor, const SHit* hit);
 } // namespace requests
 } // namespace coop

@@ -952,6 +952,8 @@ bool client_filter(NET_Packet& P)
 
 bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 {
+	if (mgr().is_host())
+		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
 	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying())
 		return false;
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;

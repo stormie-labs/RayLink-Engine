@@ -40,7 +40,8 @@ void print_status();
 // CLevel::Send hook. true = the message is handled by coop and must not reach the local server.
 bool client_filter(NET_Packet& P);
 // CActor::Hit hook. true = drop this hit: it comes from a host-driven object, the host sends the
-// authoritative damage as PlayerHit.
+// authoritative damage as PlayerHit. On the host it applies friendly fire to the host's player instead
+// (requests::host_actor_hit_dropped, R3 minor).
 bool client_block_actor_hit(const CActor* actor, const SHit* hit);
 // Lua attach_vehicle hook (CScriptGameObject::AttachVehicle). true = refuse: on a coop client cars are
 // kinematic copies the host drives; mounted guns and other holders stay local (same rule as the router).

@@ -13,6 +13,7 @@
 #include "coop_items.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_hits.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -209,6 +210,28 @@ float hit_range(ALife::EHitType type)
 	default:
 		return kFireRange;
 	}
+}
+
+// R3 В2: who set off a hit on `victim` (a player's character or the host's actor), for the rules in coop_hits.h.
+hits::Source hit_source(const CGameObject* victim, const CGameObject* who)
+{
+	if (!who)
+		return hits::Source::Missing;
+	if (who == victim)
+		return hits::Source::Self;
+	if (is_player(who->ID()))
+		return hits::Source::Player;
+	return smart_cast<const CEntity*>(who) ? hits::Source::Creature : hits::Source::Object;
+}
+
+// R3 В2: blast waves and fragments name the explosive as the weapon (CExplosive::Explode). Found while it is being
+// destroyed too (net_Find, as the engine's own GE_HIT does): late fragments can land after it asked to be removed.
+bool weapon_is_explosive(u16 weapon_id, const CGameObject* victim)
+{
+	if (weapon_id == kNoId || !g_pGameLevel)
+		return false;
+	CGameObject* weapon = smart_cast<CGameObject*>(Level().Objects.net_Find(weapon_id));
+	return weapon && weapon != victim && weapon->cast_explosive();
 }
 
 // Damage for the local actor through CActor::Hit, exactly what the engine's GE_HIT event does
@@ -612,6 +635,8 @@ struct HostCounters
 {
 	u64 results[u32(Reason::Count)] = {};
 	u64 dropped_joining = 0, malformed = 0, hits_applied = 0, proxy_hits = 0, player_hits_sent = 0, spawns_local = 0;
+	u64 explosion_hits_sent = 0; // R3 В2: blasts / fragments no creature set off (a barrel, a mine, an anomaly)
+	u64 friendly_fire_dropped = 0; // hits of one player on another dropped at the character (proxy or host actor)
 } g_h;
 
 bool allow(PeerId peer, Cat c)
@@ -1347,8 +1372,10 @@ void print_status()
 		    ok, refused, g_h.results[u32(Reason::Moved)], g_h.results[u32(Reason::NotOwner)],
 		    g_h.results[u32(Reason::TooFar)], g_h.results[u32(Reason::RateLimited)], g_h.hits_applied,
 		    g_h.dropped_joining, g_h.malformed, g_h.spawns_local);
-		::Msg("[coop]   player damage: %llu hits on characters, %llu sent to players, friendly fire %s",
-		    g_h.proxy_hits, g_h.player_hits_sent, g_coop_friendly_fire ? "on" : "off");
+		::Msg("[coop]   player damage: %llu hits on characters, %llu sent to players (%llu from explosions no creature "
+		      "set off), friendly fire %s (%llu hits between players dropped at the character, %llu ReqHit refused)",
+		    g_h.proxy_hits, g_h.player_hits_sent, g_h.explosion_hits_sent, g_coop_friendly_fire ? "on" : "off",
+		    g_h.friendly_fire_dropped, g_h.results[u32(Reason::FriendlyFire)]);
 		::Msg("[coop]   refused as invalid (R3): %llu bones, %llu spawn sections, %llu spawn states, %llu numbers, "
 		      "%llu out-of-reach moves claimed as local",
 		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange]);
@@ -1688,20 +1715,40 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 	if (peer == kInvalidPeer || sync::host_peer_joining(peer))
 		return true;
 	CGameObject* who = hit->who ? smart_cast<CGameObject*>(hit->who) : nullptr;
+	hits::ProxyHit h;
+	h.source = hit_source(npc, who);
 	// The player's own grenade/rocket explodes on the host with this character as initiator (WP7):
 	// blast and fragments name the explosive as the weapon. Clients deal no explosion damage
 	// locally, so this is the only way the player gets hurt by it.
-	const bool own_explosive = who == npc && hit->weaponID != id && hit->weaponID != kNoId;
-	if (!who || (who == npc && !own_explosive) || !smart_cast<CEntity*>(who))
-		return true; // anomalies, falls, physics: the player's own game computes them
-	if (who != npc && is_player(who->ID()) && !g_coop_friendly_fire)
-		return true;
+	h.own_weapon = hit->weaponID != id && hit->weaponID != kNoId;
+	// R3 В2: the same for every explosion, whoever set it off: a barrel or mine that went off by itself or from an
+	// anomaly (the initiator is not a creature), or one whose initiator is no longer online.
+	h.explosion = weapon_is_explosive(hit->weaponID, npc);
+	if (!hits::to_owner(h, g_coop_friendly_fire != 0))
+	{
+		if (h.source == hits::Source::Player)
+			++g_h.friendly_fire_dropped;
+		return true; // friendly fire off; or anomalies, falls, physics: the player's own game computes them
+	}
 	Writer w(64);
 	w.u16(id);
-	write_hit(w, *hit, who->ID(), hit->weaponID);
+	write_hit(w, *hit, who ? who->ID() : kNoId, hit->weaponID); // no initiator: the owner keeps the damage (apply_to_actor)
 	net::host_send(peer, Msg::PlayerHit, w);
 	++g_h.player_hits_sent;
+	if (h.source == hits::Source::Object || h.source == hits::Source::Missing)
+		++g_h.explosion_hits_sent;
 	return true; // the character itself is never damaged or killed by the host
+}
+
+bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
+{
+	if (!actor || !hit || !mgr().is_host())
+		return false;
+	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
+	if (!hits::host_actor_drops(hit_source(actor, who), g_coop_friendly_fire != 0))
+		return false;
+	++g_h.friendly_fire_dropped;
+	return true;
 }
 } // namespace requests
 } // namespace coop
