@@ -116,7 +116,10 @@ bool is_runtime_written(LPCSTR name)
 	for (char* c = low; *c; ++c)
 		if (*c == '/')
 			*c = '\\';
-	static const char* exact[] = {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx.bak"};
+	// localization.ltx: the game writes the chosen language at start (live check 2026-10-23: a second instance
+	// started after the host had it, the host did not, and the join was refused as a different mod list)
+	static const char* exact[] = {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx",
+	    "configs\\localization.ltx.bak"};
 	for (const char* e : exact)
 		if (!xr_strcmp(low, e))
 			return true;
@@ -316,6 +319,13 @@ void Manager::install_session_callbacks()
 			for (const auto& s : diff.missing_here) ::Msg("!   missing here: %s", s.c_str());
 			for (const auto& s : diff.extra_here) ::Msg("!   extra here:   %s", s.c_str());
 			for (const auto& s : diff.differ) ::Msg("!   different:    %s", s.c_str());
+		}
+		// -coop_connect retries only what changes by itself (the host still loading, a lost answer). Anything else
+		// refuses every retry and pops the refusal window again every few seconds (live check 2026-10-23).
+		if (r.reason != RejectReason::HostNotReady && r.reason != RejectReason::Timeout && !g_auto.connect.empty())
+		{
+			::Msg("! [coop] autostart: no more connection attempts after this refusal");
+			g_auto.connect.clear();
 		}
 		script::on_rejected(r.reason, r.text.c_str(), diff); // W3d: refusal window (R-1.3, R-1.4)
 		join::on_session_lost(r.text.c_str());
