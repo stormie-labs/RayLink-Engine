@@ -78,8 +78,9 @@ void register_console_commands();
 void on_frame();
 // Engine hooks (W9): this thread is about to block and will not pump the network for a while: a level is torn
 // down or loaded, a save is written (CLevel::net_Stop, CGamePersistent::Start, every CGamePersistent::LoadTitle
-// stage, CALifeStorageManager::save). In a session the link is held alive from a helper thread until the next
-// normal frame (at most kLoadHoldMs after the last call). Any thread.
+// stage, CALifeStorageManager::save). In a session the link is held alive from a helper thread until this machine
+// plays normally again: no load step queued, precache frames done, a client live (coop_link_hold.h; Manager::frame
+// re-arms it until then). At most kLoadHoldMs after the last arm. Any thread.
 void on_blocking_work();
 // Engine hook: skip the "press any key" screen after a level load (a joining client, or an
 // instance started with -coop_host / -coop_connect for automated tests).

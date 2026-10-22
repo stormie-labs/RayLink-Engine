@@ -2,6 +2,13 @@
 //
 // Host: on JoinRequest it makes sure the player has a character (a proxy NPC in the host world,
 // found by player key), writes a fresh save of the world and streams it to the client.
+// Protocol 8 (owner, live test 2026-10-23): a key the world has no character for chooses one first. The host answers
+// its JoinRequest with Msg::CharOffer; the client shows it in the choice window (scripts\coop_menu_char.script, main
+// menu) and sends Msg::CharChoice; the host's script checks it and picks the faction's start on the host's level (else
+// a camp of the faction there, else next to the host: every player is on the host's level until split levels, F3a);
+// the host makes the character there with the faction's community, the script gives the kit and the money, and the
+// world save follows as for a returning player. A refused choice is offered again with the reason; the time to choose
+// is limited (xrCoop/coop_newchar.h).
 // Client: loads that save, so every server entity has the same id as on the host. Right after
 // the save is read and before anything goes online, the client swaps roles: its local actor
 // (id 0) takes the data of its own proxy, and the proxy takes the host actor's data — the proxy

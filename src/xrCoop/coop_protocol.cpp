@@ -32,6 +32,8 @@ const char* msg_name(Msg type)
 	case Msg::LevelChange: return "LevelChange";
 	case Msg::TransitionVote: return "TransitionVote";
 	case Msg::AvatarList: return "AvatarList";
+	case Msg::CharOffer: return "CharOffer";
+	case Msg::CharChoice: return "CharChoice";
 
 	case Msg::PlayerState: return "PlayerState";
 	case Msg::PlayerVitals: return "PlayerVitals";
@@ -127,6 +129,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::SessionReset:
 	case Msg::LevelChange:
 	case Msg::AvatarList:
+	case Msg::CharOffer: // protocol 8: the host offers a new character before the world
 	case Msg::PlayerHit:
 	case Msg::PlayerRules:
 	case Msg::EntitySpawn:
@@ -154,6 +157,7 @@ MsgSender msg_sender(Msg type)
 
 	// a client's requests and reports
 	case Msg::JoinRequest:
+	case Msg::CharChoice: // protocol 8: the player's choice, the host makes the character
 	case Msg::WorldLoaded:
 	case Msg::TransitionVote:
 	case Msg::PlayerVitals:
@@ -424,6 +428,84 @@ bool AvatarListMsg::read(Reader& r)
 	owners = std::move(rows);
 	return true;
 }
+// ---------------------------------------------------------------- protocol 8: a new character before the world
+
+bool char_name_valid(const std::string& s, size_t max)
+{
+	if (s.empty() || s.size() > max)
+		return false;
+	for (const char ch : s)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+		    c == '.' || c == '-';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+void CharOfferMsg::write(Writer& w) const
+{
+	w.u8(eco);
+	w.u32(points);
+	w.u8(flags);
+	w.str(level);
+	w.str(refusal);
+}
+
+bool CharOfferMsg::read(Reader& r)
+{
+	eco = r.u8();
+	points = r.u32();
+	flags = r.u8();
+	level = r.str();
+	refusal = r.str();
+	if (!r.ok() || eco < 1 || eco > 3 || (flags & ~uint8_t(Known)) != 0)
+		return false;
+	if (!level.empty() && !char_name_valid(level, kMaxLevel))
+		return false;
+	return refusal.empty() || char_name_valid(refusal, kMaxRefusal);
+}
+
+bool CharChoiceMsg::valid() const
+{
+	if (!char_name_valid(faction) || buy.size() > kMaxBuy)
+		return false;
+	for (const std::string& s : buy)
+		if (!char_name_valid(s))
+			return false;
+	return true;
+}
+
+void CharChoiceMsg::write(Writer& w) const
+{
+	const size_t count = std::min(buy.size(), kMaxBuy);
+	w.str(faction);
+	w.u8(uint8_t(count));
+	for (size_t i = 0; i < count; ++i)
+		w.str(buy[i]);
+}
+
+bool CharChoiceMsg::read(Reader& r)
+{
+	buy.clear();
+	faction = r.str();
+	const uint8_t count = r.u8();
+	if (!r.ok() || count > kMaxBuy || !char_name_valid(faction))
+		return false;
+	std::vector<std::string> items;
+	items.reserve(count);
+	for (uint8_t i = 0; i < count; ++i)
+	{
+		items.push_back(r.str());
+		if (!r.ok() || !char_name_valid(items.back()))
+			return false;
+	}
+	buy = std::move(items);
+	return true;
+}
+
 // ---------------------------------------------------------------- W5 C2: creature sounds
 
 bool sound_path_valid(const std::string& path)

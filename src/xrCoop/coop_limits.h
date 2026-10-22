@@ -49,6 +49,10 @@ constexpr RateRule kClientRateRules[] = {
 	// refreshed every 30 s while the talk lasts (coop_dialog.cpp kPendingTimeoutMs, kKeepAliveMs). 10 covers a player
 	// clicking an NPC that is busy, then one per second.
 	{Msg::DialogLock, 10, 1000},
+	// Protocol 8: a player with a new key sends his choice of character when he presses Done (the window waits for the
+	// answer); a refused choice is sent again after a change. Each one runs the host's Lua check and, when accepted, a
+	// world save. One per 2 s after a burst; a choice nobody asked for is ignored anyway (coop_join, newchar::Choosers).
+	{Msg::CharChoice, 4, 2000},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "pch_script.h"
 #include "coop_join.h"
 #include "coop_manager.h"
 #include "coop_sync.h"
@@ -11,8 +12,12 @@
 #include "coop_script.h"
 #include "xrCoop/coop_shapes.h"
 #include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_newchar.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
+#include "ai_space.h"
+#include "script_engine.h"
+#include "level_graph.h"
 #include "Level.h"
 #include "level_changer.h"
 #include "alife_simulator.h"
@@ -25,6 +30,7 @@
 #include "game_graph.h"
 #include "character_community.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 
@@ -90,6 +96,8 @@ struct State
 	bool reset_pending = false;
 	// host: R1 I4, R2 I4: one join in flight per player, one per 5 s
 	JoinGate gate;
+	// host: JoinRequests that came while the host's own level was still coming up (host_precaching), sent after it
+	xr_vector<PeerId> precache_wait;
 	// host: Ruling F2-10 b: the keys this session made a new character for (coop_max_new_characters); a new session
 	// starts over (on_host_started)
 	limits::NewCharacters new_characters;
@@ -104,6 +112,21 @@ struct State
 	PeerId transition_from = kInvalidPeer;
 	// host: when each player's vote last reached Lua and the chat (kVoteNoticeMs)
 	xr_map<PeerId, u64> vote_noticed;
+	// host, protocol 8: the players with a new key who are choosing their character before the world
+	newchar::Choosers choosers;
+	u32 choices_ignored = 0; // diagnostics: CharChoice nobody asked for, or unreadable
+	u32 choices_refused = 0; // choices the host's Lua refused (the player was asked again)
+	u32 characters_made = 0; // new characters made at their faction's start before the world
+	// client, protocol 8: the host's offer of a new character, in the choice window until it gives a choice
+	enum class CharStep : u8
+	{
+		None,
+		Offered, // to be shown (coop_menu_char.join_offer)
+		Shown, // the window is open: its choice is taken by join_choice
+		Sent, // the CharChoice is on its way: the world, or the offer again with a refusal
+	} char_step = CharStep::None;
+	CharOfferMsg char_offer;
+	u64 char_next_try = 0;
 } g;
 
 constexpr u32 kRefusalsLogged = 5;
@@ -120,6 +143,108 @@ constexpr u64 kVoteNoticeMs = 10000;
 constexpr float kVoteReachM = 5.f;
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
+
+// ---------------------------------------------------------------- protocol 8: the choice window's script
+// scripts\coop_menu_char.script: the host checks a choice and picks the start there, the client shows the offer and
+// gives the choice back (the functions are listed in its header). Called on the main thread, from the session's
+// handlers and join::frame, as coop_script.cpp calls coop_main.
+constexpr const char* kCharScript = "coop_menu_char";
+
+enum class LuaCall : u8
+{
+	Done,
+	Missing, // the script or the function is not there
+	Failed, // it raised an error (logged)
+};
+
+int char_traceback(lua_State* L)
+{
+	const char* msg = lua_tostring(L, 1);
+	if (!msg)
+		msg = "(error object is not a string)";
+	lua_getglobal(L, "debug");
+	if (!lua_istable(L, -1))
+	{
+		lua_pop(L, 1);
+		lua_pushstring(L, msg);
+		return 1;
+	}
+	lua_getfield(L, -1, "traceback");
+	if (!lua_isfunction(L, -1))
+	{
+		lua_pop(L, 2);
+		lua_pushstring(L, msg);
+		return 1;
+	}
+	lua_pushstring(L, msg);
+	lua_pushinteger(L, 2);
+	lua_call(L, 2, 1);
+	return 1;
+}
+
+// Protected call of coop_menu_char.<fn>(what `push` pushes; it returns how many) with `nres` results, which
+// `read(L, index of the first)` reads. Never throws, leaves the stack as it was.
+template <typename Push, typename Read>
+LuaCall call_char(const char* fn, Push push, int nres, Read read)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 24))
+		return LuaCall::Missing;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &char_traceback);
+	const int errfunc = lua_gettop(L);
+	lua_getglobal(L, kCharScript); // _G.__index loads gamedata/scripts/<name>.script
+	if (lua_istable(L, -1))
+	{
+		lua_getfield(L, -1, fn);
+		lua_remove(L, -2);
+	}
+	if (!lua_isfunction(L, -1))
+	{
+		lua_settop(L, top);
+		return LuaCall::Missing;
+	}
+	const int nargs = push(L);
+	if (lua_pcall(L, nargs, nres, errfunc) != 0)
+	{
+		const char* err = lua_tostring(L, -1);
+		::Msg("! [coop] lua error in %s.%s: %s", kCharScript, fn, err ? err : "?");
+		lua_settop(L, top);
+		return LuaCall::Failed;
+	}
+	read(L, errfunc + 1);
+	lua_settop(L, top);
+	return LuaCall::Done;
+}
+
+int push_nothing(lua_State*) { return 0; }
+
+std::string lua_string_at(lua_State* L, int index)
+{
+	if (lua_type(L, index) != LUA_TSTRING)
+		return std::string();
+	size_t n = 0;
+	const char* s = lua_tolstring(L, index, &n);
+	return std::string(s, n);
+}
+
+std::string lua_string_field(lua_State* L, int table, const char* key)
+{
+	lua_getfield(L, table, key);
+	std::string out = lua_string_at(L, -1);
+	lua_pop(L, 1);
+	return out;
+}
+
+bool lua_number_field(lua_State* L, int table, const char* key, lua_Number& out)
+{
+	lua_getfield(L, table, key);
+	const bool ok = lua_type(L, -1) == LUA_TNUMBER;
+	if (ok)
+		out = lua_tonumber(L, -1);
+	lua_pop(L, 1);
+	return ok;
+}
 
 // R1 I1: a player's character keeps in its custom data the SHA-256 of its player's key, never the key itself: the
 // world save goes to every client, and a key is all it takes to play someone's character. Format, strict parse
@@ -186,14 +311,34 @@ CSE_ALifeHumanStalker* find_proxy_by_key(const std::string& digest)
 	return found;
 }
 
-CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_digest)
+// Protocol 8: where a new character appears: the point the host's Lua picked (its faction's start or camp, checked by
+// host_place), else next to the host.
+struct StartPoint
+{
+	bool set = false;
+	Fvector pos{};
+	u32 lvid = u32(-1);
+	GameGraph::_GRAPH_ID gvid = GameGraph::_GRAPH_ID(-1);
+	std::string where; // "start:<location>" / "camp:<smart>" (the log)
+};
+
+CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_digest, const StartPoint& at)
 {
 	CSE_ALifeCreatureActor* actor = ai().alife().graph().actor();
 	if (!actor)
 		return nullptr;
 	Fvector pos = actor->o_Position;
-	pos.x += 1.5f;
-	CSE_Abstract* e = alife_rw().spawn_item(kProxySection, pos, actor->m_tNodeID, actor->m_tGraphID, kNoId);
+	u32 node = actor->m_tNodeID;
+	GameGraph::_GRAPH_ID graph = actor->m_tGraphID;
+	if (at.set)
+	{
+		pos = at.pos;
+		node = at.lvid;
+		graph = at.gvid;
+	}
+	else
+		pos.x += 1.5f;
+	CSE_Abstract* e = alife_rw().spawn_item(kProxySection, pos, node, graph, kNoId);
 	CSE_ALifeHumanStalker* proxy = smart_cast<CSE_ALifeHumanStalker*>(e);
 	if (!proxy)
 	{
@@ -206,9 +351,68 @@ CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_di
 	xr_sprintf(ini, "[coop]\nkey = %s\nnick = %s\n", key_digest.c_str(), p.nick.c_str()); // R1 I1: the digest
 	proxy->m_ini_string = ini;
 	proxy->m_character_name = p.nick.c_str();
-	::Msg("[coop] new character for '%s': proxy id %u at [%.1f %.1f %.1f]", p.nick.c_str(), proxy->ID, pos.x, pos.y,
-	    pos.z);
+	::Msg("[coop] new character for '%s': proxy id %u at [%.1f %.1f %.1f] (%s)", p.nick.c_str(), proxy->ID, pos.x, pos.y,
+	    pos.z, at.set ? at.where.c_str() : "next to the host");
 	return proxy;
+}
+
+// Protocol 8: the point the host's Lua picked for a new character, if it can be used. Until split levels (F3a,
+// newchar::kOwnLevels) it must be on the host's level; its level vertex can only be checked there (the level graph of
+// another level is not loaded).
+StartPoint host_place(bool have, const lua_Number (&xyz)[3], lua_Number lvid, lua_Number gvid, const std::string& where)
+{
+	StartPoint sp;
+	if (!have)
+		return sp;
+	const CGameGraph& gg = ai().game_graph();
+	const bool graph_ok = gvid >= 0 && gvid < lua_Number(0xFFFF) && gg.valid_vertex_id(u32(gvid));
+	const bool here = graph_ok &&
+	    gg.vertex(GameGraph::_GRAPH_ID(gvid))->level_id() == ai().alife().graph().level().level_id();
+	bool valid = graph_ok && _valid(float(xyz[0])) && _valid(float(xyz[1])) && _valid(float(xyz[2])) && lvid >= 0 &&
+	    lvid < lua_Number(u32(-1));
+	if (valid && here)
+		valid = ai().level_graph().valid_vertex_id(u32(lvid));
+	if (!newchar::point_usable(valid, here))
+	{
+		::Msg("! [coop] new character: %s (game vertex %.0f, level vertex %.0f) %s, next to the host instead", where.c_str(),
+		    gvid, lvid, valid ? "is on another level (every player is on the host's level)" : "is not a point of this world");
+		return sp;
+	}
+	sp.set = true;
+	sp.pos.set(float(xyz[0]), float(xyz[1]), float(xyz[2]));
+	sp.lvid = u32(lvid);
+	sp.gvid = GameGraph::_GRAPH_ID(gvid);
+	sp.where = where;
+	return sp;
+}
+
+// Protocol 8: a fresh character carries its NPC profile's supplies (spawn_supplies): a player gets his faction's kit
+// instead (coop_menu_char.host_make_character), as the in-world choice replaced the inventory.
+u32 strip_supplies(CSE_ALifeHumanStalker& proxy)
+{
+	const xr_vector<ALife::_OBJECT_ID> kids = proxy.children;
+	u32 n = 0;
+	for (const ALife::_OBJECT_ID id : kids)
+	{
+		if (CSE_ALifeDynamicObject* item = ai().alife().objects().object(id, true))
+		{
+			alife_rw().release(item, true);
+			++n;
+		}
+	}
+	return n;
+}
+
+// Protocol 8: the character's community is its faction's (the NPC community; the client's actor becomes actor_<faction>
+// in the role swap, on_alife_objects_loaded).
+bool set_faction(CSE_ALifeHumanStalker& proxy, const std::string& faction)
+{
+	const CHARACTER_COMMUNITY_INDEX index =
+	    CHARACTER_COMMUNITY::IdToIndex(shared_str(faction.c_str()), NO_COMMUNITY_INDEX, true);
+	if (index == NO_COMMUNITY_INDEX)
+		return false;
+	proxy.m_community_index = index;
+	return true;
 }
 
 // The group lives on one level. A character left behind (its player was away when the host
@@ -294,8 +498,76 @@ void host_send_owners()
 }
 
 // --- host: JoinRequest ---
-// The world for a player whose join the gate admitted: his character (found by key, or a new one), a fresh save of
-// the world, the blob. false if it could not be sent (the player is gone or was kicked with the reason).
+// The digest of a player's key (R1 I1), or false (logged, he is kicked: the host cannot tell his character).
+bool host_key_digest(PeerId from, const PeerInfo& p, std::string& out)
+{
+	if (key_digest_hex(p.key, out))
+		return true;
+	::Msg("! [coop] cannot hash the player key of '%s' (BCrypt)", p.nick.c_str());
+	mgr().session().kick(from, RejectReason::HostNotReady, "host could not check your player key");
+	return false;
+}
+
+// Ruling F2-10 b: the client picks its key; every new one used to get a character (starting kit, money) that stays in
+// the save for good. A session makes coop_max_new_characters (F2 T3 fix round 1: a host setting, read at each join); a
+// returning player costs nothing. False: he is kicked with the reason.
+bool host_admits_new_key(PeerId from, const PeerInfo& p, const std::string& key_digest)
+{
+	const u32 max_new = u32(g_coop_max_new_characters);
+	if (g.new_characters.admits(key_digest, max_new))
+		return true;
+	if (++g.characters_refused <= kRefusalsLogged)
+		::Msg("! [coop] '%s' has no character in this world, and this session has made %u new characters "
+		      "(coop_max_new_characters %u): refused",
+		    p.nick.c_str(), u32(g.new_characters.count()), max_new);
+	mgr().session().kick(from, limits::kNoNewCharacterReason, limits::no_new_character_text(max_new));
+	return false;
+}
+
+bool host_send_save(PeerId from, const PeerInfo& p, CSE_ALifeHumanStalker& proxy_ref);
+
+// Protocol 8: player `from` has no character in this world: he chooses one before the world (Msg::CharOffer; again
+// after a refused choice, `refusal` is its reason code). False if the host's game has no choice window
+// (coop_menu_char.script): his character is made next to the host as before.
+bool host_offer_character(PeerId from, const PeerInfo& p, const char* refusal)
+{
+	lua_Number eco = 1, points = 0;
+	bool story = false;
+	const LuaCall call = call_char("join_terms", &push_nothing, 3, [&](lua_State* L, int at) {
+		if (lua_type(L, at) == LUA_TNUMBER)
+			eco = lua_tonumber(L, at);
+		if (lua_type(L, at + 1) == LUA_TNUMBER)
+			points = lua_tonumber(L, at + 1);
+		story = lua_toboolean(L, at + 2) != 0;
+	});
+	if (call != LuaCall::Done)
+	{
+		::Msg("! [coop] %s.join_terms %s: '%s' gets a character next to the host, without a choice", kCharScript,
+		    call == LuaCall::Missing ? "is missing" : "failed", p.nick.c_str());
+		return false;
+	}
+	CharOfferMsg m;
+	m.eco = u8(eco >= 3 ? 3 : (eco >= 2 ? 2 : 1));
+	m.points = points > 0 ? u32(_min(points, lua_Number(1e9))) : 0u;
+	m.flags = story ? CharOfferMsg::StoryMode : 0;
+	const xr_string level = g_pGameLevel ? Level().name().c_str() : "";
+	if (char_name_valid(level.c_str(), CharOfferMsg::kMaxLevel))
+		m.level = level.c_str();
+	if (refusal && *refusal)
+		m.refusal = char_name_valid(refusal, CharOfferMsg::kMaxRefusal) ? refusal : "busy";
+	Writer w(96);
+	m.write(w);
+	mgr().session().send(from, Lane::Reliable, Msg::CharOffer, w);
+	g.choosers.offer(from, mgr().now_ms());
+	::Msg("[coop] '%s' has no character in this world: he chooses one before the world (economy %u, %u points, %s)%s%s",
+	    p.nick.c_str(), u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.refusal.empty() ? "" : ", refused: ",
+	    m.refusal.c_str());
+	return true;
+}
+
+// The world for a player whose join the gate admitted: his character (found by key) and a fresh save of the world, or
+// (protocol 8) the offer of a new character, whose choice brings the world (host_on_char_choice). false if neither
+// could be sent (the player is gone or was kicked with the reason).
 bool host_send_world(PeerId from)
 {
 	const PeerInfo* p = mgr().session().peer(from);
@@ -308,42 +580,201 @@ bool host_send_world(PeerId from)
 	}
 
 	std::string key_digest;
-	if (!key_digest_hex(p->key, key_digest))
-	{
-		::Msg("! [coop] cannot hash the player key of '%s' (BCrypt)", p->nick.c_str());
-		mgr().session().kick(from, RejectReason::HostNotReady, "host could not check your player key");
+	if (!host_key_digest(from, *p, key_digest))
 		return false;
-	}
 	CSE_ALifeHumanStalker* proxy = find_proxy_by_key(key_digest);
 	if (proxy)
 	{
 		::Msg("[coop] '%s' returns to character proxy id %u", p->nick.c_str(), proxy->ID);
 		bring_proxy_to_level(*proxy, p->nick.c_str());
+		return host_send_save(from, *p, *proxy);
 	}
-	else
-	{
-		// Ruling F2-10 b: the client picks its key; every new one used to get a character (starting kit, money) that
-		// stays in the save for good. A session makes coop_max_new_characters (F2 T3 fix round 1: a host setting, read
-		// at each join); a returning player costs nothing.
-		const u32 max_new = u32(g_coop_max_new_characters);
-		if (!g.new_characters.admits(key_digest, max_new))
-		{
-			if (++g.characters_refused <= kRefusalsLogged)
-				::Msg("! [coop] '%s' has no character in this world, and this session has made %u new characters "
-				      "(coop_max_new_characters %u): refused",
-				    p->nick.c_str(), u32(g.new_characters.count()), max_new);
-			mgr().session().kick(from, limits::kNoNewCharacterReason, limits::no_new_character_text(max_new));
-			return false;
-		}
-		proxy = create_proxy(*p, key_digest);
-		if (proxy)
-			g.new_characters.add(key_digest);
-	}
+	if (!host_admits_new_key(from, *p, key_digest))
+		return false;
+	if (host_offer_character(from, *p, nullptr))
+		return true; // the join stays in flight while he chooses
+	proxy = create_proxy(*p, key_digest, StartPoint());
 	if (!proxy)
 	{
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");
 		return false;
 	}
+	g.new_characters.add(key_digest);
+	return host_send_save(from, *p, *proxy);
+}
+
+// Protocol 8: a refused choice: the offer again with the reason. If even that fails (the host's script broke meanwhile),
+// the player cannot choose: he is dropped with the reason instead of waiting for the time limit.
+void host_ask_again(PeerId from, const PeerInfo& p, const char* refusal)
+{
+	if (host_offer_character(from, p, refusal))
+		return;
+	g.choosers.forget(from);
+	mgr().session().kick(from, RejectReason::HostNotReady, "the host's character window failed, see the host's log");
+}
+
+// What the host's Lua answered about a choice (coop_menu_char.host_plan_character).
+struct CharPlan
+{
+	bool ok = false;
+	std::string reason = "busy";
+	bool have_point = false;
+	lua_Number xyz[3] = {0, 0, 0};
+	lua_Number lvid = -1, gvid = -1;
+	std::string where;
+	lua_Number money = 0;
+};
+
+// Protocol 8: player `from` chose. The host's Lua checks the choice and picks the start of the faction; the engine
+// makes the character there (offline: its player is not in the world yet), strips the NPC supplies, sets the faction;
+// the Lua gives the kit and the money; then the world save. A refused choice is offered again with the reason.
+void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg& m)
+{
+	if (!host_can_start())
+	{
+		g.choosers.forget(from);
+		mgr().session().kick(from, RejectReason::HostNotReady, "host is not in a game right now, try again later");
+		return;
+	}
+	std::string key_digest;
+	if (!host_key_digest(from, p, key_digest))
+	{
+		g.choosers.forget(from);
+		return;
+	}
+	if (CSE_ALifeHumanStalker* had = find_proxy_by_key(key_digest)) // cannot happen: one connection per key
+	{
+		g.choosers.forget(from);
+		::Msg("[coop] '%s' has a character after all (proxy id %u): no new one", p.nick.c_str(), had->ID);
+		bring_proxy_to_level(*had, p.nick.c_str());
+		if (!host_send_save(from, p, *had))
+			g.gate.forget(from);
+		return;
+	}
+	if (!host_admits_new_key(from, p, key_digest)) // the setting may have been lowered while he chose
+	{
+		g.choosers.forget(from);
+		return;
+	}
+
+	const std::string buy = newchar::buy_csv(m);
+	auto push_choice = [&](lua_State* L) {
+		lua_pushnumber(L, lua_Number(from));
+		lua_pushlstring(L, m.faction.data(), m.faction.size());
+		lua_pushlstring(L, buy.data(), buy.size());
+		return 3;
+	};
+	CharPlan plan;
+	const LuaCall planned = call_char("host_plan_character", push_choice, 1, [&](lua_State* L, int at) {
+		if (!lua_istable(L, at))
+			return;
+		lua_getfield(L, at, "ok");
+		plan.ok = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		const std::string reason = lua_string_field(L, at, "reason");
+		if (!reason.empty())
+			plan.reason = reason;
+		lua_number_field(L, at, "money", plan.money);
+		plan.where = lua_string_field(L, at, "where");
+		plan.have_point = lua_number_field(L, at, "x", plan.xyz[0]) && lua_number_field(L, at, "y", plan.xyz[1]) &&
+		    lua_number_field(L, at, "z", plan.xyz[2]) && lua_number_field(L, at, "lvid", plan.lvid) &&
+		    lua_number_field(L, at, "gvid", plan.gvid);
+	});
+	if (planned != LuaCall::Done || !plan.ok)
+	{
+		++g.choices_refused;
+		::Msg("[coop] '%s' chose %s: refused (%s), asked again", p.nick.c_str(), m.faction.c_str(),
+		    planned == LuaCall::Done ? plan.reason.c_str() : "the host's script failed");
+		host_ask_again(from, p, plan.reason.c_str());
+		return;
+	}
+
+	CSE_ALifeHumanStalker* proxy = create_proxy(p, key_digest, host_place(plan.have_point, plan.xyz, plan.lvid,
+	                                                                           plan.gvid, plan.where));
+	if (!proxy)
+	{
+		g.choosers.forget(from);
+		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");
+		return;
+	}
+	const u32 stripped = strip_supplies(*proxy);
+	if (!set_faction(*proxy, m.faction))
+		::Msg("! [coop] community '%s' is not in game_relations.ltx: the character keeps its profile's", m.faction.c_str());
+	// money::host_set (coop.money_set) finds a player's character by his peer: his entry knows it from here
+	const bool had_entry = g.peers.find(from) != g.peers.end();
+	HostPeer& hp = g.peers[from];
+	hp.proxy = proxy->ID;
+	hp.loading = true;
+	bool made = false;
+	std::string why = "busy";
+	const u16 proxy_id = proxy->ID;
+	const LuaCall given = call_char("host_make_character",
+	    [&](lua_State* L) {
+		    lua_pushnumber(L, lua_Number(from));
+		    lua_pushnumber(L, lua_Number(proxy_id));
+		    lua_pushlstring(L, m.faction.data(), m.faction.size());
+		    lua_pushlstring(L, buy.data(), buy.size());
+		    return 4;
+	    },
+	    2, [&](lua_State* L, int at) {
+		    made = lua_toboolean(L, at) != 0;
+		    const std::string reason = lua_string_at(L, at + 1);
+		    if (!made && !reason.empty())
+			    why = reason;
+	    });
+	if (given != LuaCall::Done || !made)
+	{
+		::Msg("! [coop] new character of '%s' not made (%s): released, asked again", p.nick.c_str(), why.c_str());
+		if (had_entry)
+			hp.proxy = kNoId;
+		else
+			g.peers.erase(from);
+		alife_rw().release(proxy, true);
+		host_ask_again(from, p, why.c_str());
+		return;
+	}
+	g.new_characters.add(key_digest);
+	g.choosers.forget(from);
+	++g.characters_made;
+	::Msg("[coop] '%s' chose %s: character %u made before the world (%u NPC item(s) stripped, %.0f RU), sending the "
+	      "world",
+	    p.nick.c_str(), m.faction.c_str(), u32(proxy_id), stripped, plan.money);
+	if (!host_send_save(from, p, *proxy))
+		g.gate.forget(from);
+}
+
+// Protocol 8, host: a player's choice of his new character.
+void host_on_char_choice(PeerId from, Reader& r)
+{
+	if (!mgr().is_host())
+		return; // the session drops it on a client already (msg_sender)
+	const PeerInfo* p = mgr().session().peer(from);
+	if (!p)
+		return;
+	CharChoiceMsg m;
+	const bool readable = m.read(r);
+	if (!g.choosers.take(from))
+	{
+		if (++g.choices_ignored <= kRefusalsLogged)
+			::Msg("! [coop] '%s' sends a character choice nobody asked for: ignored", p->nick.c_str());
+		return;
+	}
+	if (!readable)
+	{
+		if (++g.choices_ignored <= kRefusalsLogged)
+			::Msg("! [coop] '%s' sends an unreadable character choice: asked again", p->nick.c_str());
+		host_ask_again(from, *p, "items");
+		return;
+	}
+	host_make_new_character(from, *p, m);
+}
+
+// The save of the world for player `from`, whose character is `proxy`, streamed to him (the join is in flight until
+// his WorldLoaded). false if it could not be sent (he was kicked with the reason).
+bool host_send_save(PeerId from, const PeerInfo& p_ref, CSE_ALifeHumanStalker& proxy_ref)
+{
+	const PeerInfo* p = &p_ref;
+	CSE_ALifeHumanStalker* proxy = &proxy_ref;
 	HostPeer& hp = g.peers[from];
 	hp.proxy = proxy->ID;
 	hp.loading = true; // W9: not in the world before WorldLoaded: the save he gets has his character offline
@@ -374,7 +805,8 @@ bool host_send_world(PeerId from)
 	const bool saved = read_file(scop, engine_part) && !engine_part.empty();
 	if (saved)
 		read_file(scoc, script_part); // absent if Anomaly's script storage is disabled
-	mgr().session().hold_connection(0); // W9: done blocking (Manager::frame would release it next frame anyway)
+	// W9: the hold is not let go here. Manager::frame decides on the next frame (link_hold::keep_held): a join that
+	// comes while the host's own level is still coming up must not cut the hold of that load short.
 	if (!saved)
 	{
 		::Msg("! [coop] world save failed (%s)", scop);
@@ -410,13 +842,23 @@ bool host_send_world(PeerId from)
 	return true;
 }
 
-void host_on_join_request(PeerId from, Reader&)
+// The host's own level is still coming up (precache frames, the first update of every script): a world save now
+// would stall those frames further, and they are held by the link hold of that load (Manager::frame).
+bool host_precaching() { return g_pGameLevel && Device.dwPrecacheFrame != 0; }
+
+// The gate for a JoinRequest of `from` that arrives now (or waited for the host's load, host_due_joins).
+void host_join_request(PeerId from, const PeerInfo& peer)
 {
-	if (!mgr().is_host())
-		return; // F0 final review: the session drops it on a client already (msg_sender); handlers check it too
-	const PeerInfo* p = mgr().session().peer(from);
-	if (!p)
+	const PeerInfo* p = &peer;
+	// Review of the live fixes: a join during the host's own load waits like a Later until the host plays normally.
+	if (host_precaching())
+	{
+		if (std::find(g.precache_wait.begin(), g.precache_wait.end(), from) == g.precache_wait.end())
+			g.precache_wait.push_back(from);
+		::Msg("[coop] '%s' asks for the world while the host's level is loading: it is sent when that is over",
+		    p->nick.c_str());
 		return;
+	}
 	// R1 I4, R2 I4: every join costs a full world save on this thread. (A JoinRequest made in a world that is gone
 	// never gets here: the session drops it by the world epoch, R2 I1.)
 	switch (g.gate.request(from, mgr().now_ms()))
@@ -436,9 +878,27 @@ void host_on_join_request(PeerId from, Reader&)
 	}
 }
 
-// Host: joins that waited for their turn (JoinGate) and whose time has come.
+void host_on_join_request(PeerId from, Reader&)
+{
+	if (!mgr().is_host())
+		return; // F0 final review: the session drops it on a client already (msg_sender); handlers check it too
+	if (const PeerInfo* p = mgr().session().peer(from))
+		host_join_request(from, *p);
+}
+
+// Host: joins that waited for their turn (JoinGate) or for the host's own load, and whose time has come.
 void host_due_joins()
 {
+	if (host_precaching())
+		return; // the gate keeps its waiting ones until the host plays normally
+	if (!g.precache_wait.empty())
+	{
+		const xr_vector<PeerId> waited = g.precache_wait;
+		g.precache_wait.clear();
+		for (PeerId id : waited)
+			if (const PeerInfo* p = mgr().session().peer(id))
+				host_join_request(id, *p);
+	}
 	for (PeerId id : g.gate.due(mgr().now_ms()))
 		if (!host_send_world(id))
 			g.gate.forget(id);
@@ -500,6 +960,8 @@ void client_on_session_reset(PeerId from, Reader& r)
 	g.my_proxy = kNoId;
 	g.load_issued = false;
 	g.swap_done = false;
+	// protocol 8: an offer of the old world is void; the window stays open until the host offers again (join_offer)
+	g.char_step = State::CharStep::None;
 	sync::reset();
 	g.receive_started = mgr().now_ms(); // the join time limit starts again
 	mgr().set_phase(Phase::ReceivingWorld);
@@ -535,6 +997,118 @@ void client_on_avatar_list(PeerId from, Reader& r)
 		owners.push_back(mine);
 	}
 	world::client_set_owners(owners);
+}
+
+// Protocol 8, client: the host has no character for our key: we choose one before the world. The offer goes to the
+// choice window from join::frame (client_char_frame); again after a refused choice, with the reason.
+void client_on_char_offer(PeerId from, Reader& r)
+{
+	if (from != kHostPeer || !mgr().is_client())
+		return; // only the host sends it (the session kicks a client that does, msg_sender)
+	CharOfferMsg m;
+	if (!m.read(r))
+	{
+		::Msg("! [coop] malformed CharOffer from the host");
+		mgr().stop("bad data from the host");
+		return;
+	}
+	if (mgr().phase() != Phase::ReceivingWorld || g.load_issued)
+	{
+		::Msg("! [coop] an offer of a new character arrived while no world was awaited (%s): ignored",
+		    phase_name(mgr().phase()));
+		return;
+	}
+	g.char_offer = m;
+	g.char_step = State::CharStep::Offered;
+	g.char_next_try = 0;
+	g.receive_started = mgr().now_ms(); // the time to choose is the host's (newchar::kChoiceTimeoutMs)
+	::Msg("[coop] the host has no character for us: choose faction and gear (economy %u, %u points, level %s)%s%s",
+	    u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.refusal.empty() ? "" : ", last choice refused: ",
+	    m.refusal.c_str());
+}
+
+// Protocol 8, client (join::frame): the offer to the window, the window's choice to the host.
+void client_char_frame()
+{
+	if (g.char_step == State::CharStep::None || g.char_step == State::CharStep::Sent ||
+	    mgr().phase() != Phase::ReceivingWorld)
+		return;
+	const u64 now = mgr().now_ms();
+	if (now < g.char_next_try)
+		return;
+	if (g.char_step == State::CharStep::Offered)
+	{
+		g.char_next_try = now + 500; // no dialog can be opened yet (precache, no menu): again soon
+		const CharOfferMsg& o = g.char_offer;
+		bool shown = false;
+		const LuaCall call = call_char("join_offer",
+		    [&o](lua_State* L) {
+			    lua_pushnumber(L, lua_Number(o.eco));
+			    lua_pushnumber(L, lua_Number(o.points));
+			    lua_pushlstring(L, o.level.data(), o.level.size());
+			    lua_pushlstring(L, o.refusal.data(), o.refusal.size());
+			    lua_pushnumber(L, lua_Number(o.flags));
+			    return 5;
+		    },
+		    1, [&shown](lua_State* L, int at) { shown = lua_toboolean(L, at) != 0; });
+		if (call != LuaCall::Done)
+		{
+			::Msg("! [coop] %s.join_offer %s: cannot choose a character", kCharScript,
+			    call == LuaCall::Missing ? "is missing" : "failed");
+			mgr().stop(call == LuaCall::Missing ? "this game has no co-op character window (coop_menu_char.script)"
+			                                    : "the co-op character window failed, see the log");
+			return;
+		}
+		if (shown)
+		{
+			g.char_step = State::CharStep::Shown;
+			g.char_next_try = now;
+		}
+		return;
+	}
+	g.char_next_try = now + 100;
+	std::string faction, buy;
+	bool chose = false;
+	const LuaCall call = call_char("join_choice", &push_nothing, 2, [&](lua_State* L, int at) {
+		chose = lua_type(L, at) == LUA_TSTRING;
+		faction = lua_string_at(L, at);
+		buy = lua_string_at(L, at + 1);
+	});
+	if (call != LuaCall::Done)
+	{
+		mgr().stop("the co-op character window failed, see the log");
+		return;
+	}
+	if (!chose)
+		return;
+	CharChoiceMsg m;
+	if (!newchar::make_choice(faction, buy, m))
+	{
+		::Msg("! [coop] the character window gave a choice the host cannot read ('%s'): not sent", faction.c_str());
+		g.char_offer.refusal = "items";
+		g.char_step = State::CharStep::Offered;
+		return;
+	}
+	Writer w(64 + buy.size() + 2 * m.buy.size());
+	m.write(w);
+	mgr().session().send(kHostPeer, Lane::Reliable, Msg::CharChoice, w);
+	g.char_step = State::CharStep::Sent;
+	g.receive_started = now; // the join time limit starts again: the world follows the choice
+	::Msg("[coop] character chosen: %s, %u item(s) bought; waiting for the world", m.faction.c_str(), u32(m.buy.size()));
+}
+
+// Protocol 8, client: the world arrives or the session ends: the choice window closes.
+void client_char_closed(const char* why)
+{
+	if (g.char_step == State::CharStep::None)
+		return;
+	g.char_step = State::CharStep::None;
+	call_char("join_closed",
+	    [why](lua_State* L) {
+		    lua_pushstring(L, why);
+		    return 1;
+	    },
+	    0, [](lua_State*, int) {});
 }
 
 void client_load_world(std::vector<u8>& data)
@@ -581,6 +1155,7 @@ void client_load_world(std::vector<u8>& data)
 	::Msg("[coop] world received (%u + %u bytes), my character is proxy %u in host numbering, loading", engine_size,
 	    script_size, proxy);
 
+	client_char_closed("world"); // protocol 8: the choice window (main menu) closes before the load
 	on_blocking_work(); // W9: the load below does not pump the network; the engine hooks re-arm it per stage
 	if (g_pGameLevel)
 		Console->Execute("disconnect");
@@ -747,6 +1322,8 @@ void install(Session& s)
 		s.limit_rate(rule.type, rule.burst, rule.refill_ms); // R2 I4, T12 review, F2 T3 (host only, per client)
 	s.on(Msg::TransitionVote, &host_on_transition_vote);
 	s.on(Msg::JoinRequest, &host_on_join_request);
+	s.on(Msg::CharChoice, &host_on_char_choice); // protocol 8
+	s.on(Msg::CharOffer, &client_on_char_offer);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
 	s.on(Msg::JoinComplete, &client_on_join_complete);
 	s.on(Msg::SessionReset, &client_on_session_reset);
@@ -844,6 +1421,8 @@ void on_peer_left(PeerId id)
 	// T12 review (Ruling 18): before the lookup below. A player who got Later and left before his world was sent has
 	// no entry in g.peers; his waiting request must not outlive him (the next player in his slot would be Refused).
 	g.gate.forget(id);
+	g.precache_wait.erase(std::remove(g.precache_wait.begin(), g.precache_wait.end(), id), g.precache_wait.end());
+	g.choosers.forget(id); // protocol 8: he left while choosing his character
 	g.vote_noticed.erase(id);
 	if (g.transition_from == id)
 	{
@@ -895,6 +1474,7 @@ void on_welcome(const WelcomeMsg&)
 {
 	g.my_proxy = kNoId;
 	g.load_issued = false;
+	g.char_step = State::CharStep::None;
 	g.receive_started = mgr().now_ms();
 	mgr().set_phase(Phase::ReceivingWorld);
 	mgr().session().send(kHostPeer, Lane::Reliable, Msg::JoinRequest, Writer());
@@ -957,6 +1537,8 @@ void host_watch_world()
 		// The epoch moved on in on_world_created (R2 I1). Joins into the old world are void, everybody rejoins
 		// after SessionReset; a level exit asked for in it means nothing here.
 		g.gate.world_replaced();
+		g.precache_wait.clear(); // requests of the old world: everybody rejoins after SessionReset
+		g.choosers.world_replaced(); // protocol 8: a player choosing is asked again after his SessionReset
 		g.pending_changer = kNoId;
 		g.reset_pending = true;
 		for (auto& it : g.peers)
@@ -997,8 +1579,8 @@ void host_watch_joins()
 	xr_vector<PeerId> stuck;
 	for (const auto& it : g.peers)
 	{
-		if (!it.second.loading)
-			continue;
+		if (!it.second.loading || g.choosers.in_choice(it.first))
+			continue; // protocol 8: a player choosing his character (after a world change) has the limit below
 		if (net::host_queue_overflow(it.first) || (it.second.sent_at && now - it.second.sent_at > kJoinTimeoutMs))
 			stuck.push_back(it.first);
 	}
@@ -1006,6 +1588,13 @@ void host_watch_joins()
 	{
 		::Msg("! [coop] #%u did not finish loading the world in time, dropping it", id);
 		mgr().session().kick(id, RejectReason::Timeout, "loading the host's world took too long, try to join again");
+	}
+	// Protocol 8: a player who keeps the choice window open holds a slot and a join in flight.
+	for (PeerId id : g.choosers.expired(now))
+	{
+		::Msg("! [coop] #%u did not choose a character in %u min, dropping it", id, u32(newchar::kChoiceTimeoutMs / 60000));
+		g.choosers.forget(id);
+		mgr().session().kick(id, RejectReason::Timeout, "you did not choose a character in time, join again");
 	}
 }
 
@@ -1018,14 +1607,20 @@ void frame()
 		host_due_joins();
 		return;
 	}
-	// Client: downloading or loading the world must end in time (R-2.3).
+	// Client: downloading or loading the world must end in time (R-2.3). Protocol 8: choosing a character has the
+	// host's limit (it drops us first; a minute more here for a host that is gone silent).
+	const bool choosing = g.char_step == State::CharStep::Offered || g.char_step == State::CharStep::Shown;
+	const u64 limit = choosing ? newchar::kChoiceTimeoutMs + 60000 : kJoinTimeoutMs;
 	if ((mgr().phase() == Phase::ReceivingWorld || mgr().phase() == Phase::LoadingWorld) && g.receive_started &&
-	    mgr().now_ms() - g.receive_started > kJoinTimeoutMs)
+	    mgr().now_ms() - g.receive_started > limit)
 	{
 		::Msg("! [coop] joining the host's world took too long");
 		mgr().stop("joining the host's world took too long");
 		return;
 	}
+	client_char_frame(); // protocol 8: the offer of a new character and the choice
+	if (!mgr().active())
+		return; // the window is gone (stopped above)
 	if (mgr().phase() != Phase::LoadingWorld || !g.swap_done)
 		return;
 	// Level is up and the local actor exists: tell the host.
@@ -1040,14 +1635,18 @@ void print_status()
 {
 	if (mgr().is_host())
 	{
-		::Msg("[coop]   world epoch %u; refused: %u join(s), %u WorldLoaded, %u level exit(s)", g.epoch,
-		    g.joins_refused, g.loaded_ignored, g.votes_refused);
+		::Msg("[coop]   world epoch %u; refused: %u join(s), %u WorldLoaded, %u level exit(s); %u join(s) wait for the "
+		      "host's load",
+		    g.epoch, g.joins_refused, g.loaded_ignored, g.votes_refused, u32(g.precache_wait.size()));
 		// T12 review (Ruling 18): the log names a dropped type once per client; the count is here every time
 		for (const limits::RateRule& rule : limits::kClientRateRules)
 			::Msg("[coop]   rate limit %s: %llu dropped (more than %u in a row, then one per %u ms)", msg_name(rule.type),
 			    mgr().session().stats(u16(rule.type)).rate_dropped, rule.burst, rule.refill_ms);
 		::Msg("[coop]   new characters this session: %u of %u (coop_max_new_characters), %u new key(s) refused",
 		    u32(g.new_characters.count()), u32(g_coop_max_new_characters), g.characters_refused);
+		::Msg("[coop]   new characters before the world (protocol 8): %u made, %u choosing now, %u choice(s) refused, "
+		      "%u ignored",
+		    g.characters_made, u32(g.choosers.count()), g.choices_refused, g.choices_ignored);
 		if (g.pending_changer != kNoId)
 			::Msg("[coop]   level exit %u asked for by #%u, waiting for coop_accept_transition", g.pending_changer,
 			    g.transition_from);
@@ -1056,7 +1655,12 @@ void print_status()
 			    g.gate.waiting(it.first) ? " (join waits for its turn)" : "");
 	}
 	else if (mgr().is_client())
+	{
 		::Msg("[coop]   my proxy (host numbering) %u, swap %s", g.my_proxy, g.swap_done ? "done" : "pending");
+		if (g.char_step != State::CharStep::None)
+			::Msg("[coop]   new character: %s", g.char_step == State::CharStep::Sent ? "chosen, waiting for the world"
+			                                                                       : "choosing (window)");
+	}
 }
 
 void on_alife_objects_loaded(CALifeObjectRegistry& objects)

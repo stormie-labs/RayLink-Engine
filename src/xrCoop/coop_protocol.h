@@ -22,7 +22,9 @@ namespace coop
 // 7 (F2 T1): player money lives on the host (review R4 7). ReqMoney carries a
 //    change with a cause (coop_ledger.h MoneyReq) instead of an absolute amount and goes client -> host only;
 //    MoneyBalance 0x0190 (host -> the player it belongs to); TradeOp Deal lost `applied` and `client_money`
-constexpr uint32_t kProtocolVersion = 7;
+// 8 (owner, live test 2026-10-23): a player whose key has no character chooses faction and gear before the world:
+//    CharOffer (host -> client, answers JoinRequest), CharChoice (client -> host); the world follows the choice
+constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -69,6 +71,8 @@ enum class Msg : uint16_t
 	LevelChange = 0x0105, // host -> clients: group transition, rejoin after
 	TransitionVote = 0x0106, // client -> host: u16 level changer (host numbering) the client stands in
 	AvatarList = 0x0107, // host -> clients: AvatarListMsg, who plays each player character in the world (R3 В3)
+	CharOffer = 0x0108, // host -> client: CharOfferMsg, his key has no character here: choose one (protocol 8)
+	CharChoice = 0x0109, // client -> host: CharChoiceMsg, faction and bought gear; the host answers with the world
 
 	// players
 	PlayerState = 0x0110, // unreliable movement snapshot (owner -> host -> others)
@@ -262,6 +266,56 @@ struct AvatarListMsg
 	void write(Writer& w) const;
 	// False (owners cleared) on overrun, more rows than kMaxPlayers, avatar 0xFFFF, a peer that is no player slot
 	// (>= kMaxPlayers), a character or a player listed twice, id 0 for anybody but the host or the host with another id.
+	bool read(Reader& r);
+};
+
+// ---------------------------------------------------------------- protocol 8: a new character before the world
+
+// Owner, live test 2026-10-23: a player whose key has no character in the host's world chooses faction and gear in the
+// main menu, before the world is sent, and enters the world as that faction at its start (coop_join.cpp,
+// scripts\coop_menu_char.script, xrCoop/coop_newchar.h). The host answers his JoinRequest with Msg::CharOffer, he
+// answers with Msg::CharChoice; the host checks it, makes the character and sends the world, or offers again with the
+// reason of the refusal. A returning player (his key has a character) gets the world at once, as before.
+
+// A name the join flow carries (faction, item section, level, refusal reason): 1..max characters of [A-Za-z0-9_.-].
+// They pick ltx sections, string ids and textures on the other side: no separators, spaces or paths.
+constexpr size_t kMaxCharName = 64;
+bool char_name_valid(const std::string& s, size_t max = kMaxCharName);
+
+// Host -> client. Wire: u8 eco, u32 points, u8 flags, str level, str refusal.
+struct CharOfferMsg
+{
+	static constexpr size_t kMaxLevel = 64;
+	static constexpr size_t kMaxRefusal = 32;
+	enum Flags : uint8_t
+	{
+		StoryMode = 1, // the host's game has the story on: which faction starts the stock new game lists
+		Known = StoryMode,
+	};
+
+	uint8_t eco = 1; // the host's economy tier 1..3: what can be bought and its price (new_game_loadouts.ltx)
+	uint32_t points = 0; // points for gear of that tier
+	uint8_t flags = 0;
+	std::string level; // the host's level ("l01_escape"): every player is on it until split levels (F3a); may be empty
+	std::string refusal; // reason code of the choice the host refused ("points", "busy", ...); empty in a first offer
+
+	void write(Writer& w) const;
+	// False on overrun, eco outside 1..3, unknown flags, a level or a refusal that is not a name or too long.
+	bool read(Reader& r);
+};
+
+// Client -> host. Wire: str faction, u8 count (<= kMaxBuy), count x str section.
+struct CharChoiceMsg
+{
+	static constexpr size_t kMaxBuy = 64; // the window cannot buy more: a faction lists a few dozen items
+
+	std::string faction; // stalker, bandit, ... (the host's Lua checks it is one a player may pick)
+	std::vector<std::string> buy; // sections bought with points, one entry per copy; the free kit is not listed
+
+	// What the host reads: a faction and at most kMaxBuy sections, every one a name. The client sends only a valid one.
+	bool valid() const;
+	void write(Writer& w) const;
+	// False (buy cleared) on overrun, more than kMaxBuy entries, a faction or a section that is not a name.
 	bool read(Reader& r);
 };
 

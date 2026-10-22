@@ -6,6 +6,7 @@
 #include "coop_script.h"
 #include "xrCoop/coop_link_hold.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -32,9 +33,13 @@ constexpr u32 kLoadHoldMs = link_hold::kLoadHoldMs;
 // holds the link), in front of the handler that was there (the console's cvar dump).
 crashhandler* g_next_crash_handler = nullptr;
 bool g_crash_hook_exit_registered = false;
+// Set by on_crash (any thread), never cleared: no frame and no load stage holds the link after a crash (review of the
+// live fixes: the next frame of the main thread armed the hold again for kLoadHoldMs; link_hold::FrameState::crashed).
+std::atomic<bool> g_crashed{false};
 
 void on_crash()
 {
+	g_crashed.store(true);
 	Manager::get().session().hold_connection(0); // atomics only: fine from any thread, also mid-crash
 	if (g_next_crash_handler)
 		g_next_crash_handler();
@@ -505,12 +510,13 @@ void Manager::frame()
 	// W9: the link stays held until this machine plays normally again, not just until its last load step: the first
 	// frames after a load (precache, the first update of every script, a client's way to live) can each stall longer
 	// than the silence timeout (live check 2026-10-23: a GAMMA client was dropped there). Until then every frame
-	// re-arms the hold, so a hang still goes silent kLoadHoldMs after its last frame; a crash releases it at once
-	// (on_crash). Afterwards a stall must look like silence to the peers.
+	// re-arms the hold, so a hang still goes silent kLoadHoldMs after its last frame; a crash releases it at once and
+	// for good (on_crash, g_crashed). Afterwards a stall must look like silence to the peers.
 	link_hold::FrameState fs;
 	fs.load_steps_queued = !g_loading_events.empty();
 	fs.precache_frames = g_pGameLevel && Device.dwPrecacheFrame != 0;
 	fs.joining_world = m_phase == Phase::LoadingWorld;
+	fs.crashed = g_crashed.load();
 	m_session.hold_connection(link_hold::keep_held(fs) ? kLoadHoldMs : 0);
 	m_session.update(now_ms());
 	join::frame();
@@ -545,7 +551,7 @@ void on_frame() { Manager::get().frame(); }
 void on_blocking_work()
 {
 	Manager& m = Manager::get();
-	if (m.active())
+	if (m.active() && link_hold::may_arm(g_crashed.load()))
 		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread
 }
 
