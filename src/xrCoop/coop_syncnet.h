@@ -420,11 +420,55 @@ inline bool player_scope_of(const std::string& custom_data, ScopeId& out)
 	return true;
 }
 
+// F2 T14 fix 1 (review I3, Ruling F2-31): the host's own data in the scopes clients write.
+// - Keys "coop.*" of a player scope are the host's (F3 keeps a player's checkpoint there, syncapi::player_set): his own
+//   player cannot write or remove them, so he cannot forge them.
+// - Clients never take the room the host keeps for its own writes: kHostPlayerReserve of every player scope,
+//   kHostObjectReserve of every object scope, kHostPoolReserve of the pool all player and object scopes share. A client
+//   that fills his scope or the pool gets ScopeFull; the host still writes.
+constexpr std::string_view kHostKeyPrefix = "coop.";
+constexpr size_t kHostPlayerReserve = size_t(64) << 10;
+constexpr size_t kHostObjectReserve = size_t(8) << 10;
+constexpr size_t kHostPoolReserve = size_t(1) << 20;
+static_assert(kHostPlayerReserve < syncstore::kMaxPlayerBytes && kHostObjectReserve < syncstore::kMaxObjectBytes &&
+        kHostPoolReserve < syncstore::kMaxPoolBytes,
+    "a client keeps room of his own");
+
+inline bool host_key(const ScopeId& scope, std::string_view key)
+{
+	return scope.kind == ScopeId::Player && key.substr(0, kHostKeyPrefix.size()) == kHostKeyPrefix;
+}
+
+inline size_t host_scope_reserve(ScopeId::Kind kind)
+{
+	return kind == ScopeId::Player ? kHostPlayerReserve : kind == ScopeId::Object ? kHostObjectReserve : 0;
+}
+
+// A client's change of `scope`, before the store sees it. `owner`: he is the player of a player scope or holds the
+// object. NotAllowed if he may not write the scope (may_set) or the key is the host's; ScopeFull if it would take the
+// host's room (a removal only frees room); else Ok (the store checks the rest: form, size, versions).
+inline SetResult client_check(const Store& store, const ScopeId& scope, std::string_view key, const Value& value, bool owner)
+{
+	if (!syncstore::may_set(scope.kind, false, owner) || host_key(scope, key))
+		return SetResult::NotAllowed;
+	if (value.type == syncstore::ValueType::Nil)
+		return SetResult::Ok;
+	const Value* had = store.get(scope, key);
+	const size_t old = had ? syncstore::entry_bytes(key, *had) : 0; // what the store counts for it (Entry::cost)
+	const size_t cost = syncstore::entry_bytes(key, value); // the order of a table's fields does not change it
+	if (store.bytes(scope) - old + cost > syncstore::scope_limit(scope.kind) - host_scope_reserve(scope.kind))
+		return SetResult::ScopeFull;
+	if (syncstore::pooled(scope.kind) && store.pool_bytes() - old + cost > syncstore::kMaxPoolBytes - kHostPoolReserve)
+		return SetResult::ScopeFull;
+	return SetResult::Ok;
+}
+
 // Host: applies one change made by `by` (kHostPeer: the host's Lua or engine), stamped with the next version of the
 // store's one counter, and says who hears of it in `out`. `by_owner`: `by` is the player of a Player scope or holds the
 // object (may_set). `ack`: a client's change, answered to him with this seq whatever comes of it; nullptr for the
 // host's own. `player_peer`: the connected player whose Player scope this is (kInvalidPeer: none, or not a Player
-// scope). `event` (if given) gets the change when the store changed (Ok). Returns the store's result.
+// scope). `event` (if given) gets the change when the store changed (Ok). Returns the store's result; a client's change
+// goes through client_check first (fix 1, Ruling F2-31).
 inline SetResult host_set(Store& store, const ScopeId& scope, std::string_view key, Value value, PeerId by, bool by_owner,
     const uint32_t* ack, PeerId player_peer, std::vector<Delivery>& out, Change* event = nullptr)
 {
@@ -432,7 +476,10 @@ inline SetResult host_set(Store& store, const ScopeId& scope, std::string_view k
 	if (const Value* was = store.get(scope, key))
 		old = *was;
 	const uint64_t version = store.top_version() + 1; // above kMaxVersion the store refuses it (BadValue)
-	const SetResult r = store.set_by(scope, key, std::move(value), version, by == kHostPeer, by_owner);
+	// F2 T14 fix 1 (Ruling F2-31): a client's change keeps off the host's keys and the host's room.
+	SetResult r = by == kHostPeer ? SetResult::Ok : client_check(store, scope, key, value, by_owner);
+	if (r == SetResult::Ok)
+		r = store.set_by(scope, key, std::move(value), version, by == kHostPeer, by_owner);
 	if (r != SetResult::Ok && r != SetResult::Same)
 	{
 		if (ack)

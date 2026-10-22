@@ -4,6 +4,7 @@
 #include "coop_net.h"
 #include "coop_join.h"
 #include "xrCoop/coop_rules.h"
+#include "xrCoop/coop_limits.h" // F2 T14 fix 1: limits::Pacer
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -237,9 +238,25 @@ struct Out
 	u16 spot_id = kNoId; // local numbering
 };
 xr_vector<Out> g_outbox;
+// F2 T14 fix 1 (review M1, Ruling F2-14): a client sends infos and spots only as fast as the host takes them
+// (kClientRateRules InfoPortion, MapSpot): the host drops what exceeds its limit unseen, and a lost info or spot never
+// comes back. What waits stays queued, in order; the queue is bounded (a broken mod must not fill the memory).
+constexpr size_t kMaxOutbox = 4096;
+limits::Pacer g_pacer;
+u64 g_out_held = 0, g_out_dropped = 0;
+
+bool outbox_room()
+{
+	if (g_outbox.size() < kMaxOutbox)
+		return true;
+	++g_out_dropped;
+	return false;
+}
 
 void push_out(Msg type, Writer&& w)
 {
+	if (!outbox_room()) // F2 T14 fix 1
+		return;
 	Out o;
 	o.type = type;
 	o.w = std::move(w);
@@ -1498,8 +1515,17 @@ void flush_outbox()
 	xr_vector<Out> out;
 	out.swap(g_outbox);
 	const bool host = mgr().is_host();
-	for (Out& o : out)
+	const u64 now = mgr().now_ms();
+	for (size_t i = 0; i < out.size(); ++i)
 	{
+		Out& o = out[i];
+		if (!host && !g_pacer.take(o.type, now)) // F2 T14 fix 1: the rest waits for a later frame, in order
+		{
+			g_outbox.insert(g_outbox.begin(), std::make_move_iterator(out.begin() + ptrdiff_t(i)),
+			    std::make_move_iterator(out.end()));
+			++g_out_held;
+			return;
+		}
 		if (!o.spot_add)
 		{
 			send_out(o.type, o.w);
@@ -2321,6 +2347,7 @@ void install(Session& s)
 void reset()
 {
 	g_outbox.clear();
+	g_pacer.reset(); // F2 T14 fix 1
 	g_deferred.clear();
 	g_info_requests.clear();
 	g_hold_infos = false;
@@ -2421,6 +2448,8 @@ void print_status()
 	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
 	::Msg("[coop] story: held infos %llu (kept here %u, holds left on %llu) | personal tasks %u, local task edits %llu",
 	    g_infos_held, (u32)g_local_infos.size(), g_holds_leaked, (u32)g_local_tasks.size(), g_local_task_edits);
+	::Msg("[coop] story: outbox %u, held for the host's rate %llu frames, dropped (queue full) %llu", // F2 T14 fix 1
+	    (u32)g_outbox.size(), g_out_held, g_out_dropped);
 	for (const auto& it : g_finisher)
 		::Msg("[coop] story:   task '%s' finished at the request of %s", cs(it.first), peer_name(it.second));
 	if (in_game()) // the Lua side of shared tasks (coop_tasks.script, W3c)
@@ -2686,6 +2715,8 @@ void on_spot_added(const shared_str& spot_type, u16 id)
 			return;
 		}
 	}
+	if (!outbox_room()) // F2 T14 fix 1
+		return;
 	Out o;
 	o.type = Msg::MapSpot;
 	o.spot_add = true;

@@ -117,6 +117,7 @@ struct Stats
 	u64 host_requests = 0, no_handler = 0, rate_limited = 0, busy = 0, not_in_world = 0, bad_requests = 0;
 	u64 handler_errors = 0, bad_results = 0, results_out = 0; // host
 	u64 client_sets = 0, client_sets_not_in_world = 0; // host: changes of clients taken
+	u64 client_refused = 0, host_keys_refused = 0; // host: client changes refused (fix 1: of them the host's keys)
 	u64 casts = 0, cast_machines = 0, casts_in = 0, effects = 0; // broadcast
 	u64 calls = 0, lua_errors = 0, calls_dropped = 0, calls_stale = 0;
 	u64 bad_messages = 0;
@@ -141,6 +142,7 @@ std::string g_own_digest;
 u32 g_lua_gen = 0; // register_lua calls: a reference of another generation belongs to a closed Lua state
 bool g_resync = false; // host: import replaced the store: every client gets a new full copy
 bool g_was_live = false; // client: in the world at the last frame
+u32 g_join_saves = 0; // fix 1: SavingForJoin guards alive (the host writes a join save)
 Stats g_stats;
 
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
@@ -381,7 +383,9 @@ const Fvector* as_vector(lua_State* L, int idx)
 		return nullptr;
 	const luabind::detail::object_rep* o = static_cast<const luabind::detail::object_rep*>(lua_touserdata(L, idx));
 	const luabind::detail::class_rep* c = o ? o->crep() : nullptr;
-	if (!c || !c->name() || xr_strcmp(c->name(), "vector") || !o->ptr())
+	// Fix 1 (review M6): the C++ class Fvector itself, not a class that is only named "vector" (a Lua class could be).
+	if (!c || c->get_class_type() != luabind::detail::class_rep::cpp_class ||
+	    !(LUABIND_TYPE_INFO_EQUAL(c->type(), LUABIND_TYPEID(Fvector))) || !o->ptr())
 		return nullptr;
 	return static_cast<const Fvector*>(o->ptr());
 }
@@ -464,6 +468,7 @@ bool scalar(lua_State* L, int idx, Value& out, size_t& size, bool copy, std::str
 {
 	switch (lua_type(L, idx))
 	{
+	case LUA_TNONE: // fix 1 (review I2): a value left out, coop.sync.request("x") / set(scope, key): nil, as in Lua
 	case LUA_TNIL:
 		out = Value();
 		size += 1;
@@ -897,7 +902,19 @@ void host_on_set(PeerId from, Reader& r)
 	else if (m.scope.kind == ScopeId::Object)
 		owner = held_by(m.scope.arg, from);
 	++g_stats.client_sets;
-	host_change(m.scope, m.key, std::move(m.value), from, owner, &m.seq);
+	const bool reserved = sn::host_key(m.scope, m.key); // F2 T14 fix 1 (Ruling F2-31)
+	const std::string key = reserved ? m.key : std::string();
+	const SetResult result = host_change(m.scope, m.key, std::move(m.value), from, owner, &m.seq);
+	if (result == SetResult::Ok || result == SetResult::Same)
+		return;
+	++g_stats.client_refused;
+	if (reserved)
+	{
+		++g_stats.host_keys_refused; // an honest client refuses it itself (l_set): a modified one
+		if (log_allowed(g_stats.host_keys_refused))
+			::Msg("! [coop] coop.sync: #%u wrote '%s' of his player scope, a key of the host's (coop.*): refused", from,
+			    key.c_str());
+	}
 }
 
 void on_set(PeerId from, Reader& r)
@@ -1326,6 +1343,12 @@ int l_set(lua_State* L)
 		}
 		++g_stats.lua_sets;
 		return done(L);
+	}
+	// F2 T14 fix 1 (Ruling F2-31): keys coop.* of a player scope are the host's.
+	if (sn::host_key(scope, key))
+	{
+		++g_stats.lua_refused;
+		return fail(L, "not allowed: coop.* keys of a player scope are the host's");
 	}
 	// Client: his own player scope, or an object he holds.
 	const bool owner = (scope.kind == ScopeId::Player) ||
@@ -1827,6 +1850,13 @@ int l_import(lua_State* L)
 	return done(L);
 }
 
+// coop.saving_for_join() -> bool (F2 T14 fix 1, review I1)
+int l_saving_for_join(lua_State* L)
+{
+	lua_pushboolean(L, g_join_saves != 0 ? 1 : 0);
+	return 1;
+}
+
 // A new Lua state: every registration of the old one goes (its references died with it).
 void forget_lua()
 {
@@ -1965,9 +1995,10 @@ void print_status()
 	}
 	else
 	{
-		::Msg("[coop-sync] host: client changes %llu (not in the world %llu) | copies %llu (%llu B, after an import %llu) "
-		      "| outbox %u",
-		    s.client_sets, s.client_sets_not_in_world, s.copies, s.copy_bytes, s.resyncs, u32(g_out.size()));
+		::Msg("[coop-sync] host: client changes %llu (not in the world %llu, refused %llu, of them the host's keys %llu) | "
+		      "copies %llu (%llu B, after an import %llu) | outbox %u",
+		    s.client_sets, s.client_sets_not_in_world, s.client_refused, s.host_keys_refused, s.copies, s.copy_bytes,
+		    s.resyncs, u32(g_out.size()));
 		::Msg("[coop-sync] requests: taken %llu, refused: no handler %llu, rate limited %llu, busy %llu, not in the world "
 		      "%llu, malformed %llu | handler errors %llu, bad results %llu, answers sent %llu, waiting %u",
 		    s.host_requests, s.no_handler, s.rate_limited, s.busy, s.not_in_world, s.bad_requests, s.handler_errors,
@@ -2020,6 +2051,10 @@ void on_entity_destroyed(u16 id)
 	queue_deliveries(out);
 }
 
+SavingForJoin::SavingForJoin() { ++g_join_saves; }
+SavingForJoin::~SavingForJoin() { --g_join_saves; }
+bool saving_for_join() { return g_join_saves != 0; }
+
 void on_peer_left(PeerId id)
 {
 	g_limits.forget_peer(id);
@@ -2060,6 +2095,8 @@ void register_lua(lua_State* L)
 		lua_setfield(L, -2, f->name);
 	}
 	lua_setfield(L, -2, "sync");
+	lua_pushcfunction(L, &l_saving_for_join); // fix 1: coop.saving_for_join() (scripts\coop_sync.script)
+	lua_setfield(L, -2, "saving_for_join");
 	lua_pop(L, 1);
 }
 

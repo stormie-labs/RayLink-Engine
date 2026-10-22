@@ -821,6 +821,7 @@ bool host_send_save(PeerId from, const PeerInfo& p_ref, CSE_ALifeHumanStalker& p
 		// "load last save" must keep pointing at the host's real one.
 		string_path last_save;
 		xr_strcpy(last_save, g_last_saved_game);
+		const syncapi::SavingForJoin join_save; // F2 T14 fix 1: this save goes to him, coop.sync stays out (save_state)
 		NET_Packet packet;
 		packet.w_begin(M_SAVE_GAME);
 		packet.w_stringZ(name);

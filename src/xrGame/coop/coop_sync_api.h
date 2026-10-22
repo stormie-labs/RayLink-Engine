@@ -23,7 +23,10 @@
 // player, on the host), "object:<id>" (local numbering; the host or the player who holds it writes it), "object" (every
 // object: on_change only, its handler gets the object id as a fifth argument). Values: nil, number, string, boolean,
 // vector, a flat table (string keys and array indices; values number / string / boolean / vector). Ids inside values
-// are not translated.
+// are not translated. Fix 1 (Ruling F2-31): keys "coop.*" of a player scope are the host's; a client's writes keep off
+// the room the host keeps in every player and object scope and in the pool (coop_syncnet.h client_check).
+// coop.saving_for_join() -> bool: the host writes the world save of a joining player now (scripts\coop_sync.script
+// leaves coop.sync out of it).
 //
 // Threading: Lua may call coop.sync.* on the game thread, which never runs during FrameMove; those calls change the
 // store and queue messages, frame() (main thread) sends them. Lua functions are kept as references in the Lua registry
@@ -60,6 +63,18 @@ void print_status();
 // world blob): anything changed before it goes out before it; what changes after it is queued with the rest of his
 // world changes until his WorldLoaded (sync::host_begin_join) and so arrives after it.
 void host_send_full(PeerId peer);
+// Host: the world save for a joining player is being written while one of these lives (coop_join host_send_save, around
+// its M_SAVE_GAME); coop.saving_for_join() says so to Lua, and scripts\coop_sync.script leaves coop.sync out of that save
+// (F2 T14 fix 1, review I1: the save goes to the joining client whole, other players' scopes must not).
+class SavingForJoin
+{
+public:
+	SavingForJoin();
+	~SavingForJoin();
+	SavingForJoin(const SavingForJoin&) = delete;
+	SavingForJoin& operator=(const SavingForJoin&) = delete;
+};
+bool saving_for_join();
 // Host and single player: object `id` was released from ALife (any game thread): its scope goes, and on every client.
 // A client does nothing (the host's drop reaches it).
 void on_entity_destroyed(u16 id);
@@ -75,7 +90,10 @@ void register_lua(lua_State* L);
 // a player key, a missing key or a value that is not a string.
 std::optional<std::string> player_get(u16 character, std::string_view key);
 // Sets it (nil is not taken: use an empty string or another key); the player gets it if he is connected. true if the
-// store took it (changed or the same).
+// store took it (changed or the same). F2 T14 fix 1 (Ruling F2-31): use keys "coop.*" (sn::kHostKeyPrefix): only the
+// host writes those, the player cannot forge or remove them, and no client takes the room the host keeps in every player
+// scope and in the pool (coop_syncnet.h kHostPlayerReserve, kHostPoolReserve). false only when the host's own data
+// passes the limits: then F3 keeps its custom data as before.
 bool player_set(u16 character, std::string_view key, std::string_view value);
 } // namespace syncapi
 } // namespace coop
