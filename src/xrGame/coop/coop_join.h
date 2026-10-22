@@ -39,8 +39,9 @@ bool is_proxy(u16 id);
 // his character in the world: an absent or still loading player's proxy stays offline (coop::switch_vote).
 bool host_player_in_world(u16 proxy_id);
 
-// Host: increments when a load or level change replaces the served world. Requests from
-// peers that have not rejoined the current world must be ignored (see sync::host_peer_joining).
+// Host: increments when a load or level change replaces the served world (on_world_created), and so does the
+// session's world epoch: the session drops what peers made in an older world (R2 I1). Requests from peers that
+// rejoin the current world but have not loaded it yet must be ignored (see sync::host_peer_joining).
 u32 host_world_epoch();
 // Engine hook (end of the CALifeSimulator constructor, main thread): a world was created
 // (save loaded, level changed, new game). A same-level quick load deletes and recreates the
@@ -48,11 +49,12 @@ u32 host_world_epoch();
 void on_world_created();
 // Number of worlds created in this process (any role).
 u32 world_generation();
-// Host: execute a level change a client asked for (console coop_accept_transition).
+// Host: execute a level change a client asked for (console coop_accept_transition), built from the host's own
+// level changer (R2 I3).
 bool accept_transition();
 
 // --- client ---
-// Client touched a level exit: the host decides (raw M_CHANGE_LEVEL packet is forwarded).
+// Client touched a level exit: the host decides. Only the id of the level changer goes to the host (R2 I3).
 void client_request_level_change(NET_Packet& P);
 void on_welcome(const WelcomeMsg& w);
 // Server entity id that represents this client in the host world (our own proxy there).

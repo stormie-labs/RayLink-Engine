@@ -124,18 +124,30 @@ struct OutBlob
 {
 	uint32_t id = 0;
 	uint32_t kind = 0;
+	uint32_t epoch = 0; // world epoch when it was queued (R2 I1)
 	std::vector<uint8_t> data;
 	uint32_t crc = 0;
 	size_t offset = 0;
 	bool begun = false;
+	bool cancelled = false; // R1 I4, R2 I1: cut at `offset`, its BlobEnd comes early
 };
 
 struct InBlob
 {
 	uint32_t kind = 0;
+	uint32_t epoch = 0;
 	uint64_t total = 0;
 	uint32_t crc = 0;
 	std::vector<uint8_t> data;
+};
+
+// R2 I4: a token bucket of one message type from one client.
+struct RateBucket
+{
+	bool started = false;
+	bool logged = false;
+	double tokens = 0.;
+	uint64_t at = 0;
 };
 
 // One transport connection (host: every remote peer; client: the host).
@@ -148,6 +160,8 @@ struct Conn
 	uint64_t created_ms = 0;
 	std::deque<OutBlob> out_blobs;
 	std::map<uint32_t, InBlob> in_blobs;
+	uint32_t epoch = 0; // host: the world epoch this client is in (Welcome, then its WorldEpoch); R2 I1
+	std::map<uint16_t, RateBucket> rates; // host: R2 I4, by message type
 	net::ByteCounterPtr bulk = std::make_shared<net::ByteCounter>();
 	uint64_t out_due[size_t(Lane::Count)] = {}; // NetSim: keeps per-lane order under jitter
 	uint64_t in_due[size_t(Lane::Count)] = {};
@@ -184,6 +198,17 @@ struct Session::Impl
 	uint64_t m_host_fp = 0;
 	uint64_t m_session_token = 0;
 	uint32_t m_max_players = kMaxPlayers;
+	// host, set by the game once, kept across sessions like the handlers
+	std::set<uint32_t> m_client_blob_kinds; // R1 I3
+	struct RateRule
+	{
+		uint32_t burst = 0;
+		uint32_t refill_ms = 0;
+	};
+	std::map<uint16_t, RateRule> m_rates; // R2 I4, by message type
+
+	// both: R2 I1
+	uint32_t m_epoch = 0;
 
 	// client
 	enum class CState : uint8_t
@@ -508,6 +533,12 @@ struct Session::Impl
 		case Msg::BlobEnd:
 			blob_end(c, r);
 			break;
+		case Msg::WorldEpoch:
+			if (host)
+				host_world_epoch(c, r);
+			else
+				malformed(c, "unexpected WorldEpoch");
+			break;
 		default:
 			if (m_logged_unknown.insert(type).second)
 				logf("unknown core message %s dropped", msg_name(type));
@@ -532,6 +563,19 @@ struct Session::Impl
 				malformed(c, "game message before handshake");
 			return;
 		}
+		if (m_role == Role::Host)
+		{
+			// R2 I1: made in a world that is gone (the client has not rejoined yet): not for this one.
+			if (c.epoch != m_epoch)
+			{
+				if (first_time("stale-in" + std::to_string(c.serial) + ":" + std::to_string(c.epoch)))
+					logf("host: %s from peer %u dropped: made in world epoch %u, the host is in world epoch %u",
+						msg_name(type), unsigned(c.info.id), unsigned(c.epoch), unsigned(m_epoch));
+				return;
+			}
+			if (!within_rate(c, type))
+				return;
+		}
 		if (m_handlers.find(type) == m_handlers.end())
 		{
 			if (m_logged_unknown.insert(type).second)
@@ -548,6 +592,106 @@ struct Session::Impl
 			Reader r(data->data() + 2, data->size() - 2);
 			h(from, r);
 		});
+	}
+
+	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else logged once and false.
+	bool within_rate(Conn& c, uint16_t type)
+	{
+		const auto rule = m_rates.find(type);
+		if (rule == m_rates.end())
+			return true;
+		RateBucket& b = c.rates[type];
+		const double burst = double(rule->second.burst);
+		if (!b.started)
+		{
+			b.started = true;
+			b.tokens = burst;
+			b.at = m_now;
+		}
+		else if (m_now > b.at)
+		{
+			b.tokens = std::min(burst, b.tokens + double(m_now - b.at) / double(rule->second.refill_ms));
+			b.at = m_now;
+		}
+		if (b.tokens >= 1.)
+		{
+			b.tokens -= 1.;
+			return true;
+		}
+		if (!b.logged)
+		{
+			b.logged = true;
+			logf("host: rate limit: %s from peer %u dropped (more than %u in a row, then one per %u ms)",
+				msg_name(type), unsigned(c.info.id), unsigned(rule->second.burst), unsigned(rule->second.refill_ms));
+		}
+		return false;
+	}
+
+	// R2 I1, host: a game message goes to a client only in the world epoch it is in; SessionReset tells it the new
+	// one. A client still in the old world must not apply the new world's changes to it.
+	bool may_send(const Conn& c, Msg type)
+	{
+		if (m_role != Role::Host || c.epoch == m_epoch || type == Msg::SessionReset)
+			return true;
+		if (first_time("stale-out" + std::to_string(c.serial) + ":" + std::to_string(c.epoch) + ":" +
+				std::to_string(m_epoch)))
+			logf("host: game messages to peer %u are not sent until it rejoins: it is in world epoch %u, the host in "
+				 "world epoch %u (first: %s)",
+				unsigned(c.info.id), unsigned(c.epoch), unsigned(m_epoch), msg_name(type));
+		return false;
+	}
+
+	// Host: a client tells which world it is in now (it got SessionReset and rejoins). It can neither go back nor
+	// be in a world the host has not made.
+	void host_world_epoch(Conn& c, Reader& r)
+	{
+		if (c.info.state != PeerState::Joined)
+		{
+			malformed(c, "WorldEpoch before handshake");
+			return;
+		}
+		const uint32_t epoch = r.u32();
+		if (!r.ok())
+		{
+			malformed(c, "WorldEpoch");
+			return;
+		}
+		if (epoch > m_epoch || epoch < c.epoch)
+		{
+			malformed(c, epoch > m_epoch ? "WorldEpoch of a world the host has not made" : "WorldEpoch going back");
+			return;
+		}
+		if (epoch != c.epoch)
+			logf("host: peer %u is in world epoch %u now", unsigned(c.info.id), unsigned(epoch));
+		c.epoch = epoch;
+	}
+
+	// R1 I4, R2 I1: cancels the queued blobs of `c` that `match`. One not begun is forgotten; one streaming ends at
+	// the chunks already sent, its BlobEnd follows and the receiver drops what it got. (A blob whose every byte is
+	// already sent cannot be taken back: it completes, and the receiver's epoch check is the last word.)
+	template <class Match>
+	void cancel_blobs(Conn& c, Match match, const char* why)
+	{
+		for (auto it = c.out_blobs.begin(); it != c.out_blobs.end();)
+		{
+			OutBlob& b = *it;
+			if (b.cancelled || !match(b))
+			{
+				++it;
+				continue;
+			}
+			logf("blob %u (kind %u) for peer %u cancelled after %zu of %zu bytes: %s", unsigned(b.id),
+				unsigned(b.kind), unsigned(peer_id_of(c)), b.offset, b.data.size(), why);
+			if (!b.begun)
+			{
+				it = c.out_blobs.erase(it);
+				continue;
+			}
+			b.cancelled = true;
+			b.data.resize(b.offset);
+			b.data.shrink_to_fit();
+			++it;
+		}
 	}
 
 	// Malformed message. Host: kick the sender. Client: log and ignore.
@@ -763,6 +907,7 @@ struct Session::Impl
 		c.info.state = PeerState::Joined;
 		c.info.key = h.key;
 		c.info.nick = sanitize_nick(h.nick, ("Player" + std::to_string(slot)).c_str());
+		c.epoch = m_epoch; // R2 I1: a newcomer is in the world the host serves now
 		m_joined[slot] = &c;
 
 		WelcomeMsg w;
@@ -770,6 +915,7 @@ struct Session::Impl
 		w.session_token = m_session_token;
 		w.host_nick = m_cfg.nick;
 		w.max_players = m_max_players;
+		w.world_epoch = m_epoch;
 		Writer ww;
 		w.write(ww);
 		send_core(c, Msg::Welcome, ww);
@@ -864,6 +1010,7 @@ struct Session::Impl
 		}
 		m_cstate = CState::Joined;
 		m_self_id = w.slot;
+		m_epoch = w.world_epoch; // R2 I1: the world the host serves; the game moves it on with SessionReset
 		m_host_info = PeerInfo();
 		m_host_info.id = kHostPeer;
 		m_host_info.state = PeerState::Joined;
@@ -1046,14 +1193,50 @@ struct Session::Impl
 		const uint32_t kind = r.u32();
 		const uint64_t total = r.u64();
 		const uint32_t crc = r.u32();
-		if (!r.ok() || total > kMaxBlobBytes || c.in_blobs.size() >= kMaxIncomingBlobsPerPeer ||
-			c.in_blobs.count(id))
+		const uint32_t epoch = r.u32();
+		if (!r.ok() || total > kMaxBlobBytes || c.in_blobs.count(id))
 		{
 			malformed(c, "BlobBegin");
 			return;
 		}
+		if (m_role == Role::Host)
+		{
+			// R1 I3: a client announces any kind and size it likes. The host takes only what its game asked for, in
+			// sizes it can afford to buffer.
+			char what[160];
+			if (!m_client_blob_kinds.count(kind))
+			{
+				std::snprintf(what, sizeof(what), "BlobBegin: blob kind %u is not accepted from clients", unsigned(kind));
+				malformed(c, what);
+				return;
+			}
+			if (total > kMaxClientBlobBytes)
+			{
+				std::snprintf(what, sizeof(what), "BlobBegin: a blob of %llu bytes is over the client limit of %llu",
+					static_cast<unsigned long long>(total), static_cast<unsigned long long>(kMaxClientBlobBytes));
+				malformed(c, what);
+				return;
+			}
+			uint64_t in_flight = total;
+			for (const auto& kv : c.in_blobs)
+				in_flight += kv.second.total;
+			if (in_flight > kMaxClientBlobBytesInFlight)
+			{
+				std::snprintf(what, sizeof(what), "BlobBegin: too many unfinished blob bytes (%llu, the limit is %llu)",
+					static_cast<unsigned long long>(in_flight),
+					static_cast<unsigned long long>(kMaxClientBlobBytesInFlight));
+				malformed(c, what);
+				return;
+			}
+		}
+		if (c.in_blobs.size() >= kMaxIncomingBlobsPerPeer)
+		{
+			malformed(c, "BlobBegin: too many unfinished blobs");
+			return;
+		}
 		InBlob b;
 		b.kind = kind;
+		b.epoch = epoch;
 		b.total = total;
 		b.crc = crc;
 		if (m_role == Role::Client) // the host is trusted, a client announcing a size is not
@@ -1107,6 +1290,13 @@ struct Session::Impl
 				static_cast<unsigned long long>(b.total));
 			return;
 		}
+		if (b.epoch != m_epoch)
+		{
+			// R2 I1: a world save of a world that is gone (this side already rejoins the new one).
+			logf("blob %u (kind %u) from peer %u dropped: made in world epoch %u, this side is in world epoch %u",
+				unsigned(id), unsigned(b.kind), unsigned(from), unsigned(b.epoch), unsigned(m_epoch));
+			return;
+		}
 		const uint32_t got = crc32(b.data.data(), b.data.size());
 		if (got != b.crc)
 		{
@@ -1140,6 +1330,7 @@ struct Session::Impl
 					w.u32(b.kind);
 					w.u64(b.data.size());
 					w.u32(b.crc);
+					w.u32(b.epoch);
 					send_core(c, Msg::BlobBegin, w, Lane::Bulk);
 					b.begun = true;
 				}
@@ -1362,6 +1553,7 @@ bool Session::host(const SessionConfig& cfg, std::string* err)
 		s.m_role = Role::Host;
 		s.m_host_fp = manifest_fingerprint(s.m_cfg.manifest);
 		s.m_session_token = random_u64();
+		s.m_epoch = 0;
 		s.logf("host: listening on 0.0.0.0:%u", unsigned(cfg.port));
 		return true;
 	}
@@ -1405,6 +1597,7 @@ bool Session::connect(const SessionConfig& cfg, const std::string& address, uint
 		}
 		s.m_role = Role::Client;
 		s.m_cstate = Impl::CState::Connecting;
+		s.m_epoch = 0;
 		s.m_deadline_set = false;
 		s.m_transport_up = false;
 		s.m_server_text = address + ":" + std::to_string(unsigned(port));
@@ -1556,6 +1749,8 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 			s.logf("send(%s): payload of %zu bytes is too large, dropped", msg_name(type), payload.size());
 			return;
 		}
+		if (!s.may_send(*c, type))
+			return;
 		s.send_packet(*c, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 	}
 	catch (...)
@@ -1583,7 +1778,7 @@ void Session::broadcast(Lane lane, Msg type, const Writer& payload, PeerId excep
 			return;
 		}
 		for (const auto& kv : s.m_joined)
-			if (kv.first != except)
+			if (kv.first != except && s.may_send(*kv.second, type))
 				s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 	}
 	catch (...)
@@ -1634,11 +1829,13 @@ uint32_t Session::send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data)
 				static_cast<unsigned long long>(kMaxBlobBytes));
 			return 0;
 		}
+		s.cancel_blobs(*c, [kind](const OutBlob& old) { return old.kind == kind; }, "replaced by a newer blob");
 		OutBlob b;
 		b.id = s.m_next_blob_id++;
 		if (!s.m_next_blob_id)
 			s.m_next_blob_id = 1;
 		b.kind = kind;
+		b.epoch = s.m_epoch;
 		b.crc = crc32(data.data(), data.size());
 		b.data = std::move(data);
 		const uint32_t id = b.id;
@@ -1652,6 +1849,58 @@ uint32_t Session::send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data)
 		s.logf("internal exception in send_blob() was suppressed");
 		return 0;
 	}
+}
+
+void Session::accept_client_blob(uint32_t kind)
+{
+	m->m_client_blob_kinds.insert(kind);
+}
+
+void Session::limit_rate(Msg type, uint32_t burst, uint32_t refill_ms)
+{
+	const uint16_t t = static_cast<uint16_t>(type);
+	if (!burst || !refill_ms)
+	{
+		m->m_rates.erase(t);
+		return;
+	}
+	Impl::RateRule& rule = m->m_rates[t];
+	rule.burst = burst;
+	rule.refill_ms = refill_ms;
+}
+
+void Session::set_world_epoch(uint32_t epoch)
+{
+	Impl& s = *m;
+	try
+	{
+		if (s.m_epoch == epoch)
+			return;
+		const uint32_t old = s.m_epoch;
+		s.m_epoch = epoch;
+		if (s.m_role == Role::None)
+			return;
+		s.logf("world epoch %u (was %u)", unsigned(epoch), unsigned(old));
+		// The world those blobs carry is gone: not a byte more of them.
+		for (auto& c : s.m_conns)
+			s.cancel_blobs(*c, [epoch](const OutBlob& b) { return b.epoch != epoch; }, "its world is gone");
+		// Client: tell the host before anything made in the new world (the reliable lane keeps the order).
+		if (s.m_role == Role::Client && s.m_cstate == Impl::CState::Joined && s.m_server)
+		{
+			Writer w;
+			w.u32(epoch);
+			s.send_core(*s.m_server, Msg::WorldEpoch, w);
+		}
+	}
+	catch (...)
+	{
+		s.logf("internal exception in set_world_epoch() was suppressed");
+	}
+}
+
+uint32_t Session::world_epoch() const
+{
+	return m->m_epoch;
 }
 
 void Session::send_chat(const std::string& text)
@@ -1894,6 +2143,74 @@ bool migrate_key_value(std::string& ini)
 		return false;
 	ini.replace(at, len, digest);
 	return true;
+}
+
+// ============================================================================ JoinGate (R1 I4, R2 I4)
+
+JoinGate::Verdict JoinGate::request(PeerId peer, uint64_t now_ms)
+{
+	Peer& p = m_peers[peer];
+	if (p.in_flight || p.waiting)
+		return Verdict::Refused;
+	if (p.admitted_once && now_ms - p.last_admit_ms < kIntervalMs)
+	{
+		p.waiting = true;
+		return Verdict::Later;
+	}
+	p.in_flight = true;
+	p.admitted_once = true;
+	p.last_admit_ms = now_ms;
+	return Verdict::Admit;
+}
+
+std::vector<PeerId> JoinGate::due(uint64_t now_ms)
+{
+	std::vector<PeerId> out;
+	for (auto& kv : m_peers)
+	{
+		Peer& p = kv.second;
+		if (!p.waiting || now_ms - p.last_admit_ms < kIntervalMs)
+			continue;
+		p.waiting = false;
+		p.in_flight = true;
+		p.last_admit_ms = now_ms;
+		out.push_back(kv.first);
+	}
+	return out;
+}
+
+bool JoinGate::loaded(PeerId peer)
+{
+	const auto it = m_peers.find(peer);
+	if (it == m_peers.end() || !it->second.in_flight)
+		return false;
+	it->second.in_flight = false;
+	return true;
+}
+
+void JoinGate::world_replaced()
+{
+	for (auto& kv : m_peers)
+		kv.second.in_flight = kv.second.waiting = false;
+}
+
+void JoinGate::forget(PeerId peer)
+{
+	const auto it = m_peers.find(peer);
+	if (it != m_peers.end())
+		it->second.in_flight = it->second.waiting = false;
+}
+
+bool JoinGate::in_flight(PeerId peer) const
+{
+	const auto it = m_peers.find(peer);
+	return it != m_peers.end() && it->second.in_flight;
+}
+
+bool JoinGate::waiting(PeerId peer) const
+{
+	const auto it = m_peers.find(peer);
+	return it != m_peers.end() && it->second.waiting;
 }
 
 uint32_t crc32(const void* data, size_t size, uint32_t seed)

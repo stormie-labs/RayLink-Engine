@@ -12,6 +12,7 @@
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Level.h"
+#include "level_changer.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "alife_graph_registry.h"
@@ -54,15 +55,27 @@ struct State
 	bool swap_done = false;
 	u64 last_progress_log = 0;
 	// host: the world we serve (world_generation() when it was seen); a load or a level change
-	// replaces it (epoch++)
+	// replaces it (epoch++ in on_world_created, the session's world epoch with it: R2 I1)
 	u32 world_seen = 0;
 	u32 epoch = 1;
 	bool reset_pending = false;
-	// host: transition asked by a client (raw M_CHANGE_LEVEL), waiting for coop_accept_transition
-	std::vector<u8> pending_transition;
+	// host: R1 I4, R2 I4: one join in flight per player, one per 5 s
+	JoinGate gate;
+	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
+	u32 loaded_ignored = 0;
+	u32 votes_refused = 0;
+	// host: level exit asked by a client (R2 I3: the id of a level changer of the host's own level), waiting for
+	// coop_accept_transition
+	u16 pending_changer = kNoId;
 	PeerId transition_from = kInvalidPeer;
-	u64 transition_at = 0; // last vote (a repeat within 3 s does not notify Lua again)
+	u64 transition_at = 0; // last vote (a repeat within 3 s does not notify Lua or the chat again)
 } g;
+
+constexpr u32 kRefusalsLogged = 5;
+// R2 I4: StateDumpRequest = a client asks for an entity it misses (P3); a modified one could ask for the whole
+// world in a loop, each answer a full spawn packet.
+constexpr u32 kStateDumpBurst = 64;
+constexpr u32 kStateDumpRefillMs = 50; // 20 per second after a burst
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
 
@@ -207,15 +220,17 @@ void bring_online(u16 proxy)
 }
 
 // --- host: JoinRequest ---
-void host_on_join_request(PeerId from, Reader&)
+// The world for a player whose join the gate admitted: his character (found by key, or a new one), a fresh save of
+// the world, the blob. false if it could not be sent (the player is gone or was kicked with the reason).
+bool host_send_world(PeerId from)
 {
 	const PeerInfo* p = mgr().session().peer(from);
 	if (!p)
-		return;
+		return false;
 	if (!host_can_start())
 	{
 		mgr().session().kick(from, RejectReason::HostNotReady, "host is not in a game right now, try again later");
-		return;
+		return false;
 	}
 
 	std::string key_digest;
@@ -223,7 +238,7 @@ void host_on_join_request(PeerId from, Reader&)
 	{
 		::Msg("! [coop] cannot hash the player key of '%s' (BCrypt)", p->nick.c_str());
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not check your player key");
-		return;
+		return false;
 	}
 	CSE_ALifeHumanStalker* proxy = find_proxy_by_key(key_digest);
 	if (proxy)
@@ -236,7 +251,7 @@ void host_on_join_request(PeerId from, Reader&)
 	if (!proxy)
 	{
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");
-		return;
+		return false;
 	}
 	HostPeer& hp = g.peers[from];
 	hp.proxy = proxy->ID;
@@ -273,7 +288,7 @@ void host_on_join_request(PeerId from, Reader&)
 	{
 		::Msg("! [coop] world save failed (%s)", scop);
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not save the world");
-		return;
+		return false;
 	}
 
 	xr_vector<u16> online;
@@ -290,6 +305,7 @@ void host_on_join_request(PeerId from, Reader&)
 	if (!script_part.empty())
 		w.bytes(script_part.data(), script_part.size());
 	std::vector<u8> blob(w.data().begin(), w.data().end());
+	// R1 I4: a world save still queued or streaming to this player is replaced by this one (Session::send_blob)
 	const u32 id = mgr().session().send_blob(from, BlobWorldSave, std::move(blob));
 	hp.loading = true;
 	hp.sent_at = mgr().now_ms();
@@ -300,14 +316,53 @@ void host_on_join_request(PeerId from, Reader&)
 
 	FS.file_delete(scop);
 	FS.file_delete(scoc);
+	return true;
+}
+
+void host_on_join_request(PeerId from, Reader&)
+{
+	const PeerInfo* p = mgr().session().peer(from);
+	if (!p)
+		return;
+	// R1 I4, R2 I4: every join costs a full world save on this thread. (A JoinRequest made in a world that is gone
+	// never gets here: the session drops it by the world epoch, R2 I1.)
+	switch (g.gate.request(from, mgr().now_ms()))
+	{
+	case JoinGate::Verdict::Admit:
+		if (!host_send_world(from))
+			g.gate.forget(from);
+		return;
+	case JoinGate::Verdict::Later:
+		::Msg("[coop] '%s' asks for the world again within %u s of the last time: it is sent when that is over",
+		    p->nick.c_str(), JoinGate::kIntervalMs / 1000);
+		return;
+	case JoinGate::Verdict::Refused:
+		if (++g.joins_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' asks for the world while his join is under way: ignored", p->nick.c_str());
+		return;
+	}
+}
+
+// Host: joins that waited for their turn (JoinGate) and whose time has come.
+void host_due_joins()
+{
+	for (PeerId id : g.gate.due(mgr().now_ms()))
+		if (!host_send_world(id))
+			g.gate.forget(id);
 }
 
 // --- host: WorldLoaded ---
 void host_on_world_loaded(PeerId from, Reader&)
 {
 	auto it = g.peers.find(from);
-	if (it == g.peers.end())
+	// R2 I4: only the end of a join in flight. A repeated, unasked-for or old world's WorldLoaded would run the
+	// catch-up again (or bring an id of the old world online).
+	if (!g.gate.loaded(from) || it == g.peers.end() || !it->second.loading || it->second.proxy == kNoId)
+	{
+		if (++g.loaded_ignored <= kRefusalsLogged)
+			::Msg("! [coop] #%u says it loaded the world, but no world is being sent to it: ignored", from);
 		return;
+	}
 	it->second.loading = false;
 	const PeerInfo* p = mgr().session().peer(from);
 	::Msg("[coop] '%s' is in the world (load took %.1f s)", p ? p->nick.c_str() : "?",
@@ -331,13 +386,23 @@ void client_on_join_complete(PeerId, Reader&)
 void client_on_session_reset(PeerId, Reader& r)
 {
 	const std::string why = r.str();
-	::Msg("[coop] host replaced the world (%s), rejoining", why.c_str());
+	const u32 epoch = r.u32();
+	if (!r.ok())
+	{
+		::Msg("! [coop] malformed SessionReset from the host");
+		mgr().stop("bad data from the host");
+		return;
+	}
+	::Msg("[coop] host replaced the world (%s, epoch %u), rejoining", why.c_str(), epoch);
 	g.my_proxy = kNoId;
 	g.load_issued = false;
 	g.swap_done = false;
 	sync::reset();
 	g.receive_started = mgr().now_ms(); // the join time limit starts again
 	mgr().set_phase(Phase::ReceivingWorld);
+	// R2 I1: the session tells the host we are in the new world before our JoinRequest; a save of the old world
+	// still on its way is dropped when it completes.
+	mgr().session().set_world_epoch(epoch);
 	mgr().session().send(kHostPeer, Lane::Reliable, Msg::JoinRequest, Writer());
 }
 
@@ -405,30 +470,84 @@ void swap_values(T& a, T& b)
 	b = t;
 }
 
+// R2 I3, host: a level changer of the level the host is on, from its own ALife, nullptr if `id` is none (or one the
+// host's scripts have switched off). The level change is built from its data, never from a client's bytes.
+CSE_ALifeLevelChanger* level_changer_here(u16 id)
+{
+	if (id == kNoId || !g_pGameLevel || !ai().get_alife())
+		return nullptr;
+	CSE_ALifeLevelChanger* lc = smart_cast<CSE_ALifeLevelChanger*>(ai().alife().objects().object(id, true));
+	if (!lc)
+		return nullptr;
+	const CGameGraph& gg = ai().game_graph();
+	if (!gg.valid_vertex_id(lc->m_tGraphID) || !gg.valid_vertex_id(lc->m_tNextGraphID) ||
+	    gg.vertex(lc->m_tGraphID)->level_id() != ai().alife().graph().level().level_id())
+		return nullptr;
+	CObject* object = Level().Objects.net_Find(id);
+	const CLevelChanger* changer = object ? object->cast_level_changer() : nullptr;
+	if (changer && !changer->IsLevelChangerEnabled())
+		return nullptr;
+	return lc;
+}
+
+// R2 I3, client: the level changer of this level whose destination our engine wrote into a level change packet
+// (CLevelChanger and its dialog write the changer's own m_tNext* values), kNoId if none (jump_to_level and the like).
+u16 level_changer_of(NET_Packet& P)
+{
+	constexpr u32 kBody = sizeof(GameGraph::_GRAPH_ID) + sizeof(u32) + 2 * sizeof(Fvector);
+	if (!ai().get_alife() || P.B.count < sizeof(u16) + kBody)
+		return kNoId;
+	const u32 read_at = P.r_pos;
+	P.r_pos = sizeof(u16); // after the message type
+	GameGraph::_GRAPH_ID graph;
+	u32 node;
+	Fvector position, angles;
+	P.r(&graph, sizeof(graph));
+	P.r(&node, sizeof(node));
+	P.r_vec3(position);
+	P.r_vec3(angles);
+	P.r_pos = read_at;
+	const CGameGraph& gg = ai().game_graph();
+	const GameGraph::_LEVEL_ID here = ai().alife().graph().level().level_id();
+	for (const auto& it : ai().alife().objects().objects())
+	{
+		CSE_ALifeLevelChanger* lc = smart_cast<CSE_ALifeLevelChanger*>(it.second);
+		if (lc && lc->m_tNextGraphID == graph && lc->m_dwNextNodeID == node && lc->m_tNextPosition.similar(position) &&
+		    lc->m_tAngles.similar(angles) && gg.valid_vertex_id(lc->m_tGraphID) &&
+		    gg.vertex(lc->m_tGraphID)->level_id() == here)
+			return lc->ID;
+	}
+	return kNoId;
+}
+
 } // namespace
 
 void host_on_transition_vote(PeerId from, Reader& r)
 {
 	if (!mgr().is_host())
 		return;
-	const u32 size = r.u32();
-	if (!r.ok() || !size || size > 4096)
+	const u16 changer = r.u16();
+	if (!r.ok())
 		return;
-	g.pending_transition.resize(size);
-	if (!r.bytes(g.pending_transition.data(), size))
+	const PeerInfo* p = mgr().session().peer(from);
+	const char* nick = p ? p->nick.c_str() : "?";
+	// R2 I3: the client names a level exit; the host goes only through a level changer of its own level.
+	if (!level_changer_here(changer))
 	{
-		g.pending_transition.clear();
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' asks to leave through object %u, which is no level exit here: ignored", nick, changer);
 		return;
 	}
 	const u64 now = mgr().now_ms();
-	const bool repeat = g.transition_from == from && now - g.transition_at < 3000;
+	const bool repeat = g.transition_from == from && g.pending_changer == changer && now - g.transition_at < 3000;
+	g.pending_changer = changer;
 	g.transition_from = from;
 	g.transition_at = now;
-	const PeerInfo* p = mgr().session().peer(from);
-	::Msg("[coop] '%s' stands at a level exit and wants the group to move. Host: coop_accept_transition to go",
-	      p ? p->nick.c_str() : "?");
-	if (!repeat)
-		script::on_transition_vote(p ? p->nick.c_str() : "?"); // the host's Lua (clients get the chat line below)
+	if (repeat)
+		return; // the same player at the same exit again: Lua and the chat know already
+	::Msg("[coop] '%s' stands at a level exit (%u) and wants the group to move. Host: coop_accept_transition to go",
+	      nick, changer);
+	script::on_transition_vote(nick); // the host's Lua (clients get the chat line below)
 	Writer w(128);
 	string256 text;
 	xr_sprintf(text, "%s wants to move the group to the next level", p ? p->nick.c_str() : "a player");
@@ -438,6 +557,7 @@ void host_on_transition_vote(PeerId from, Reader& r)
 
 void install(Session& s)
 {
+	s.limit_rate(Msg::StateDumpRequest, kStateDumpBurst, kStateDumpRefillMs); // R2 I4 (host only, per client)
 	s.on(Msg::TransitionVote, &host_on_transition_vote);
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
@@ -464,28 +584,50 @@ void on_host_started()
 {
 	g = State();
 	g.world_seen = g_world_generation;
+	mgr().session().set_world_epoch(g.epoch); // R2 I1: clients learn it from Welcome
 	world::host_scan_proxies();
 }
 
 u32 host_world_epoch() { return g.epoch; }
 
-void on_world_created() { ++g_world_generation; }
+void on_world_created()
+{
+	++g_world_generation;
+	// R2 I1: the host's world epoch moves on right here, before the first frame of the new world pumps the session
+	// (coop::on_frame handles messages before join::frame sees the new world): what clients made in the old world
+	// is dropped from now on, and nothing of the new world goes to a client before its SessionReset.
+	if (mgr().is_host())
+	{
+		++g.epoch;
+		mgr().session().set_world_epoch(g.epoch);
+	}
+}
 
 u32 world_generation() { return g_world_generation; }
 
 bool accept_transition()
 {
-	if (!mgr().is_host() || g.pending_transition.empty() || !g_pGameLevel)
+	if (!mgr().is_host() || g.pending_changer == kNoId || !g_pGameLevel)
 	{
 		::Msg("! [coop] no pending transition");
 		return false;
 	}
+	const u16 id = g.pending_changer;
+	g.pending_changer = kNoId;
+	const CSE_ALifeLevelChanger* lc = level_changer_here(id);
+	if (!lc)
+	{
+		::Msg("! [coop] the level exit %u asked for is not usable any more", id);
+		return false;
+	}
+	// R2 I3: the level change the stock level changer sends, made from the host's own entity.
 	NET_Packet P;
-	P.B.count = (u32)g.pending_transition.size();
-	CopyMemory(P.B.data, g.pending_transition.data(), P.B.count);
-	P.r_pos = 0;
-	g.pending_transition.clear();
-	::Msg("[coop] moving the group to the next level");
+	P.w_begin(M_CHANGE_LEVEL);
+	P.w(&lc->m_tNextGraphID, sizeof(lc->m_tNextGraphID));
+	P.w(&lc->m_dwNextNodeID, sizeof(lc->m_dwNextNodeID));
+	P.w_vec3(lc->m_tNextPosition);
+	P.w_vec3(lc->m_tAngles);
+	::Msg("[coop] moving the group to the next level (level exit %u)", id);
 	Level().Send(P, net_flags(TRUE)); // the host's own level change; clients follow via SessionReset
 	return true;
 }
@@ -494,11 +636,17 @@ void client_request_level_change(NET_Packet& P)
 {
 	if (!mgr().is_live_client())
 		return;
-	Writer w(P.B.count + 8);
-	w.u32(P.B.count);
-	w.bytes(P.B.data, P.B.count);
+	// R2 I3: the host builds the level change itself; it only learns which of its level changers we stand in.
+	const u16 changer = level_changer_of(P);
+	if (changer == kNoId)
+	{
+		::Msg("! [coop] level exit: no level changer of this level leads there, the host is not asked");
+		return;
+	}
+	Writer w(4);
+	w.u16(to_host(changer));
 	net::client_send(Msg::TransitionVote, w);
-	::Msg("[coop] level exit: asked the host to move the group");
+	::Msg("[coop] level exit %u: asked the host to move the group", changer);
 }
 
 void on_peer_joined(const PeerInfo&) {}
@@ -511,6 +659,7 @@ void on_peer_left(PeerId id)
 	const u16 proxy = it->second.proxy;
 	world::host_park_proxy(proxy);
 	g.peers.erase(it);
+	g.gate.forget(id);
 	take_offline(proxy); // W9: gone from the session = gone from the world (stays in the save)
 }
 
@@ -582,8 +731,15 @@ void on_blob_progress(PeerId, u32, u32 kind, u64 done, u64 total)
 
 void on_blob_complete(PeerId from, u32, u32 kind, std::vector<u8>& data)
 {
-	if (kind == BlobWorldSave && from == kHostPeer && mgr().is_client())
-		client_load_world(data);
+	if (kind != BlobWorldSave || from != kHostPeer || !mgr().is_client())
+		return;
+	// R2 I1: only the world we asked for and are waiting for (the session already dropped saves of another epoch).
+	if (mgr().phase() != Phase::ReceivingWorld || g.load_issued)
+	{
+		::Msg("! [coop] a world save arrived while none was awaited (%s): ignored", phase_name(mgr().phase()));
+		return;
+	}
+	client_load_world(data);
 }
 
 // Host: a load or a level change replaced the world under the session. Everybody rejoins
@@ -596,7 +752,10 @@ void host_watch_world()
 	{
 		g.world_seen = g_world_generation;
 		objects::reset(); // per-world state of physics/zones belongs to the old world
-		++g.epoch;
+		// The epoch moved on in on_world_created (R2 I1). Joins into the old world are void, everybody rejoins
+		// after SessionReset; a level exit asked for in it means nothing here.
+		g.gate.world_replaced();
+		g.pending_changer = kNoId;
 		g.reset_pending = true;
 		for (auto& it : g.peers)
 		{
@@ -612,6 +771,7 @@ void host_watch_world()
 	world::host_scan_proxies();
 	Writer w(64);
 	w.str("the host loaded a save or changed level");
+	w.u32(g.epoch); // R2 I1: the client's session tells it back before its JoinRequest
 	const u64 now = mgr().now_ms();
 	for (const PeerInfo& p : mgr().session().peers())
 	{
@@ -650,6 +810,7 @@ void frame()
 	{
 		host_watch_world();
 		host_watch_joins();
+		host_due_joins();
 		return;
 	}
 	// Client: downloading or loading the world must end in time (R-2.3).
@@ -674,8 +835,11 @@ void print_status()
 {
 	if (mgr().is_host())
 	{
+		::Msg("[coop]   world epoch %u; refused: %u join(s), %u WorldLoaded, %u level exit(s)", g.epoch,
+		    g.joins_refused, g.loaded_ignored, g.votes_refused);
 		for (const auto& it : g.peers)
-			::Msg("[coop]   peer #%u proxy %u%s", it.first, it.second.proxy, it.second.loading ? " (loading)" : "");
+			::Msg("[coop]   peer #%u proxy %u%s%s", it.first, it.second.proxy, it.second.loading ? " (loading)" : "",
+			    g.gate.waiting(it.first) ? " (join waits for its turn)" : "");
 	}
 	else if (mgr().is_client())
 		::Msg("[coop]   my proxy (host numbering) %u, swap %s", g.my_proxy, g.swap_done ? "done" : "pending");

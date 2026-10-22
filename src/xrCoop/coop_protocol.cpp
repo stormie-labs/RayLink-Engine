@@ -21,6 +21,7 @@ const char* msg_name(Msg type)
 	case Msg::BlobEnd: return "BlobEnd";
 	case Msg::PeerList: return "PeerList";
 	case Msg::Chat: return "Chat";
+	case Msg::WorldEpoch: return "WorldEpoch";
 
 	// Msg::GameBase aliases Msg::JoinRequest (same value) and is reported under that name.
 	case Msg::JoinRequest: return "JoinRequest";
@@ -247,6 +248,7 @@ void WelcomeMsg::write(Writer& w) const
 	w.u64(session_token);
 	w.str(host_nick);
 	w.u32(max_players);
+	w.u32(world_epoch);
 }
 
 bool WelcomeMsg::read(Reader& r)
@@ -255,6 +257,7 @@ bool WelcomeMsg::read(Reader& r)
 	session_token = r.u64();
 	host_nick = r.str();
 	max_players = r.u32();
+	world_epoch = r.u32();
 	return r.ok();
 }
 

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,6 +15,10 @@
 
 namespace coop
 {
+// R1 I3: what a host takes from one client in blobs (a client announces any size it likes; the host buffers it).
+constexpr uint64_t kMaxClientBlobBytes = 1024 * 1024; // one blob
+constexpr uint64_t kMaxClientBlobBytesInFlight = 4 * 1024 * 1024; // announced sizes of its unfinished blobs together
+
 enum class Role : uint8_t
 {
 	None,
@@ -112,8 +117,31 @@ public:
 	uint64_t keepalive_services() const; // helper services so far (diagnostics)
 
 	// Bulk transfer of an arbitrary byte blob in chunks over Lane::Bulk, with CRC32 check.
-	// Returns the blob id.
+	// Returns the blob id. R1 I4: a blob of the same kind still queued or streaming to that peer is cancelled, the
+	// newer one replaces it (a streaming one ends early, its receiver drops it). The blob carries the world epoch of
+	// the moment it was queued.
 	uint32_t send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data);
+
+	// R1 I3, host: a blob kind a client may send (none by default). A client that announces another kind, a blob
+	// over kMaxClientBlobBytes or more than kMaxClientBlobBytesInFlight of unfinished blobs is kicked as malformed.
+	void accept_client_blob(uint32_t kind);
+
+	// R2 I4, host: a client may send `type` at most `burst` times in a row, and once more every `refill_ms` (a token
+	// bucket per client). What exceeds it is dropped before its handler (logged once per client and type, the
+	// sender is not kicked: a burst may be honest). burst or refill_ms 0 removes the limit.
+	void limit_rate(Msg type, uint32_t burst, uint32_t refill_ms);
+
+	// R2 I1: the world epoch. A load or a level change on the host replaces the world under the session; nothing
+	// made in the old world may be applied to the new one.
+	// Host: the epoch of the world it serves, raised by the game as soon as a new world exists. Each client is in
+	//   the epoch of its Welcome until it tells otherwise (core WorldEpoch, sent by its set_world_epoch). Game
+	//   messages from a client in another epoch are dropped (logged once per client and epoch); game messages to it
+	//   are not sent, except SessionReset, which tells it the new epoch. Blobs of another epoch are cancelled.
+	// Client: the epoch of the world it is in or rejoins: from Welcome, then set by the game from SessionReset
+	//   before its JoinRequest. A completed blob of another epoch is dropped.
+	// host() and connect() start at 0.
+	void set_world_epoch(uint32_t epoch);
+	uint32_t world_epoch() const;
 
 	// --- callbacks (all optional) ---
 	std::function<void(const PeerInfo&)> on_peer_joined; // host: client accepted; client: other player joined
@@ -172,4 +200,44 @@ bool key_from_hex(const std::string& hex, PlayerKey& out);
 bool migrate_key_value(std::string& ini);
 // CRC32 (IEEE) used by blob transfer, exposed for tests.
 uint32_t crc32(const void* data, size_t size, uint32_t seed = 0);
+
+// R1 I4, R2 I4: the host's gate for JoinRequest. A join costs the host a full world save, written and read back on
+// the main thread, and a blob of tens of MB: one join in flight per peer (from its admission to its WorldLoaded),
+// and admissions of one peer at least kIntervalMs apart. A request that comes too soon is not lost: it waits and
+// due() admits it. Times are any monotonic ms clock. Pure logic, no engine.
+class JoinGate
+{
+public:
+	static constexpr uint32_t kIntervalMs = 5000;
+	enum class Verdict : uint8_t
+	{
+		Admit, // send the world now: the join is in flight
+		Later, // too soon after the peer's last join: waits, due() admits it
+		Refused, // a join of the peer is in flight or already waits: this request is dropped
+	};
+
+	Verdict request(PeerId peer, uint64_t now_ms);
+	// Waiting requests whose time has come, admitted now (in flight).
+	std::vector<PeerId> due(uint64_t now_ms);
+	// WorldLoaded from the peer: true if its join was in flight (it ends here). false: nothing was asked of it (a
+	// repeat, a forged one, one from a world that is gone) and the message is to be ignored.
+	bool loaded(PeerId peer);
+	// A load or a level change replaced the world: joins in flight and waiting requests are void, everybody rejoins
+	// after SessionReset. The interval holds across it.
+	void world_replaced();
+	// The peer left: its join and its waiting request are gone. The interval stays with its slot.
+	void forget(PeerId peer);
+	bool in_flight(PeerId peer) const;
+	bool waiting(PeerId peer) const;
+
+private:
+	struct Peer
+	{
+		bool in_flight = false;
+		bool waiting = false;
+		bool admitted_once = false;
+		uint64_t last_admit_ms = 0;
+	};
+	std::map<PeerId, Peer> m_peers;
+};
 } // namespace coop

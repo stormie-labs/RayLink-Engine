@@ -16,7 +16,9 @@ namespace coop
 // 3: EntitySound (NPC voices on clients); the EntitySnapshot animation-count byte carries creature flags (W5 C2)
 // 4: TradeOp Deal carries item ids only, the host prices the deal (review R4 2);
 //    ReqSpawn carries the section and an ItemState blob instead of raw spawn bytes, marker 0xC6 (review R3 V6)
-constexpr uint32_t kProtocolVersion = 4;
+// 5: world epoch: Welcome and BlobBegin carry it, core WorldEpoch (client -> host), SessionReset carries the new one;
+//    TransitionVote carries a level changer id instead of a raw M_CHANGE_LEVEL packet (review R1 I3-I4, R2 I1, I3, I4)
+constexpr uint32_t kProtocolVersion = 5;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -44,11 +46,12 @@ enum class Msg : uint16_t
 	Welcome = 0x0002, // host -> client
 	Reject = 0x0003, // host -> client, then disconnect
 	Bye = 0x0004, // either side, graceful leave with reason text
-	BlobBegin = 0x0005, // bulk transfer header
+	BlobBegin = 0x0005, // bulk transfer header: id, kind, size, crc, world epoch of the sender
 	BlobChunk = 0x0006,
-	BlobEnd = 0x0007,
+	BlobEnd = 0x0007, // also ends a cancelled blob early: the receiver drops what it got
 	PeerList = 0x0008, // host -> all: joined players (slot, nick, key hash)
 	Chat = 0x0009,
+	WorldEpoch = 0x000A, // client -> host: u32 world epoch the client rejoins (Session::set_world_epoch)
 
 	// --- game (dispatched to registered handlers) ---
 	GameBase = 0x0100,
@@ -58,9 +61,9 @@ enum class Msg : uint16_t
 	WorldBlob = 0x0101, // host -> client: blob id of the world save follows
 	WorldLoaded = 0x0102, // client -> host: save loaded, local actor ready
 	JoinComplete = 0x0103, // host -> client: catch-up done, live sync on
-	SessionReset = 0x0104, // host -> clients: world replaced (host load), rejoin
+	SessionReset = 0x0104, // host -> clients: world replaced (host load): str reason, u32 new world epoch; rejoin
 	LevelChange = 0x0105, // host -> clients: group transition, rejoin after
-	TransitionVote = 0x0106, // client -> host: ready / not ready at level exit
+	TransitionVote = 0x0106, // client -> host: u16 level changer (host numbering) the client stands in
 
 	// players
 	PlayerState = 0x0110, // unreliable movement snapshot (owner -> host -> others)
@@ -199,6 +202,7 @@ struct WelcomeMsg
 	uint64_t session_token = 0; // random per session; used to rejoin after level change
 	std::string host_nick;
 	uint32_t max_players = kMaxPlayers;
+	uint32_t world_epoch = 0; // the world the host serves now (Session::set_world_epoch)
 
 	void write(Writer& w) const;
 	bool read(Reader& r);
