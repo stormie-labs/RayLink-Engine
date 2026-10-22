@@ -72,15 +72,22 @@ inline bool live_only(Msg type)
 // change itself (a host command, entities::ClientApply) or runs the same story with its own reactions (an addon's
 // info callback while story::applying()). Such a reaction is dropped instead of being forwarded to the host: forwarded,
 // it would happen twice.
+// Ruling F2-12: the host runs those reactions on its own actor only. Nobody but this player touches the items this
+// player holds, so `own_item` — an existing item held by this player's actor (root), or one it gives away from its
+// inventory — still goes to the host from the story's reactions, which checks ownership as for any request. A new
+// object (a spawn, our inventory included) is never `own_item`: shared rewards are routed by the task layer (W3c).
+// A host command's own events are never requests, whatever they touch.
 enum class Echo : uint8_t
 {
 	Forward, // a request of this player: the router may send it to the host
 	Drop, // a reaction to a host broadcast: nothing goes to the host
 };
 
-inline Echo client_echo(bool story_applying, bool entities_applying)
+inline Echo client_echo(bool story_applying, bool entities_applying, bool own_item)
 {
-	return story_applying || entities_applying ? Echo::Drop : Echo::Forward;
+	if (entities_applying)
+		return Echo::Drop;
+	return story_applying && !own_item ? Echo::Drop : Echo::Forward;
 }
 } // namespace rules
 } // namespace coop

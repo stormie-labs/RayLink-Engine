@@ -81,7 +81,7 @@ struct Counters
 	u64 moves_forwarded = 0, moves_blocked = 0, hits_forwarded = 0, hits_blocked = 0, actor_hits_blocked = 0;
 	u64 deaths_blocked = 0, other_blocked = 0, level_changes = 0, saves_blocked = 0, vehicles_blocked = 0;
 	u64 launches_forwarded = 0, launches_dropped = 0; // W3a: own rockets (ReqLaunch / old drop fallback)
-	u64 echo_dropped = 0; // R4 4: requests not made from reactions to the host's story (filter_event, filter_spawn)
+	u64 echo_dropped = 0; // R4 4: spawns and world-object requests not made from reactions to the host's story
 	// client apply
 	u64 parent_applied = 0, parent_failed = 0, parent_timeouts = 0, deaths_applied = 0, local_spawns = 0,
 	    local_destroys = 0, local_errors = 0, launches_applied = 0, launches_missed = 0;
@@ -172,7 +172,9 @@ bool filter_spawn(NET_Packet& P)
 	// (EntityLocal, with the host's id) goes to the local server as before; a spawn made while we apply the host's
 	// story (an addon's info callback) is neither sent nor made here: world objects are the host's, and the host
 	// runs that story with its own reactions.
-	if (rules::client_echo(story::applying(), entities::client_applying()) == rules::Echo::Drop)
+	// Ruling F2-12: also a spawn into our own inventory (a new object is nobody's item yet): shared rewards are routed
+	// by the task layer (W3c), a second one here would be a double reward.
+	if (rules::client_echo(story::applying(), entities::client_applying(), false) == rules::Echo::Drop)
 		return entities::client_applying() ? false : swallow(g_c.echo_dropped);
 	u16 type;
 	P.r_begin(type);
@@ -196,27 +198,35 @@ bool filter_spawn(NET_Packet& P)
 	return true;
 }
 
-// `echo` (R4 4, filter_event): we apply the host's story; what would go to the host as a request is dropped here.
+// R4 4, Ruling F2-12 (rules::client_echo): true = a request about `id` made now would be a reaction to a host
+// broadcast, so it is not made (the caller drops the event and counts it). Asked right before each request, after the
+// router's own blocks. While we apply the host's story only world objects are dropped: our own items (root: our actor;
+// one we give away is still ours until the host moves it) go to the host as before, it checks them as any request.
+// A host command's events never get here (filter_event passes them on first).
+bool echo_of(u16 id)
+{
+	return rules::client_echo(story::applying(), entities::client_applying(), is_ours(id)) == rules::Echo::Drop;
+}
 
-bool on_take(u16 dest, u16 item, bool trade, bool echo)
+bool on_take(u16 dest, u16 item, bool trade)
 {
 	CSE_Abstract* e = find_entity(item);
 	if (!e)
 		return false; // not part of the host world: a purely local object
-	if (echo)
+	if (echo_of(item))
 		return swallow(g_c.echo_dropped);
 	requests::client_move(item, e->ID_Parent, dest, nullptr, trade ? 2 : 0);
 	++g_c.moves_forwarded;
 	return true;
 }
 
-bool on_reject(u16 dest, u16 item, bool before_destroy, const Fvector* pos, bool trade, bool echo)
+bool on_reject(u16 dest, u16 item, bool before_destroy, const Fvector* pos, bool trade)
 {
 	if (!find_entity(item))
 		return false;
 	if (before_destroy)
 		return swallow(g_c.moves_blocked); // the GE_DESTROY that follows goes to the host
-	if (echo)
+	if (echo_of(item))
 		return swallow(g_c.echo_dropped);
 	// A thrown missile leaves the grenade/bolt that held it: local and immediate (the throw
 	// must not wait for the network); the host repeats it on its copy.
@@ -232,15 +242,15 @@ bool on_reject(u16 dest, u16 item, bool before_destroy, const Fvector* pos, bool
 	return true;
 }
 
-bool on_destroy(u16 dest, bool echo)
+bool on_destroy(u16 dest)
 {
 	CSE_Abstract* e = find_entity(dest);
 	if (!e)
 		return false; // not part of the host world
 	if (smart_cast<CSE_ALifeCreatureAbstract*>(e))
 		return swallow(g_c.destroys_blocked); // creatures live and die on the host
-	if (echo && (is_ours(dest) || e->ID_Parent == kNoId))
-		return swallow(g_c.echo_dropped); // one of the two requests below
+	if ((is_ours(dest) || e->ID_Parent == kNoId) && echo_of(dest))
+		return swallow(g_c.echo_dropped); // one of the two requests below, about a world object
 	if (is_ours(dest))
 	{
 		CGameObject* go = find_go(dest);
@@ -258,7 +268,7 @@ bool on_destroy(u16 dest, bool echo)
 	return swallow(g_c.destroys_blocked);
 }
 
-bool on_hit(NET_Packet& P, u16 dest, u16 type, bool echo)
+bool on_hit(NET_Packet& P, u16 dest, u16 type)
 {
 	SHit hit;
 	hit.PACKET_TYPE = type;
@@ -279,7 +289,7 @@ bool on_hit(NET_Packet& P, u16 dest, u16 type, bool echo)
 	const bool ours = hit.whoID == kActor || is_ours(hit.whoID);
 	if (!ours)
 		return swallow(g_c.hits_blocked);
-	if (echo)
+	if (echo_of(dest))
 		return swallow(g_c.echo_dropped);
 	requests::client_hit(dest, hit);
 	++g_c.hits_forwarded;
@@ -304,11 +314,11 @@ bool filter_event(NET_Packet& P)
 		return false; // our own death is ours; the host is told
 	}
 	// R4 4: no request from a reaction to a host broadcast (rules::client_echo). A host command (entities::ClientApply)
-	// goes to the local server unchanged, as before. While we apply the host's story (an addon's info callback), an
-	// item event that would become a request is dropped here (`echo`): the item stays as the host has it, and the
-	// host runs that story with its own reactions. What the router blocks or keeps local stays so; GE_MONEY goes on.
-	const bool echo = rules::client_echo(story::applying(), entities::client_applying()) == rules::Echo::Drop;
-	if (echo && entities::client_applying())
+	// goes to the local server unchanged, as before: its events are the host's change itself. While we apply the
+	// host's story (an addon's info callback), an event that would become a request about a world object is dropped
+	// (echo_of): the object stays as the host has it, and the host runs that story with its own reactions. Our own
+	// items still go to the host (Ruling F2-12). What the router blocks or keeps local stays so; GE_MONEY goes on.
+	if (entities::client_applying())
 		return false;
 
 	switch (type)
@@ -319,7 +329,7 @@ bool filter_event(NET_Packet& P)
 	{
 		u16 item;
 		P.r_u16(item);
-		return on_take(dest, item, type == GE_TRADE_BUY, echo);
+		return on_take(dest, item, type == GE_TRADE_BUY);
 	}
 	case GE_OWNERSHIP_REJECT:
 	case GE_TRADE_SELL:
@@ -331,7 +341,7 @@ bool filter_event(NET_Packet& P)
 		const bool has_pos = !P.r_eof();
 		if (has_pos)
 			P.r_vec3(pos);
-		return on_reject(dest, item, before_destroy, has_pos ? &pos : nullptr, type == GE_TRADE_SELL, echo);
+		return on_reject(dest, item, before_destroy, has_pos ? &pos : nullptr, type == GE_TRADE_SELL);
 	}
 	case GE_LAUNCH_ROCKET:
 	{
@@ -339,7 +349,7 @@ bool filter_event(NET_Packet& P)
 		P.r_u16(item);
 		if (is_ours(dest) && find_entity(item))
 		{
-			if (echo)
+			if (echo_of(item))
 				return swallow(g_c.echo_dropped);
 			// W3a: the host launches its copy with our launch (it flies, detonates and is removed for everybody);
 			// ours flies as a visual copy that never detonates here (WP7) and goes with the host's destroy.
@@ -355,10 +365,10 @@ bool filter_event(NET_Packet& P)
 	}
 	case GE_DESTROY:
 	case GE_DESTROY_REJECT:
-		return on_destroy(dest, echo);
+		return on_destroy(dest);
 	case GE_HIT:
 	case GE_HIT_STATISTIC:
-		return on_hit(P, dest, type, echo);
+		return on_hit(P, dest, type);
 	case GE_DIE:
 	case GE_ASSIGN_KILLER:
 		if (dest == kActor || !find_entity(dest))
@@ -378,7 +388,7 @@ bool filter_event(NET_Packet& P)
 	case GE_INSTALL_UPGRADE:
 		if (is_ours(dest) && P.r_pos < P.B.count)
 		{
-			if (echo)
+			if (echo_of(dest))
 				return swallow(g_c.echo_dropped);
 			requests::client_item_event(dest, type, P.B.data + P.r_pos, P.B.count - P.r_pos);
 		}
@@ -387,7 +397,7 @@ bool filter_event(NET_Packet& P)
 	{
 		Fvector pos;
 		P.r_vec3(pos);
-		if (echo)
+		if (echo_of(dest))
 			return false; // amends no drop request: it moves the object here, as without a drop in flight
 		return requests::client_move_position(dest, pos); // drop_item_and_teleport: folded into the drop
 	}
@@ -989,8 +999,8 @@ void print_status()
 	      "pending), local %llu spawns / %llu destroys / %llu errors",
 	    g_c.parent_applied, g_c.parent_failed, g_c.parent_timeouts, (u32)g_parent_targets.size(), g_c.deaths_applied,
 	    (u32)g_death_targets.size(), g_c.local_spawns, g_c.local_destroys, g_c.local_errors);
-	::Msg("[coop]   echo dropped: %llu spawns / item requests made in reaction to the host's story (R4 4); %llu world "
-	      "messages (parents, deaths, local entities) dropped before live (R2 I2)",
+	::Msg("[coop]   echo dropped: %llu spawns / world-object requests made in reaction to the host's story (R4 4); "
+	      "%llu world messages (parents, deaths, local entities) dropped before live (R2 I2)",
 	    g_c.echo_dropped, g_c.dropped_before_live);
 }
 
