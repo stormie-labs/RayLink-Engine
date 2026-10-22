@@ -12,6 +12,8 @@
 #include "coop_trade.h"
 #include "coop_items.h"
 #include "coop_money.h"
+#include "coop_dialog.h"
+#include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_hits.h"
@@ -98,15 +100,39 @@ bool spawnable_section(const char* section)
 	    pSettings->line_exist(section, "class");
 }
 
-// R3 В6 (review), F2 T2: the lines the constructor of `rule`'s server entity and of its bases read unchecked are
-// there (xrCoop/coop_spawn.h required_lines). Returns the first missing line, nullptr if none. `section` passed
-// spawnable_section.
-const char* missing_item_line(const char* section, const spawn::ClassRule& rule)
+// F2 T2 fix round 1 (Ruling F2-17): a section as spawn::missing_line asks about it (xrCoop/coop_spawn.h When). It never
+// reads a missing line, nor a number or flag of an empty value (r_s32 / r_bool of one would itself be FATAL here).
+struct SectionIni
 {
-	for (const char* line : spawn::required_lines(rule.cse))
-		if (!pSettings->line_exist(section, line))
-			return line;
-	return nullptr;
+	LPCSTR section;
+
+	LPCSTR value(LPCSTR line) const
+	{
+		return pSettings->line_exist(section, line) ? pSettings->r_string(section, line) : nullptr;
+	}
+	bool has(LPCSTR line) const { return !!pSettings->line_exist(section, line); }
+	long long number(LPCSTR line) const // as r_s32 / r_u32 read it
+	{
+		const LPCSTR v = value(line);
+		return v ? atoi(v) : 0;
+	}
+	bool flag(LPCSTR line) const { return value(line) && !!pSettings->r_bool(section, line); }
+	bool ref_exists(LPCSTR line) const
+	{
+		const LPCSTR v = value(line);
+		return v && v[0] && pSettings->section_exist(v);
+	}
+	bool ref_has(LPCSTR line, LPCSTR other) const
+	{
+		return ref_exists(line) && !!pSettings->line_exist(value(line), other);
+	}
+};
+
+// R3 В6 (review), F2 T2: the lines the constructors of `rule`'s server entity and game object (and their bases and
+// Loads) read unchecked are there (xrCoop/coop_spawn.h missing_line). `section` passed spawnable_section.
+spawn::Missing missing_item_line(const char* section, const spawn::ClassRule& rule)
+{
+	return spawn::missing_line(rule, SectionIni{section});
 }
 
 u16 to_host_id(u16 id) { return id == kNoId ? kNoId : join::to_host(id); }
@@ -705,8 +731,9 @@ bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 
 // ---------------------------------------------------------------- F2 T2: what a client may ask for
 // The verdict is xrCoop/coop_spawn.h judge(). Host settings: configs\coop_spawn.ltx, read once per process. The cost
-// budgets belong to the characters (proxy ids) for the whole session (Ruling F2-11): a peer that leaves and joins
-// again as the same character refills nothing; reset() at the session's start and end clears them.
+// budgets belong to the characters for the whole session (Ruling F2-11), by player key (Ruling F2-18): a peer that
+// leaves and joins again as the same character refills nothing, nor does a reload that gives his character another
+// id; reset() at the session's start and end clears them.
 constexpr LPCSTR kSpawnSettings = "coop_spawn";
 constexpr int kMaxSpawnSetting = 2000000000; // ltx values are ints
 constexpr u32 kSpawnVerdicts = u32(spawn::SpawnVerdict::OverBudget) + 1;
@@ -716,6 +743,23 @@ xr_set<shared_str> g_spawn_allow, g_spawn_deny;
 spawn::BudgetBook g_spawn_budgets;
 u64 g_spawn_refused[kSpawnVerdicts] = {};
 u64 g_spawn_refusals = 0;
+u64 g_spawn_quest_gifts = 0; // Ruling F2-16: quest items let through for a talk
+
+// Ruling F2-18: the key of a character's budget, the same as the money book's (coop_money character_key_of): the player
+// key digest on the "key" line of the proxy's custom data (ledger::character_key); a character without one (none of
+// coop_join's) is keyed by its id.
+std::string spawn_budget_key(u16 proxy)
+{
+	const CSE_Abstract* e = events::find_entity(proxy);
+	std::string key = e && e->m_ini_string.size() ? ledger::character_key(e->m_ini_string.c_str()) : std::string();
+	if (key.empty())
+	{
+		char id[16];
+		xr_sprintf(id, "#%u", u32(proxy));
+		key = id;
+	}
+	return key;
+}
 
 u32 read_spawn_setting(CInifile& ini, LPCSTR key, u32 fallback)
 {
@@ -777,7 +821,8 @@ spawn::SectionFacts spawn_facts(const char* section)
 }
 
 // A refused ReqSpawn: counted by verdict (coop_status), the first ten logged with the section and the player.
-void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, const char* missing, u16 parent)
+void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, const spawn::Missing& missing, u16 parent,
+    double budget_left)
 {
 	using spawn::SpawnVerdict;
 	++g_spawn_refused[u32(v)];
@@ -792,7 +837,13 @@ void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, cons
 			    pSettings->r_string(section, "class"));
 			break;
 		case SpawnVerdict::MissingLine:
-			xr_sprintf(why, "no `%s` (its class reads it unchecked)", missing ? missing : "?");
+			if (missing.no_section)
+				xr_sprintf(why, "its `%s` names no section (its class reads it unchecked)", missing.line);
+			else if (missing.in)
+				xr_sprintf(why, "no `%s` in the section its `%s` names (its class reads it unchecked)", missing.line,
+				    missing.in);
+			else
+				xr_sprintf(why, "no `%s` (its class reads it unchecked)", missing.line ? missing.line : "?");
 			break;
 		case SpawnVerdict::Denied: xr_strcpy(why, "in [deny_sections] of coop_spawn.ltx");
 			break;
@@ -800,7 +851,7 @@ void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, cons
 			break;
 		case SpawnVerdict::OverBudget:
 			xr_sprintf(why, "over the cost budget of character %u (cost %u RU, %.0f RU left)", q.proxy,
-			    spawn_facts(section).cost, g_spawn_budgets.of(q.proxy).tokens);
+			    spawn_facts(section).cost, budget_left);
 			break;
 		default: xr_strcpy(why, "?");
 			break;
@@ -926,12 +977,12 @@ void host_on_spawn(PeerId from, Reader& r)
 			    from, validate::resource_name_ok(section, spawn::kMaxSection) ? section : "<bad name>");
 		return reply(q, Reason::BadSection, s.parent);
 	}
-	// F2 T2: an item class of the game with every line its server entity's constructor reads unchecked; anything
-	// else is never constructed (a missing line is FATAL on the host).
+	// F2 T2: an item class of the game with every line its server entity and game object read unchecked (Ruling
+	// F2-17); anything else is never constructed (a missing line is FATAL on the host).
 	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(section, "class"));
-	const char* missing = rule ? missing_item_line(section, *rule) : nullptr;
+	const spawn::Missing missing = rule ? missing_item_line(section, *rule) : spawn::Missing();
 	CSE_Abstract* e = nullptr;
-	if (rule && !missing)
+	if (rule && !missing.line)
 	{
 		// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
 		if (!items::section_defaults_ok(shared_str(section)))
@@ -963,14 +1014,19 @@ void host_on_spawn(PeerId from, Reader& r)
 	}
 	// F2 T2: deny/allow lists, quest items, the character's cost budget; after the item state, so a malformed one
 	// costs nothing. No rule or a missing line ends here too (judge steps 1-2, nothing was constructed).
-	const spawn::SpawnVerdict verdict = spawn::judge(rule, missing, spawn_facts(section),
-	    g_spawn_budgets.of(q.proxy), g_spawn_policy, mgr().now_ms());
+	spawn::SectionFacts facts = spawn_facts(section);
+	// Ruling F2-16: a quest item into his own character while he holds a talk lock (the stock dialogs give it there).
+	facts.in_dialog_to_own_actor = spawn::quest_gift(dialog::host_lock_of(from) != kNoId, s.parent, q.proxy);
+	spawn::CostBudget& budget = g_spawn_budgets.of(spawn_budget_key(q.proxy));
+	const spawn::SpawnVerdict verdict = spawn::judge(rule, missing.line, facts, budget, g_spawn_policy, mgr().now_ms());
 	if (verdict != spawn::SpawnVerdict::Allow)
 	{
 		if (e)
 			F_entity_Destroy(e);
-		return refuse_spawn(q, verdict, section, missing, s.parent);
+		return refuse_spawn(q, verdict, section, missing, s.parent, budget.tokens);
 	}
+	if (facts.quest_item && !facts.allow_listed)
+		++g_spawn_quest_gifts; // let through only as a quest gift
 	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
 	const Reason why = host_spawn(e, s.parent, created);
@@ -1507,6 +1563,8 @@ void print_status()
 		    g_spawn_refused[u32(SpawnVerdict::Denied)], g_spawn_refused[u32(SpawnVerdict::QuestItem)],
 		    g_spawn_refused[u32(SpawnVerdict::OverBudget)], g_spawn_policy.cost_burst, g_spawn_policy.cost_per_sec,
 		    (u32)g_spawn_budgets.size(), (u32)g_spawn_allow.size(), (u32)g_spawn_deny.size());
+		::Msg("[coop]   quest allowed in dialog %llu (quest items a player's talk gave his own character, F2-16)",
+		    g_spawn_quest_gifts);
 		return;
 	}
 	// sent[5] was ReqMoney (now coop_money, F2 T1)

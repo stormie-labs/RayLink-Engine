@@ -129,14 +129,49 @@ enum class CseClass : uint8_t
 };
 constexpr uint8_t kCseClassCount = uint8_t(CseClass::Temporary) + 1;
 
+// The game object the factory builds for a clsid (its client class), grouped by what its constructor, Load and
+// net_Spawn read from the item's own section without line_exist (Ruling F2-17). The host builds that object too
+// (Process_spawn), so a missing line of it is as FATAL as one of the server entity. Lines: kGameGroups below.
+enum class GameClass : uint8_t
+{
+	InventoryItem, // CInventoryItemObject: addons, eatables, documents, attachables, the MP bag
+	GrenadeLauncher, // CGrenadeLauncher
+	Ammo, // CWeaponAmmo
+	CustomOutfit, // CCustomOutfit and the outfits below it
+	Helmet, // CHelmet
+	Backpack, // CBackpack
+	Torch, // CTorch
+	ExplosiveItem, // CExplosiveItem
+	Missile, // CBolt (CMissile)
+	Grenade, // CF1, CRGD5 (CGrenade)
+	ExplosiveRocket, // CExplosiveRocket
+	Artefact, // CArtefact and the artefacts whose own Load reads nothing unchecked
+	BastArtefact, // CBastArtefact
+	BlackGraviArtefact, // CBlackGraviArtefact
+	MercuryBall, // CMercuryBall
+	Pda, // CPda
+	Flare, // CFlare
+	CustomDevice, // CCustomDevice, CFlashlight, CDosimeter
+	CustomDetector, // CCustomDetector and the four detectors
+	WeaponKnife, // CWeaponKnife
+	WeaponMagazined, // CWeaponMagazined and the weapons below it without a grenade or rocket launcher
+	WeaponBinoculars, // CWeaponBinoculars
+	WeaponMagazinedWGrenade, // CWeaponMagazinedWGrenade, CWeaponAK74, CWeaponGroza
+	WeaponRocket, // CWeaponRG6, CWeaponSSRS (CRocketLauncher)
+	WeaponRPG7, // CWeaponRPG7
+};
+constexpr uint8_t kGameClassCount = uint8_t(GameClass::WeaponRPG7) + 1;
+
 struct ClassRule
 {
 	std::string_view clsid; // the `class` value of a section, as TEXT2CLSID reads it (case-sensitive, <= 8 chars)
 	CseClass cse;
+	GameClass game; // its game object (Ruling F2-17)
 };
 
-// Every item class of the game, one rule per clsid. Sources (tools/check_spawn_classes.py checks this table against
-// them and fails on any difference, the cited lines included):
+// Every item class of the game, one rule per clsid, with its server entity class and the group of its game object (the
+// client class of the same registration: every Load above it must be in its group's `loads`). Sources
+// (tools/check_spawn_classes.py checks this table against them and fails on any difference, the cited lines included):
 //   engine :N  engine/src/xrServerEntities/object_factory_register.cpp line N, an ADD(..., CSE_ALifeItem* or
 //              CSE_Temporary, id, ...) before `if (!g_dedicated_server) return;` (the ADDs after it exist only on a
 //              dedicated server); id from clsid_game.h or TEXT2CLSID;
@@ -145,127 +180,127 @@ struct ClassRule
 //              se_artefact.script).
 inline constexpr ClassRule kClassRules[] = {
 	// engine: artefacts
-	{"AF_MBALL", CseClass::Artefact}, // engine :287
-	{"AF_BDROP", CseClass::Artefact}, // engine :288
-	{"AF_NEEDL", CseClass::Artefact}, // engine :289
-	{"AF_BAST", CseClass::Artefact}, // engine :290
-	{"AF_BGRAV", CseClass::Artefact}, // engine :291
-	{"AF_DUMMY", CseClass::Artefact}, // engine :292
-	{"AF_ZUDA", CseClass::Artefact}, // engine :293
-	{"AF_THORN", CseClass::Artefact}, // engine :294
-	{"AF_FBALL", CseClass::Artefact}, // engine :295
-	{"AF_EBALL", CseClass::Artefact}, // engine :296
-	{"AF_RHAIR", CseClass::Artefact}, // engine :297
-	{"AF_GALAN", CseClass::Artefact}, // engine :298
-	{"AF_GRAVI", CseClass::Artefact}, // engine :299
-	{"ARTEFACT", CseClass::Artefact}, // engine :300
-	{"AF_CTA", CseClass::Artefact}, // engine :301
+	{"AF_MBALL", CseClass::Artefact, GameClass::MercuryBall}, // engine :287
+	{"AF_BDROP", CseClass::Artefact, GameClass::Artefact}, // engine :288
+	{"AF_NEEDL", CseClass::Artefact, GameClass::BlackGraviArtefact}, // engine :289
+	{"AF_BAST", CseClass::Artefact, GameClass::BastArtefact}, // engine :290
+	{"AF_BGRAV", CseClass::Artefact, GameClass::BlackGraviArtefact}, // engine :291
+	{"AF_DUMMY", CseClass::Artefact, GameClass::Artefact}, // engine :292
+	{"AF_ZUDA", CseClass::Artefact, GameClass::Artefact}, // engine :293
+	{"AF_THORN", CseClass::Artefact, GameClass::Artefact}, // engine :294
+	{"AF_FBALL", CseClass::Artefact, GameClass::Artefact}, // engine :295
+	{"AF_EBALL", CseClass::Artefact, GameClass::Artefact}, // engine :296
+	{"AF_RHAIR", CseClass::Artefact, GameClass::Artefact}, // engine :297
+	{"AF_GALAN", CseClass::Artefact, GameClass::Artefact}, // engine :298
+	{"AF_GRAVI", CseClass::Artefact, GameClass::Artefact}, // engine :299
+	{"ARTEFACT", CseClass::Artefact, GameClass::Artefact}, // engine :300
+	{"AF_CTA", CseClass::Artefact, GameClass::Artefact}, // engine :301
 	// engine: weapons
-	{"W_WMAGAZ", CseClass::WeaponMagazined}, // engine :304
-	{"W_WMAGGL", CseClass::WeaponMagazinedWGL}, // engine :307
-	{"W_FN2000", CseClass::WeaponMagazinedWGL}, // engine :309
-	{"W_AK74", CseClass::WeaponMagazinedWGL}, // engine :310
-	{"W_LR300", CseClass::WeaponMagazined}, // engine :311
-	{"W_HPSA", CseClass::WeaponMagazined}, // engine :312
-	{"W_PM", CseClass::WeaponMagazined}, // engine :313
-	{"W_FORT", CseClass::WeaponMagazined}, // engine :314
-	{"W_BINOC", CseClass::WeaponMagazined}, // engine :315
-	{"W_SHOTGN", CseClass::WeaponShotGun}, // engine :316
-	{"W_SVD", CseClass::WeaponMagazined}, // engine :317
-	{"W_SVU", CseClass::WeaponMagazined}, // engine :318
-	{"W_RPG7", CseClass::WeaponMagazined}, // engine :319
-	{"W_VAL", CseClass::WeaponMagazined}, // engine :320
-	{"W_VINT", CseClass::WeaponMagazined}, // engine :321
-	{"W_WALTHR", CseClass::WeaponMagazined}, // engine :322
-	{"W_USP45", CseClass::WeaponMagazined}, // engine :323
-	{"W_GROZA", CseClass::WeaponMagazinedWGL}, // engine :324
-	{"W_KNIFE", CseClass::Weapon}, // engine :325
-	{"W_BM16", CseClass::WeaponShotGun}, // engine :326
-	{"W_RG6", CseClass::WeaponShotGun}, // engine :327
-	{"_W_SSRS", CseClass::WeaponMagazined}, // engine :431
+	{"W_WMAGAZ", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :304
+	{"W_WMAGGL", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazinedWGrenade}, // engine :307
+	{"W_FN2000", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazined}, // engine :309
+	{"W_AK74", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazinedWGrenade}, // engine :310
+	{"W_LR300", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :311
+	{"W_HPSA", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :312
+	{"W_PM", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :313
+	{"W_FORT", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :314
+	{"W_BINOC", CseClass::WeaponMagazined, GameClass::WeaponBinoculars}, // engine :315
+	{"W_SHOTGN", CseClass::WeaponShotGun, GameClass::WeaponMagazined}, // engine :316
+	{"W_SVD", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :317
+	{"W_SVU", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :318
+	{"W_RPG7", CseClass::WeaponMagazined, GameClass::WeaponRPG7}, // engine :319
+	{"W_VAL", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :320
+	{"W_VINT", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :321
+	{"W_WALTHR", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :322
+	{"W_USP45", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // engine :323
+	{"W_GROZA", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazinedWGrenade}, // engine :324
+	{"W_KNIFE", CseClass::Weapon, GameClass::WeaponKnife}, // engine :325
+	{"W_BM16", CseClass::WeaponShotGun, GameClass::WeaponMagazined}, // engine :326
+	{"W_RG6", CseClass::WeaponShotGun, GameClass::WeaponRocket}, // engine :327
+	{"_W_SSRS", CseClass::WeaponMagazined, GameClass::WeaponRocket}, // engine :431
 	// engine: ammo, addons
-	{"AMMO", CseClass::Ammo}, // engine :329
-	{"A_VOG25", CseClass::Ammo}, // engine :330
-	{"A_OG7B", CseClass::Ammo}, // engine :331
-	{"A_M209", CseClass::Ammo}, // engine :332
-	{"W_SCOPE", CseClass::Item}, // engine :336
-	{"W_SILENC", CseClass::Item}, // engine :337
-	{"W_GLAUNC", CseClass::Item}, // engine :338
+	{"AMMO", CseClass::Ammo, GameClass::Ammo}, // engine :329
+	{"A_VOG25", CseClass::Ammo, GameClass::Ammo}, // engine :330
+	{"A_OG7B", CseClass::Ammo, GameClass::Ammo}, // engine :331
+	{"A_M209", CseClass::Ammo, GameClass::Ammo}, // engine :332
+	{"W_SCOPE", CseClass::Item, GameClass::InventoryItem}, // engine :336
+	{"W_SILENC", CseClass::Item, GameClass::InventoryItem}, // engine :337
+	{"W_GLAUNC", CseClass::Item, GameClass::GrenadeLauncher}, // engine :338
 	// engine: inventory
-	{"II_BOLT", CseClass::Bolt}, // engine :342
-	{"II_MEDKI", CseClass::Item}, // engine :344
-	{"II_BANDG", CseClass::Item}, // engine :345
-	{"II_ANTIR", CseClass::Item}, // engine :346
-	{"II_FOOD", CseClass::Item}, // engine :347
-	{"II_BOTTL", CseClass::Item}, // engine :348
-	{"II_EXPLO", CseClass::Explosive}, // engine :349
-	{"II_DOC", CseClass::Document}, // engine :352
-	{"II_ATTCH", CseClass::Item}, // engine :353
+	{"II_BOLT", CseClass::Bolt, GameClass::Missile}, // engine :342
+	{"II_MEDKI", CseClass::Item, GameClass::InventoryItem}, // engine :344
+	{"II_BANDG", CseClass::Item, GameClass::InventoryItem}, // engine :345
+	{"II_ANTIR", CseClass::Item, GameClass::InventoryItem}, // engine :346
+	{"II_FOOD", CseClass::Item, GameClass::InventoryItem}, // engine :347
+	{"II_BOTTL", CseClass::Item, GameClass::InventoryItem}, // engine :348
+	{"II_EXPLO", CseClass::Explosive, GameClass::ExplosiveItem}, // engine :349
+	{"II_DOC", CseClass::Document, GameClass::InventoryItem}, // engine :352
+	{"II_ATTCH", CseClass::Item, GameClass::InventoryItem}, // engine :353
 	// engine: equipment
-	{"EQU_SCIE", CseClass::CustomOutfit}, // engine :356
-	{"EQU_STLK", CseClass::CustomOutfit}, // engine :357
-	{"EQU_MLTR", CseClass::CustomOutfit}, // engine :358
-	{"EQU_EXO", CseClass::CustomOutfit}, // engine :359
-	{"EQ_HLMET", CseClass::Item}, // engine :360
-	{"EQ_BAKPK", CseClass::Item}, // engine :361
+	{"EQU_SCIE", CseClass::CustomOutfit, GameClass::CustomOutfit}, // engine :356
+	{"EQU_STLK", CseClass::CustomOutfit, GameClass::CustomOutfit}, // engine :357
+	{"EQU_MLTR", CseClass::CustomOutfit, GameClass::CustomOutfit}, // engine :358
+	{"EQU_EXO", CseClass::CustomOutfit, GameClass::CustomOutfit}, // engine :359
+	{"EQ_HLMET", CseClass::Item, GameClass::Helmet}, // engine :360
+	{"EQ_BAKPK", CseClass::Item, GameClass::Backpack}, // engine :361
 	// engine: grenades, rockets
-	{"G_F1", CseClass::Grenade}, // engine :364
-	{"G_RGD5", CseClass::Grenade}, // engine :365
-	{"G_RPG7", CseClass::Temporary}, // engine :368
-	{"G_FAKE", CseClass::Temporary}, // engine :369
-	{"MP_PLBAG", CseClass::Item}, // engine :372
+	{"G_F1", CseClass::Grenade, GameClass::Grenade}, // engine :364
+	{"G_RGD5", CseClass::Grenade, GameClass::Grenade}, // engine :365
+	{"G_RPG7", CseClass::Temporary, GameClass::ExplosiveRocket}, // engine :368
+	{"G_FAKE", CseClass::Temporary, GameClass::ExplosiveRocket}, // engine :369
+	{"MP_PLBAG", CseClass::Item, GameClass::InventoryItem}, // engine :372
 	// engine: detectors, devices
-	{"D_SIMDET", CseClass::Detector}, // engine :397
-	{"D_ADVANC", CseClass::Detector}, // engine :398
-	{"D_ELITE", CseClass::Detector}, // engine :399
-	{"D_SCIENT", CseClass::Detector}, // engine :400
-	{"D_TORCH", CseClass::Torch}, // engine :403
-	{"D_PDA", CseClass::PDA}, // engine :404
-	{"D_FLARE", CseClass::Item}, // engine :405
-	{"D_FLALIT", CseClass::Item}, // engine :406
-	{"D_DSMETR", CseClass::Item}, // engine :407
-	{"D_CUSTOM", CseClass::Item}, // engine :408
+	{"D_SIMDET", CseClass::Detector, GameClass::CustomDetector}, // engine :397
+	{"D_ADVANC", CseClass::Detector, GameClass::CustomDetector}, // engine :398
+	{"D_ELITE", CseClass::Detector, GameClass::CustomDetector}, // engine :399
+	{"D_SCIENT", CseClass::Detector, GameClass::CustomDetector}, // engine :400
+	{"D_TORCH", CseClass::Torch, GameClass::Torch}, // engine :403
+	{"D_PDA", CseClass::PDA, GameClass::Pda}, // engine :404
+	{"D_FLARE", CseClass::Item, GameClass::Flare}, // engine :405
+	{"D_FLALIT", CseClass::Item, GameClass::CustomDevice}, // engine :406
+	{"D_DSMETR", CseClass::Item, GameClass::CustomDevice}, // engine :407
+	{"D_CUSTOM", CseClass::Item, GameClass::CustomDevice}, // engine :408
 	// script (class_registrator.script)
-	{"SCRPTART", CseClass::Artefact}, // class_registrator :36
-	{"TORCH_S", CseClass::Torch}, // class_registrator :59
-	{"DET_SCIE", CseClass::Detector}, // class_registrator :62
-	{"DET_ELIT", CseClass::Detector}, // class_registrator :63
-	{"DET_ADVA", CseClass::Detector}, // class_registrator :64
-	{"DET_SIMP", CseClass::Detector}, // class_registrator :65
-	{"S_PDA", CseClass::PDA}, // class_registrator :66
-	{"E_STLK", CseClass::CustomOutfit}, // class_registrator :72
-	{"E_HLMET", CseClass::Helmet}, // class_registrator :73
-	{"WP_BINOC", CseClass::WeaponMagazined}, // class_registrator :76
-	{"WP_KNIFE", CseClass::Weapon}, // class_registrator :77
-	{"WP_BM16", CseClass::WeaponShotGun}, // class_registrator :78
-	{"WP_GROZA", CseClass::WeaponMagazinedWGL}, // class_registrator :79
-	{"WP_SVD", CseClass::WeaponMagazined}, // class_registrator :80
-	{"WP_AK74", CseClass::WeaponMagazinedWGL}, // class_registrator :81
-	{"WP_LR300", CseClass::WeaponMagazined}, // class_registrator :82
-	{"WP_HPSA", CseClass::WeaponMagazined}, // class_registrator :83
-	{"WP_PM", CseClass::WeaponMagazined}, // class_registrator :84
-	{"WP_RG6", CseClass::WeaponShotGun}, // class_registrator :85
-	{"WP_RPG7", CseClass::WeaponMagazined}, // class_registrator :86
-	{"WP_SHOTG", CseClass::WeaponShotGun}, // class_registrator :87
-	{"WP_ASHTG", CseClass::WeaponAutoShotGun}, // class_registrator :88
-	{"WP_SVU", CseClass::WeaponMagazined}, // class_registrator :90
-	{"WP_USP45", CseClass::WeaponMagazined}, // class_registrator :91
-	{"WP_VAL", CseClass::WeaponMagazined}, // class_registrator :92
-	{"WP_VINT", CseClass::WeaponMagazined}, // class_registrator :93
-	{"WP_WALTH", CseClass::WeaponMagazined}, // class_registrator :94
-	{"AMMO_S", CseClass::Ammo}, // class_registrator :108
-	{"S_VOG25", CseClass::Ammo}, // class_registrator :109
-	{"S_OG7B", CseClass::Ammo}, // class_registrator :110
-	{"S_M209", CseClass::Ammo}, // class_registrator :111
-	{"G_F1_S", CseClass::Grenade}, // class_registrator :114
-	{"G_RGD5_S", CseClass::Grenade}, // class_registrator :115
-	{"S_FOOD", CseClass::Item}, // class_registrator :118
-	{"WP_SCOPE", CseClass::Item}, // class_registrator :121
-	{"WP_SILEN", CseClass::Item}, // class_registrator :122
-	{"WP_GLAUN", CseClass::Item}, // class_registrator :123
-	{"S_EXPLO", CseClass::Explosive}, // class_registrator :129
+	{"SCRPTART", CseClass::Artefact, GameClass::Artefact}, // class_registrator :36
+	{"TORCH_S", CseClass::Torch, GameClass::Torch}, // class_registrator :59
+	{"DET_SCIE", CseClass::Detector, GameClass::CustomDetector}, // class_registrator :62
+	{"DET_ELIT", CseClass::Detector, GameClass::CustomDetector}, // class_registrator :63
+	{"DET_ADVA", CseClass::Detector, GameClass::CustomDetector}, // class_registrator :64
+	{"DET_SIMP", CseClass::Detector, GameClass::CustomDetector}, // class_registrator :65
+	{"S_PDA", CseClass::PDA, GameClass::Pda}, // class_registrator :66
+	{"E_STLK", CseClass::CustomOutfit, GameClass::CustomOutfit}, // class_registrator :72
+	{"E_HLMET", CseClass::Helmet, GameClass::Helmet}, // class_registrator :73
+	{"WP_BINOC", CseClass::WeaponMagazined, GameClass::WeaponBinoculars}, // class_registrator :76
+	{"WP_KNIFE", CseClass::Weapon, GameClass::WeaponKnife}, // class_registrator :77
+	{"WP_BM16", CseClass::WeaponShotGun, GameClass::WeaponMagazined}, // class_registrator :78
+	{"WP_GROZA", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazinedWGrenade}, // class_registrator :79
+	{"WP_SVD", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :80
+	{"WP_AK74", CseClass::WeaponMagazinedWGL, GameClass::WeaponMagazinedWGrenade}, // class_registrator :81
+	{"WP_LR300", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :82
+	{"WP_HPSA", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :83
+	{"WP_PM", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :84
+	{"WP_RG6", CseClass::WeaponShotGun, GameClass::WeaponRocket}, // class_registrator :85
+	{"WP_RPG7", CseClass::WeaponMagazined, GameClass::WeaponRPG7}, // class_registrator :86
+	{"WP_SHOTG", CseClass::WeaponShotGun, GameClass::WeaponMagazined}, // class_registrator :87
+	{"WP_ASHTG", CseClass::WeaponAutoShotGun, GameClass::WeaponMagazined}, // class_registrator :88
+	{"WP_SVU", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :90
+	{"WP_USP45", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :91
+	{"WP_VAL", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :92
+	{"WP_VINT", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :93
+	{"WP_WALTH", CseClass::WeaponMagazined, GameClass::WeaponMagazined}, // class_registrator :94
+	{"AMMO_S", CseClass::Ammo, GameClass::Ammo}, // class_registrator :108
+	{"S_VOG25", CseClass::Ammo, GameClass::Ammo}, // class_registrator :109
+	{"S_OG7B", CseClass::Ammo, GameClass::Ammo}, // class_registrator :110
+	{"S_M209", CseClass::Ammo, GameClass::Ammo}, // class_registrator :111
+	{"G_F1_S", CseClass::Grenade, GameClass::Grenade}, // class_registrator :114
+	{"G_RGD5_S", CseClass::Grenade, GameClass::Grenade}, // class_registrator :115
+	{"S_FOOD", CseClass::Item, GameClass::InventoryItem}, // class_registrator :118
+	{"WP_SCOPE", CseClass::Item, GameClass::InventoryItem}, // class_registrator :121
+	{"WP_SILEN", CseClass::Item, GameClass::InventoryItem}, // class_registrator :122
+	{"WP_GLAUN", CseClass::Item, GameClass::GrenadeLauncher}, // class_registrator :123
+	{"S_EXPLO", CseClass::Explosive, GameClass::ExplosiveItem}, // class_registrator :129
 	// script (engine/gamedata/scripts/class_registrator_modded_exes.script, added by mod_script_dxml.ltx)
-	{"_WP_SSRS", CseClass::WeaponMagazined}, // class_registrator_modded_exes :17
+	{"_WP_SSRS", CseClass::WeaponMagazined, GameClass::WeaponRocket}, // class_registrator_modded_exes :17
 };
 
 // The rule of a section's `class` value (trailing blanks of an ini value ignored), nullptr for anything that is not
@@ -326,15 +361,511 @@ inline std::vector<const char*> required_lines(CseClass cse)
 	return lines;
 }
 
+// ---------------------------------------------------------------- the game object's lines (Ruling F2-17)
+// When a line of the game object's Load is read at all, decided by other lines of the same section. Ini (missing_line)
+// answers has(line), number(line) (atoi, as r_s32 / r_u32; 0 if missing) and flag(line) (r_bool; false if missing).
+enum class When : uint8_t
+{
+	Always,
+	InSlotOrBelt, // slot is not -1, or belt (inventory_item.cpp:120-121, :136)
+	ShotLight, // light_disabled is not true (ShootingObject.cpp:64-68, LoadLights :180)
+	// ShotLight, and a permanent or attachable silencer: InitAddons loads the "silencer_" lights
+	// (WeaponMagazined.cpp:1567), at Load for a permanent one, at net_Spawn for an attachable one the state attaches.
+	SilencerShotLight,
+	ShellParticles, // shell_particles exists (ShootingObject.cpp:289)
+	FirstBullet, // use_first_bullet (first_bullet_controller.cpp:16-17)
+	ScopeModular, // scope_status 2 (attachable) and modular_attachments (Weapon.cpp:766-770)
+	// scope_status 2, not modular, no scopes_sect: the weapon is its own scope (Weapon.cpp:790-792) and
+	// LoadScopeKoeffs (WeaponMagazined.cpp:1622) reads its scope_name (Weapon.h:333).
+	ScopeOwnName,
+	SilencerAttachable, // silencer_status 2 (Weapon.cpp:815)
+	LauncherAttachable, // grenade_launcher_status 2 (Weapon.cpp:822)
+	LauncherPermanent, // grenade_launcher_status 1 (WeaponMagazinedWGrenade.cpp:45)
+	ArtefactLights, // lights_enabled (Artefact.cpp:61)
+};
+
+struct GameLine
+{
+	const char* line;
+	When when;
+	const char* src; // the read, file:line in engine/src/xrGame (tools/check_spawn_classes.py checks each one)
+};
+
+// CInventoryItem::Load, every item.
+inline constexpr GameLine kInventoryItemLines[] = {
+	{"immunities_sect", When::Always, "inventory_item.cpp:96"},
+	{"inv_name", When::Always, "inventory_item.cpp:104"},
+	{"inv_name_short", When::Always, "inventory_item.cpp:105"},
+	{"inv_weight", When::Always, "inventory_item.cpp:116"},
+	{"cost", When::Always, "inventory_item.cpp:119"},
+	{"slot", When::Always, "inventory_item.cpp:120"},
+	{"description", When::Always, "inventory_item.cpp:123"},
+	{"default_to_ruck", When::InSlotOrBelt, "inventory_item.cpp:138"},
+	{"sprint_allowed", When::InSlotOrBelt, "inventory_item.cpp:139"},
+	{"control_inertion_factor", When::InSlotOrBelt, "inventory_item.cpp:140"},
+};
+// CHitImmunity::LoadImmunities of the section `immunities_sect` names: it must exist (R_ASSERT2, hit_immunity.cpp:23).
+inline constexpr GameLine kImmunityLines[] = {
+	{"burn_immunity", When::Always, "hit_immunity.cpp:25"},
+	{"strike_immunity", When::Always, "hit_immunity.cpp:26"},
+	{"shock_immunity", When::Always, "hit_immunity.cpp:27"},
+	{"wound_immunity", When::Always, "hit_immunity.cpp:28"},
+	{"radiation_immunity", When::Always, "hit_immunity.cpp:29"},
+	{"telepatic_immunity", When::Always, "hit_immunity.cpp:30"},
+	{"chemical_burn_immunity", When::Always, "hit_immunity.cpp:31"},
+	{"explosion_immunity", When::Always, "hit_immunity.cpp:32"},
+	{"fire_wound_immunity", When::Always, "hit_immunity.cpp:33"},
+};
+// CHudItem::Load: weapons, missiles, artefacts, devices, PDA, flare.
+inline constexpr GameLine kHudItemLines[] = {
+	{"hud", When::Always, "HudItem.cpp:79"},
+	{"animation_slot", When::Always, "HudItem.cpp:80"},
+};
+// CShootingObject::Load, LoadFireParams, LoadLights, LoadShellParticles (prefix "").
+inline constexpr GameLine kShootingLines[] = {
+	{"rpm", When::Always, "ShootingObject.cpp:71"},
+	{"fire_dispersion_base", When::Always, "ShootingObject.cpp:117"},
+	{"hit_power", When::Always, "ShootingObject.cpp:120"},
+	{"hit_power_critical", When::Always, "ShootingObject.cpp:121"},
+	{"hit_impulse", When::Always, "ShootingObject.cpp:163"},
+	{"fire_distance", When::Always, "ShootingObject.cpp:165"},
+	{"bullet_speed", When::Always, "ShootingObject.cpp:167"},
+	{"light_color", When::ShotLight, "ShootingObject.cpp:181"},
+	{"light_range", When::ShotLight, "ShootingObject.cpp:183"},
+	{"light_var_color", When::ShotLight, "ShootingObject.cpp:185"},
+	{"light_var_range", When::ShotLight, "ShootingObject.cpp:187"},
+	{"light_time", When::ShotLight, "ShootingObject.cpp:188"},
+	{"shell_point", When::ShellParticles, "ShootingObject.cpp:293"},
+};
+// CWeapon::Load and the first bullet controller it loads.
+inline constexpr GameLine kWeaponLines[] = {
+	{"ammo_class", When::Always, "Weapon.cpp:586"},
+	{"ammo_elapsed", When::Always, "Weapon.cpp:598"},
+	{"ammo_mag_size", When::Always, "Weapon.cpp:599"},
+	{"cam_relax_speed", When::Always, "Weapon.cpp:612"},
+	{"cam_max_angle", When::Always, "Weapon.cpp:633"},
+	{"cam_max_angle_horz", When::Always, "Weapon.cpp:641"},
+	{"cam_step_angle_horz", When::Always, "Weapon.cpp:649"},
+	{"PDM_disp_base", When::Always, "Weapon.cpp:711"},
+	{"PDM_disp_vel_factor", When::Always, "Weapon.cpp:712"},
+	{"PDM_disp_accel_factor", When::Always, "Weapon.cpp:713"},
+	{"PDM_disp_crouch", When::Always, "Weapon.cpp:714"},
+	{"PDM_disp_crouch_no_acc", When::Always, "Weapon.cpp:715"},
+	{"use_first_bullet", When::Always, "first_bullet_controller.cpp:16"},
+	{"first_bullet_dispertion", When::FirstBullet, "first_bullet_controller.cpp:19"},
+	{"first_bullet_timeout", When::FirstBullet, "first_bullet_controller.cpp:20"},
+	{"first_bullet_velocity_limit", When::FirstBullet, "first_bullet_controller.cpp:21"},
+	{"fire_dispersion_condition_factor", When::Always, "Weapon.cpp:719"},
+	{"misfire_start_condition", When::Always, "Weapon.cpp:724"},
+	{"misfire_end_prob", When::Always, "Weapon.cpp:727"},
+	{"condition_shot_dec", When::Always, "Weapon.cpp:728"},
+	{"fire_point", When::Always, "Weapon.cpp:732"},
+	{"hand_dependence", When::Always, "Weapon.cpp:745"},
+	{"min_radius", When::Always, "Weapon.cpp:750"},
+	{"max_radius", When::Always, "Weapon.cpp:751"},
+	{"scope_status", When::Always, "Weapon.cpp:754"},
+	{"silencer_status", When::Always, "Weapon.cpp:755"},
+	{"grenade_launcher_status", When::Always, "Weapon.cpp:756"},
+	{"zoom_enabled", When::Always, "Weapon.cpp:760"},
+	{"zoom_rotate_time", When::Always, "Weapon.cpp:761"},
+	{"modular_scope_group", When::ScopeModular, "Weapon.cpp:770"},
+	{"silencer_name", When::SilencerAttachable, "Weapon.cpp:817"},
+	{"silencer_x", When::SilencerAttachable, "Weapon.cpp:818"},
+	{"silencer_y", When::SilencerAttachable, "Weapon.cpp:819"},
+	{"grenade_launcher_name", When::LauncherAttachable, "Weapon.cpp:824"},
+	{"grenade_launcher_x", When::LauncherAttachable, "Weapon.cpp:825"},
+	{"grenade_launcher_y", When::LauncherAttachable, "Weapon.cpp:826"},
+};
+// CWeaponMagazined::Load (LoadScopeKoeffs) and InitAddons (the silencer's lights, LoadLights with prefix "silencer_").
+inline constexpr GameLine kWeaponMagazinedLines[] = {
+	{"scope_name", When::ScopeOwnName, "Weapon.h:333"},
+	{"silencer_light_color", When::SilencerShotLight, "ShootingObject.cpp:181"},
+	{"silencer_light_range", When::SilencerShotLight, "ShootingObject.cpp:183"},
+	{"silencer_light_var_color", When::SilencerShotLight, "ShootingObject.cpp:185"},
+	{"silencer_light_var_range", When::SilencerShotLight, "ShootingObject.cpp:187"},
+	{"silencer_light_time", When::SilencerShotLight, "ShootingObject.cpp:188"},
+};
+inline constexpr GameLine kRocketLauncherLines[] = {
+	{"launch_speed", When::Always, "RocketLauncher.cpp:25"},
+};
+inline constexpr GameLine kWeaponGrenadeLines[] = {
+	{"grenade_flame_particles", When::Always, "WeaponMagazinedWGrenade.cpp:43"},
+	{"grenade_vel", When::LauncherPermanent, "WeaponMagazinedWGrenade.cpp:47"},
+	{"grenade_class", When::Always, "WeaponMagazinedWGrenade.cpp:53"},
+};
+inline constexpr GameLine kRPG7Lines[] = {
+	{"max_zoom_factor", When::Always, "WeaponRPG7.cpp:23"},
+	{"rocket_class", When::Always, "WeaponRPG7.cpp:25"},
+};
+inline constexpr GameLine kBinocularsLines[] = {
+	{"vision_present", When::Always, "WeaponBinoculars.cpp:35"},
+};
+inline constexpr GameLine kKnifeLines[] = {
+	{"wm_size", When::Always, "WeaponKnife.cpp:53"},
+	{"splash1_direction", When::Always, "WeaponKnife.cpp:58"},
+	{"splash2_direction", When::Always, "WeaponKnife.cpp:59"},
+	{"spash1_dist", When::Always, "WeaponKnife.cpp:61"},
+	{"spash2_dist", When::Always, "WeaponKnife.cpp:62"},
+	{"spash1_radius", When::Always, "WeaponKnife.cpp:64"},
+	{"spash2_radius", When::Always, "WeaponKnife.cpp:65"},
+	{"splash1_hits_count", When::Always, "WeaponKnife.cpp:67"},
+	{"splash1_pervictim_hcount", When::Always, "WeaponKnife.cpp:68"},
+	{"splash2_hits_count", When::Always, "WeaponKnife.cpp:69"},
+	{"splash_hit_divide_factor", When::Always, "WeaponKnife.cpp:73"},
+};
+inline constexpr GameLine kAmmoLines[] = {
+	{"k_dist", When::Always, "WeaponAmmo.cpp:115"},
+	{"k_disp", When::Always, "WeaponAmmo.cpp:116"},
+	{"k_hit", When::Always, "WeaponAmmo.cpp:117"},
+	{"k_impulse", When::Always, "WeaponAmmo.cpp:119"},
+	{"k_ap", When::Always, "WeaponAmmo.cpp:121"},
+	{"tracer", When::Always, "WeaponAmmo.cpp:128"},
+	{"buck_shot", When::Always, "WeaponAmmo.cpp:134"},
+	{"impair", When::Always, "WeaponAmmo.cpp:135"},
+	{"wm_size", When::Always, "WeaponAmmo.cpp:136"},
+	{"box_size", When::Always, "WeaponAmmo.cpp:139"},
+};
+inline constexpr GameLine kGrenadeLauncherLines[] = {
+	{"grenade_vel", When::Always, "GrenadeLauncher.cpp:27"},
+};
+// CExplosive::Load(ini, section): grenades, explosive items, rockets.
+inline constexpr GameLine kExplosiveLines[] = {
+	{"blast", When::Always, "Explosive.cpp:105"},
+	{"blast_r", When::Always, "Explosive.cpp:106"},
+	{"blast_impulse", When::Always, "Explosive.cpp:107"},
+	{"frags", When::Always, "Explosive.cpp:109"},
+	{"frags_r", When::Always, "Explosive.cpp:110"},
+	{"frag_hit", When::Always, "Explosive.cpp:111"},
+	{"frag_hit_impulse", When::Always, "Explosive.cpp:112"},
+	{"hit_type_blast", When::Always, "Explosive.cpp:114"},
+	{"hit_type_frag", When::Always, "Explosive.cpp:115"},
+	{"up_throw_factor", When::Always, "Explosive.cpp:117"},
+	{"wm_size", When::Always, "Explosive.cpp:128"},
+	{"explode_particles", When::Always, "Explosive.cpp:131"},
+	{"light_color", When::Always, "Explosive.cpp:133"},
+	{"light_range", When::Always, "Explosive.cpp:134"},
+	{"light_time", When::Always, "Explosive.cpp:135"},
+	{"fragment_speed", When::Always, "Explosive.cpp:138"},
+	{"explode_duration", When::Always, "Explosive.cpp:142"},
+};
+inline constexpr GameLine kExplosiveItemLines[] = {
+	{"time_to_explode", When::Always, "ExplosiveItem.cpp:31"},
+	{"condition_to_explode", When::Always, "ExplosiveItem.cpp:32"},
+};
+inline constexpr GameLine kMissileLines[] = {
+	{"force_min", When::Always, "Missile.cpp:84"},
+	{"force_const", When::Always, "Missile.cpp:85"},
+	{"force_max", When::Always, "Missile.cpp:86"},
+	{"force_grow_speed", When::Always, "Missile.cpp:87"},
+	{"destroy_time", When::Always, "Missile.cpp:89"},
+	{"throw_point", When::Always, "Missile.cpp:91"},
+	{"throw_dir", When::Always, "Missile.cpp:92"},
+};
+inline constexpr GameLine kOutfitLines[] = {
+	{"burn_protection", When::Always, "CustomOutfit.cpp:74"},
+	{"strike_protection", When::Always, "CustomOutfit.cpp:75"},
+	{"shock_protection", When::Always, "CustomOutfit.cpp:76"},
+	{"wound_protection", When::Always, "CustomOutfit.cpp:77"},
+	{"radiation_protection", When::Always, "CustomOutfit.cpp:78"},
+	{"telepatic_protection", When::Always, "CustomOutfit.cpp:79"},
+	{"chemical_burn_protection", When::Always, "CustomOutfit.cpp:80"},
+	{"explosion_protection", When::Always, "CustomOutfit.cpp:81"},
+	{"hit_fraction_actor", When::Always, "CustomOutfit.cpp:86"},
+	{"ef_equipment_type", When::Always, "CustomOutfit.cpp:100"},
+	{"additional_inventory_weight", When::Always, "CustomOutfit.cpp:104"},
+	{"additional_inventory_weight2", When::Always, "CustomOutfit.cpp:105"},
+	{"full_icon_name", When::Always, "CustomOutfit.cpp:114"},
+};
+inline constexpr GameLine kHelmetLines[] = {
+	{"burn_protection", When::Always, "ActorHelmet.cpp:34"},
+	{"strike_protection", When::Always, "ActorHelmet.cpp:35"},
+	{"shock_protection", When::Always, "ActorHelmet.cpp:36"},
+	{"wound_protection", When::Always, "ActorHelmet.cpp:37"},
+	{"radiation_protection", When::Always, "ActorHelmet.cpp:38"},
+	{"telepatic_protection", When::Always, "ActorHelmet.cpp:39"},
+	{"chemical_burn_protection", When::Always, "ActorHelmet.cpp:40"},
+	{"explosion_protection", When::Always, "ActorHelmet.cpp:41"},
+	{"hit_fraction_actor", When::Always, "ActorHelmet.cpp:46"},
+};
+inline constexpr GameLine kBackpackLines[] = {
+	{"additional_inventory_weight", When::Always, "ActorBackpack.cpp:19"},
+	{"additional_inventory_weight2", When::Always, "ActorBackpack.cpp:20"},
+};
+inline constexpr GameLine kTorchLines[] = {
+	{"light_trace_bone", When::Always, "Torch.cpp:107"},
+};
+// CArtefact::Load, and net_Spawn (can_be_controlled).
+inline constexpr GameLine kArtefactLines[] = {
+	{"lights_enabled", When::Always, "Artefact.cpp:60"},
+	{"trail_light_color", When::ArtefactLights, "Artefact.cpp:63"},
+	{"trail_light_range", When::ArtefactLights, "Artefact.cpp:65"},
+	{"health_restore_speed", When::Always, "Artefact.cpp:69"},
+	{"radiation_restore_speed", When::Always, "Artefact.cpp:70"},
+	{"satiety_restore_speed", When::Always, "Artefact.cpp:71"},
+	{"power_restore_speed", When::Always, "Artefact.cpp:72"},
+	{"bleeding_restore_speed", When::Always, "Artefact.cpp:73"},
+	{"hit_absorbation_sect", When::Always, "Artefact.cpp:75"},
+	{"af_rank", When::Always, "Artefact.cpp:80"},
+	{"additional_inventory_weight", When::Always, "Artefact.cpp:81"},
+	{"can_be_controlled", When::Always, "Artefact.cpp:86"},
+};
+inline constexpr GameLine kBastArtefactLines[] = {
+	{"impulse_threshold", When::Always, "BastArtifact.cpp:108"},
+	{"radius", When::Always, "BastArtifact.cpp:109"},
+	{"strike_impulse", When::Always, "BastArtifact.cpp:110"},
+	{"energy_max", When::Always, "BastArtifact.cpp:112"},
+	{"energy_decrease_speed", When::Always, "BastArtifact.cpp:113"},
+	{"particle", When::Always, "BastArtifact.cpp:115"},
+};
+inline constexpr GameLine kBlackGraviArtefactLines[] = {
+	{"impulse_threshold", When::Always, "BlackGraviArtifact.cpp:37"},
+	{"radius", When::Always, "BlackGraviArtifact.cpp:38"},
+	{"strike_impulse", When::Always, "BlackGraviArtifact.cpp:39"},
+	{"particle", When::Always, "BlackGraviArtifact.cpp:40"},
+};
+inline constexpr GameLine kMercuryBallLines[] = {
+	{"time_to_update", When::Always, "MercuryBall.cpp:29"},
+	{"impulse_min", When::Always, "MercuryBall.cpp:30"},
+	{"impulse_max", When::Always, "MercuryBall.cpp:31"},
+};
+inline constexpr GameLine kPdaLines[] = {
+	{"radius", When::Always, "PDA.cpp:64"},
+};
+inline constexpr GameLine kFlareLines[] = {
+	{"work_time_sec", When::Always, "flare.cpp:9"},
+};
+inline constexpr GameLine kCustomDeviceLines[] = {
+	{"hud", When::Always, "CustomDevice.cpp:319"},
+};
+inline constexpr GameLine kCustomDetectorLines[] = {
+	{"af_radius", When::Always, "CustomDetector.cpp:39"},
+	{"af_vis_radius", When::Always, "CustomDetector.cpp:40"},
+};
+
+struct LineBlock
+{
+	const GameLine* lines = nullptr;
+	size_t count = 0;
+};
+template <size_t N>
+constexpr LineBlock block(const GameLine (&lines)[N])
+{
+	return {lines, N};
+}
+
+// The blocks of each group, in Load order. `loads`: every class with its own Load(LPCSTR) above the group's client
+// classes (up to CGameObject), so the blocks cover all of them; tools/check_spawn_classes.py walks each client class's
+// bases in xrGame and fails on a Load that is not listed. A listed Load with no block reads nothing unchecked.
+struct GameGroup
+{
+	GameClass game;
+	const char* loads;
+	LineBlock blocks[7];
+};
+inline constexpr GameGroup kGameGroups[] = {
+	{GameClass::InventoryItem,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CSilencer CInfoDocument"
+	    " CEatableItemObject CEatableItem CBottleItem",
+	    {block(kInventoryItemLines)}},
+	{GameClass::GrenadeLauncher,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CGrenadeLauncher",
+	    {block(kInventoryItemLines), block(kGrenadeLauncherLines)}},
+	{GameClass::Ammo,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CWeaponAmmo",
+	    {block(kInventoryItemLines), block(kAmmoLines)}},
+	{GameClass::CustomOutfit,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CCustomOutfit",
+	    {block(kInventoryItemLines), block(kOutfitLines)}},
+	{GameClass::Helmet,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHelmet",
+	    {block(kInventoryItemLines), block(kHelmetLines)}},
+	{GameClass::Backpack,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CBackpack",
+	    {block(kInventoryItemLines), block(kBackpackLines)}},
+	{GameClass::Torch,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CTorch",
+	    {block(kInventoryItemLines), block(kTorchLines)}},
+	{GameClass::ExplosiveItem,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CExplosiveItem CExplosive",
+	    {block(kInventoryItemLines), block(kExplosiveLines), block(kExplosiveItemLines)}},
+	{GameClass::Missile,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CMissile",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kMissileLines)}},
+	{GameClass::Grenade,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CMissile"
+	    " CGrenade CExplosive",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kMissileLines), block(kExplosiveLines)}},
+	{GameClass::ExplosiveRocket,
+	    "CExplosiveRocket CCustomRocket CPhysicItem CGameObject CScriptBinder CInventoryItem CExplosive",
+	    {block(kInventoryItemLines), block(kExplosiveLines)}},
+	{GameClass::Artefact,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CArtefact"
+	    " CBlackDrops CDummyArtefact CElectricBall CFadedBall CGalantineArtefact CRustyHairArtefact CThornArtefact"
+	    " CZudaArtefact CGraviArtefact",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kArtefactLines)}},
+	{GameClass::BastArtefact,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CArtefact"
+	    " CBastArtefact",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kArtefactLines), block(kBastArtefactLines)}},
+	{GameClass::BlackGraviArtefact,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CArtefact"
+	    " CGraviArtefact CBlackGraviArtefact",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kArtefactLines), block(kBlackGraviArtefactLines)}},
+	{GameClass::MercuryBall,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CArtefact"
+	    " CMercuryBall",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kArtefactLines), block(kMercuryBallLines)}},
+	{GameClass::Pda,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CPda",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kPdaLines)}},
+	{GameClass::Flare,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CFlare",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kFlareLines)}},
+	{GameClass::CustomDevice,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem"
+	    " CCustomDevice CFlashlight",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kCustomDeviceLines)}},
+	{GameClass::CustomDetector,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem"
+	    " CCustomDevice CCustomDetector CScientificDetector",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kCustomDeviceLines), block(kCustomDetectorLines)}},
+	{GameClass::WeaponKnife,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponKnife",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kKnifeLines)}},
+	{GameClass::WeaponMagazined,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponMagazined CWeaponPistol CWeaponShotgun CWeaponBM16 CWeaponAutomaticShotgun",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kWeaponMagazinedLines)}},
+	{GameClass::WeaponBinoculars,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponMagazined CWeaponPistol CWeaponShotgun CWeaponBM16 CWeaponAutomaticShotgun"
+	    " CWeaponBinoculars",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kWeaponMagazinedLines), block(kBinocularsLines)}},
+	{GameClass::WeaponMagazinedWGrenade,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponMagazined CWeaponPistol CWeaponShotgun CWeaponBM16 CWeaponAutomaticShotgun"
+	    " CWeaponMagazinedWGrenade CRocketLauncher",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kWeaponMagazinedLines), block(kRocketLauncherLines), block(kWeaponGrenadeLines)}},
+	{GameClass::WeaponRocket,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponMagazined CWeaponPistol CWeaponShotgun CWeaponBM16 CWeaponAutomaticShotgun"
+	    " CRocketLauncher CWeaponRG6 CWeaponSSRS",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kWeaponMagazinedLines), block(kRocketLauncherLines)}},
+	{GameClass::WeaponRPG7,
+	    "CInventoryItemObject CInventoryItem CPhysicItem CGameObject CScriptBinder CHudItemObject CHudItem CWeapon"
+	    " CShootingObject CWeaponMagazined CWeaponPistol CWeaponShotgun CWeaponBM16 CWeaponAutomaticShotgun"
+	    " CRocketLauncher CWeaponRPG7",
+	    {block(kInventoryItemLines), block(kHudItemLines), block(kShootingLines), block(kWeaponLines),
+	        block(kWeaponMagazinedLines), block(kRocketLauncherLines), block(kRPG7Lines)}},
+};
+
+// The lines of a group's game object, in Load order.
+inline std::vector<GameLine> game_lines(GameClass game)
+{
+	std::vector<GameLine> out;
+	for (const GameGroup& group : kGameGroups)
+		if (group.game == game)
+			for (const LineBlock& b : group.blocks)
+				out.insert(out.end(), b.lines, b.lines + b.count);
+	return out;
+}
+
+template <class Ini>
+bool holds(When when, const Ini& ini)
+{
+	switch (when)
+	{
+	case When::Always: return true;
+	case When::InSlotOrBelt: return ini.number("slot") != -1 || ini.flag("belt");
+	case When::ShotLight: return !ini.flag("light_disabled");
+	case When::SilencerShotLight:
+	{
+		const long long silencer = ini.number("silencer_status");
+		return !ini.flag("light_disabled") && (silencer == 1 || silencer == 2);
+	}
+	case When::ShellParticles: return ini.has("shell_particles");
+	case When::FirstBullet: return ini.flag("use_first_bullet");
+	case When::ScopeModular: return ini.number("scope_status") == 2 && ini.flag("modular_attachments");
+	case When::ScopeOwnName:
+		return ini.number("scope_status") == 2 && !ini.flag("modular_attachments") && !ini.has("scopes_sect");
+	case When::SilencerAttachable: return ini.number("silencer_status") == 2;
+	case When::LauncherAttachable: return ini.number("grenade_launcher_status") == 2;
+	case When::LauncherPermanent: return ini.number("grenade_launcher_status") == 1;
+	case When::ArtefactLights: return ini.flag("lights_enabled");
+	}
+	return true;
+}
+
+// The first line a section lacks for a client-asked entity of `rule`'s class.
+struct Missing
+{
+	const char* line = nullptr; // nullptr: nothing is missing
+	const char* in = nullptr; // `line` is missing in the section this line of the item names (immunities_sect)
+	bool no_section = false; // `line` names a section that does not exist
+};
+
+// Ini: has(line), number(line), flag(line) of the item's section (see When), ref_exists(line) (the line names an
+// existing section) and ref_has(line, other) (that section has `other`). The server entity's lines first, then the
+// game object's unconditional ones (the conditions read some of them), its conditional ones, its immunities section.
+template <class Ini>
+Missing missing_line(const ClassRule& rule, const Ini& ini)
+{
+	Missing m;
+	for (const char* line : required_lines(rule.cse))
+		if (!ini.has(line))
+		{
+			m.line = line;
+			return m;
+		}
+	const std::vector<GameLine> lines = game_lines(rule.game);
+	for (const bool always : {true, false})
+		for (const GameLine& g : lines)
+			if ((g.when == When::Always) == always && !ini.has(g.line) && holds(g.when, ini))
+			{
+				m.line = g.line;
+				return m;
+			}
+	if (!ini.ref_exists("immunities_sect"))
+	{
+		m.line = "immunities_sect";
+		m.no_section = true;
+		return m;
+	}
+	for (const GameLine& g : kImmunityLines)
+		if (!ini.ref_has("immunities_sect", g.line))
+		{
+			m.line = g.line;
+			m.in = "immunities_sect";
+			return m;
+		}
+	return m;
+}
+
 // What the host knows of the asked section: `quest_item` (as CInventoryItem::Load reads it), `cost`, and whether the
-// host's configs\coop_spawn.ltx lists it in [allow_sections] / [deny_sections].
+// host's configs\coop_spawn.ltx lists it in [allow_sections] / [deny_sections]; and of the request: a quest gift
+// (quest_gift) lets a quest item through.
 struct SectionFacts
 {
 	bool quest_item = false;
 	uint32_t cost = 0;
 	bool allow_listed = false;
 	bool deny_listed = false;
+	bool in_dialog_to_own_actor = false; // Ruling F2-16
 };
+
+// Ruling F2-16: the stock dialogs create a quest reward on the client (alife_create_item(section, db.actor), the talk
+// runs there). A quest item is a gift only into the asking player's own character (`parent` is his proxy on the host)
+// while he holds a talk lock with an NPC (coop_dialog host_lock_of).
+inline bool quest_gift(bool holds_talk_lock, uint16_t parent, uint16_t own_character)
+{
+	return holds_talk_lock && own_character != 0xffff && parent == own_character;
+}
 
 // Cost budget (host settings, configs\coop_spawn.ltx [coop_spawn]): the sum of `cost` a character may have created
 // in a row, and how much comes back per second.
@@ -367,9 +898,9 @@ enum class SpawnVerdict : uint8_t
 //   2. a required line is missing (`missing`) -> MissingLine
 //   3. deny-listed                            -> Denied
 //   4. allow-listed                           -> Allow, the budget untouched
-//   5. a quest item                           -> QuestItem
+//   5. a quest item, unless a quest gift      -> QuestItem
 //   6. `cost` over what the budget holds      -> OverBudget (nothing taken); else Allow and the cost is taken.
-// Only step 6 reads or changes `budget`.
+// Only step 6 reads or changes `budget`; a quest gift goes on to it like any item.
 inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const SectionFacts& facts,
     CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms)
 {
@@ -381,7 +912,7 @@ inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const
 		return SpawnVerdict::Denied;
 	if (facts.allow_listed)
 		return SpawnVerdict::Allow;
-	if (facts.quest_item)
+	if (facts.quest_item && !facts.in_dialog_to_own_actor)
 		return SpawnVerdict::QuestItem;
 	const double burst = double(policy.cost_burst);
 	if (!budget.started)
@@ -403,19 +934,20 @@ inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const
 	return SpawnVerdict::Allow;
 }
 
-// Cost budgets per character (the player's proxy id in the host world) for the whole session (Ruling F2-11): a
-// player who leaves and joins again finds his budget as he left it, whatever his new connection is; only a session
-// start or end clears the book. A character the book has not seen yet starts with the full burst (the number of new
-// characters per session is a host setting of its own).
+// Cost budgets per character for the whole session (Ruling F2-11): a player who leaves and joins again finds his
+// budget as he left it, whatever his new connection is; only a session start or end clears the book. The key is the
+// character's player key, as the money book's (ledger::character_key, Ruling F2-18): loading an older save gives the
+// same player's character another proxy id. A key the book has not seen yet starts with the full burst (the number of
+// new characters per session is a host setting of its own).
 class BudgetBook
 {
 public:
-	CostBudget& of(uint16_t character) { return m_budgets[character]; }
+	CostBudget& of(const std::string& character_key) { return m_budgets[character_key]; }
 	void clear() { m_budgets.clear(); }
 	size_t size() const { return m_budgets.size(); }
 
 private:
-	std::map<uint16_t, CostBudget> m_budgets;
+	std::map<std::string, CostBudget> m_budgets;
 };
 } // namespace spawn
 } // namespace coop
