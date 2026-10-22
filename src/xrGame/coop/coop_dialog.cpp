@@ -28,6 +28,10 @@ constexpr u64 kLockTimeoutMs = 120000; // host: client lock without keep-alive
 constexpr u64 kKeepAliveMs = 30000; // client: refresh period while talking
 constexpr u64 kPendingTimeoutMs = 10000; // client: a request without answer may be repeated after this
 constexpr u64 kStartWaitMs = 3000; // client: granted talk waits this long for the refused window to hide
+// F2 T1 fix round 1 (Ruling F2-1): a client's character <-> the NPC on the host when it asks for the lock. The stock
+// window of an NPC closes beyond 3 m (CUIActorMenu::CheckDistance); twice that for the lag of the character on the host,
+// as kTradeReach in coop_trade. A lock is the condition for dialog money (coop_money).
+constexpr float kTalkReach = 6.f;
 
 enum LockResult : u8
 {
@@ -35,6 +39,7 @@ enum LockResult : u8
 	Busy = 1, // another player talks to this NPC
 	Gone = 2, // no such NPC on the host or it is dead
 	Refused = 3, // not a talk partner (player avatar)
+	TooFar = 4, // F2 T1 fix round 1: the player's character is not by the NPC on the host
 };
 
 const char* result_name(u8 r)
@@ -45,6 +50,7 @@ const char* result_name(u8 r)
 	case Busy: return "busy";
 	case Gone: return "gone";
 	case Refused: return "refused";
+	case TooFar: return "too far";
 	default: return "?";
 	}
 }
@@ -159,6 +165,15 @@ u8 host_try_lock(u16 npc, PeerId who)
 	CInventoryOwner* io = find_owner(npc);
 	if (!io || !alive(io))
 		return Gone;
+	// F2 T1 fix round 1 (Ruling F2-1): a client talks only to an NPC his character stands by on the host (the stock
+	// distance exception for NeedOsoznanieMode as in CUIActorMenu::CheckDistance). The host's own talk is local.
+	if (who != kHostPeer && !io->NeedOsoznanieMode())
+	{
+		CObject* me = g_pGameLevel ? Level().Objects.net_Find(join::proxy_of_peer(who)) : nullptr;
+		CObject* them = smart_cast<CGameObject*>(io);
+		if (!me || !them || me->Position().distance_to(them->Position()) > kTalkReach)
+			return TooFar;
+	}
 	auto it = g_locks.find(npc);
 	if (it != g_locks.end() && it->second.holder != who)
 		return Busy;

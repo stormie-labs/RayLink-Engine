@@ -1,15 +1,18 @@
-// Anomaly Coop — player money on the host (F2 T1, review R4 7).
+// Anomaly Coop — player money on the host (F2 T1, review R4 7; fix round 1: Ruling F2-1).
 //
 // The host owns every player's balance: the money of his character on the host (the proxy's m_dwMoney, kept in the
 // host save). A client never sends an amount, only a change with a cause (Msg::ReqMoney = MoneyReq); the host checks
 // it and answers every change with the balance it holds and the change it got to (Msg::MoneyBalance =
 // MoneyBalanceMsg). Rules (apply_client_delta):
 //   - a spend is accepted while the balance covers it;
-//   - money gained in a dialog while the player holds the NPC's talk lock: up to Policy::dialog_gain_cap per lock;
-//   - any other gain (a mod's give_money, a service, the rest of a dialog payout) comes out of the player's allowance,
-//     a bucket of money: Policy::script_gain_burst in a row, refilled with script_gain_per_min per minute;
+//   - money a client gains by itself comes out of allowances, buckets of money kept per character for the whole
+//     session (HostBook): a dialog payout while the player talks to an NPC (holds its talk lock) from the dialog
+//     bucket (Policy::dialog_gain_cap in a row, dialog_gain_per_min per minute), anything else and the rest of a
+//     payout from the script bucket (script_gain_burst in a row, script_gain_per_min per minute). Changing the NPC
+//     or leaving the session refills nothing;
 //   - no balance goes above Policy::max_money;
-//   - a transfer to another player is a spend for the giver; the caller credits the receiver.
+//   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer);
+//   - a change of zero is malformed: a client never sends one.
 // Trades, transfers and host grants change the balance on the host itself (coop_money host_adjust). The client shows
 // the host's balance plus its own changes the host has not answered yet (client_view).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
@@ -17,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 #include "coop_wire.h"
@@ -33,16 +37,19 @@ enum class Cause : uint8_t
 };
 constexpr uint8_t kCauseCount = 3;
 
-// Host settings (configs\coop_money.ltx [coop_money], console coop_money_*; Ruling 21).
+// Host settings (configs\coop_money.ltx [coop_money], console coop_money_*; Ruling 21, Ruling F2-1).
 struct Policy
 {
 	uint32_t script_gain_burst = 50000; // money a client may gain without the host in a row
 	uint32_t script_gain_per_min = 10000; // and then per minute
-	uint32_t dialog_gain_cap = 100000; // gained in dialogs per talk lock
+	uint32_t dialog_gain_cap = 100000; // dialogs may pay this much in a row (one big quest reward)
+	// and then this much per minute: several ordinary rewards (1 000 - 15 000 RU) a minute, a farm of talk locks
+	// gains no more than 1.2 M RU an hour on top of the cap
+	uint32_t dialog_gain_per_min = 20000;
 	uint32_t max_money = 100000000; // no balance goes above this
 };
 
-// The allowance of one player: a bucket of money, full at the first gain, refilled per minute up to the burst.
+// An allowance: a bucket of money, full at its first use, refilled per minute up to its size.
 struct Allowance
 {
 	double tokens = 0;
@@ -54,40 +61,45 @@ enum class Verdict : uint8_t
 {
 	Applied,
 	Insufficient, // a spend above the balance
-	NoAllowance, // a gain above what the allowance (and the dialog cap) holds now
-	OverMax, // the balance would go above max_money
-	Malformed, // unknown cause, a transfer that gives nothing
+	NoAllowance, // a gain above what the allowances hold now
+	OverMax, // the balance (the giver's or a transfer's receiver's) would go above max_money
+	Malformed, // unknown cause, a change of zero, a transfer that gives nothing or to nobody
 };
 
-// Refills `a` up to `now_ms` (the first call fills it). A clock that goes back refills nothing.
-inline void refill(Allowance& a, const Policy& p, uint64_t now_ms)
+// Refills `a` (size `burst`, `per_min` a minute) up to `now_ms`; the first call fills it. A clock that goes back
+// refills nothing.
+inline void refill(Allowance& a, uint32_t burst, uint32_t per_min, uint64_t now_ms)
 {
 	if (!a.started)
 	{
 		a.started = true;
-		a.tokens = double(p.script_gain_burst);
+		a.tokens = double(burst);
 		a.at = now_ms;
 		return;
 	}
 	if (now_ms <= a.at)
 		return;
-	const double gained = double(now_ms - a.at) * double(p.script_gain_per_min) / 60000.0;
-	a.tokens = std::min(double(p.script_gain_burst), a.tokens + gained);
+	const double gained = double(now_ms - a.at) * double(per_min) / 60000.0;
+	a.tokens = std::min(double(burst), a.tokens + gained);
 	a.at = now_ms;
 }
 
+// The refill is fractional: whole RU must not miss by a rounding error.
+constexpr double kSlack = 1e-6;
+
 // Applies one change a client asked for to its balance on the host. Everything or nothing: a refused change leaves
-// `balance`, `dialog_gained` and the allowance's tokens as they were. `dialog_lock`: the player holds an NPC's talk
-// lock now; `dialog_gained`: what dialogs paid him under that lock (the caller zeroes it when the lock changes).
-inline Verdict apply_client_delta(uint32_t& balance, int64_t delta, Cause cause, bool dialog_lock,
-    uint32_t& dialog_gained, Allowance& script, const Policy& p, uint64_t now_ms)
+// `balance` and the tokens of both allowances as they were. `dialog_lock`: the player talks to an NPC now (holds its
+// talk lock); only then does a Dialog gain draw on `dialog` first. `from_dialog` (optional): the part of an applied
+// gain the dialog allowance paid.
+inline Verdict apply_client_delta(uint32_t& balance, int64_t delta, Cause cause, bool dialog_lock, Allowance& dialog,
+    Allowance& script, const Policy& p, uint64_t now_ms, uint32_t* from_dialog_out = nullptr)
 {
-	if (uint8_t(cause) >= kCauseCount)
+	if (from_dialog_out)
+		*from_dialog_out = 0;
+	if (uint8_t(cause) >= kCauseCount || delta == 0)
 		return Verdict::Malformed;
-	if (cause == Cause::Transfer && delta >= 0)
+	if (cause == Cause::Transfer && delta > 0)
 		return Verdict::Malformed; // the giver's side of a transfer is a spend
-	if (delta == 0)
-		return Verdict::Applied;
 	if (delta < 0)
 	{
 		const uint64_t spend = uint64_t(-(delta + 1)) + 1u; // no overflow at INT64_MIN
@@ -100,19 +112,53 @@ inline Verdict apply_client_delta(uint32_t& balance, int64_t delta, Cause cause,
 	if (uint64_t(balance) + gain > uint64_t(p.max_money))
 		return Verdict::OverMax;
 	uint64_t from_dialog = 0;
-	if (cause == Cause::Dialog && dialog_lock && dialog_gained < p.dialog_gain_cap)
-		from_dialog = std::min<uint64_t>(gain, uint64_t(p.dialog_gain_cap - dialog_gained));
+	if (cause == Cause::Dialog && dialog_lock)
+	{
+		refill(dialog, p.dialog_gain_cap, p.dialog_gain_per_min, now_ms);
+		from_dialog = std::min<uint64_t>(gain, uint64_t(std::max(0.0, dialog.tokens + kSlack)));
+	}
 	const uint64_t from_script = gain - from_dialog;
 	if (from_script)
 	{
-		refill(script, p, now_ms);
-		constexpr double kSlack = 1e-6; // the refill is fractional: whole RU must not miss by a rounding error
+		refill(script, p.script_gain_burst, p.script_gain_per_min, now_ms);
 		if (double(from_script) > script.tokens + kSlack)
 			return Verdict::NoAllowance;
 		script.tokens = std::max(0.0, script.tokens - double(from_script));
 	}
-	dialog_gained += uint32_t(from_dialog);
+	if (from_dialog)
+		dialog.tokens = std::max(0.0, dialog.tokens - double(from_dialog));
 	balance = uint32_t(uint64_t(balance) + gain);
+	if (from_dialog_out)
+		*from_dialog_out = uint32_t(from_dialog);
+	return Verdict::Applied;
+}
+
+// The receiver of a transfer as the host sees it.
+struct Receiver
+{
+	uint32_t peer = 0xFFFFFFFFu;
+	bool present = false; // a player of the session (joined, or the host) who has a character
+	uint32_t balance = 0;
+};
+
+// The giver's side of a transfer of -delta from player `from` (balance `balance`) to `to`. Applied: `balance` is the
+// giver's new balance and `credit` what the receiver gets; else both stay. Malformed: no receiver (nobody, himself) or
+// nothing given.
+inline Verdict check_transfer(uint32_t from, const Receiver& to, int64_t delta, uint32_t& balance, uint32_t& credit,
+    const Policy& p)
+{
+	credit = 0;
+	if (!to.present || to.peer == from)
+		return Verdict::Malformed;
+	if (delta >= 0)
+		return Verdict::Malformed;
+	const uint64_t give = uint64_t(-(delta + 1)) + 1u;
+	if (give > balance)
+		return Verdict::Insufficient;
+	if (uint64_t(to.balance) + give > uint64_t(p.max_money))
+		return Verdict::OverMax;
+	balance = uint32_t(balance - give);
+	credit = uint32_t(give);
 	return Verdict::Applied;
 }
 
@@ -202,5 +248,89 @@ inline bool read(Reader& r, MoneyBalanceMsg& m)
 	m.acked_seq = r.u32();
 	return r.ok();
 }
+// ---------------------------------------------------------------- host book
+
+// The allowances of one character (its id in the host world). Kept for the whole session: a player who leaves and
+// joins again (a new connection, maybe a new peer id) finds them as he left them.
+struct CharacterAllowances
+{
+	Allowance script;
+	Allowance dialog;
+};
+
+// What the host does with one ReqMoney.
+struct Decision
+{
+	Verdict verdict = Verdict::Malformed;
+	bool stale = false; // not newer than the newest answered change of this connection: nothing done
+	uint32_t balance = 0; // the sender's balance after it (to write, and to answer with)
+	uint32_t credit = 0; // a transfer applied: what the receiver gets
+	uint32_t acked = 0; // MoneyBalance::acked_seq of the answer
+	uint32_t gain_script = 0, gain_dialog = 0; // an applied gain, by the allowance that paid it
+};
+
+// The host's state of the players' money changes: per connection (peer id) the newest answered change, per character
+// the allowances. A request is answered whatever the verdict (MoneyBalance{balance, acked}).
+class HostBook
+{
+public:
+	// ReqMoney `q` of connection `peer` whose character is `character` and has `balance`. `dialog_lock`: he holds an
+	// NPC's talk lock now; `to`: the receiver of a transfer (looked up from q.ref; ignored for other causes).
+	Decision on_request(uint32_t peer, uint32_t character, const MoneyReq& q, uint32_t balance, bool dialog_lock,
+	    const Receiver& to, const Policy& p, uint64_t now_ms)
+	{
+		Decision d;
+		d.balance = balance;
+		uint32_t& acked = m_acked[peer];
+		if (!seq_newer(q.seq, acked))
+		{
+			d.stale = true; // a repeat or an old change: the answer only says where we are
+			d.acked = acked;
+			return d;
+		}
+		acked = q.seq;
+		d.acked = q.seq;
+		if (q.cause == Cause::Transfer)
+		{
+			d.verdict = check_transfer(peer, to, q.delta, d.balance, d.credit, p);
+			return d;
+		}
+		CharacterAllowances& a = m_characters[character];
+		uint32_t from_dialog = 0;
+		d.verdict = apply_client_delta(d.balance, q.delta, q.cause, dialog_lock, a.dialog, a.script, p, now_ms,
+		    &from_dialog);
+		if (d.verdict == Verdict::Applied && q.delta > 0)
+		{
+			d.gain_dialog = from_dialog;
+			d.gain_script = uint32_t(q.delta) - from_dialog;
+		}
+		return d;
+	}
+
+	// MoneyBalance::acked_seq for connection `peer` (0: nothing answered yet).
+	uint32_t acked(uint32_t peer) const
+	{
+		const auto it = m_acked.find(peer);
+		return it == m_acked.end() ? 0u : it->second;
+	}
+	// A connection ended: its numbering goes (a new one starts at 1), the character's allowances stay.
+	void peer_left(uint32_t peer) { m_acked.erase(peer); }
+	// A new session: nothing is kept.
+	void reset()
+	{
+		m_acked.clear();
+		m_characters.clear();
+	}
+	const CharacterAllowances* allowances(uint32_t character) const
+	{
+		const auto it = m_characters.find(character);
+		return it == m_characters.end() ? nullptr : &it->second;
+	}
+	const std::map<uint32_t, uint32_t>& connections() const { return m_acked; }
+
+private:
+	std::map<uint32_t, uint32_t> m_acked; // peer -> newest answered seq
+	std::map<uint32_t, CharacterAllowances> m_characters; // character id -> allowances
+};
 } // namespace ledger
 } // namespace coop

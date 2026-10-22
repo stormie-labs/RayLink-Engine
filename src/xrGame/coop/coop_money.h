@@ -2,16 +2,16 @@
 //
 // Host: a player's balance is the money of his character — the proxy's CInventoryOwner money while it is online, the
 // server entity's m_dwMoney while it is parked or its player loads the world; kHostPeer is the host's own actor. A
-// ReqMoney is checked with ledger::apply_client_delta and every one is answered with MoneyBalance{balance, acked_seq =
-// its seq}. Trades, transfers and Lua grants change balances on the host (host_adjust / host_set), which send the new
-// balance to the player.
+// ReqMoney is checked with ledger::HostBook (allowances per character for the whole session, Ruling F2-1) and every one
+// is answered with MoneyBalance{balance, acked_seq = its seq}. Trades, transfers and Lua grants change balances on the
+// host (host_adjust / host_set), which send the new balance to the player; so does the end of his join.
 // Client: every change of the actor's money (GE_MONEY through the router, requests::client_money) becomes a ReqMoney
 // with a cause: Dialog while we hold an NPC's talk lock, else Script. The actor shows the host's balance plus the
 // changes the host has not answered yet (ledger::client_view); a MoneyBalance sets the actor's money without an echo
 // (entities::ClientApply). Changes are queued (the router may run on the game thread) and sent by frame(), or at once
 // by client_flush() before a trade deal and before a talk lock is released.
 // Settings (host): configs\coop_money.ltx [coop_money], read once; console coop_money_gain_burst,
-// coop_money_gain_per_min, coop_money_dialog_cap, coop_money_max (Ruling 21).
+// coop_money_gain_per_min, coop_money_dialog_cap, coop_money_dialog_per_min, coop_money_max (Ruling 21, F2-1).
 // Lua (coop.*):
 //   money_give(peer, amount) -> ok, why    any machine: our money to another player (the host checks it)
 //   money_grant(peer, amount) -> ok, why   host: adds (or, negative, takes) money, never below 0
@@ -32,7 +32,10 @@ namespace money
 void install(Session& s);
 void reset(); // session started / ended / world replaced
 void frame(); // main thread, every frame: the client sends its queued changes
-void on_peer_left(PeerId id);
+void on_peer_left(PeerId id); // the connection's numbering goes; the character keeps its allowances
+// Host (sync::host_end_join): player `id` has loaded the world and is live. Sends him his balance once: the client
+// drops MoneyBalance until it is live, and the save it loaded may be older than its balance.
+void host_on_peer_in_world(PeerId id);
 // Client: live in the host's world. The actor's money came from the host's save (role swap): it is the balance.
 void on_client_live();
 void print_status();
@@ -46,7 +49,8 @@ float upgrade_min_percent();
 // The balance of `peer`'s character, 0 if he has none.
 u32 host_balance(PeerId peer);
 // Changes the balance of `peer`'s character by `delta` (never below 0, never above max_money unless it already is)
-// and sends it to its player. `why`: a literal for the log ("trade", "grant", ...). False if he has no character.
+// and sends it to its player. `why`: a literal for the log ("trade", "grant", ...); "trade" is counted as a trade in
+// coop_status, anything else as a grant. False if he has no character.
 bool host_adjust(PeerId peer, s64 delta, const char* why);
 // Sets the balance (up to max_money) and sends it to its player. False if he has no character.
 bool host_set(PeerId peer, u32 amount, const char* why);

@@ -121,6 +121,7 @@ void host_end_join(PeerId id)
 	entities::host_end_join(id);
 	net::host_flush(id);
 	g_joining.erase(id);
+	money::host_on_peer_in_world(id); // F2 T1 fix round 1: the balance after the queued changes, once he is live
 }
 
 bool host_peer_joining(PeerId id) { return g_joining.count(id) != 0; }

@@ -36,10 +36,11 @@ constexpr u32 kVerdictCount = u32(Verdict::Malformed) + 1;
 constexpr int kMaxSetting = 2000000000; // console and ltx values are ints
 constexpr LPCSTR kSection = "coop_money";
 
-// ---------------------------------------------------------------- settings (Ruling 21)
+// ---------------------------------------------------------------- settings (Ruling 21, Ruling F2-1)
 int g_gain_burst = int(ledger::Policy().script_gain_burst);
 int g_gain_per_min = int(ledger::Policy().script_gain_per_min);
 int g_dialog_cap = int(ledger::Policy().dialog_gain_cap);
+int g_dialog_per_min = int(ledger::Policy().dialog_gain_per_min);
 int g_max_money = int(ledger::Policy().max_money);
 // 1.7 (the lowest stock mech_discount) x 1.3 (the lowest `upgrade` factor of plugins\difficulty.ltx), for F2 T5.
 float g_upgrade_min_percent = 2.21f;
@@ -50,6 +51,7 @@ ledger::Policy policy()
 	p.script_gain_burst = u32(_max(g_gain_burst, 0));
 	p.script_gain_per_min = u32(_max(g_gain_per_min, 0));
 	p.dialog_gain_cap = u32(_max(g_dialog_cap, 0));
+	p.dialog_gain_per_min = u32(_max(g_dialog_per_min, 0));
 	p.max_money = u32(_max(g_max_money, 1));
 	return p;
 }
@@ -85,6 +87,7 @@ void load_settings()
 	g_gain_burst = read_setting(ini, "script_gain_burst", g_gain_burst, 0);
 	g_gain_per_min = read_setting(ini, "script_gain_per_min", g_gain_per_min, 0);
 	g_dialog_cap = read_setting(ini, "dialog_gain_cap", g_dialog_cap, 0);
+	g_dialog_per_min = read_setting(ini, "dialog_gain_per_min", g_dialog_per_min, 0);
 	g_max_money = read_setting(ini, "max_money", g_max_money, 1);
 	if (ini.line_exist(kSection, "upgrade_min_percent"))
 	{
@@ -103,6 +106,7 @@ void register_console()
 	CMD4(CCC_Integer, "coop_money_gain_burst", &g_gain_burst, 0, kMaxSetting);
 	CMD4(CCC_Integer, "coop_money_gain_per_min", &g_gain_per_min, 0, kMaxSetting);
 	CMD4(CCC_Integer, "coop_money_dialog_cap", &g_dialog_cap, 0, kMaxSetting);
+	CMD4(CCC_Integer, "coop_money_dialog_per_min", &g_dialog_per_min, 0, kMaxSetting);
 	CMD4(CCC_Integer, "coop_money_max", &g_max_money, 1, kMaxSetting);
 }
 
@@ -142,21 +146,16 @@ const char* nick_of(PeerId id)
 }
 
 // ---------------------------------------------------------------- host state
-struct HostPeer
-{
-	ledger::Allowance script;
-	u32 dialog_gained = 0;
-	u16 dialog_npc = kNoId; // the talk lock dialog_gained belongs to
-	u32 acked = 0; // the newest ReqMoney answered (MoneyBalance::acked_seq)
-};
-xr_map<PeerId, HostPeer> g_host;
+// Per connection the newest answered change, per character (proxy id) the allowances for the whole session: leaving
+// and joining again refills nothing (fix round 1). Rules: xrCoop/coop_ledger.h HostBook.
+ledger::HostBook g_book;
 
 struct HostCounters
 {
 	u64 changes = 0, malformed = 0, no_character = 0, stale = 0, dropped_joining = 0, bad_receiver = 0;
 	u64 verdicts[kVerdictCount] = {};
 	u64 gain_script = 0, gain_dialog = 0; // RU
-	u64 grants = 0, transfers = 0, capped = 0;
+	u64 grants = 0, trades = 0, transfers = 0, capped = 0, joins = 0;
 } g_h;
 
 // The character that holds a player's money: the host's own actor, else his proxy (kNoId if none).
@@ -204,15 +203,21 @@ void send_balance(PeerId to, u32 balance)
 {
 	if (to == kHostPeer)
 		return;
-	auto it = g_host.find(to);
-	const ledger::MoneyBalanceMsg m{balance, it == g_host.end() ? 0u : it->second.acked};
+	const ledger::MoneyBalanceMsg m{balance, g_book.acked(to)};
 	Writer w(ledger::kMoneyBalanceSize);
 	ledger::write(w, m);
 	net::host_send(to, Msg::MoneyBalance, w); // queued while he loads the world
 }
 
+enum class Source : u8
+{
+	Grant, // host_adjust / host_set from the host (Lua, the engine)
+	Trade, // host_adjust(..., "trade") from coop_trade
+	Transfer, // the receiver's side of a transfer (counted with the transfer)
+};
+
 // Host: changes a balance by `delta` within [0, max(max_money, balance)] and tells its player.
-bool adjust(PeerId peer, s64 delta, const char* why, bool count_grant)
+bool adjust(PeerId peer, s64 delta, const char* why, Source source)
 {
 	if (!mgr().is_host())
 		return false;
@@ -223,8 +228,10 @@ bool adjust(PeerId peer, s64 delta, const char* why, bool count_grant)
 	const s64 hi = _max(s64(policy().max_money), s64(balance));
 	const s64 want = s64(balance) + delta;
 	const u32 next = u32(want < 0 ? 0 : (want > hi ? hi : want));
-	if (count_grant)
+	if (source == Source::Grant)
 		++g_h.grants;
+	else if (source == Source::Trade)
+		++g_h.trades;
 	if (s64(next) != want)
 	{
 		++g_h.capped;
@@ -237,42 +244,21 @@ bool adjust(PeerId peer, s64 delta, const char* why, bool count_grant)
 	return true;
 }
 
-// A transfer's receiver: another player of the session who has a character (the host always has his actor).
-bool receiver_ok(PeerId from, PeerId to)
+// A transfer's receiver as the ledger wants it: another player of the session (joined, or the host) who has a
+// character, with his balance.
+ledger::Receiver receiver_of(PeerId to)
 {
-	if (to == from)
-		return false;
+	ledger::Receiver r;
+	r.peer = to;
 	if (to != kHostPeer)
 	{
 		const PeerInfo* p = mgr().session().peer(to);
 		if (!p || p->state != PeerState::Joined)
-			return false;
+			return r;
 	}
-	u32 unused = 0;
-	return read_balance(holder_of(to), unused);
-}
-
-// `from` gives -delta to `to`. The giver's side is a spend (Cause::Transfer); the receiver is credited here. `balance`
-// is the giver's, changed but not written on success.
-Verdict transfer(PeerId from, PeerId to, s64 delta, u32& balance, ledger::Allowance& script)
-{
-	if (!receiver_ok(from, to))
-	{
-		++g_h.bad_receiver;
-		return Verdict::Malformed;
-	}
-	u32 after = balance, unused_dialog = 0;
-	const Verdict v = ledger::apply_client_delta(after, delta, Cause::Transfer, false, unused_dialog, script, policy(),
-	    mgr().now_ms());
-	if (v != Verdict::Applied)
-		return v;
-	const u32 give = balance - after;
-	if (u64(host_balance(to)) + give > u64(policy().max_money))
-		return Verdict::OverMax;
-	adjust(to, s64(give), "transfer", false);
-	balance = after;
-	++g_h.transfers;
-	return Verdict::Applied;
+	const u16 holder = holder_of(to);
+	r.present = holder != kNoId && read_balance(holder, r.balance);
+	return r;
 }
 
 void host_on_req(PeerId from, Reader& r)
@@ -301,43 +287,37 @@ void host_on_req(PeerId from, Reader& r)
 		++g_h.no_character; // not in this world: no balance to answer with
 		return;
 	}
-	HostPeer& st = g_host[from];
-	if (!ledger::seq_newer(q.seq, st.acked))
+	ledger::Receiver to;
+	if (q.cause == Cause::Transfer)
+		to = receiver_of(PeerId(q.ref));
+	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's (F2-1).
+	const bool talking = dialog::host_lock_of(from) != kNoId;
+	const ledger::Decision d = g_book.on_request(from, holder, q, balance, talking, to, policy(), mgr().now_ms());
+	if (d.stale)
 	{
 		++g_h.stale; // a repeat or an old change: the answer says where we are
 		send_balance(from, balance);
 		return;
 	}
-	const u32 before = balance;
-	Verdict v = Verdict::Malformed;
-	if (q.cause == Cause::Transfer)
-		v = transfer(from, PeerId(q.ref), q.delta, balance, st.script);
-	else
+	++g_h.verdicts[u32(d.verdict)];
+	if (d.verdict == Verdict::Applied)
 	{
-		const u16 lock = dialog::host_lock_of(from);
-		if (lock != st.dialog_npc)
+		g_h.gain_script += d.gain_script;
+		g_h.gain_dialog += d.gain_dialog;
+		if (d.credit)
 		{
-			st.dialog_npc = lock; // another talk (or none): its dialogs pay from zero
-			st.dialog_gained = 0;
+			adjust(PeerId(q.ref), s64(d.credit), "transfer", Source::Transfer); // the receiver first
+			++g_h.transfers;
 		}
-		const u32 dialog_before = st.dialog_gained;
-		v = ledger::apply_client_delta(balance, q.delta, q.cause, lock != kNoId, st.dialog_gained, st.script, policy(),
-		    mgr().now_ms());
-		if (v == Verdict::Applied && q.delta > 0)
-		{
-			const u32 from_dialog = st.dialog_gained - dialog_before;
-			g_h.gain_dialog += from_dialog;
-			g_h.gain_script += u64(q.delta) - from_dialog;
-		}
+		if (d.balance != balance)
+			write_balance(holder, d.balance);
 	}
-	st.acked = q.seq;
-	++g_h.verdicts[u32(v)];
-	if (balance != before)
-		write_balance(holder, balance);
-	if (v != Verdict::Applied && log_allowed())
+	else if (q.cause == Cause::Transfer && (!to.present || to.peer == from))
+		++g_h.bad_receiver;
+	if (d.verdict != Verdict::Applied && log_allowed())
 		::Msg("[coop] money change #%u of <%s> refused: %+d RU (%s), %s; balance %u RU", q.seq, nick_of(from), q.delta,
-		    cause_name(q.cause), verdict_name(v), balance);
-	send_balance(from, balance);
+		    cause_name(q.cause), verdict_name(d.verdict), d.balance);
+	send_balance(from, d.balance);
 }
 
 // ---------------------------------------------------------------- client state
@@ -452,10 +432,12 @@ int host_give(lua_State* L, PeerId to, u32 amount)
 	u32 balance = 0;
 	if (!read_balance(holder_of(kHostPeer), balance))
 		return refuse(L, "no character");
-	ledger::Allowance unused; // a spend never touches the allowance
-	const Verdict v = transfer(kHostPeer, to, -s64(amount), balance, unused);
+	u32 credit = 0;
+	const Verdict v = ledger::check_transfer(kHostPeer, receiver_of(to), -s64(amount), balance, credit, policy());
 	if (v != Verdict::Applied)
 		return refuse(L, v == Verdict::Malformed ? "no such player" : verdict_name(v));
+	adjust(to, s64(credit), "transfer", Source::Transfer);
+	++g_h.transfers;
 	write_balance(holder_of(kHostPeer), balance);
 	return done(L);
 }
@@ -564,7 +546,7 @@ void install(Session& s)
 
 void reset()
 {
-	g_host.clear();
+	g_book.reset(); // a new session (or none): nothing is kept
 	xrCriticalSectionGuard guard(g_cl_lock);
 	g_cl = ClientState(); // g_cl_seq goes on: see its comment
 }
@@ -575,7 +557,19 @@ void frame()
 		client_flush();
 }
 
-void on_peer_left(PeerId id) { g_host.erase(id); }
+void on_peer_left(PeerId id) { g_book.peer_left(id); } // the character keeps its allowances
+
+void host_on_peer_in_world(PeerId id)
+{
+	// Fix round 1: the client drops a MoneyBalance until it is live, and the save it loaded may be older than its
+	// balance (a grant while it loaded). One answer now anchors it: its pending list is empty at this point.
+	const u16 holder = mgr().is_host() && id != kHostPeer ? holder_of(id) : kNoId;
+	u32 balance = 0;
+	if (holder == kNoId || !read_balance(holder, balance))
+		return;
+	++g_h.joins;
+	send_balance(id, balance);
+}
 
 void on_client_live()
 {
@@ -593,19 +587,24 @@ void print_status()
 	{
 		::Msg("[coop]   money: changes in %llu, refused insufficient/allowance/max %llu/%llu/%llu (%llu malformed, %llu "
 		      "to nobody, %llu stale, %llu without a character, %llu dropped while rejoining), gains script %llu dialog "
-		      "%llu RU, grants %llu (%llu capped), transfers %llu",
+		      "%llu RU, grants %llu, trades %llu (%llu capped), transfers %llu, %llu balances sent on joining",
 		    g_h.changes, g_h.verdicts[u32(Verdict::Insufficient)], g_h.verdicts[u32(Verdict::NoAllowance)],
 		    g_h.verdicts[u32(Verdict::OverMax)], g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
 		    g_h.bad_receiver, g_h.stale, g_h.no_character, g_h.dropped_joining, g_h.gain_script, g_h.gain_dialog,
-		    g_h.grants, g_h.capped, g_h.transfers);
-		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u per talk, max %u, upgrades from "
-		      "%.2f x cost",
-		    p.script_gain_burst, p.script_gain_per_min, p.dialog_gain_cap, p.max_money, g_upgrade_min_percent);
-		for (const auto& it : g_host)
-			::Msg("[coop]     #%u <%s>: %u RU, answered #%u, allowance %.0f RU, dialogs %u RU (talk lock %u)", it.first,
-			    nick_of(it.first), host_balance(it.first), it.second.acked,
-			    it.second.script.started ? it.second.script.tokens : double(p.script_gain_burst),
-			    it.second.dialog_gained, it.second.dialog_npc);
+		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins);
+		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u in a row + %u per minute, max %u, "
+		      "upgrades from %.2f x cost",
+		    p.script_gain_burst, p.script_gain_per_min, p.dialog_gain_cap, p.dialog_gain_per_min, p.max_money,
+		    g_upgrade_min_percent);
+		for (const auto& it : g_book.connections())
+		{
+			const u16 holder = holder_of(it.first);
+			const ledger::CharacterAllowances* a = holder != kNoId ? g_book.allowances(holder) : nullptr;
+			::Msg("[coop]     #%u <%s>: %u RU, answered #%u, character %u, allowances script %.0f / dialog %.0f RU",
+			    it.first, nick_of(it.first), host_balance(it.first), it.second, holder,
+			    a && a->script.started ? a->script.tokens : double(p.script_gain_burst),
+			    a && a->dialog.started ? a->dialog.tokens : double(p.dialog_gain_cap));
+		}
 		return;
 	}
 	if (!mgr().is_client())
@@ -628,7 +627,12 @@ u32 host_balance(PeerId peer)
 	return holder != kNoId && read_balance(holder, balance) ? balance : 0;
 }
 
-bool host_adjust(PeerId peer, s64 delta, const char* why) { return adjust(peer, delta, why, true); }
+bool host_adjust(PeerId peer, s64 delta, const char* why)
+{
+	// Fix round 1: trades are counted apart from grants (coop_trade passes "trade").
+	const bool trade = why && !xr_strcmp(why, "trade");
+	return adjust(peer, delta, why, trade ? Source::Trade : Source::Grant);
+}
 
 bool host_set(PeerId peer, u32 amount, const char* why)
 {
