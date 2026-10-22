@@ -109,7 +109,9 @@ inline bool parse_domain(std::string_view text, Domain& out)
 }
 
 // Pseudo-callback names the Lua shim uses for AddUniqueCall and CreateTimeEvent. They have no callback of their own:
-// the handler's script decides, owner by default.
+// the handler's script decides, host by default (Ruling F2-29, review I1: a timer is how stock and mod world logic
+// polls - tasks_*, xr_effects, simulation_objects -, so a script without a rule keeps its timers on the host, as the
+// Lua filter did before F2 T10; our coop_* and the listed owner / view scripts keep theirs everywhere).
 inline constexpr std::string_view kUniqueCall = "unique_call";
 inline constexpr std::string_view kTimeEvent = "time_event";
 
@@ -302,8 +304,8 @@ inline constexpr StockRoute kStockRoutes[] = {
 
 	// Not in intercepts, named by the brief
 	{"on_xml_read", Domain::View}, // modxml_core
-	{kUniqueCall, Domain::Owner},
-	{kTimeEvent, Domain::Owner},
+	{kUniqueCall, Domain::Host}, // F2-29: see kUniqueCall
+	{kTimeEvent, Domain::Host},
 };
 
 // Domains for callback names that are not in the list above (callbacks mods and the monolith add themselves).
@@ -703,20 +705,23 @@ inline bool parse_outcome(std::string_view text, Outcome& out)
 	return true;
 }
 
-// Call counters of the router: per domain (ran, skipped, errors) and skips per script for "the most skipped" list.
-// The per-script table is bounded (kMaxScripts names); a name past that counts in its domain only.
+// Call counters of the router: per domain (ran, skipped, errors) and skips per (callback, script) pair, named like a
+// [route_pairs] key ("actor_on_update@guards_spawner"; the script alone when the callback is not given).
+// Review M2: a handler skipped every frame tops "the most skipped"; a rare one (a use, a key press) would never get
+// there, so the pairs skipped for the first time most recently are kept too ("latest new skips").
+// The pair table is bounded (kMaxPairs); a pair past that counts in its domain only.
 class Counters
 {
 public:
 	static constexpr size_t kDomains = size_t(Domain::Level) + 1;
-	static constexpr size_t kMaxScripts = 1024;
+	static constexpr size_t kMaxPairs = 1024;
 
 	struct Totals
 	{
 		uint64_t ran = 0, skipped = 0, errors = 0;
 	};
 
-	void note(Domain d, Outcome o, std::string_view script)
+	void note(Domain d, Outcome o, std::string_view script, std::string_view callback = {})
 	{
 		Totals& t = m_totals[size_t(d) < kDomains ? size_t(d) : 0];
 		switch (o)
@@ -725,47 +730,105 @@ public:
 		case Outcome::Error: ++t.errors; break;
 		case Outcome::Skipped:
 			++t.skipped;
-			if (script.empty())
-				break;
-			if (const auto it = m_skips.find(script); it != m_skips.end())
-				++it->second;
-			else if (m_skips.size() < kMaxScripts)
-				m_skips.emplace(std::string(script), uint64_t(1));
-			else
-				++m_dropped;
+			if (!script.empty())
+				note_skip(script, callback);
 			break;
 		}
 	}
 
 	const Totals& totals(Domain d) const { return m_totals[size_t(d) < kDomains ? size_t(d) : 0]; }
 
-	// The scripts with the most skips, most first (a tie by name), at most n.
+	// The pairs with the most skips, most first (a tie by name), at most n.
 	std::vector<std::pair<std::string, uint64_t>> top_skipped(size_t n) const
 	{
-		std::vector<std::pair<std::string, uint64_t>> all(m_skips.begin(), m_skips.end());
-		const auto more = [](const std::pair<std::string, uint64_t>& a, const std::pair<std::string, uint64_t>& b)
-		{ return a.second != b.second ? a.second > b.second : a.first < b.first; };
+		std::vector<Row> all = rows();
+		const auto more = [](const Row& a, const Row& b)
+		{ return a.count != b.count ? a.count > b.count : a.name < b.name; };
 		const size_t k = n < all.size() ? n : all.size();
 		std::partial_sort(all.begin(), all.begin() + std::ptrdiff_t(k), all.end(), more);
-		all.resize(k);
-		return all;
+		std::vector<std::pair<std::string, uint64_t>> out;
+		for (size_t i = 0; i < k; ++i)
+			out.emplace_back(std::move(all[i].name), all[i].count);
+		return out;
 	}
 
-	size_t scripts_tracked() const { return m_skips.size(); }
-	uint64_t scripts_dropped() const { return m_dropped; } // skips of names past kMaxScripts
+	// The pairs skipped for the first time most recently, the latest first, at most n.
+	std::vector<std::string> latest_new_skips(size_t n) const
+	{
+		std::vector<Row> all = rows();
+		const auto later = [](const Row& a, const Row& b) { return a.first > b.first; };
+		const size_t k = n < all.size() ? n : all.size();
+		std::partial_sort(all.begin(), all.begin() + std::ptrdiff_t(k), all.end(), later);
+		std::vector<std::string> out;
+		for (size_t i = 0; i < k; ++i)
+			out.push_back(std::move(all[i].name));
+		return out;
+	}
+
+	size_t pairs_tracked() const { return m_pairs; }
+	uint64_t pairs_dropped() const { return m_dropped; } // skips of pairs past kMaxPairs
 
 	void clear()
 	{
 		for (Totals& t : m_totals)
 			t = Totals();
 		m_skips.clear();
+		m_pairs = 0;
 		m_dropped = 0;
+		m_seq = 0;
 	}
 
 private:
+	struct Skip
+	{
+		uint64_t count = 0;
+		uint64_t first = 0; // order of its first skip
+	};
+	struct Row
+	{
+		std::string name;
+		uint64_t count, first;
+	};
+	using Callbacks = std::map<std::string, Skip, std::less<>>; // std::less<>: find() by string_view, no allocation
+
+	void note_skip(std::string_view script, std::string_view callback)
+	{
+		auto it = m_skips.find(script);
+		if (it != m_skips.end())
+		{
+			const auto jt = it->second.find(callback);
+			if (jt != it->second.end())
+			{
+				++jt->second.count;
+				return;
+			}
+		}
+		if (m_pairs >= kMaxPairs)
+		{
+			++m_dropped;
+			return;
+		}
+		if (it == m_skips.end())
+			it = m_skips.emplace(std::string(script), Callbacks()).first;
+		it->second.emplace(std::string(callback), Skip{1, ++m_seq});
+		++m_pairs;
+	}
+
+	std::vector<Row> rows() const
+	{
+		std::vector<Row> all;
+		all.reserve(m_pairs);
+		for (const auto& s : m_skips)
+			for (const auto& c : s.second)
+				all.push_back(Row{c.first.empty() ? s.first : c.first + "@" + s.first, c.second.count, c.second.first});
+		return all;
+	}
+
 	Totals m_totals[kDomains];
-	std::map<std::string, uint64_t, std::less<>> m_skips; // std::less<>: find() by string_view, no allocation
+	std::map<std::string, Callbacks, std::less<>> m_skips; // script -> callback -> skips
+	size_t m_pairs = 0;
 	uint64_t m_dropped = 0;
+	uint64_t m_seq = 0;
 };
 } // namespace routes
 } // namespace coop

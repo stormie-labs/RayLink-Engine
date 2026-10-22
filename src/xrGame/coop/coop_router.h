@@ -14,8 +14,9 @@
 //   coop.route.runs(domain) -> bool
 //     outside a session every domain runs (single player is untouched); in a session host and level run on the host,
 //     owner and view everywhere, none nowhere (the host too). An unknown name runs (as owner).
-//   coop.route.note(domain, outcome[, script])
-//     counts a call: outcome "ran" | "skipped" | "error"; script names a skip for "the most skipped" list.
+//   coop.route.note(domain, outcome[, script[, callback]])
+//     counts a call: outcome "ran" | "skipped" | "error"; script and callback name a skip for the per-pair lists
+//     ("most skipped", "latest new skips"). of("", func) only names the script: it is neither counted nor cached.
 //   coop.route.none_functions() -> {"module.function", ...}
 //     [route_none_functions] of the ltx files (debug tools replaced by a message on a client, coop_main.script).
 //
@@ -39,7 +40,8 @@ namespace router
 void install();
 // Session started or ended: the call counters start again. The table stays.
 void reset();
-// coop_status: the rule files, call counters by domain and the ten most skipped scripts.
+// coop_status: the rule files, call counters by domain, the ten most skipped (callback, script) pairs and the ten
+// pairs skipped for the first time most recently.
 void print_status();
 // Reads the ltx overrides unless done already. Called by the Lua functions; safe to call again.
 void load_overrides();

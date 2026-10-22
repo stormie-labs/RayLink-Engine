@@ -190,8 +190,13 @@ int l_of(lua_State* L)
 	Domain d = Domain::Owner;
 	{
 		xrCriticalSectionGuard guard(g_lock);
-		d = route_of(callback, script);
-		++g.routed[size_t(d)];
+		if (callback.empty()) // review M4: coop_route.script_of only asks the script; not a handler, not cached
+			d = g.table.route(callback, script);
+		else
+		{
+			d = route_of(callback, script);
+			++g.routed[size_t(d)];
+		}
 	}
 	lua_pushstring(L, routes::domain_name(d));
 	lua_pushlstring(L, script.data(), script.size());
@@ -212,15 +217,16 @@ int l_runs(lua_State* L)
 // coop.route.note(domain, outcome[, script])
 int l_note(lua_State* L)
 {
-	std::string_view name, outcome, script;
+	std::string_view name, outcome, script, callback;
 	Domain d = Domain::Owner;
 	Outcome o = Outcome::Ran;
 	if (!arg_string(L, 1, name) || !arg_string(L, 2, outcome) || !routes::parse_domain(name, d) ||
 		!routes::parse_outcome(outcome, o))
 		return 0;
 	arg_string(L, 3, script);
+	arg_string(L, 4, callback); // review M2: skips are kept per (callback, script)
 	xrCriticalSectionGuard guard(g_lock);
-	g.counters.note(d, o, script);
+	g.counters.note(d, o, script, callback);
 	return 0;
 }
 
@@ -331,12 +337,19 @@ void print_status()
 		::Msg("[coop] routes:   %-5s ran %llu, skipped %llu, errors %llu", routes::domain_name(d), t.ran, t.skipped,
 			t.errors);
 	}
+	// Review M2: per (callback, script). A handler skipped every frame tops the first list; a rare one (a use, a key
+	// press) shows in the second, the pairs skipped for the first time most recently.
 	const std::vector<std::pair<std::string, u64>> top = g.counters.top_skipped(kTopSkipped);
 	std::string line;
 	for (const std::pair<std::string, u64>& s : top)
 		line += (line.empty() ? "" : ", ") + s.first + " " + std::to_string(s.second);
 	::Msg("[coop] routes: most skipped %s%s", line.empty() ? "(none)" : line.c_str(),
-		g.counters.scripts_dropped() ? " (more scripts than the table keeps)" : "");
+		g.counters.pairs_dropped() ? " (more pairs than the table keeps)" : "");
+	line.clear();
+	for (const std::string& s : g.counters.latest_new_skips(kTopSkipped))
+		line += (line.empty() ? "" : ", ") + s;
+	::Msg("[coop] routes: latest new skips %s (%u pair(s) skipped so far)", line.empty() ? "(none)" : line.c_str(),
+		u32(g.counters.pairs_tracked()));
 }
 } // namespace router
 } // namespace coop
