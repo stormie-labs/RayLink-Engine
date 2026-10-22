@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -40,10 +41,14 @@ enum class Verdict : uint8_t
 // `defaults`: for a new entity, the section's installed_upgrades — CInventoryItem::net_Spawn_install_upgrades puts
 // them on first (Manager::init_install, the same rules) and only then the list. A list taken from a server entity
 // lacks them (loading installs send no GE_INSTALL_UPGRADE), a list from a game object has them.
-inline std::vector<Verdict> plan(
-    const std::vector<Upgrade>& installed, const std::vector<Upgrade>& wanted, const std::vector<Upgrade>& defaults = {})
+// `refused_defaults` (optional): how many defaults the engine itself would refuse (not in the tree, parent group
+// missing, group taken) — init_install is FATAL on those (task 10b). A repeated default is skipped by the engine
+// (result_e_installed) and is not counted.
+inline std::vector<Verdict> plan(const std::vector<Upgrade>& installed, const std::vector<Upgrade>& wanted,
+    const std::vector<Upgrade>& defaults = {}, size_t* refused_defaults = nullptr)
 {
 	std::vector<std::string> ids, groups, unclaimed_defaults;
+	size_t refused = 0;
 	const auto has = [](const std::vector<std::string>& v, const std::string& s)
 	{ return std::find(v.begin(), v.end(), s) != v.end(); };
 	const auto parents_ok = [&](const Upgrade& u)
@@ -62,9 +67,13 @@ inline std::vector<Verdict> plan(
 	}
 	for (const Upgrade& u : defaults)
 	{
-		// One the engine refuses here would be FATAL in init_install itself (the game's data, not a peer's).
-		if (!u.in_tree || has(ids, u.id) || !parents_ok(u) || has(groups, u.group))
+		if (has(ids, u.id))
 			continue;
+		if (!u.in_tree || !parents_ok(u) || has(groups, u.group))
+		{
+			++refused; // FATAL in init_install itself: the section's data is broken
+			continue;
+		}
 		ids.push_back(u.id);
 		groups.push_back(u.group);
 		unclaimed_defaults.push_back(u.id);
@@ -94,7 +103,28 @@ inline std::vector<Verdict> plan(
 			groups.push_back(u.group);
 		}
 	}
+	if (refused_defaults)
+		*refused_defaults = refused;
 	return out;
+}
+
+// The section's installed_upgrades break the tree rules: any new entity of it is FATAL in init_install.
+inline bool defaults_ok(const std::vector<Upgrade>& defaults)
+{
+	size_t refused = 0;
+	plan({}, {}, defaults, &refused);
+	return refused == 0;
+}
+
+// A client installed `added` on its item (GE_INSTALL_UPGRADE, task 10b). `entity`: the item's server entity list
+// (no section defaults). The verdict of `added` the way the next net_Spawn from scratch installs them: defaults,
+// that list, then it. Only Install may reach the entity (CSE add_upgrade); Installed / Default = already there.
+inline Verdict verdict_of_added(
+    const std::vector<Upgrade>& entity, const Upgrade& added, const std::vector<Upgrade>& defaults)
+{
+	std::vector<Upgrade> list = entity;
+	list.push_back(added);
+	return plan({}, list, defaults).back();
 }
 } // namespace upgrades
 } // namespace coop

@@ -75,5 +75,19 @@ bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob);
 // Host: applies a client's blob to a fresh entity (not spawned yet) with the ItemState checks: kind, counts,
 // known upgrades and ammo types. False = refused (`why` says why); the entity may be half changed: discard it.
 bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, const char*& why);
+// Host (R3 В6, task 10b): the section's own installed_upgrades break its upgrade tree, so any new entity of it is
+// FATAL in Manager::init_install (broken data). True for a section without upgrades.
+bool section_defaults_ok(const shared_str& section);
+
+// Host (R3 В6, task 10b): a client's GE_INSTALL_UPGRADE `upgrade` on the item whose server entity is `entity`,
+// checked the way the next net_Spawn from scratch installs (section defaults, the entity's list, then it; a loading
+// install is FATAL on a missing parent group or a taken group). Refused: `why` says why.
+enum class AddedUpgrade : u8
+{
+	Relay, // the entity may keep it (CSE add_upgrade)
+	AlreadyThere, // on the entity already or a section default: nothing to do (add_upgrade is FATAL on a duplicate)
+	Refused,
+};
+AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why);
 } // namespace items
 } // namespace coop

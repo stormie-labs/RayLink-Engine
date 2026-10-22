@@ -15,6 +15,8 @@
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_hits.h"
 
+#include <cstring>
+
 #include "Level.h"
 #include "Actor.h"
 #include "GameObject.h"
@@ -80,6 +82,7 @@ enum Bad : u8
 	BadNumber,
 	BadSpawnState,
 	BadMoveRange,
+	BadUpgrade, // task 10b: an upgrade the next spawn of the item would be FATAL on
 	BadCount
 };
 constexpr u64 kBadLogFirst = 10;
@@ -819,7 +822,9 @@ void host_on_spawn(PeerId from, Reader& r)
 	const char* section = s.section.c_str();
 	const bool known = spawnable_section(section);
 	const char* missing = known ? missing_item_line(section) : nullptr;
-	CSE_Abstract* e = known && !missing ?
+	// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
+	const bool defaults_ok = known && !missing && items::section_defaults_ok(shared_str(section));
+	CSE_Abstract* e = defaults_ok ?
 	    make_temp(section, Fvector().set(s.pos[0], s.pos[1], s.pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1), s.parent) :
 	    nullptr;
 	if (!e)
@@ -829,6 +834,10 @@ void host_on_spawn(PeerId from, Reader& r)
 			if (missing)
 				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has no `%s` (its class reads it unchecked)",
 				    q.seq, from, section, missing);
+			else if (known && !defaults_ok)
+				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has default upgrades its own upgrade tree "
+				      "refuses (broken data)",
+				    q.seq, from, section);
 			else
 				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%.64s] is not a section with a class here",
 				    q.seq, from, validate::resource_name_ok(section, spawn::kMaxSection) ? section : "<bad name>");
@@ -1126,16 +1135,32 @@ void host_on_item_event(PeerId from, Reader& r)
 	if (events::root_of(item) != q.proxy)
 		return reply(q, Reason::NotOwner, item);
 	{
-		// A repeated upgrade must not reach CSE_ALifeInventoryItem::add_upgrade: it is FATAL on duplicates.
+		// R3 В6 (task 10b): the upgrade id ends inside the event bytes (r_stringZ reads up to a zero) and is a name.
+		if (!size || !std::memchr(data, 0, size))
+			return reply(q, Reason::Malformed, item);
 		NET_Packet probe;
 		probe.B.count = size;
 		CopyMemory(probe.B.data, data, size);
 		probe.r_pos = 0;
 		shared_str upgrade;
 		probe.r_stringZ(upgrade);
-		CSE_ALifeInventoryItem* inv = smart_cast<CSE_ALifeInventoryItem*>(ai().alife().objects().object(item, true));
-		if (inv && inv->has_upgrade(upgrade))
-			return;
+		if (!validate::resource_name_ok(upgrade.c_str(), spawn::kMaxSection))
+			return reply(q, Reason::Malformed, item);
+		// The server entity keeps it in the host save, and its next net_Spawn from scratch installs the section
+		// defaults, its list, then it with loading = true: FATAL on a taken group or a missing parent group. A
+		// repeat must not reach CSE_ALifeInventoryItem::add_upgrade either (FATAL on duplicates).
+		CSE_Abstract* e = ai().alife().objects().object(item, true);
+		const char* why = nullptr;
+		switch (items::host_check_added_upgrade(e, upgrade, why))
+		{
+		case items::AddedUpgrade::AlreadyThere: return;
+		case items::AddedUpgrade::Refused:
+			if (note_bad(BadUpgrade))
+				::Msg("! [coop] upgrade [%s] of item %u from player #%u refused: %s", upgrade.c_str(), item, from,
+				    why ? why : "?");
+			return reply(q, Reason::NotAllowed, item);
+		case items::AddedUpgrade::Relay: break;
+		}
 	}
 	NET_Packet P;
 	CGameObject::u_EventGen(P, type, item);
@@ -1379,8 +1404,9 @@ void print_status()
 		    g_h.proxy_hits, g_h.player_hits_sent, g_h.explosion_hits_sent, g_coop_friendly_fire ? "on" : "off",
 		    g_h.friendly_fire_dropped, g_h.results[u32(Reason::FriendlyFire)], g_h.explosions_as_player);
 		::Msg("[coop]   refused as invalid (R3): %llu bones, %llu spawn sections, %llu spawn states, %llu numbers, "
-		      "%llu out-of-reach moves claimed as local",
-		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange]);
+		      "%llu out-of-reach moves claimed as local, %llu upgrades",
+		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange],
+		    g_bad[BadUpgrade]);
 		return;
 	}
 	::Msg("[coop]   requests out: spawn %llu, destroy %llu, use %llu, move %llu, hit %llu, money %llu, item event %llu; "

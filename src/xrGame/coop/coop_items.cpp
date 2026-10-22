@@ -1863,5 +1863,45 @@ bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, c
 		ii->m_upgrades = d.upgrades;
 	return true;
 }
+
+bool section_defaults_ok(const shared_str& section)
+{
+	if (!ai().get_alife())
+		return true;
+	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
+	inventory::upgrade::Root* root = um.get_root(section);
+	std::vector<upgrades::Upgrade> defaults;
+	for (const shared_str& id : section_default_upgrades(um, section))
+		defaults.push_back(describe_upgrade(um, root, id));
+	return upgrades::defaults_ok(defaults);
+}
+
+AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why)
+{
+	why = nullptr;
+	CSE_ALifeInventoryItem* ii = smart_cast<CSE_ALifeInventoryItem*>(entity);
+	if (!ii || !ai().get_alife())
+	{
+		why = "not an inventory item";
+		return AddedUpgrade::Refused;
+	}
+	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
+	inventory::upgrade::Root* root = um.get_root(entity->s_name);
+	std::vector<upgrades::Upgrade> list, defaults;
+	for (const shared_str& id : ii->m_upgrades)
+		list.push_back(describe_upgrade(um, root, id));
+	for (const shared_str& id : section_default_upgrades(um, entity->s_name))
+		defaults.push_back(describe_upgrade(um, root, id));
+	const upgrades::Verdict v = upgrades::verdict_of_added(list, describe_upgrade(um, root, upgrade), defaults);
+	switch (v)
+	{
+	case upgrades::Verdict::Install: return AddedUpgrade::Relay;
+	case upgrades::Verdict::Installed:
+	case upgrades::Verdict::Default: return AddedUpgrade::AlreadyThere;
+	default:
+		why = verdict_name(v);
+		return AddedUpgrade::Refused;
+	}
+}
 } // namespace items
 } // namespace coop
