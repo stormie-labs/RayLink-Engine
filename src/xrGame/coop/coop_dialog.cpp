@@ -7,6 +7,7 @@
 #include "coop_world.h"
 #include "coop_sync.h"
 #include "coop_money.h"
+#include "coop_requests.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -281,7 +282,9 @@ void client_release()
 {
 	if (g_cl.granted == kNoId)
 		return;
-	money::client_flush(); // F2 T1: the talk's money changes reach the host while it still sees the lock
+	// F2 T1 / T2: the talk's money changes and spawns (a quest item given on the closing click) reach the host
+	// while it still sees the lock; the outbox flush includes the money flush
+	requests::client_flush_outbox();
 	Writer w(4);
 	w.u16(g_cl.granted);
 	net::client_send(Msg::DialogUnlock, w);
