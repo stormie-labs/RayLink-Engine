@@ -29,6 +29,7 @@
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "../xrServerEntities/xrServer_Objects.h"
 #include "../xrServerEntities/xrMessages.h"
+#include "xrCoop/coop_item_tags.h"
 
 namespace coop
 {
@@ -173,6 +174,7 @@ struct Owned
 	bool stuck = false; // the host copy does not take this state: do not retry until the next one
 };
 xr_map<u16, Owned> g_owned; // items of players' characters with the owner's last state
+xr_set<u32> g_logged_tags; // R3 В1: (item id << 8 | itemtags::Bit) already reported as different from the owner's state
 struct Left
 {
 	PeerId peer = kInvalidPeer;
@@ -402,27 +404,85 @@ bool same_upgrades(const UpgradeList& a, const UpgradeList& b)
 	return true;
 }
 
-// Semantic comparison (upgrade order does not matter).
-bool same(const ItemData& a, const ItemData& b)
+// R3 В1: tags (itemtags::Bit) of the host copy `cur` that differ from the owner's state. Semantic comparison (upgrade
+// order does not matter). Only the tags the owner carries count: the old symmetric comparison made every weapon
+// without scopes "stuck" over a scope tag the owner never sent.
+u32 diverged_tags(const ItemData& cur, const ItemData& owner)
 {
-	if (a.has_cond != b.has_cond || (a.has_cond && a.cond != b.cond))
-		return false;
-	if (a.has_upgrades != b.has_upgrades || (a.has_upgrades && !same_upgrades(a.upgrades, b.upgrades)))
-		return false;
-	if (a.has_box != b.has_box || (a.has_box && a.box != b.box))
-		return false;
-	if (a.has_addons != b.has_addons || (a.has_addons && a.addons != b.addons))
-		return false;
-	if (a.has_scope != b.has_scope || (a.has_scope && a.scope != b.scope))
-		return false;
-	if (a.has_main != b.has_main || (a.has_main && (a.main_count != b.main_count || a.main_type != b.main_type)))
-		return false;
-	if (a.has_launcher != b.has_launcher ||
-	    (a.has_launcher && (a.gl_count != b.gl_count || a.gl_type != b.gl_type)))
-		return false;
-	if (a.has_uses != b.has_uses || (a.has_uses && a.uses != b.uses))
-		return false;
-	return true;
+	return itemtags::diverged(cur, owner, same_upgrades);
+}
+
+// R3 В1: a tag's value for the log ("none" = the state does not carry it).
+std::string describe_tag(itemtags::Bit bit, const ItemData& d)
+{
+	char buf[96];
+	buf[0] = 0;
+	switch (bit)
+	{
+	case itemtags::Cond:
+		if (d.has_cond)
+			xr_sprintf(buf, "%u/65535", u32(d.cond));
+		break;
+	case itemtags::Upgrades:
+	{
+		if (!d.has_upgrades)
+			break;
+		std::string s = "[";
+		for (const shared_str& id : d.upgrades)
+		{
+			if (s.size() > 1)
+				s += ' ';
+			s += id.c_str() ? id.c_str() : "?";
+			if (s.size() > 200)
+			{
+				s += "...";
+				break;
+			}
+		}
+		return s + "]";
+	}
+	case itemtags::Box:
+		if (d.has_box)
+			xr_sprintf(buf, "%u rounds", u32(d.box));
+		break;
+	case itemtags::Addons:
+		if (d.has_addons)
+			xr_sprintf(buf, "0x%02x", u32(d.addons));
+		break;
+	case itemtags::Scope:
+		if (d.has_scope)
+			xr_sprintf(buf, "scope %u", u32(d.scope));
+		break;
+	case itemtags::Main:
+		if (d.has_main)
+			xr_sprintf(buf, "%u rounds, type %u", u32(d.main_count), u32(d.main_type));
+		break;
+	case itemtags::Launcher:
+		if (d.has_launcher)
+			xr_sprintf(buf, "%u rounds, type %u", u32(d.gl_count), u32(d.gl_type));
+		break;
+	case itemtags::Uses:
+		if (d.has_uses)
+			xr_sprintf(buf, "%u portions", u32(d.uses));
+		break;
+	default:
+		break;
+	}
+	return buf[0] ? std::string(buf) : std::string("none");
+}
+
+// R3 В1: a host copy that does not take the owner's state is reported by tag, once per item and tag (a stuck item
+// is retried with every new state of the owner: the log must not repeat). Forgotten when the item leaves g_owned.
+void log_diverged(u16 id, const char* section, u32 mask, const ItemData& cur, const ItemData& owner)
+{
+	for (u32 bit = 1; bit <= itemtags::Uses; bit <<= 1)
+	{
+		if (!(mask & bit) || !g_logged_tags.insert((u32(id) << 8) | bit).second)
+			continue;
+		::Msg("! [coop] item %u [%s]: the host copy keeps its own %s after the owner's state was applied: host %s, owner %s",
+		    u32(id), section, itemtags::name(itemtags::Bit(bit)), describe_tag(itemtags::Bit(bit), cur).c_str(),
+		    describe_tag(itemtags::Bit(bit), owner).c_str());
+	}
 }
 
 // ---------------------------------------------------------------- capture
@@ -444,8 +504,13 @@ void capture_object(CInventoryItem* item, ItemData& d)
 	{
 		d.has_addons = true;
 		d.addons = w->GetAddonsState();
-		d.has_scope = true;
-		d.scope = w->m_cur_scope;
+		// R3 В1: no scope tag for a weapon without scopes (pistols, knife): has_scope stays untouched (false), the
+		// same as in the owner's state after host_sanitize.
+		if (itemtags::scope_tag_applies(w->m_scopes.size()))
+		{
+			d.has_scope = true;
+			d.scope = w->m_cur_scope;
+		}
 		CWeaponMagazinedWGrenade* g = smart_cast<CWeaponMagazinedWGrenade*>(w);
 		const u16 cur_count = u16(_max(0, w->GetAmmoElapsed()));
 		d.has_main = true;
@@ -1038,8 +1103,8 @@ void host_sanitize(CSE_Abstract* e, CInventoryItem* item, ItemData& d)
 		d.main_type = cur.has_main && cur.main_type < c.main_types ? cur.main_type : u8(0);
 	if (d.has_launcher && d.gl_type >= c.gl_types)
 		d.gl_type = cur.has_launcher && cur.gl_type < c.gl_types ? cur.gl_type : u8(0);
-	if (d.has_scope && d.scope >= c.scopes)
-		d.has_scope = false;
+	if (d.has_scope && !itemtags::scope_index_ok(d.scope, c.scopes))
+		d.has_scope = false; // R3 В1: also every scope tag for a weapon without scopes (c.scopes == 0)
 }
 
 // Broadcast the host's view of an item (after applying a player's state, or authority push).
@@ -1444,23 +1509,26 @@ void host_enforce(u64 now)
 		{
 			ItemData cur;
 			capture_object(item, cur);
-			if (!same(cur, it->second.data))
+			if (diverged_tags(cur, it->second.data))
 			{
 				apply_object(item, it->second.data, false);
 				if (CSE_Abstract* e = find_entity(it->first))
 					apply_entity(e, it->second.data, false);
 				++g_stats.enforced;
 				capture_object(item, cur);
-				if (!same(cur, it->second.data))
+				if (const u32 left = diverged_tags(cur, it->second.data))
 				{
 					it->second.stuck = true;
 					::Msg("! [coop] item %u [%s]: the host copy does not take its owner's state", it->first,
 					    item->object().cNameSect().c_str());
+					log_diverged(it->first, item->object().cNameSect().c_str(), left, cur, it->second.data); // R3 В1
 				}
 			}
 		}
 		++it;
 	}
+	for (auto it = g_logged_tags.begin(); it != g_logged_tags.end();) // R3 В1: forget items that are gone
+		it = g_owned.count(u16(*it >> 8)) ? std::next(it) : g_logged_tags.erase(it);
 	for (auto it = g_left.begin(); it != g_left.end();)
 		it = now - it->second.time > kGraceMs ? g_left.erase(it) : std::next(it);
 	for (auto it = g_releasing.begin(); it != g_releasing.end();)
@@ -1504,6 +1572,7 @@ void reset()
 	g_sent.clear();
 	g_pending.clear();
 	g_owned.clear();
+	g_logged_tags.clear();
 	g_left.clear();
 	g_proxy_items.clear();
 	g_unload_used.clear();
