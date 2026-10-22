@@ -10,6 +10,7 @@
 #include "coop_net.h"
 #include "coop_script.h"
 #include "xrCoop/coop_shapes.h"
+#include "xrCoop/coop_limits.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Level.h"
@@ -87,6 +88,10 @@ struct State
 	bool reset_pending = false;
 	// host: R1 I4, R2 I4: one join in flight per player, one per 5 s
 	JoinGate gate;
+	// host: Ruling F2-10 b: the keys this session made a new character for (kMaxNewCharacters); a new session starts
+	// over (on_host_started)
+	limits::NewCharacters new_characters;
+	u32 characters_refused = 0; // diagnostics: new keys refused over the limit (the first few logged)
 	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
 	u32 loaded_ignored = 0;
 	u32 votes_refused = 0;
@@ -100,27 +105,8 @@ struct State
 } g;
 
 constexpr u32 kRefusalsLogged = 5;
-// R2 I4: StateDumpRequest = a client asks for an entity it misses (P3); a modified one could ask for the whole
-// world in a loop, each answer a full spawn packet.
-constexpr u32 kStateDumpBurst = 64;
-constexpr u32 kStateDumpRefillMs = 50; // 20 per second after a burst
-// T12 review (Ruling 18): an honest client votes when it touches a level exit (once, or each time the player says yes
-// to the stock dialog, which comes back every 5 s while he stays inside).
-constexpr u32 kVoteBurst = 4;
-constexpr u32 kVoteRefillMs = 2000; // one per 2 s after a burst
-
-struct RateRule
-{
-	Msg type;
-	u32 burst;
-	u32 refill_ms;
-};
-// Host: what the session drops when a client sends too much of it (Session::limit_rate, per client); coop_status
-// shows how many of each were dropped.
-constexpr RateRule kRateRules[] = {
-	{Msg::StateDumpRequest, kStateDumpBurst, kStateDumpRefillMs},
-	{Msg::TransitionVote, kVoteBurst, kVoteRefillMs},
-};
+// Host: what the session drops when a client sends too much of it (Session::limit_rate, per client): the table and
+// why each value is in xrCoop/coop_limits.h (F2 T3); coop_status shows how many of each were dropped.
 
 // T12 review (Ruling 18): a player's vote reaches the host's Lua and the chat at most once per 10 s, whatever exit he
 // stands at: two exits side by side, or a modified client alternating them, do not flood the chat.
@@ -333,7 +319,21 @@ bool host_send_world(PeerId from)
 		bring_proxy_to_level(*proxy, p->nick.c_str());
 	}
 	else
+	{
+		// Ruling F2-10 b: the client picks its key; every new one used to get a character (starting kit, money) that
+		// stays in the save for good. A session makes kMaxNewCharacters; a returning player costs nothing.
+		if (!g.new_characters.admits(key_digest))
+		{
+			if (++g.characters_refused <= kRefusalsLogged)
+				::Msg("! [coop] '%s' has no character in this world, and this session has made all %u new ones: refused",
+				    p->nick.c_str(), limits::kMaxNewCharacters);
+			mgr().session().kick(from, limits::kNoNewCharacterReason, limits::no_new_character_text());
+			return false;
+		}
 		proxy = create_proxy(*p, key_digest);
+		if (proxy)
+			g.new_characters.add(key_digest);
+	}
 	if (!proxy)
 	{
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");
@@ -738,8 +738,8 @@ void host_on_transition_vote(PeerId from, Reader& r)
 
 void install(Session& s)
 {
-	for (const RateRule& rule : kRateRules)
-		s.limit_rate(rule.type, rule.burst, rule.refill_ms); // R2 I4, T12 review (host only, per client)
+	for (const limits::RateRule& rule : limits::kClientRateRules)
+		s.limit_rate(rule.type, rule.burst, rule.refill_ms); // R2 I4, T12 review, F2 T3 (host only, per client)
 	s.on(Msg::TransitionVote, &host_on_transition_vote);
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
@@ -1038,9 +1038,11 @@ void print_status()
 		::Msg("[coop]   world epoch %u; refused: %u join(s), %u WorldLoaded, %u level exit(s)", g.epoch,
 		    g.joins_refused, g.loaded_ignored, g.votes_refused);
 		// T12 review (Ruling 18): the log names a dropped type once per client; the count is here every time
-		for (const RateRule& rule : kRateRules)
+		for (const limits::RateRule& rule : limits::kClientRateRules)
 			::Msg("[coop]   rate limit %s: %llu dropped (more than %u in a row, then one per %u ms)", msg_name(rule.type),
 			    mgr().session().stats(u16(rule.type)).rate_dropped, rule.burst, rule.refill_ms);
+		::Msg("[coop]   new characters this session: %u of %u, %u new key(s) refused", u32(g.new_characters.count()),
+		    limits::kMaxNewCharacters, g.characters_refused);
 		if (g.pending_changer != kNoId)
 			::Msg("[coop]   level exit %u asked for by #%u, waiting for coop_accept_transition", g.pending_changer,
 			    g.transition_from);

@@ -109,22 +109,99 @@ const char* msg_name(Msg type)
 	return buf;
 }
 
+// F2 T3: every game message has a direction, from its senders in the game layer (net::host_send / host_broadcast
+// against net::client_send); one without a sender yet takes the direction of its comment in coop_protocol.h. A new
+// message needs its row here: tests/test_session_limits.cpp game_messages_have_direction fails without it.
 MsgSender msg_sender(Msg type)
 {
 	switch (type)
 	{
+	// the host's world and its answers
 	case Msg::WorldBlob:
 	case Msg::JoinComplete:
 	case Msg::SessionReset:
 	case Msg::LevelChange:
 	case Msg::AvatarList:
-	case Msg::MoneyBalance: return MsgSender::HostOnly; // F2 T1: only the host holds balances
+	case Msg::PlayerHit:
+	case Msg::PlayerRules:
+	case Msg::EntitySpawn:
+	case Msg::EntityDestroy:
+	case Msg::EntitySwitch:
+	case Msg::EntitySnapshot:
+	case Msg::EntityAnim:
+	case Msg::EntityHealth:
+	case Msg::EntityDied:
+	case Msg::EntityParent:
+	case Msg::EntityState:
+	case Msg::EntityLocal:
+	case Msg::EntitySound:
+	case Msg::ReqResult:
+	case Msg::TimeSync:
+	case Msg::WeatherSync:
+	case Msg::Emission:
+	case Msg::ZoneState:
+	case Msg::TaskList:
+	case Msg::StoryHash:
+	case Msg::DialogLockResult:
+	case Msg::DialogPhrases:
+	case Msg::MoneyBalance: // F2 T1: only the host holds balances
+	case Msg::StateDump: return MsgSender::HostOnly;
+
+	// a client's requests and reports
 	case Msg::JoinRequest:
 	case Msg::WorldLoaded:
 	case Msg::TransitionVote:
-	case Msg::ReqMoney: return MsgSender::ClientOnly; // F2 T1: the host changes its own money directly
-	default: return MsgSender::Either;
+	case Msg::PlayerVitals:
+	case Msg::EntityEvent: // use / push / throw / activate (coop_objects.h): the host applies it
+	case Msg::ReqSpawn:
+	case Msg::ReqDestroy:
+	case Msg::ReqTake:
+	case Msg::ReqDrop:
+	case Msg::ReqTransfer:
+	case Msg::ReqUse:
+	case Msg::ReqHit:
+	case Msg::ReqMoney: // F2 T1: the host changes its own money directly
+	case Msg::ReqContainer:
+	case Msg::ReqItemEvent:
+	case Msg::ReqLaunch:
+	case Msg::TimeRequest:
+	case Msg::StoryResync:
+	case Msg::DialogLock:
+	case Msg::DialogSelect:
+	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
+
+	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender
+	case Msg::PlayerState:
+	case Msg::PlayerEquip:
+	case Msg::PlayerAnim:
+	case Msg::PlayerShot:
+	case Msg::PlayerGrenade:
+	case Msg::PlayerWounded:
+	case Msg::PlayerRevive:
+	case Msg::PlayerDied:
+	case Msg::ItemState:
+	case Msg::InfoPortion:
+	case Msg::TaskUpdate:
+	case Msg::MapSpot:
+	case Msg::Relation:
+	case Msg::Progress:
+	case Msg::DialogUnlock:
+	case Msg::TradeOp:
+	case Msg::ScriptEvent: return MsgSender::Either;
+
+	// core messages: the Session's own dispatch checks them
+	case Msg::Hello:
+	case Msg::Welcome:
+	case Msg::Reject:
+	case Msg::Bye:
+	case Msg::BlobBegin:
+	case Msg::BlobChunk:
+	case Msg::BlobEnd:
+	case Msg::PeerList:
+	case Msg::Chat:
+	case Msg::WorldEpoch: return MsgSender::Either;
 	}
+	return MsgSender::Either; // not a message of the protocol: no handler takes it
 }
 
 const char* reject_reason_name(RejectReason r)
