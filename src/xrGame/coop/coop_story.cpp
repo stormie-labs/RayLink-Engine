@@ -3,6 +3,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "xrCoop/coop_rules.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -91,6 +92,9 @@ enum : u8
 
 const char* cs(const shared_str& s) { return s.c_str() ? s.c_str() : ""; }
 shared_str to_shared(const std::string& s) { return s.empty() ? shared_str() : shared_str(s.c_str()); }
+
+// R4 1: UI / sleep info portions belong to one machine (coop_rules.h): not sent, not applied, not hashed.
+bool machine_info(const shared_str& id) { return rules::is_machine_info(cs(id)); }
 
 u16 host_id_of(u16 local) { return local == kNoId ? kNoId : join::to_host(local); }
 u16 local_id_of(u16 host) { return host == kNoId ? kNoId : join::to_local(host); }
@@ -281,6 +285,8 @@ DomainHash hash_infos()
 	{
 		for (const shared_str& id : *v)
 		{
+			if (machine_info(id))
+				continue; // R4 1: UI / sleep infos are not part of the group story
 			if (g_local_infos.count(id))
 				continue; // client: held by this machine only (the host does not have it)
 			Fnv f;
@@ -295,6 +301,8 @@ void client_apply_info(bool give, const shared_str& id)
 {
 	if (!g_actor || !id.size())
 		return;
+	if (machine_info(id))
+		return; // R4 1: never applied from the network (the host's UI is not ours)
 	g_info_requests.erase(std::make_pair(u8(give ? InfoGive : InfoDisable), id));
 	g_local_infos.erase(id); // the host's word: shared from now on
 	Applying guard(Kind::Info, id);
@@ -310,11 +318,16 @@ void send_info_list(PeerId to)
 	const KNOWN_INFO_VECTOR* v = actor_infos();
 	if (!v)
 		return;
-	Writer w(v->size() * 32 + 8);
-	w.u8(InfoFull);
-	w.u32((u32)v->size());
+	xr_vector<const shared_str*> shared; // R4 1: UI / sleep infos stay on the host
+	shared.reserve(v->size());
 	for (const shared_str& id : *v)
-		w.str(cs(id));
+		if (!machine_info(id))
+			shared.push_back(&id);
+	Writer w(shared.size() * 32 + 8);
+	w.u8(InfoFull);
+	w.u32((u32)shared.size());
+	for (const shared_str* id : shared)
+		w.str(cs(*id));
 	net::host_send(to, Msg::InfoPortion, w);
 	++g_stats.infos_out;
 }
@@ -324,7 +337,11 @@ void client_apply_info_list(Reader& r)
 	const u32 n = r.u32();
 	xr_set<shared_str> host;
 	for (u32 i = 0; i < n && r.ok(); ++i)
-		host.insert(to_shared(r.str()));
+	{
+		const shared_str id = to_shared(r.str());
+		if (!machine_info(id)) // R4 1: the host's UI / sleep infos are not ours
+			host.insert(id);
+	}
 	if (!r.ok() || !g_actor)
 		return;
 	for (auto it = g_local_infos.begin(); it != g_local_infos.end();)
@@ -336,7 +353,7 @@ void client_apply_info_list(Reader& r)
 		for (const shared_str& id : *v)
 			mine.insert(id);
 		for (const shared_str& id : mine)
-			if (!host.count(id) && !g_local_infos.count(id))
+			if (!host.count(id) && !g_local_infos.count(id) && !machine_info(id)) // R4 1: ours alone, keep
 				drop.push_back(id);
 		for (const shared_str& id : host)
 			if (id.size() && !mine.count(id))
@@ -1963,6 +1980,8 @@ void handle_host(Msg type, PeerId from, Reader& r)
 		const shared_str id = to_shared(r.str());
 		if (!r.ok() || !id.size() || (op != InfoGive && op != InfoDisable) || !g_actor)
 			return;
+		if (machine_info(id))
+			return; // R4 1: a client's UI / sleep info is its own (an old client may still send it)
 		++g_stats.requests_in;
 		const bool give = op == InfoGive;
 		ExecFor ef(from);
@@ -2364,6 +2383,8 @@ bool on_info(const CInventoryOwner* owner, const shared_str& info_id, bool give)
 {
 	if (!owner || !info_id.size() || !mgr().active() || owner->object_id() != 0)
 		return false;
+	if (machine_info(info_id))
+		return false; // R4 1: UI / sleep info of this machine: applied here, never sent, never held or dropped
 	if (owner->HasInfo(info_id) == give)
 		return false; // nothing changes: let the engine run its no-op path
 	const u8 op = give ? InfoGive : InfoDisable;
