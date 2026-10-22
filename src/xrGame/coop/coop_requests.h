@@ -27,6 +27,9 @@
 //                 mechanic (his talk lock, a live stalker with mechanic settings, within 6 m), the price
 //                 (paid >= floor(cost x upgrade_min_percent)) and the balance, relays the upgrade, answers (always),
 //                 then charges `paid` — the MoneyBalance follows the answer, also after a refusal of a paid one.
+//                 Fix round 1: a sold upgrade goes onto the host's game object and the others' copies (the owner's
+//                 ItemState never adds one); a client whose upgrade was refused builds the item again from the
+//                 host's entity (local destroy, StateDumpRequest).
 //   ReqLaunch     u32 seq, u16 launcher, u16 rocket, vec3 pos, vec3 dir, vec3 vel, vec3 angular_vel (W3a)
 //                 the client already launched its copy (a visual that never detonates there); the host
 //                 checks it, launches its own copy (it flies, detonates, is removed for everybody) and

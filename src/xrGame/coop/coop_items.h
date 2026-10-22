@@ -90,6 +90,10 @@ enum class AddedUpgrade : u8
 	Refused,
 };
 AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why);
+// Host (F2 T5 fix round 1): the host sold an upgrade of item `id` to player `owner` (ReqItemEvent accepted, the entity
+// holds it). The host's game object of the item takes the entity's list (a loading install: no event, no Lua price) and
+// the other players' copies get the host's state of it. The owner's own ItemState never adds an upgrade on the host.
+void host_upgrade_sold(u16 id, PeerId owner);
 
 // --- F2 T5: an upgrade a client buys at a mechanic ---
 // requests::client_item_event, the client's GE_INSTALL_UPGRADE of `local_item`: inside an UpgradePurchase of that item,

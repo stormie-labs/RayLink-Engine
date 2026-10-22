@@ -46,8 +46,9 @@ int g_gain_per_min = int(ledger::Policy().script_gain_per_min);
 int g_dialog_cap = int(ledger::Policy().dialog_gain_cap);
 int g_dialog_per_min = int(ledger::Policy().dialog_gain_per_min);
 int g_max_money = int(ledger::Policy().max_money);
-// 1.7 (the lowest stock mech_discount) x 1.3 (the lowest `upgrade` factor of plugins\difficulty.ltx), for F2 T5.
-float g_upgrade_min_percent = 2.21f;
+// F2 T5 fix round 1 (review 2): 1.7 (the lowest stock mech_discount) x 1.0 (the economy slider `upgrade` of
+// ui_options.script starts at 1.0; plugins\difficulty.ltx 1.3 is only a preset's value).
+float g_upgrade_min_percent = 1.7f;
 bool g_scripted_upgrades = false; // F2 T5: upgrades that name no mechanic (a script's) are refused
 
 ledger::Policy policy()

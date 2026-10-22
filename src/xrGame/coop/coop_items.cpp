@@ -32,6 +32,7 @@
 #include "../xrServerEntities/xrServer_Objects.h"
 #include "../xrServerEntities/xrMessages.h"
 #include "xrCoop/coop_item_tags.h"
+#include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_upgrades.h"
@@ -134,6 +135,7 @@ struct Stats
 	u64 rejected[u32(Reason::Count)] = {};
 	u64 upgrades_dropped = 0; // R3 В6: unknown / out-of-order / clashing upgrades never reach a loading install
 	u64 dropped_before_live = 0; // R2 I2: client, ItemState that came before we were live
+	u64 upgrades_sold = 0; // F2 T5 fix round 1: host, sold upgrades installed on its copy and sent to the others
 };
 Stats g_stats;
 
@@ -1134,8 +1136,8 @@ bool host_validate_kind(CSE_Abstract* e, const ItemData& d, const char*& why)
 	return true;
 }
 
-// Refused: counts no item of this kind can have (rounds or portions out of nothing).
-// Checked after the upgrades are installed: they may enlarge the magazine.
+// Refused: counts no item of this kind can have (rounds or portions out of nothing). The host copy has the upgrades the
+// host sold (F2 T5): a magazine an upgrade enlarged fits the slack of the cap.
 bool host_validate_counts(CSE_Abstract* e, CInventoryItem* item, const ItemData& d, const char*& why)
 {
 	if (d.has_uses && item)
@@ -1283,8 +1285,11 @@ void host_on_state(PeerId from, Reader& r)
 		return;
 	}
 	CInventoryItem* item = find_item(id);
-	if (item && !ammo_only && d.has_upgrades)
-		install_upgrades(item, d.upgrades); // unknown ones are skipped
+	// F2 T5 fix round 1 (review 1): the owner's upgrade list never reaches the host copy. An upgrade is bought from a
+	// mechanic (ReqItemEvent: checked and charged, then host_upgrade_sold installs it here); one taken from this state
+	// would be unpaid and still count in the copy's price (CInventoryItem::Cost), which a trade on the host pays. The
+	// copy and the relay below keep the host's list.
+	ledger::host_keeps_own_upgrades(d);
 	if (!host_validate_counts(e, item, d, why))
 	{
 		reject(Reason::Insane, from, id, why);
@@ -1507,6 +1512,7 @@ void host_push(u16 id, PeerId peer)
 	Owned& o = g_owned[id];
 	o.peer = peer;
 	o.data = d;
+	ledger::host_keeps_own_upgrades(o.data); // F2 T5 fix round 1: the list is the host's, never enforced from here
 	o.stuck = false;
 	g_left.erase(id);
 	host_send_view(id, e, item, nullptr, kFlagAuthority, kInvalidPeer);
@@ -1547,6 +1553,7 @@ void host_track_proxies(u64 now)
 				Owned& o = g_owned[id];
 				o.peer = peer;
 				capture_object(item, o.data);
+				ledger::host_keeps_own_upgrades(o.data); // F2 T5 fix round 1: the host's list, not enforced
 				o.stuck = false;
 			}
 			g_proxy_items.emplace(proxy, cur);
@@ -1767,9 +1774,10 @@ void print_status()
 		for (const auto& it : g_owned)
 			stuck += it.second.stuck ? 1 : 0;
 		::Msg("[coop]   items host: %u tracked (%u stuck), %llu relayed, %llu pushed, %llu enforced, "
-		      "%llu boxes released, ammo spawns %llu ok (%llu rounds, %llu repeats)",
+		      "%llu boxes released, ammo spawns %llu ok (%llu rounds, %llu repeats), %llu sold upgrades installed "
+		      "(owners' upgrade lists are never taken, F2 T5)",
 		    (u32)g_owned.size(), stuck, s.relayed, s.pushed, s.enforced, s.boxes_released, s.spawns_ok,
-		    s.spawn_rounds, s.spawns_repeat);
+		    s.spawn_rounds, s.spawns_repeat, s.upgrades_sold);
 		::Msg("[coop]   items refused: malformed %llu, no character %llu, missing %llu, section %llu, "
 		      "not owner %llu, moved %llu, insane %llu",
 		    s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4], s.rejected[5],
@@ -1921,6 +1929,19 @@ AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& up
 		why = verdict_name(v);
 		return AddedUpgrade::Refused;
 	}
+}
+
+void host_upgrade_sold(u16 id, PeerId owner)
+{
+	CSE_Abstract* e = find_entity(id);
+	CSE_ALifeInventoryItem* ii = e ? smart_cast<CSE_ALifeInventoryItem*>(e) : nullptr;
+	if (!ii)
+		return;
+	CInventoryItem* item = find_item(id);
+	if (item)
+		install_upgrades(item, ii->m_upgrades); // a loading install: no event, no Lua price
+	host_send_view(id, e, item, nullptr, 0, owner); // the owner has it already
+	++g_stats.upgrades_sold;
 }
 
 // ---------------------------------------------------------------- F2 T5: an upgrade bought at a mechanic (client)

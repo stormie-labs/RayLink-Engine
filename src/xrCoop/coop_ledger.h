@@ -471,8 +471,9 @@ enum class UpgradeVerdict : uint8_t
 {
 	Ok,
 	Scripted, // no mechanic named (a script installed it) and the host does not take those (scripted_upgrades)
-	NoMechanic, // not a live stalker whose talk lock the player holds, or not a mechanic (stalkers_upgrade_info)
+	NoMechanic, // not a live NPC with an inventory whose talk lock the player holds and stalkers_upgrade_info names
 	TooFar, // the player's character on the host stands farther than the reach from the mechanic
+	UnknownCost, // fix round 1 (review 4): the host cannot read the upgrade's cost (never priced at 0)
 	Underpaid, // paid less than floor(cost x upgrade_min_percent)
 	Insufficient, // the player's balance on the host does not cover what he paid
 };
@@ -488,12 +489,13 @@ struct UpgradeFacts
 	float reach = 6.f;
 	uint32_t paid = 0; // what the client's game charged for it
 	uint32_t cost = 0; // `cost` of the upgrade's section
+	bool cost_known = false; // the host read `cost` (fix round 1, review 4)
 	float min_percent = 0.f;
 	uint32_t balance = 0; // the player's balance on the host
 };
 
-// The checks in order: a mechanic, within reach, paid enough, has the money. An upgrade without a mechanic (a script's)
-// has no price: if the host takes those, it only needs the money it paid.
+// The checks in order: a mechanic, within reach, a cost the host knows, paid enough, has the money. An upgrade without a
+// mechanic (a script's) has no price: if the host takes those, it only needs the money it paid.
 inline UpgradeVerdict judge_upgrade(const UpgradeFacts& f)
 {
 	if (!f.mechanic_named)
@@ -506,11 +508,57 @@ inline UpgradeVerdict judge_upgrade(const UpgradeFacts& f)
 		return UpgradeVerdict::NoMechanic;
 	if (!(f.distance <= f.reach)) // NaN is never near
 		return UpgradeVerdict::TooFar;
+	if (!f.cost_known)
+		return UpgradeVerdict::UnknownCost;
 	if (!upgrade_price_ok(f.paid, f.cost, f.min_percent))
 		return UpgradeVerdict::Underpaid;
 	if (f.paid > f.balance)
 		return UpgradeVerdict::Insufficient;
 	return UpgradeVerdict::Ok;
+}
+
+// The NPC an upgrade names, as the host sees him (fix round 1, review 3). A mechanic is any live NPC with an inventory
+// (CInventoryOwner: a stalker, or a trader class like the Forester, m_lesnik : m_trader, CAI_Trader) whose talk lock the
+// player holds (the stock upgrade windows run inside the mechanic's dialog) and whose section the mechanics' settings
+// name (misc\stalkers_upgrade_info.ltx [<section>] or [<section>_upgr]); never a player's character.
+struct MechanicFacts
+{
+	bool talk_lock = false; // the requesting player holds this NPC's talk lock
+	bool inventory_owner = false; // a CInventoryOwner game object
+	bool alive = false;
+	bool player = false; // a player's character (the host's actor or a proxy)
+	bool listed = false; // stalkers_upgrade_info names its section
+};
+
+enum class MechanicCheck : uint8_t
+{
+	Ok,
+	NotHisTalk,
+	NotAlive, // gone, dead, or no inventory (a monster, an object)
+	NotMechanic, // the settings do not name it, or a player's character
+};
+
+inline MechanicCheck check_mechanic(const MechanicFacts& m)
+{
+	if (!m.talk_lock)
+		return MechanicCheck::NotHisTalk;
+	if (!m.inventory_owner || !m.alive)
+		return MechanicCheck::NotAlive;
+	if (m.player || !m.listed)
+		return MechanicCheck::NotMechanic;
+	return MechanicCheck::Ok;
+}
+
+// Fix round 1 (review 1): an owner's item state (Msg::ItemState) never brings an upgrade to the host. The host copy of
+// a player's item takes upgrades only from a purchase the host accepted (ReqItemEvent, judge_upgrade) and from its own
+// entity: an owner's list taken onto it would put unpaid upgrades into its price (the section's cost plus each upgrade's,
+// CInventoryItem::Cost), which a trade on the host pays. `State` is the item layer's ItemData (has_upgrades, upgrades);
+// a state without the tag leaves a copy's list as it is.
+template <class State>
+void host_keeps_own_upgrades(State& owner_state)
+{
+	owner_state.has_upgrades = false;
+	owner_state.upgrades.clear();
 }
 
 // Msg::ReqItemEvent ends with this (F2 T5), after the event bytes. Wire: u16 mechanic, u32 paid (6 bytes).

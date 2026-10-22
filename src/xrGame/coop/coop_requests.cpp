@@ -550,6 +550,119 @@ void client_flush()
 	}
 }
 
+// ---------------------------------------------------------------- F2 T5 fix round 1: a refused upgrade (client)
+// The host refused an upgrade this client installed on its item already (the engine installs before the request goes).
+// An installed upgrade cannot leave a live object: its properties were added to the ones the item loaded, and a list is
+// installed only on a fresh object (CInventoryItem::net_Spawn_install_upgrades). So the item is built again from the
+// host's entity, which keeps the host's list: it is destroyed here as a host command (the local server does it,
+// nothing goes to the host), and once it is gone it is asked for again with its children (StateDumpRequest; the
+// host's EntitySpawn creates it in our inventory with the same id). Bounded: kMaxRebuilds at a time, a few tries.
+constexpr size_t kMaxRebuilds = 16;
+constexpr size_t kMaxRebuildChildren = 16;
+constexpr u64 kRebuildDestroyMs = 5000; // the local destroy chain takes a frame or two
+constexpr u64 kRebuildAskMs = 3000; // no EntitySpawn yet: ask again
+constexpr u32 kRebuildTries = 3;
+
+struct Rebuild
+{
+	u16 host_id = kNoId;
+	xr_vector<u16> children; // host numbering
+	u32 epoch = 0; // the world it belongs to
+	u64 at = 0; // destroyed / last asked
+	u32 asked = 0;
+};
+xr_map<u16, Rebuild> g_rebuilds; // local id -> (main thread)
+u64 g_rebuilt = 0, g_rebuild_lost = 0;
+
+void client_rebuild_item(u16 local_item)
+{
+	if (local_item == kNoId || local_item == kActor || g_rebuilds.size() >= kMaxRebuilds ||
+	    g_rebuilds.count(local_item) || !mgr().is_live_client())
+		return;
+	CSE_Abstract* e = events::find_entity(local_item);
+	CGameObject* go = find_go(local_item);
+	if (!e || !go || go->getDestroy() || events::root_of(local_item) != kActor)
+		return; // not ours, not online here: nothing of ours to correct
+	Rebuild& rb = g_rebuilds[local_item];
+	rb.host_id = to_host_id(local_item);
+	for (u16 child : e->children)
+		if (rb.children.size() < kMaxRebuildChildren)
+			rb.children.push_back(to_host_id(child));
+	rb.epoch = mgr().session().world_epoch();
+	rb.at = mgr().now_ms();
+	entities::ClientApply apply; // a host command: nothing goes to the host
+	NET_Packet packet;
+	packet.w_begin(M_EVENT);
+	packet.w_u32(Level().timeServer());
+	packet.w_u16(GE_DESTROY);
+	packet.w_u16(local_item);
+	Level().Send(packet, net_flags(TRUE, TRUE));
+	++g_rebuilt;
+	if (log_allowed())
+		::Msg("[coop] the host refused an upgrade of item %u: it is built again from the host's copy", local_item);
+}
+
+void client_ask_rebuild(const Rebuild& rb)
+{
+	Writer w(4);
+	w.u16(rb.host_id); // the holder before its children
+	net::client_send(Msg::StateDumpRequest, w);
+	for (u16 child : rb.children)
+	{
+		Writer wc(4);
+		wc.u16(child);
+		net::client_send(Msg::StateDumpRequest, wc);
+	}
+}
+
+void client_pump_rebuilds()
+{
+	if (g_rebuilds.empty())
+		return;
+	const u64 now = mgr().now_ms();
+	const u32 epoch = mgr().session().world_epoch();
+	for (auto it = g_rebuilds.begin(); it != g_rebuilds.end();)
+	{
+		Rebuild& rb = it->second;
+		const bool here = events::find_entity(it->first) != nullptr;
+		if (rb.epoch != epoch || (rb.asked && here))
+		{
+			it = g_rebuilds.erase(it); // another world (it came with the host's state), or back from the host
+			continue;
+		}
+		if (!rb.asked)
+		{
+			if (here)
+			{
+				if (now - rb.at > kRebuildDestroyMs)
+				{
+					++g_rebuild_lost; // the local destroy did not happen: keep it as it is
+					it = g_rebuilds.erase(it);
+					continue;
+				}
+				++it;
+				continue;
+			}
+			client_ask_rebuild(rb); // gone here: the host's copy
+			rb.asked = 1;
+			rb.at = now;
+		}
+		else if (now - rb.at > kRebuildAskMs)
+		{
+			if (rb.asked >= kRebuildTries)
+			{
+				++g_rebuild_lost; // the host has it no more (or does not answer): its relays decide
+				it = g_rebuilds.erase(it);
+				continue;
+			}
+			client_ask_rebuild(rb);
+			++rb.asked;
+			rb.at = now;
+		}
+		++it;
+	}
+}
+
 void client_on_result(PeerId, Reader& r)
 {
 	const u32 seq = r.u32();
@@ -559,10 +672,12 @@ void client_on_result(PeerId, Reader& r)
 	if (!r.ok())
 		return;
 	Msg type = Msg::ReqResult;
+	u16 local_item = kNoId;
 	auto it = g_inflight.find(seq);
 	if (it != g_inflight.end())
 	{
 		type = it->second.type;
+		local_item = it->second.item;
 		// F2 T5: an upgrade's answer. The host sends the balance right after it (charged or not), so the money shown
 		// stays as it is until then.
 		money::client_release(it->second.hold);
@@ -574,6 +689,11 @@ void client_on_result(PeerId, Reader& r)
 		return;
 	}
 	++g_cl.rejected;
+	// F2 T5 fix round 1 (review 1): our item has the upgrade the host refused; it is built again from the host's
+	// entity. Not for Offline / NoProxy: our world is being replaced (or we have no character), and the next world
+	// comes with the host's state of our items.
+	if (type == Msg::ReqItemEvent && reason != u8(Reason::Offline) && reason != u8(Reason::NoProxy))
+		client_rebuild_item(local_item);
 	if (type == Msg::ReqTake || type == Msg::ReqDrop || type == Msg::ReqTransfer)
 		trade::invalidate_views(); // an open box/body window shows the real content again
 	if (log_allowed())
@@ -709,13 +829,15 @@ void reply(const Req& q, Reason why, u16 subject)
 }
 
 // Common checks of every request. False = drop (already answered when an answer makes sense).
+// Precaching: the world was just loaded. The session pump runs before join::frame() notices the
+// new world and marks the peers as joining, so requests made in the old world would land here.
+bool host_drops_requests_of(PeerId from) { return sync::host_peer_joining(from) || Device.dwPrecacheFrame; }
+
 bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 {
 	if (!mgr().is_host())
 		return false;
-	// Precaching: the world was just loaded. The session pump runs before join::frame() notices the
-	// new world and marks the peers as joining, so requests made in the old world would land here.
-	if (sync::host_peer_joining(from) || Device.dwPrecacheFrame)
+	if (host_drops_requests_of(from))
 	{
 		++g_h.dropped_joining; // its ids belong to a world that was replaced (load, level change)
 		return false;
@@ -1456,15 +1578,17 @@ struct UpgradeCounters
 	u64 verdicts[ledger::kUpgradeVerdictCount] = {};
 	u64 without_mechanic = 0; // requests that named no mechanic (a script installed the upgrade)
 	u64 bought = 0, charged = 0, already = 0, engine = 0, no_cost = 0, not_his = 0, not_alive = 0, not_mechanic = 0;
+	u64 answered_dropped = 0; // fix round 1 (review 5): requests host_begin drops silently, answered here
 } g_upgrades;
 
-CInifile* open_game_config(LPCSTR name)
+// `missing`: what a missing file means, for the log (fix round 1, review 4: the line says what the host then does).
+CInifile* open_game_config(LPCSTR name, LPCSTR missing)
 {
 	string_path path;
 	FS.update_path(path, "$game_config$", name);
 	if (!FS.exist(path))
 	{
-		::Msg("! [coop] configs\\%s not found: client upgrades at a mechanic are refused", name);
+		::Msg("! [coop] configs\\%s not found: %s", name, missing);
 		return nullptr;
 	}
 	return xr_new<CInifile>(path, TRUE, TRUE, FALSE);
@@ -1473,14 +1597,16 @@ CInifile* open_game_config(LPCSTR name)
 // Mechanics: [<section>] (discount, tiers) and [<section>_upgr] (his own upgrade conditions).
 CInifile* upgrade_info_ini()
 {
-	static CInifile* ini = open_game_config("misc\\stalkers_upgrade_info.ltx");
+	static CInifile* ini = open_game_config("misc\\stalkers_upgrade_info.ltx",
+	    "no NPC is a mechanic, every client upgrade at one is refused");
 	return ini;
 }
 
 // Upgrade prices as the Lua price reads them (char_ini): item_upgrades.ltx is not part of system.ltx.
 CInifile* item_upgrades_ini()
 {
-	static CInifile* ini = open_game_config("item_upgrades.ltx");
+	static CInifile* ini = open_game_config("item_upgrades.ltx",
+	    "upgrade costs come from the game settings; an upgrade without one there is refused");
 	return ini;
 }
 
@@ -1521,30 +1647,39 @@ bool upgrade_cost(const shared_str& upgrade, u32& cost)
 	return false;
 }
 
-// `mechanic` (host numbering) sells upgrades to player `from` now: he holds that NPC's talk lock (the stock upgrade
-// windows run inside the mechanic's dialog; coop_dialog), it is a live stalker, and the mechanics' settings name it.
+// `mechanic` (host numbering) sells upgrades to player `from` now (ledger::check_mechanic): he holds that NPC's talk
+// lock (the stock upgrade windows run inside the mechanic's dialog; coop_dialog); it is a live NPC with an inventory, a
+// stalker or a trader class (fix round 1, review 3: the Forester, m_lesnik : m_trader, is a CAI_Trader), and not a
+// player's character; the mechanics' settings name its section.
 bool host_his_mechanic(PeerId from, u16 mechanic, const char*& why)
 {
-	if (dialog::host_lock_of(from) != mechanic)
+	ledger::MechanicFacts m;
+	m.talk_lock = dialog::host_lock_of(from) == mechanic;
+	CGameObject* go = m.talk_lock ? smart_cast<CGameObject*>(Level().Objects.net_Find(mechanic)) : nullptr;
+	if (go && go->getDestroy())
+		go = nullptr;
+	CEntityAlive* npc = go ? smart_cast<CEntityAlive*>(go) : nullptr;
+	m.inventory_owner = go && smart_cast<CInventoryOwner*>(go);
+	m.alive = npc && npc->g_Alive();
+	m.player = go && world::is_player_character(go);
+	m.listed = go && is_mechanic_section(go->cNameSect());
+	switch (ledger::check_mechanic(m))
 	{
+	case ledger::MechanicCheck::Ok: return true;
+	case ledger::MechanicCheck::NotHisTalk:
 		++g_upgrades.not_his;
 		why = "he does not talk to him";
 		return false;
-	}
-	CAI_Stalker* s = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(mechanic));
-	if (!s || s->getDestroy() || !s->g_Alive())
-	{
+	case ledger::MechanicCheck::NotAlive:
 		++g_upgrades.not_alive;
-		why = "not a live stalker";
+		why = "not a live NPC with an inventory";
 		return false;
-	}
-	if (!is_mechanic_section(s->cNameSect()))
-	{
+	case ledger::MechanicCheck::NotMechanic:
 		++g_upgrades.not_mechanic;
 		why = "not a mechanic";
 		return false;
 	}
-	return true;
+	return false;
 }
 
 const char* upgrade_verdict_name(ledger::UpgradeVerdict v)
@@ -1555,6 +1690,7 @@ const char* upgrade_verdict_name(ledger::UpgradeVerdict v)
 	case ledger::UpgradeVerdict::Scripted: return "no mechanic named (scripted_upgrades = false)";
 	case ledger::UpgradeVerdict::NoMechanic: return "no mechanic";
 	case ledger::UpgradeVerdict::TooFar: return "too far from the mechanic";
+	case ledger::UpgradeVerdict::UnknownCost: return "the upgrade's cost is unknown here";
 	case ledger::UpgradeVerdict::Underpaid: return "underpaid";
 	case ledger::UpgradeVerdict::Insufficient: return "not enough money on the host";
 	}
@@ -1562,8 +1698,8 @@ const char* upgrade_verdict_name(ledger::UpgradeVerdict v)
 }
 
 // The brief's checks before the upgrade's own (host_check_added_upgrade): a mechanic, within kTradeReach of the
-// player's character, paid at least floor(cost x upgrade_min_percent), and the player's balance on the host covers it.
-// Refusals are NotAllowed on the wire, counted by cause.
+// player's character, a cost the host knows (fix round 1, review 4), paid at least floor(cost x upgrade_min_percent),
+// and the player's balance on the host covers it. Refusals are NotAllowed on the wire, counted by cause.
 Reason host_sell_upgrade(const Req& q, const shared_str& upgrade, const ledger::UpgradePayment& pay)
 {
 	ledger::UpgradeFacts f;
@@ -1574,8 +1710,9 @@ Reason host_sell_upgrade(const Req& q, const shared_str& upgrade, const ledger::
 	f.distance = f.mechanic_ok ? talk_distance(pay.mechanic, q.proxy) : flt_max;
 	f.reach = trade::kTradeReach;
 	f.paid = pay.paid;
-	if (f.mechanic_named && !upgrade_cost(upgrade, f.cost))
-		++g_upgrades.no_cost; // host_check_added_upgrade judges such a name next
+	f.cost_known = upgrade_cost(upgrade, f.cost);
+	if (f.mechanic_named && !f.cost_known)
+		++g_upgrades.no_cost; // refused (UnknownCost) when the mechanic is right and near
 	f.min_percent = money::upgrade_min_percent();
 	f.balance = money::host_balance(q.from);
 	if (!f.mechanic_named)
@@ -1602,21 +1739,55 @@ void answer_upgrade(const Req& q, Reason why, u16 item, u32 paid)
 		money::host_send_balance(q.from);
 }
 
+// A ReqItemEvent after its seq: u16 item, u16 ge_type, u16 size, the event bytes, the payment (F2 T5).
+struct ItemEventBody
+{
+	u16 item = kNoId, type = 0, size = 0;
+	u8 data[512];
+	ledger::UpgradePayment pay;
+};
+
+bool read_item_event(Reader& r, ItemEventBody& b)
+{
+	b.item = r.u16();
+	b.type = r.u16();
+	b.size = r.u16();
+	return r.ok() && b.size <= sizeof(b.data) && r.bytes(b.data, b.size) && ledger::read(r, b.pay);
+}
+
 void host_on_item_event(PeerId from, Reader& r)
 {
+	// Fix round 1 (review 5): host_begin drops a request silently while its player joins or a world is precached. The
+	// client of an upgrade holds what it paid until the answer, so this one is answered: Offline (his world is being
+	// replaced; the new one brings the host's state of his items), with the balance after it.
+	if (mgr().is_host() && host_drops_requests_of(from))
+	{
+		Reader peek = r;
+		Req dropped;
+		dropped.from = from;
+		dropped.type = Msg::ReqItemEvent;
+		dropped.seq = peek.u32();
+		ItemEventBody b;
+		if (read_item_event(peek, b))
+		{
+			++g_upgrades.answered_dropped;
+			answer_upgrade(dropped, Reason::Offline, b.item, b.pay.paid);
+		}
+	}
 	Req q;
 	if (!host_begin(from, r, Msg::ReqItemEvent, q))
 		return;
-	const u16 item = r.u16();
-	const u16 type = r.u16();
-	const u16 size = r.u16();
-	u8 data[512];
-	ledger::UpgradePayment pay; // F2 T5: the event bytes are followed by the payment
-	if (!r.ok() || size > sizeof(data) || !r.bytes(data, size) || !ledger::read(r, pay))
+	ItemEventBody b;
+	if (!read_item_event(r, b))
 		return reply(q, Reason::Malformed, kNoId);
-	if (!allow(from, CatMisc))
-		return reply(q, Reason::RateLimited, item);
+	const u16 item = b.item;
+	const u16 type = b.type;
+	const u16 size = b.size;
+	const u8* data = b.data;
+	const ledger::UpgradePayment& pay = b.pay; // F2 T5: the event bytes are followed by the payment
 	const auto answer = [&q, item, &pay](Reason why) { answer_upgrade(q, why, item, pay.paid); };
+	if (!allow(from, CatMisc))
+		return answer(Reason::RateLimited); // fix round 1 (review 5): with the balance, as every other answer
 	if (type != GE_INSTALL_UPGRADE)
 		return answer(Reason::NotAllowed);
 	if (!events::find_entity(item))
@@ -1673,6 +1844,9 @@ void host_on_item_event(PeerId from, Reader& r)
 	reply(q, Reason::Ok, item);
 	if (pay.paid && money::host_adjust(from, -s64(pay.paid), "upgrade"))
 		g_upgrades.charged += pay.paid;
+	// Fix round 1 (review 1): the host's game object of the item takes it now (the owner's ItemState never adds one),
+	// and the other players' copies get the host's state of the item.
+	items::host_upgrade_sold(item, from);
 }
 
 // ---------------------------------------------------------------- rockets (W3a)
@@ -1869,6 +2043,7 @@ void reset()
 		g_launches.clear(); // W3a
 	}
 	g_inflight.clear();
+	g_rebuilds.clear(); // F2 T5 fix round 1
 	g_limits.clear();
 	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
 	g_spawn_queue.clear(drop_queued); // Ruling F2-21: nothing of the old session is created
@@ -1898,6 +2073,8 @@ void frame()
 		return;
 	client_flush_launches(); // W3a: before the outbox (a launch usually precedes a drop of the launcher)
 	client_flush();
+	if (mgr().is_live_client())
+		client_pump_rebuilds(); // F2 T5 fix round 1
 }
 
 void register_console()
@@ -1944,14 +2121,16 @@ void print_status()
 		using ledger::UpgradeVerdict;
 		const auto upgrade_refused = [](UpgradeVerdict v) { return g_upgrades.verdicts[u32(v)]; };
 		::Msg("[coop]   upgrades at a mechanic (F2 T5): %llu bought (%llu RU charged), %llu already there, refused: no "
-		      "mechanic %llu (not his talk %llu, not a live stalker %llu, not a mechanic %llu), too far %llu, underpaid "
-		      "%llu, not enough money %llu, engine %llu; upgrades without a mechanic %llu (%llu refused, "
-		      "scripted_upgrades %s); %llu without a cost",
+		      "mechanic %llu (not his talk %llu, not a live NPC with an inventory %llu, not a mechanic %llu), too far "
+		      "%llu, cost unknown %llu, underpaid %llu, not enough money %llu, engine %llu; upgrades without a mechanic "
+		      "%llu (%llu refused, scripted_upgrades %s); %llu named a mechanic without a cost; %llu answered while "
+		      "their player joined",
 		    g_upgrades.bought, g_upgrades.charged, g_upgrades.already, upgrade_refused(UpgradeVerdict::NoMechanic),
 		    g_upgrades.not_his, g_upgrades.not_alive, g_upgrades.not_mechanic, upgrade_refused(UpgradeVerdict::TooFar),
-		    upgrade_refused(UpgradeVerdict::Underpaid), upgrade_refused(UpgradeVerdict::Insufficient),
-		    g_upgrades.engine, g_upgrades.without_mechanic, upgrade_refused(UpgradeVerdict::Scripted),
-		    money::scripted_upgrades() ? "true" : "false", g_upgrades.no_cost);
+		    upgrade_refused(UpgradeVerdict::UnknownCost), upgrade_refused(UpgradeVerdict::Underpaid),
+		    upgrade_refused(UpgradeVerdict::Insufficient), g_upgrades.engine, g_upgrades.without_mechanic,
+		    upgrade_refused(UpgradeVerdict::Scripted), money::scripted_upgrades() ? "true" : "false",
+		    g_upgrades.no_cost, g_upgrades.answered_dropped);
 		return;
 	}
 	// sent[5] was ReqMoney (now coop_money, F2 T1)
@@ -1963,6 +2142,8 @@ void print_status()
 	    g_cl.child_dups, g_cl.lua_forwarded, g_cl.lua_refused, g_cl.hits_in);
 	::Msg("[coop]   hit perks (%s): %llu hits through the before-hit Lua, %llu dropped by it, %llu lua errors",
 	    g_coop_client_hit_perks ? "on" : "off", g_cl.hits_perked, g_cl.hits_cancelled, g_cl.perk_errors);
+	::Msg("[coop]   refused upgrades (F2 T5): %llu items built again from the host's copy (%u waiting, %llu given up)",
+	    g_rebuilt, (u32)g_rebuilds.size(), g_rebuild_lost);
 }
 
 // ---------------------------------------------------------------- client API
