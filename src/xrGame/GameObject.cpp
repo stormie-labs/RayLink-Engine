@@ -40,6 +40,8 @@ extern MagicBox3 MagicMinBox(int iQuantity, const Fvector* akPoint);
 #pragma warning(disable:4995)
 #include <malloc.h>
 #pragma warning(pop)
+#include <atomic>
+#include <mutex>
 
 #ifdef DEBUG
 #	include "debug_renderer.h"
@@ -1047,6 +1049,10 @@ void VisualCallback(IKinematics* tpKinematics)
 		(*I)(tpKinematics);
 }
 
+// Anomaly Coop: xrCore's stack printer (xrDebugNew.cpp, used by the crash handler: Lua stack, then C++ stack).
+// xrDebug.h declares only a one-argument LogStackTrace that has no definition, so the real signature is declared here.
+void LogStackTrace(LPCSTR header, bool printStack);
+
 CScriptGameObject* CGameObject::lua_game_object() const
 {
 	if (!this) return NULL;
@@ -1054,6 +1060,14 @@ CScriptGameObject* CGameObject::lua_game_object() const
 	{
 		Msg("! you are trying to use a destroyed object [%i]", ID());
 		ai().script_engine().print_stack();
+		// Anomaly Coop: who still holds a destroyed object (F0 task 14): C++ stack for the first 3 hits
+		static std::atomic<u32> s_destroyed_hits{0};
+		if (s_destroyed_hits.fetch_add(1, std::memory_order_relaxed) < 3)
+		{
+			static std::mutex s_stack_lock; // DbgHelp behind the stack walker is single-threaded
+			std::lock_guard<std::mutex> lock(s_stack_lock);
+			LogStackTrace("! [coop] C++ stack of the access to a destroyed object (first 3 hits):", true);
+		}
 		return NULL;
 	}
 	if (!m_lua_game_object)
