@@ -112,6 +112,8 @@ void client_player_died(u16 local_killer);
 bool client_launch(u16 local_launcher, u16 local_rocket);
 
 // --- Lua wrappers on a client (alife():create/create_ammo/clone_weapon/register/release) ---
+// The request paths of the call gate (coop_callgate.h, F2 T12): alife_simulator_script.cpp asks the gate first and
+// calls these on Request.
 bool lua_client(); // true on a coop client in the host's world: the hooks below apply
 // Returns nullptr after forwarding/refusing; for register=false returns a temporary object
 // without an id that a later lua_register_spawn() forwards.
@@ -120,11 +122,16 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector& pos, u32 level_vertex,
     u16 game_vertex, u16 parent, bool register_now);
 CSE_Abstract* lua_register_spawn(CSE_Abstract* object);
-void lua_release(CSE_Abstract* object);
-CSE_Abstract* lua_refuse(const char* what);
+// alife():release on a client, the gate included: true = handled here (an own item released through the host, a
+// refusal, a temporary object that was never created); false = the gate runs the stock code (an ltx override).
+bool lua_release(CSE_Abstract* object);
+// A refusal of the request path after the gate let the call through: counted, logged by the gate (name = a kCalls
+// name such as "alife:register"). Returns nullptr.
+CSE_Abstract* lua_refuse(const char* name, const char* why);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
-// set_switch_online/offline; W3a). true on a coop client = refuse; logged once per `what` (a literal).
-bool lua_client_refuse(const char* what);
+// set_switch_online/offline; W3a). A wrapper over the call gate (F2 T12): name is the kCalls name ("alife:kill_entity"),
+// target the object id (0xffff = none). true on a coop client = refuse (the gate counted and logged it).
+bool lua_client_refuse(const char* name, u16 target = u16(-1));
 
 // --- damage (R-5.1) ---
 // CAI_Stalker::Hit hook. true = do not apply here. Host: a player character never takes damage

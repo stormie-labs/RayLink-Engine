@@ -25,6 +25,7 @@
 #include "coop_rest.h"
 #include "coop_autosave.h"
 #include "coop_router.h" // F2 T10
+#include "coop_callgate.h" // F2 T12
 
 #include "Level.h"
 #include "Actor.h"
@@ -67,6 +68,7 @@ void install(Session& s)
 	items::install(s);
 	objects::install(s);
 	router::install(); // F2 T10
+	callgate::install(); // F2 T12
 }
 
 void on_session_started()
@@ -91,6 +93,7 @@ void on_session_started()
 	items::reset();
 	objects::reset();
 	router::reset(); // F2 T10: call counters
+	callgate::reset(); // F2 T12: gated call counters, the log budget
 	g_joining.clear();
 }
 
@@ -133,6 +136,7 @@ void reset()
 	items::reset();
 	objects::reset();
 	router::reset(); // F2 T10: call counters
+	callgate::reset(); // F2 T12: gated call counters, the log budget
 	g_joining.clear();
 }
 
@@ -192,6 +196,7 @@ void print_status()
 	script::print_status();
 	syncapi::print_status(); // F2 T14
 	router::print_status(); // F2 T10
+	callgate::print_status(); // F2 T12
 	story::print_status();
 	events::print_status();
 	requests::print_status();

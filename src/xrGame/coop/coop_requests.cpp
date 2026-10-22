@@ -13,6 +13,7 @@
 #include "coop_items.h"
 #include "coop_money.h"
 #include "coop_dialog.h"
+#include "coop_callgate.h" // F2 T12
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
@@ -743,14 +744,16 @@ CSE_Abstract* make_temp(const char* section, const Fvector& pos, u32 level_verte
 	return e;
 }
 
-CSE_Abstract* lua_forward(CSE_Abstract* e, const char* what)
+CSE_Abstract* lua_forward(CSE_Abstract* e, const char* name)
 {
 	if (client_forward_spawn(e))
 		++g_cl.lua_forwarded;
 	else
 	{
-		++g_cl.lua_refused;
-		::Msg("[coop] %s [%s] refused on a client: world spawns are the host's job", what, e->s_name.c_str());
+		// F2 T12: the call gate already refused a parent that is not ours; this is the backstop, counted with it
+		string256 why;
+		xr_sprintf(why, "[%s] is a world spawn, the host's job", e->s_name.c_str());
+		lua_refuse(name, why);
 	}
 	return nullptr;
 }
@@ -1866,7 +1869,6 @@ struct Launch
 };
 xr_vector<Launch> g_launches; // under g_out_lock: the router may run on the game thread
 xr_map<PeerId, u64> g_last_launch;
-xr_set<shared_str> g_lua_refused_once;
 
 void put_vec(Writer& w, const Fvector& v)
 {
@@ -2048,7 +2050,6 @@ void reset()
 	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
 	g_spawn_queue.clear(drop_queued); // Ruling F2-21: nothing of the old session is created
 	g_last_launch.clear(); // W3a
-	g_lua_refused_once.clear(); // W3a
 	g_log_count = 0;
 	// Lua may still hold these pointers; reset runs when a session ends, long after any script used them.
 	for (CSE_Abstract* e : g_lua_temps)
@@ -2359,7 +2360,7 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 		g_lua_temps.push_back(e); // the script edits it, then calls alife():register(se)
 		return e;
 	}
-	lua_forward(e, "alife():create");
+	lua_forward(e, "alife:create");
 	F_entity_Destroy(e);
 	return nullptr;
 }
@@ -2389,7 +2390,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 		g_lua_temps.push_back(e);
 		return e;
 	}
-	lua_forward(e, "alife():clone_weapon");
+	lua_forward(e, "alife:clone_weapon");
 	F_entity_Destroy(e);
 	return nullptr;
 }
@@ -2398,40 +2399,44 @@ CSE_Abstract* lua_register_spawn(CSE_Abstract* object)
 {
 	const bool temp = std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end();
 	if (!temp)
-		return lua_refuse("alife():register of an object the host did not create");
+		return lua_refuse("alife:register", "an object the host did not create");
 	if (!g_lua_forwarded.insert(object).second)
-		return lua_refuse("second alife():register of one object"); // would be a duplicate
-	return lua_forward(object, "alife():register");
+		return lua_refuse("alife:register", "a second register of one object"); // would be a duplicate
+	return lua_forward(object, "alife:register");
 }
 
-void lua_release(CSE_Abstract* object)
+bool lua_release(CSE_Abstract* object)
 {
 	if (!object || std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
-		return; // never created: nothing to release
+		return true; // never created: nothing to release
+	// F2 T12: the call gate decides; our own items (not our actor) have the client_destroy path
 	const u16 id = object->ID;
-	if (id != kNoId && id != kActor && events::root_of(id) == kActor)
+	switch (callgate::client_gate_own("alife:release", id != kActor && callgate::is_own(id)))
 	{
-		client_destroy(id, false); // ours: the host releases it and tells everybody
-		return;
+	case calls::Gate::Run: return false; // an ltx override runs it here
+	case calls::Gate::Refuse: ++g_cl.lua_refused; return true; // the gate logged it
+	case calls::Gate::Request: break;
 	}
-	++g_cl.lua_refused;
-	::Msg("[coop] alife():release of [%s] %u refused on a client: the world is the host's", object->name_replace(), id);
+	client_destroy(id, false); // ours: the host releases it and tells everybody
+	return true;
 }
 
-CSE_Abstract* lua_refuse(const char* what)
+CSE_Abstract* lua_refuse(const char* name, const char* why)
 {
 	++g_cl.lua_refused;
-	::Msg("[coop] %s refused on a client: the host creates world objects", what);
+	callgate::note_refused(name, why); // F2 T12: counted and logged with the gate's refusals
 	return nullptr;
 }
 
-bool lua_client_refuse(const char* what)
+bool lua_client_refuse(const char* name, u16 target)
 {
 	if (!lua_client())
 		return false;
+	// F2 T12: the call gate decides. These calls have no request path, so a client refuses them unless an ltx override
+	// runs them here; the gate counts and logs.
+	if (callgate::client_gate_id(name, target) == calls::Gate::Run)
+		return false;
 	++g_cl.lua_refused;
-	if (g_lua_refused_once.insert(shared_str(what)).second)
-		::Msg("[coop] %s refused on a client: the host's world is only mirrored here (logged once)", what);
 	return true;
 }
 

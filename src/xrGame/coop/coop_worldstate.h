@@ -32,15 +32,16 @@ bool allow_time_factor_change(float factor);
 
 // level.change_game_time (Anomaly sleep, fast travel, scripted skips).
 // Client in a session: true, the caller must not move time; a request goes to the host, which shows
-// "[coop] <nick> wants to sleep" (R-10.2 v1: the host decides, nothing else happens).
+// "[coop] <nick> wants to sleep" (R-10.2 v1: the host decides, nothing else happens). The call gate (F2 T12,
+// "level:change_game_time") decides: Request as above, Refuse without a request, Run (an ltx override) false.
 // Host: false (the jump happens) and a TimeSync goes out at once. No session: false.
 bool intercept_time_jump(u32 days, u32 hours, u32 mins);
 
 // level.set_weather / set_weather_smooth / set_weather_weight / set_weather_fx /
-// start_weather_fx_from_time / stop_weather_fx.
-// Client in a session: true, the call is refused (Anomaly weather scripts are random per machine).
-// Host: false, and a WeatherSync goes out at once. No session: false.
-bool refuse_script_weather(const char* what);
+// start_weather_fx_from_time / stop_weather_fx; name is the call gate's ("level:set_weather", F2 T12).
+// Client in a session: true, the call is refused by the call gate (Anomaly weather scripts are random per machine).
+// Host: false, and a WeatherSync goes out at once. No session, or an ltx override: false.
+bool refuse_script_weather(const char* name);
 
 // Console `time_factor` / `freeze_time` (engine device time scale, slow motion).
 // True during a session for any value other than 1: refused with a log line.

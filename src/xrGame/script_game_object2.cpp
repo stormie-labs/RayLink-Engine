@@ -38,6 +38,7 @@
 #include "movement_manager.h"
 #include "detail_path_manager.h"
 #include "Inventory.h"
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 #include "InventoryOwner.h"
 #include "CharacterPhysicsSupport.h"
 
@@ -391,6 +392,10 @@ void CScriptGameObject::SetActorPosition(Fvector pos, bool bskip_collision_corre
 
 void CScriptGameObject::SetNpcPosition(Fvector pos)
 {
+	coop::callgate::Args coop_args; // Anomaly Coop (F2 T12 gate): the host moves another's NPC; a NaN never moves one
+	coop_args.pos = &pos;
+	if (coop::callgate::client_gate("game_object:set_npc_position", &object(), coop_args) == coop::calls::Gate::Refuse)
+		return;
 	CCustomMonster* obj = smart_cast<CCustomMonster*>(&object());
 	if (obj)
 	{

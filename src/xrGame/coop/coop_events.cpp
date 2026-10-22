@@ -11,6 +11,7 @@
 #include "coop_remote.h"
 #include "coop_dialog.h"
 #include "coop_story.h"
+#include "coop_callgate.h" // F2 T12
 #include "xrCoop/coop_rules.h"
 
 #include "Level.h"
@@ -1113,10 +1114,11 @@ bool client_refuse_vehicle(CGameObject* holder)
 {
 	if (!holder || !mgr().is_client() || !router_on() || entities::client_applying() || !smart_cast<CCar*>(holder))
 		return false;
+	// F2 T12: the call gate decides and logs (world, no request path: the host drives cars)
+	if (callgate::client_gate("game_object:attach_vehicle", holder) == calls::Gate::Run)
+		return false; // an ltx override lets this client drive
 	g_vehicle_note = true; // the HUD note goes out from frame()
 	++g_c.vehicles_blocked;
-	if (log_allowed())
-		::Msg("[coop] Lua attach_vehicle to car %u refused on a client: the host drives cars", join::to_host(holder->ID()));
 	return true;
 }
 

@@ -19,6 +19,7 @@
 #include "PHSimpleCalls.h"
 #include "../xrphysics/iphworld.h"
 #include "doors_manager.h"
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 
 void CScriptGameObject::SetTipText(LPCSTR tip_text)
 {
@@ -115,6 +116,8 @@ void CScriptGameObject::Kill(CScriptGameObject* who,
 		                                *object().cName());
 		return;
 	}
+	if (coop::callgate::client_gate("game_object:kill", &object()) == coop::calls::Gate::Refuse)
+		return; // Anomaly Coop (F2 T12 gate): another's creature dies on the host
 	if (!l_tpEntity->AlreadyDie())
 		l_tpEntity->KillEntity(who ? who->object().ID() : object().ID(), bypass_actor_check ? 1 : 0);
 	else

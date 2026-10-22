@@ -1756,7 +1756,7 @@ void CScriptGameObject::SetArtefactAdditionalInventoryWeight(float value)
 
 void CScriptGameObject::AttachVehicle(CScriptGameObject* veh, bool bForce)
 {
-	if (veh && coop::events::client_refuse_vehicle(&veh->object())) return; // Anomaly Coop: the host drives cars
+	if (veh && coop::events::client_refuse_vehicle(&veh->object())) return; // Anomaly Coop: the host drives cars (F2 T12 gate inside)
 	CActor* actor = smart_cast<CActor*>(&object());
 	if (actor)
 	{

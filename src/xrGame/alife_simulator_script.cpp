@@ -20,6 +20,7 @@
 #include "xrServer.h"
 #include "level.h"
 #include "coop/coop_requests.h" // Anomaly Coop
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 
 #include <luabind/iterator_policy.hpp>
 #include <luabind/iterator_pair_policy.hpp>
@@ -36,6 +37,20 @@ SPAWN_STORY_PAIRS spawn_story_ids;
 CALifeSimulator* alife()
 {
 	return (const_cast<CALifeSimulator*>(ai().get_alife()));
+}
+
+// Anomaly Coop (F2 T12): the call gate of a spawning alife() call on a client in the host's world (Run elsewhere).
+// own: the new object's parent is our actor or under it (ReqSpawn only creates items in our own inventory); a
+// temporary object (create/clone_weapon with register = false) passes as own, its alife():register is gated. A
+// refusal returns nil, as the request path does. position (may be null) must be finite; section names the log line.
+static coop::calls::Gate coop_spawn_gate(const char* name, bool own, const Fvector* position, LPCSTR section)
+{
+	if (!coop::requests::lua_client())
+		return coop::calls::Gate::Run;
+	coop::callgate::Args args;
+	args.pos = position;
+	args.what = section;
+	return coop::callgate::client_gate_own(name, own, args);
 }
 
 CSE_ALifeDynamicObject* alife_object(const CALifeSimulator* self, ALife::_OBJECT_ID object_id)
@@ -121,32 +136,32 @@ void generate_story_ids(
 
 void kill_entity0(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, const GameGraph::_GRAPH_ID& game_vertex_id)
 {
-	if (coop::requests::lua_client_refuse("alife():kill_entity")) return; // Anomaly Coop: deaths are the host's
+	if (coop::requests::lua_client_refuse("alife:kill_entity", monster ? monster->ID : ALife::_OBJECT_ID(-1))) return; // Anomaly Coop (F2 T12 gate): deaths are the host's
 	alife->kill_entity(monster, game_vertex_id, 0);
 }
 
 void kill_entity1(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster)
 {
-	if (coop::requests::lua_client_refuse("alife():kill_entity")) return; // Anomaly Coop
+	if (coop::requests::lua_client_refuse("alife:kill_entity", monster ? monster->ID : ALife::_OBJECT_ID(-1))) return; // Anomaly Coop (F2 T12 gate)
 	alife->kill_entity(monster, monster->m_tGraphID, 0);
 }
 
 // Anomaly Coop: wrappers so a coop client can refuse these (bound as members before)
 void kill_entity2(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, const GameGraph::_GRAPH_ID& game_vertex_id, CSE_ALifeSchedulable* schedulable)
 {
-	if (coop::requests::lua_client_refuse("alife():kill_entity")) return;
+	if (coop::requests::lua_client_refuse("alife:kill_entity", monster ? monster->ID : ALife::_OBJECT_ID(-1))) return; // F2 T12 gate
 	alife->kill_entity(monster, game_vertex_id, schedulable);
 }
 
 void CALifeSimulator__set_switch_online(CALifeSimulator* self, ALife::_OBJECT_ID id, bool value)
 {
-	if (coop::requests::lua_client_refuse("alife():set_switch_online")) return; // the host switches objects
+	if (coop::requests::lua_client_refuse("alife:set_switch_online", id)) return; // the host switches objects (F2 T12 gate)
 	self->set_switch_online(id, value);
 }
 
 void CALifeSimulator__set_switch_offline(CALifeSimulator* self, ALife::_OBJECT_ID id, bool value)
 {
-	if (coop::requests::lua_client_refuse("alife():set_switch_offline")) return;
+	if (coop::requests::lua_client_refuse("alife:set_switch_offline", id)) return; // F2 T12 gate
 	self->set_switch_offline(id, value);
 }
 
@@ -177,7 +192,7 @@ u32 get_level_id(CALifeSimulator* self)
 
 CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_SPAWN_ID spawn_id)
 {
-	if (coop::requests::lua_client()) { coop::requests::lua_refuse("alife():create(spawn_id)"); return nullptr; } // Anomaly Coop
+	if (coop::requests::lua_client() && coop::callgate::client_gate_own("alife:create", false) != coop::calls::Gate::Run) return nullptr; // Anomaly Coop (F2 T12 gate): a spawn-graph object is a world spawn
 	const CALifeSpawnRegistry::SPAWN_GRAPH::CVertex* vertex = ai().alife().spawns().spawns().vertex(spawn_id);
 	THROW2(vertex, "Invalid spawn id!");
 
@@ -192,14 +207,24 @@ CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_S
 
 CSE_Abstract* CALifeSimulator__spawn_item(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1), true); // Anomaly Coop
+	switch (coop_spawn_gate("alife:create", false, &position, section)) // Anomaly Coop (F2 T12 gate): no parent, a world spawn
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1), true);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	THROW(self);
 	return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1)));
 }
 
 CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true); // Anomaly Coop: player items via the host
+	switch (coop_spawn_gate("alife:create", coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate): player items via the host
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	if (id_parent == ALife::_OBJECT_ID(-1))
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
@@ -234,7 +259,12 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 //Alundaio: Allows to call alife():register(se_obj) manually afterward so that packet editing can be done safely when spawning object with a parent
 CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, bool reg = true)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, reg); // Anomaly Coop: no id until the host creates it
+	switch (coop_spawn_gate("alife:create", !reg || coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate): no id until the host creates it
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, reg);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	if (reg == true)
 		return CALifeSimulator__spawn_item2(self, section, position, level_vertex_id, game_vertex_id, id_parent);
 
@@ -258,7 +288,12 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 
 CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, int ammo_to_spawn)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true, ammo_to_spawn); // Anomaly Coop
+	switch (coop_spawn_gate("alife:create_ammo", coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate)
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true, ammo_to_spawn);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	//	if (id_parent == ALife::_OBJECT_ID(-1))
 	//		return							(self->spawn_item(section,position,level_vertex_id,game_vertex_id,id_parent));
 	CSE_ALifeDynamicObject* object = 0;
@@ -315,7 +350,7 @@ ALife::_SPAWN_ID CALifeSimulator__spawn_id(CALifeSimulator* self, ALife::_SPAWN_
 
 void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 {
-	if (coop::requests::lua_client()) { coop::requests::lua_release(object); return; } // Anomaly Coop: the host releases
+	if (coop::requests::lua_client() && coop::requests::lua_release(object)) return; // Anomaly Coop: the host releases (F2 T12 gate inside)
 	VERIFY(self);
 	//	self->release						(object,true);
 
@@ -418,7 +453,7 @@ void AlifeRemoveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, 
 void teleport_object(CALifeSimulator* alife, ALife::_OBJECT_ID id, GameGraph::_GRAPH_ID game_vertex_id,
                      u32 level_vertex_id, const Fvector& position)
 {
-	if (coop::requests::lua_client_refuse("alife():teleport_object")) return; // Anomaly Coop: the host moves objects
+	if (coop::requests::lua_client_refuse("alife:teleport_object", id)) return; // Anomaly Coop: the host moves objects (F2 T12 gate)
 	alife->teleport_object(id, game_vertex_id, level_vertex_id, position);
 }
 
@@ -436,7 +471,12 @@ void IterateInfo(const CALifeSimulator* alife, const ALife::_OBJECT_ID& id, cons
 
 CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_register_spawn(object); // Anomaly Coop
+	switch (coop_spawn_gate("alife:register", object && coop::callgate::is_own(object->ID_Parent), nullptr, object ? object->s_name.c_str() : nullptr)) // Anomaly Coop (F2 T12 gate)
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_register_spawn(object);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	NET_Packet packet;
 	packet.w_begin(M_SPAWN);
 	packet.w_stringZ(object->s_name);
@@ -458,7 +498,12 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
                                   u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent,
                                   bool bRegister = true)
 {
-	if (coop::requests::lua_client()) return coop::requests::lua_clone(object, section, position, level_vertex_id, game_vertex_id, id_parent, bRegister); // Anomaly Coop
+	switch (coop_spawn_gate("alife:clone_weapon", !bRegister || coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate)
+	{
+	case coop::calls::Gate::Request: return coop::requests::lua_clone(object, section, position, level_vertex_id, game_vertex_id, id_parent, bRegister);
+	case coop::calls::Gate::Refuse: return nullptr;
+	case coop::calls::Gate::Run: break;
+	}
 	CSE_ALifeItemWeaponMagazined* wpnmag = smart_cast<CSE_ALifeItemWeaponMagazined*>(object);
 	if (wpnmag)
 	{

@@ -66,11 +66,13 @@
 #include "Flashlight.h"
 #include "CharacterPhysicsSupport.h"
 #include "coop/coop_items.h" // Anomaly Coop (F2 T5): an upgrade bought at a mechanic
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12): the call gate of a client
 
 bool CScriptGameObject::GiveInfoPortion(LPCSTR info_id)
 {
 	CInventoryOwner* pInventoryOwner = smart_cast<CInventoryOwner*>(&object());
 	if (!pInventoryOwner) return false;
+	if (coop::callgate::client_gate("game_object:give_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // Anomaly Coop (F2 T12 gate): story path below
 	pInventoryOwner->TransferInfo(info_id, true);
 	return true;
 }
@@ -79,6 +81,7 @@ bool CScriptGameObject::DisableInfoPortion(LPCSTR info_id)
 {
 	CInventoryOwner* pInventoryOwner = smart_cast<CInventoryOwner*>(&object());
 	if (!pInventoryOwner) return false;
+	if (coop::callgate::client_gate("game_object:disable_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // Anomaly Coop (F2 T12 gate): story path below
 	pInventoryOwner->TransferInfo(info_id, false);
 	return true;
 }
@@ -617,6 +620,13 @@ void CScriptGameObject::TransferItem(CScriptGameObject* pItem, CScriptGameObject
 		return;
 	}
 
+	// Anomaly Coop (F2 T12 gate): a client moves an item only with its own actor on one side (the item is ours, or it
+	// comes to us: a mechanic or a box handing it back); the event router sends it as ReqTransfer / ReqTake / ReqDrop
+	// and the host checks owner and reach. Between two others' inventories it is the host's.
+	if (coop::callgate::client_gate_own("game_object:transfer_item",
+			coop::callgate::is_own(pIItem->object().ID()) || coop::callgate::is_own(pForWho->object().ID())) == coop::calls::Gate::Refuse)
+		return;
+
 	// выбросить у себя
 	NET_Packet P;
 	CGameObject::u_EventGen(P, GE_TRADE_SELL, object().ID());
@@ -737,6 +747,9 @@ void CScriptGameObject::GiveMoney(int money)
 {
 	CInventoryOwner* pOurOwner = smart_cast<CInventoryOwner*>(&object());
 	VERIFY(pOurOwner);
+	// Anomaly Coop (F2 T12 gate): our actor's money goes to the host's journal (GE_MONEY, F2 T1); an NPC's is the host's
+	if (coop::callgate::client_gate("game_object:give_money", &object()) == coop::calls::Gate::Refuse)
+		return;
 
     GiveMoneySafe(pOurOwner, money, true);
 }
@@ -767,6 +780,7 @@ void CScriptGameObject::SetGoodwill(int goodwill, CScriptGameObject* pWhoToSet)
 		                                "SetGoodwill available only for InventoryOwner");
 		return;
 	}
+	if (coop::callgate::client_gate("game_object:set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
 	RELATION_REGISTRY().SetGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), goodwill);
 }
 
@@ -780,6 +794,7 @@ void CScriptGameObject::ForceSetGoodwill(int goodwill, CScriptGameObject* pWhoTo
 		                                "ForceSetGoodwill available only for InventoryOwner");
 		return;
 	}
+	if (coop::callgate::client_gate("game_object:force_set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
 	RELATION_REGISTRY().ForceSetGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), goodwill);
 }
 
@@ -793,6 +808,7 @@ void CScriptGameObject::ChangeGoodwill(int delta_goodwill, CScriptGameObject* pW
 		                                "ChangeGoodwill available only for InventoryOwner");
 		return;
 	}
+	if (coop::callgate::client_gate("game_object:change_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
 	RELATION_REGISTRY().ChangeGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), delta_goodwill);
 }
 
@@ -817,6 +833,7 @@ void CScriptGameObject::SetRelation(ALife::ERelationType relation, CScriptGameOb
 		                                "SetRelation available only for InventoryOwner");
 		return;
 	}
+	if (coop::callgate::client_gate("game_object:set_relation", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
 	RELATION_REGISTRY().SetRelationType(pInventoryOwner, pOthersInventoryOwner, relation);
 }
 
@@ -875,6 +892,7 @@ void CScriptGameObject::SetCommunityGoodwill_obj(LPCSTR community, int goodwill)
 	CHARACTER_COMMUNITY c;
 	c.set(community);
 
+	if (coop::callgate::client_gate("game_object:set_community_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
 	RELATION_REGISTRY().SetCommunityGoodwill(c.index(), pInventoryOwner->object_id(), goodwill);
 }
 

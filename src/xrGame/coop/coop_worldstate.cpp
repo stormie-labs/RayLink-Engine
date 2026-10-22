@@ -5,6 +5,7 @@
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
+#include "coop_callgate.h" // F2 T12
 
 #include "Level.h"
 #include "ai_space.h"
@@ -741,7 +742,13 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 	}
 	if (!mgr().is_client())
 		return false;
+	// F2 T12: the call gate decides (world with the TimeRequest path; an ltx override may run it here)
+	const calls::Gate gate = callgate::client_gate("level:change_game_time", nullptr);
+	if (gate == calls::Gate::Run)
+		return false;
 	++g.refused_time;
+	if (gate == calls::Gate::Refuse)
+		return true; // the gate logged it
 	const u32 minutes = days * 24 * 60 + hours * 60 + mins;
 	const u64 now = mgr().now_ms();
 	if (mgr().is_live_client() && (!g.last_request_sent || now - g.last_request_sent >= kRequestDebounceMs))
@@ -756,7 +763,7 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 	return true;
 }
 
-bool refuse_script_weather(const char* what)
+bool refuse_script_weather(const char* name)
 {
 	if (mgr().is_host())
 	{
@@ -765,9 +772,10 @@ bool refuse_script_weather(const char* what)
 	}
 	if (!mgr().is_client())
 		return false;
+	// F2 T12: the call gate decides and logs (world, no request path: the host decides the weather)
+	if (callgate::client_gate(name, nullptr) == calls::Gate::Run)
+		return false; // an ltx override makes it local
 	++g.refused_weather;
-	if (refuse_log_allowed())
-		::Msg("[coop] weather: level.%s ignored on a client (the host decides the weather)", what);
 	return true;
 }
 
