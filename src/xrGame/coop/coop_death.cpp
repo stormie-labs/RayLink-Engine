@@ -275,7 +275,10 @@ Carried carried_of(u16 character, CInventoryOwner* io, bool everything, u16 seq)
 	c.layout_known = character == 0;
 	c.everything = everything;
 	xr_vector<u16> reported;
-	if (!everything && character != 0 && seq != kNoSeq && survival::host_worn_items(character, seq, reported))
+	// T8b review N2: an empty list is no list - a live player always carries a knife and a PDA, nothing on him means his
+	// inventory was not read, and his armour must not become a candidate by it
+	if (!everything && character != 0 && seq != kNoSeq && survival::host_worn_items(character, seq, reported) &&
+	    !reported.empty())
 	{
 		c.items = collect(io, true);
 		c.worn = mark_worn(c.items, std::vector<u16>(reported.begin(), reported.end()));

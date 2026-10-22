@@ -133,7 +133,8 @@ void sort_unique_bounded(std::vector<T>& v, Id id_of)
 // F3 T8b (Ruling F3-4): applies the list of what the owner of a client's proxy reported on him (his slots and belt, host
 // numbering, as survival::host_worn_items gives it) to the proxy's items: `worn` is set on the items named in it and
 // cleared on all the others, so a second list replaces the first. The order of the list, repeated ids and ids the proxy
-// does not carry do not matter; 0xffff is no id. Returns how many items are marked.
+// does not carry do not matter; 0xffff is no id; an item that cannot be worn is never marked. Returns how many items
+// are marked.
 inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_t>& worn)
 {
 	std::vector<uint16_t> ids(worn);
@@ -141,7 +142,8 @@ inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_
 	size_t marked = 0;
 	for (ItemFacts& f : items)
 	{
-		f.worn = f.id != 0xffff && std::binary_search(ids.begin(), ids.end(), f.id);
+		// T8b review N1: only a wearable item can be worn - a client naming his parts and ammo keeps nothing by it
+		f.worn = f.wearable && f.id != 0xffff && std::binary_search(ids.begin(), ids.end(), f.id);
 		if (f.worn)
 			++marked;
 	}
