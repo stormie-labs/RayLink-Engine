@@ -23,6 +23,7 @@
 #include "coop_death.h"
 #include "coop_rest.h"
 #include "coop_autosave.h"
+#include "coop_router.h" // F2 T10
 
 #include "Level.h"
 #include "Actor.h"
@@ -63,6 +64,7 @@ void install(Session& s)
 	presence::install(s);
 	items::install(s);
 	objects::install(s);
+	router::install(); // F2 T10
 }
 
 void on_session_started()
@@ -85,6 +87,7 @@ void on_session_started()
 	presence::reset();
 	items::reset();
 	objects::reset();
+	router::reset(); // F2 T10: call counters
 	g_joining.clear();
 }
 
@@ -124,6 +127,7 @@ void reset()
 	presence::reset();
 	items::reset();
 	objects::reset();
+	router::reset(); // F2 T10: call counters
 	g_joining.clear();
 }
 
@@ -180,6 +184,7 @@ void print_status()
 	remote::print_status();
 	worldstate::print_status();
 	script::print_status();
+	router::print_status(); // F2 T10
 	story::print_status();
 	events::print_status();
 	requests::print_status();

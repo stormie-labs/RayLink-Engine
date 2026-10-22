@@ -8,11 +8,15 @@
 //   none  - nowhere in co-op (mechanics the engine replaced, debug tools); `blocked` is the old name
 //   level - reserved for F3a (split levels); behaves as host until then
 // Names (callbacks and scripts) compare case-insensitively: an ltx reader may lowercase keys, Lua sends the real case.
+// F2 T10 adds what the router needs besides the table: script_key (a function's script from its Lua source) and the
+// call counters.
 // Pure C++17, header-only, no engine dependencies: used by the engine, the unit-test exe and the Lua test runner.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <string>
@@ -603,5 +607,165 @@ inline bool runs_here(Domain d, bool is_host)
 	}
 	return false;
 }
+
+// --- F2 T10: what the router (xrGame/coop/coop_router.cpp) needs besides the table ---
+
+// The key of the script a Lua function comes from, given its lua_Debug::source:
+//   "@D:\...\gamedata\scripts\xr_combat_ignore.script"          -> "xr_combat_ignore"
+//     a .script by its base name: the engine loads them from the scripts root by name;
+//   "@.\gamedata\scripts\illish\patches\xr_combat_ignore.lua"   -> "illish.patches.xr_combat_ignore"
+//     a .lua by its path under the scripts folder, folders joined by dots (the name require gives it). Never its bare
+//     base name: GAMMA's patch of a stock script is its own script, not the stock one (live bug 2026-10-23: the old
+//     Lua filter took illish\patches\xr_combat_ignore.lua for the stock host-only xr_combat_ignore). The folder is
+//     the part after the last "\gamedata\scripts\", else after the last "\scripts\", else the path itself without a
+//     drive and leading ".\" / "..\";
+//   anything else (no .script / .lua: a string chunk, "=[C]", "@console_command") -> "?".
+// Lowercase; '/' and '\' are both separators; a leading '@' or '=' is dropped.
+inline std::string script_key(std::string_view source)
+{
+	if (!source.empty() && (source.front() == '@' || source.front() == '='))
+		source.remove_prefix(1);
+	std::string p = "\\" + detail::lowered(source); // a leading separator: "scripts\x.lua" matches "\scripts\" too
+	for (char& c : p)
+		if (c == '/')
+			c = '\\';
+
+	const auto strip = [&p](std::string_view ext)
+	{
+		if (p.size() < ext.size() || p.compare(p.size() - ext.size(), ext.size(), ext) != 0)
+			return false;
+		p.resize(p.size() - ext.size());
+		return true;
+	};
+	std::string key;
+	if (strip(".script"))
+		key = p.substr(p.find_last_of('\\') + 1);
+	else if (strip(".lua"))
+	{
+		size_t from = std::string::npos;
+		for (const std::string_view folder : {std::string_view("\\gamedata\\scripts\\"), std::string_view("\\scripts\\")})
+		{
+			const size_t at = p.rfind(folder);
+			if (at != std::string::npos)
+			{
+				from = at + folder.size();
+				break;
+			}
+		}
+		if (from == std::string::npos)
+		{
+			from = 0;
+			const size_t drive = p.find(':');
+			if (drive != std::string::npos && drive < p.find('\\', 1))
+				from = drive + 1;
+			for (bool more = true; more;)
+			{
+				more = false;
+				for (const std::string_view lead : {std::string_view("\\"), std::string_view(".\\"), std::string_view("..\\")})
+					if (p.compare(from, lead.size(), lead) == 0)
+					{
+						from += lead.size();
+						more = true;
+						break;
+					}
+			}
+		}
+		key = p.substr(from);
+		for (char& c : key)
+			if (c == '\\')
+				c = '.';
+	}
+	else
+		return "?";
+	return key.empty() ? std::string("?") : key;
+}
+
+// What happened to one call of a routed handler.
+enum class Outcome : uint8_t
+{
+	Ran,     // called (a call that then failed is counted here and under Error)
+	Skipped, // not called on this machine
+	Error    // called on a client under pcall and raised a Lua error
+};
+
+// Accepts ran, skipped, error; surrounding blanks and letter case are ignored.
+inline bool parse_outcome(std::string_view text, Outcome& out)
+{
+	const std::string_view t = detail::trimmed(text);
+	if (detail::iequals(t, "ran"))
+		out = Outcome::Ran;
+	else if (detail::iequals(t, "skipped"))
+		out = Outcome::Skipped;
+	else if (detail::iequals(t, "error"))
+		out = Outcome::Error;
+	else
+		return false;
+	return true;
+}
+
+// Call counters of the router: per domain (ran, skipped, errors) and skips per script for "the most skipped" list.
+// The per-script table is bounded (kMaxScripts names); a name past that counts in its domain only.
+class Counters
+{
+public:
+	static constexpr size_t kDomains = size_t(Domain::Level) + 1;
+	static constexpr size_t kMaxScripts = 1024;
+
+	struct Totals
+	{
+		uint64_t ran = 0, skipped = 0, errors = 0;
+	};
+
+	void note(Domain d, Outcome o, std::string_view script)
+	{
+		Totals& t = m_totals[size_t(d) < kDomains ? size_t(d) : 0];
+		switch (o)
+		{
+		case Outcome::Ran: ++t.ran; break;
+		case Outcome::Error: ++t.errors; break;
+		case Outcome::Skipped:
+			++t.skipped;
+			if (script.empty())
+				break;
+			if (const auto it = m_skips.find(script); it != m_skips.end())
+				++it->second;
+			else if (m_skips.size() < kMaxScripts)
+				m_skips.emplace(std::string(script), uint64_t(1));
+			else
+				++m_dropped;
+			break;
+		}
+	}
+
+	const Totals& totals(Domain d) const { return m_totals[size_t(d) < kDomains ? size_t(d) : 0]; }
+
+	// The scripts with the most skips, most first (a tie by name), at most n.
+	std::vector<std::pair<std::string, uint64_t>> top_skipped(size_t n) const
+	{
+		std::vector<std::pair<std::string, uint64_t>> all(m_skips.begin(), m_skips.end());
+		const auto more = [](const std::pair<std::string, uint64_t>& a, const std::pair<std::string, uint64_t>& b)
+		{ return a.second != b.second ? a.second > b.second : a.first < b.first; };
+		const size_t k = n < all.size() ? n : all.size();
+		std::partial_sort(all.begin(), all.begin() + std::ptrdiff_t(k), all.end(), more);
+		all.resize(k);
+		return all;
+	}
+
+	size_t scripts_tracked() const { return m_skips.size(); }
+	uint64_t scripts_dropped() const { return m_dropped; } // skips of names past kMaxScripts
+
+	void clear()
+	{
+		for (Totals& t : m_totals)
+			t = Totals();
+		m_skips.clear();
+		m_dropped = 0;
+	}
+
+private:
+	Totals m_totals[kDomains];
+	std::map<std::string, uint64_t, std::less<>> m_skips; // std::less<>: find() by string_view, no allocation
+	uint64_t m_dropped = 0;
+};
 } // namespace routes
 } // namespace coop

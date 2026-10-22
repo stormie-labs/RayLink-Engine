@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_router.h" />
     <ClInclude Include="coop\coop_autosave.h" />
     <ClInclude Include="coop\coop_rest.h" />
     <ClInclude Include="coop\coop_death.h" />
@@ -2107,6 +2108,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_router.cpp" />
     <ClCompile Include="coop\coop_autosave.cpp" />
     <ClCompile Include="coop\coop_rest.cpp" />
     <ClCompile Include="coop\coop_death.cpp" />

@@ -13,6 +13,7 @@
 #include "coop_dialog.h" // W11: dialog::host_talk_holder
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
 #include "coop_money.h" // F2 T1: money::register_lua
+#include "coop_router.h" // F2 T10: router::register_lua (coop.route)
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -1437,6 +1438,7 @@ void register_raw(lua_State* L)
 	}
 	lua_pop(L, 1);
 	money::register_lua(L); // F2 T1: coop.money_give / money_grant / money_set / money_of / talk_lock_of
+	router::register_lua(L); // F2 T10: coop.route.of / runs / note / none_functions (scripts\coop_route.script)
 }
 } // namespace
 
