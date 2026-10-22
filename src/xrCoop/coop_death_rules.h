@@ -138,6 +138,9 @@ inline bool category_from_name(const char* name, uint8_t& out)
 	return false;
 }
 
+// An item the death may take. The caller decides what is a candidate: quest items are never lost (IsQuestItem(),
+// i_quest, i_letter, the PDA and the like are filtered out before the call), and so are items that cannot leave the
+// inventory. The candidates go in a stable order (by id): for one seed the answer follows the order of the input.
 struct Candidate
 {
 	uint16_t id;
@@ -186,6 +189,8 @@ struct Rng
 // probability frac(n*s); which ones is a seeded shuffle (xorshift32), so the same seed gives the same answer. A share
 // is cut to 0..1 (NaN counts as 0). Items of an unknown category are not touched; an id that is offered twice is
 // counted once. The result holds ids from `items` only, none twice.
+// Contract with the caller: `items` holds no quest items (see Candidate) and comes in a stable order, sorted by id;
+// the same inputs and seed then give the same answer on every machine, which the tests pin with fixed vectors.
 inline std::vector<uint16_t> pick_losses(const std::vector<Candidate>& items, const Shares& shares, uint32_t seed)
 {
 	std::vector<uint16_t> bucket[kCategories];
@@ -248,8 +253,10 @@ inline bool is_wipe(const std::vector<uint8_t>& lives_of_present_players)
 	return true;
 }
 
-// One per player. Makes each death count once: `decided_seq` is the sequence number of the last death the host acted
-// on. It survives a leave/return and a reload of the world, so the items are never taken twice for one death.
+// One per player. Makes each death count once: `decided_seq` is the sequence number (a u16 counter of the player's
+// current actor) of the last death the host acted on. It survives a leave/return and a reload of the world while the
+// player is dead, so the items are never taken twice for one death; on_alive clears it. 0xffff is the guard "no death
+// decided": the counter of the actor must never produce it.
 struct Tracker
 {
 	uint16_t decided_seq = 0xffff;
@@ -327,11 +334,16 @@ inline bool on_world_replaced(Tracker& t)
 	return pending;
 }
 
-// The player stood up: nothing is waiting any more. `decided_seq` stays.
+// The player stood up: nothing is waiting any more, and the next death is a new one. `decided_seq` goes back to the
+// "none decided" guard because the client's death counter starts again from 0 with every new actor (a respawn, a
+// world change, a rejoin): the next death of the new actor can carry the same number as the last one of the old actor
+// and must not be taken for it. (A reload of the world while the player is dead is on_world_replaced, which keeps
+// `decided_seq` until they stand up.) F3 review round 1, finding 1.
 inline void on_alive(Tracker& t)
 {
 	t.respawn_at = 0;
 	t.respawn_due = false;
+	t.decided_seq = 0xffff;
 }
 } // namespace death
 } // namespace coop

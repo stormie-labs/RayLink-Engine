@@ -47,6 +47,11 @@ inline const char* kind_name(Kind k)
 // Arrival and story records come from no object.
 constexpr uint16_t kNoSource = 0xffff;
 
+// A coordinate of a record is within +-1e6 m. The game maps are a few kilometres across, so anything beyond is garbage
+// (a corrupt save, a hostile packet); it also keeps the text form short and exact (%.3f of 1e30 would run to 30 digits)
+// and keeps "respawn at 1e30" out of the engine. A float of this size still has millimetre steps.
+constexpr float kMaxCoord = 1.0e6f;
+
 // A level name as the engine writes it in a record: 1..64 characters of [A-Za-z0-9_] (no '|', no blanks, no line
 // breaks, so the text form and the ini value cannot be torn apart).
 inline bool level_ok(const std::string& s)
@@ -72,15 +77,16 @@ struct Record
 	uint16_t source = kNoSource;
 	uint64_t game_time_ms = 0;
 
-	// kind is one of the six, the level name is sane, the position is finite. A record that is not valid is "no
-	// record": it is never stored, encoded, sent or read.
+	// kind is one of the six, the level name is sane, every coordinate is a number within +-kMaxCoord (NaN and
+	// infinity fail the comparison). A record that is not valid is "no record": it is never stored, encoded, sent or
+	// read.
 	bool valid() const
 	{
 		if (kind == Kind::None || static_cast<uint8_t>(kind) > static_cast<uint8_t>(Kind::Mod))
 			return false;
 		if (!level_ok(level))
 			return false;
-		return std::isfinite(pos[0]) && std::isfinite(pos[1]) && std::isfinite(pos[2]);
+		return std::fabs(pos[0]) <= kMaxCoord && std::fabs(pos[1]) <= kMaxCoord && std::fabs(pos[2]) <= kMaxCoord;
 	}
 };
 
@@ -197,7 +203,9 @@ inline bool decode(const std::string& line, Record& out)
 	return true;
 }
 
-// Wire form: level string, position, level vertex, game vertex, kind, source, time.
+// Wire form: level string, position, level vertex, game vertex, kind, source, time. Only a valid record may be written:
+// `read` rejects anything else, so the caller checks `valid()` first (and sends a separate "no checkpoint" flag when
+// there is none).
 inline void write(Writer& w, const Record& r)
 {
 	w.str(r.level);
@@ -287,8 +295,9 @@ struct Choice
 	float pos[3];
 };
 
-// Where a player comes back to life on `level`: the current record, else the previous one, else the level's anchor
-// point (story spawn), else the arrival point, else where the body lies. `anchor` and `arrival` may be null.
+// Where a player comes back to life on `level`: the current record, else the previous one, else the anchor, else the
+// arrival point, else where the body lies. `anchor` and `arrival` may be null. The anchor is the player's first living
+// position that the host recorded for them (HostRec), not the story spawn point of the level.
 // F3: a record on another level is skipped; F3a replaces this by a transition to that level (the one place is here).
 inline Choice resolve(const Slot& s, const std::string& level, const float* anchor, const float* arrival,
 	const float body[3])

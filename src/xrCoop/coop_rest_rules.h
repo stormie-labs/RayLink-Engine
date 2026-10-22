@@ -65,6 +65,9 @@ inline uint8_t clamp_hours(int h)
 // start: at least one player present, every one of them alive, Resting and out of a fight, and the world does not
 // block (`world_blocked`: an emission or a story scene). hours = the minimum of the wishes, so nobody sleeps longer
 // than they wanted. Nobody present is not a sleep: it blocks as NotAll (or World).
+// `present` holds the players who take part in the sleep. A hardcore spectator (out of the run for good) is not one of
+// them: passed in as a dead member he would block the sleep with Dead for ever, as a resting one he would be counted
+// as asleep. The caller leaves him out.
 inline Decision decide(const std::vector<Member>& present, bool world_blocked)
 {
 	Decision d;
