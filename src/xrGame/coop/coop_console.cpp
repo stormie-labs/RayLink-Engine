@@ -8,6 +8,10 @@
 #include "coop_survival.h"
 #include "coop_presence.h"
 #include "coop_script.h"
+#include "coop_checkpoints.h" // F3
+#include "coop_death.h"
+#include "coop_rest.h"
+#include "coop_autosave.h"
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -174,6 +178,10 @@ void register_console_commands()
 	CMD4(CCC_Integer, "coop_max_new_characters", &g_coop_max_new_characters, int(limits::kNewCharactersMin),
 	    int(limits::kNewCharactersMax)); // host setting (Ruling F2-10 b, F2 T3 fix round 1)
 	survival::register_console();
+	checkpoints::register_console(); // F3
+	death::register_console();
+	rest::register_console();
+	autosave::register_console();
 	presence::register_console();
 }
 } // namespace coop

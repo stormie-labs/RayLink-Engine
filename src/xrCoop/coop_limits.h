@@ -53,6 +53,16 @@ constexpr RateRule kClientRateRules[] = {
 	// answer); a refused choice is sent again after a change. Each one runs the host's Lua check and, when accepted, a
 	// world save. One per 2 s after a burst; a choice nobody asked for is ignored anyway (coop_join, newchar::Choosers).
 	{Msg::CharChoice, 4, 2000},
+	// F3: one per tent the player places (the stock use of a sleeping bag, an animation, then picking the tent up again
+	// before the next one); the host keeps each claim open 15 s (tent_claim_ms) to find the tent. One per 2 s after a
+	// burst.
+	{Msg::CheckpointClaim, 4, 2000},
+	// F3: the player lies down at his rest spot or gets up (the doze window, any time); the plan's host limit is one
+	// per second. 4 covers a quick lie down / get up / lie down.
+	{Msg::RestRequest, 4, 1000},
+	// F3: hardcore, one per death: the dead player holds USE 3 s (or coop_new_character) and the host stashes all his
+	// gear and sends him the world again. A double press, then one per 5 s.
+	{Msg::NewCharacter, 2, 5000},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:

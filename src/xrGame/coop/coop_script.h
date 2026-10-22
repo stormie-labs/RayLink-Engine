@@ -34,9 +34,12 @@
 //   coop.player_safemode(peer) -> bool | nil    weapon lowered (Anomaly safe mode); nil if not known yet
 // Engine callbacks fired from frame(): coop_main.on_transition_vote(nick) (host), SendScriptCallback
 // "coop_actor_revived" (reviver_peer, medkit_section) and "coop_on_container_opened" (peer, container_id).
+// F3 modules fire their own through queue_callback(name, {cb_int(..), cb_str(..), ...}).
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
+#include <string>
 
 #include "script_export_space.h"
 
@@ -81,6 +84,32 @@ void on_transition_vote(const char* nick);
 void on_actor_revived(uint32_t reviver_peer, const char* medkit_section);
 // Host: a client opened a box or a corpse -> SendScriptCallback("coop_on_container_opened", peer, container_id).
 void on_container_opened(uint32_t peer, u16 container_id);
+
+// --- engine -> Lua callbacks of the F3 modules (checkpoints, death, rest, autosave) ---
+// One argument of SendScriptCallback: nil, a boolean, an integer or a string.
+struct CallbackArg
+{
+	enum Kind : u8
+	{
+		Nil,
+		Bool,
+		Int,
+		Str
+	} kind = Nil;
+	s64 i = 0; // Bool: 0 / 1, Int: the value (a Lua number: exact up to 2^53)
+	std::string s; // Str
+};
+CallbackArg cb_nil();
+CallbackArg cb_bool(bool v);
+CallbackArg cb_int(s64 v);
+CallbackArg cb_str(const char* v); // nullptr -> nil
+// Queues SendScriptCallback(name, args...): delivered by frame() on the main thread once this machine is in the world,
+// in the order queued, with the other engine events (same queue limit; dropped if older than 2 minutes). Main thread.
+// A name that is not 1..64 printable characters without spaces, more than kMaxCallbackArgs arguments or a string
+// argument over kMaxCallbackStr bytes is a bug of the caller: the callback is dropped, logged and counted.
+constexpr size_t kMaxCallbackArgs = 8;
+constexpr size_t kMaxCallbackStr = 4096;
+void queue_callback(const char* name, std::initializer_list<CallbackArg> args);
 } // namespace script
 
 // "1.2.3.4:5678" / "1.2.3.4" / "[::1]:5678" -> address + port (kDefaultPort if none). coop_console.cpp.

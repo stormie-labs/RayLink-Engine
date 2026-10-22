@@ -98,6 +98,14 @@ const char* msg_name(Msg type)
 
 	case Msg::MoneyBalance: return "MoneyBalance";
 
+	case Msg::CheckpointState: return "CheckpointState";
+	case Msg::CheckpointClaim: return "CheckpointClaim";
+	case Msg::RestRequest: return "RestRequest";
+	case Msg::RestState: return "RestState";
+	case Msg::RestSleep: return "RestSleep";
+	case Msg::DeathMarker: return "DeathMarker";
+	case Msg::NewCharacter: return "NewCharacter";
+
 	case Msg::ScriptEvent: return "ScriptEvent";
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
@@ -153,6 +161,10 @@ MsgSender msg_sender(Msg type)
 	case Msg::DialogLockResult:
 	case Msg::DialogPhrases:
 	case Msg::MoneyBalance: // F2 T1: only the host holds balances
+	case Msg::CheckpointState: // F3: the host sets every checkpoint
+	case Msg::RestState: // F3: the host decides the shared sleep
+	case Msg::RestSleep:
+	case Msg::DeathMarker: // F3: the host moves a dead player's things
 	case Msg::StateDump: return MsgSender::HostOnly;
 
 	// a client's requests and reports
@@ -177,6 +189,9 @@ MsgSender msg_sender(Msg type)
 	case Msg::StoryResync:
 	case Msg::DialogLock:
 	case Msg::DialogSelect:
+	case Msg::CheckpointClaim: // F3: a player reports his tent, the host checks it
+	case Msg::RestRequest: // F3: a player lies down or gets up
+	case Msg::NewCharacter: // F3: hardcore, a dead player asks for a new character
 	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
 
 	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender

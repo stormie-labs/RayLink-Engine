@@ -23,6 +23,7 @@
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIPdaWnd.h"
 #include "coop/coop_script.h" // Anomaly Coop
+#include "coop/coop_checkpoints.h" // Anomaly Coop: F3
 
 void export_classes	(lua_State *L)
 {
@@ -276,6 +277,7 @@ void export_classes	(lua_State *L)
 	//UIHintWindow::script_register(L);
 	CUIListBox::script_register(L);
 	coop_script_registrator::script_register(L); // Anomaly Coop: `coop` namespace
+	coop_checkpoints_script_registrator::script_register(L); // Anomaly Coop: F3 coop.checkpoint, coop.rest
 	//CUIMainIngameWnd::script_register(L);
 	//CUIPdaWnd::script_register(L);
 

@@ -144,6 +144,15 @@ enum class Msg : uint16_t
 	// F2 mod layer (0x0190-0x019F)
 	MoneyBalance = 0x0190, // host -> the player it belongs to: u32 balance, u32 acked seq (coop_ledger.h; F2 T1)
 
+	// F3 checkpoints, shared sleep and death (0x01C0-0x01CF; docs/CHECKPOINTS_DEATH.md). Characters in host numbering.
+	CheckpointState = 0x01C0, // host -> client(s): u16 character, u8 flags (1 rollback, 2 cleared), checkpoint::write(Record)
+	CheckpointClaim = 0x01C1, // client -> host: u8 what (1 = tent placed), vec3 pos
+	RestRequest = 0x01C2, // client -> host: u8 op (1 lie down, 2 get up), u8 hours, u8 forced
+	RestState = 0x01C3, // host -> all: u8 world_block, u8 n, n x {u16 character, u8 state, u8 hours}
+	RestSleep = 0x01C4, // host -> all: u8 hours
+	DeathMarker = 0x01C5, // host -> all: u16 character, u16 marker object, u8 drop mode
+	NewCharacter = 0x01C6, // client -> host: hardcore, the dead player starts a new character
+
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
 	StateDumpRequest = 0x01B0,

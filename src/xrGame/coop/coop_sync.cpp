@@ -19,6 +19,10 @@
 #include "coop_objects.h"
 #include "coop_remote.h"
 #include "coop_money.h"
+#include "coop_checkpoints.h" // F3
+#include "coop_death.h"
+#include "coop_rest.h"
+#include "coop_autosave.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -52,6 +56,10 @@ void install(Session& s)
 	trade::install(s);
 	money::install(s); // F2 T1
 	survival::install(s);
+	checkpoints::install(s); // F3
+	death::install(s);
+	rest::install(s);
+	autosave::install(s);
 	presence::install(s);
 	items::install(s);
 	objects::install(s);
@@ -70,6 +78,10 @@ void on_session_started()
 	trade::reset();
 	money::on_session_started(); // F2 T1 (round 2: characters from the save keep full allowances, Ruling F2-10)
 	survival::reset();
+	checkpoints::reset(); // F3
+	death::reset();
+	rest::reset();
+	autosave::reset();
 	presence::reset();
 	items::reset();
 	objects::reset();
@@ -105,6 +117,10 @@ void reset()
 	trade::reset();
 	money::reset(); // F2 T1
 	survival::reset();
+	checkpoints::reset(); // F3
+	death::reset();
+	rest::reset();
+	autosave::reset();
 	presence::reset();
 	items::reset();
 	objects::reset();
@@ -138,6 +154,10 @@ void frame()
 {
 	players::frame();
 	survival::frame();
+	checkpoints::frame(); // F3
+	death::frame();
+	rest::frame();
+	autosave::frame();
 	presence::frame();
 	items::frame();
 	entities::frame();
@@ -167,6 +187,10 @@ void print_status()
 	trade::print_status();
 	money::print_status(); // F2 T1
 	survival::print_status();
+	checkpoints::print_status(); // F3
+	death::print_status();
+	rest::print_status();
+	autosave::print_status();
 	presence::print_status();
 	items::print_status();
 	objects::print_status();

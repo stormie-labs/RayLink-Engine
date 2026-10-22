@@ -2502,6 +2502,21 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_autosave.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_rest.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_death.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_checkpoint_sources.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_checkpoints.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_money.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7460,6 +7475,24 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_autosave.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_rest.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_death.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_checkpoints_lua.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_checkpoint_sources.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_checkpoints.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_money.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

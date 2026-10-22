@@ -74,13 +74,18 @@ struct EngineEvent
 		TransitionVote, // coop_main.on_transition_vote(text = nick)
 		ActorRevived, // SendScriptCallback("coop_actor_revived", peer, text = medkit section or nil)
 		ContainerOpened, // SendScriptCallback("coop_on_container_opened", peer, id)
+		Callback, // F3: SendScriptCallback(name, args...) (queue_callback)
 	} kind = TransitionVote;
 	std::string text;
 	PeerId peer = kInvalidPeer;
 	u16 id = 0xffff;
 	u64 t_ms = 0;
+	std::string name; // Callback
+	std::vector<CallbackArg> args; // Callback, at most kMaxCallbackArgs
 };
 constexpr size_t kMaxEngineEvents = 64;
+// send_script_callback reserves 16 Lua stack slots: traceback, SendScriptCallback, the name, then the arguments.
+static_assert(kMaxCallbackArgs + 3 <= 16, "queue_callback arguments must fit the stack send_script_callback checks");
 
 struct Stats
 {
@@ -97,6 +102,7 @@ struct Stats
 	u64 lua_missing = 0; // coop_main or the function is missing
 	u64 chat_delivered = 0;
 	u64 engine_events = 0, engine_delivered = 0, engine_dropped = 0; // W5 engine callbacks
+	u64 engine_invalid = 0; // F3: queue_callback refused (bad name, too many or too long arguments)
 };
 
 // Host refusal waiting for a dialog (R-1.3, R-1.4). Kept outside Stats: reset() must not drop it.
@@ -536,6 +542,23 @@ void deliver_engine()
 				lua_pushnumber(L, lua_Number(e.peer));
 				lua_pushnumber(L, lua_Number(e.id));
 				return 2;
+			});
+			break;
+		case EngineEvent::Callback:
+			ok = send_script_callback(e.name.c_str(), [&e](lua_State* L)
+			{
+				for (const CallbackArg& a : e.args)
+				{
+					switch (a.kind)
+					{
+					case CallbackArg::Bool: lua_pushboolean(L, a.i != 0 ? 1 : 0); break;
+					case CallbackArg::Int: lua_pushinteger(L, lua_Integer(a.i)); break;
+					case CallbackArg::Str: lua_pushlstring(L, a.s.data(), a.s.size()); break;
+					case CallbackArg::Nil:
+					default: lua_pushnil(L); break;
+					}
+				}
+				return int(e.args.size());
 			});
 			break;
 		}
@@ -1463,6 +1486,59 @@ void on_container_opened(uint32_t peer, u16 container_id)
 	push_engine_event(std::move(e));
 }
 
+CallbackArg cb_nil() { return CallbackArg(); }
+
+CallbackArg cb_bool(bool v)
+{
+	CallbackArg a;
+	a.kind = CallbackArg::Bool;
+	a.i = v ? 1 : 0;
+	return a;
+}
+
+CallbackArg cb_int(s64 v)
+{
+	CallbackArg a;
+	a.kind = CallbackArg::Int;
+	a.i = v;
+	return a;
+}
+
+CallbackArg cb_str(const char* v)
+{
+	CallbackArg a;
+	if (!v)
+		return a;
+	a.kind = CallbackArg::Str;
+	a.s = v;
+	return a;
+}
+
+void queue_callback(const char* name, std::initializer_list<CallbackArg> args)
+{
+	size_t n = 0; // bounded: a name past kMaxName is refused anyway
+	if (name)
+		while (n <= kMaxName && name[n])
+			++n;
+	bool ok = valid_name(name, n) && args.size() <= kMaxCallbackArgs;
+	for (const CallbackArg& a : args)
+		if (a.kind == CallbackArg::Str && a.s.size() > kMaxCallbackStr)
+			ok = false;
+	if (!ok)
+	{
+		++g_stats.engine_invalid;
+		if (log_allowed(g_stats.engine_invalid))
+			::Msg("! [coop] engine callback '%.64s' dropped: bad name, %u arguments (max %u) or a string over %u bytes",
+			    name ? name : "(null)", u32(args.size()), u32(kMaxCallbackArgs), u32(kMaxCallbackStr));
+		return;
+	}
+	EngineEvent e;
+	e.kind = EngineEvent::Callback;
+	e.name.assign(name, n);
+	e.args.assign(args.begin(), args.end());
+	push_engine_event(std::move(e));
+}
+
 void on_chat(const char* nick, const char* text)
 {
 	if (!text || !*text)
@@ -1537,8 +1613,8 @@ void print_status()
 	    g_ui.expired, g_reject.pending ? "yes" : "no");
 	::Msg("[coop-lua] menu: port %u, address '%s', host after loading %s, last error [%s] '%s'", u32(g_menu.port),
 	    g_menu.address.c_str(), g_menu.pending ? "pending" : "no", g_menu.last_code.c_str(), g_menu.last_error.c_str());
-	::Msg("[coop-lua] engine callbacks: queued %llu, delivered %llu, dropped %llu, waiting %u", s.engine_events,
-	    s.engine_delivered, s.engine_dropped, (u32)g_engine.size());
+	::Msg("[coop-lua] engine callbacks: queued %llu, delivered %llu, dropped %llu, refused %llu, waiting %u",
+	    s.engine_events, s.engine_delivered, s.engine_dropped, s.engine_invalid, (u32)g_engine.size());
 	if (lua_ready())
 	{
 		call_lua("print_status", [](lua_State*) { return 0; });
