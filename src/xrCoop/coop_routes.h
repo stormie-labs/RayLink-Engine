@@ -175,8 +175,13 @@ inline constexpr StockRoute kStockRoutes[] = {
 	{"actor_on_land", Domain::Owner},
 	{"actor_on_before_throwable_select", Domain::Owner},
 
-	// NPCs: AI and world -> host
-	{"npc_on_use", Domain::Host},
+	// NPCs: AI and world -> host. Except the player's own use action (here and in Mutants, Physical objects): it fires
+	// on the machine whose actor pressed "use" (bind_monster.script:291 use_callback; GAMMA ui_mutant_loot.script:172
+	// sends monster_on_loot_init for that player's loot window), and only a CPhysicObject use is moved to the host
+	// (client_intercept_use, coop_objects.cpp), where owner runs it as well. Host would drop the NPC and mutant ones
+	// for a client, so owner; world logic in those handlers stays on the host through script rules (treasure_manager,
+	// grok_stashes_on_corpses = host).
+	{"npc_on_use", Domain::Owner},
 	{"npc_on_choose_weapon", Domain::Host},
 	{"npc_on_item_take", Domain::Host},
 	{"npc_on_item_take_from_box", Domain::Host},
@@ -204,13 +209,13 @@ inline constexpr StockRoute kStockRoutes[] = {
 	{"monster_on_net_spawn", Domain::Host},
 	{"monster_on_net_destroy", Domain::Host},
 	{"monster_on_death_callback", Domain::Host},
-	{"monster_on_actor_use_callback", Domain::Host},
-	{"monster_on_loot_init", Domain::Host},
+	{"monster_on_actor_use_callback", Domain::Owner}, // the player's own use, see NPCs
+	{"monster_on_loot_init", Domain::Owner},          // the player's own loot window, see NPCs
 	{"burer_on_before_weapon_drop", Domain::Host},
 
 	// Physical objects -> host
 	{"physic_object_on_hit_callback", Domain::Host},
-	{"physic_object_on_use_callback", Domain::Host},
+	{"physic_object_on_use_callback", Domain::Owner}, // the player's own use, see NPCs
 
 	// Vehicles -> host
 	{"heli_on_hit_callback", Domain::Host},
@@ -305,6 +310,7 @@ inline constexpr StockRoute kPrefixRoutes[] = {
 	{"squad_", Domain::Host},
 	{"smart_terrain_", Domain::Host},
 	{"server_entity_", Domain::Host},
+	{"server_object_", Domain::Host}, // monolith callbacks_gameobject.script: server_object_on_register/unregister
 	{"heli_", Domain::Host},
 	{"vehicle_", Domain::Host},
 	{"physic_object_", Domain::Host},
