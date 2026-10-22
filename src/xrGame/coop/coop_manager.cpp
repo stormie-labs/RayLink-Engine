@@ -4,6 +4,7 @@
 #include "coop_join.h"
 #include "coop_sync.h"
 #include "coop_script.h"
+#include "xrCoop/coop_link_hold.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,9 +21,10 @@ void log_line(const char* line) { ::Msg("%s", line); }
 // after this; ENet rounds it up to its next retransmission (10-16 s). Was 120 s, which kept a crashed client
 // "connected" for two minutes.
 constexpr u32 kPeerTimeoutMs = 10000;
-// W9: how long one loading activity holds the link (re-armed by every load stage): the longest single stage we
-// wait for, e.g. the texture upload of a big level on a slow disk.
-constexpr u32 kLoadHoldMs = 120000;
+// W9: how long one loading activity holds the link (re-armed by every load stage and by every frame until this machine
+// plays normally again, coop_link_hold.h): the longest single stage we wait for, e.g. the texture upload of a big
+// level on a slow disk.
+constexpr u32 kLoadHoldMs = link_hold::kLoadHoldMs;
 
 // R1 I2: a crash (FATAL dialog, access violation) must look like silence to the peers at once. Without it a client
 // that crashed while loading stays "connected", his character in the world, until the load hold runs out
@@ -500,10 +502,16 @@ void Manager::frame()
 	autostart();
 	if (m_phase == Phase::Off)
 		return;
-	// W9: frames run again and no load step is queued: whatever held the link is over. A crash after this point
-	// must look like silence to the peers.
-	if (g_loading_events.empty())
-		m_session.hold_connection(0);
+	// W9: the link stays held until this machine plays normally again, not just until its last load step: the first
+	// frames after a load (precache, the first update of every script, a client's way to live) can each stall longer
+	// than the silence timeout (live check 2026-10-23: a GAMMA client was dropped there). Until then every frame
+	// re-arms the hold, so a hang still goes silent kLoadHoldMs after its last frame; a crash releases it at once
+	// (on_crash). Afterwards a stall must look like silence to the peers.
+	link_hold::FrameState fs;
+	fs.load_steps_queued = !g_loading_events.empty();
+	fs.precache_frames = g_pGameLevel && Device.dwPrecacheFrame != 0;
+	fs.joining_world = m_phase == Phase::LoadingWorld;
+	m_session.hold_connection(link_hold::keep_held(fs) ? kLoadHoldMs : 0);
 	m_session.update(now_ms());
 	join::frame();
 	sync::frame();
