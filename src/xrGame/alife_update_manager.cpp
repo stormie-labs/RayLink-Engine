@@ -8,6 +8,8 @@
 
 #include "stdafx.h"
 #include "coop/coop_sync.h"
+#include "coop/coop_checkpoints.h" // F3: arrival checkpoints on a level change
+#include "coop/coop_autosave.h" // F3: the host's autosave name on a level change
 #include "alife_update_manager.h"
 #include "alife_simulator_header.h"
 #include "alife_time_manager.h"
@@ -199,6 +201,7 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	net_packet.r(&graph().actor()->m_tNodeID, sizeof(graph().actor()->m_tNodeID));
 	net_packet.r_vec3(graph().actor()->o_Position);
 	net_packet.r_vec3(graph().actor()->o_Angle);
+	coop::checkpoints::host_on_level_change(*graph().actor()); // Anomaly Coop: arrival checkpoints go into this save
 
 	Level().ClientSave();
 
@@ -222,7 +225,10 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	}
 
 	string256 autoave_name;
-	strconcat(sizeof(autoave_name), autoave_name, Core.UserName, " - ", "autosave");
+	if (LPCSTR coop_name = coop::autosave::level_change_name()) // Anomaly Coop: the host's coop_auto_N in a session
+		xr_strcpy(autoave_name, coop_name);
+	else
+		strconcat(sizeof(autoave_name), autoave_name, Core.UserName, " - ", "autosave");
 	LPCSTR temp0 = strstr(**m_server_command_line, "/");
 	VERIFY(temp0);
 	string256 temp;

@@ -492,8 +492,15 @@ void push_engine_event(EngineEvent&& e)
 {
 	if (g_engine.size() >= kMaxEngineEvents)
 	{
-		g_engine.pop_front();
+		// F3 T2 review: a dropped event is not sent again (Lua re-reads the state, e.g. coop.checkpoint.get); say which.
+		const EngineEvent& old = g_engine.front();
+		static const char* const kEventNames[] = {"on_transition_vote", "coop_actor_revived", "coop_on_container_opened"};
+		const char* what = old.kind == EngineEvent::Callback ? old.name.c_str() :
+			old.kind < EngineEvent::Callback ? kEventNames[old.kind] : "?";
 		++g_stats.engine_dropped;
+		if (log_allowed(g_stats.engine_dropped))
+			::Msg("! [coop] engine event queue full (%u): '%s' dropped", u32(kMaxEngineEvents), what);
+		g_engine.pop_front();
 	}
 	e.t_ms = mgr().now_ms();
 	g_engine.push_back(std::move(e));
