@@ -496,6 +496,7 @@ void push_engine_event(EngineEvent&& e)
 		// F3 T2 review: a dropped event is not sent again (Lua re-reads the state, e.g. coop.checkpoint.get); say which.
 		const EngineEvent& old = g_engine.front();
 		static const char* const kEventNames[] = {"on_transition_vote", "coop_actor_revived", "coop_on_container_opened"};
+		static_assert(sizeof(kEventNames) / sizeof(kEventNames[0]) == size_t(EngineEvent::Callback), "F3 T6 R1 M-4: one name per kind before Callback");
 		const char* what = old.kind == EngineEvent::Callback ? old.name.c_str() :
 			old.kind < EngineEvent::Callback ? kEventNames[old.kind] : "?";
 		++g_stats.engine_dropped;

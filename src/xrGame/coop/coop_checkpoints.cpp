@@ -1,6 +1,6 @@
 // Anomaly Coop — per-player checkpoints on the host (F3 Task 6). See coop_checkpoints.h for the store, the message and
-// the Lua / console surface; the record rules are xrCoop/coop_checkpoint_rules.h, the pure store parts
-// xrCoop/coop_checkpoint_store.h.
+// the Lua / console surface; the record rules are xrCoop/coop_checkpoint_rules.h, the pure store parts (the cache and
+// queue of the host, visibility, the client's mirror, the custom-data form) xrCoop/coop_checkpoint_store.h.
 #include "stdafx.h"
 #include "coop_checkpoints.h"
 #include "coop_checkpoint_sources.h"
@@ -27,6 +27,7 @@
 #include "alife_time_manager.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 
+#include <cmath>
 #include <string>
 
 namespace coop
@@ -42,28 +43,23 @@ using checkpoint::kNoSource;
 
 constexpr u16 kNoId = 0xffff;
 constexpr const char* kChangedCallback = "coop_checkpoint_changed";
+// F3 T6 R1 I-1: how often the host reads every cached slot again, so a character that is gone or whose id another
+// character got is announced as cleared (the reads are a few hundred bytes of custom data each).
+constexpr u64 kSweepMs = 1000;
 
 // Host setting (console coop_checkpoints_group): every player sees everyone's checkpoints (1) or only his own (0).
 int g_group = 1;
-
-// A change waiting for frame() to tell the owner / the group (messages and callbacks go from the main thread only).
-struct Pending
-{
-	u16 character = kNoId;
-	bool rollback = false;
-};
-// Bounded twice the store: a character is queued once (a later change of the same frame updates the entry).
-constexpr size_t kMaxPending = 2 * checkpoint::kMaxSlots;
 
 struct Host
 {
 	bool loaded = false; // the store was read from the world of `epoch`
 	u32 epoch = 0;
-	xr_map<u16, Slot> slots; // characters with a checkpoint (cur valid), host numbering; at most kMaxSlots
+	checkpoint::HostStore store; // cache of the slots (host numbering) and the changes frame() announces
 	Record arrival; // the host's own arrival point (actor custom data, key `arrival`)
-	xr_vector<Pending> outbox; // at most kMaxPending
 	xr_set<u16> in_world; // characters whose players were in the world at the last frame (at most kMaxPlayers)
 	int group_served = -1; // coop_checkpoints_group the players in the world were last served with
+	u64 next_sweep_ms = 0;
+	xr_set<u16> unreadable_told; // R1 M-2: characters whose unreadable record was logged in this world (<= kMaxSlots)
 };
 Host g_host;
 
@@ -74,7 +70,7 @@ u32 g_mirror_world = 0; // join::world_generation() of the world the mirror belo
 struct Stats
 {
 	u64 sets = 0, refused = 0, arrivals = 0, stories = 0, rollbacks = 0;
-	u64 sent = 0, reloads = 0, fixes = 0, unreadable = 0, store_full = 0, outbox_full = 0;
+	u64 sent = 0, reloads = 0, fixes = 0, unreadable = 0, vanished = 0;
 	u64 received = 0, malformed = 0, mirror_full = 0;
 };
 Stats g_stat;
@@ -146,12 +142,14 @@ bool load_slot(u16 character, Slot& out)
 		return false;
 	unsigned corrupt = 0;
 	out = checkpoint::slot_from_ini(custom_data(e), &corrupt);
-	if (corrupt)
+	// R1 M-2: an unreadable line stays until the slot is written again; it is said once per character and world, not
+	// on every read.
+	if (corrupt && !g_host.unreadable_told.count(character) && g_host.unreadable_told.size() < checkpoint::kMaxSlots)
 	{
-		g_stat.unreadable += corrupt;
-		if (log_allowed(g_stat.unreadable))
-			::Msg("! [coop] checkpoints: character %u has %u unreadable record(s) in its custom data, ignored", character,
-			    corrupt);
+		g_host.unreadable_told.insert(character);
+		++g_stat.unreadable;
+		::Msg("! [coop] checkpoints: character %u has %u unreadable record(s) in its custom data, ignored", character,
+		    corrupt);
 	}
 	return true;
 }
@@ -195,65 +193,22 @@ void store_arrival(const Record& r)
 
 // ---------------------------------------------------------------- the store
 
-void cache(u16 character, const Slot& s)
-{
-	if (!s.cur.valid())
-	{
-		g_host.slots.erase(character);
-		return;
-	}
-	auto it = g_host.slots.find(character);
-	if (it != g_host.slots.end())
-	{
-		it->second = s;
-		return;
-	}
-	if (g_host.slots.size() >= checkpoint::kMaxSlots)
-	{
-		++g_stat.store_full;
-		if (log_allowed(g_stat.store_full))
-			::Msg("! [coop] checkpoints: the store keeps %u characters, character %u is not listed",
-			    u32(checkpoint::kMaxSlots), character);
-		return;
-	}
-	g_host.slots.emplace(character, s);
-}
-
-// The slot of a character read again from where it is kept (the cache follows): a reused entity id or a load cannot
-// hand one character's slot to another. nullptr if he has no checkpoint or is no player's character.
+// The slot of a character read again from where it is kept; the cache follows, and if what the players were told no
+// longer holds (the character is gone, or its id belongs to another one now: R1 I-1) the change is queued. nullptr if
+// he has no checkpoint or is no player's character.
 const Slot* slot_of(u16 character)
 {
 	Slot s;
 	if (!load_slot(character, s))
+		s = Slot();
+	if (g_host.store.observe(character, s))
 	{
-		g_host.slots.erase(character);
-		return nullptr;
+		++g_stat.vanished;
+		if (log_allowed(g_stat.vanished))
+			::Msg("[coop] checkpoints: the record of character %u changed under the store (%s), announced", character,
+			    s.cur.valid() ? "another record" : "none any more");
 	}
-	cache(character, s);
-	const auto it = g_host.slots.find(character);
-	return it == g_host.slots.end() ? nullptr : &it->second;
-}
-
-void notify(u16 character, bool rollback)
-{
-	for (Pending& p : g_host.outbox)
-		if (p.character == character)
-		{
-			p.rollback = rollback; // the newest change decides what the players see
-			return;
-		}
-	if (g_host.outbox.size() >= kMaxPending)
-	{
-		++g_stat.outbox_full;
-		if (log_allowed(g_stat.outbox_full))
-			::Msg("! [coop] checkpoints: change of character %u not announced (%u queued)", character,
-			    u32(g_host.outbox.size()));
-		return;
-	}
-	Pending p;
-	p.character = character;
-	p.rollback = rollback;
-	g_host.outbox.push_back(p);
+	return g_host.store.find(character);
 }
 
 // A new record into the character's slot, written through and queued for the players.
@@ -262,64 +217,72 @@ bool apply_set(u16 character, const Record& r)
 	Slot s;
 	if (!load_slot(character, s))
 		return false;
-	if (!g_host.slots.count(character) && g_host.slots.size() >= checkpoint::kMaxSlots)
+	if (!g_host.store.find(character) && g_host.store.slots().size() >= checkpoint::kMaxSlots)
 	{
-		++g_stat.store_full;
-		if (log_allowed(g_stat.store_full))
-			::Msg("! [coop] checkpoints: the store keeps %u characters, character %u gets none",
-			    u32(checkpoint::kMaxSlots), character);
+		::Msg("! [coop] checkpoints: the store keeps %u characters, character %u gets none", u32(checkpoint::kMaxSlots),
+		    character);
 		return false;
 	}
 	checkpoint::set(s, r);
-	if (!store_slot(character, s))
-		return false;
-	cache(character, s);
-	notify(character, false);
-	return true;
+	return store_slot(character, s) && g_host.store.change(character, s, false);
 }
 
-// A group level change writes the players' arrival spots before the next level is loaded, so whether a spot is on its
-// AI map is known only here, in the new world: a spot on the map gets its vertex, one off it moves to the host's own
-// arrival point (plan F3 Task 6, step 3).
-void fix_arrivals()
+// An arrival spot written before its level was loaded, checked on this level's AI map (plan F3 Task 6, step 3): on
+// the map it takes the vertex under it, the height of that vertex's plane and its game vertex (R1 M-5); off the map it
+// moves to `fallback` (the host's own arrival point) when there is one. True if the record changed.
+bool fix_spot(Record& r, const Record* fallback)
 {
-	const std::string level = current_level();
 	const CLevelGraph& lg = ai().level_graph();
-	const bool host_spot = g_host.arrival.valid() && g_host.arrival.level == level &&
-		lg.valid_vertex_id(g_host.arrival.level_vertex);
-	for (auto& it : g_host.slots)
+	Fvector p;
+	p.set(r.pos[0], r.pos[1], r.pos[2]);
+	const u32 v = lg.valid_vertex_position(p) ? lg.vertex_id(p) : u32(-1);
+	if (lg.valid_vertex_id(v))
 	{
-		bool changed = false;
-		for (Record* r : {&it.second.cur, &it.second.prev})
-		{
-			if (!r->valid() || r->kind != Kind::Arrival || r->level != level)
-				continue;
-			Fvector p;
-			p.set(r->pos[0], r->pos[1], r->pos[2]);
-			const u32 v = lg.valid_vertex_position(p) ? lg.vertex_id(p) : u32(-1);
-			if (lg.valid_vertex_id(v))
-			{
-				if (r->level_vertex != v)
-				{
-					r->level_vertex = v;
-					changed = true;
-				}
-			}
-			else if (host_spot)
-			{
-				for (int i = 0; i < 3; ++i)
-					r->pos[i] = g_host.arrival.pos[i];
-				r->level_vertex = g_host.arrival.level_vertex;
-				r->game_vertex = g_host.arrival.game_vertex;
-				changed = true;
-			}
-		}
-		if (changed)
-		{
-			store_slot(it.first, it.second);
-			++g_stat.fixes;
-		}
+		const float y = lg.vertex_plane_y(v, p.x, p.z);
+		GameGraph::_GRAPH_ID gv = r.game_vertex;
+		if (ai().get_cross_table())
+			gv = ai().cross_table().vertex(v).game_vertex_id();
+		const bool changed = r.level_vertex != v || std::fabs(r.pos[1] - y) > 0.01f || r.game_vertex != gv;
+		r.level_vertex = v;
+		r.pos[1] = y;
+		r.game_vertex = gv;
+		return changed;
 	}
+	if (!fallback)
+		return false;
+	bool changed = r.level_vertex != fallback->level_vertex || r.game_vertex != fallback->game_vertex;
+	for (int i = 0; i < 3; ++i)
+	{
+		changed = changed || r.pos[i] != fallback->pos[i];
+		r.pos[i] = fallback->pos[i];
+	}
+	r.level_vertex = fallback->level_vertex;
+	r.game_vertex = fallback->game_vertex;
+	return changed;
+}
+
+// The arrival records of a slot on this level, fixed (see fix_spot). True if the slot changed.
+bool fix_arrivals(Slot& s, const std::string& level, const Record* fallback)
+{
+	bool changed = false;
+	for (Record* r : {&s.cur, &s.prev})
+		if (r->valid() && r->kind == Kind::Arrival && r->level == level && fix_spot(*r, fallback))
+			changed = true;
+	return changed;
+}
+
+// Reads a character's slot of a newly served world into the cache, its arrival spots fixed first.
+void load_into_cache(u16 character, const std::string& level, const Record* fallback)
+{
+	Slot s;
+	if (!load_slot(character, s))
+		return;
+	if (fix_arrivals(s, level, fallback))
+	{
+		store_slot(character, s);
+		++g_stat.fixes;
+	}
+	g_host.store.observe(character, s); // first met: cached, nothing announced (the players get whole lists)
 }
 
 // The store belongs to the served world: a load or a level change (join::host_world_epoch) reads it again from the
@@ -334,20 +297,26 @@ bool ensure_loaded()
 		return true;
 	g_host.loaded = true;
 	g_host.epoch = epoch;
-	g_host.slots.clear();
+	g_host.store.clear_cache(); // changes still queued go out (the host's own arrival of the level change)
 	g_host.in_world.clear(); // every player in this world gets the whole list again
+	g_host.unreadable_told.clear();
+	const std::string level = current_level();
 	g_host.arrival = Record();
-	load_arrival(g_host.arrival);
-	Slot s;
-	if (load_slot(0, s))
-		cache(0, s);
+	if (load_arrival(g_host.arrival) && g_host.arrival.level == level && fix_spot(g_host.arrival, nullptr))
+	{
+		store_arrival(g_host.arrival); // R1 M-5: the host's own point takes the vertex under it as well
+		++g_stat.fixes;
+	}
+	const bool host_spot = g_host.arrival.valid() && g_host.arrival.level == level &&
+		ai().level_graph().valid_vertex_id(g_host.arrival.level_vertex);
+	const Record* fallback = host_spot ? &g_host.arrival : nullptr;
+	load_into_cache(0, level, fallback);
 	for (const auto& it : ai().alife().objects().objects())
-		if (it.first != 0 && it.second && world::is_player_character(it.second) && load_slot(it.first, s))
-			cache(it.first, s);
-	fix_arrivals();
+		if (it.first != 0 && it.second && world::is_player_character(it.second))
+			load_into_cache(it.first, level, fallback);
 	++g_stat.reloads;
 	::Msg("[coop] checkpoints: %u character(s) with a checkpoint in this world (epoch %u), host arrival %s",
-	    u32(g_host.slots.size()), epoch, g_host.arrival.valid() ? g_host.arrival.level.c_str() : "none");
+	    u32(g_host.store.slots().size()), epoch, g_host.arrival.valid() ? g_host.arrival.level.c_str() : "none");
 	return true;
 }
 
@@ -364,7 +333,8 @@ std::string describe(const Record& r)
 
 // ---------------------------------------------------------------- telling the players
 
-// coop_checkpoint_changed(local_id, kind, source_local_id | -1, rollback, level | nil) on this machine.
+// coop_checkpoint_changed(local_id, kind, source_local_id | -1, rollback, level | nil) on this machine. A player with
+// no checkpoint (rolled back to nothing, gone, no longer shared) gets kind "none", source -1, level nil (R1 M-8).
 void fire_changed(u16 local_id, bool rollback, const Record& r, u16 source_local)
 {
 	using namespace script;
@@ -387,36 +357,31 @@ void send_state(PeerId to, u16 character, bool rollback, const Record& cur)
 	++g_stat.sent;
 }
 
-// What one player in the world may see: his own record, everyone's with the group view on. `clear_others`: the group
-// view was just turned off, his copies of the others go.
+// Reads every cached slot again (the cache follows; what changed under it is queued, R1 I-1).
+void refresh_all()
+{
+	xr_vector<u16> ids;
+	ids.reserve(g_host.store.slots().size());
+	for (const auto& it : g_host.store.slots())
+		ids.push_back(it.first);
+	for (u16 id : ids)
+		slot_of(id);
+}
+
+// The whole list for one player in the world (checkpoint::HostStore::view_for): what he may see, his own id cleared
+// when he has none.
 void send_view(u16 proxy, bool group, bool clear_others)
 {
 	const PeerId peer = join::peer_of_proxy(proxy);
 	if (peer == kInvalidPeer)
 		return;
-	xr_vector<u16> ids;
-	ids.reserve(g_host.slots.size());
-	for (const auto& it : g_host.slots)
-		ids.push_back(it.first);
-	for (u16 id : ids)
-	{
-		const Slot* s = slot_of(id);
-		if (!s)
-			continue;
-		if (group || id == proxy)
-			send_state(peer, id, false, s->cur);
-		else if (clear_others)
-			send_state(peer, id, false, Record());
-	}
+	for (const checkpoint::Outgoing& o : g_host.store.view_for(proxy, group, clear_others))
+		send_state(peer, o.character, o.rollback, o.cur);
 }
 
 void flush_outbox(bool group)
 {
-	if (g_host.outbox.empty())
-		return;
-	xr_vector<Pending> out;
-	out.swap(g_host.outbox);
-	for (const Pending& p : out)
+	for (const checkpoint::Pending& p : g_host.store.take_pending())
 	{
 		Record cur;
 		if (const Slot* s = slot_of(p.character))
@@ -429,7 +394,7 @@ void flush_outbox(bool group)
 			if (owner != kInvalidPeer)
 				send_state(owner, p.character, p.rollback, cur);
 		}
-		if (group || p.character == 0) // on the host, host numbering is local numbering
+		if (checkpoint::may_see(0, p.character, group)) // on the host, host numbering is local numbering
 			fire_changed(p.character, p.rollback, cur, cur.valid() ? cur.source : kNoSource);
 	}
 }
@@ -439,6 +404,12 @@ void host_frame()
 	if (!ensure_loaded())
 		return;
 	const bool group = g_group != 0;
+	const u64 now_ms = mgr().now_ms();
+	if (now_ms >= g_host.next_sweep_ms)
+	{
+		g_host.next_sweep_ms = now_ms + kSweepMs;
+		refresh_all();
+	}
 	// Players who came into the world since the last frame (join::host_player_in_world turned true) get the whole
 	// list; with the group view switched everyone in the world is served again.
 	xr_set<u16> now;
@@ -450,10 +421,22 @@ void host_frame()
 	}
 	const bool switched = g_host.group_served != -1 && g_host.group_served != int(group);
 	if (switched)
+	{
 		::Msg("[coop] checkpoints: the group view is %s", group ? "on" : "off");
+		refresh_all();
+		// R1 M-8: the host's own Lua learns it as the clients do (the others' records, or "none")
+		for (const auto& it : g_host.store.slots())
+			if (it.first != 0)
+				fire_changed(it.first, false, group ? it.second.cur : Record(),
+				    group && it.second.cur.valid() ? it.second.cur.source : kNoSource);
+	}
 	for (u16 proxy : now)
 		if (switched || !g_host.in_world.count(proxy))
+		{
+			if (!switched)
+				slot_of(proxy); // his own slot as it is now (his copy may hold the camp of a former owner of the id)
 			send_view(proxy, group, switched && !group);
+		}
 	g_host.in_world.swap(now);
 	g_host.group_served = int(group);
 	flush_outbox(group);
@@ -557,13 +540,15 @@ void print_status()
 {
 	if (mgr().is_host())
 	{
-		::Msg("[coop]   checkpoints: %u character(s) with one, group view %s, host arrival %s", u32(g_host.slots.size()),
+		const checkpoint::HostStore& st = g_host.store;
+		::Msg("[coop]   checkpoints: %u character(s) with one, group view %s, host arrival %s", u32(st.slots().size()),
 		    g_group ? "on" : "off", describe(g_host.arrival).c_str());
 		::Msg("[coop]   checkpoints: sets %llu, refused %llu, arrivals %llu, story %llu, rollbacks %llu, sent %llu, "
-		      "reloads %llu, arrival fixes %llu, unreadable %llu, store full %llu, not announced %llu",
+		      "reloads %llu, arrival fixes %llu, changed under the store %llu, unreadable %llu, not kept %llu, "
+		      "not announced %llu",
 		    g_stat.sets, g_stat.refused, g_stat.arrivals, g_stat.stories, g_stat.rollbacks, g_stat.sent, g_stat.reloads,
-		    g_stat.fixes, g_stat.unreadable, g_stat.store_full, g_stat.outbox_full);
-		for (const auto& it : g_host.slots)
+		    g_stat.fixes, g_stat.vanished, g_stat.unreadable, st.not_kept(), st.not_announced());
+		for (const auto& it : st.slots())
 			::Msg("[coop]   checkpoint of %u: %s | prev %s", it.first, describe(it.second.cur).c_str(),
 			    describe(it.second.prev).c_str());
 	}
@@ -626,6 +611,8 @@ bool host_set(u16 character, const Record& r)
 		why = "not on this level";
 	else if (!ai().level_graph().valid_vertex_id(r.level_vertex))
 		why = "no AI map vertex there";
+	else if (!ai().game_graph().valid_vertex_id(r.game_vertex))
+		why = "no game graph vertex"; // R1 M-6: a transition by game vertex (Task 14) needs one
 	else if (!character_entity(character))
 		why = "not a player's character";
 	else if (survival::life_of(character) != survival::Life::Alive)
@@ -640,7 +627,8 @@ bool host_set(u16 character, const Record& r)
 		return false;
 	}
 	++g_stat.sets;
-	::Msg("[coop] checkpoint of character %u: %s", character, describe(r).c_str());
+	if (log_allowed(g_stat.sets)) // R1 M-3: a mod may set them in a loop
+		::Msg("[coop] checkpoint of character %u: %s", character, describe(r).c_str());
 	return true;
 }
 
@@ -649,28 +637,23 @@ void host_source_lost(u16 source)
 	if (source == kNoSource || !ensure_loaded())
 		return;
 	xr_vector<u16> ids;
-	ids.reserve(g_host.slots.size());
-	for (const auto& it : g_host.slots)
+	ids.reserve(g_host.store.slots().size());
+	for (const auto& it : g_host.store.slots())
 		ids.push_back(it.first);
 	for (u16 id : ids)
 	{
 		Slot s;
-		if (!load_slot(id, s))
+		if (!load_slot(id, s) || !checkpoint::source_lost(s, source))
 		{
-			g_host.slots.erase(id);
-			continue;
-		}
-		if (!checkpoint::source_lost(s, source))
-		{
-			cache(id, s);
+			slot_of(id); // unchanged, or the character is gone (announced as such)
 			continue;
 		}
 		store_slot(id, s);
-		cache(id, s);
-		notify(id, true);
+		g_host.store.change(id, s, true);
 		++g_stat.rollbacks;
-		::Msg("[coop] checkpoint of character %u rolled back (source %u is gone): %s", id, source,
-		    describe(s.cur).c_str());
+		if (log_allowed(g_stat.rollbacks))
+			::Msg("[coop] checkpoint of character %u rolled back (source %u is gone): %s", id, source,
+			    describe(s.cur).c_str());
 	}
 }
 
@@ -749,7 +732,8 @@ bool host_story(const char* reason)
 			++set;
 	}
 	++g_stat.stories;
-	::Msg("[coop] checkpoints: story checkpoint '%.64s' for %u player(s)", reason ? reason : "", set);
+	if (log_allowed(g_stat.stories)) // R1 M-3: coop.checkpoint.story is open to every addon
+		::Msg("[coop] checkpoints: story checkpoint '%.64s' for %u player(s)", reason ? reason : "", set);
 	return set != 0;
 }
 
@@ -807,9 +791,9 @@ bool get(u16 local_id, Record& out)
 		return false;
 	if (mgr().is_host())
 	{
-		if (local_id != 0 && !g_group)
+		if (!checkpoint::may_see(0, local_id, g_group != 0))
 			return false;
-		// Read where the slot lives without touching the cache: Lua may call this off the main thread.
+		// R1 M-1: read where the slot lives; the cache serves the whole lists and the announcements (frame()).
 		Slot s;
 		if (!ensure_loaded() || !load_slot(local_id, s) || !s.cur.valid())
 			return false;

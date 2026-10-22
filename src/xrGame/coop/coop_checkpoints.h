@@ -12,10 +12,14 @@
 // Messages (ids in host numbering):
 //   CheckpointState  host -> owner, and -> all while coop_checkpoints_group = 1   reliable
 //                    {u16 character, u8 flags (1 rollback, 2 cleared), record unless cleared}; a player who comes into
-//                    the world gets the whole list he may see (his own, everyone's with the group view on).
+//                    the world gets the whole list he may see (his own, everyone's with the group view on) and his
+//                    own id as cleared when he has none. A slot that changed under the store (the character is gone,
+//                    or its id belongs to another character now) is announced like any change (R1 I-1).
 // Callback (owner, and everyone with the group view on; the host too):
-//   coop_checkpoint_changed(local_id, kind, source_local_id or -1, rollback, level or nil). The callback queue is
-//   shared and bounded, a dropped callback is not sent again: Lua re-reads coop.checkpoint.get.
+//   coop_checkpoint_changed(local_id, kind, source_local_id or -1, rollback, level or nil). Kind "none" (source -1,
+//   level nil) means the player has no checkpoint any more for this machine: rolled back to nothing, his character
+//   gone, or no longer shared (the group view turned off). The callback queue is shared and bounded, a dropped
+//   callback is not sent again: Lua re-reads coop.checkpoint.get.
 // Lua: coop.checkpoint.get(local_id) -> nil | {kind, level, x, y, z, source = local id | nil};
 //      coop.checkpoint.story(reason) -> bool (host).
 // Console: coop_checkpoints_group 0/1 (host setting), coop_checkpoint_status, coop_checkpoint_here (host, debug).

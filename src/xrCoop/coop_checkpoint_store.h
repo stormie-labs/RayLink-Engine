@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "coop_checkpoint_rules.h"
 #include "coop_wire.h"
@@ -156,6 +157,160 @@ inline void arrival_spot(const float host[3], unsigned n, float out[3])
 	out[1] = host[1];
 	out[2] = host[2];
 }
+
+// ---------------------------------------------------------------- visibility
+
+// Who sees a player's checkpoint: its owner always, the others while the host shares them (coop_checkpoints_group).
+// `viewer` and `owner` are characters in one numbering (the host's actor is 0 on the host).
+inline bool may_see(uint16_t viewer, uint16_t owner, bool group) { return group || viewer == owner; }
+
+// ---------------------------------------------------------------- host store
+
+// A change the host is to announce (frame() sends the character's record as it is then).
+struct Pending
+{
+	uint16_t character = 0xffff;
+	bool rollback = false;
+};
+
+// One CheckpointState of a whole list: the character, the flag and his current record (not valid = cleared).
+struct Outgoing
+{
+	uint16_t character = 0xffff;
+	bool rollback = false;
+	Record cur;
+};
+
+// A character is queued once (a later change of the same frame updates the entry); twice the store for the ones that
+// just left it.
+constexpr size_t kMaxPending = 2 * kMaxSlots;
+
+// The host's cache of the slots and the queue of changes to announce. The slots live in the characters' custom data;
+// the cache follows them (it is what the players were last told) and serves the whole lists. Bounded: kMaxSlots slots,
+// kMaxPending changes.
+class HostStore
+{
+public:
+	// A slot just read back from where it lives. If what the players were told no longer holds (the current record
+	// changed or went away: the character is gone, or its id belongs to another character now) the change is queued
+	// and true returned. A slot first met here is only cached: nothing about it was announced from this cache (a
+	// player who comes into the world gets it with the whole list).
+	bool observe(uint16_t id, const Slot& s)
+	{
+		const auto it = m_slots.find(id);
+		const bool told = it != m_slots.end();
+		const bool differs = told && (!s.cur.valid() || encode(it->second.cur) != encode(s.cur));
+		put(id, s);
+		if (differs)
+			queue(id, false);
+		return differs;
+	}
+
+	// A change the host made (a new camp, a rollback): cached and queued. False when `id` is new and the cache is full.
+	bool change(uint16_t id, const Slot& s, bool rollback)
+	{
+		if (!put(id, s))
+			return false;
+		queue(id, rollback);
+		return true;
+	}
+
+	const Slot* find(uint16_t id) const
+	{
+		const auto it = m_slots.find(id);
+		return it == m_slots.end() ? nullptr : &it->second;
+	}
+	const std::map<uint16_t, Slot>& slots() const { return m_slots; }
+
+	// What frame() announces now; the queue empties.
+	std::vector<Pending> take_pending()
+	{
+		std::vector<Pending> out;
+		out.swap(m_pending);
+		return out;
+	}
+
+	// The whole list for the player of character `viewer` (he came into the world, or the group view switched): the
+	// records he may see; his own id as cleared when he has none (his copy may hold the camp of a character that had
+	// this id before); with `clear_others` (the group view was just turned off) the others' as cleared.
+	std::vector<Outgoing> view_for(uint16_t viewer, bool group, bool clear_others) const
+	{
+		std::vector<Outgoing> out;
+		if (m_slots.find(viewer) == m_slots.end())
+		{
+			Outgoing own;
+			own.character = viewer;
+			out.push_back(own);
+		}
+		for (const auto& it : m_slots)
+		{
+			Outgoing o;
+			o.character = it.first;
+			if (may_see(viewer, it.first, group))
+				o.cur = it.second.cur;
+			else if (!clear_others)
+				continue;
+			out.push_back(o);
+		}
+		return out;
+	}
+
+	void clear_cache() { m_slots.clear(); } // a new world (queued changes still go out)
+	void clear()
+	{
+		m_slots.clear();
+		m_pending.clear();
+	}
+	uint64_t not_kept() const { return m_not_kept; } // a new character over kMaxSlots
+	uint64_t not_announced() const { return m_not_announced; } // a change over kMaxPending
+
+private:
+	// Caches the slot (an empty one leaves the cache). False when `id` is new and kMaxSlots are kept.
+	bool put(uint16_t id, const Slot& s)
+	{
+		if (!s.cur.valid())
+		{
+			m_slots.erase(id);
+			return true;
+		}
+		const auto it = m_slots.find(id);
+		if (it != m_slots.end())
+		{
+			it->second = s;
+			return true;
+		}
+		if (m_slots.size() >= kMaxSlots)
+		{
+			++m_not_kept;
+			return false;
+		}
+		m_slots.emplace(id, s);
+		return true;
+	}
+
+	void queue(uint16_t id, bool rollback)
+	{
+		for (Pending& p : m_pending)
+			if (p.character == id)
+			{
+				p.rollback = rollback; // the newest change decides what the players see
+				return;
+			}
+		if (m_pending.size() >= kMaxPending)
+		{
+			++m_not_announced;
+			return;
+		}
+		Pending p;
+		p.character = id;
+		p.rollback = rollback;
+		m_pending.push_back(p);
+	}
+
+	std::map<uint16_t, Slot> m_slots;
+	std::vector<Pending> m_pending;
+	uint64_t m_not_kept = 0, m_not_announced = 0;
+};
 
 // ---------------------------------------------------------------- client mirror
 
