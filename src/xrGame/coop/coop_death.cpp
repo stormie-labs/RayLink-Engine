@@ -30,10 +30,13 @@
 #include "ai_object_location.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
+#include "alife_graph_registry.h"
 #include "alife_time_manager.h"
 #include "xrServer_Objects_ALife.h"
+#include "xrServer_Objects_ALife_Items.h"
 #include "../xrServerEntities/xrMessages.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -46,7 +49,6 @@ namespace death
 namespace
 {
 constexpr u16 kNoId = 0xffff;
-constexpr u64 kStashWaitMs = 5000; // plan T9 step 3: the stash has this long to come online
 constexpr size_t kMaxPendingStashes = 16; // one per death; more at once falls back to dropping
 constexpr size_t kMaxMarkers = 32;
 constexpr size_t kMaxPreviewLine = 900; // section lists in coop_death_preview are cut here
@@ -131,11 +133,15 @@ struct PendingStash
 {
 	u16 stash = kNoId;
 	u16 character = kNoId;
-	// The character's player key digest (ledger::character_key): the id alone says nothing about who plays it once
-	// the character is gone and the id is given to another one (F2-13).
-	std::string key;
+	// Who it is for (fix round 1, review I1): the player and the key of the character when the stash was made. The id
+	// alone says nothing once the character is released and the id given to another one (F2-13); the key alone is
+	// rewritten by Task 10 for a retiring character, the peer alone is gone when the player leaves (same_owner).
+	StashOwner owner;
 	std::vector<u16> items; // host ids, as stash_ids gave them
-	u64 deadline = 0;
+	u64 deadline = 0; // the stash must be online by then while the character is here (stash_presence restarts it)
+	u64 give_up_at = 0; // a player who left: the move waits for him (or for both to go offline) until then
+	bool away = false; // the character was not online at the last check
+	DropPlace died; // where the stash was made: a fallback drop puts the items there (fallback_place)
 };
 xr_vector<PendingStash> g_stashes;
 
@@ -179,14 +185,15 @@ u16 server_parent(u16 id)
 	return e ? e->ID_Parent : kNoId;
 }
 
-// The key of a character: the player key digest of its custom data (as the money book keys it), "#<id>" without one.
-std::string character_key_of(u16 character)
+// Who plays `character` now and the player key digest on its custom data (as the money book keys it; empty if none).
+StashOwner owner_of(u16 character)
 {
+	StashOwner o;
+	o.peer = character == 0 ? kHostPeer : join::peer_of_proxy(character);
 	const CSE_Abstract* e = events::find_entity(character);
-	std::string key = e && e->m_ini_string.size() ? ledger::character_key(e->m_ini_string.c_str()) : std::string();
-	if (key.empty())
-		key = "#" + std::to_string(u32(character));
-	return key;
+	if (e && e->m_ini_string.size())
+		o.key = ledger::character_key(e->m_ini_string.c_str());
+	return o;
 }
 
 // A player character online on this machine: the host's actor (0) or a player's proxy.
@@ -313,14 +320,13 @@ bool drop_one(u16 character, u16 item, const DropPlace& place, size_t index)
 	return true;
 }
 
-// Drops `items` of `character`; the id of the first one that fell, kNoId if none did.
-u16 drop_all(u16 character, CGameObject* body, const std::vector<u16>& items, u32& count)
+// Drops `items` of `character` at `place`; the id of the first one that fell, kNoId if none did.
+u16 drop_all_at(u16 character, const std::vector<u16>& items, const DropPlace& place, u32& count)
 {
 	count = 0;
 	u16 first = kNoId;
-	const BodyPlace place = body_place(body);
 	for (u16 id : items)
-		if (drop_one(character, id, place.drop, count))
+		if (drop_one(character, id, place, count))
 		{
 			if (first == kNoId)
 				first = id;
@@ -329,9 +335,14 @@ u16 drop_all(u16 character, CGameObject* body, const std::vector<u16>& items, u3
 	g_st.dropped += count;
 	if (count)
 		::Msg("[coop] death: %u items of %s dropped at (%.1f, %.1f, %.1f)%s", count, nick(character).c_str(),
-		    place.drop.at.x, place.drop.at.y, place.drop.at.z,
-		    place.drop.moved ? ", above the level vertex (the body is under the ground or off the level graph)" : "");
+		    place.at.x, place.at.y, place.at.z,
+		    place.moved ? ", put there (the body is under the ground, off the level graph or away from it)" : "");
 	return first;
+}
+
+u16 drop_all(u16 character, CGameObject* body, const std::vector<u16>& items, u32& count)
+{
+	return drop_all_at(character, items, body_place(body).drop, count);
 }
 
 void move_item(u16 from, u16 to, u16 item)
@@ -451,9 +462,11 @@ u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everyt
 	PendingStash p;
 	p.stash = e->ID;
 	p.character = character;
-	p.key = character_key_of(character);
+	p.owner = owner_of(character);
 	p.items = picked;
 	p.deadline = now_ms() + kStashWaitMs;
+	p.give_up_at = now_ms() + kStashAwayWaitMs;
+	p.died = place.drop;
 	count = u32(p.items.size());
 	g_stashes.push_back(std::move(p));
 	++g_st.stashes;
@@ -463,19 +476,47 @@ u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everyt
 	return e->ID;
 }
 
-// The stash is online: the items go in, as the stock corpse search window moves them (move_item_from_to).
-void fill_stash(PendingStash& p)
+// Where the character is: Online = a player character in the level; Offline = his player left and the character is
+// parked in ALife (join::take_offline); Between = switching; Gone = no entity.
+Presence character_presence(u16 character)
 {
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
-	if (character_key_of(p.character) != p.key || !player_character(p.character, body, io))
+	if (player_character(character, body, io))
+		return Presence::Online;
+	CSE_ALifeDynamicObject* d = ai().get_alife() ? ai().alife().objects().object(character, true) : nullptr;
+	if (d)
+		return d->m_bOnline ? Presence::Between : Presence::Offline;
+	return events::find_entity(character) ? Presence::Between : Presence::Gone;
+}
+
+// Where the stash is: Online only as an inventory box (another class under that section never fills: its 5 s run out).
+Presence stash_presence_of(u16 stash)
+{
+	if (CGameObject* go = game_object(stash))
+		return smart_cast<CInventoryBox*>(go) ? Presence::Online : Presence::Between;
+	CSE_ALifeDynamicObject* d = ai().get_alife() ? ai().alife().objects().object(stash, true) : nullptr;
+	if (d)
+		return d->m_bOnline ? Presence::Between : Presence::Offline;
+	return events::find_entity(stash) ? Presence::Between : Presence::Gone;
+}
+
+void stash_filled(PendingStash& p, u32 moved, const char* how)
+{
+	g_st.moved += moved;
+	::Msg("[coop] death stash %u: %u of %u items of %s are in%s", p.stash, moved, u32(p.items.size()),
+	    nick(p.character).c_str(), how);
+	if (!moved)
 	{
-		::Msg("! [coop] death stash %u: character %u is gone or offline, his items stay with him", p.stash,
-		    p.character);
-		++g_st.stash_lost;
 		release_stash(p.stash);
 		return;
 	}
+	queue_marker(p.character, p.stash, Drop::Corpse);
+}
+
+// Both online: the items go in, as the stock corpse search window moves them (move_item_from_to).
+void fill_stash(PendingStash& p)
+{
 	u32 moved = 0;
 	for (u16 item : p.items)
 	{
@@ -485,36 +526,62 @@ void fill_stash(PendingStash& p)
 		if (server_parent(item) == p.stash)
 			++moved;
 	}
-	g_st.moved += moved;
-	::Msg("[coop] death stash %u: %u of %u items of %s are in", p.stash, moved, u32(p.items.size()),
-	    nick(p.character).c_str());
-	if (!moved)
-	{
-		release_stash(p.stash);
-		return;
-	}
-	queue_marker(p.character, p.stash, Drop::Corpse);
+	stash_filled(p, moved, "");
 }
 
-// The stash did not come online in time: it goes, the items drop at the body.
-void stash_timed_out(PendingStash& p)
+// Both offline (fix round 1, review minor 1: the player left before the stash came online and nobody is near it):
+// there are no game objects for the events, so the move is ALife's, as an offline transfer request (coop_requests
+// apply_move): detach from the character, attach to the stash, and the parent change is relayed to the clients by hand.
+void move_offline(PendingStash& p)
 {
-	::Msg("! [coop] death stash %u not online after %u s: the items of %s drop at the body", p.stash,
+	CSE_ALifeDynamicObject* from = ai().alife().objects().object(p.character, true);
+	CSE_ALifeDynamicObject* to = ai().alife().objects().object(p.stash, true);
+	u32 moved = 0;
+	if (from && to && !from->m_bOnline && !to->m_bOnline)
+		for (u16 item : p.items)
+		{
+			CSE_ALifeDynamicObject* d = ai().alife().objects().object(item, true);
+			CSE_ALifeInventoryItem* ii = smart_cast<CSE_ALifeInventoryItem*>(d);
+			if (!d || !ii || d->m_bOnline || d->ID_Parent != p.character)
+				continue;
+			if (std::find(from->children.begin(), from->children.end(), item) == from->children.end())
+				continue;
+			alife_rw().graph().detach(*from, ii, from->m_tGraphID, true, true);
+			alife_rw().graph().attach(*to, ii, d->m_tGraphID, true, true);
+			events::host_on_parent_changed(item, p.character, p.stash); // no server event ran: relay it ourselves
+			if (d->ID_Parent == p.stash)
+				++moved;
+		}
+	stash_filled(p, moved, " (moved offline: its player is away)");
+}
+
+// The character is here and the stash did not come online in time (or is gone): it goes, the items drop at the body.
+void drop_at_body(PendingStash& p)
+{
+	::Msg("! [coop] death stash %u not online %u s after %s was there: his items drop at the body", p.stash,
 	    u32(kStashWaitMs / 1000), nick(p.character).c_str());
 	++g_st.stash_fallbacks;
 	release_stash(p.stash);
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
-	if (character_key_of(p.character) != p.key || !player_character(p.character, body, io))
-	{
-		++g_st.stash_lost;
-		::Msg("! [coop] death stash %u: character %u is gone or offline, his items stay with him", p.stash,
-		    p.character);
-		return;
-	}
+	if (!player_character(p.character, body, io))
+		return; // stash_step said Online this frame
+	const Fvector pos = body->Position();
+	const DropPlace place = fallback_place(p.died, body_place(body).drop, Point{pos.x, pos.y, pos.z});
 	u32 count = 0;
-	const u16 first = drop_all(p.character, body, p.items, count);
+	const u16 first = drop_all_at(p.character, p.items, place, count);
 	queue_marker(p.character, first, Drop::Drop);
+}
+
+// Another character now, no character, or his player stayed away: the items stay with the character, the stash goes.
+void give_up(PendingStash& p, bool owner_same, Presence character)
+{
+	const char* why = !owner_same ? "the id belongs to another character now"
+	                              : character == Presence::Gone ? "the character is gone"
+	                                                             : "his player stayed away";
+	::Msg("! [coop] death stash %u given up (%s): the items stay with character %u", p.stash, why, p.character);
+	++g_st.stash_lost;
+	release_stash(p.stash);
 }
 
 void host_frame()
@@ -529,20 +596,22 @@ void host_frame()
 		g_stashes.clear();
 		g_markers.clear();
 	}
-	if (!g_stashes.empty())
+	if (!g_stashes.empty() && ai().get_alife())
 	{
 		const u64 t = now_ms();
 		for (size_t i = 0; i < g_stashes.size();)
 		{
 			PendingStash& p = g_stashes[i];
-			if (smart_cast<CInventoryBox*>(game_object(p.stash)))
-				fill_stash(p);
-			else if (t >= p.deadline || !events::find_entity(p.stash))
-				stash_timed_out(p);
-			else
+			const bool owner_same = same_owner(p.owner, owner_of(p.character));
+			const Presence character = character_presence(p.character);
+			stash_presence(p.deadline, p.away, character, t);
+			switch (stash_step(owner_same, character, stash_presence_of(p.stash), t, p.deadline, p.give_up_at))
 			{
-				++i;
-				continue;
+			case StashStep::Wait: ++i; continue;
+			case StashStep::Fill: fill_stash(p); break;
+			case StashStep::MoveOffline: move_offline(p); break;
+			case StashStep::DropAtBody: drop_at_body(p); break;
+			case StashStep::GiveUp: give_up(p, owner_same, character); break;
 			}
 			g_stashes.erase(g_stashes.begin() + i);
 		}
@@ -799,7 +868,7 @@ void print_status()
 	if (mgr().is_host())
 	{
 		::Msg("[coop]   death: %llu deaths charged; items %llu dropped, %llu destroyed, %llu into stashes; %llu stashes "
-		      "(%llu fell back to dropping, %llu lost their character), %u waiting; %llu markers sent (%llu not), "
+		      "(%llu fell back to dropping, %llu given up: items stayed), %u waiting; %llu markers sent (%llu not), "
 		      "%llu RU taken",
 		    g_st.deaths, g_st.dropped, g_st.destroyed, g_st.moved, g_st.stashes, g_st.stash_fallbacks, g_st.stash_lost,
 		    u32(g_stashes.size()), g_st.markers_sent, g_st.markers_dropped, g_st.money_taken);

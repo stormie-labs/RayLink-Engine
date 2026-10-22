@@ -268,5 +268,102 @@ inline const char* marker_kind(Drop d)
 {
 	return d == Drop::Corpse ? "corpse" : "drop";
 }
+
+// ---------------------------------------------------------------- a stash waiting for its items (T9 fix round 1)
+
+// Who a death stash is for: taken when it is spawned and checked again before the items move, because the character id
+// alone can be given to another character once this one is released.
+struct StashOwner
+{
+	uint32_t peer = 0xffffffffu; // the player who plays the character (a session PeerId, 0 = the host); none: 0xffffffff
+	std::string key; // the player key digest on the character's custom data ([coop] key), empty if none
+};
+
+// Still the same character: the same player still plays it, or it still carries the same key. Either is enough:
+// a hardcore retirement (Task 10) rewrites the key while its player is still there (review I1), and a player who leaves
+// keeps the key on his parked character but not his peer (review minor 1).
+inline bool same_owner(const StashOwner& then, const StashOwner& now)
+{
+	const bool peer = then.peer != 0xffffffffu && then.peer == now.peer;
+	const bool key = !then.key.empty() && then.key == now.key;
+	return peer || key;
+}
+
+// Where an object is on the host. Gone: no entity. Online: its game object is in the level (the stash: as an
+// inventory box). Offline: an ALife entity switched off. Between: online in ALife without its game object yet.
+enum class Presence : uint8_t
+{
+	Gone,
+	Online,
+	Offline,
+	Between
+};
+
+enum class StashStep : uint8_t
+{
+	Wait,
+	Fill, // both online: GE_TRADE_SELL from the character + GE_TRADE_BUY to the stash
+	MoveOffline, // both offline (the player left and nobody is near): ALife detach from the character, attach to the stash
+	DropAtBody, // the character is here, the stash did not come online in time or is gone: the items drop at the body
+	GiveUp // another character now, the character is gone, or his player stayed away: the items stay, the stash goes
+};
+
+constexpr uint64_t kStashWaitMs = 5000; // plan T9 step 3: while the character is here, the stash has this long
+constexpr uint64_t kStashAwayWaitMs = 600000; // a player who left: his parked character waits this long for the move
+
+// What a pending stash does this frame. `deadline`: the 5 s of the stash (see stash_presence); `give_up_at`: its
+// creation + kStashAwayWaitMs.
+inline StashStep stash_step(bool owner_same, Presence character, Presence stash, uint64_t now, uint64_t deadline,
+	uint64_t give_up_at)
+{
+	if (!owner_same || character == Presence::Gone)
+		return StashStep::GiveUp;
+	if (character == Presence::Online)
+	{
+		if (stash == Presence::Online)
+			return StashStep::Fill;
+		return stash == Presence::Gone || now >= deadline ? StashStep::DropAtBody : StashStep::Wait;
+	}
+	if (character == Presence::Offline && stash == Presence::Offline)
+		return StashStep::MoveOffline;
+	return stash == Presence::Gone || now >= give_up_at ? StashStep::GiveUp : StashStep::Wait;
+}
+
+constexpr float kDropReachM = 3.0f; // Review Focus 4: what fell lies within this distance of the death spot
+
+// Where the items of a stash that did not come online drop (StashStep::DropAtBody). They belong where he died: `died`
+// is the place the stash was made for, `now` the drop place of the body as it is, `body` its position. A body within
+// kDropReachM of `died` lets them fall as usual (`now`); one farther away (the player left and came back, or was
+// already respawned) has them put at `died` — kAboveVertexM up when that was the body's own spot.
+inline DropPlace fallback_place(const DropPlace& died, const DropPlace& now, const Point& body)
+{
+	const float dx = body.x - died.at.x, dy = body.y - died.at.y, dz = body.z - died.at.z;
+	const float d2 = dx * dx + dy * dy + dz * dz; // NaN: not within reach
+	if (d2 <= kDropReachM * kDropReachM)
+		return now;
+	DropPlace r = died;
+	if (!r.moved)
+	{
+		r.at.y += kAboveVertexM;
+		r.moved = true;
+	}
+	return r;
+}
+
+// The 5 s count while the character is here: when he is back after an absence (he left and returned, or came online
+// again) they start again from `now`. `away` is the pending stash's own flag, false at its creation.
+inline void stash_presence(uint64_t& deadline, bool& away, Presence character, uint64_t now)
+{
+	if (character != Presence::Online)
+	{
+		away = true;
+		return;
+	}
+	if (away)
+	{
+		away = false;
+		deadline = now + kStashWaitMs;
+	}
+}
 } // namespace death
 } // namespace coop

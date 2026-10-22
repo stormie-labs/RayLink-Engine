@@ -13,7 +13,11 @@
 //   Lose   - DestroyObject;
 //   Corpse - a coop_death_stash is spawned at the body (ALife, relayed as every host spawn); once it is online
 //            (within 5 s) the items go in by GE_TRADE_SELL from the character + GE_TRADE_BUY to the stash. A stash that
-//            does not come online in time is released and the items drop at the body instead.
+//            does not come online in time is released and the items drop at the body instead. If the player leaves
+//            first, the move waits for him (the 5 s start again when he is back) or for both to be offline, then ALife
+//            moves the items (detach + attach); after 10 min away it is given up and the items stay with him.
+//            The stash checks it is still for the same character by its player OR its key (same_owner): Task 10 may
+//            rewrite the key of a retiring character, a player who leaves takes his peer away, not both.
 // Never taken: quest items (IsQuestItem, kind i_quest / i_letter), the PDA, helper items, host-only objects. A client's
 // proxy does not show the host where its player keeps his things (an NPC cannot wear an outfit, has no belt and fills
 // its slots in its own order), so from a proxy nothing the player may have on (slot or belt items) is taken either;
@@ -53,7 +57,7 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode);
 // the stash is online (up to 5 s): see host_stash_pending. Sends DeathMarker (corpse) when they are in.
 u16 host_move_to_stash(u16 character, bool everything);
 // True while a stash of `character` waits to be filled: his items are still on him. Task 10 releases a retiring
-// character only once this is false.
+// character only once this is false (rewriting his key before that is fine: the same player still plays him).
 bool host_stash_pending(u16 character);
 // The money part of a death (F2 T1: the host's ledger holds every balance): takes `pct` % (0..100, rounded down) of the
 // balance of `character`'s player through money::host_adjust, which sends him the new balance. Returns the amount.
