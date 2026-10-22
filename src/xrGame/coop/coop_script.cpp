@@ -14,6 +14,8 @@
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
 #include "coop_money.h" // F2 T1: money::register_lua
 #include "coop_router.h" // F2 T10: router::register_lua (coop.route)
+#include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
+#include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -95,6 +97,7 @@ struct Stats
 	u64 relayed = 0; // host: client events forwarded to other clients
 	u64 delivered = 0; // coop_main.on_event calls that returned normally
 	u64 send_rejected = 0; // coop.send_event refused (bad args, not ready, to myself, queue full)
+	u64 send_held = 0; // F2 T14 (Ruling F2-14): frames a client held events back for the host's rate limit
 	u64 drop_invalid = 0; // malformed / bad name / payload too big / bad target
 	u64 drop_not_ready = 0; // host: sender is still loading the world (P6)
 	u64 drop_overflow = 0; // inbox or chat queue full
@@ -405,6 +408,11 @@ void on_script_event(PeerId from, Reader& r)
 	}
 }
 
+// F2 T14 (Ruling F2-14): a client sends events only as fast as the host takes them (kClientRateRules ScriptEvent): the
+// host drops what exceeds its limit and the sender never learns of it, so an event over it waits here for a later frame
+// instead (send_event refuses only when this queue is full).
+limits::Pacer g_pacer;
+
 void flush_outbox()
 {
 	if (g_outbox.empty())
@@ -413,6 +421,11 @@ void flush_outbox()
 	const bool client = mgr().is_live_client();
 	while (!g_outbox.empty())
 	{
+		if (client && !g_pacer.take(Msg::ScriptEvent, mgr().now_ms()))
+		{
+			++g_stats.send_held; // F2 T14: the rest goes in a later frame, in order
+			break;
+		}
 		Outgoing o = std::move(g_outbox.front());
 		g_outbox.pop_front();
 		if (!host && !client)
@@ -1440,6 +1453,7 @@ void register_raw(lua_State* L)
 	lua_pop(L, 1);
 	money::register_lua(L); // F2 T1: coop.money_give / money_grant / money_set / money_of / talk_lock_of
 	router::register_lua(L); // F2 T10: coop.route.of / runs / note / none_functions (scripts\coop_route.script)
+	syncapi::register_lua(L); // F2 T14: coop.sync.* (coop_sync_api.h)
 }
 } // namespace
 
@@ -1452,6 +1466,7 @@ void reset()
 	g_chat.clear();
 	g_engine.clear();
 	g_stats = Stats();
+	g_pacer.reset(); // F2 T14
 }
 
 void frame()
@@ -1613,8 +1628,9 @@ void print_status()
 	const Stats& s = g_stats;
 	::Msg("[coop-lua] events: sent %llu, received %llu, relayed %llu, delivered %llu", s.sent, s.received, s.relayed,
 	    s.delivered);
-	::Msg("[coop-lua] refused sends %llu | dropped: invalid %llu, sender not ready %llu, overflow %llu, stale %llu",
-	    s.send_rejected, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale);
+	::Msg("[coop-lua] refused sends %llu, held for the host's rate %llu frames | dropped: invalid %llu, sender not ready "
+	      "%llu, overflow %llu, stale %llu",
+	    s.send_rejected, s.send_held, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale); // F2 T14
 	::Msg("[coop-lua] lua errors %llu, missing handlers %llu, chat lines shown %llu | queued: out %u, in %u, chat %u",
 	    s.lua_errors, s.lua_missing, s.chat_delivered, (u32)g_outbox.size(), (u32)g_inbox.size(), (u32)g_chat.size());
 	::Msg("[coop-lua] stash %u keys / %u bytes (dropped at session end %llu) | refusals %llu: shown %llu, failed %llu, "

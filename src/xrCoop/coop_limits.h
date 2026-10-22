@@ -1,10 +1,12 @@
 // Anomaly Coop — what a host takes from a client: message rates per type (F2 T3) and new player characters per
 // session (Ruling F2-10 b). The game installs the rates (coop_join install) and keeps the character count (coop_join).
+// F2 T14: a client paces itself by the same rates (Pacer; coop_script.cpp script events, coop_sync_api.cpp).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 
@@ -63,6 +65,12 @@ constexpr RateRule kClientRateRules[] = {
 	// F3: hardcore, one per death: the dead player holds USE 3 s (or coop_new_character) and the host stashes all his
 	// gear and sends him the world again. A double press, then one per 5 s.
 	{Msg::NewCharacter, 2, 5000},
+	// F2 T14: coop.sync changes of a player's own data and of his items (a mod writes them on its events: a shot, an
+	// item used, a perk; Lua protocols over coop.send_event move here), as many as script events.
+	{Msg::SyncSet, 64, 20},
+	// F2 T14: coop.sync.request runs a handler of the host's Lua; per handler name the host limits it again (20 in a row,
+	// 10 per second by default, coop.sync.limit). 20 per second in all after a burst.
+	{Msg::SyncRequest, 32, 50},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
@@ -97,6 +105,71 @@ public:
 
 private:
 	std::set<std::string> m_keys; // at most kNewCharactersMax (admits)
+};
+
+// F2 T14 (Ruling F2-14): the client's side of kClientRateRules. The host drops what exceeds a rule and the sender never
+// learns of it (a dropped InfoPortion or script event is lost for good), so a client holds such a message back in its
+// queue and sends it later instead. The host measures when a message arrives, and the network can bunch up messages
+// that left evenly (a lag spike delivers them together): the client goes slower than the rule, half its burst in a row,
+// then one per 5/4 of its refill.
+inline const RateRule* client_rule(Msg type)
+{
+	for (const RateRule& r : kClientRateRules)
+		if (r.type == type)
+			return &r;
+	return nullptr;
+}
+
+struct Pace
+{
+	uint32_t burst;
+	uint32_t interval_ms;
+};
+inline Pace client_pace(const RateRule& r)
+{
+	return {r.burst / 2 ? r.burst / 2 : 1, r.refill_ms + (r.refill_ms / 4 ? r.refill_ms / 4 : 1)};
+}
+
+// A token bucket per message type, as the host's (Session::limit_rate) at client_pace. One per client machine.
+class Pacer
+{
+public:
+	// True if one more `type` may go now (it is counted); false: hold it and ask again later. A type without a rule
+	// always goes.
+	bool take(Msg type, uint64_t now_ms)
+	{
+		const RateRule* rule = client_rule(type);
+		if (!rule)
+			return true;
+		const Pace pace = client_pace(*rule);
+		Bucket& b = m_buckets[uint16_t(type)]; // at most one per rule
+		if (!b.started)
+		{
+			b.started = true;
+			b.tokens = double(pace.burst);
+			b.at = now_ms;
+		}
+		else if (now_ms > b.at)
+		{
+			const double refilled = b.tokens + double(now_ms - b.at) / double(pace.interval_ms);
+			b.tokens = refilled < double(pace.burst) ? refilled : double(pace.burst);
+			b.at = now_ms;
+		}
+		if (b.tokens < 1.)
+			return false;
+		b.tokens -= 1.;
+		return true;
+	}
+	void reset() { m_buckets.clear(); }
+
+private:
+	struct Bucket
+	{
+		bool started = false;
+		double tokens = 0.;
+		uint64_t at = 0;
+	};
+	std::map<uint16_t, Bucket> m_buckets;
 };
 } // namespace limits
 } // namespace coop

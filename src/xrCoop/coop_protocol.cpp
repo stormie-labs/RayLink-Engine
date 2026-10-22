@@ -97,6 +97,11 @@ const char* msg_name(Msg type)
 	case Msg::TradeOp: return "TradeOp";
 
 	case Msg::MoneyBalance: return "MoneyBalance";
+	case Msg::SyncSet: return "SyncSet";
+	case Msg::SyncFull: return "SyncFull";
+	case Msg::SyncRequest: return "SyncRequest";
+	case Msg::SyncResult: return "SyncResult";
+	case Msg::SyncCast: return "SyncCast";
 
 	case Msg::CheckpointState: return "CheckpointState";
 	case Msg::CheckpointClaim: return "CheckpointClaim";
@@ -161,6 +166,9 @@ MsgSender msg_sender(Msg type)
 	case Msg::DialogLockResult:
 	case Msg::DialogPhrases:
 	case Msg::MoneyBalance: // F2 T1: only the host holds balances
+	case Msg::SyncFull: // F2 T14: the host's copy at join
+	case Msg::SyncResult: // F2 T14: the host's handler answers
+	case Msg::SyncCast: // F2 T14: only the host broadcasts effects
 	case Msg::CheckpointState: // F3: the host sets every checkpoint
 	case Msg::RestState: // F3: the host decides the shared sleep
 	case Msg::RestSleep:
@@ -182,6 +190,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::ReqUse:
 	case Msg::ReqHit:
 	case Msg::ReqMoney: // F2 T1: the host changes its own money directly
+	case Msg::SyncRequest: // F2 T14: the host runs its own handlers directly
 	case Msg::ReqContainer:
 	case Msg::ReqItemEvent:
 	case Msg::ReqLaunch:
@@ -211,6 +220,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::Progress:
 	case Msg::DialogUnlock:
 	case Msg::TradeOp:
+	case Msg::SyncSet: // F2 T14: a client's own data to the host (checked there), the host's changes to clients
 	case Msg::ScriptEvent: return MsgSender::Either;
 
 	// core messages: the Session's own dispatch checks them

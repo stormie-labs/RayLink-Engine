@@ -2502,6 +2502,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_sync_api.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_router.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7478,6 +7481,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_sync_api.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_router.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

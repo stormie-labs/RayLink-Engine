@@ -8,6 +8,7 @@
 #include "coop_net.h"
 #include "coop_worldstate.h"
 #include "coop_script.h"
+#include "coop_sync_api.h" // F2 T14: coop.sync
 #include "coop_story.h"
 #include "coop_events.h"
 #include "coop_requests.h"
@@ -50,6 +51,7 @@ void install(Session& s)
 	entities::install(s);
 	worldstate::install(s);
 	script::install(s);
+	syncapi::install(s); // F2 T14
 	story::install(s);
 	events::install(s);
 	requests::install(s);
@@ -73,6 +75,7 @@ void on_session_started()
 	entities::reset();
 	worldstate::reset();
 	script::reset();
+	syncapi::reset(); // F2 T14: the host drops the session scope, a client everything
 	story::reset();
 	events::reset();
 	requests::reset();
@@ -101,6 +104,7 @@ void on_peer_left(PeerId id)
 	trade::on_peer_left(id);
 	money::on_peer_left(id); // F2 T1
 	requests::on_peer_left(id); // F2 T2: his queued spawn requests (F2-21)
+	syncapi::on_peer_left(id); // F2 T14: his request limits
 	net::host_drop(id);
 	g_joining.erase(id);
 }
@@ -113,6 +117,7 @@ void reset()
 	net::reset();
 	worldstate::reset();
 	script::reset();
+	syncapi::reset(); // F2 T14: the host drops the session scope, a client everything
 	story::reset();
 	events::reset();
 	requests::reset();
@@ -173,6 +178,7 @@ void frame()
 	money::frame(); // F2 T1
 	worldstate::frame();
 	script::frame();
+	syncapi::frame(); // F2 T14
 	story::frame();
 }
 
@@ -184,6 +190,7 @@ void print_status()
 	remote::print_status();
 	worldstate::print_status();
 	script::print_status();
+	syncapi::print_status(); // F2 T14
 	router::print_status(); // F2 T10
 	story::print_status();
 	events::print_status();

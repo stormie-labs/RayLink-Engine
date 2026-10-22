@@ -7,6 +7,7 @@
 #include "coop_sync.h"
 #include "coop_remote.h"
 #include "coop_requests.h"
+#include "coop_sync_api.h" // F2 T14
 
 #include "Level.h"
 #include "GameObject.h"
@@ -839,6 +840,7 @@ void host_on_entity_registered(CSE_ALifeDynamicObject* e)
 
 void host_on_entity_released(u16 id)
 {
+	syncapi::on_entity_destroyed(id); // F2 T14: its coop.sync scope goes (host, single player; any game thread)
 	if (mgr().is_host())
 		g_host_events.push_back({HostEventKind::Released, id, false});
 }

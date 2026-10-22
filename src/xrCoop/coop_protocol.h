@@ -26,6 +26,8 @@ namespace coop
 //    CharOffer (host -> client, answers JoinRequest), CharChoice (client -> host); the world follows the choice.
 //    Also in 8 (F2 T5): ReqItemEvent ends with `u16 mechanic` and `u32 paid` (an upgrade is bought from a mechanic and
 //    charged by the host); F3 Msg 0x01C0-0x01C6
+//    Also in 8 (F2 T14): coop.sync SyncSet / SyncFull / SyncRequest / SyncResult / SyncCast 0x0191-0x0195
+//    (xrCoop/coop_syncnet.h)
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
@@ -145,6 +147,12 @@ enum class Msg : uint16_t
 
 	// F2 mod layer (0x0190-0x019F)
 	MoneyBalance = 0x0190, // host -> the player it belongs to: u32 balance, u32 acked seq (coop_ledger.h; F2 T1)
+	// F2 T14 coop.sync (SYNC_SPEC §6.1-6.3; layouts: coop_syncnet.h). All of them on Lane::Reliable: one ordered lane.
+	SyncSet = 0x0191, // client -> host: a change of his own player / object data; host -> clients: every change, answers
+	SyncFull = 0x0192, // host -> client: the full copy of what goes to him, in parts, before his world (join)
+	SyncRequest = 0x0193, // client -> host: coop.sync.request to a handler of the host's Lua
+	SyncResult = 0x0194, // host -> client: its answer (ok, result)
+	SyncCast = 0x0195, // host -> clients: coop.sync.broadcast (effects: visuals and sound)
 
 	// F3 checkpoints, shared sleep and death (0x01C0-0x01CF; docs/CHECKPOINTS_DEATH.md). Characters in host numbering.
 	CheckpointState = 0x01C0, // host -> client(s): u16 character, u8 flags (1 rollback, 2 cleared), checkpoint::write(Record)

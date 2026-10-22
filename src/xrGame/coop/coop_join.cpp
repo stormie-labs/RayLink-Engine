@@ -10,6 +10,7 @@
 #include "coop_alife.h"
 #include "coop_net.h"
 #include "coop_script.h"
+#include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_shapes.h"
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_link_hold.h"
@@ -857,6 +858,7 @@ bool host_send_save(PeerId from, const PeerInfo& p_ref, CSE_ALifeHumanStalker& p
 	if (!script_part.empty())
 		w.bytes(script_part.data(), script_part.size());
 	std::vector<u8> blob(w.data().begin(), w.data().end());
+	syncapi::host_send_full(from); // F2 T14: his coop.sync copy, before the world (Reliable lane: ahead of his changes)
 	// R1 I4: a world save still queued or streaming to this player is replaced by this one (Session::send_blob)
 	const u32 id = mgr().session().send_blob(from, BlobWorldSave, std::move(blob));
 	hp.loading = true;
