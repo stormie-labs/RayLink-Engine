@@ -21,7 +21,9 @@
 //   gone, or no longer shared (the group view turned off). The callback queue is shared and bounded, a dropped
 //   callback is not sent again: Lua re-reads coop.checkpoint.get.
 // Lua: coop.checkpoint.get(local_id) -> nil | {kind, level, x, y, z, source = local id | nil};
-//      coop.checkpoint.story(reason) -> bool (host).
+//      coop.checkpoint.story(reason) -> bool (host);
+//      register_source, unregister_source, claim_tent and the callback coop_checkpoint_refused:
+//      coop_checkpoint_sources.h (F3 Task 7).
 // Console: coop_checkpoints_group 0/1 (host setting), coop_checkpoint_status, coop_checkpoint_here (host, debug).
 #pragma once
 
@@ -72,6 +74,16 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 checkpoint::Record record_here(const CGameObject* character, checkpoint::Kind kind, u16 source);
 // The slot of a character, nullptr if he has no checkpoint. Valid until the next change of the store.
 const checkpoint::Slot* host_slot(u16 character);
+// F3 Task 7 (coop_checkpoint_sources): every record of the host's cache that came from an object (current and previous
+// of each slot): whose it is, the object and the kind. For the sweep of lost sources and the owners of tents; empty
+// without a host world.
+struct SourceRef
+{
+	u16 character = 0xffff;
+	u16 source = checkpoint::kNoSource;
+	checkpoint::Kind kind = checkpoint::Kind::None;
+};
+void host_record_sources(xr_vector<SourceRef>& out);
 
 // --- any machine
 // The current checkpoint of the player whose character has `local_id` here (0 = me), source in local numbering: the

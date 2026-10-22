@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_checkpoints.h"
+#include "coop_checkpoint_sources.h"
 #include "coop_rest.h"
 #include "coop_autosave.h"
 
@@ -85,6 +86,54 @@ int l_story(lua_State* L)
 	lua_pushboolean(L, host_story(reason) ? 1 : 0);
 	return 1;
 }
+
+// A finite number from argument `idx`.
+bool arg_number(lua_State* L, int idx, float& out)
+{
+	if (lua_type(L, idx) != LUA_TNUMBER)
+		return false;
+	const double v = double(lua_tonumber(L, idx));
+	if (!std::isfinite(v) || std::fabs(v) > double(checkpoint::kMaxCoord))
+		return false;
+	out = float(v);
+	return true;
+}
+
+// coop.checkpoint.register_source(id, radius) -> bool: a mod object counts as a camp within `radius` metres (F3 Task
+// 7; the host, or the game before it hosts; false on a client, for no such object or a radius outside (0, 500]).
+int l_register_source(lua_State* L)
+{
+	u16 id = 0;
+	float radius = 0.0f;
+	const bool ok = arg_character(L, 1, id) && arg_number(L, 2, radius) && sources::host_register_source(id, radius);
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
+// coop.checkpoint.unregister_source(id) -> bool: no longer a camp (false on a client or if it was none).
+int l_unregister_source(lua_State* L)
+{
+	u16 id = 0;
+	lua_pushboolean(L, arg_character(L, 1, id) && sources::host_unregister_source(id) ? 1 : 0);
+	return 1;
+}
+
+// coop.checkpoint.claim_tent(x, y, z) -> bool: "I put up a tent here" (F3 Task 7). Host: checked at once; client: sent
+// to the host (at most one per 2 s). The answer is a checkpoint (coop_checkpoint_changed) or the host's
+// coop_checkpoint_refused; false outside a session, for a position that is not one, or a claim sent too soon.
+int l_claim_tent(lua_State* L)
+{
+	float p[3] = {0, 0, 0};
+	bool ok = arg_number(L, 1, p[0]) && arg_number(L, 2, p[1]) && arg_number(L, 3, p[2]);
+	if (ok)
+	{
+		Fvector pos;
+		pos.set(p[0], p[1], p[2]);
+		ok = sources::claim_tent(pos);
+	}
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
 } // namespace
 
 // Fills coop.checkpoint (made here if no one made it yet: F3 Task 7 adds its functions to the same table).
@@ -93,6 +142,9 @@ void register_lua(lua_State* L)
 	static const luaL_Reg fns[] = {
 		{"get", &l_get},
 		{"story", &l_story},
+		{"register_source", &l_register_source}, // F3 Task 7
+		{"unregister_source", &l_unregister_source},
+		{"claim_tent", &l_claim_tent},
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

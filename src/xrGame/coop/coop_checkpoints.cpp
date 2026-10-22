@@ -439,6 +439,7 @@ void host_frame()
 		}
 	g_host.in_world.swap(now);
 	g_host.group_served = int(group);
+	sources::host_frame(now_ms); // F3 Task 7: campfires, tents, mod objects, lost sources; its changes go out below
 	flush_outbox(group);
 }
 
@@ -517,7 +518,11 @@ public:
 
 // ---------------------------------------------------------------- lifecycle
 
-void install(Session& s) { s.on(Msg::CheckpointState, &client_on_state); }
+void install(Session& s)
+{
+	s.on(Msg::CheckpointState, &client_on_state);
+	sources::install(s); // F3 Task 7: CheckpointClaim
+}
 
 void reset()
 {
@@ -782,6 +787,23 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 }
 
 const checkpoint::Slot* host_slot(u16 character) { return ensure_loaded() ? slot_of(character) : nullptr; }
+
+void host_record_sources(xr_vector<SourceRef>& out)
+{
+	out.clear();
+	if (!ensure_loaded())
+		return;
+	for (const auto& it : g_host.store.slots()) // the cache, read again every kSweepMs (refresh_all)
+		for (const Record* r : {&it.second.cur, &it.second.prev})
+			if (r->valid() && r->source != kNoSource)
+			{
+				SourceRef ref;
+				ref.character = it.first;
+				ref.source = r->source;
+				ref.kind = r->kind;
+				out.push_back(ref);
+			}
+}
 
 // ---------------------------------------------------------------- any machine
 
