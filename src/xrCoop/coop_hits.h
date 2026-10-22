@@ -11,6 +11,10 @@ namespace coop
 {
 namespace hits
 {
+constexpr uint16_t kNoObject = 0xffff;
+// The host's actor. Also the weapon id of a hit built without one (SHit(), Lua hit() with the default weapon_id).
+constexpr uint16_t kHostActor = 0;
+
 // Who set a hit off, seen from the character it landed on.
 enum class Source : uint8_t
 {
@@ -20,6 +24,25 @@ enum class Source : uint8_t
 	Creature, // any other creature: stalkers, monsters, vehicles, helicopters
 	Object, // not a creature: a barrel or mine that went off by itself, an anomaly, a physics object, an artefact
 };
+
+// The weapon of a hit names the character's own explosive: not the character, not "none", and not the host's actor
+// id 0 that a hit built without a weapon carries (R3 В2 review).
+inline bool names_own_weapon(uint16_t weapon_id, uint16_t victim_id)
+{
+	return weapon_id != victim_id && weapon_id != kNoObject && weapon_id != kHostActor;
+}
+
+// A blast wave or fragment: the weapon is an explosive. Or its late fragment (R3 В2 review): an explosive that went off
+// by itself is its own initiator, and with explode_duration 0 (mines, IEDs, RPG rockets) it is removed a few frames
+// after the blast while its fragments still fly — then neither the initiator nor the weapon is online, and the hit
+// names one object as both. Online objects that name themselves (artefacts, a poltergeist's flame, collisions) are not
+// explosions; a bullet names its gun, not its shooter.
+inline bool is_explosion(bool weapon_is_explosive, bool who_online, uint16_t who_id, uint16_t weapon_id)
+{
+	if (weapon_is_explosive)
+		return true;
+	return !who_online && who_id != kNoObject && who_id == weapon_id;
+}
 
 struct ProxyHit
 {
@@ -52,11 +75,12 @@ inline bool to_owner(const ProxyHit& h, bool friendly_fire)
 }
 
 // Host: does the host's own player drop a hit (CActor::Hit)? Another player's damage with friendly fire off (R3 minor):
-// its shots and blows are refused as ReqHit, but its grenade, rocket or the barrel it shot explode on the host and hit
-// the host's actor directly.
-inline bool host_actor_drops(Source source, bool friendly_fire)
+// its shots and blows are refused as ReqHit, but its grenade, rocket, charge or the barrel it shot explode on the host
+// and hit the host's actor directly. A collision (the contact object names itself as the weapon: the host fell onto
+// a client's character) is the host's own fall, not friendly fire.
+inline bool host_actor_drops(Source source, bool collision, bool friendly_fire)
 {
-	return source == Source::Player && !friendly_fire;
+	return source == Source::Player && !collision && !friendly_fire;
 }
 } // namespace hits
 } // namespace coop

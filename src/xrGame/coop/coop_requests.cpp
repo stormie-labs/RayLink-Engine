@@ -637,6 +637,7 @@ struct HostCounters
 	u64 dropped_joining = 0, malformed = 0, hits_applied = 0, proxy_hits = 0, player_hits_sent = 0, spawns_local = 0;
 	u64 explosion_hits_sent = 0; // R3 В2: blasts / fragments no creature set off (a barrel, a mine, an anomaly)
 	u64 friendly_fire_dropped = 0; // hits of one player on another dropped at the character (proxy or host actor)
+	u64 explosions_as_player = 0; // charges set off as their planter (coop.explode_as)
 } g_h;
 
 bool allow(PeerId peer, Cat c)
@@ -1373,9 +1374,10 @@ void print_status()
 		    g_h.results[u32(Reason::TooFar)], g_h.results[u32(Reason::RateLimited)], g_h.hits_applied,
 		    g_h.dropped_joining, g_h.malformed, g_h.spawns_local);
 		::Msg("[coop]   player damage: %llu hits on characters, %llu sent to players (%llu from explosions no creature "
-		      "set off), friendly fire %s (%llu hits between players dropped at the character, %llu ReqHit refused)",
+		      "set off), friendly fire %s (%llu hits between players dropped at the character, %llu ReqHit refused), "
+		      "%llu charges set off as their player",
 		    g_h.proxy_hits, g_h.player_hits_sent, g_h.explosion_hits_sent, g_coop_friendly_fire ? "on" : "off",
-		    g_h.friendly_fire_dropped, g_h.results[u32(Reason::FriendlyFire)]);
+		    g_h.friendly_fire_dropped, g_h.results[u32(Reason::FriendlyFire)], g_h.explosions_as_player);
 		::Msg("[coop]   refused as invalid (R3): %llu bones, %llu spawn sections, %llu spawn states, %llu numbers, "
 		      "%llu out-of-reach moves claimed as local",
 		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange]);
@@ -1720,10 +1722,10 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 	// The player's own grenade/rocket explodes on the host with this character as initiator (WP7):
 	// blast and fragments name the explosive as the weapon. Clients deal no explosion damage
 	// locally, so this is the only way the player gets hurt by it.
-	h.own_weapon = hit->weaponID != id && hit->weaponID != kNoId;
+	h.own_weapon = hits::names_own_weapon(hit->weaponID, id);
 	// R3 В2: the same for every explosion, whoever set it off: a barrel or mine that went off by itself or from an
 	// anomaly (the initiator is not a creature), or one whose initiator is no longer online.
-	h.explosion = weapon_is_explosive(hit->weaponID, npc);
+	h.explosion = hits::is_explosion(weapon_is_explosive(hit->weaponID, npc), who != nullptr, hit->whoID, hit->weaponID);
 	if (!hits::to_owner(h, g_coop_friendly_fire != 0))
 	{
 		if (h.source == hits::Source::Player)
@@ -1745,10 +1747,44 @@ bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
 	if (!actor || !hit || !mgr().is_host())
 		return false;
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
-	if (!hits::host_actor_drops(hit_source(actor, who), g_coop_friendly_fire != 0))
+	// Collision damage (Actor.cpp) names the contact object as both initiator and weapon.
+	const bool collision = hit->whoID == hit->weaponID;
+	if (!hits::host_actor_drops(hit_source(actor, who), collision, g_coop_friendly_fire != 0))
 		return false;
 	++g_h.friendly_fire_dropped;
 	return true;
+}
+
+bool host_explode_as(u16 explosive, u16 initiator)
+{
+	if (!mgr().is_host() || !g_pGameLevel || !is_player(initiator) || !valid_go(initiator))
+		return false;
+	CGameObject* go = valid_go(explosive);
+	CExplosive* ex = go ? go->cast_explosive() : nullptr;
+	if (!ex || go->H_Parent())
+		return false;
+	// as CScriptGameObject::explode, with the player as the initiator instead of the charge itself
+	Fvector normal;
+	ex->FindNormal(normal);
+	ex->SetInitiator(initiator);
+	ex->GenExplodeEvent(go->Position(), normal);
+	++g_h.explosions_as_player;
+	return true;
+}
+
+int lua_explode_as(lua_State* L)
+{
+	u16 ids[2] = {kNoId, kNoId};
+	for (int i = 0; i < 2; ++i)
+	{
+		if (lua_type(L, i + 1) != LUA_TNUMBER)
+			break;
+		const lua_Number v = lua_tonumber(L, i + 1);
+		if (v >= 0 && v < lua_Number(kNoId) && v == lua_Number(u16(v))) // NaN fails the first test
+			ids[i] = u16(v);
+	}
+	lua_pushboolean(L, ids[0] != kNoId && ids[1] != kNoId && host_explode_as(ids[0], ids[1]) ? 1 : 0);
+	return 1;
 }
 } // namespace requests
 } // namespace coop

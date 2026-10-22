@@ -40,6 +40,7 @@ class CSE_Abstract;
 class CAI_Stalker;
 class CActor;
 struct SHit;
+struct lua_State;
 
 // Server option: players can hurt each other (default on, R-5.3). Console var for the lead.
 extern int g_coop_friendly_fire;
@@ -125,5 +126,13 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit);
 // hit: another player's damage with friendly fire off. Its shots and blows are refused as ReqHit; its grenade, rocket
 // or the barrel it shot explode here and hit the host's actor directly (R3 minor).
 bool host_actor_hit_dropped(const CActor* actor, const SHit* hit);
+// Host: detonates the free explosive `explosive` (a planted charge) as set off by `initiator`, a player's character or
+// the host's actor: its blast and fragments are that player's, so friendly fire, kills and NPC blame count for them
+// (R3 В2 review; stock CScriptGameObject::explode names the charge itself). False (nothing done) for a client, an
+// explosive with a parent, or an initiator that is not an online player's character.
+bool host_explode_as(u16 explosive, u16 initiator);
+// Lua: coop.explode_as(explosive_id, initiator_id) -> bool, host numbering. A raw C function for
+// coop::script::register_raw (coop_script.cpp); coop_npc_world.script calls it when present.
+int lua_explode_as(lua_State* L);
 } // namespace requests
 } // namespace coop
