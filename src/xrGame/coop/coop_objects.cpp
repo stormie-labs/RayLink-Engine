@@ -9,6 +9,7 @@
 #include "coop_entities.h"
 #include "coop_events.h"
 #include "coop_alife.h"
+#include "coop_story.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 
@@ -173,6 +174,7 @@ struct Counters
 	    pushes_sent = 0, throws_sent = 0, activations_sent = 0, forced_online = 0, explode_blocked = 0,
 	    switches_blocked = 0;
 	u64 dropped_before_live = 0; // R2 I2: EntityState / ZoneState that came before we were live
+	u64 uses_echo_dropped = 0;   // R4 4: obj:use() on a world object from a reaction to the host's story
 };
 
 xrCriticalSection g_lock;
@@ -2057,8 +2059,9 @@ void print_status()
 		    "%llu destroyed, %llu broken, %llu local detonations / %llu zone switches blocked",
 		    g_c.zones_applied, (u32)g_zone_pending.size(), g_c.explode_applied, g_c.explode_fallback,
 		    g_c.destroyed_applied, g_c.broken_applied, g_c.explode_blocked, g_c.switches_blocked);
-		::Msg("[coop]   objects req: %llu uses, %llu pushes, %llu throws, %llu artefact activations sent",
-		    g_c.uses_sent, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent);
+		::Msg("[coop]   objects req: %llu uses (%llu dropped as story echo), %llu pushes, %llu throws, "
+		    "%llu artefact activations sent",
+		    g_c.uses_sent, g_c.uses_echo_dropped, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent);
 		::Msg("[coop]   objects in: %llu state / zone messages dropped before live (R2 I2)", g_c.dropped_before_live);
 	}
 }
@@ -2131,6 +2134,12 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 		return false;
 	if (who->ID() != kActor || !smart_cast<CPhysicObject*>(obj) || obj->H_Parent())
 		return false;
+	// the host runs the same story reaction on its side: a second Use from us would toggle the object twice
+	if (rules::client_echo(story::applying(), false, false) == rules::Echo::Drop)
+	{
+		++g_c.uses_echo_dropped;
+		return true;
+	}
 	if (mgr().is_live_client())
 	{
 		Writer w(4);
