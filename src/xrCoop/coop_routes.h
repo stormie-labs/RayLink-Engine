@@ -109,9 +109,10 @@ inline bool parse_domain(std::string_view text, Domain& out)
 }
 
 // Pseudo-callback names the Lua shim uses for AddUniqueCall and CreateTimeEvent. They have no callback of their own:
-// the handler's script decides, host by default (Ruling F2-29, review I1: a timer is how stock and mod world logic
-// polls - tasks_*, xr_effects, simulation_objects -, so a script without a rule keeps its timers on the host, as the
-// Lua filter did before F2 T10; our coop_* and the listed owner / view scripts keep theirs everywhere).
+// the handler's script decides, owner by default: a timer follows its script like the script's callbacks, so a client
+// mod is never half on (fix round 2, review I2: a callback that starts an action and a time event that ends it). World
+// scripts (tasks_*, xr_effects, simulation_objects ...) are host by their generated rules (configs\coop_route_stock.ltx
+// / coop_route_gamma.ltx, Ruling F2-29), whatever registers them.
 inline constexpr std::string_view kUniqueCall = "unique_call";
 inline constexpr std::string_view kTimeEvent = "time_event";
 
@@ -304,8 +305,8 @@ inline constexpr StockRoute kStockRoutes[] = {
 
 	// Not in intercepts, named by the brief
 	{"on_xml_read", Domain::View}, // modxml_core
-	{kUniqueCall, Domain::Host}, // F2-29: see kUniqueCall
-	{kTimeEvent, Domain::Host},
+	{kUniqueCall, Domain::Owner}, // see kUniqueCall
+	{kTimeEvent, Domain::Owner},
 };
 
 // Domains for callback names that are not in the list above (callbacks mods and the monolith add themselves).
