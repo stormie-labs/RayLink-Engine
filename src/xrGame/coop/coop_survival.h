@@ -1,31 +1,54 @@
-// Anomaly Coop — player survival (WP8): down instead of dead, revive by a teammate, bleed-out, death modes
-// (SPEC R-10.4, DESIGN §6.12).
+// Anomaly Coop — player survival (WP8, F3 Task 8): down instead of dead, revive by a teammate, bleed-out, the death
+// modes checkpoint / hardcore (SPEC R-10.4, DESIGN §6.12, docs/CHECKPOINTS_DEATH.md §3).
 //
 // Life of a player. The owner decides when it falls and when it bleeds out; the host decides what
-// happens after death (it owns the rules) and checks every revive (the medkit is a world item).
+// happens after death (it owns the rules, xrCoop/coop_death_rules.h) and checks every revive (the medkit
+// is a world item).
 //
 //   Alive --health would reach 0--> Wounded --teammate holds USE with a medkit (host checks)--> Alive
 //   Wounded --bleed-out timer ends / player holds USE to give up--> Dead
-//   Dead --host, coop_death_mode hardcore--> Spectating (camera on teammates until the host loads a save)
-//   Dead --host, respawn / respawn_keep, after coop_respawn_delay--> Respawning --> Alive near a teammate
+//   Dead --host, coop_death_mode hardcore--> Spectating (out of the run, camera on teammates)
+//   Dead --host, checkpoint: losses (coop_death), money, Evacuate; after coop_respawn_delay--> Respawning
+//        --> Alive at the player's own checkpoint (coop_checkpoints::host_respawn_point)
+// While evacuated the dead player watches a living teammate (Fire / Aim switch), or the place of death from
+// above when nobody is alive. On standing up the owner wears its slot items (coop_death_wear) and fires the
+// Lua callback coop_respawned(kind, contusion_s, money_pct, rank_pct): kind is the checkpoint kind name
+// ("campfire", "arrival", ..., "none" for no camp); the money is already taken by the host (death ledger).
+// Host: coop_group_wipe() once when every present player is dead / spectating / respawning, again only
+// after somebody stood up.
 //
-// The engine actor never dies during a session: while the player is down its health is pinned just above
-// zero (CActorCondition hook), so the single-player death flow (Lua actor_before_death, game over) never
-// runs and the save keeps a living character (P4). Player proxies stay unharmable on every machine.
+// The death is counted once (death::Tracker): a player who leaves while dead or evacuated comes back alive
+// at his checkpoint, and so does every dead player when the host's world is replaced (level change, load);
+// nothing is taken from him a second time. The host's actor (character 0) takes the same path.
+//
+// The engine actor never dies during a session, in either mode: while the player is down its health is
+// pinned just above zero (CActorCondition hook) and every kill of it is intercepted (CEntity::KillEntity),
+// so the single-player death flow (Lua actor_before_death, CActor::Die, game over with load_last_save)
+// never runs and the save keeps a living character (P4). Player proxies stay unharmable on every machine.
 //
 // Messages (ids in host numbering):
 //   PlayerWounded  owner -> host -> all  {u16 player, u8 life, u16 seq, u32 bleed_left_ms, str nick} reliable
 //                  on change and every 5 s; the host also repeats every player's state every 5 s (P5, late
 //                  joiners, the client roster of player names). Life = Dead is the owner's "I bled out":
 //                  the host answers by its death mode. (Msg::PlayerDied stays WP2's engine-death relay.)
+//                  A client's Dead adds {u8 n, n x u16 item}: what it has in its slots and on its belt
+//                  (Ruling F3-4, at most 40 ids; the host keeps the ones its proxy really carries and does not
+//                  relay them).
 //   PlayerRevive   {u8 op, ...}                                                                   reliable
 //     Request  reviver -> host       {u16 target, u16 seq, u16 item}
 //     Revive   host -> target owner  {u16 target, u16 seq, u16 reviver, f32 health}
-//     Respawn  host -> target owner  {u16 target, u16 seq, vec3 pos, u8 drop_items}
+//     Respawn  host -> target owner  {u16 target, u16 seq, vec3 pos, u8 checkpoint kind}
+//              (to a Dead owner after the evacuation; to an Alive one that came back to the world while dead)
 //     Spectate host -> target owner  {u16 target, u16 seq}
 //     Refused  host -> reviver       {u16 target, u8 reason}
-//   PlayerRules    host -> all  {u8 death_mode, u32 bleedout_ms, f32 revive_health, u32 respawn_delay_ms}
-// `seq` counts the falls of one player; every order names the fall it answers, so repeats are no-ops.
+//     Evacuate host -> target owner  {u16 target, u16 seq, u32 delay_ms}
+//   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %)
+// `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
+// answers, so repeats are no-ops.
+// Console (host rules, CCC_Float unless a token): coop_death_mode checkpoint | hardcore (respawn, respawn_keep =
+// checkpoint), coop_death_drop drop | corpse | lose, coop_bleedout s, coop_revive_health, coop_respawn_delay 0..300 s
+// (30), coop_contusion 0..60 min (10), coop_death_money / coop_death_wear / coop_death_rank 0..100 % (10 / 10 / 0);
+// coop_wound_me (test).
 #pragma once
 
 #include "xrCoop/coop_session.h"
@@ -43,19 +66,13 @@ enum class Life : u8
 {
 	Alive = 0,
 	Wounded = 1, // down, bleeding out, can be revived
-	Dead = 2, // bled out, waiting for the host's decision
-	Spectating = 3, // hardcore: watching teammates until the host loads a save
-	Respawning = 4, // respawn ordered, items dropping, teleport pending
+	Dead = 2, // bled out: waiting for the host's decision, then evacuated (checkpoint mode)
+	Spectating = 3, // hardcore: out of the run, watching teammates
+	Respawning = 4, // respawn ordered, teleport pending
 };
 const char* life_name(Life l);
 inline bool is_down(Life l) { return l != Life::Alive; }
-
-enum class DeathMode : u8
-{
-	Hardcore = 0,
-	Respawn = 1, // carried items are dropped where the player died
-	RespawnKeep = 2,
-};
+// The death modes and the item loss modes are death::Mode / death::Drop (xrCoop/coop_death_rules.h).
 
 // A player known on this machine (self included on request).
 struct PlayerRef
@@ -81,6 +98,10 @@ void render_hud(); // HUDManager::RenderUI (main thread, render phase): reads da
 Life life_of(u16 local_id);
 // Wounded players: milliseconds of bleed-out left (as last reported), 0 otherwise.
 u32 bleed_left_ms(u16 local_id);
+// Host (Ruling F3-4): what the owner of `character` had in his slots and on his belt when he reported his death `seq`,
+// host numbering, sorted, each id once and carried by the character when the report came (at most 40). False when
+// no report of that death brought the list (the host's own actor: its slots and belt are seen directly).
+bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out);
 
 // --- engine hooks ---
 

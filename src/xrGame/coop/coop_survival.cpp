@@ -1,4 +1,4 @@
-// Anomaly Coop — player survival (WP8). See coop_survival.h for the life cycle and the wire layouts.
+// Anomaly Coop — player survival (WP8, F3 Task 8). See coop_survival.h for the life cycle and the wire layouts.
 #include "stdafx.h"
 #include "coop_survival.h"
 #include "coop_manager.h"
@@ -6,6 +6,8 @@
 #include "coop_world.h"
 #include "coop_net.h"
 #include "coop_script.h"
+#include "coop_death.h"
+#include "coop_checkpoints.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -26,6 +28,7 @@
 #include "ui/UIActorMenu.h"
 #include "ui_base.h"
 #include "MainMenu.h"
+#include "string_table.h"
 #include "xr_level_controller.h"
 #include "ai_space.h"
 #include "level_graph.h"
@@ -34,8 +37,10 @@
 #include "../Include/xrRender/KinematicsAnimated.h"
 #include "../Include/xrRender/animation_blend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
+#include <vector>
 
 namespace coop
 {
@@ -53,10 +58,18 @@ constexpr float kHostReviveRange = 4.5f; // host check (avatars are rendered 100
 constexpr u32 kStateRefreshMs = 5000; // own life state and (host) rules / roster resend: P5, late joiners
 constexpr u32 kRevivePendingMs = 5000; // host: one medkit per fall, even if the order is slow
 constexpr u32 kDamageMsPerHealth = 100000; // damage taken while down shortens bleed-out (0.1 health = 10 s)
-constexpr u32 kDropWaitMs = 1500; // respawn with item loss: let the drops land before the teleport
+constexpr u32 kRespawnSettleMs = 300; // owner: the Respawning state goes out before the teleport
+constexpr u32 kRespawnRetryMs = 2000; // host: no body to respawn right now (not in the world yet), try again
+constexpr float kRespawnLift = 0.2f; // a respawn point is on the ground: appear this much above it
 constexpr u32 kStaleRemoteMs = 15000; // client: forget players the host stopped reporting
 constexpr u32 kGuardMs = 1000;
 constexpr float kCamDrop = 1.1f; // eye height drop while lying
+constexpr float kOverheadHeight = 6.f; // evacuated with nobody alive: camera this high above the body
+constexpr float kOverheadTurn = 0.08f; // ... turning this many radians a second
+// Ruling F3-4: slot and belt ids in a client's Dead report. The stock slots are 1..LAST_SLOT (18 with
+// MORE_INVENTORY_SLOTS), a belt holds a few artefacts: 40 is more than any loadout, and caps what a modified
+// client can claim as worn.
+constexpr u8 kMaxWornIds = 40;
 
 enum Op : u8
 {
@@ -65,6 +78,7 @@ enum Op : u8
 	OpRespawn = 2,
 	OpSpectate = 3,
 	OpRefused = 4,
+	OpEvacuate = 5,
 };
 
 enum Refusal : u8
@@ -103,74 +117,63 @@ const char* const kDeadPoses[] = {"wounded_heavy_2_idle_0", "wounded_heavy_3_idl
 
 // ---------------------------------------------------------------- console (host rules)
 
-u32 g_cv_death_mode = u32(DeathMode::RespawnKeep);
+u32 g_cv_death_mode = u32(death::Mode::Checkpoint);
+u32 g_cv_death_drop = u32(death::Drop::Drop);
 float g_cv_bleedout_s = 60.f;
 float g_cv_revive_health = 0.3f;
-float g_cv_respawn_delay_s = 10.f;
+float g_cv_respawn_delay_s = 30.f;
+float g_cv_contusion_min = 10.f;
+float g_cv_death_money = 10.f; // percentages: CCC_Float like the other host rules (the options page reads floats)
+float g_cv_death_wear = 10.f;
+float g_cv_death_rank = 0.f;
 
+// The WP8 modes respawn / respawn_keep live on in old user.ltx files: both mean checkpoint now (plan decision 11).
+// CCC_Token shows and saves the first name of a value, so they come back as "checkpoint".
 xr_token g_death_mode_tokens[] = {
-	{"hardcore", int(DeathMode::Hardcore)},
-	{"respawn", int(DeathMode::Respawn)},
-	{"respawn_keep", int(DeathMode::RespawnKeep)},
+	{"checkpoint", int(death::Mode::Checkpoint)},
+	{"hardcore", int(death::Mode::Hardcore)},
+	{"respawn", int(death::Mode::Checkpoint)},
+	{"respawn_keep", int(death::Mode::Checkpoint)},
 	{nullptr, 0},
 };
 
-const char* mode_name(DeathMode m)
+xr_token g_death_drop_tokens[] = {
+	{"drop", int(death::Drop::Drop)},
+	{"corpse", int(death::Drop::Corpse)},
+	{"lose", int(death::Drop::Lose)},
+	{nullptr, 0},
+};
+
+const char* mode_name(death::Mode m) { return m == death::Mode::Hardcore ? "hardcore" : "checkpoint"; }
+
+const char* drop_name(death::Drop d)
 {
-	switch (m)
+	switch (d)
 	{
-	case DeathMode::Hardcore: return "hardcore";
-	case DeathMode::Respawn: return "respawn";
-	default: return "respawn_keep";
+	case death::Drop::Corpse: return "corpse";
+	case death::Drop::Lose: return "lose";
+	default: return "drop";
 	}
 }
 
-struct Rules
-{
-	DeathMode mode = DeathMode::RespawnKeep;
-	u32 bleedout_ms = 60000;
-	float revive_health = 0.3f;
-	u32 respawn_delay_ms = 10000;
+u8 console_pct(float v) { return u8(iFloor(clampr(v, 0.f, 100.f) + 0.5f)); }
 
-	bool operator==(const Rules& o) const
-	{
-		return mode == o.mode && bleedout_ms == o.bleedout_ms && fsimilar(revive_health, o.revive_health) &&
-		    respawn_delay_ms == o.respawn_delay_ms;
-	}
-	void write(Writer& w) const
-	{
-		w.u8(u8(mode));
-		w.u32(bleedout_ms);
-		w.f32(revive_health);
-		w.u32(respawn_delay_ms);
-	}
-	bool read(Reader& r)
-	{
-		const u8 m = r.u8();
-		bleedout_ms = r.u32();
-		revive_health = r.f32();
-		respawn_delay_ms = r.u32();
-		if (!r.ok() || m > u8(DeathMode::RespawnKeep) || !_valid(revive_health))
-			return false;
-		mode = DeathMode(m);
-		clamp(bleedout_ms, u32(5000), u32(600000));
-		clamp(revive_health, 0.05f, 1.f);
-		clamp(respawn_delay_ms, u32(0), u32(120000));
-		return true;
-	}
-};
-
-Rules console_rules()
+death::Rules console_rules()
 {
-	Rules r;
-	r.mode = DeathMode(_min(g_cv_death_mode, u32(DeathMode::RespawnKeep)));
+	death::Rules r;
+	r.mode = g_cv_death_mode == u32(death::Mode::Hardcore) ? death::Mode::Hardcore : death::Mode::Checkpoint;
+	r.drop = death::Drop(_min(g_cv_death_drop, u32(death::Drop::Lose)));
 	r.bleedout_ms = u32(g_cv_bleedout_s * 1000.f);
 	r.revive_health = g_cv_revive_health;
-	r.respawn_delay_ms = u32(g_cv_respawn_delay_s * 1000.f);
+	r.delay_ms = u32(clampr(g_cv_respawn_delay_s, 0.f, 300.f) * 1000.f);
+	r.contusion_s = u32(clampr(g_cv_contusion_min, 0.f, 60.f) * 60.f + 0.5f);
+	r.money_pct = console_pct(g_cv_death_money);
+	r.wear_pct = console_pct(g_cv_death_wear);
+	r.rank_pct = console_pct(g_cv_death_rank);
 	return r;
 }
 
-Rules g_rules; // in force: host = console, client = last PlayerRules from the host
+death::Rules g_rules; // in force: host = console, client = last PlayerRules from the host
 bool g_rules_from_host = false;
 
 // ---------------------------------------------------------------- state
@@ -189,9 +192,12 @@ struct Local
 	bool slots_blocked = false;
 	bool inv_blocked = false;
 	bool inv_prev = false;
-	u8 cam = 0; // 0 none, 1 lying, 2 spectator
+	u8 cam = 0; // 0 none, 1 lying, 2 spectator, 3 overhead
+	// evacuation (checkpoint mode): the host's countdown as seen here, 0 = no Evacuate for this death yet
+	u64 evac_end = 0;
 	// respawn
 	Fvector respawn_pos{};
+	checkpoint::Kind respawn_kind = checkpoint::Kind::None;
 	u64 respawn_at = 0;
 	// give up while wounded (armed once USE was seen released after the fall)
 	u64 giveup_start = 0;
@@ -221,16 +227,21 @@ xr_map<u16, Remote> g_players;
 // Host bookkeeping per character (host numbering, 0 = host actor).
 struct HostRec
 {
-	u16 died_seq = 0xffff; // last fall that ended in death and got a decision
-	u64 respawn_at = 0;
-	u16 respawn_seq = 0;
-	bool respawn_drop = false;
+	death::Tracker tracker; // one decision per death; the evacuation countdown; out of the run (hardcore)
 	u64 revive_pending_until = 0;
-	bool hardcore_dead = false; // stays dead in this world even after a rejoin
 	bool has_anchor = false;
 	Fvector anchor{}; // where the player was first seen alive in this world (respawn fallback)
+	// Ruling F3-4: the slot and belt items of the owner's Dead report of death `worn_seq`
+	bool has_worn = false;
+	u16 worn_seq = 0xffff;
+	xr_vector<u16> worn;
 };
 xr_map<u16, HostRec> g_host;
+// Characters to put on their checkpoint as soon as they report Alive (Review Focus 1 and 2): dead when they left
+// after the respawn order went out (the tracker no longer waits then), or dead / evacuated when the host's world was
+// replaced. Survives the world change (g_host does not); cleared with the session.
+xr_set<u16> g_camp_on_return;
+bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
 u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
 u64 g_last_guard = 0;
@@ -273,11 +284,21 @@ struct SpecCam
 };
 SpecCam g_spec;
 
+// Overhead camera over the own body (evacuated, nobody alive to watch), prepared by frame().
+struct OverCam
+{
+	bool valid = false;
+	Fvector body{};
+	float height = kOverheadHeight; // cut by a ceiling
+};
+OverCam g_over;
+
 struct Stats
 {
-	u64 falls = 0, deaths = 0, revives = 0, refused = 0, respawns = 0, spectates = 0;
+	u64 falls = 0, deaths = 0, revives = 0, refused = 0, respawns = 0, spectates = 0, evacuations = 0;
 	u64 states_out = 0, states_in = 0, orders_in = 0, requests_in = 0;
 	u64 kills_intercepted = 0, proxy_kills_refused = 0, guard_fixes = 0, stale_orders = 0;
+	u64 wipes = 0, worn_reports = 0, worn_refused = 0;
 } g_stat;
 xr_set<u16> g_guard_logged;
 
@@ -312,6 +333,29 @@ void feed(const char* fmt, ...)
 	g_feed.push_back(l);
 	while (g_feed.size() > 5)
 		g_feed.pop_front();
+}
+
+// A HUD string of text/*/st_coop_survival.xml, `fallback` while the table does not have it.
+xr_string tr(const char* id, const char* fallback)
+{
+	const shared_str s = CStringTable().translate(id);
+	return s.size() && xr_strcmp(s.c_str(), id) != 0 ? xr_string(s.c_str()) : xr_string(fallback);
+}
+
+// A translated format with exactly one conversion `conv` (%d, %s) and no other '%': a broken translation must not
+// reach xr_sprintf with the wrong arguments.
+xr_string tr_format(const char* id, const char* fallback, char conv)
+{
+	xr_string f = tr(id, fallback);
+	u32 percents = 0;
+	bool ok = false;
+	for (size_t i = 0; i < f.size(); ++i)
+		if (f[i] == '%')
+		{
+			++percents;
+			ok = i + 1 < f.size() && f[i + 1] == conv;
+		}
+	return percents == 1 && ok ? f : xr_string(fallback);
 }
 
 bool action_down(EGameActions a)
@@ -371,6 +415,7 @@ u16 seq_by_host_id(u16 host_id)
 
 ECamEffectorType eff_down() { return (ECamEffectorType)0x434F4F01; }
 ECamEffectorType eff_spectate() { return (ECamEffectorType)0x434F4F02; }
+ECamEffectorType eff_overhead() { return (ECamEffectorType)0x434F4F03; }
 
 // First-person camera of a player lying on the ground.
 class DownCam : public CEffectorCam
@@ -423,6 +468,30 @@ private:
 	Fvector m_pos{}, m_look{};
 };
 
+// Evacuated with nobody alive to watch: straight down at the own body from kOverheadHeight, slowly turning.
+class OverheadCam : public CEffectorCam
+{
+public:
+	OverheadCam() : CEffectorCam(eff_overhead(), 100000.f) { SetHudAffect(false); }
+	bool AbsolutePositioning() override { return true; }
+	BOOL ProcessCam(SCamEffectorInfo& info) override
+	{
+		fLifeTime = 100000.f;
+		if (!g_over.valid)
+			return TRUE;
+		m_yaw += kOverheadTurn * Device.fTimeDelta;
+		if (m_yaw > PI_MUL_2)
+			m_yaw -= PI_MUL_2;
+		info.p.set(g_over.body.x, g_over.body.y + g_over.height, g_over.body.z);
+		info.d.set(0.f, -1.f, 0.f);
+		info.n.set(_sin(m_yaw), 0.f, _cos(m_yaw)); // "up" on the screen turns: the view rotates about the body
+		return TRUE;
+	}
+
+private:
+	float m_yaw = 0.f;
+};
+
 void set_cam(CActor* a, u8 cam)
 {
 	if (g_me.cam == cam)
@@ -433,6 +502,8 @@ void set_cam(CActor* a, u8 cam)
 			a->Cameras().RemoveCamEffector(eff_down());
 		else if (g_me.cam == 2)
 			a->Cameras().RemoveCamEffector(eff_spectate());
+		else if (g_me.cam == 3)
+			a->Cameras().RemoveCamEffector(eff_overhead());
 		if (cam == 1)
 			a->Cameras().AddCamEffector(xr_new<DownCam>());
 		else if (cam == 2)
@@ -440,6 +511,8 @@ void set_cam(CActor* a, u8 cam)
 			g_spec.valid = false;
 			a->Cameras().AddCamEffector(xr_new<SpectateCam>());
 		}
+		else if (cam == 3)
+			a->Cameras().AddCamEffector(xr_new<OverheadCam>());
 	}
 	g_me.cam = cam;
 }
@@ -519,6 +592,7 @@ void release_controls(CActor* a)
 	}
 	set_cam(a, 0);
 	g_spec.valid = false;
+	g_over.valid = false;
 }
 
 // ---------------------------------------------------------------- messages out
@@ -530,6 +604,29 @@ void write_state(Writer& w, u16 host_id, Life life, u16 seq, u32 left, const cha
 	w.u16(seq);
 	w.u32(left);
 	w.str(nick ? nick : "");
+}
+
+// Ruling F3-4: the tail of a client's Dead report, {u8 n, n x u16 item}: the items in its slots and on its belt in
+// host numbering, each once, at most kMaxWornIds. The host's proxy cannot show them (an NPC has no outfit or belt).
+void write_worn(Writer& w, CActor& a)
+{
+	xr_vector<u16> ids;
+	const auto add = [&ids](PIItem it)
+	{
+		if (!it || it->object().getDestroy() || ids.size() >= kMaxWornIds)
+			return;
+		const u16 id = join::to_host(it->object().ID());
+		if (id != 0xffff && std::find(ids.begin(), ids.end(), id) == ids.end())
+			ids.push_back(id);
+	};
+	CInventory& inv = a.inventory();
+	for (u16 slot = inv.FirstSlot(); slot <= inv.LastSlot(); ++slot)
+		add(inv.ItemFromSlot(slot));
+	for (PIItem it : inv.m_belt)
+		add(it);
+	w.u8(u8(ids.size()));
+	for (u16 id : ids)
+		w.u16(id);
 }
 
 void host_on_state(u16 id, Life life, u16 seq);
@@ -549,7 +646,11 @@ void send_my_state(u64 t)
 		host_on_state(0, g_me.life, g_me.seq);
 	}
 	else
+	{
+		if (g_me.life == Life::Dead && g_me.actor)
+			write_worn(w, *g_me.actor); // the host takes the death's losses on this report (no actor: no list)
 		net::client_send(Msg::PlayerWounded, w);
+	}
 	++g_stat.states_out;
 }
 
@@ -579,13 +680,24 @@ void host_order_spectate(u16 target, u16 seq)
 	host_send_order(target, w);
 }
 
+void host_order_evacuate(u16 target, u16 seq, u32 delay_ms)
+{
+	Writer w(12);
+	w.u8(OpEvacuate);
+	w.u16(target);
+	w.u16(seq);
+	w.u32(delay_ms);
+	host_send_order(target, w);
+}
+
 // ---------------------------------------------------------------- own life
 
 void enter_wounded(CActor* a, u64 t)
 {
 	g_me.life = Life::Wounded;
 	g_hook_life.store(u8(Life::Wounded));
-	++g_me.seq;
+	if (++g_me.seq == 0xffff) // 0xffff is death::Tracker's "no death decided"
+		g_me.seq = 0;
 	g_me.since = t;
 	g_me.bleed_end = t + g_rules.bleedout_ms;
 	g_me.giveup_start = 0;
@@ -606,6 +718,7 @@ void enter_dead(CActor* a, u64 t)
 	g_hook_life.store(u8(Life::Dead));
 	g_me.since = t;
 	g_me.giveup_start = 0;
+	g_me.evac_end = 0;
 	hold_controls(a);
 	set_cam(a, 1);
 	++g_stat.deaths;
@@ -620,6 +733,7 @@ void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 	g_hook_damage.store(0);
 	g_me.since = t;
 	g_me.respawn_at = 0;
+	g_me.evac_end = 0;
 	g_me.spectate = 0xffff;
 	if (a)
 	{
@@ -634,29 +748,25 @@ void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 		send_my_state(t);
 }
 
-// Respawn with item loss: every carried item except quest items and the PDA is dropped through the normal
-// drop path (GE_OWNERSHIP_REJECT, as the inventory UI does). On a client the coop router turns it into a
-// drop request and the host performs it, so the host world gets the items where the player died.
-u32 drop_carried_items(CActor* a)
+// The wear of a death (coop_death_wear): the weapons, the outfit and the helmet in the owner's slots lose `pct` % of
+// their condition. The owner owns the condition of its items: WP9's ItemState carries it to the host and the others.
+u32 wear_worn_items(CActor* a, u8 pct)
 {
-	xr_vector<u16> ids;
-	for (PIItem it : a->inventory().m_all)
+	if (!pct)
+		return 0;
+	static const u16 kWornSlots[] = {KNIFE_SLOT, INV_SLOT_2, INV_SLOT_3, OUTFIT_SLOT, HELMET_SLOT};
+	u32 worn = 0;
+	for (u16 slot : kWornSlots)
 	{
-		if (!it || it->object().getDestroy() || it->IsQuestItem() || it->BaseSlot() == PDA_SLOT)
+		if (slot > a->inventory().LastSlot())
 			continue;
-		ids.push_back(it->object().ID());
-	}
-	for (u16 id : ids)
-	{
-		CGameObject* o = object_here(id);
-		if (!o || !o->H_Parent() || o->H_Parent()->ID() != a->ID())
+		PIItem it = a->inventory().ItemFromSlot(slot);
+		if (!it || it->object().getDestroy() || !it->IsUsingCondition())
 			continue;
-		NET_Packet P;
-		o->u_EventGen(P, GE_OWNERSHIP_REJECT, a->ID());
-		P.w_u16(id);
-		o->u_EventSend(P);
+		it->ChangeCondition(-float(pct) / 100.f);
+		++worn;
 	}
-	return u32(ids.size());
+	return worn;
 }
 
 void apply_revive(u16 seq, u16 reviver, float health, PeerId reviver_peer, const char* medkit)
@@ -676,25 +786,51 @@ void apply_revive(u16 seq, u16 reviver, float health, PeerId reviver_peer, const
 	script::on_actor_revived(reviver_peer, medkit); // Lua coop_actor_revived, from the frame queue
 }
 
-void apply_respawn(u16 seq, const Fvector& pos, bool drop)
+// The host's Evacuate: this death costs what it costs (the host took it already), the player waits `delay_ms` for
+// the respawn and watches a living teammate meanwhile (local_frame).
+void apply_evacuate(u16 seq, u32 delay_ms)
 {
 	CActor* a = local_actor();
-	if (!a || g_me.life != Life::Dead || seq != g_me.seq)
+	if (!a || g_me.life != Life::Dead || seq != g_me.seq || g_me.evac_end)
+	{
+		++g_stat.stale_orders;
+		return;
+	}
+	g_me.evac_end = now() + delay_ms;
+	if (!g_me.evac_end)
+		g_me.evac_end = 1; // 0 means "no Evacuate yet"
+	g_me.spectate = 0xffff;
+	close_menus();
+	++g_stat.evacuations;
+}
+
+// The host's Respawn: back to life at `pos`, the player's checkpoint of `kind`. A Dead owner gets it when its
+// evacuation is over; an Alive one when it came back to the world while dead (a rejoin, a world change) and the
+// host still owes it the respawn (its seq is the one it reported alive). The items were taken once, by the host,
+// when the death was decided.
+void apply_respawn(u16 seq, const Fvector& pos, checkpoint::Kind kind)
+{
+	CActor* a = local_actor();
+	if (!a || (g_me.life != Life::Dead && g_me.life != Life::Alive) || seq != g_me.seq)
 	{
 		++g_stat.stale_orders;
 		return;
 	}
 	const u64 t = now();
+	if (g_me.life == Life::Alive)
+	{
+		close_menus();
+		hold_controls(a); // as every Respawning frame (local_frame); the camera stays where it is
+	}
 	g_me.life = Life::Respawning;
 	g_hook_life.store(u8(Life::Respawning));
 	g_me.since = t;
 	g_me.respawn_pos = pos;
-	u32 dropped = 0;
-	if (drop)
-		dropped = drop_carried_items(a);
-	g_me.respawn_at = t + (dropped ? kDropWaitMs : 300);
-	if (dropped)
-		feed("Your gear stays where you died (%u items).", dropped);
+	g_me.respawn_kind = kind;
+	g_me.respawn_at = t + kRespawnSettleMs;
+	const u32 worn = wear_worn_items(a, g_rules.wear_pct);
+	if (worn)
+		::Msg("[coop] death wear: %u worn item(s) lose %u%% condition", worn, u32(g_rules.wear_pct));
 	send_my_state(t);
 }
 
@@ -704,8 +840,16 @@ void finish_respawn(CActor* a, u64 t)
 	m.c.set(g_me.respawn_pos);
 	a->ForceTransform(m);
 	++g_stat.respawns;
+	const checkpoint::Kind kind = g_me.respawn_kind;
 	stand_up(a, a->conditions().GetMaxHealth(), true, t);
-	feed("You respawned.");
+	if (kind == checkpoint::Kind::None)
+		feed("You respawned (no camp of yours on this level).");
+	else
+		feed("You are back at your camp (%s).", checkpoint::kind_name(kind));
+	// Lua (F3 Task 15): contusion, rank; the money is the host's (death::host_take_money), Lua only tells it.
+	script::queue_callback("coop_respawned", {script::cb_str(checkpoint::kind_name(kind)),
+		script::cb_int(s64(g_rules.contusion_s)), script::cb_int(s64(g_rules.money_pct)),
+		script::cb_int(s64(g_rules.rank_pct))});
 }
 
 void apply_spectate(u16 seq)
@@ -772,12 +916,21 @@ void apply_order(u8 op, Reader& r)
 	{
 		float p[3];
 		r.vec3(p);
-		const bool drop = r.boolean();
-		if (r.ok() && _valid(p[0]) && _valid(p[1]) && _valid(p[2]))
-			apply_respawn(seq, Fvector().set(p[0], p[1], p[2]), drop);
+		const u8 kind = r.u8();
+		if (!r.ok() || !_valid(p[0]) || !_valid(p[1]) || !_valid(p[2]))
+			break;
+		const bool known = kind <= u8(checkpoint::Kind::Mod); // a newer kind: still a respawn, shown as "none"
+		apply_respawn(seq, Fvector().set(p[0], p[1], p[2]), known ? checkpoint::Kind(kind) : checkpoint::Kind::None);
 		break;
 	}
 	case OpSpectate: apply_spectate(seq); break;
+	case OpEvacuate:
+	{
+		const u32 delay = r.u32();
+		if (r.ok())
+			apply_evacuate(seq, _min(delay, u32(300000))); // death::Rules caps the delay at 300 s
+		break;
+	}
 	default: break;
 	}
 }
@@ -820,6 +973,7 @@ void apply_remote_state(u16 id, Life life, u16 seq, u32 left, const char* nick)
 
 // ---------------------------------------------------------------- host
 
+// Where a character stands on the ground: the position of its AI vertex when it has a valid one.
 Fvector ground_point(CGameObject* o)
 {
 	Fvector p = o->Position();
@@ -828,78 +982,76 @@ Fvector ground_point(CGameObject* o)
 		const u32 v = o->ai_location().level_vertex_id();
 		if (ai().level_graph().valid_vertex_id(v))
 			p = ai().level_graph().vertex_position(v);
-		// stand beside the teammate, not inside its capsule, when that spot is walkable
-		Fvector side = p;
-		side.x += 0.8f;
-		if (ai().level_graph().valid_vertex_id(ai().level_graph().vertex_id(side)))
-			p = side;
 	}
-	p.y += 0.2f;
 	return p;
 }
 
-// Respawn point: beside the living teammate nearest to the body; else where the player was first seen
-// alive in this world; else where it fell.
-bool pick_respawn_point(u16 dead, Fvector& out)
+// F3 Task 8 step 3: after a decision, the lives of everybody present in the host's world (the host, the players that
+// report, without the parked characters of players who left). Every one of them down for good: coop_group_wipe, once
+// until somebody stands up again (host_on_state Alive).
+void host_check_wipe()
 {
-	CGameObject* body = object_here(dead);
-	float best = flt_max;
-	bool found = false;
-	auto consider = [&](u16 id)
-	{
-		if (id == dead)
-			return;
-		CGameObject* o = object_here(id);
-		if (!o)
-			return;
-		const float d = body ? o->Position().distance_to_sqr(body->Position()) : 0.f;
-		if (d < best)
-		{
-			best = d;
-			out = ground_point(o);
-			found = true;
-		}
-	};
-	if (g_me.life == Life::Alive)
-		consider(0);
+	std::vector<u8> lives;
+	lives.push_back(u8(g_me.life));
 	for (const auto& it : g_players)
-		if (it.second.life == Life::Alive && !world::is_parked(it.first))
-			consider(it.first);
-	if (found)
-		return true;
-	const HostRec& h = g_host[dead];
-	if (h.has_anchor)
-	{
-		out = h.anchor;
-		return true;
-	}
-	if (body)
-	{
-		out = body->Position();
-		return true;
-	}
-	return false;
+		if (!world::is_parked(it.first))
+			lives.push_back(u8(it.second.life));
+	if (g_wipe_fired || !death::is_wipe(lives))
+		return;
+	g_wipe_fired = true;
+	++g_stat.wipes;
+	feed("%s", tr("st_coop_evac_no_allies", "Nobody is left alive. The world is not rolled back.").c_str());
+	script::queue_callback("coop_group_wipe", {});
 }
 
+// The respawn of `id` at his own checkpoint (coop_checkpoints::host_respawn_point: his camp, the previous one, the
+// anchor, the host's arrival point, else the body). `seq` is the fall the owner is at: the death after an evacuation,
+// or the seq it reported alive with when it came back. False when the character has no object here to start from.
+bool host_order_respawn(u16 id, u16 seq)
+{
+	CGameObject* body = object_here(id);
+	if (!body)
+		return false;
+	const HostRec& h = g_host[id];
+	Fvector pos;
+	checkpoint::Kind kind = checkpoint::Kind::None;
+	if (!checkpoints::host_respawn_point(id, h.has_anchor ? &h.anchor : nullptr, body->Position(), pos, kind))
+		::Msg("! [coop] respawn of %s: no checkpoint store in this world, back where the body lies", nick_of(id).c_str());
+	pos.y += kRespawnLift;
+	::Msg("[coop] respawn of %s (fall #%u): %s at (%.1f, %.1f, %.1f)", nick_of(id).c_str(), seq,
+	    checkpoint::kind_name(kind), pos.x, pos.y, pos.z);
+	Writer w(24);
+	w.u8(OpRespawn);
+	w.u16(id);
+	w.u16(seq);
+	const float p[3] = {pos.x, pos.y, pos.z};
+	w.vec3(p);
+	w.u8(u8(kind));
+	host_send_order(id, w);
+	return true;
+}
+
+// The host's answer to a death (death::Tracker: once per death). Checkpoint: the items (coop_death, by
+// coop_death_drop) and the money go now, the owner is evacuated for coop_respawn_delay, host_frame respawns him.
+// Hardcore: he is out and watches. The host's own actor (0) takes the same path: host_send_order applies to itself.
 void host_on_died(u16 id, u16 seq)
 {
 	HostRec& h = g_host[id];
-	if (h.died_seq == seq)
-		return; // decided already (state repeats are normal)
-	h.died_seq = seq;
-	switch (g_rules.mode)
+	switch (death::on_died(h.tracker, seq, now(), g_rules))
 	{
-	case DeathMode::Hardcore:
-		h.hardcore_dead = true;
-		host_order_spectate(id, seq);
-		break;
-	case DeathMode::Respawn:
-	case DeathMode::RespawnKeep:
-		h.respawn_at = now() + g_rules.respawn_delay_ms;
-		h.respawn_seq = seq;
-		h.respawn_drop = g_rules.mode == DeathMode::Respawn;
+	case death::Action::None: return; // decided already (state repeats are normal)
+	case death::Action::Spectate: host_order_spectate(id, seq); break;
+	case death::Action::LossesAndEvacuate:
+	{
+		const u32 items = death::host_apply_losses(id, seq, g_rules.drop);
+		const u32 money = death::host_take_money(id, g_rules.money_pct);
+		::Msg("[coop] death of %s (fall #%u): %u item(s) (%s), %u RU; respawn in %u s", nick_of(id).c_str(), seq, items,
+		    drop_name(g_rules.drop), money, g_rules.delay_ms / 1000);
+		host_order_evacuate(id, seq, g_rules.delay_ms);
 		break;
 	}
+	}
+	host_check_wipe();
 }
 
 void host_on_state(u16 id, Life life, u16 seq)
@@ -908,18 +1060,32 @@ void host_on_state(u16 id, Life life, u16 seq)
 	switch (life)
 	{
 	case Life::Alive:
+	{
 		h.revive_pending_until = 0;
-		h.respawn_at = 0;
-		h.died_seq = 0xffff; // that death is over (a rejoined player counts its falls from 0 again)
+		g_wipe_fired = false; // somebody stands: the next wipe is a new one
 		if (!h.has_anchor)
 			if (CGameObject* o = object_here(id))
 			{
 				h.anchor = ground_point(o);
 				h.has_anchor = true;
 			}
-		if (h.hardcore_dead && g_rules.mode == DeathMode::Hardcore)
-			host_order_spectate(id, seq); // rejoined after dying: still out in this world
+		// Review Focus 1 and 2: a respawn owed to a player who came back to the world while dead. on_returned
+		// before on_alive, which forgets the death (the new actor counts its falls from 0 again, F3 R1 finding 1).
+		const bool returned = death::on_returned(h.tracker);
+		const bool camp = g_camp_on_return.erase(id) != 0;
+		death::on_alive(h.tracker);
+		h.has_worn = false;
+		if (h.tracker.hardcore_out)
+		{
+			if (g_rules.mode == death::Mode::Hardcore)
+				host_order_spectate(id, seq); // rejoined after dying: still out in this world
+			else
+				h.tracker.hardcore_out = false; // the host left hardcore: he plays on (and leaves / returns as anyone)
+		}
+		else if ((returned || camp) && !host_order_respawn(id, seq))
+			g_camp_on_return.insert(id); // no body here yet: his next Alive report (5 s) tries again
 		break;
+	}
 	case Life::Dead: host_on_died(id, seq); break;
 	default: break;
 	}
@@ -987,18 +1153,36 @@ void host_broadcast_rules()
 	net::host_broadcast(Msg::PlayerRules, w);
 }
 
+// Review Focus 2: a load / level change replaces the host's world. Whoever was dead or evacuated comes back on his
+// checkpoint (the arrival point Task 6 set on a level change) once he reports alive in the new world; the losses of
+// that death were taken already. Dead after the respawn order went out (the tracker no longer waits then): the same.
+// Hardcore's out players are not brought back here. Runs before the host's books (g_host) are dropped.
+void host_mark_world_replaced()
+{
+	for (auto& it : g_host)
+	{
+		const bool ordered = !it.second.tracker.hardcore_out && life_by_host_id(it.first) == Life::Dead;
+		if (death::on_world_replaced(it.second.tracker) || ordered)
+			g_camp_on_return.insert(it.first);
+	}
+}
+
 void host_frame(u64 t)
 {
 	const u32 epoch = join::host_world_epoch();
 	if (epoch != g_epoch)
 	{
 		if (g_epoch != 0xffffffff)
+		{
 			g_me.actor = nullptr; // the new actor may reuse the old one's address: frame() must still start it over
-		g_epoch = epoch; // a load / level change replaced the world: deaths and anchors start over
+			host_mark_world_replaced();
+		}
+		g_epoch = epoch; // deaths and anchors start over (the new actors count their falls from 0)
 		g_host.clear();
+		g_wipe_fired = false;
 	}
 
-	const Rules r = console_rules();
+	const death::Rules r = console_rules();
 	if (!(r == g_rules))
 	{
 		const bool mode_changed = r.mode != g_rules.mode;
@@ -1008,41 +1192,33 @@ void host_frame(u64 t)
 			feed("Death mode: %s.", mode_name(r.mode));
 	}
 
-	// players that left: their characters are parked, nothing to decide for them
+	// players that left: their characters are parked. Dead or evacuated: the countdown stops and the respawn waits for
+	// their return (death::on_left, Review Focus 1); dead with the respawn order already out: the same, by life state.
 	for (auto it = g_players.begin(); it != g_players.end();)
 	{
 		if (world::is_parked(it->first) || join::peer_of_proxy(it->first) == kInvalidPeer)
 		{
 			HostRec& h = g_host[it->first];
-			h.respawn_at = 0;
+			death::on_left(h.tracker); // hardcore_out stays: leaving does not bring a dead player back
+			if (it->second.life == Life::Dead && !h.tracker.hardcore_out && !h.tracker.respawn_due)
+				g_camp_on_return.insert(it->first);
 			h.revive_pending_until = 0;
-			h.died_seq = 0xffff; // hardcore_dead stays: leaving does not bring a dead player back
 			it = g_players.erase(it);
 		}
 		else
 			++it;
 	}
 
+	// evacuations that are over (orders after the walk: the host's own respawn re-enters host_on_state)
+	xr_vector<u16> due;
 	for (auto& it : g_host)
+		if (death::due(it.second.tracker, t))
+			due.push_back(it.first);
+	for (u16 id : due)
 	{
-		HostRec& h = it.second;
-		if (!h.respawn_at || t < h.respawn_at)
-			continue;
-		Fvector pos;
-		if (!pick_respawn_point(it.first, pos))
-		{
-			h.respawn_at = t + 2000;
-			continue;
-		}
-		h.respawn_at = 0;
-		Writer w(24);
-		w.u8(OpRespawn);
-		w.u16(it.first);
-		w.u16(h.respawn_seq);
-		const float p[3] = {pos.x, pos.y, pos.z};
-		w.vec3(p);
-		w.boolean(h.respawn_drop);
-		host_send_order(it.first, w);
+		HostRec& h = g_host[id];
+		if (!host_order_respawn(id, h.tracker.decided_seq))
+			h.tracker.respawn_at = t + kRespawnRetryMs; // no body here right now: still waiting (on_left sees it)
 	}
 
 	if (t - g_last_roster >= kStateRefreshMs)
@@ -1061,6 +1237,44 @@ void host_frame(u64 t)
 
 // ---------------------------------------------------------------- handlers
 
+// Host, Ruling F3-4: the slot / belt tail of a client's Dead report (write_worn). Checked as anything from the
+// network: at most kMaxWornIds, a short or longer list is dropped whole; of the ids only items the proxy carries
+// right now stay (each once, sorted). Kept per death: the losses of that death read it (host_worn_items).
+void host_read_worn(u16 proxy, u16 seq, Reader& r)
+{
+	if (r.remaining() == 0)
+		return; // the report without the tail: the layout stays unknown
+	HostRec& h = g_host[proxy];
+	if (h.has_worn && h.worn_seq == seq)
+		return; // the 5 s repeat of the same death: the first list counts
+	const u8 n = r.u8();
+	if (!r.ok() || n > kMaxWornIds)
+	{
+		++g_stat.worn_refused;
+		return;
+	}
+	xr_vector<u16> ids;
+	ids.reserve(n);
+	for (u8 i = 0; i < n; ++i)
+		ids.push_back(r.u16());
+	if (!r.ok())
+	{
+		++g_stat.worn_refused;
+		return;
+	}
+	std::sort(ids.begin(), ids.end());
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	ids.erase(std::remove_if(ids.begin(), ids.end(), [proxy](u16 id)
+	{
+		CGameObject* o = object_here(id);
+		return !o || !smart_cast<CInventoryItem*>(o) || !o->H_Parent() || o->H_Parent()->ID() != proxy;
+	}), ids.end());
+	h.has_worn = true;
+	h.worn_seq = seq;
+	h.worn = std::move(ids);
+	++g_stat.worn_reports;
+}
+
 void on_state_msg(PeerId from, Reader& r)
 {
 	u16 id = r.u16();
@@ -1077,6 +1291,8 @@ void on_state_msg(PeerId from, Reader& r)
 			return;
 		const PeerInfo* p = mgr().session().peer(from);
 		const xr_string name = p ? p->nick.c_str() : nick.c_str();
+		if (Life(life) == Life::Dead)
+			host_read_worn(id, seq, r); // before the decision: the losses of this death read it
 		apply_remote_state(id, Life(life), seq, left, name.c_str());
 		host_on_state(id, Life(life), seq);
 		Writer w(32);
@@ -1115,12 +1331,14 @@ void on_rules_msg(PeerId from, Reader& r)
 {
 	if (mgr().is_host() || from != kHostPeer)
 		return;
-	Rules rules;
+	death::Rules rules = g_rules;
 	if (!rules.read(r))
 		return;
-	if (!g_rules_from_host || rules.mode != g_rules.mode)
-		::Msg("[coop] host survival rules: death mode %s, bleed-out %u s, revive health %.2f, respawn delay %u s",
-		    mode_name(rules.mode), rules.bleedout_ms / 1000, rules.revive_health, rules.respawn_delay_ms / 1000);
+	if (!g_rules_from_host || !(rules == g_rules))
+		::Msg("[coop] host survival rules: death mode %s, drop %s, bleed-out %u s, revive health %.2f, respawn delay "
+		      "%u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
+		    mode_name(rules.mode), drop_name(rules.drop), rules.bleedout_ms / 1000, rules.revive_health,
+		    rules.delay_ms / 1000, rules.contusion_s, u32(rules.money_pct), u32(rules.wear_pct), u32(rules.rank_pct));
 	g_rules = rules;
 	g_rules_from_host = true;
 }
@@ -1218,6 +1436,37 @@ void spectate_frame(u64)
 	g_spec.valid = true;
 }
 
+// Evacuated with nobody to watch: the overhead camera's target, the own body, and how high it may go (a ceiling).
+void overhead_frame(CActor* a)
+{
+	Fvector from = a->Position();
+	from.y += 0.5f;
+	float dist = kOverheadHeight;
+	collide::rq_result R;
+	if (Level().ObjectSpace.RayPick(from, Fvector().set(0.f, 1.f, 0.f), dist, collide::rqtStatic, R, nullptr))
+		dist = _max(1.f, R.range - 0.3f);
+	g_over.body = a->Position();
+	g_over.height = _min(kOverheadHeight, dist + 0.5f);
+	g_over.valid = true;
+}
+
+// Dead and evacuated: watch a living teammate (Fire / Aim switch), nobody alive: look down at the body.
+void evacuated_frame(CActor* a, u64 t)
+{
+	spectate_frame(t);
+	const u8 cam = g_spec.valid ? 2 : 3;
+	if (g_me.cam != cam)
+	{
+		set_cam(a, cam);
+		if (cam == 2)
+			spectate_frame(t); // set_cam starts the spectator camera without a target
+	}
+	if (cam == 3)
+		overhead_frame(a);
+	else
+		g_over.valid = false;
+}
+
 void local_frame(CActor* a, u64 t)
 {
 	if (g_hook_fell.exchange(false) && g_me.life == Life::Alive)
@@ -1249,7 +1498,11 @@ void local_frame(CActor* a, u64 t)
 		if (t >= g_me.bleed_end)
 			enter_dead(a, t);
 		break;
-	case Life::Dead: hold_controls(a); break;
+	case Life::Dead:
+		hold_controls(a);
+		if (g_me.evac_end)
+			evacuated_frame(a, t);
+		break;
 	case Life::Spectating:
 		hold_controls(a);
 		spectate_frame(t);
@@ -1353,15 +1606,27 @@ void build_hud(u64 t)
 		break;
 	}
 	case Life::Dead:
-		line("YOU DIED", 0xffe03c3c, true);
-		if (g_rules.mode == DeathMode::Hardcore)
-			line("Waiting for the host...", 0xfff0f0f0, false);
-		else
+		if (!g_me.evac_end)
 		{
-			const u64 at = g_me.since + g_rules.respawn_delay_ms;
-			xr_sprintf(buf, "Respawn in %u s%s", at > t ? u32((at - t + 999) / 1000) : 0,
-			    g_rules.mode == DeathMode::Respawn ? " (your gear stays here)" : "");
+			line("YOU DIED", 0xffe03c3c, true);
+			line("Waiting for the host...", 0xfff0f0f0, false);
+			break;
+		}
+		{
+			line(tr("st_coop_evac_title", "You were pulled out...").c_str(), 0xffe03c3c, true);
+			const int left = g_me.evac_end > t ? int((g_me.evac_end - t + 999) / 1000) : 0;
+			xr_sprintf(buf, tr_format("st_coop_evac_wait", "Back at your camp in %d s", 'd').c_str(), left);
 			line(buf, 0xfff0f0f0, false);
+			if (g_spec.valid && g_me.spectate != 0xffff)
+			{
+				xr_sprintf(buf, tr_format("st_coop_evac_watch", "Watching: %s", 's').c_str(),
+				    nick_of(join::to_host(g_me.spectate)).c_str());
+				line(buf, 0xfff0f0f0, false);
+				line("Fire: next player   Aim: previous player", 0xffa0a0a0, false);
+			}
+			else
+				line(tr("st_coop_evac_no_allies", "Nobody is left alive. The world is not rolled back.").c_str(),
+				    0xffa0a0a0, false);
 		}
 		break;
 	case Life::Respawning: line("Respawning...", 0xfff0f0f0, true); break;
@@ -1408,6 +1673,7 @@ void forget_local(CActor* next = nullptr)
 		g_hook_life.store(u8(Life::Alive)); // the new actor fell before we saw it: frame() makes it wounded
 	g_hook_damage.store(0);
 	g_spec.valid = false;
+	g_over.valid = false;
 	g_poses.clear();
 	g_players.clear();
 }
@@ -1420,7 +1686,8 @@ void leave_session()
 	else if (a && a == g_me.actor)
 		release_controls(a);
 	forget_local();
-	g_host.clear();
+	g_host.clear(); // g_camp_on_return stays: a host frame without a level is a world change (reset() clears it)
+	g_wipe_fired = false;
 	g_rules_from_host = false;
 	g_hud.clear();
 }
@@ -1543,6 +1810,18 @@ u32 bleed_left_ms(u16 local_id)
 	return p && p->life == Life::Wounded && p->bleed_end > t ? u32(p->bleed_end - t) : 0;
 }
 
+bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
+{
+	out.clear();
+	if (!mgr().is_host())
+		return false;
+	const auto it = g_host.find(character);
+	if (it == g_host.end() || !it->second.has_worn || it->second.worn_seq != seq)
+		return false;
+	out = it->second.worn;
+	return true;
+}
+
 void install(Session& s)
 {
 	s.on(Msg::PlayerWounded, &on_state_msg);
@@ -1553,15 +1832,21 @@ void install(Session& s)
 void register_console()
 {
 	CMD3(CCC_Token, "coop_death_mode", &g_cv_death_mode, g_death_mode_tokens);
+	CMD3(CCC_Token, "coop_death_drop", &g_cv_death_drop, g_death_drop_tokens);
 	CMD4(CCC_Float, "coop_bleedout", &g_cv_bleedout_s, 10.f, 600.f);
 	CMD4(CCC_Float, "coop_revive_health", &g_cv_revive_health, 0.05f, 1.f);
-	CMD4(CCC_Float, "coop_respawn_delay", &g_cv_respawn_delay_s, 0.f, 120.f);
+	CMD4(CCC_Float, "coop_respawn_delay", &g_cv_respawn_delay_s, 0.f, 300.f); // s
+	CMD4(CCC_Float, "coop_contusion", &g_cv_contusion_min, 0.f, 60.f); // min
+	CMD4(CCC_Float, "coop_death_money", &g_cv_death_money, 0.f, 100.f); // %
+	CMD4(CCC_Float, "coop_death_wear", &g_cv_death_wear, 0.f, 100.f); // %
+	CMD4(CCC_Float, "coop_death_rank", &g_cv_death_rank, 0.f, 100.f); // %
 	CMD1(CCC_CoopWoundMe, "coop_wound_me");
 }
 
 void reset()
 {
 	leave_session();
+	g_camp_on_return.clear();
 	g_rules = console_rules();
 	g_epoch = 0xffffffff;
 	g_last_roster = g_last_guard = 0;
@@ -1574,7 +1859,11 @@ void frame()
 	if (!g_pGameLevel || !live())
 	{
 		if (g_me.actor || !g_players.empty() || !g_host.empty())
+		{
+			if (live() && mgr().is_host())
+				host_mark_world_replaced(); // the host's world is going away mid-session: a load / level change
 			leave_session();
+		}
 		return;
 	}
 	const u64 t = now();
@@ -1612,24 +1901,35 @@ void frame()
 
 void print_status()
 {
-	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, bleed-out %u s, revive health %.2f",
+	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, drop %s, bleed-out %u s, revive health %.2f, "
+	      "respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
 	    life_name(g_me.life), g_me.seq, mode_name(g_rules.mode),
-	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", g_rules.bleedout_ms / 1000,
-	    g_rules.revive_health);
-	::Msg("[coop]   survival: falls %llu, deaths %llu, revived %llu, refused %llu, respawns %llu, spectate %llu",
-	    g_stat.falls, g_stat.deaths, g_stat.revives, g_stat.refused, g_stat.respawns, g_stat.spectates);
+	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", drop_name(g_rules.drop),
+	    g_rules.bleedout_ms / 1000, g_rules.revive_health, g_rules.delay_ms / 1000, g_rules.contusion_s,
+	    u32(g_rules.money_pct), u32(g_rules.wear_pct), u32(g_rules.rank_pct));
+	::Msg("[coop]   survival: falls %llu, deaths %llu, revived %llu, refused %llu, evacuated %llu, respawns %llu, "
+	      "spectate %llu, wipes %llu",
+	    g_stat.falls, g_stat.deaths, g_stat.revives, g_stat.refused, g_stat.evacuations, g_stat.respawns,
+	    g_stat.spectates, g_stat.wipes);
 	::Msg("[coop]   survival: states out %llu in %llu, orders in %llu, requests in %llu, stale orders %llu, kills "
-	      "intercepted %llu, proxy kills refused %llu, unharmable fixes %llu",
+	      "intercepted %llu, proxy kills refused %llu, unharmable fixes %llu, worn lists %llu (refused %llu)",
 	    g_stat.states_out, g_stat.states_in, g_stat.orders_in, g_stat.requests_in, g_stat.stale_orders,
-	    g_stat.kills_intercepted, g_stat.proxy_kills_refused, g_stat.guard_fixes);
+	    g_stat.kills_intercepted, g_stat.proxy_kills_refused, g_stat.guard_fixes, g_stat.worn_reports,
+	    g_stat.worn_refused);
 	const u64 t = now();
 	for (const auto& it : g_players)
 		::Msg("[coop]   player %u '%s': %s (fall #%u)%s", it.first, it.second.nick.c_str(), life_name(it.second.life),
 		    it.second.seq, it.second.life == Life::Wounded && it.second.bleed_end > t ? ", bleeding out" : "");
 	for (const auto& it : g_host)
-		if (it.second.respawn_at || it.second.hardcore_dead)
-			::Msg("[coop]   host: character %u%s%s", it.first, it.second.respawn_at ? " respawn pending" : "",
-			    it.second.hardcore_dead ? " out (hardcore)" : "");
+	{
+		const death::Tracker& k = it.second.tracker;
+		if (k.respawn_at || k.respawn_due || k.hardcore_out)
+			::Msg("[coop]   host: character %u%s%s%s", it.first,
+			    k.respawn_at ? (k.respawn_at > t ? " evacuated" : " respawn due") : "",
+			    k.respawn_due ? " respawn on return" : "", k.hardcore_out ? " out (hardcore)" : "");
+	}
+	for (u16 id : g_camp_on_return)
+		::Msg("[coop]   host: character %u goes to his checkpoint when he reports alive", id);
 }
 
 void render_hud()
