@@ -98,13 +98,12 @@ bool spawnable_section(const char* section)
 	    pSettings->line_exist(section, "class");
 }
 
-// R3 В6 (review): the lines the entity's constructor reads unchecked are there (inv_weight and cost of every
-// inventory item, which also keeps non-items out, plus those of weapons, ammo, detectors, outfits). Returns the
-// first missing line, nullptr if none. `section` passed spawnable_section.
-const char* missing_item_line(const char* section)
+// R3 В6 (review), F2 T2: the lines the constructor of `rule`'s server entity and of its bases read unchecked are
+// there (xrCoop/coop_spawn.h required_lines). Returns the first missing line, nullptr if none. `section` passed
+// spawnable_section.
+const char* missing_item_line(const char* section, const spawn::ClassRule& rule)
 {
-	const spawn::ItemKind kind = spawn::item_kind(pSettings->r_string(section, "class"));
-	for (const char* line : spawn::required_lines(kind))
+	for (const char* line : spawn::required_lines(rule.cse))
 		if (!pSettings->line_exist(section, line))
 			return line;
 	return nullptr;
@@ -704,6 +703,119 @@ bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 	return true;
 }
 
+// ---------------------------------------------------------------- F2 T2: what a client may ask for
+// The verdict is xrCoop/coop_spawn.h judge(). Host settings: configs\coop_spawn.ltx, read once per process. The cost
+// budgets belong to the characters (proxy ids) for the whole session (Ruling F2-11): a peer that leaves and joins
+// again as the same character refills nothing; reset() at the session's start and end clears them.
+constexpr LPCSTR kSpawnSettings = "coop_spawn";
+constexpr int kMaxSpawnSetting = 2000000000; // ltx values are ints
+constexpr u32 kSpawnVerdicts = u32(spawn::SpawnVerdict::OverBudget) + 1;
+constexpr u64 kSpawnLogFirst = 10;
+spawn::SpawnPolicy g_spawn_policy;
+xr_set<shared_str> g_spawn_allow, g_spawn_deny;
+spawn::BudgetBook g_spawn_budgets;
+u64 g_spawn_refused[kSpawnVerdicts] = {};
+u64 g_spawn_refusals = 0;
+
+u32 read_spawn_setting(CInifile& ini, LPCSTR key, u32 fallback)
+{
+	if (!ini.line_exist(kSpawnSettings, key))
+		return fallback;
+	return u32(_max(0, _min(ini.r_s32(kSpawnSettings, key), kMaxSpawnSetting)));
+}
+
+void read_section_list(CInifile& ini, LPCSTR list, xr_set<shared_str>& out)
+{
+	if (!ini.section_exist(list))
+		return;
+	const u32 n = ini.line_count(list);
+	for (u32 i = 0; i < n; ++i)
+	{
+		LPCSTR name = nullptr;
+		LPCSTR value = nullptr;
+		if (ini.r_line(list, int(i), &name, &value) && name && name[0])
+			out.insert(shared_str(name));
+	}
+}
+
+void load_spawn_settings()
+{
+	static bool loaded = false;
+	if (loaded)
+		return;
+	loaded = true;
+	string_path path;
+	FS.update_path(path, "$game_config$", "coop_spawn.ltx");
+	if (!FS.exist(path))
+	{
+		::Msg("! [coop] configs\\coop_spawn.ltx not found: spawn cost budget is the default, no allow or deny lists");
+		return;
+	}
+	CInifile ini(path, TRUE, TRUE, FALSE); // DLTX: mod_coop_spawn_*.ltx add to it
+	if (ini.section_exist(kSpawnSettings))
+	{
+		g_spawn_policy.cost_burst = read_spawn_setting(ini, "cost_burst", g_spawn_policy.cost_burst);
+		g_spawn_policy.cost_per_sec = read_spawn_setting(ini, "cost_per_sec", g_spawn_policy.cost_per_sec);
+	}
+	else
+		::Msg("! [coop] configs\\coop_spawn.ltx has no [%s]: spawn cost budget is the default", kSpawnSettings);
+	read_section_list(ini, "allow_sections", g_spawn_allow);
+	read_section_list(ini, "deny_sections", g_spawn_deny);
+}
+
+// What the verdict needs to know of the section: `quest_item` exactly as CInventoryItem::Load reads it, `cost` as
+// CSE_ALifeInventoryItem does (0 if missing: the class check refuses such a section first), the host's lists.
+spawn::SectionFacts spawn_facts(const char* section)
+{
+	spawn::SectionFacts f;
+	f.quest_item = !!READ_IF_EXISTS(pSettings, r_bool, section, "quest_item", FALSE);
+	f.cost = pSettings->line_exist(section, "cost") ? pSettings->r_u32(section, "cost") : 0;
+	const shared_str name(section);
+	f.allow_listed = g_spawn_allow.find(name) != g_spawn_allow.end();
+	f.deny_listed = g_spawn_deny.find(name) != g_spawn_deny.end();
+	return f;
+}
+
+// A refused ReqSpawn: counted by verdict (coop_status), the first ten logged with the section and the player.
+void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, const char* missing, u16 parent)
+{
+	using spawn::SpawnVerdict;
+	++g_spawn_refused[u32(v)];
+	if (++g_spawn_refusals <= kSpawnLogFirst)
+	{
+		const PeerInfo* p = mgr().session().peer(q.from);
+		string256 why;
+		switch (v)
+		{
+		case SpawnVerdict::UnknownClass:
+			xr_sprintf(why, "class %.16s is not an item class a client may ask for",
+			    pSettings->r_string(section, "class"));
+			break;
+		case SpawnVerdict::MissingLine:
+			xr_sprintf(why, "no `%s` (its class reads it unchecked)", missing ? missing : "?");
+			break;
+		case SpawnVerdict::Denied: xr_strcpy(why, "in [deny_sections] of coop_spawn.ltx");
+			break;
+		case SpawnVerdict::QuestItem: xr_strcpy(why, "a quest item");
+			break;
+		case SpawnVerdict::OverBudget:
+			xr_sprintf(why, "over the cost budget of character %u (cost %u RU, %.0f RU left)", q.proxy,
+			    spawn_facts(section).cost, g_spawn_budgets.of(q.proxy).tokens);
+			break;
+		default: xr_strcpy(why, "?");
+			break;
+		}
+		::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u <%s> refused: %s", q.seq, section, q.from,
+		    p ? p->nick.c_str() : "?", why);
+	}
+	Reason reason = Reason::NotAllowed; // not an item class, deny-listed, a quest item
+	if (v == SpawnVerdict::MissingLine)
+		reason = Reason::BadSection;
+	else if (v == SpawnVerdict::OverBudget)
+		reason = Reason::RateLimited;
+	reply(q, reason, parent);
+}
+
 // Who would hold a client's new item: checked before anything is constructed (R3 В6 review).
 Reason host_spawn_holder(const Req& q, u16 parent)
 {
@@ -805,47 +917,61 @@ void host_on_spawn(PeerId from, Reader& r)
 	const Reason holder = host_spawn_holder(q, s.parent);
 	if (holder != Reason::Ok)
 		return reply(q, holder, s.parent);
-	// R3 В6: a section with a class and the lines its entity's constructor reads unchecked (FATAL otherwise), then
-	// the host builds the entity from its own section.
+	// R3 В6: a section the host knows, with a class; then the host builds the entity from its own section.
 	const char* section = s.section.c_str();
-	const bool known = spawnable_section(section);
-	const char* missing = known ? missing_item_line(section) : nullptr;
-	// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
-	const bool defaults_ok = known && !missing && items::section_defaults_ok(shared_str(section));
-	CSE_Abstract* e = defaults_ok ?
-	    make_temp(section, Fvector().set(s.pos[0], s.pos[1], s.pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1), s.parent) :
-	    nullptr;
-	if (!e)
+	if (!spawnable_section(section))
 	{
 		if (note_bad(BadSection))
+			::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%.64s] is not a section with a class here", q.seq,
+			    from, validate::resource_name_ok(section, spawn::kMaxSection) ? section : "<bad name>");
+		return reply(q, Reason::BadSection, s.parent);
+	}
+	// F2 T2: an item class of the game with every line its server entity's constructor reads unchecked; anything
+	// else is never constructed (a missing line is FATAL on the host).
+	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(section, "class"));
+	const char* missing = rule ? missing_item_line(section, *rule) : nullptr;
+	CSE_Abstract* e = nullptr;
+	if (rule && !missing)
+	{
+		// Task 10b: the section's own installed_upgrades break its tree: init_install is FATAL on the new object.
+		if (!items::section_defaults_ok(shared_str(section)))
 		{
-			if (missing)
-				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has no `%s` (its class reads it unchecked)",
-				    q.seq, from, section, missing);
-			else if (known && !defaults_ok)
+			if (note_bad(BadSection))
 				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has default upgrades its own upgrade tree "
 				      "refuses (broken data)",
 				    q.seq, from, section);
-			else
-				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%.64s] is not a section with a class here",
-				    q.seq, from, validate::resource_name_ok(section, spawn::kMaxSection) ? section : "<bad name>");
+			return reply(q, Reason::BadSection, s.parent);
 		}
-		return reply(q, Reason::BadSection, s.parent);
-	}
-	if (s.state_size)
-	{
-		// The item state goes through the ItemState checks (WP9): counts, upgrades in an order the engine takes,
-		// ammo types.
-		const char* why = nullptr;
-		if (!items::host_apply_spawn_state(e, s.state, s.state_size, why))
+		e = make_temp(section, Fvector().set(s.pos[0], s.pos[1], s.pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1),
+		    s.parent);
+		if (!e)
+			return reply(q, Reason::Engine, s.parent);
+		if (s.state_size)
 		{
-			if (note_bad(BadSpawnState))
-				::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section, from,
-				    why ? why : "item state");
-			F_entity_Destroy(e);
-			return reply(q, Reason::Malformed, s.parent);
+			// The item state goes through the ItemState checks (WP9): counts, upgrades in an order the engine takes,
+			// ammo types.
+			const char* why = nullptr;
+			if (!items::host_apply_spawn_state(e, s.state, s.state_size, why))
+			{
+				if (note_bad(BadSpawnState))
+					::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section, from,
+					    why ? why : "item state");
+				F_entity_Destroy(e);
+				return reply(q, Reason::Malformed, s.parent);
+			}
 		}
 	}
+	// F2 T2: deny/allow lists, quest items, the character's cost budget; after the item state, so a malformed one
+	// costs nothing. No rule or a missing line ends here too (judge steps 1-2, nothing was constructed).
+	const spawn::SpawnVerdict verdict = spawn::judge(rule, missing, spawn_facts(section),
+	    g_spawn_budgets.of(q.proxy), g_spawn_policy, mgr().now_ms());
+	if (verdict != spawn::SpawnVerdict::Allow)
+	{
+		if (e)
+			F_entity_Destroy(e);
+		return refuse_spawn(q, verdict, section, missing, s.parent);
+	}
+	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
 	const Reason why = host_spawn(e, s.parent, created);
 	reply(q, why, why == Reason::Ok ? created : s.parent);
@@ -1305,6 +1431,7 @@ const char* reason_name(Reason r)
 
 void install(Session& s)
 {
+	load_spawn_settings(); // F2 T2
 	s.on(Msg::ReqSpawn, &host_on_spawn);
 	s.on(Msg::ReqDestroy, [](PeerId from, Reader& r) { host_on_destroy_req(from, r, Msg::ReqDestroy); });
 	s.on(Msg::ReqUse, [](PeerId from, Reader& r) { host_on_destroy_req(from, r, Msg::ReqUse); });
@@ -1328,6 +1455,7 @@ void reset()
 	}
 	g_inflight.clear();
 	g_limits.clear();
+	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
 	g_last_launch.clear(); // W3a
 	g_lua_refused_once.clear(); // W3a
 	g_log_count = 0;
@@ -1372,6 +1500,13 @@ void print_status()
 		      "%llu out-of-reach moves claimed as local, %llu upgrades",
 		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange],
 		    g_bad[BadUpgrade]);
+		using spawn::SpawnVerdict;
+		::Msg("[coop]   spawns refused: class %llu, line %llu, denied %llu, quest %llu, budget %llu (budget %u RU in a "
+		      "row + %u RU/s per character, %u characters this session; %u allow-listed, %u deny-listed sections)",
+		    g_spawn_refused[u32(SpawnVerdict::UnknownClass)], g_spawn_refused[u32(SpawnVerdict::MissingLine)],
+		    g_spawn_refused[u32(SpawnVerdict::Denied)], g_spawn_refused[u32(SpawnVerdict::QuestItem)],
+		    g_spawn_refused[u32(SpawnVerdict::OverBudget)], g_spawn_policy.cost_burst, g_spawn_policy.cost_per_sec,
+		    (u32)g_spawn_budgets.size(), (u32)g_spawn_allow.size(), (u32)g_spawn_deny.size());
 		return;
 	}
 	// sent[5] was ReqMoney (now coop_money, F2 T1)
