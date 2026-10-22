@@ -861,7 +861,16 @@ struct SectionFacts
 	bool in_dialog_to_own_actor = false; // Ruling F2-16
 	bool parent_ok = true; // review round 2, Important 1
 	bool queue_waiting = false; // Ruling F2-21
+	bool launch_child = false; // Ruling F2-22: a child its parent item takes (child_allowed): a shot
 };
+
+// What the budget does not charge (and the queue does not hold): an allow-listed section, and a child its parent item
+// takes (Ruling F2-22: a rocket in its launcher, a fake missile in its grenade or bolt - a shot, the charge already
+// left the client's inventory; waiting would refuse the shot; task 3's rate limits bound how often).
+inline bool budget_free(const SectionFacts& facts)
+{
+	return facts.allow_listed || facts.launch_child;
+}
 
 // coop_dialog kTalkReach: a client talks only to an NPC his character stands by on the host (host_try_lock).
 constexpr float kTalkReach = 6.f;
@@ -968,9 +977,10 @@ enum class SpawnVerdict : uint8_t
 //   4. deny-listed                            -> Denied
 //   5. allow-listed                           -> Allow, the budget untouched
 //   6. a quest item, unless a quest gift      -> QuestItem
-//   7. requests of the character wait in the queue, or the budget does not hold charge_of(cost)
+//   7. a child its parent item takes (launch_child, Ruling F2-22) -> Allow, the budget untouched, no queue
+//   8. requests of the character wait in the queue, or the budget does not hold charge_of(cost)
 //                                             -> OverBudget (nothing taken); else Allow and the charge is taken.
-// Only step 7 reads or changes `budget`; a quest gift goes on to it like any item.
+// Only step 8 reads or changes `budget` (budget_free: steps 5 and 7 do not); a quest gift goes on to it like any item.
 inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const SectionFacts& facts,
     CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms)
 {
@@ -986,6 +996,8 @@ inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const
 		return SpawnVerdict::Allow;
 	if (facts.quest_item && !facts.in_dialog_to_own_actor)
 		return SpawnVerdict::QuestItem;
+	if (facts.launch_child)
+		return SpawnVerdict::Allow;
 	if (facts.queue_waiting || !charge(budget, facts.cost, policy, now_ms))
 		return SpawnVerdict::OverBudget;
 	return SpawnVerdict::Allow;

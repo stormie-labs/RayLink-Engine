@@ -1106,6 +1106,8 @@ void host_on_spawn(PeerId from, Reader& r)
 	spawn::SectionFacts facts = spawn_facts(section);
 	// Review round 2, Important 1: into one of his items only what that item takes.
 	facts.parent_ok = s.parent == q.proxy || !rule || parent_takes(s.parent, *rule, section);
+	// Ruling F2-22: what an item of his takes is a shot (a rocket, a fake missile): no budget, no queue.
+	facts.launch_child = s.parent != q.proxy && rule != nullptr && facts.parent_ok;
 	// Ruling F2-16: a quest item into his own character while he holds a talk lock (the stock dialogs give it there)
 	// and stands within talk reach of that NPC (round 2 minor).
 	const u16 talk_npc = dialog::host_lock_of(from);
@@ -1138,7 +1140,7 @@ void host_on_spawn(PeerId from, Reader& r)
 	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
 	const Reason why = host_spawn(e, s.parent, created);
-	if (why != Reason::Ok && !facts.allow_listed)
+	if (why != Reason::Ok && !spawn::budget_free(facts))
 		spawn::refund(budget, facts.cost, g_spawn_policy); // Ruling F2-21 (3): the engine refused what was charged
 	reply(q, why, why == Reason::Ok ? created : s.parent);
 }
