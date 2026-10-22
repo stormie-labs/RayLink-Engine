@@ -11,6 +11,7 @@
 #include "coop_alife.h"
 #include "coop_trade.h"
 #include "coop_items.h"
+#include "coop_money.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_hits.h"
@@ -272,7 +273,6 @@ enum class Act : u8
 	Use,
 	Move,
 	Hit,
-	Money,
 	ItemEvent,
 	Died,
 };
@@ -284,8 +284,6 @@ struct Action
 	Fvector pos{};
 	u8 flags = 0;
 	bool open = false; // a reject a take of the same item can still complete (box -> actor)
-	u32 value = 0;
-	u32 deals = 0; // Money: trade answers already in `value` (coop_trade ledger, W3b)
 	u16 ge_type = 0;
 	SHit hit;
 	xr_vector<u8> bytes; // ItemEvent: event bytes; Spawn: item state (coop_items blob)
@@ -466,16 +464,6 @@ void send_action(const Action& a)
 		write_hit(w, hit, to_host_id(hit.whoID), to_host_id(hit.weaponID));
 		net::client_send(Msg::ReqHit, w);
 		++g_cl.sent[4];
-		break;
-	}
-	case Act::Money:
-	{
-		Writer w(12);
-		w.u32(++g_seq);
-		w.u32(a.value);
-		w.u32(a.deals);
-		net::client_send(Msg::ReqMoney, w);
-		++g_cl.sent[5];
 		break;
 	}
 	case Act::ItemEvent:
@@ -1093,28 +1081,6 @@ void host_on_hit(PeerId from, Reader& r)
 		reply(q, why, target);
 }
 
-void host_on_money(PeerId from, Reader& r)
-{
-	Req q;
-	if (!host_begin(from, r, Msg::ReqMoney, q))
-		return;
-	const u32 snapshot = r.u32();
-	const bool has_deals = r.remaining() >= 4;
-	const u32 deals = has_deals ? r.u32() : 0;
-	if (!r.ok())
-		return reply(q, Reason::Malformed, kNoId);
-	// No rate limit: an absolute snapshot (a repeat changes nothing) that the client coalesces in its
-	// outbox; dropping one would leave the proxy's money wrong until the next change.
-	// Trades the host accepted that the snapshot does not contain yet are added (coop_trade ledger).
-	const u32 money = has_deals ? trade::host_player_money(from, snapshot, deals) : snapshot;
-	if (CInventoryOwner* owner = smart_cast<CInventoryOwner*>(find_go(q.proxy)))
-		owner->set_money(money, true); // GE_MONEY: the proxy's server entity keeps it (P4)
-	else if (CSE_ALifeTraderAbstract* trader = smart_cast<CSE_ALifeTraderAbstract*>(events::find_entity(q.proxy)))
-		trader->m_dwMoney = money;
-	else
-		reply(q, Reason::Missing, q.proxy);
-}
-
 void host_on_item_event(PeerId from, Reader& r)
 {
 	Req q;
@@ -1346,8 +1312,7 @@ void install(Session& s)
 	s.on(Msg::ReqDrop, [](PeerId from, Reader& r) { host_on_move(from, r, Msg::ReqDrop); });
 	s.on(Msg::ReqTransfer, [](PeerId from, Reader& r) { host_on_move(from, r, Msg::ReqTransfer); });
 	s.on(Msg::ReqHit, &host_on_hit);
-	s.on(Msg::ReqMoney, &host_on_money);
-	s.on(Msg::ReqItemEvent, &host_on_item_event);
+	s.on(Msg::ReqItemEvent, &host_on_item_event); // ReqMoney: coop_money (F2 T1)
 	s.on(Msg::ReqLaunch, &host_on_launch); // W3a
 	s.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_result(from, r); });
 	s.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_player_hit(from, r); });
@@ -1409,10 +1374,11 @@ void print_status()
 		    g_bad[BadUpgrade]);
 		return;
 	}
-	::Msg("[coop]   requests out: spawn %llu, destroy %llu, use %llu, move %llu, hit %llu, money %llu, item event %llu; "
+	// sent[5] was ReqMoney (now coop_money, F2 T1)
+	::Msg("[coop]   requests out: spawn %llu, destroy %llu, use %llu, move %llu, hit %llu, item event %llu; "
 	      "%llu accepted, %llu refused, %llu unanswered, %u in flight; %llu while not live, %llu foreign moves, %llu "
 	      "duplicate child spawns; lua %llu forwarded / %llu refused; %llu hits received",
-	    g_cl.sent[0], g_cl.sent[1], g_cl.sent[2], g_cl.sent[3], g_cl.sent[4], g_cl.sent[5], g_cl.sent[6],
+	    g_cl.sent[0], g_cl.sent[1], g_cl.sent[2], g_cl.sent[3], g_cl.sent[4], g_cl.sent[6],
 	    g_cl.accepted, g_cl.rejected, g_cl.timeouts, (u32)g_inflight.size(), g_cl.not_live, g_cl.foreign_moves,
 	    g_cl.child_dups, g_cl.lua_forwarded, g_cl.lua_refused, g_cl.hits_in);
 	::Msg("[coop]   hit perks (%s): %llu hits through the before-hit Lua, %llu dropped by it, %llu lua errors",
@@ -1550,26 +1516,13 @@ void client_hit(u16 local_target, const SHit& hit)
 
 void client_money(u32 money)
 {
-	if (!mgr().is_live_client())
-		return;
-	const u32 deals = trade::client_deals_applied(); // read together with `money`: one consistent snapshot
-	xrCriticalSectionGuard guard(g_out_lock);
-	if (!g_outbox.empty() && g_outbox.back().kind == Act::Money)
-	{
-		g_outbox.back().value = money; // only the latest amount matters
-		g_outbox.back().deals = deals;
-		return;
-	}
-	Action a;
-	a.kind = Act::Money;
-	a.value = money;
-	a.deals = deals;
-	g_outbox.push_back(std::move(a));
+	money::client_on_actor_money(money); // F2 T1: a change with a cause, the host keeps the balance
 }
 
 void client_flush_outbox()
 {
 	frame(); // exactly what the end of this frame would send, in the same order
+	money::client_flush(); // F2 T1: and the money changes made before
 }
 
 void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)

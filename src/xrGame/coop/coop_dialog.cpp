@@ -6,6 +6,7 @@
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_sync.h"
+#include "coop_money.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -265,6 +266,7 @@ void client_release()
 {
 	if (g_cl.granted == kNoId)
 		return;
+	money::client_flush(); // F2 T1: the talk's money changes reach the host while it still sees the lock
 	Writer w(4);
 	w.u16(g_cl.granted);
 	net::client_send(Msg::DialogUnlock, w);
@@ -529,6 +531,18 @@ PeerId host_talk_holder(u16 npc) // W11
 		return kInvalidPeer;
 	auto it = g_locks.find(npc);
 	return it == g_locks.end() ? kInvalidPeer : it->second.holder;
+}
+
+u16 client_partner() { return mgr().is_client() ? g_cl.granted : kNoId; } // F2 T1
+
+u16 host_lock_of(PeerId peer) // F2 T1
+{
+	if (!mgr().is_host())
+		return kNoId;
+	for (const auto& it : g_locks)
+		if (it.second.holder == peer)
+			return it.first; // a player holds at most one lock (host_try_lock)
+	return kNoId;
 }
 
 void print_status()

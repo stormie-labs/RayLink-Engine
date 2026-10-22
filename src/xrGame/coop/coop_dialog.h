@@ -49,6 +49,13 @@ bool may_start_talk(CInventoryOwner* partner, bool disable_break);
 // still and turns it to a client that talks to it on his machine.
 PeerId host_talk_holder(u16 npc);
 
+// F2 T1, client: the NPC whose talk lock we hold (host numbering), 0xffff if none. Money changes made meanwhile go to
+// the host as dialog changes (coop_money); they are sent before the lock is released.
+u16 client_partner();
+// F2 T1, host: the NPC whose talk lock player `peer` holds (host numbering, kHostPeer: the host's own talk), 0xffff if
+// none or not the host.
+u16 host_lock_of(PeerId peer);
+
 // --- engine hooks (ui/UITalkWnd.cpp) ---
 // CUITalkWnd::Show(true), before InitTalkDialog. false: do not initialize; the talk state of both
 // sides is stopped here and the window hides itself on its next Update (talk_window_refused).

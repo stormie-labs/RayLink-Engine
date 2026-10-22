@@ -20,8 +20,7 @@
 //                 flags: 1 = already applied locally (thrown missile, launched rocket), 2 = trade, 4 = exact drop
 //                 position; the host checks the reach whatever the flags say (R3 В8)
 //   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit   (power etc. after the client's before-hit Lua, W5)
-//   ReqMoney      u32 seq, u32 money, u32 deals           (the client owns its money, R-6.7; deals = newest
-//                 trade answer already in `money`, the host adds the accepted trades after it: coop_trade.h)
+//   ReqMoney      a change of the actor's money with a cause, not an amount: coop_money.h (F2 T1, R4 7)
 //   ReqItemEvent  u32 seq, u16 item, u16 ge_type, u16 size, bytes after the GE header
 //   ReqLaunch     u32 seq, u16 launcher, u16 rocket, vec3 pos, vec3 dir, vec3 vel, vec3 angular_vel (W3a)
 //                 the client already launched its copy (a visual that never detonates there); the host
@@ -92,9 +91,10 @@ void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 // Updates the drop position of a queued move (GE_CHANGE_POS right after a drop). False if none.
 bool client_move_position(u16 local_item, const Fvector& pos);
 void client_hit(u16 local_target, const SHit& hit);
+// GE_MONEY of our actor (router): passed to money::client_on_actor_money (F2 T1, the host keeps the balance).
 void client_money(u32 money);
-// Main thread: sends the queue now (as frame() does). Before a trade deal, so the host gets the
-// money snapshots and item moves made before it first (W3b).
+// Main thread: sends the queue now (as frame() does) and the queued money changes. Before a trade deal,
+// so the host gets the item moves and money changes made before it first (W3b, F2 T1).
 void client_flush_outbox();
 void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size);
 void client_player_died(u16 local_killer);

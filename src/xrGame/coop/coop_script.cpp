@@ -12,6 +12,7 @@
 #include "coop_players.h" // players::avatar_safemode (coop_equip.cpp)
 #include "coop_dialog.h" // W11: dialog::host_talk_holder
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
+#include "coop_money.h" // F2 T1: money::register_lua
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -1405,6 +1406,7 @@ void register_raw(lua_State* L)
 		lua_setfield(L, -2, f->name);
 	}
 	lua_pop(L, 1);
+	money::register_lua(L); // F2 T1: coop.money_give / money_grant / money_set / money_of / talk_lock_of
 }
 } // namespace
 

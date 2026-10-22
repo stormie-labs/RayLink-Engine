@@ -94,6 +94,8 @@ const char* msg_name(Msg type)
 	case Msg::DialogSelect: return "DialogSelect";
 	case Msg::TradeOp: return "TradeOp";
 
+	case Msg::MoneyBalance: return "MoneyBalance";
+
 	case Msg::ScriptEvent: return "ScriptEvent";
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
@@ -115,10 +117,12 @@ MsgSender msg_sender(Msg type)
 	case Msg::JoinComplete:
 	case Msg::SessionReset:
 	case Msg::LevelChange:
-	case Msg::AvatarList: return MsgSender::HostOnly;
+	case Msg::AvatarList:
+	case Msg::MoneyBalance: return MsgSender::HostOnly; // F2 T1: only the host holds balances
 	case Msg::JoinRequest:
 	case Msg::WorldLoaded:
-	case Msg::TransitionVote: return MsgSender::ClientOnly;
+	case Msg::TransitionVote:
+	case Msg::ReqMoney: return MsgSender::ClientOnly; // F2 T1: the host changes its own money directly
 	default: return MsgSender::Either;
 	}
 }

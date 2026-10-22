@@ -19,7 +19,10 @@ namespace coop
 // 5: world epoch: Welcome and BlobBegin carry it, core WorldEpoch (client -> host), SessionReset carries the new one;
 //    TransitionVote carries a level changer id instead of a raw M_CHANGE_LEVEL packet (review R1 I3-I4, R2 I1, I3, I4)
 // 6: AvatarList (host -> clients): the owner of every player character (review R3 В3)
-constexpr uint32_t kProtocolVersion = 6;
+// 7 (F2 T1): player money lives on the host (review R4 7). ReqMoney carries a
+//    change with a cause (coop_ledger.h MoneyReq) instead of an absolute amount and goes client -> host only;
+//    MoneyBalance 0x0190 (host -> the player it belongs to); TradeOp Deal lost `applied` and `client_money`
+constexpr uint32_t kProtocolVersion = 7;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -104,7 +107,7 @@ enum class Msg : uint16_t
 	ReqUse = 0x0145, // eat / use: host destroys, owner applies effect
 	ReqHit = 0x0146, // hit claim on an NPC / object
 	ReqResult = 0x0147, // host -> client: accepted/rejected with request seq
-	ReqMoney = 0x0148,
+	ReqMoney = 0x0148, // client -> host: u32 seq, i32 delta, u8 cause, u32 ref (coop_ledger.h MoneyReq; F2 T1)
 	ReqContainer = 0x0149, // open/close container (shared view)
 	ReqItemEvent = 0x014A, // GE_* event on an owned item the host must repeat (upgrade install)
 	ReqLaunch = 0x014B, // rocket / launcher grenade fired: launcher, rocket, launch transform and velocity (W3a)
@@ -134,6 +137,9 @@ enum class Msg : uint16_t
 	DialogSelect = 0x0184, // client -> host: chosen phrase
 	TradeOp = 0x0185,
 
+	// F2 mod layer (0x0190-0x019F)
+	MoneyBalance = 0x0190, // host -> the player it belongs to: u32 balance, u32 acked seq (coop_ledger.h; F2 T1)
+
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
 	StateDumpRequest = 0x01B0,
@@ -152,8 +158,8 @@ inline const char* msg_name(uint16_t type) { return msg_name(static_cast<Msg>(ty
 enum class MsgSender : uint8_t
 {
 	Either,
-	HostOnly, // host -> clients: WorldBlob, JoinComplete, SessionReset, LevelChange, AvatarList
-	ClientOnly, // client -> host: JoinRequest, WorldLoaded, TransitionVote
+	HostOnly, // host -> clients: WorldBlob, JoinComplete, SessionReset, LevelChange, AvatarList, MoneyBalance
+	ClientOnly, // client -> host: JoinRequest, WorldLoaded, TransitionVote, ReqMoney
 };
 MsgSender msg_sender(Msg type);
 

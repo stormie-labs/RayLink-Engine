@@ -10,6 +10,7 @@
 #include "coop_sync.h"
 #include "coop_requests.h"
 #include "coop_script.h"
+#include "coop_money.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -48,7 +49,6 @@ constexpr u64 kMoveCheckMs = 2500; // container move not applied after this -> r
 constexpr u64 kRefreshMinMs = 150; // at most one list rebuild per this period (take-all bursts)
 constexpr u64 kSettleMs = 1500; // after a successful deal, one consistency rebuild
 constexpr u64 kPendingWarnMs = 15000; // client: a deal without answer is logged
-constexpr u32 kMaxOpenDeals = 64; // host: accepted deals a client has not confirmed yet
 constexpr s64 kMaxMoney = 0xffffffffll;
 constexpr u8 kDealDonate = 1;
 // R4 2: player character <-> trader on the host. The stock trade window closes beyond 3 m
@@ -66,7 +66,7 @@ enum class Op : u8
 enum TradeResult : u8
 {
 	Ok = 0,
-	NotReady = 1, // the player is still joining, or has too many deals unconfirmed
+	NotReady = 1, // the player is still joining
 	NoPlayer = 2, // the player's proxy is not online on the host
 	NoTrader = 3, // trader missing, dead, not a trader or not trading now
 	ItemGone = 4, // an item is no longer where the client saw it
@@ -194,20 +194,14 @@ struct LastResult
 	s32 delta = 0;
 	u32 trader_money = 0;
 };
-struct LedgerEntry
-{
-	u32 seq; // the deal
-	s64 delta; // its change of the player's money (sold - bought)
-};
 struct PeerTrade
 {
 	LastResult last; // last answered deal (repeats, P6)
-	xr_vector<LedgerEntry> open; // accepted deals the client has not applied yet, oldest first
 };
 xr_map<PeerId, PeerTrade> g_peers; // host, per player
-u32 g_host_world = 0; // join::world_generation() the ledgers belong to
+u32 g_host_world = 0; // join::world_generation() the answers belong to
 
-// A new world (load, level change) comes with the money of its save: the old ledgers are void.
+// A new world (load, level change): the answers of the old one are void.
 void host_sync_world()
 {
 	const u32 gen = join::world_generation();
@@ -217,29 +211,11 @@ void host_sync_world()
 	g_peers.clear();
 }
 
-// Forgets the deals a snapshot with `applied` already contains (it was taken after their answers).
-void ledger_prune(PeerTrade& p, u32 applied)
-{
-	p.open.erase(std::remove_if(p.open.begin(), p.open.end(),
-	                 [applied](const LedgerEntry& e) { return s32(e.seq - applied) <= 0; }),
-	    p.open.end());
-}
-
-s64 ledger_sum(const PeerTrade& p)
-{
-	s64 sum = 0;
-	for (const LedgerEntry& e : p.open)
-		sum += e.delta;
-	return sum;
-}
-
 struct Deal
 {
 	u32 seq = 0;
-	u32 applied = 0; // the client's newest applied answer when it read `client_money`
 	u16 trader = kNoId;
 	bool donate = false;
-	u32 client_money = 0;
 	xr_vector<u16> sell; // player -> trader
 	xr_vector<u16> buy; // trader -> player
 	// Priced by the host (R4 2), not sent by the client.
@@ -275,9 +251,6 @@ struct PendingDeal
 };
 xr_map<u32, PendingDeal> g_pending; // client: seq -> deal
 u32 g_seq = 0;
-// Newest deal whose answer is in the actor's money (read by ReqMoney from any thread; written on
-// the main thread by the network pump, which never runs together with the game thread).
-u32 g_applied = 0;
 u32 g_client_world = 0; // join::world_generation() of the pending deals
 
 // Client: Lua actor_on_trade for an accepted deal, fired when the item has arrived locally
@@ -292,7 +265,7 @@ struct TradeCallback
 };
 xr_vector<TradeCallback> g_callbacks;
 constexpr u64 kCallbackWaitMs = 3000;
-u64 g_cl_deals = 0, g_cl_ok = 0, g_cl_rejected = 0, g_cl_overdrawn = 0;
+u64 g_cl_deals = 0, g_cl_ok = 0, g_cl_rejected = 0;
 
 // The host's save of a new world holds the outcome of every deal sent so far: nothing is pending.
 void client_sync_world()
@@ -303,7 +276,6 @@ void client_sync_world()
 	g_client_world = gen;
 	g_pending.clear();
 	g_callbacks.clear();
-	g_applied = g_seq;
 }
 
 // ---------------------------------------------------------------- open window state (both roles)
@@ -431,18 +403,15 @@ u8 price_list(CTrade& pricing, CInventoryOwner* trader, const xr_vector<u16>& li
 	return Ok;
 }
 
-// One deal, everything or nothing. `p` is the player's ledger, already pruned with d.applied.
-// Money: the trader's is the host's; the player's stays his own (the client applies `delta`), the
-// proxy keeps the copy that goes into the host save. Both sides are checked after the whole deal,
-// so what the player sells pays for what he buys and the other way round. The host prices the
-// deal (d.sell_total, d.buy_total); the client sends item ids only (R4 2).
-u8 host_apply(PeerId from, Deal& d, const PeerTrade& p, s64& delta)
+// One deal, everything or nothing. Money: the trader's and the player's both live on the host (the
+// player's is his balance, coop_money; F2 T1). Both sides are checked after the whole deal, so what
+// the player sells pays for what he buys and the other way round. The host prices the deal
+// (d.sell_total, d.buy_total); the client sends item ids only (R4 2).
+u8 host_apply(PeerId from, Deal& d, s64& delta)
 {
 	delta = 0;
 	if (sync::host_peer_joining(from) || Device.dwPrecacheFrame) // precaching: a deal from the old world
 		return NotReady;
-	if (p.open.size() >= kMaxOpenDeals)
-		return NotReady; // the client does not confirm its answers: its money cannot be checked
 	const u16 proxy_id = join::proxy_of_peer(from);
 	CInventoryOwner* proxy = find_owner(proxy_id);
 	if (!proxy)
@@ -499,15 +468,16 @@ u8 host_apply(PeerId from, Deal& d, const PeerTrade& p, s64& delta)
 			return c;
 	}
 
-	// The player's money now: his snapshot plus the accepted deals it does not contain yet.
+	// F2 T1: the player's money is his balance on the host, never a figure from the client.
 	const s64 net = s64(d.sell_total) - s64(d.buy_total); // to the player
-	const s64 player_after = s64(d.client_money) + ledger_sum(p) + net;
+	const s64 player_after = s64(money::host_balance(from)) + net;
 	const s64 trader_after = s64(trader->get_money()) - net;
 	if (player_after < 0)
 		return NoMoney;
 	if (trader_after < 0 && !trader->InfinitiveMoney())
 		return TraderNoMoney;
-	if (player_after > kMaxMoney || trader_after > kMaxMoney || net > INT_MAX || net < -INT_MAX)
+	if ((net > 0 && player_after > s64(money::max_money())) || trader_after > kMaxMoney || net > INT_MAX ||
+	    net < -INT_MAX)
 		return Malformed;
 
 	// The trader's own reaction (scripted trader animations / phrases), as OnPerformTrade(get, put).
@@ -531,9 +501,11 @@ u8 host_apply(PeerId from, Deal& d, const PeerTrade& p, s64& delta)
 	}
 	g_host_items += n;
 
-	if (net != 0) // an infinite-money trader keeps max(old, new), exactly as in single player
-		trader->set_money(clamp_money(trader_after), true);
-	proxy->set_money(u32(player_after), true);
+	if (net != 0)
+	{
+		trader->set_money(clamp_money(trader_after), true); // an infinite-money trader keeps max(old, new), as in SP
+		money::host_adjust(from, net, "trade"); // F2 T1: MoneyBalance reaches the player before the Result
+	}
 	delta = net;
 	return Ok;
 }
@@ -553,10 +525,8 @@ void host_on_deal(PeerId from, Reader& r)
 {
 	Deal d;
 	d.seq = r.u32();
-	d.applied = r.u32();
 	d.trader = r.u16();
 	const u8 flags = r.u8();
-	d.client_money = r.u32();
 	if (!r.ok())
 		return; // no seq to answer
 	d.donate = (flags & kDealDonate) != 0;
@@ -572,14 +542,10 @@ void host_on_deal(PeerId from, Reader& r)
 	}
 	if (last.have && s32(d.seq - last.seq) < 0)
 		return; // older than the last answered deal
-	if (parsed)
-		ledger_prune(p, d.applied); // the snapshot in this deal contains those answers
 
 	++g_host_deals;
 	s64 delta = 0;
-	const u8 code = parsed ? host_apply(from, d, p, delta) : u8(Malformed);
-	if (code == Ok && delta != 0)
-		p.open.push_back({d.seq, delta});
+	const u8 code = parsed ? host_apply(from, d, delta) : u8(Malformed);
 	CInventoryOwner* trader = find_owner(d.trader);
 
 	last.have = true;
@@ -660,25 +626,22 @@ void write_list(Writer& w, const xr_vector<DealItem>& list)
 void client_send_deal(u16 trader_local, PendingDeal& deal)
 {
 	client_sync_world();
-	// Money snapshots (ReqMoney) and item moves made before the deal go out first: on the one
-	// reliable lane the host then sees the client's money changes in the order they happened.
+	// Item moves and money changes (ReqMoney, F2 T1) made before the deal go out first: on the one
+	// reliable lane the host checks the deal against them.
 	requests::client_flush_outbox();
 	// Our own prices stay here (the money pre-checks of the trade buttons); the host prices the deal (R4 2).
 	deal.sell_total = list_total(deal.sell);
 	deal.buy_total = list_total(deal.buy);
-	CActor* a = Actor();
 	const u32 seq = ++g_seq;
 	deal.trader = join::to_host(trader_local);
 	deal.sent_at = now_ms();
 
-	// No reservation here: the host adds the accepted deals this snapshot does not contain yet.
-	Writer w(40 + (deal.sell.size() + deal.buy.size()) * 2);
+	// F2 T1: no money of ours in the deal; the host checks it against our balance there.
+	Writer w(32 + (deal.sell.size() + deal.buy.size()) * 2);
 	w.u8(u8(Op::Deal));
 	w.u32(seq);
-	w.u32(g_applied);
 	w.u16(deal.trader);
 	w.u8(deal.donate ? kDealDonate : 0);
-	w.u32(a ? a->get_money() : 0);
 	write_list(w, deal.sell);
 	write_list(w, deal.buy);
 	net::client_send(Msg::TradeOp, w);
@@ -701,10 +664,6 @@ void client_on_result(Reader& r)
 		return; // repeat or unknown: applied already
 	const PendingDeal deal = std::move(it->second);
 	g_pending.erase(it);
-	// Before the money below: the snapshot its GE_MONEY sends (ReqMoney) contains this deal, so the
-	// host must not add it again. Answers arrive in order (one reliable lane), rejected ones move nothing.
-	if (s32(seq - g_applied) > 0)
-		g_applied = seq;
 
 	if (CInventoryOwner* trader = find_owner(join::to_local(trader_host)))
 		trader->set_money(trader_money, false);
@@ -720,17 +679,7 @@ void client_on_result(Reader& r)
 			::Msg("[coop] trade #%u: the host priced it %d RU, this window showed %lld RU", seq, delta, shown);
 		if (a)
 		{
-			const s64 money = s64(a->get_money()) + delta;
-			if (money < 0)
-			{
-				// Spent elsewhere (script, service) while the deal was on the way: the player pays only
-				// what is left (the one case in which a deal creates money; the trader got it in full).
-				// The proxy follows with the next snapshot.
-				++g_cl_overdrawn;
-				::Msg("! [coop] trade #%u: %lld RU short, the money was spent while the deal was on the way", seq,
-				    -money);
-			}
-			a->set_money(clamp_money(money), true); // GE_MONEY -> ReqMoney (money, applied = seq)
+			// F2 T1: the money came before this answer (MoneyBalance from the host's balance), nothing to set.
 			// Lua sees the trade of the local actor as in single player (actor_on_trade), see frame(),
 			// with the item prices this window showed.
 			const u64 deadline = now_ms() + kCallbackWaitMs;
@@ -876,7 +825,6 @@ void reset()
 	g_open.clear();
 	g_pending.clear();
 	g_callbacks.clear();
-	g_applied = g_seq; // a new session starts from the money in the host's save
 	g_view.labels = false;
 	g_view.rebuild_at = 0;
 	g_view.moves.clear();
@@ -884,7 +832,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
-	g_peers.erase(id); // the proxy keeps the money with every accepted deal (P4)
+	g_peers.erase(id); // his money stays on his character (P4, coop_money)
 	g_open.erase(id);
 }
 
@@ -969,20 +917,6 @@ int client_trader_money_in_flight(CInventoryOwner* trader)
 }
 
 bool lua_trade_window_allowed() { return !mgr().is_client(); }
-
-u32 client_deals_applied() { return g_applied; }
-
-u32 host_player_money(PeerId peer, u32 money, u32 applied)
-{
-	if (!mgr().is_host())
-		return money;
-	host_sync_world();
-	auto it = g_peers.find(peer);
-	if (it == g_peers.end())
-		return money;
-	ledger_prune(it->second, applied);
-	return clamp_money(s64(money) + ledger_sum(it->second));
-}
 
 void on_local_trade_done(CTrade* trade)
 {
@@ -1128,10 +1062,6 @@ void print_status()
 	{
 		::Msg("[coop]   trade: %llu deals (%llu ok, %llu rejected), %llu items moved", g_host_deals, g_host_ok,
 		    g_host_rejected, g_host_items);
-		for (const auto& it : g_peers)
-			if (!it.second.open.empty())
-				::Msg("[coop]     #%u: %u accepted deal(s) not confirmed yet, %lld RU", it.first,
-				    (u32)it.second.open.size(), ledger_sum(it.second));
 		for (const auto& it : g_open)
 		{
 			u32 sharing = 0;
@@ -1143,10 +1073,8 @@ void print_status()
 		}
 	}
 	else if (mgr().is_client())
-		::Msg("[coop]   trade: %llu deals sent (%llu ok, %llu rejected), %u waiting (%d RU), answers applied up to "
-		      "#%u, %llu overdrawn",
-		    g_cl_deals, g_cl_ok, g_cl_rejected, (u32)g_pending.size(), client_money_in_flight(), g_applied,
-		    g_cl_overdrawn);
+		::Msg("[coop]   trade: %llu deals sent (%llu ok, %llu rejected), %u waiting (%d RU)", g_cl_deals, g_cl_ok,
+		    g_cl_rejected, (u32)g_pending.size(), client_money_in_flight());
 	::Msg("[coop]   container view: %s %u, %llu rebuilds, %llu moves not applied", container_name(g_view.kind),
 	    g_view.id, g_rebuilds, g_moves_failed);
 }

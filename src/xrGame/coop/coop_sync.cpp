@@ -18,6 +18,7 @@
 #include "coop_items.h"
 #include "coop_objects.h"
 #include "coop_remote.h"
+#include "coop_money.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -49,6 +50,7 @@ void install(Session& s)
 	requests::install(s);
 	dialog::install(s);
 	trade::install(s);
+	money::install(s); // F2 T1
 	survival::install(s);
 	presence::install(s);
 	items::install(s);
@@ -66,6 +68,7 @@ void on_session_started()
 	requests::reset();
 	dialog::reset();
 	trade::reset();
+	money::reset(); // F2 T1
 	survival::reset();
 	presence::reset();
 	items::reset();
@@ -81,6 +84,7 @@ void on_peer_left(PeerId id)
 	entities::on_peer_left(id);
 	dialog::on_peer_left(id);
 	trade::on_peer_left(id);
+	money::on_peer_left(id); // F2 T1
 	net::host_drop(id);
 	g_joining.erase(id);
 }
@@ -98,6 +102,7 @@ void reset()
 	requests::reset();
 	dialog::reset();
 	trade::reset();
+	money::reset(); // F2 T1
 	survival::reset();
 	presence::reset();
 	items::reset();
@@ -124,6 +129,7 @@ void on_client_live()
 {
 	players::reset();
 	entities::on_client_live();
+	money::on_client_live(); // F2 T1: the actor's money is the host's balance
 }
 
 void frame()
@@ -138,6 +144,7 @@ void frame()
 	requests::frame();
 	dialog::frame();
 	trade::frame();
+	money::frame(); // F2 T1
 	worldstate::frame();
 	script::frame();
 	story::frame();
@@ -156,6 +163,7 @@ void print_status()
 	requests::print_status();
 	dialog::print_status();
 	trade::print_status();
+	money::print_status(); // F2 T1
 	survival::print_status();
 	presence::print_status();
 	items::print_status();
