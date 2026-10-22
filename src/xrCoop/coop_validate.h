@@ -31,6 +31,25 @@ inline bool speed_ok(const float v[3], float max_speed)
 	return std::sqrt(x * x + y * y + z * z) <= double(max_speed);
 }
 
+// The same for any vector with x, y, z members (Fvector in the engine).
+template <class V>
+inline bool vec_finite(const V& v)
+{
+	const float a[3] = {v.x, v.y, v.z};
+	return finite3(a);
+}
+
+template <class V>
+inline bool vec_speed_ok(const V& v, float max_speed)
+{
+	const float a[3] = {v.x, v.y, v.z};
+	return speed_ok(a, max_speed);
+}
+
+// Longest direction vector accepted from a peer: a unit vector with slack for float noise. A huge finite one
+// normalizes to zero and the throw / launch matrix built from it to NaN.
+constexpr float kMaxDirLength = 2.f;
+
 // p is inside [lo, hi] grown by margin on every side, borders included: same float math as Fbox::grow + contains.
 // A non-finite point, box or margin fails.
 inline bool in_box(const float p[3], const float lo[3], const float hi[3], float margin)

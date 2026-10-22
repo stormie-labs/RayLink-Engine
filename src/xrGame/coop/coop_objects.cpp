@@ -73,7 +73,6 @@ constexpr u32 kConsumeAfterMs = 3000;
 constexpr u32 kPacketBudget = 1100;
 constexpr u16 kMaxElements = 64;
 constexpr float kMaxThrowSpeed = 45.f;
-constexpr float kMaxThrowDir = 2.f; // a throw direction is a unit vector (slack for float noise)
 constexpr float kMaxReach = 4.5f; // request validation: player character to object
 
 enum class StateKind : u8
@@ -460,7 +459,10 @@ struct Consume
 {
 	u16 proxy = kNoId;
 	u64 deadline = 0;
-	const CSE_Abstract* entity = nullptr; // R3 В7: the thrown item itself (its id may be reused once it is gone)
+	// R3 В7: the thrown item itself. Its id may be reused once it is gone, and a freed entity's memory too (ABA):
+	// both the pointer and the section must still match.
+	const CSE_Abstract* entity = nullptr;
+	shared_str section;
 };
 xr_map<u16, Consume> g_consume; // thrown hand item -> host removes it if the owner did not
 xr_map<PeerId, u64> g_last_throw;
@@ -1414,10 +1416,8 @@ void host_on_throw(PeerId from, Reader& r)
 	t.flags = r.u8();
 	// Malformed: nothing from the wire reaches the physics world unchecked (R3: through coop::validate). The
 	// direction is a unit vector: a huge one normalizes to zero and the throw matrix to NaN.
-	const float d3[3] = {t.dir.x, t.dir.y, t.dir.z};
-	const float p3[3] = {t.pos.x, t.pos.y, t.pos.z};
-	const float v3[3] = {t.vel.x, t.vel.y, t.vel.z};
-	if (!r.ok() || !validate::finite3(p3) || !validate::speed_ok(d3, kMaxThrowDir) || !validate::finite3(v3))
+	if (!r.ok() || !validate::vec_finite(t.pos) || !validate::vec_speed_ok(t.dir, validate::kMaxDirLength) ||
+	    !validate::vec_finite(t.vel))
 	{
 		if (r.ok() && ++g_c.throws_malformed <= 10)
 			::Msg("! [coop] throw of item %u by #%u refused: a vector is not a number", hand, from);
@@ -1456,7 +1456,7 @@ void host_on_throw(PeerId from, Reader& r)
 		return refuse("rate");
 	if (!in_reach(who, t.pos, 4.f))
 		t.pos.set(who->Position()).y += 1.5f;
-	if (!validate::speed_ok(v3, kMaxThrowSpeed))
+	if (!validate::vec_speed_ok(t.vel, kMaxThrowSpeed))
 		t.vel.normalize_safe().mul(kMaxThrowSpeed);
 	if (t.dir.magnitude() < EPS_L)
 		t.dir.set(0.f, 0.f, 1.f);
@@ -1482,6 +1482,7 @@ void host_on_throw(PeerId from, Reader& r)
 		c.proxy = proxy;
 		c.deadline = now + kConsumeAfterMs;
 		c.entity = he;
+		c.section = he->s_name;
 	}
 	++g_c.throws_ok;
 }
@@ -1592,7 +1593,7 @@ void host_apply_throws()
 		}
 		// R3 В7: wherever the thrown item went meanwhile (dropped, stashed, handed over), it was thrown.
 		CSE_Abstract* e = events::find_entity(it->first);
-		if (e && e == it->second.entity)
+		if (e && e == it->second.entity && e->s_name == it->second.section)
 		{
 			host_destroy_entity(e); // the owner never removed the thrown item itself
 			++g_c.consumed;

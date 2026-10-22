@@ -9,8 +9,9 @@
 // Wire layouts (client -> host, ids in host numbering, every request starts with u32 seq):
 //   ReqSpawn      u32 seq, u8 0xC6, u16 parent, vec3 pos, str section, varu n, n bytes item state (coop_items blob)
 //                 legacy (no seq): str section, u16 parent, vec3 pos  (entities::intercept_local_spawn)
-//                 The host builds the entity from its own section (it must have `class`) and applies the item state
-//                 with the ItemState checks; raw M_SPAWN bytes (old marker 0xC5) are refused (R3 В6).
+//                 The host builds the entity from its own section (it must have `class` and the lines its entity's
+//                 constructor reads unchecked) and applies the item state with the ItemState checks; raw M_SPAWN
+//                 bytes (old marker 0xC5) are refused (R3 В6). Parser and class lines: xrCoop/coop_spawn.h.
 //   ReqDestroy    u32 seq, u16 item
 //   ReqUse        u32 seq, u16 item                       (eatables; effect already applied)
 //   ReqTake       u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags

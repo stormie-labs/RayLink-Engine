@@ -33,6 +33,9 @@ namespace inventory
 			void fill_root(Root* root);
 
 			UpgradeStateResult can_install(CInventoryItem& item, UpgradeBase& test_upgrade, bool loading);
+			// Anomaly Coop (R3 В6): the groups can_install needs an installed upgrade in — the own groups of the
+			// non-root parent upgrades — to check an upgrade list from the network without an item.
+			void required_groups(xr_vector<shared_str>& out) const;
 
 			void highlight_up();
 			void highlight_down();

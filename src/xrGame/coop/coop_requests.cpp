@@ -11,6 +11,7 @@
 #include "coop_alife.h"
 #include "coop_trade.h"
 #include "coop_items.h"
+#include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
 
 #include "Level.h"
@@ -52,12 +53,6 @@ namespace
 {
 constexpr u16 kNoId = 0xffff;
 constexpr u16 kActor = 0; // the local actor on every machine; on the host also the host player
-// ReqSpawn markers after seq (the legacy layout starts with a short string). 0xC5 carried raw M_SPAWN bytes and is
-// refused since R3 В6; 0xC6 carries the section and the item state (coop_items blob).
-constexpr u8 kSpawnRaw = 0xC5;
-constexpr u8 kSpawnState = 0xC6;
-constexpr size_t kMaxSpawnState = 4096; // coop_items blob limit
-constexpr size_t kMaxSection = 255; // string256
 constexpr u8 kMoveLocal = 1; // already applied on the client (thrown missile, launched rocket)
 constexpr u8 kMoveTrade = 2;
 constexpr u8 kMovePos = 4; // the drop goes to `pos` exactly (drop at a chosen place, script teleport)
@@ -67,6 +62,7 @@ constexpr float kMeleeRange = 100.f; // strike/wound hits (knife, thrown physics
 constexpr float kExplosionRange = 150.f;
 constexpr float kFireRange = 1500.f;
 constexpr float kMaxHitPower = 100.f;
+constexpr float kMaxArmorPiercing = 100.f; // stock ammo k_ap: 0.02 .. 5
 constexpr float kMaxImpulse = 10000.f;
 constexpr u32 kResultTimeoutMs = 10000;
 constexpr u32 kChildSpawnHoldMs = 3000;
@@ -89,18 +85,24 @@ constexpr u64 kBadLogFirst = 10;
 u64 g_bad[BadCount] = {};
 bool note_bad(Bad kind) { return ++g_bad[kind] <= kBadLogFirst; }
 
-bool finite_vec(const Fvector& v)
-{
-	const float a[3] = {v.x, v.y, v.z};
-	return validate::finite3(a);
-}
-
 // R3 В6: a section from a peer (or a script) is a printable name the host knows and that names an entity class:
 // F_entity_Create is FATAL for a section without `class`.
 bool spawnable_section(const char* section)
 {
-	return validate::resource_name_ok(section, kMaxSection) && pSettings->section_exist(section) &&
+	return validate::resource_name_ok(section, spawn::kMaxSection) && pSettings->section_exist(section) &&
 	    pSettings->line_exist(section, "class");
+}
+
+// R3 В6 (review): the lines the entity's constructor reads unchecked are there (inv_weight and cost of every
+// inventory item, which also keeps non-items out, plus those of weapons, ammo, detectors, outfits). Returns the
+// first missing line, nullptr if none. `section` passed spawnable_section.
+const char* missing_item_line(const char* section)
+{
+	const spawn::ItemKind kind = spawn::item_kind(pSettings->r_string(section, "class"));
+	for (const char* line : spawn::required_lines(kind))
+		if (!pSettings->line_exist(section, line))
+			return line;
+	return nullptr;
 }
 
 u16 to_host_id(u16 id) { return id == kNoId ? kNoId : join::to_host(id); }
@@ -190,7 +192,8 @@ bool hit_sane(const SHit& h)
 {
 	return h.hit_type >= ALife::eHitTypeBurn && h.hit_type < ALife::eHitTypeMax && validate::finite(h.power) &&
 	    h.power >= 0.f && h.power <= kMaxHitPower && validate::finite(h.impulse) && _abs(h.impulse) <= kMaxImpulse &&
-	    finite_vec(h.dir) && finite_vec(h.p_in_bone_space) && validate::finite(h.armor_piercing);
+	    validate::vec_finite(h.dir) && validate::vec_finite(h.p_in_bone_space) &&
+	    validate::finite(h.armor_piercing) && h.armor_piercing >= 0.f && h.armor_piercing <= kMaxArmorPiercing;
 }
 
 float hit_range(ALife::EHitType type)
@@ -382,15 +385,9 @@ void send_action(const Action& a)
 	{
 		const u32 seq = track(Msg::ReqSpawn, a.item);
 		Writer w(a.bytes.size() + a.section.size() + 32);
-		w.u32(seq);
-		w.u8(kSpawnState); // R3 В6: section + item state, the host builds the entity itself
-		w.u16(to_host_id(a.item));
 		const float p[3] = {a.pos.x, a.pos.y, a.pos.z};
-		w.vec3(p);
-		w.str(a.section.c_str());
-		w.varu(a.bytes.size());
-		if (!a.bytes.empty())
-			w.bytes(a.bytes.data(), a.bytes.size());
+		// R3 В6: section + item state, the host builds the entity itself
+		spawn::write_state(w, seq, to_host_id(a.item), p, a.section.c_str(), a.bytes.data(), a.bytes.size());
 		net::client_send(Msg::ReqSpawn, w);
 		++g_cl.sent[0];
 		break;
@@ -690,10 +687,24 @@ bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 	return true;
 }
 
+// Who would hold a client's new item: checked before anything is constructed (R3 В6 review).
+Reason host_spawn_holder(const Req& q, u16 parent)
+{
+	if (parent == kNoId)
+		return Reason::NotAllowed; // world spawns are the host's
+	if (events::root_of(parent) != q.proxy)
+		return Reason::NotOwner;
+	if (!events::find_entity(parent))
+		return Reason::Missing;
+	if (!Level().Server->ID_to_entity(parent))
+		return Reason::Offline; // Process_spawn needs an online holder
+	return Reason::Ok;
+}
+
 // Creates `e` (consumed) as a child of `parent` exactly like alife():create with an online parent:
 // the server's Process_spawn with a host id; ALife registration announces it (EntitySpawn), a
-// non-ALife child (fake missile, rocket) is announced with EntityLocal.
-Reason host_spawn(const Req& q, CSE_Abstract* e, u16 parent, u16& created)
+// non-ALife child (fake missile, rocket) is announced with EntityLocal. The holder passed host_spawn_holder.
+Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created)
 {
 	created = kNoId;
 	const auto fail = [&](Reason why)
@@ -701,20 +712,12 @@ Reason host_spawn(const Req& q, CSE_Abstract* e, u16 parent, u16& created)
 		F_entity_Destroy(e);
 		return why;
 	};
-	if (!allow(q.from, CatSpawn))
-		return fail(Reason::RateLimited);
 	if (smart_cast<CSE_ALifeCreatureAbstract*>(e) ||
 	    (!smart_cast<CSE_ALifeInventoryItem*>(e) && !smart_cast<CSE_Temporary*>(e)))
 		return fail(Reason::NotAllowed); // clients create items for themselves, nothing else
-	if (parent == kNoId)
-		return fail(Reason::NotAllowed); // world spawns are the host's
-	if (events::root_of(parent) != q.proxy)
-		return fail(Reason::NotOwner);
 	CSE_Abstract* holder = events::find_entity(parent);
 	if (!holder)
 		return fail(Reason::Missing);
-	if (!Level().Server->ID_to_entity(parent))
-		return fail(Reason::Offline); // Process_spawn needs an online holder
 
 	// what a client may not choose
 	e->ID = kNoId;
@@ -758,82 +761,71 @@ Reason host_spawn(const Req& q, CSE_Abstract* e, u16 parent, u16& created)
 
 void host_on_spawn(PeerId from, Reader& r)
 {
-	// Layouts: u32 seq, u8 kSpawnState, u16 parent, vec3 pos, str section, varu n, n bytes item state;
-	// legacy (entities::intercept_local_spawn): str section, u16 parent, vec3 pos, no seq.
-	// A string starts with its length (< 0x80 for any section), so byte 4 is a letter, never a marker.
-	const u8 marker = r.remaining() >= 5 ? r.cursor()[4] : 0;
-	const bool has_seq = marker == kSpawnState || marker == kSpawnRaw;
+	// Layouts and markers: xrCoop/coop_spawn.h.
+	const spawn::Layout layout = spawn::detect(r.cursor(), r.remaining());
 	Req q;
-	if (!host_begin(from, r, Msg::ReqSpawn, q, has_seq))
+	if (!host_begin(from, r, Msg::ReqSpawn, q, spawn::has_seq(layout)))
 		return;
-	if (marker == kSpawnRaw)
+	// R3 В6 (review): every spawn request costs a token first, whatever is wrong with it
+	if (!allow(from, CatSpawn))
+		return reply(q, Reason::RateLimited, kNoId);
+	if (layout == spawn::Layout::Raw)
 	{
 		// R3 В6: raw M_SPAWN bytes (an older client) are never read: Spawn_Read trusts every byte (FATAL, AV).
 		if (note_bad(BadSpawnState))
 			::Msg("! [coop] ReqSpawn #%u from player #%u refused: raw spawn bytes (older client)", q.seq, from);
 		return reply(q, Reason::Malformed, kNoId);
 	}
-	u16 parent = kNoId;
-	float p[3] = {0.f, 0.f, 0.f};
-	std::string section;
-	const u8* state = nullptr;
-	size_t state_size = 0;
-	if (has_seq)
-	{
-		r.u8();
-		parent = r.u16();
-		r.vec3(p);
-		section = r.str();
-		const u64 n = r.varu();
-		if (r.ok() && n <= kMaxSpawnState && n <= r.remaining())
-		{
-			state = r.cursor();
-			state_size = size_t(n);
-			r.skip(state_size);
-		}
-		else
-			return reply(q, Reason::Malformed, kNoId);
-	}
-	else
-	{
-		section = r.str();
-		parent = r.u16();
-		r.vec3(p);
-	}
-	if (!r.ok())
+	spawn::Request s;
+	if (!spawn::read_body(r, layout, s))
 		return reply(q, Reason::Malformed, kNoId);
-	if (!validate::finite3(p))
+	if (!validate::finite3(s.pos))
 	{
 		if (note_bad(BadNumber))
 			::Msg("! [coop] ReqSpawn #%u from player #%u refused: position is not a number", q.seq, from);
-		return reply(q, Reason::Malformed, parent);
+		return reply(q, Reason::Malformed, s.parent);
 	}
-	// R3 В6: the host builds the entity from its own section (make_temp checks name, section and class).
-	CSE_Abstract* e = make_temp(section.c_str(), Fvector().set(p[0], p[1], p[2]), u32(-1), GameGraph::_GRAPH_ID(-1),
-	    parent);
+	const Reason holder = host_spawn_holder(q, s.parent);
+	if (holder != Reason::Ok)
+		return reply(q, holder, s.parent);
+	// R3 В6: a section with a class and the lines its entity's constructor reads unchecked (FATAL otherwise), then
+	// the host builds the entity from its own section.
+	const char* section = s.section.c_str();
+	const bool known = spawnable_section(section);
+	const char* missing = known ? missing_item_line(section) : nullptr;
+	CSE_Abstract* e = known && !missing ?
+	    make_temp(section, Fvector().set(s.pos[0], s.pos[1], s.pos[2]), u32(-1), GameGraph::_GRAPH_ID(-1), s.parent) :
+	    nullptr;
 	if (!e)
 	{
 		if (note_bad(BadSection))
-			::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%.64s] is not a section with a class here", q.seq,
-			    from, validate::resource_name_ok(section.c_str(), kMaxSection) ? section.c_str() : "<bad name>");
-		return reply(q, Reason::BadSection, parent);
+		{
+			if (missing)
+				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%s] has no `%s` (its class reads it unchecked)",
+				    q.seq, from, section, missing);
+			else
+				::Msg("! [coop] ReqSpawn #%u from player #%u refused: [%.64s] is not a section with a class here",
+				    q.seq, from, validate::resource_name_ok(section, spawn::kMaxSection) ? section : "<bad name>");
+		}
+		return reply(q, Reason::BadSection, s.parent);
 	}
-	if (state_size)
+	if (s.state_size)
 	{
-		// The item state goes through the ItemState checks (WP9): counts, known upgrades and ammo types.
+		// The item state goes through the ItemState checks (WP9): counts, upgrades in an order the engine takes,
+		// ammo types.
 		const char* why = nullptr;
-		if (!items::host_apply_spawn_state(e, state, state_size, why))
+		if (!items::host_apply_spawn_state(e, s.state, s.state_size, why))
 		{
 			if (note_bad(BadSpawnState))
-				::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section.c_str(), from,
+				::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u refused: %s", q.seq, section, from,
 				    why ? why : "item state");
 			F_entity_Destroy(e);
-			return reply(q, Reason::Malformed, parent);
+			return reply(q, Reason::Malformed, s.parent);
 		}
 	}
 	u16 created = kNoId;
-	const Reason why = host_spawn(q, e, parent, created);
-	reply(q, why, why == Reason::Ok ? created : parent);
+	const Reason why = host_spawn(e, s.parent, created);
+	reply(q, why, why == Reason::Ok ? created : s.parent);
 }
 
 // Moves `item` from `src` to `dst` (0xffff = the world) through the engine: ownership events
@@ -919,7 +911,7 @@ Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvect
 			    msg_name(q.type), q.seq, q.from, item);
 		return Reason::TooFar;
 	}
-	const bool exact = (flags & kMovePos) && dst == kNoId && finite_vec(pos) &&
+	const bool exact = (flags & kMovePos) && dst == kNoId && validate::vec_finite(pos) &&
 	    position_of(q.proxy).distance_to(pos) <= kDropPosRange;
 	return apply_move(item, src, dst, exact ? &pos : nullptr);
 }
@@ -1133,7 +1125,6 @@ void host_on_item_event(PeerId from, Reader& r)
 constexpr float kLaunchReach = 6.f; // player character <-> launch point, with lag slack
 constexpr float kMaxLaunchSpeed = 400.f; // stock launchers: 32..121 m/s
 constexpr float kMaxLaunchSpin = 50.f; // rad/s; stock launchers use 0
-constexpr float kMaxDirLength = 2.f; // a launch direction is a unit vector (slack for float noise)
 constexpr u32 kLaunchIntervalMs = 100;
 
 struct Launch
@@ -1196,9 +1187,8 @@ Reason host_launch(const Req& q, u16 launcher, u16 rocket, Fvector pos, Fvector 
 {
 	// Nothing from the wire reaches the physics world unchecked (R3: through coop::validate). The direction is a unit
 	// vector: a huge one normalizes to zero and the launch matrix to NaN.
-	const float d3[3] = {dir.x, dir.y, dir.z};
-	if (!finite_vec(pos) || !validate::speed_ok(d3, kMaxDirLength) || !finite_vec(vel) || !finite_vec(ang) ||
-	    dir.magnitude() < EPS_L)
+	if (!validate::vec_finite(pos) || !validate::vec_speed_ok(dir, validate::kMaxDirLength) ||
+	    !validate::vec_finite(vel) || !validate::vec_finite(ang) || dir.magnitude() < EPS_L)
 	{
 		if (note_bad(BadNumber))
 			::Msg("! [coop] ReqLaunch #%u of rocket %u from player #%u refused: a vector is not a number", q.seq, rocket,
@@ -1227,11 +1217,9 @@ Reason host_launch(const Req& q, u16 launcher, u16 rocket, Fvector pos, Fvector 
 	if (me->Position().distance_to(pos) > kLaunchReach)
 		pos.set(me->Position()).y += 1.5f;
 	dir.normalize();
-	const float v3[3] = {vel.x, vel.y, vel.z};
-	if (!validate::speed_ok(v3, kMaxLaunchSpeed))
+	if (!validate::vec_speed_ok(vel, kMaxLaunchSpeed))
 		vel.normalize_safe().mul(kMaxLaunchSpeed);
-	const float a3[3] = {ang.x, ang.y, ang.z};
-	if (!validate::speed_ok(a3, kMaxLaunchSpin))
+	if (!validate::vec_speed_ok(ang, kMaxLaunchSpin))
 		ang.normalize_safe().mul(kMaxLaunchSpin);
 	Fmatrix xf; // as the weapons build it (CWeaponRPG7::switch2_Fire, CWeaponMagazinedWGrenade::LaunchGrenade)
 	xf.identity();

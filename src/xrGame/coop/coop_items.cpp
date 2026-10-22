@@ -24,12 +24,17 @@
 #include "alife_object_registry.h"
 #include "inventory_upgrade_manager.h"
 #include "inventory_upgrade_root.h"
+#include "inventory_upgrade.h"
+#include "inventory_upgrade_group.h"
 #include "xrServer.h"
 #include "xrServer_Objects_ALife_Items.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "../xrServerEntities/xrServer_Objects.h"
 #include "../xrServerEntities/xrMessages.h"
 #include "xrCoop/coop_item_tags.h"
+#include "xrCoop/coop_spawn.h"
+#include "xrCoop/coop_upgrades.h"
+#include "xrCoop/coop_validate.h"
 
 namespace coop
 {
@@ -45,7 +50,7 @@ constexpr u32 kEnforceMs = 500; // host: re-apply owner state if the host copy d
 constexpr u32 kGraceMs = 3000; // host: late state of an item that just left the sender's hands
 constexpr u32 kPendingMs = 30000; // client: state for an entity that does not exist yet
 constexpr float kForeignRange = 50.f; // a corpse / stash a player unloads must be near that player
-constexpr size_t kMaxBlob = 4096;
+constexpr size_t kMaxBlob = kMaxItemState; // shared with ReqSpawn (coop_spawn.h)
 constexpr u32 kLauncherCap = 3; // rounds a launcher magazine may report (stock launchers hold 1)
 
 enum class Op : u8
@@ -126,6 +131,7 @@ struct Stats
 	u64 authority_applied = 0, authority_skipped = 0, ignored = 0, pending_dropped = 0;
 	u64 enforced = 0, boxes_released = 0, spawns_ok = 0, spawn_rounds = 0, spawns_repeat = 0;
 	u64 rejected[u32(Reason::Count)] = {};
+	u64 upgrades_dropped = 0; // R3 В6: unknown / out-of-order / clashing upgrades never reach a loading install
 };
 Stats g_stats;
 
@@ -244,13 +250,62 @@ bool in_list(const char* list, const char* sect)
 	return false;
 }
 
-bool upgrade_valid(const shared_str& item_section, const shared_str& upgrade)
+upgrades::Upgrade describe_upgrade(
+    inventory::upgrade::Manager& um, inventory::upgrade::Root* root, const shared_str& id)
 {
-	if (!ai().get_alife() || !upgrade.c_str())
-		return false;
+	upgrades::Upgrade u;
+	u.id = id.c_str() ? id.c_str() : "";
+	inventory::upgrade::Upgrade* up = id.c_str() ? um.get_upgrade(id) : nullptr;
+	u.in_tree = root && up && root->contain_upgrade(id);
+	if (!u.in_tree)
+		return u;
+	u.group = up->parent_group_id().c_str();
+	xr_vector<shared_str> needs;
+	up->parent_group()->required_groups(needs);
+	for (const shared_str& g : needs)
+		u.needs_groups.push_back(g.c_str());
+	return u;
+}
+
+const char* verdict_name(upgrades::Verdict v)
+{
+	switch (v)
+	{
+	case upgrades::Verdict::Unknown: return "not in this item's tree";
+	case upgrades::Verdict::NoParent: return "its parent group has no upgrade (yet)";
+	case upgrades::Verdict::GroupTaken: return "another upgrade of its group is there";
+	default: return "?";
+	}
+}
+
+// R3 В6 (review): the upgrades of `wanted` the engine can install on an item of `section` in this order, after
+// `installed`. A loading install (net_Spawn of a new entity, ItemState) is FATAL on a missing parent group or a
+// taken group (inventory::upgrade::Group::can_install), so those are dropped here, like unknown ones; already
+// installed ones are left out. `report`: count and log the first 10 dropped ones.
+UpgradeList installable_upgrades(
+    const shared_str& section, const UpgradeList& installed, const UpgradeList& wanted, bool report)
+{
+	UpgradeList out;
+	if (!ai().get_alife())
+		return out;
 	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
-	inventory::upgrade::Root* root = um.get_root(item_section);
-	return root && um.get_upgrade(upgrade) && root->contain_upgrade(upgrade);
+	inventory::upgrade::Root* root = um.get_root(section);
+	std::vector<upgrades::Upgrade> have, want;
+	for (const shared_str& id : installed)
+		have.push_back(describe_upgrade(um, root, id));
+	for (const shared_str& id : wanted)
+		want.push_back(describe_upgrade(um, root, id));
+	const std::vector<upgrades::Verdict> verdicts = upgrades::plan(have, want);
+	for (size_t i = 0; i < verdicts.size(); ++i)
+	{
+		if (verdicts[i] == upgrades::Verdict::Install)
+			out.push_back(wanted[i]);
+		else if (verdicts[i] != upgrades::Verdict::Installed && report && ++g_stats.upgrades_dropped <= 10)
+			::Msg("! [coop] upgrade [%s] of [%s] dropped: %s",
+			    validate::resource_name_ok(want[i].id.c_str(), 64) ? want[i].id.c_str() : "<bad name>",
+			    section.c_str(), verdict_name(verdicts[i]));
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------- blob
@@ -588,9 +643,9 @@ void install_upgrades(CInventoryItem* item, const UpgradeList& list)
 		return;
 	const shared_str& section = item->object().cNameSect();
 	inventory::upgrade::Manager& um = ai().alife().inventory_upgrade_manager();
-	for (const shared_str& id : list)
-		if (!item->has_upgrade(id) && upgrade_valid(section, id))
-			um.upgrade_install(*item, id, true); // "loading": no unload/detach, no event
+	// R3 В6: only what Group::can_install accepts in this order — a loading install is FATAL otherwise
+	for (const shared_str& id : installable_upgrades(section, item->get_upgrades(), list, true))
+		um.upgrade_install(*item, id, true); // "loading": no unload/detach, no event
 }
 
 // Magazine of the current launcher mode.
@@ -705,13 +760,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
 		if (d.has_upgrades && !mgr().is_host())
-		{
-			UpgradeList valid;
-			for (const shared_str& id : d.upgrades)
-				if (upgrade_valid(e->s_name, id))
-					valid.push_back(id);
-			ii->m_upgrades = valid;
-		}
+			ii->m_upgrades = installable_upgrades(e->s_name, {}, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
 		if (CSE_ALifeItemAmmo* a = smart_cast<CSE_ALifeItemAmmo*>(e))
@@ -1081,14 +1130,8 @@ bool host_validate_counts(CSE_Abstract* e, CInventoryItem* item, const ItemData&
 // refused state would leave the host with stale round counts.
 void host_sanitize(CSE_Abstract* e, CInventoryItem* item, ItemData& d)
 {
-	if (d.has_upgrades)
-	{
-		UpgradeList valid;
-		for (const shared_str& id : d.upgrades)
-			if (upgrade_valid(e->s_name, id))
-				valid.push_back(id);
-		d.upgrades.swap(valid);
-	}
+	if (d.has_upgrades) // the owner's list is its install order from scratch (R3 В6: in an order the engine takes)
+		d.upgrades = installable_upgrades(e->s_name, {}, d.upgrades, false);
 	CSE_ALifeItemWeapon* we = smart_cast<CSE_ALifeItemWeapon*>(e);
 	if (!we)
 		return;
@@ -1687,6 +1730,8 @@ void print_status()
 		    s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4], s.rejected[5],
 		    s.rejected[6]);
 	}
+	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
+	    s.upgrades_dropped);
 }
 
 void touch(CInventoryItem* item)
@@ -1775,18 +1820,15 @@ bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, c
 	}
 	if (!host_validate_kind(entity, d, why) || !host_validate_counts(entity, nullptr, d, why))
 		return false;
-	host_sanitize(entity, nullptr, d); // unknown upgrades dropped, ammo types in range
-	apply_entity(entity, d, false);
-	// apply_entity leaves upgrades to GE_INSTALL_UPGRADE on the host. A fresh entity has none: the new object
-	// installs these on its spawn. One of each (CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate).
+	// The new object installs these on its spawn with loading = true (FATAL on a missing parent group, a taken
+	// group): only an order the engine takes, each once. Dropped ones are counted and logged here.
 	if (d.has_upgrades)
-	{
-		UpgradeList unique;
-		for (const shared_str& id : d.upgrades)
-			if (std::find(unique.begin(), unique.end(), id) == unique.end())
-				unique.push_back(id);
-		ii->m_upgrades = unique;
-	}
+		d.upgrades = installable_upgrades(entity->s_name, {}, d.upgrades, true);
+	host_sanitize(entity, nullptr, d); // ammo types in range
+	apply_entity(entity, d, false);
+	// apply_entity leaves upgrades to GE_INSTALL_UPGRADE on the host; a fresh entity has none yet.
+	if (d.has_upgrades)
+		ii->m_upgrades = d.upgrades;
 	return true;
 }
 } // namespace items

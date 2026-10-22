@@ -132,6 +132,24 @@ void Group::log_hierarchy( LPCSTR nest )
 			return result_ok;
 		}
 
+		// Anomaly Coop (R3 В6): the parents loop of can_install, without an item.
+		void Group::required_groups(xr_vector<shared_str>& out) const
+		{
+			out.clear();
+			for (UpgradeBase* parent : m_parent_upgrades)
+			{
+				if (parent->is_root())
+				{
+					continue;
+				}
+				Upgrade* U = smart_cast<Upgrade*>(parent);
+				if (U && std::find(out.begin(), out.end(), U->parent_group_id()) == out.end())
+				{
+					out.push_back(U->parent_group_id());
+				}
+			}
+		}
+
 		void Group::highlight_up()
 		{
 			Upgrades_type::iterator ib = m_included_upgrades.begin();
