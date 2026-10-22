@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <string>
 #include <string_view>
@@ -849,7 +850,8 @@ Missing missing_line(const ClassRule& rule, const Ini& ini)
 
 // What the host knows of the asked section: `quest_item` (as CInventoryItem::Load reads it), `cost`, and whether the
 // host's configs\coop_spawn.ltx lists it in [allow_sections] / [deny_sections]; and of the request: a quest gift
-// (quest_gift) lets a quest item through.
+// (quest_gift) lets a quest item through, a parent item that does not take the item (child_allowed) refuses it, and
+// requests of the character waiting in the queue put this one behind them.
 struct SectionFacts
 {
 	bool quest_item = false;
@@ -857,14 +859,39 @@ struct SectionFacts
 	bool allow_listed = false;
 	bool deny_listed = false;
 	bool in_dialog_to_own_actor = false; // Ruling F2-16
+	bool parent_ok = true; // review round 2, Important 1
+	bool queue_waiting = false; // Ruling F2-21
 };
+
+// coop_dialog kTalkReach: a client talks only to an NPC his character stands by on the host (host_try_lock).
+constexpr float kTalkReach = 6.f;
 
 // Ruling F2-16: the stock dialogs create a quest reward on the client (alife_create_item(section, db.actor), the talk
 // runs there). A quest item is a gift only into the asking player's own character (`parent` is his proxy on the host)
-// while he holds a talk lock with an NPC (coop_dialog host_lock_of).
-inline bool quest_gift(bool holds_talk_lock, uint16_t parent, uint16_t own_character)
+// while he holds a talk lock with an NPC (coop_dialog host_lock_of) and his character stands within talk reach of that
+// NPC (round 2: as host_try_lock; `npc_distance` 0 for an NPC that talks from afar, NeedOsoznanieMode).
+inline bool quest_gift(bool holds_talk_lock, float npc_distance, uint16_t parent, uint16_t own_character)
 {
-	return holds_talk_lock && own_character != 0xffff && parent == own_character;
+	return holds_talk_lock && npc_distance <= kTalkReach && own_character != 0xffff && parent == own_character;
+}
+
+// Review round 2, Important 1: what may be created inside one of the player's items (the parent is not his character).
+// The host gives the parent the new entity with GE_OWNERSHIP_TAKE, and the items whose handler takes a child cast it
+// unchecked: CRocketLauncher::AttachRocket (RocketLauncher.cpp:56-57) to CCustomRocket, CMissile::OnEvent
+// (Missile.cpp:606-608) to CMissile. So: a rocket into a weapon with a rocket launcher, a missile into a missile of the
+// same section (its fake missile, CMissile::spawn_fake_missile); nothing else into an item.
+inline bool child_allowed(GameClass parent, std::string_view parent_section, GameClass child,
+    std::string_view child_section)
+{
+	switch (parent)
+	{
+	case GameClass::WeaponMagazinedWGrenade:
+	case GameClass::WeaponRocket:
+	case GameClass::WeaponRPG7: return child == GameClass::ExplosiveRocket;
+	case GameClass::Missile:
+	case GameClass::Grenade: return child == parent && child_section == parent_section;
+	default: return false;
+	}
 }
 
 // Cost budget (host settings, configs\coop_spawn.ltx [coop_spawn]): the sum of `cost` a character may have created
@@ -883,37 +910,17 @@ struct CostBudget
 	bool started = false;
 };
 
-enum class SpawnVerdict : uint8_t
+// Ruling F2-21: what an item takes from the budget: its cost, at most the whole burst (an item dearer than the burst
+// waits for a full budget instead of being refused for ever).
+inline uint32_t charge_of(uint32_t cost, const SpawnPolicy& policy)
 {
-	Allow,
-	UnknownClass, // the section's class has no rule
-	MissingLine, // a line the class's constructor reads unchecked is missing
-	Denied, // [deny_sections]
-	QuestItem, // quest_item = true
-	OverBudget,
-};
+	return cost < policy.cost_burst ? cost : policy.cost_burst;
+}
 
-// The verdict on a client's ReqSpawn, in this order:
-//   1. no rule (not an item class)            -> UnknownClass
-//   2. a required line is missing (`missing`) -> MissingLine
-//   3. deny-listed                            -> Denied
-//   4. allow-listed                           -> Allow, the budget untouched
-//   5. a quest item, unless a quest gift      -> QuestItem
-//   6. `cost` over what the budget holds      -> OverBudget (nothing taken); else Allow and the cost is taken.
-// Only step 6 reads or changes `budget`; a quest gift goes on to it like any item.
-inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const SectionFacts& facts,
-    CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms)
+// Refills `budget` up to now (full at its first use; a clock that went back refills nothing), then takes the item's
+// charge if it holds it. False: not enough, nothing taken.
+inline bool charge(CostBudget& budget, uint32_t cost, const SpawnPolicy& policy, uint64_t now_ms)
 {
-	if (!rule)
-		return SpawnVerdict::UnknownClass;
-	if (missing_line)
-		return SpawnVerdict::MissingLine;
-	if (facts.deny_listed)
-		return SpawnVerdict::Denied;
-	if (facts.allow_listed)
-		return SpawnVerdict::Allow;
-	if (facts.quest_item && !facts.in_dialog_to_own_actor)
-		return SpawnVerdict::QuestItem;
 	const double burst = double(policy.cost_burst);
 	if (!budget.started)
 	{
@@ -921,16 +928,66 @@ inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const
 		budget.tokens = burst;
 		budget.at = now_ms;
 	}
-	else if (now_ms > budget.at) // a clock that went back refills nothing
+	else if (now_ms > budget.at)
 	{
 		budget.tokens += double(now_ms - budget.at) * double(policy.cost_per_sec) / 1000.0;
 		budget.at = now_ms;
 	}
 	if (budget.tokens > burst)
 		budget.tokens = burst;
-	if (double(facts.cost) > budget.tokens)
+	const double amount = double(charge_of(cost, policy));
+	if (amount > budget.tokens)
+		return false;
+	budget.tokens -= amount;
+	return true;
+}
+
+// Ruling F2-21 (3): the charge of an item the engine then refused goes back (up to the burst).
+inline void refund(CostBudget& budget, uint32_t cost, const SpawnPolicy& policy)
+{
+	budget.tokens += double(charge_of(cost, policy));
+	if (budget.tokens > double(policy.cost_burst))
+		budget.tokens = double(policy.cost_burst);
+}
+
+enum class SpawnVerdict : uint8_t
+{
+	Allow,
+	UnknownClass, // the section's class has no rule
+	MissingLine, // a line the class's constructor reads unchecked is missing
+	Denied, // [deny_sections]
+	QuestItem, // quest_item = true
+	OverBudget, // the host queues it (SpawnQueue); refused only when the queue is full
+	WrongParent, // an item into one of his items that does not take it (child_allowed)
+};
+
+// The verdict on a client's ReqSpawn, in this order:
+//   1. no rule (not an item class)            -> UnknownClass
+//   2. a required line is missing (`missing`) -> MissingLine
+//   3. into one of his items that cannot take it (parent_ok false) -> WrongParent
+//   4. deny-listed                            -> Denied
+//   5. allow-listed                           -> Allow, the budget untouched
+//   6. a quest item, unless a quest gift      -> QuestItem
+//   7. requests of the character wait in the queue, or the budget does not hold charge_of(cost)
+//                                             -> OverBudget (nothing taken); else Allow and the charge is taken.
+// Only step 7 reads or changes `budget`; a quest gift goes on to it like any item.
+inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const SectionFacts& facts,
+    CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms)
+{
+	if (!rule)
+		return SpawnVerdict::UnknownClass;
+	if (missing_line)
+		return SpawnVerdict::MissingLine;
+	if (!facts.parent_ok)
+		return SpawnVerdict::WrongParent;
+	if (facts.deny_listed)
+		return SpawnVerdict::Denied;
+	if (facts.allow_listed)
+		return SpawnVerdict::Allow;
+	if (facts.quest_item && !facts.in_dialog_to_own_actor)
+		return SpawnVerdict::QuestItem;
+	if (facts.queue_waiting || !charge(budget, facts.cost, policy, now_ms))
 		return SpawnVerdict::OverBudget;
-	budget.tokens -= double(facts.cost);
 	return SpawnVerdict::Allow;
 }
 
@@ -948,6 +1005,115 @@ public:
 
 private:
 	std::map<std::string, CostBudget> m_budgets;
+};
+
+// Ruling F2-21 (2): a request over its character's budget is not refused: it waits on the host, first in first out
+// per character (budget key), and is created when the budget has refilled for it. Otherwise a fair mass disassembly
+// or craft would lose items: the inputs are already spent, the outputs refused. At most kMaxQueued wait per
+// character; more is refused. `Item` has `uint32_t cost`; the host keeps the built entity in it.
+constexpr size_t kMaxQueued = 256;
+
+template <class Item>
+class SpawnQueue
+{
+public:
+	bool waiting(const std::string& key) const
+	{
+		const auto it = m_queues.find(key);
+		return it != m_queues.end() && !it->second.empty();
+	}
+	size_t size(const std::string& key) const
+	{
+		const auto it = m_queues.find(key);
+		return it == m_queues.end() ? 0 : it->second.size();
+	}
+	size_t total() const
+	{
+		size_t n = 0;
+		for (const auto& it : m_queues)
+			n += it.second.size();
+		return n;
+	}
+	std::vector<std::string> keys() const
+	{
+		std::vector<std::string> out;
+		for (const auto& it : m_queues)
+			if (!it.second.empty())
+				out.push_back(it.first);
+		return out;
+	}
+	// False: the character's queue is full (the item stays the caller's).
+	bool push(const std::string& key, Item item)
+	{
+		std::deque<Item>& q = m_queues[key];
+		if (q.size() >= kMaxQueued)
+			return false;
+		q.push_back(std::move(item));
+		return true;
+	}
+	// Creates in order what the budget holds now: `create(item)` true = created; false = refused or no longer possible,
+	// its charge goes back and the next one is tried. Returns the number created.
+	template <class Create>
+	size_t pump(const std::string& key, CostBudget& budget, const SpawnPolicy& policy, uint64_t now_ms, Create&& create)
+	{
+		const auto it = m_queues.find(key);
+		if (it == m_queues.end())
+			return 0;
+		size_t created = 0;
+		std::deque<Item>& q = it->second;
+		while (!q.empty() && charge(budget, q.front().cost, policy, now_ms))
+		{
+			Item item = std::move(q.front());
+			q.pop_front();
+			if (create(item))
+				++created;
+			else
+				refund(budget, item.cost, policy);
+		}
+		if (q.empty())
+			m_queues.erase(it);
+		return created;
+	}
+	// The character left (or the world was replaced): `drop(item)` for each waiting one, nothing of it is created.
+	template <class Drop>
+	size_t drop(const std::string& key, Drop&& drop)
+	{
+		return drop_if(key, [](const Item&) { return true; }, drop);
+	}
+	template <class Pred, class Drop>
+	size_t drop_if(const std::string& key, Pred&& pred, Drop&& drop)
+	{
+		const auto it = m_queues.find(key);
+		if (it == m_queues.end())
+			return 0;
+		size_t n = 0;
+		std::deque<Item> keep;
+		for (Item& item : it->second)
+		{
+			if (pred(static_cast<const Item&>(item)))
+			{
+				drop(item);
+				++n;
+			}
+			else
+				keep.push_back(std::move(item));
+		}
+		it->second.swap(keep);
+		if (it->second.empty())
+			m_queues.erase(it);
+		return n;
+	}
+	template <class Drop>
+	void clear(Drop&& drop)
+	{
+		for (auto& it : m_queues)
+			for (Item& item : it.second)
+				drop(item);
+		m_queues.clear();
+	}
+
+private:
+	std::map<std::string, std::deque<Item>> m_queues;
 };
 } // namespace spawn
 } // namespace coop

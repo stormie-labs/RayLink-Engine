@@ -736,7 +736,7 @@ bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 // id; reset() at the session's start and end clears them.
 constexpr LPCSTR kSpawnSettings = "coop_spawn";
 constexpr int kMaxSpawnSetting = 2000000000; // ltx values are ints
-constexpr u32 kSpawnVerdicts = u32(spawn::SpawnVerdict::OverBudget) + 1;
+constexpr u32 kSpawnVerdicts = u32(spawn::SpawnVerdict::WrongParent) + 1;
 constexpr u64 kSpawnLogFirst = 10;
 spawn::SpawnPolicy g_spawn_policy;
 xr_set<shared_str> g_spawn_allow, g_spawn_deny;
@@ -849,9 +849,15 @@ void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, cons
 			break;
 		case SpawnVerdict::QuestItem: xr_strcpy(why, "a quest item");
 			break;
-		case SpawnVerdict::OverBudget:
-			xr_sprintf(why, "over the cost budget of character %u (cost %u RU, %.0f RU left)", q.proxy,
-			    spawn_facts(section).cost, budget_left);
+		case SpawnVerdict::OverBudget: // only when the queue is full (Ruling F2-21)
+			xr_sprintf(why, "over the cost budget of character %u (cost %u RU, %.0f RU left) and %u of his requests "
+			                "already wait",
+			    q.proxy, spawn_facts(section).cost, budget_left, u32(spawn::kMaxQueued));
+			break;
+		case SpawnVerdict::WrongParent:
+			xr_sprintf(why, "the item %u it would go into does not take it (only a launcher its rocket, a missile its "
+			                "fake missile)",
+			    parent);
 			break;
 		default: xr_strcpy(why, "?");
 			break;
@@ -859,7 +865,7 @@ void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, cons
 		::Msg("! [coop] ReqSpawn #%u of [%s] from player #%u <%s> refused: %s", q.seq, section, q.from,
 		    p ? p->nick.c_str() : "?", why);
 	}
-	Reason reason = Reason::NotAllowed; // not an item class, deny-listed, a quest item
+	Reason reason = Reason::NotAllowed; // not an item class, a parent that does not take it, deny-listed, a quest item
 	if (v == SpawnVerdict::MissingLine)
 		reason = Reason::BadSection;
 	else if (v == SpawnVerdict::OverBudget)
@@ -939,6 +945,89 @@ Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created)
 	return Reason::Ok;
 }
 
+// Review round 2, Important 1: the item `parent` (one of the asker's, not his character) takes the new entity: the host
+// gives it GE_OWNERSHIP_TAKE, whose handlers cast the child unchecked (xrCoop/coop_spawn.h child_allowed).
+bool parent_takes(u16 parent, const spawn::ClassRule& child, const char* child_section)
+{
+	const CSE_Abstract* holder = events::find_entity(parent);
+	if (!holder || !holder->s_name.size() || !pSettings->section_exist(holder->s_name) ||
+	    !pSettings->line_exist(holder->s_name, "class"))
+		return false;
+	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(holder->s_name, "class"));
+	return rule && spawn::child_allowed(rule->game, holder->s_name.c_str(), child.game, child_section);
+}
+
+// Round 2 minor (Ruling F2-16): how far the asker's character stands from the NPC of his talk lock, as host_try_lock
+// (coop_dialog.cpp) measures it: 0 for an NPC that talks from afar (NeedOsoznanieMode), flt_max when either is not in
+// the world.
+float talk_distance(u16 npc, u16 proxy)
+{
+	CObject* them = g_pGameLevel ? Level().Objects.net_Find(npc) : nullptr;
+	CInventoryOwner* io = smart_cast<CInventoryOwner*>(them);
+	if (io && io->NeedOsoznanieMode())
+		return 0.f;
+	CObject* me = g_pGameLevel ? Level().Objects.net_Find(proxy) : nullptr;
+	if (!me || !them)
+		return flt_max;
+	return me->Position().distance_to(them->Position());
+}
+
+// ---------------------------------------------------------------- Ruling F2-21: requests waiting for the budget
+// A request over its character's budget waits here (xrCoop/coop_spawn.h SpawnQueue) and is created and answered when
+// the budget has refilled for it. Its player leaving, or the world replaced (SessionReset), drops it unanswered.
+struct QueuedSpawn
+{
+	CSE_Abstract* entity = nullptr; // built from the host's section with the checked item state; the queue owns it
+	Req q;
+	u16 parent = kNoId;
+	u32 cost = 0; // `cost` of the section; SpawnQueue charges charge_of(cost)
+	u32 epoch = 0; // join::host_world_epoch() when it was asked
+};
+spawn::SpawnQueue<QueuedSpawn> g_spawn_queue;
+u64 g_spawn_queued = 0, g_spawn_dequeued = 0, g_spawn_queue_dropped = 0;
+
+void drop_queued(QueuedSpawn& s)
+{
+	F_entity_Destroy(s.entity);
+	s.entity = nullptr;
+	++g_spawn_queue_dropped;
+}
+
+// A waiting request the budget holds now: its holder is checked again (the player may have moved or dropped the
+// parent meanwhile), then it is created and answered. False: refused, its charge goes back.
+bool create_queued(QueuedSpawn& s)
+{
+	const Reason holder = host_spawn_holder(s.q, s.parent);
+	if (holder != Reason::Ok)
+	{
+		F_entity_Destroy(s.entity);
+		s.entity = nullptr;
+		reply(s.q, holder, s.parent);
+		return false;
+	}
+	u16 created = kNoId;
+	const Reason why = host_spawn(s.entity, s.parent, created); // consumes the entity
+	s.entity = nullptr;
+	reply(s.q, why, why == Reason::Ok ? created : s.parent);
+	return why == Reason::Ok;
+}
+
+// Host frame: drops what belongs to a player who left or to a replaced world, creates what the budgets hold now.
+void host_pump_spawns()
+{
+	if (!g_spawn_queue.total() || !g_pGameLevel || !ai().get_alife() || !Level().Server || Device.dwPrecacheFrame)
+		return;
+	const u32 epoch = join::host_world_epoch();
+	const u64 now = mgr().now_ms();
+	const auto gone = [epoch](const QueuedSpawn& s)
+	{ return s.epoch != epoch || join::proxy_of_peer(s.q.from) != s.q.proxy; };
+	for (const std::string& key : g_spawn_queue.keys())
+	{
+		g_spawn_queue.drop_if(key, gone, drop_queued);
+		g_spawn_dequeued += g_spawn_queue.pump(key, g_spawn_budgets.of(key), g_spawn_policy, now, create_queued);
+	}
+}
+
 void host_on_spawn(PeerId from, Reader& r)
 {
 	// Layouts and markers: xrCoop/coop_spawn.h.
@@ -1015,21 +1104,42 @@ void host_on_spawn(PeerId from, Reader& r)
 	// F2 T2: deny/allow lists, quest items, the character's cost budget; after the item state, so a malformed one
 	// costs nothing. No rule or a missing line ends here too (judge steps 1-2, nothing was constructed).
 	spawn::SectionFacts facts = spawn_facts(section);
-	// Ruling F2-16: a quest item into his own character while he holds a talk lock (the stock dialogs give it there).
-	facts.in_dialog_to_own_actor = spawn::quest_gift(dialog::host_lock_of(from) != kNoId, s.parent, q.proxy);
-	spawn::CostBudget& budget = g_spawn_budgets.of(spawn_budget_key(q.proxy));
+	// Review round 2, Important 1: into one of his items only what that item takes.
+	facts.parent_ok = s.parent == q.proxy || !rule || parent_takes(s.parent, *rule, section);
+	// Ruling F2-16: a quest item into his own character while he holds a talk lock (the stock dialogs give it there)
+	// and stands within talk reach of that NPC (round 2 minor).
+	const u16 talk_npc = dialog::host_lock_of(from);
+	facts.in_dialog_to_own_actor = spawn::quest_gift(talk_npc != kNoId,
+	    talk_npc != kNoId ? talk_distance(talk_npc, q.proxy) : flt_max, s.parent, q.proxy);
+	const std::string key = spawn_budget_key(q.proxy);
+	facts.queue_waiting = g_spawn_queue.waiting(key); // Ruling F2-21: behind his earlier requests
+	spawn::CostBudget& budget = g_spawn_budgets.of(key);
 	const spawn::SpawnVerdict verdict = spawn::judge(rule, missing.line, facts, budget, g_spawn_policy, mgr().now_ms());
+	const bool gift = facts.quest_item && !facts.allow_listed; // a quest item past judge is a quest gift
+	// Ruling F2-21: over the budget it waits (`e` was built: OverBudget needs a rule and no missing line); answered
+	// when it is created (host_pump_spawns). Refused only when his queue is full.
+	if (verdict == spawn::SpawnVerdict::OverBudget && e &&
+	    g_spawn_queue.push(key, QueuedSpawn{e, q, s.parent, facts.cost, join::host_world_epoch()}))
+	{
+		g_spawn_quest_gifts += gift ? 1 : 0;
+		if (++g_spawn_queued <= kSpawnLogFirst)
+			::Msg("[coop] ReqSpawn #%u of [%s] from player #%u waits for the cost budget of character %u (%u in his "
+			      "queue): answered when created",
+			    q.seq, section, from, q.proxy, u32(g_spawn_queue.size(key)));
+		return;
+	}
 	if (verdict != spawn::SpawnVerdict::Allow)
 	{
 		if (e)
 			F_entity_Destroy(e);
 		return refuse_spawn(q, verdict, section, missing, s.parent, budget.tokens);
 	}
-	if (facts.quest_item && !facts.allow_listed)
-		++g_spawn_quest_gifts; // let through only as a quest gift
+	g_spawn_quest_gifts += gift ? 1 : 0;
 	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
 	const Reason why = host_spawn(e, s.parent, created);
+	if (why != Reason::Ok && !facts.allow_listed)
+		spawn::refund(budget, facts.cost, g_spawn_policy); // Ruling F2-21 (3): the engine refused what was charged
 	reply(q, why, why == Reason::Ok ? created : s.parent);
 }
 
@@ -1512,6 +1622,7 @@ void reset()
 	g_inflight.clear();
 	g_limits.clear();
 	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
+	g_spawn_queue.clear(drop_queued); // Ruling F2-21: nothing of the old session is created
 	g_last_launch.clear(); // W3a
 	g_lua_refused_once.clear(); // W3a
 	g_log_count = 0;
@@ -1524,6 +1635,8 @@ void reset()
 
 void frame()
 {
+	if (mgr().is_host())
+		host_pump_spawns(); // Ruling F2-21
 	if (!mgr().is_client())
 		return;
 	client_flush_launches(); // W3a: before the outbox (a launch usually precedes a drop of the launcher)
@@ -1557,12 +1670,18 @@ void print_status()
 		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange],
 		    g_bad[BadUpgrade]);
 		using spawn::SpawnVerdict;
-		::Msg("[coop]   spawns refused: class %llu, line %llu, denied %llu, quest %llu, budget %llu (budget %u RU in a "
-		      "row + %u RU/s per character, %u characters this session; %u allow-listed, %u deny-listed sections)",
+		::Msg("[coop]   spawns refused: class %llu, line %llu, parent %llu, denied %llu, quest %llu, budget %llu "
+		      "(budget %u RU in a row + %u RU/s per character, %u characters this session; %u allow-listed, %u "
+		      "deny-listed sections)",
 		    g_spawn_refused[u32(SpawnVerdict::UnknownClass)], g_spawn_refused[u32(SpawnVerdict::MissingLine)],
-		    g_spawn_refused[u32(SpawnVerdict::Denied)], g_spawn_refused[u32(SpawnVerdict::QuestItem)],
-		    g_spawn_refused[u32(SpawnVerdict::OverBudget)], g_spawn_policy.cost_burst, g_spawn_policy.cost_per_sec,
-		    (u32)g_spawn_budgets.size(), (u32)g_spawn_allow.size(), (u32)g_spawn_deny.size());
+		    g_spawn_refused[u32(SpawnVerdict::WrongParent)], g_spawn_refused[u32(SpawnVerdict::Denied)],
+		    g_spawn_refused[u32(SpawnVerdict::QuestItem)], g_spawn_refused[u32(SpawnVerdict::OverBudget)],
+		    g_spawn_policy.cost_burst, g_spawn_policy.cost_per_sec, (u32)g_spawn_budgets.size(),
+		    (u32)g_spawn_allow.size(), (u32)g_spawn_deny.size());
+		::Msg("[coop]   spawns queued %u (waiting for the cost budget now; %llu queued in all, %llu created from the "
+		      "queue, %llu dropped: player gone or world replaced; at most %u per character, F2-21)",
+		    (u32)g_spawn_queue.total(), g_spawn_queued, g_spawn_dequeued, g_spawn_queue_dropped,
+		    u32(spawn::kMaxQueued));
 		::Msg("[coop]   quest allowed in dialog %llu (quest items a player's talk gave his own character, F2-16)",
 		    g_spawn_quest_gifts);
 		return;
