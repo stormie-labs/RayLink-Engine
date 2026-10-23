@@ -712,7 +712,11 @@ struct Session::Impl
 		// host's handler: it wiped the host's sync state and made it a client. The host kicks the sender, a client
 		// logs and ignores it (malformed).
 		const bool host = m_role == Role::Host;
-		if (msg_sender(static_cast<Msg>(type)) == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
+		const MsgSender sender = msg_sender(static_cast<Msg>(type));
+		// Protocol 11: MsgSender::TrunkOnly is the bridge of a map server's, and no peer is a bridge yet (F3a T9 adds that
+		// kind of connection and lets it through): until then it is refused from everybody, on both roles, so that it can
+		// never pass as a message of either side.
+		if (sender == MsgSender::TrunkOnly || sender == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
 		{
 			const std::string what =
 				std::string("unexpected ") + msg_name(type) + (host ? " from a client" : " from the host");

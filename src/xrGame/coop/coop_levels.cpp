@@ -48,7 +48,8 @@ LevelId level_of_vertex(u16 game_vertex)
 
 LevelId level_of_object(u16 id)
 {
-	if (!ai().get_alife())
+	// like my_level(): the simulator of a level that is being built or torn down answers nothing safely
+	if (!world_up() || !ai().get_alife())
 		return wire::kNoLevel;
 	const CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	return e ? level_of_vertex(e->m_tGraphID) : wire::kNoLevel;
@@ -58,8 +59,9 @@ LevelId level_of_player(PeerId peer)
 {
 	if (!is_player())
 		return wire::kNoLevel;
-	// the host is a player of its own session; the others are the peers the session knows
-	if (peer != kHostPeer && !mgr().session().peer(peer))
+	// the host is a player of its own session, so is this machine whatever its slot (a client's own slot is not among
+	// the peers its session lists); the others are the peers the session knows
+	if (peer != kHostPeer && peer != mgr().self() && !mgr().session().peer(peer))
 		return wire::kNoLevel;
 	return my_level(); // skeleton: one world, one level for everybody
 }

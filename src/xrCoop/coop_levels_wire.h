@@ -2,8 +2,14 @@
 // protocol 11, Msg 0x01D0-0x01DF). One struct per message with write() and read(): read() takes nothing it cannot bound — a
 // count over its limit, an id or an enum out of range, a float that is not finite or beyond any level, a string that is not a
 // name, an id listed twice, a cut packet — and returns false with the message emptied; a message is read whole, and a packet
-// with bytes left over is the caller's to refuse (read_all in the tests). write() keeps to the same limits, so what it writes
-// is always read.
+// with bytes left over is the caller's to refuse (read_all in the tests).
+//
+// A writer never turns a message that is over a limit into one that reads: the formats with a limit (LevelMap, LevelXferUp and
+// Down, LevelBrain, Tunnel, LoadWait) have `bool fits() const` and `[[nodiscard]] bool write(Writer&) const`, which returns false
+// and writes NOTHING (the Writer is as it was) for a message over a limit — a cargo of 32 KiB + 1, a ninth player, 256 squads,
+// a packet of 65536 bytes. Cutting it down instead would deliver a partial Grant or a map without a player as a whole message.
+// The caller sends such a message another way (a blob for a big cargo, two packets for the squads) or not at all. The fixed
+// layouts have no limit to break and write() is void. A message within its limits is written and read back whole.
 //
 // Numbers of levels are game graph level ids (u16 on the wire, kNoLevel = none), players are session slots (PeerId < kMaxPlayers,
 // the host is 0), objects are ids in the world server's numbering. The enums are numbered here, in the order of the plan's
@@ -24,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "coop_levels_rules.h" // Gate: the byte of a LevelMap gate row
 #include "coop_protocol.h"
 #include "coop_wire.h"
 
@@ -49,7 +56,12 @@ constexpr size_t kMaxXferCargo = 32 * 1024; // what goes in one packet; a bigger
 constexpr size_t kMaxScripted = 64; // the scheme or section name of a squad
 constexpr size_t kHashBuckets = 32; // LevelHash buckets, LevelResync mask bits
 constexpr size_t kMaxTunnelPacket = 0xFFFF; // a u16 length
+constexpr size_t kMaxBrainRows = 255; // squads, and assignments, in one LevelBrain (a u8 count each)
 constexpr float kMaxCoord = 1.0e6f; // meters: beyond any level, finite
+
+// The last gate a LevelMap row may carry: T3's Gate (coop_levels_rules.h: Free 0, BetterTogether 1, Together 2) is the enum of
+// that byte. A Gate added there is added here.
+constexpr uint8_t kLastGate = uint8_t(levels::Gate::Together);
 
 // State of a server, shared by LevelMap and MapServerState (order of the plan's table).
 enum class ServerState : uint8_t
@@ -105,8 +117,8 @@ inline bool read_tail(Reader& r, std::vector<uint8_t>& out, size_t max)
 //       u8 g, g x {u16 level, u8 gate, str reason}.
 // A player row says on which level a player stands (kNoLevel while he loads); `role` is the Hello role of the node (0 a player,
 // 1 a map server). A server row says who leads a level: the host's process (at most one) or a map server, and its state. A gate
-// row is the world server's verdict on entering a level (the Gate of coop_levels_rules.h, a byte the consumer checks) and the
-// string id of the placard that says why; the game sends the levels whose gate is not open.
+// row is the world server's verdict on entering a level (the Gate of coop_levels_rules.h: 0 .. kLastGate) and the string id of
+// the placard that says why; the game sends the levels whose gate is not open.
 struct LevelMapMsg
 {
 	enum Flags : uint8_t
@@ -144,33 +156,40 @@ struct LevelMapMsg
 	std::vector<Server> servers;
 	std::vector<Gate> gates;
 
-	void write(Writer& w) const
+	// The three lists are within their limits (a player a row at the most, 8 servers, 128 gates).
+	bool fits() const
 	{
+		return players.size() <= kMaxMapPlayers && servers.size() <= kMaxMapServers && gates.size() <= kMaxMapGates;
+	}
+
+	// False, nothing written, for a map over a limit.
+	[[nodiscard]] bool write(Writer& w) const
+	{
+		if (!fits())
+			return false;
 		w.u8(flags);
-		const size_t n = players.size() < kMaxMapPlayers ? players.size() : kMaxMapPlayers;
-		w.u8(uint8_t(n));
-		for (size_t i = 0; i < n; ++i)
+		w.u8(uint8_t(players.size()));
+		for (const Player& p : players)
 		{
-			w.u32(players[i].peer);
-			w.u16(players[i].level);
-			w.u8(players[i].role);
+			w.u32(p.peer);
+			w.u16(p.level);
+			w.u8(p.role);
 		}
-		const size_t m = servers.size() < kMaxMapServers ? servers.size() : kMaxMapServers;
-		w.u8(uint8_t(m));
-		for (size_t i = 0; i < m; ++i)
+		w.u8(uint8_t(servers.size()));
+		for (const Server& sv : servers)
 		{
-			w.u16(servers[i].level);
-			w.u8(servers[i].server);
-			w.u8(servers[i].state);
+			w.u16(sv.level);
+			w.u8(sv.server);
+			w.u8(sv.state);
 		}
-		const size_t g = gates.size() < kMaxMapGates ? gates.size() : kMaxMapGates;
-		w.u8(uint8_t(g));
-		for (size_t i = 0; i < g; ++i)
+		w.u8(uint8_t(gates.size()));
+		for (const Gate& g : gates)
 		{
-			w.u16(gates[i].level);
-			w.u8(gates[i].gate);
-			w.str(gates[i].reason);
+			w.u16(g.level);
+			w.u8(g.gate);
+			w.str(g.reason);
 		}
+		return true;
 	}
 
 	bool read(Reader& r)
@@ -223,7 +242,8 @@ struct LevelMapMsg
 			gate.level = r.u16();
 			gate.gate = r.u8();
 			gate.reason = r.str();
-			if (!r.ok() || gate.level == kNoLevel || !(gate.reason.empty() || char_name_valid(gate.reason, kMaxGateReason)))
+			if (!r.ok() || gate.level == kNoLevel || gate.gate > kLastGate ||
+			    !(gate.reason.empty() || char_name_valid(gate.reason, kMaxGateReason)))
 				return false;
 			for (const Gate& seen : tmp.gates)
 				if (seen.level == gate.level)
@@ -308,7 +328,8 @@ struct LevelMoveMsg
 // Wire: u32 seq, u8 verdict, u8 reason, u16 level.
 // Go: the world server moves him now; Together: the level is entered together, he waits at its board; Refused: not now, and
 // `reason` says why (Cap: the machine's limit of map servers, Gate: the level is closed to him, Invalid: not an exit he stands
-// at). `level` is the level the answer is about. The reason is None unless the verdict has one.
+// at). `level` is the level the answer is about. A verdict and its reason are one story: Go and Together have reason None,
+// Refused always has one; read() refuses the other pairs.
 struct LevelMoveResultMsg
 {
 	enum Verdict : uint8_t
@@ -344,7 +365,7 @@ struct LevelMoveResultMsg
 		verdict = r.u8();
 		reason = r.u8();
 		level = r.u16();
-		if (!r.ok() || verdict > Refused || reason > Invalid)
+		if (!r.ok() || verdict > Refused || reason > Invalid || (verdict == Refused) != (reason != None))
 		{
 			*this = LevelMoveResultMsg();
 			return false;
@@ -447,7 +468,12 @@ struct LevelEntityHead
 // ---------------------------------------------------------------- LevelXferUp (0x01D6), LevelXferDown (0x01D7)
 
 // Wire: u8 op, u16 id, u32 gen, then the cargo: the rest of the packet, at most kMaxXferCargo (a bigger one goes as a blob). The
-// ops are the two halves of the two-phase transfer of coop_xfer.h; which op carries a cargo is the logic's rule, not the wire's.
+// ops are the two halves of the two-phase transfer of coop_xfer.h (xfer::Op, one wire value for each op the core sends in that
+// direction: levels_wire_xfer_ops_cover_the_core); which op carries a cargo is the logic's rule, not the wire's.
+//   LevelXferUp   (the Holder, map server -> world server)  TakeReq, TakeCommit, ReleasePrepare, ReleaseCommit, SpawnPrepare,
+//                                                            Destroy, AbortAck, Snapshot (the stream: cargo = seq + state)
+//   LevelXferDown (the Ledger, world server -> map server)  Grant, Ack, Done, Abort, Drop, Snapshot (the ack of the stream and
+//                                                            the auditor's resync request: cargo = seq)
 // `id` is the root of the transferred unit in the world server's numbering, `gen` the generation of the transfer.
 struct LevelXferUpMsg
 {
@@ -468,14 +494,20 @@ struct LevelXferUpMsg
 	uint32_t gen = 0;
 	std::vector<uint8_t> cargo;
 
-	void write(Writer& w) const
+	// The cargo fits a packet (kMaxXferCargo); a bigger one goes as a blob.
+	bool fits() const { return cargo.size() <= kMaxXferCargo; }
+
+	// False, nothing written, for a cargo over the limit: a cargo cut to the limit would be applied as the whole object.
+	[[nodiscard]] bool write(Writer& w) const
 	{
+		if (!fits())
+			return false;
 		w.u8(op);
 		w.u16(id);
 		w.u32(gen);
-		const size_t n = cargo.size() < kMaxXferCargo ? cargo.size() : kMaxXferCargo;
-		if (n)
-			w.bytes(cargo.data(), n);
+		if (!cargo.empty())
+			w.bytes(cargo.data(), cargo.size());
+		return true;
 	}
 
 	bool read(Reader& r)
@@ -501,6 +533,7 @@ struct LevelXferDownMsg
 		Done = 2,
 		Abort = 3,
 		Drop = 4,
+		Snapshot = 5, // the ack of a snapshot stream (cargo: its sequence number) and the auditor's resync request
 	};
 
 	uint8_t op = Grant;
@@ -508,14 +541,20 @@ struct LevelXferDownMsg
 	uint32_t gen = 0;
 	std::vector<uint8_t> cargo; // Grant
 
-	void write(Writer& w) const
+	// The cargo fits a packet (kMaxXferCargo); a bigger one goes as a blob.
+	bool fits() const { return cargo.size() <= kMaxXferCargo; }
+
+	// False, nothing written, for a cargo over the limit: a cargo cut to the limit would be applied as the whole object.
+	[[nodiscard]] bool write(Writer& w) const
 	{
+		if (!fits())
+			return false;
 		w.u8(op);
 		w.u16(id);
 		w.u32(gen);
-		const size_t n = cargo.size() < kMaxXferCargo ? cargo.size() : kMaxXferCargo;
-		if (n)
-			w.bytes(cargo.data(), n);
+		if (!cargo.empty())
+			w.bytes(cargo.data(), cargo.size());
+		return true;
 	}
 
 	bool read(Reader& r)
@@ -523,7 +562,7 @@ struct LevelXferDownMsg
 		op = r.u8();
 		id = r.u16();
 		gen = r.u32();
-		if (!r.ok() || op > Drop || id == kNoObject || !detail::read_tail(r, cargo, kMaxXferCargo))
+		if (!r.ok() || op > Snapshot || id == kNoObject || !detail::read_tail(r, cargo, kMaxXferCargo))
 		{
 			*this = LevelXferDownMsg();
 			return false;
@@ -555,30 +594,35 @@ struct LevelBrainMsg
 		uint16_t old_smart = 0xFFFF;
 	};
 
-	std::vector<Squad> squads; // at most 255
-	std::vector<Assign> assigns; // at most 255
+	std::vector<Squad> squads; // at most kMaxBrainRows
+	std::vector<Assign> assigns; // at most kMaxBrainRows
 
-	void write(Writer& w) const
+	// At most kMaxBrainRows squads and as many assignments; the sender splits more over several packets.
+	bool fits() const { return squads.size() <= kMaxBrainRows && assigns.size() <= kMaxBrainRows; }
+
+	// False, nothing written, for more rows than that: the 256th squad would be one that is never told where to go.
+	[[nodiscard]] bool write(Writer& w) const
 	{
-		const size_t s = squads.size() < 255 ? squads.size() : 255;
-		w.u8(uint8_t(s));
-		for (size_t i = 0; i < s; ++i)
+		if (!fits())
+			return false;
+		w.u8(uint8_t(squads.size()));
+		for (const Squad& q : squads)
 		{
-			w.u16(squads[i].squad);
-			w.u16(squads[i].assigned);
-			w.u16(squads[i].current);
-			w.u8(squads[i].action);
-			w.u32(squads[i].stay_ms);
-			w.str(squads[i].scripted);
+			w.u16(q.squad);
+			w.u16(q.assigned);
+			w.u16(q.current);
+			w.u8(q.action);
+			w.u32(q.stay_ms);
+			w.str(q.scripted);
 		}
-		const size_t a = assigns.size() < 255 ? assigns.size() : 255;
-		w.u8(uint8_t(a));
-		for (size_t i = 0; i < a; ++i)
+		w.u8(uint8_t(assigns.size()));
+		for (const Assign& a : assigns)
 		{
-			w.u16(assigns[i].squad);
-			w.u16(assigns[i].smart);
-			w.u16(assigns[i].old_smart);
+			w.u16(a.squad);
+			w.u16(a.smart);
+			w.u16(a.old_smart);
 		}
+		return true;
 	}
 
 	bool read(Reader& r)
@@ -707,14 +751,20 @@ struct TunnelMsg
 		return packet.size() >= 2 ? static_cast<Msg>(uint16_t(packet[0] | (packet[1] << 8))) : static_cast<Msg>(0);
 	}
 
-	void write(Writer& w) const
+	// The packet is what a u16 length can name.
+	bool fits() const { return packet.size() <= kMaxTunnelPacket; }
+
+	// False, nothing written, for a longer packet: a packet cut to 65535 bytes would reach its handler as a whole message.
+	[[nodiscard]] bool write(Writer& w) const
 	{
-		const size_t n = packet.size() < kMaxTunnelPacket ? packet.size() : kMaxTunnelPacket;
+		if (!fits())
+			return false;
 		w.u32(peer);
 		w.u8(flags);
-		w.u16(uint16_t(n));
-		if (n)
-			w.bytes(packet.data(), n);
+		w.u16(uint16_t(packet.size()));
+		if (!packet.empty())
+			w.bytes(packet.data(), packet.size());
+		return true;
 	}
 
 	bool read(Reader& r)
@@ -845,18 +895,24 @@ struct LoadWaitMsg
 	uint16_t level = kNoLevel;
 	std::vector<Row> rows;
 
-	void write(Writer& w) const
+	// A row for each player of the session at the most.
+	bool fits() const { return rows.size() <= kMaxPlayers; }
+
+	// False, nothing written, for more rows: a player cut away would be taken for one nobody waits for.
+	[[nodiscard]] bool write(Writer& w) const
 	{
+		if (!fits())
+			return false;
 		w.u8(state);
 		w.u32(epoch);
 		w.u16(level);
-		const size_t n = rows.size() < kMaxPlayers ? rows.size() : size_t(kMaxPlayers);
-		w.u8(uint8_t(n));
-		for (size_t i = 0; i < n; ++i)
+		w.u8(uint8_t(rows.size()));
+		for (const Row& row : rows)
 		{
-			w.u32(rows[i].peer);
-			w.u8(rows[i].ready);
+			w.u32(row.peer);
+			w.u8(row.ready);
 		}
+		return true;
 	}
 
 	bool read(Reader& r)

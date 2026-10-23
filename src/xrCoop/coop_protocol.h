@@ -233,7 +233,8 @@ enum class MsgSender : uint8_t
 	HostOnly, // from a client: kicked as malformed before any handler
 	ClientOnly, // from the host: a client logs and ignores it
 	TrunkOnly, // protocol 11: sent by the bridge of a map server to the host's process; from anybody else: kicked as malformed
-	           // (the session's check comes with the bridge, F3a T9: until then no handler takes these)
+	           // (Session::game_message refuses it from everybody, a client of the host included, until the bridge peer
+	           // exists: F3a T9 lets the bridge through)
 };
 MsgSender msg_sender(Msg type);
 
