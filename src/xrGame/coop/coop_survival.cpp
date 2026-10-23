@@ -1321,13 +1321,21 @@ const HostRec* host_rec_if(u16 id)
 	return it == g_host.end() ? nullptr : &it->second;
 }
 
+// The `busy` of a Begin and of a Request alike: a revive of this fall is in order already, or another reviver's hold (his
+// Begin's lock) is on the wounded. The reviver's own lock does not turn him away.
+bool host_revive_busy(const HostRec* rec, u64 t, u16 seq, u16 reviver)
+{
+	return rec && (t < rec->revive_pending_until || rec->hold.busy_for(t, seq, reviver));
+}
+
 void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u16 item)
 {
 	++g_stat.requests_in;
 	const u64 t = now();
 	const HostRec* known = host_rec_if(target);
 	CGameObject* i_obj = nullptr;
-	const Refusal reason = host_revive_verdict(reviver, target, seq, item, known && t < known->revive_pending_until, i_obj);
+	// HUD v2 revive review M-3: a Request meets the lock of another reviver's Begin, as the header promises
+	const Refusal reason = host_revive_verdict(reviver, target, seq, item, host_revive_busy(known, t, seq, reviver), i_obj);
 
 	if (reason != RefNone)
 	{
@@ -1336,7 +1344,7 @@ void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u
 		if (known)
 		{
 			HostRec& h = g_host[target];
-			if (h.hold.stop(seq, reviver)) // the ring on the wounded ends: his Request was no good
+			if (h.hold.stop(t, seq, reviver)) // the ring on the wounded ends: his Request was no good
 				host_tell_stopped(target, seq, reviver);
 		}
 		return;
@@ -1373,9 +1381,9 @@ void host_on_revive_begin(u16 reviver, PeerId reply_to, const revive::BeginMsg& 
 	++g_stat.begins_in;
 	const u64 t = now();
 	const HostRec* known = host_rec_if(m.target);
-	const bool busy = known && (t < known->revive_pending_until || known->hold.busy_for(t, m.seq, reviver));
 	CGameObject* i_obj = nullptr;
-	const Refusal reason = host_revive_verdict(reviver, m.target, m.seq, m.item, busy, i_obj);
+	const Refusal reason =
+	    host_revive_verdict(reviver, m.target, m.seq, m.item, host_revive_busy(known, t, m.seq, reviver), i_obj);
 	if (reason != RefNone)
 	{
 		++g_stat.begins_refused;
@@ -1383,7 +1391,14 @@ void host_on_revive_begin(u16 reviver, PeerId reply_to, const revive::BeginMsg& 
 		return;
 	}
 	HostRec& h = g_host[m.target];
-	h.hold.begin(t, m.seq, reviver, m.held_ms);
+	// HUD v2 revive review I-1: the lock of the same reviver is not renewed for ever (HostHold: the chain's end), a Begin
+	// closer than the pace or just after his chain ran out is Busy, and the wounded hears nothing of it
+	if (h.hold.begin(t, m.seq, reviver, m.held_ms) == revive::HostHold::Begin::Busy)
+	{
+		++g_stat.begins_refused;
+		host_refuse(reply_to, m.target, RefBusy);
+		return;
+	}
 	revive::RevivingMsg out;
 	out.target = m.target;
 	out.seq = m.seq;
@@ -1401,8 +1416,24 @@ void host_on_revive_cancel(u16 reviver, u16 target, u16 seq)
 {
 	if (!host_rec_if(target))
 		return;
-	if (g_host[target].hold.stop(seq, reviver))
+	if (g_host[target].hold.stop(now(), seq, reviver))
 		host_tell_stopped(target, seq, reviver);
+}
+
+// HUD v2 revive review M-1: a reviver went away in the middle of a hold. The lock he held on anybody is dropped and that
+// wounded's owner is told, as for his Cancel (the lock and the ring would hang for up to kHoldMs + kGraceMs otherwise).
+void host_drop_reviver(u16 reviver)
+{
+	struct Dropped
+	{
+		u16 target, seq;
+	};
+	xr_vector<Dropped> dropped; // told after the walk: the orders may touch the records
+	for (auto& it : g_host)
+		if (it.second.hold.drop_reviver(reviver))
+			dropped.push_back({it.first, it.second.hold.seq()});
+	for (const Dropped& d : dropped)
+		host_tell_stopped(d.target, d.seq, reviver);
 }
 
 // ---------------------------------------------------------------- hardcore: a new character (F3 Task 10)
@@ -1652,7 +1683,9 @@ void host_frame(u64 t)
 
 	// players that left: their characters are parked. Dead or evacuated: the countdown stops and the respawn waits for
 	// their return (death::on_left, Review Focus 1); dead with the respawn order already out but not applied: the debt
-	// in the world brings it on the return. An order of the fall he left at is void.
+	// in the world brings it on the return. An order of the fall he left at is void. HUD v2 revive review M-1: and a lock
+	// he held on a wounded in the middle of a hold goes too, the wounded's owner told (host_drop_reviver).
+	xr_vector<u16> departed;
 	for (auto it = g_players.begin(); it != g_players.end();)
 	{
 		if (world::is_parked(it->first) || join::peer_of_proxy(it->first) == kInvalidPeer)
@@ -1662,11 +1695,14 @@ void host_frame(u64 t)
 			h.ordered_seq = death::kNoSeq;
 			h.revive_pending_until = 0;
 			h.hold.close();
+			departed.push_back(it->first);
 			it = g_players.erase(it);
 		}
 		else
 			++it;
 	}
+	for (const u16 id : departed)
+		host_drop_reviver(id);
 
 	host_retire_frame(t); // F3 Task 10: retirements whose stash is done
 
