@@ -94,8 +94,10 @@ std::string sanitize_nick(const std::string& in, const char* fallback)
 {
 	std::string s;
 	s.reserve(in.size());
+	// '"' goes too: the nick is written unquoted into ini texts (the proxy's custom data, [coop] nick = ...), and an odd
+	// quote leaves CInifile reading to the end of the text - an R_ASSERT at the proxy's net_Spawn (L-1 report)
 	for (unsigned char ch : in)
-		if (ch >= 0x20 && ch != 0x7F)
+		if (ch >= 0x20 && ch != 0x7F && ch != '"')
 			s.push_back(char(ch));
 	utf8_truncate(s, kMaxNickBytes);
 	return s.empty() ? std::string(fallback) : s;
