@@ -665,7 +665,7 @@ void reset()
 void frame()
 {
 	sound::frame();
-	if (!g_pGameLevel || !live())
+	if (!world_up() || !live()) // world gate: no tags while the level is built or torn down
 	{
 		g_tags.clear();
 		g_sight.clear();

@@ -2039,7 +2039,7 @@ void install(Session& s)
 
 bool host_can_start()
 {
-	if (!g_pGameLevel || !ai().get_alife() || !ai().alife().graph().actor())
+	if (!world_up() || !ai().alife().graph().actor()) // world gate: a level half built is no game to host
 	{
 		::Msg("! [coop] start or load a game first, then coop_host");
 		return false;
@@ -2396,7 +2396,7 @@ void host_watch_world()
 		}
 	}
 	// The same "level is up" as for joins (host_precaching): an unfocused host sent no SessionReset either.
-	if (!g.reset_pending || !g_pGameLevel || !g_actor || host_precaching() || !ai().get_alife())
+	if (!g.reset_pending || !world_up() || host_precaching()) // world gate: bReady too, not just g_pGameLevel
 		return;
 	g.reset_pending = false;
 	// F0 final review (task 12): a join admitted since the world changed (a player who connected meanwhile) is void

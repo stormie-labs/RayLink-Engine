@@ -100,7 +100,7 @@ bool machine_info(const shared_str& id) { return rules::is_machine_info(cs(id));
 u16 host_id_of(u16 local) { return local == kNoId ? kNoId : join::to_host(local); }
 u16 local_id_of(u16 host) { return host == kNoId ? kNoId : join::to_local(host); }
 
-bool in_game() { return g_pGameLevel && g_actor && ai().get_alife(); }
+bool in_game() { return world_up(); } // world gate: g_pGameLevel alone is set at the start of CLevel::CLevel
 bool client_live() { return mgr().is_live_client() && in_game(); }
 CGameTaskManager& tasks() { return Level().GameTaskManager(); }
 CMapManager& spots() { return Level().MapManager(); }

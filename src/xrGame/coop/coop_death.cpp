@@ -724,7 +724,7 @@ void release_empty_bags(u64 t)
 	if (t < g_next_bag_poll)
 		return;
 	g_next_bag_poll = t + kBagPollMs;
-	if (!g_pGameLevel || !ai().get_alife())
+	if (!world_up()) // world gate: not while the level is built or torn down
 		return;
 	xr_vector<u16> empty;
 	for (u32 i = 0, n = Level().Objects.o_count(); i < n; ++i)
