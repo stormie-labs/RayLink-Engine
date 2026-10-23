@@ -26,9 +26,18 @@
 // none_functions(). A rule for a script that is not installed never matches, so coop_compat_<mod>.ltx of a missing
 // mod changes nothing (MOD_LAYER §2.5).
 //
+// Binders (F2 T11): the methods the engine itself calls on a script binder (CScriptBinder: update on every shedule tick,
+// net_spawn, save ...) are not callbacks. configs\coop_route_binders.ltx ([binder_host], [binder_keep]; any coop_route*.ltx
+// or coop_compat_*.ltx may hold them) names, by the script_binding of the object's section, what a client does with each
+// method (routes::BinderAction, coop_routes.h): Run, HostOnly (not called) or KeepOnError (called, a Lua error is logged
+// once per binder and method and the binder stays). The host and single player always Run. script_binder.cpp asks
+// binder_action() before each call.
+//
 // Threading: Lua calls come from one Lua thread at a time (main or the GameThread worker); print_status comes from the
 // console. One lock guards the table, the cache and the counters.
 #pragma once
+
+#include "xrCoop/coop_routes.h"
 
 struct lua_State;
 
@@ -47,5 +56,61 @@ void print_status();
 void load_overrides();
 // Adds the `route` table to the `coop` namespace of this Lua state (coop_script.cpp register_raw).
 void register_lua(lua_State* L);
+
+// --- F2 T11: engine-invoked binder methods ---
+
+// The methods CScriptBinder calls on its Lua object; the order is routes::kBinderMethodNames.
+enum class BinderMethod : u8
+{
+	Reinit,
+	Reload,
+	NetSpawn,
+	NetDestroy,
+	Update,
+	Save,
+	Load,
+	NetSaveRelevant
+};
+
+// What this machine does with `method` of the binder created by `binding` (the script_binding of its section, e.g.
+// "bind_camp.bind"; null for a binder Lua attached by hand). Run on the host, in single player, outside a session and
+// for a binding no rule names. A HostOnly answer is a skipped call and is counted as one.
+routes::BinderAction binder_action(const char* binding, BinderMethod method);
+
+// An exception reached CScriptBinder's catch (exception builds). True: the action is KeepOnError, the binder stays and
+// the error is counted and logged (the first one per binder and method, `logged` is the binder's own bit mask); false:
+// the caller drops the binder as the stock engine does.
+bool binder_kept(routes::BinderAction action, const char* binding, BinderMethod method, u16& logged, const char* what);
+
+// While alive, a Lua error inside a call the engine makes into Lua (luabind) does not end the game: the Release engine
+// raises a fatal error from the luabind pcall handler (CScriptEngine::lua_pcall_failed) and has no C++ exceptions for
+// the catch branches to catch. The scope puts a logging handler in its place and restores the engine's on exit, so a
+// failed call returns at once like an empty method (bool methods answer what the Lua object would not have changed:
+// net_spawn true, net_save_relevant false, see failed()). `active` false: does nothing. In an exception build (Debug)
+// luabind throws and the catch branches handle it, the scope does nothing there either.
+// Errors of any luabind call made inside the scope are kept, nested binder calls included.
+class BinderKeepScope
+{
+public:
+	BinderKeepScope(bool active, const char* binding, BinderMethod method, u16& logged);
+	~BinderKeepScope();
+	BinderKeepScope(const BinderKeepScope&) = delete;
+	BinderKeepScope& operator=(const BinderKeepScope&) = delete;
+
+	// A Lua error was kept inside the scope.
+	bool failed() const { return m_failed; }
+	// Called by the handlers of the scope in force.
+	void on_lua_error(lua_State* L);
+
+private:
+	const char* m_binding;
+	BinderMethod m_method;
+	u16* m_logged;
+	bool m_active = false;
+	bool m_failed = false;
+	BinderKeepScope* m_outer = nullptr;
+	int (*m_prev_pcall)(lua_State*) = nullptr;
+	void (*m_prev_error)(lua_State*) = nullptr;
+};
 } // namespace router
 } // namespace coop

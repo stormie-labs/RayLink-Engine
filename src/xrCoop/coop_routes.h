@@ -9,7 +9,7 @@
 //   level - reserved for F3a (split levels); behaves as host until then
 // Names (callbacks and scripts) compare case-insensitively: an ltx reader may lowercase keys, Lua sends the real case.
 // F2 T10 adds what the router needs besides the table: script_key (a function's script from its Lua source) and the
-// call counters.
+// call counters. F2 T11 adds the binder rules: what a client does with a method the engine calls on a script binder.
 // Pure C++17, header-only, no engine dependencies: used by the engine, the unit-test exe and the Lua test runner.
 #pragma once
 
@@ -461,6 +461,147 @@ inline std::vector<Override> parse_section(std::string_view section,
 	return out;
 }
 
+// --- F2 T11: the methods the engine itself calls on a script binder (CScriptBinder, xrGame/script_binder.cpp) ---
+// Not callbacks: Anomaly's binders are Lua classes derived from object_binder, and the engine calls their methods by name
+// (update every shedule tick, net_spawn, save ...). The section of the object names the class's creator in
+// `script_binding = bind_camp.bind` (script.function); that string is the key here, so the engine decides what a client
+// does with a method before it enters Lua. Lua-called methods (a binder's own helpers) cannot be reached from here and
+// stay in scripts\coop_client_binders.script.
+//   Run         - call it, as the stock game does: the host, single player, a binding no rule names
+//   HostOnly    - do not call it on a client: world logic only the host runs ([binder_host]); a client keeps the C++ default
+//   KeepOnError - call it on a client; a Lua error is logged once per binder and method and the binder stays, where the
+//                 stock engine drops the binder for good ([binder_keep])
+enum class BinderAction : uint8_t
+{
+	Run,
+	HostOnly,
+	KeepOnError
+};
+
+inline const char* binder_action_name(BinderAction a)
+{
+	switch (a)
+	{
+	case BinderAction::Run: return "run";
+	case BinderAction::HostOnly: return "host";
+	case BinderAction::KeepOnError: return "keep";
+	}
+	return "run";
+}
+
+// The Lua names of the methods the engine calls, in the order of the engine enum coop::router::BinderMethod.
+// (net_Relcase is not among them: CScriptBinderObjectWrapper::net_Relcase does not call Lua, and the engine asks it of
+// every binder for every destroyed object.)
+inline constexpr std::string_view kBinderMethodNames[] = {"reinit", "reload", "net_spawn", "net_destroy", "update", "save",
+	"load", "net_save_relevant"};
+inline constexpr size_t kBinderMethodCount = sizeof(kBinderMethodNames) / sizeof(kBinderMethodNames[0]);
+
+inline constexpr const char* kBinderHostSection = "binder_host";
+inline constexpr const char* kBinderKeepSection = "binder_keep";
+
+// One line of [binder_host] / [binder_keep]: `script.function = method, method`.
+struct BinderRule
+{
+	BinderAction action = BinderAction::Run;
+	std::string binding;              // the script_binding value, as written
+	std::vector<std::string> methods; // lowercase names from kBinderMethodNames
+};
+
+namespace detail
+{
+// script.function: parts of letters, digits and '_' joined by dots, at least two (a mod's nested module is allowed).
+inline bool is_binding_name(std::string_view s)
+{
+	size_t parts = 0, len = 0;
+	for (const char c : s)
+	{
+		if (c == '.')
+		{
+			if (len == 0)
+				return false;
+			++parts;
+			len = 0;
+		}
+		else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
+			++len;
+		else
+			return false;
+	}
+	return len != 0 && parts >= 1;
+}
+
+inline int binder_method_index(std::string_view name)
+{
+	for (size_t i = 0; i < kBinderMethodCount; ++i)
+		if (iequals(name, kBinderMethodNames[i]))
+			return int(i);
+	return -1;
+}
+} // namespace detail
+
+// Parses one ltx section of `binding = method, method` lines (methods separated by commas and blanks). A bad line is
+// skipped and reported in `errors` (may be null) as "<section>: <name> = <value>: <why>"; the other lines still parse.
+// An unknown section is one error and no rules.
+inline std::vector<BinderRule> parse_binder_section(std::string_view section,
+	const std::vector<std::pair<std::string, std::string>>& lines, std::vector<std::string>* errors)
+{
+	std::vector<BinderRule> out;
+	const std::string_view sec = detail::trimmed(section);
+	BinderAction action = BinderAction::Run;
+	if (detail::iequals(sec, kBinderHostSection))
+		action = BinderAction::HostOnly;
+	else if (detail::iequals(sec, kBinderKeepSection))
+		action = BinderAction::KeepOnError;
+	else
+	{
+		if (errors)
+			errors->push_back(std::string(sec) + ": unknown section (" + kBinderHostSection + ", " + kBinderKeepSection + ")");
+		return out;
+	}
+
+	for (const std::pair<std::string, std::string>& line : lines)
+	{
+		const std::string_view key = detail::trimmed(line.first);
+		const std::string_view value = detail::trimmed(line.second);
+		BinderRule rule;
+		rule.action = action;
+		rule.binding = std::string(key);
+		std::string why;
+		if (!detail::is_binding_name(key))
+			why = "expected script.function (the script_binding of the object's section)";
+		else
+		{
+			size_t pos = 0;
+			while (pos < value.size())
+			{
+				const size_t end = value.find_first_of(", \t", pos);
+				const std::string_view token = value.substr(pos, end == std::string_view::npos ? end : end - pos);
+				pos = end == std::string_view::npos ? value.size() : end + 1;
+				if (token.empty())
+					continue;
+				const int m = detail::binder_method_index(token);
+				if (m < 0)
+				{
+					why = "unknown binder method '" + std::string(token) + "' (reinit, reload, net_spawn, net_destroy, update, save, load, "
+						"net_save_relevant)";
+					break;
+				}
+				rule.methods.emplace_back(kBinderMethodNames[size_t(m)]);
+			}
+			if (why.empty() && rule.methods.empty())
+				why = "expected a list of binder methods";
+		}
+		if (!why.empty())
+		{
+			if (errors)
+				errors->push_back(std::string(sec) + ": " + std::string(key) + " = " + std::string(value) + ": " + why);
+			continue;
+		}
+		out.push_back(std::move(rule));
+	}
+	return out;
+}
+
 // Overrides by kind; route() answers from strongest to weakest:
 //   1. pair callback@script
 //   2. forced callback, unless the script's own rule is none
@@ -500,6 +641,38 @@ public:
 		}
 	}
 
+	// F2 T11: a binder rule gives each of its methods the rule's action; a later rule for the same binding and method
+	// replaces the earlier one. Rules without a binding or a method are ignored (parse_binder_section never makes them).
+	void add(const BinderRule& r)
+	{
+		if (r.binding.empty())
+			return;
+		for (const std::string& m : r.methods)
+			if (!m.empty())
+				m_binders[detail::lowered(r.binding)][detail::lowered(m)] = r.action;
+	}
+
+	// What a client does with `method` of the binder created by `binding` (the object's script_binding, script.function).
+	BinderAction binder_action(std::string_view binding, std::string_view method) const
+	{
+		if (m_binders.empty() || binding.empty() || method.empty())
+			return BinderAction::Run;
+		const auto b = m_binders.find(detail::lowered(binding));
+		if (b == m_binders.end())
+			return BinderAction::Run;
+		const auto m = b->second.find(detail::lowered(method));
+		return m == b->second.end() ? BinderAction::Run : m->second;
+	}
+
+	// Binder rules, one per (binding, method); size() counts the callback rules only.
+	size_t binder_size() const
+	{
+		size_t n = 0;
+		for (const auto& b : m_binders)
+			n += b.second.size();
+		return n;
+	}
+
 	void clear()
 	{
 		m_pairs.clear();
@@ -507,6 +680,7 @@ public:
 		m_callbacks.clear();
 		m_scripts.clear();
 		m_prefixes.clear();
+		m_binders.clear();
 	}
 
 	size_t size() const
@@ -595,6 +769,7 @@ private:
 	std::map<std::string, Domain> m_callbacks; // callback, lowercase
 	std::map<std::string, Domain> m_scripts;   // exact script, lowercase
 	std::vector<Prefix> m_prefixes;            // script prefix without the *, lowercase
+	std::map<std::string, std::map<std::string, BinderAction>> m_binders; // binding -> method -> action, lowercase
 };
 
 // Host and level run only on the host; owner and view run everywhere; none runs nowhere.
