@@ -9,7 +9,7 @@
 //   level - reserved for F3a (split levels); behaves as host until then
 // Names (callbacks and scripts) compare case-insensitively: an ltx reader may lowercase keys, Lua sends the real case.
 // F2 T10 adds what the router needs besides the table: script_key (a function's script from its Lua source) and the
-// call counters. F2 T11 adds the binder rules: what a client does with a method the engine calls on a script binder.
+// call counters. F2 T11 adds the binder rules: whether a client calls a method the engine calls on a script binder.
 // Pure C++17, header-only, no engine dependencies: used by the engine, the unit-test exe and the Lua test runner.
 #pragma once
 
@@ -464,18 +464,16 @@ inline std::vector<Override> parse_section(std::string_view section,
 // --- F2 T11: the methods the engine itself calls on a script binder (CScriptBinder, xrGame/script_binder.cpp) ---
 // Not callbacks: Anomaly's binders are Lua classes derived from object_binder, and the engine calls their methods by name
 // (update every shedule tick, net_spawn, save ...). The section of the object names the class's creator in
-// `script_binding = bind_camp.bind` (script.function); that string is the key here, so the engine decides what a client
-// does with a method before it enters Lua. Lua-called methods (a binder's own helpers) cannot be reached from here and
-// stay in scripts\coop_client_binders.script.
-//   Run         - call it, as the stock game does: the host, single player, a binding no rule names
-//   HostOnly    - do not call it on a client: world logic only the host runs ([binder_host]); a client keeps the C++ default
-//   KeepOnError - call it on a client; a Lua error is logged once per binder and method and the binder stays, where the
-//                 stock engine drops the binder for good ([binder_keep])
+// `script_binding = bind_camp.bind` (script.function); that string is the key here, so the engine decides whether a client
+// calls a method before it enters Lua. Lua-called methods (a binder's own helpers) cannot be reached from here and stay in
+// scripts\coop_client_binders.script, and so does every "keep running through a Lua error" rule: the Release engine has no C++
+// exceptions, a Lua error there is fatal, and only a Lua pcall around the method survives it (Ruling F2-35).
+//   Run      - call it, as the stock game does: the host, single player, a binding no rule names
+//   HostOnly - do not call it on a client: world logic only the host runs ([binder_host]); a client keeps the C++ default
 enum class BinderAction : uint8_t
 {
 	Run,
-	HostOnly,
-	KeepOnError
+	HostOnly
 };
 
 inline const char* binder_action_name(BinderAction a)
@@ -484,7 +482,6 @@ inline const char* binder_action_name(BinderAction a)
 	{
 	case BinderAction::Run: return "run";
 	case BinderAction::HostOnly: return "host";
-	case BinderAction::KeepOnError: return "keep";
 	}
 	return "run";
 }
@@ -497,9 +494,8 @@ inline constexpr std::string_view kBinderMethodNames[] = {"reinit", "reload", "n
 inline constexpr size_t kBinderMethodCount = sizeof(kBinderMethodNames) / sizeof(kBinderMethodNames[0]);
 
 inline constexpr const char* kBinderHostSection = "binder_host";
-inline constexpr const char* kBinderKeepSection = "binder_keep";
 
-// One line of [binder_host] / [binder_keep]: `script.function = method, method`.
+// One line of [binder_host]: `script.function = method, method`.
 struct BinderRule
 {
 	BinderAction action = BinderAction::Run;
@@ -539,23 +535,18 @@ inline int binder_method_index(std::string_view name)
 }
 } // namespace detail
 
-// Parses one ltx section of `binding = method, method` lines (methods separated by commas and blanks). A bad line is
-// skipped and reported in `errors` (may be null) as "<section>: <name> = <value>: <why>"; the other lines still parse.
-// An unknown section is one error and no rules.
+// Parses the [binder_host] section of `binding = method, method` lines (methods separated by commas and blanks). A bad
+// line is skipped and reported in `errors` (may be null) as "<section>: <name> = <value>: <why>"; the other lines still
+// parse. Any other section is one error and no rules.
 inline std::vector<BinderRule> parse_binder_section(std::string_view section,
 	const std::vector<std::pair<std::string, std::string>>& lines, std::vector<std::string>* errors)
 {
 	std::vector<BinderRule> out;
 	const std::string_view sec = detail::trimmed(section);
-	BinderAction action = BinderAction::Run;
-	if (detail::iequals(sec, kBinderHostSection))
-		action = BinderAction::HostOnly;
-	else if (detail::iequals(sec, kBinderKeepSection))
-		action = BinderAction::KeepOnError;
-	else
+	if (!detail::iequals(sec, kBinderHostSection))
 	{
 		if (errors)
-			errors->push_back(std::string(sec) + ": unknown section (" + kBinderHostSection + ", " + kBinderKeepSection + ")");
+			errors->push_back(std::string(sec) + ": unknown section (" + kBinderHostSection + ")");
 		return out;
 	}
 
@@ -564,7 +555,7 @@ inline std::vector<BinderRule> parse_binder_section(std::string_view section,
 		const std::string_view key = detail::trimmed(line.first);
 		const std::string_view value = detail::trimmed(line.second);
 		BinderRule rule;
-		rule.action = action;
+		rule.action = BinderAction::HostOnly;
 		rule.binding = std::string(key);
 		std::string why;
 		if (!detail::is_binding_name(key))
@@ -641,8 +632,8 @@ public:
 		}
 	}
 
-	// F2 T11: a binder rule gives each of its methods the rule's action; a later rule for the same binding and method
-	// replaces the earlier one. Rules without a binding or a method are ignored (parse_binder_section never makes them).
+	// F2 T11: a binder rule gives each of its methods the rule's action. Rules without a binding or a method are ignored
+	// (parse_binder_section never makes them).
 	void add(const BinderRule& r)
 	{
 		if (r.binding.empty())
@@ -652,7 +643,7 @@ public:
 				m_binders[detail::lowered(r.binding)][detail::lowered(m)] = r.action;
 	}
 
-	// What a client does with `method` of the binder created by `binding` (the object's script_binding, script.function).
+	// Whether a client calls `method` of the binder created by `binding` (the object's script_binding, script.function).
 	BinderAction binder_action(std::string_view binding, std::string_view method) const
 	{
 		if (m_binders.empty() || binding.empty() || method.empty())

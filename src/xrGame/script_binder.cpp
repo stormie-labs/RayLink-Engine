@@ -23,35 +23,33 @@
 
 namespace
 {
-// Anomaly Coop (F2 T11): one call of a Lua method of the binder, the way the binder router says (coop_router.h).
+// Anomaly Coop (F2 T11): one call of a Lua method of the binder, unless the binder router says a client does not make it
+// (coop_router.h, [binder_host]).
 //   Done     - the method ran
 //   Skipped  - HostOnly: a client does not call it (the C++ default stands)
-//   Failed   - KeepOnError: the Lua error is logged and counted, the binder stays (the result of the call is void)
-//   Dropped  - the call threw and nothing keeps the binder: the caller clear()s it, as the stock engine does
+//   Dropped  - the call threw: the caller clear()s the binder, as the stock engine does. In the Release build (no C++
+//              exceptions) this catches structured exceptions only, not Lua errors: those are fatal, and a binder that
+//              must survive them is wrapped in pcall by scripts\coop_client_binders.script (Ruling F2-35)
 enum class Call
 {
 	Done,
 	Skipped,
-	Failed,
 	Dropped
 };
 
 template <typename F>
-Call call_routed(const char* binding, u16& logged, coop::router::BinderMethod method, F&& call)
+Call call_routed(const char* binding, coop::router::BinderMethod method, F&& call)
 {
-	const coop::routes::BinderAction action = coop::router::binder_action(binding, method);
-	if (action == coop::routes::BinderAction::HostOnly)
+	if (coop::router::binder_action(binding, method) == coop::routes::BinderAction::HostOnly)
 		return Call::Skipped;
 	try
 	{
-		// The Release engine has no C++ exceptions: a Lua error ends in a fatal error unless the scope takes it.
-		coop::router::BinderKeepScope keep(action == coop::routes::BinderAction::KeepOnError, binding, method, logged);
 		call();
-		return keep.failed() ? Call::Failed : Call::Done;
+		return Call::Done;
 	}
 	catch (...)
 	{
-		return coop::router::binder_kept(action, binding, method, logged, "exception") ? Call::Failed : Call::Dropped;
+		return Call::Dropped;
 	}
 }
 } // namespace
@@ -69,8 +67,7 @@ CScriptBinder::~CScriptBinder()
 void CScriptBinder::init()
 {
 	m_object = 0;
-	m_script_binding = 0; // Anomaly Coop
-	m_coop_logged = 0; // Anomaly Coop
+	m_script_binding = shared_str(); // Anomaly Coop
 }
 
 void CScriptBinder::clear()
@@ -96,7 +93,7 @@ void CScriptBinder::reinit()
 	if (m_object)
 	{
 		// Anomaly Coop: the call goes through the binder router (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::Reinit,
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Reinit,
 				[&] { m_object->reinit(); }) == Call::Dropped)
 			clear();
 	}
@@ -151,7 +148,7 @@ void CScriptBinder::reload(LPCSTR section)
 	if (m_object)
 	{
 		// Anomaly Coop: the call goes through the binder router (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::Reload,
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Reload,
 				[&] { m_object->reload(section); }) == Call::Dropped)
 			clear();
 	}
@@ -177,10 +174,10 @@ BOOL CScriptBinder::net_Spawn(CSE_Abstract* DC)
 	CSE_ALifeObject* object = smart_cast<CSE_ALifeObject*>(abstract);
 	if (object && m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped or failed net_spawn answers what the
-		// binder object does without one: true
+		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped net_spawn answers what the binder
+		// object does without one: true
 		BOOL result = TRUE;
-		switch (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::NetSpawn,
+		switch (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetSpawn,
 			[&] { result = (BOOL)m_object->net_Spawn(object); }))
 		{
 		case Call::Done:
@@ -188,7 +185,7 @@ BOOL CScriptBinder::net_Spawn(CSE_Abstract* DC)
 		case Call::Dropped:
 			clear();
 			break;
-		default:
+		case Call::Skipped:
 			return (TRUE);
 		}
 	}
@@ -213,7 +210,7 @@ void CScriptBinder::net_Destroy()
 		Msg						("* Core object %s is UNbinded from the script object",smart_cast<CGameObject*>(this) ? *smart_cast<CGameObject*>(this)->cName() : "");
 #endif // _DEBUG
 		// Anomaly Coop: the call goes through the binder router (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::NetDestroy,
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetDestroy,
 				[&] { m_object->net_Destroy(); }) == Call::Dropped)
 			clear();
 	}
@@ -243,8 +240,8 @@ void CScriptBinder::shedule_Update(u32 time_delta)
 	{
 		if (coop::remote::suspend_binder(this)) // Anomaly Coop: no Lua logic for puppets
 			return; // Anomaly Coop
-		// Anomaly Coop: HostOnly bindings do not update on a client, KeepOnError ones survive a Lua error (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::Update,
+		// Anomaly Coop: host-only bindings do not update on a client (F2 T11)
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Update,
 				[&] { m_object->shedule_Update(time_delta); }) == Call::Dropped)
 			clear();
 	}
@@ -256,7 +253,7 @@ void CScriptBinder::save(NET_Packet& output_packet)
 	if (m_object)
 	{
 		// Anomaly Coop: the call goes through the binder router (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::Save,
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Save,
 				[&] { m_object->save(&output_packet); }) == Call::Dropped)
 			clear();
 	}
@@ -268,7 +265,7 @@ void CScriptBinder::load(IReader& input_packet)
 	if (m_object)
 	{
 		// Anomaly Coop: the call goes through the binder router (F2 T11)
-		if (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::Load,
+		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Load,
 				[&] { m_object->load(&input_packet); }) == Call::Dropped)
 			clear();
 	}
@@ -278,9 +275,9 @@ BOOL CScriptBinder::net_SaveRelevant()
 {
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped or failed one answers false
+		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped one answers false
 		BOOL result = FALSE;
-		switch (call_routed(m_script_binding, m_coop_logged, coop::router::BinderMethod::NetSaveRelevant,
+		switch (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetSaveRelevant,
 			[&] { result = (BOOL)m_object->net_SaveRelevant(); }))
 		{
 		case Call::Done:
@@ -288,7 +285,7 @@ BOOL CScriptBinder::net_SaveRelevant()
 		case Call::Dropped:
 			clear();
 			break;
-		default:
+		case Call::Skipped:
 			break;
 		}
 	}

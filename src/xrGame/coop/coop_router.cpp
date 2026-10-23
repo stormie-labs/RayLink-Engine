@@ -5,11 +5,8 @@
 #include "coop_router.h"
 #include "coop_manager.h"
 #include "xrCoop/coop_routes.h"
-#include "ai_space.h"
-#include "script_engine.h"
 
 #include <algorithm>
-#include <cstring>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -30,19 +27,16 @@ constexpr u32 kErrorsLogged = 20;    // ltx errors written to the log one by one
 constexpr size_t kTopSkipped = 10;
 constexpr const char* kNoneSection = "route_none_functions";
 constexpr const char* kRouteSections[] = {"route_scripts", "route_callbacks", "route_callbacks_forced", "route_pairs"};
-constexpr const char* kBinderSections[] = {routes::kBinderHostSection, routes::kBinderKeepSection};
 constexpr size_t kTopBinders = 10;
-constexpr size_t kBinderMessage = 600; // longest Lua error text written to the log
 static_assert(size_t(BinderMethod::NetSaveRelevant) + 1 == routes::kBinderMethodCount,
 	"BinderMethod follows routes::kBinderMethodNames");
 
 // A binding (script_binding value) the binder router has been asked about: its resolved actions and call counters.
 struct BinderSlot
 {
-	std::string binding;
+	shared_str binding; // pinned: the cache is keyed by the address of this string, which stays valid while it lives
 	routes::BinderAction action[routes::kBinderMethodCount] = {};
 	u64 skipped[routes::kBinderMethodCount] = {}; // HostOnly answers, by method
-	u64 kept[routes::kBinderMethodCount] = {};    // Lua errors kept, by method
 };
 
 struct State
@@ -52,7 +46,7 @@ struct State
 	std::vector<std::string> none_functions;
 	std::vector<std::string> files; // read, in order
 	u32 rules = 0;
-	u32 binder_rules = 0; // (binding, method) rules of [binder_host] / [binder_keep]
+	u32 binder_rules = 0; // (binding, method) rules of [binder_host]
 	u32 errors = 0;
 	// Table::route lowercases both names and scans the prefixes: a handler is routed once when it is registered, and
 	// a pair seen before (one script's many time events) is answered from here.
@@ -60,8 +54,8 @@ struct State
 	u64 cache_flushes = 0;
 	u64 routed[routes::Counters::kDomains] = {}; // of() answers by domain since install
 	routes::Counters counters;
-	// Binders: one slot per distinct script_binding string; the binder asks with the address of the string in
-	// system.ltx, which stays valid for the whole run, so the second ask is a pointer lookup.
+	// Binders: one slot per distinct script_binding string; the binder asks with the address of its shared_str, which
+	// the slot pins, so the second ask is a pointer lookup.
 	std::vector<BinderSlot> binder_slots;
 	std::unordered_map<std::string, size_t> binder_by_name; // binding as written -> slot
 	std::unordered_map<const char*, size_t> binder_by_ptr;  // address of the binding string -> slot
@@ -148,14 +142,12 @@ void read_file(const std::string& name)
 			if (g.errors++ < kErrorsLogged)
 				::Msg("! [coop] configs\\%s: %s", name.c_str(), e.c_str());
 	}
-	// F2 T11: [binder_host] / [binder_keep], `script_binding = method, method`. In this order: a later line for the same
-	// binding and method wins, so within one file [binder_keep] overrides [binder_host].
-	for (const char* sec : kBinderSections)
+	// F2 T11: [binder_host], `script_binding = method, method`
+	if (ini.section_exist(routes::kBinderHostSection))
 	{
-		if (!ini.section_exist(sec))
-			continue;
 		std::vector<std::string> errors;
-		for (const routes::BinderRule& r : routes::parse_binder_section(sec, section_lines(ini, sec), &errors))
+		for (const routes::BinderRule& r :
+			routes::parse_binder_section(routes::kBinderHostSection, section_lines(ini, routes::kBinderHostSection), &errors))
 		{
 			g.table.add(r);
 			g.binder_rules += u32(r.methods.size());
@@ -315,9 +307,9 @@ BinderSlot& binder_slot(const char* binding)
 	else
 	{
 		BinderSlot slot;
-		slot.binding = binding;
+		slot.binding = binding; // docks the string: the same str_value the binder holds, kept alive by the slot
 		for (size_t i = 0; i < routes::kBinderMethodCount; ++i)
-			slot.action[i] = g.table.binder_action(slot.binding, routes::kBinderMethodNames[i]);
+			slot.action[i] = g.table.binder_action(binding, routes::kBinderMethodNames[i]);
 		index = g.binder_slots.size();
 		g.binder_slots.push_back(std::move(slot));
 		g.binder_by_name.emplace(binding, index);
@@ -325,47 +317,6 @@ BinderSlot& binder_slot(const char* binding)
 	g.binder_by_ptr.emplace(binding, index);
 	return g.binder_slots[index];
 }
-
-const char* method_name(BinderMethod m)
-{
-	const size_t i = size_t(m);
-	return i < routes::kBinderMethodCount ? routes::kBinderMethodNames[i].data() : "?";
-}
-
-// Counts a Lua error the binder kept. True when it is the first one of this binder for the method: the caller writes
-// it to the log (the bit mask `logged` belongs to the binder).
-bool note_kept(const char* binding, BinderMethod method, u16& logged)
-{
-	const size_t i = size_t(method);
-	if (i >= routes::kBinderMethodCount)
-		return false;
-	if (binding && *binding)
-	{
-		xrCriticalSectionGuard guard(g_lock);
-		++binder_slot(binding).kept[i];
-	}
-	const u16 bit = u16(1u << i);
-	if (logged & bit)
-		return false;
-	logged = u16(logged | bit);
-	return true;
-}
-
-// The scope in force (Release engine). Lua runs one thread at a time, and the luabind callbacks it swaps are process-wide.
-BinderKeepScope* g_scope = nullptr;
-
-#ifdef LUABIND_NO_EXCEPTIONS
-// luabind's pcall message handler, runs at the point of the error with the error object on top of the stack.
-int keep_pcall_handler(lua_State* L)
-{
-	if (g_scope)
-		g_scope->on_lua_error(L);
-	return 1; // the error object stays the result of the failed call
-}
-
-// luabind calls this after a failed call_member; the stock one raises the fatal error, the message handler did the work.
-void keep_error_callback(lua_State*) {}
-#endif
 } // namespace
 
 void install()
@@ -393,10 +344,7 @@ void reset()
 	xrCriticalSectionGuard guard(g_lock);
 	g.counters.clear();
 	for (BinderSlot& b : g.binder_slots)
-	{
 		std::fill(std::begin(b.skipped), std::end(b.skipped), u64(0));
-		std::fill(std::begin(b.kept), std::end(b.kept), u64(0));
-	}
 }
 
 void load_overrides()
@@ -459,61 +407,6 @@ routes::BinderAction binder_action(const char* binding, BinderMethod method)
 	return slot.action[i];
 }
 
-bool binder_kept(routes::BinderAction action, const char* binding, BinderMethod method, u16& logged, const char* what)
-{
-	if (action != routes::BinderAction::KeepOnError)
-		return false;
-	if (note_kept(binding, method, logged))
-		::Msg("! [coop] binder %s: %s raised an error, the binder stays (the first one of this object; all are counted in "
-			  "coop_status): %s",
-			binding ? binding : "?", method_name(method), what ? what : "?");
-	return true;
-}
-
-BinderKeepScope::BinderKeepScope(bool active, const char* binding, BinderMethod method, u16& logged) :
-	m_binding(binding), m_method(method), m_logged(&logged)
-{
-#ifdef LUABIND_NO_EXCEPTIONS
-	if (!active || !binding || !*binding)
-		return;
-	m_active = true;
-	m_outer = g_scope;
-	m_prev_pcall = ::luabind::get_pcall_callback();
-	m_prev_error = ::luabind::get_error_callback();
-	::luabind::set_pcall_callback(&keep_pcall_handler);
-	::luabind::set_error_callback(&keep_error_callback);
-	g_scope = this;
-#else
-	(void)active; // luabind throws, the catch branches of CScriptBinder keep the binder
-#endif
-}
-
-BinderKeepScope::~BinderKeepScope()
-{
-#ifdef LUABIND_NO_EXCEPTIONS
-	if (!m_active)
-		return;
-	::luabind::set_pcall_callback(m_prev_pcall);
-	::luabind::set_error_callback(m_prev_error);
-	g_scope = m_outer;
-#endif
-}
-
-void BinderKeepScope::on_lua_error(lua_State* L)
-{
-	m_failed = true;
-	if (!note_kept(m_binding, m_method, *m_logged))
-		return;
-	char text[kBinderMessage + 1];
-	text[0] = 0;
-	if (L && lua_isstring(L, -1))
-		strncpy_s(text, lua_tostring(L, -1), _TRUNCATE);
-	::Msg("! [coop] binder %s: Lua error in %s, the binder stays (the first one of this object; all are counted in "
-		  "coop_status): %s",
-		m_binding, method_name(m_method), text[0] ? text : "(the error object is not a string)");
-	ai().script_engine().print_stack(); // the stack at the point of the error, as the stock handler writes it
-}
-
 void print_status()
 {
 	xrCriticalSectionGuard guard(g_lock);
@@ -552,35 +445,25 @@ void print_status()
 	::Msg("[coop] routes: latest new skips %s (%u pair(s) skipped so far)", line.empty() ? "(none)" : line.c_str(),
 		u32(g.counters.pairs_tracked()));
 
-	// F2 T11: the binder rules. skipped = HostOnly calls a client did not make, kept = Lua errors that left the binder
-	// in place.
-	struct Row
-	{
-		std::string label;
-		u64 skipped, kept;
-	};
-	std::vector<Row> rows;
-	u64 skipped = 0, kept = 0;
+	// F2 T11: the binder rules. skipped = host-only calls a client did not make (the Lua guards of
+	// coop_client_binders.script count their errors in their own [coop-binders] lines).
+	std::vector<std::pair<std::string, u64>> rows;
+	u64 skipped = 0;
 	for (const BinderSlot& b : g.binder_slots)
 		for (size_t i = 0; i < routes::kBinderMethodCount; ++i)
 		{
 			skipped += b.skipped[i];
-			kept += b.kept[i];
-			if (b.skipped[i] || b.kept[i])
-				rows.push_back({b.binding + ":" + std::string(routes::kBinderMethodNames[i]), b.skipped[i], b.kept[i]});
+			if (b.skipped[i])
+				rows.emplace_back(std::string(b.binding.c_str()) + ":" + std::string(routes::kBinderMethodNames[i]), b.skipped[i]);
 		}
-	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b)
-		{ return a.skipped + a.kept != b.skipped + b.kept ? a.skipped + a.kept > b.skipped + b.kept : a.label < b.label; });
-	::Msg("[coop] binders: %u rule(s) (%u binding(s) asked on this client), client calls skipped %llu, Lua errors kept %llu",
-		g.binder_rules, u32(g.binder_slots.size()), skipped, kept);
+	std::sort(rows.begin(), rows.end(), [](const std::pair<std::string, u64>& a, const std::pair<std::string, u64>& b)
+		{ return a.second != b.second ? a.second > b.second : a.first < b.first; });
+	::Msg("[coop] binders: %u host-only rule(s) (%u binding(s) asked on this client), client calls skipped %llu",
+		g.binder_rules, u32(g.binder_slots.size()), skipped);
 	line.clear();
 	for (size_t i = 0; i < rows.size() && i < kTopBinders; ++i)
-	{
-		char one[256];
-		sprintf_s(one, "%s skipped %llu kept %llu", rows[i].label.c_str(), rows[i].skipped, rows[i].kept);
-		line += (line.empty() ? "" : ", ") + std::string(one);
-	}
-	::Msg("[coop] binders: most active %s", line.empty() ? "(none)" : line.c_str());
+		line += (line.empty() ? "" : ", ") + rows[i].first + " " + std::to_string(rows[i].second);
+	::Msg("[coop] binders: most skipped %s", line.empty() ? "(none)" : line.c_str());
 }
 } // namespace router
 } // namespace coop
