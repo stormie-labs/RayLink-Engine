@@ -15,6 +15,7 @@
 #include "coop_money.h" // F2 T1: money::register_lua
 #include "coop_router.h" // F2 T10: router::register_lua (coop.route)
 #include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
+#include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 
 #include "ai_space.h"
@@ -1553,6 +1554,7 @@ void register_raw(lua_State* L)
 	money::register_lua(L); // F2 T1: coop.money_give / money_grant / money_set / money_of / talk_lock_of
 	router::register_lua(L); // F2 T10: coop.route.of / runs / note / none_functions (scripts\coop_route.script)
 	syncapi::register_lua(L); // F2 T14: coop.sync.* (coop_sync_api.h)
+	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
 }
 } // namespace
 

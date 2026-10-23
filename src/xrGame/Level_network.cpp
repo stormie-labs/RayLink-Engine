@@ -22,6 +22,7 @@
 #include "coop/coop_events.h" // Anomaly Coop
 #include "coop/coop_manager.h" // Anomaly Coop
 #include "coop/coop_autosave.h" // Anomaly Coop
+#include "coop/coop_game_settings.h" // Anomaly Coop
 
 #include "../xrphysics/physicscommon.h"
 extern ENGINE_API bool g_dedicated_server;
@@ -128,6 +129,7 @@ void CLevel::net_Stop()
 	Msg("- Disconnect");
 	coop::on_blocking_work(); // Anomaly Coop: tearing the level down blocks the frame, keep the session link alive
 	coop::autosave::host_on_level_exit(); // Anomaly Coop: the host's last world save, while the level and ALife still run
+	coop::game::on_level_exit(); // Anomaly Coop: machine console values back
 
 	if (CurrentGameUI())
 	{

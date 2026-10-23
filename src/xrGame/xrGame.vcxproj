@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_game_settings.h" />
     <ClInclude Include="coop\coop_callgate.h" />
     <ClInclude Include="coop\coop_sync_api.h" />
     <ClInclude Include="coop\coop_router.h" />
@@ -2110,6 +2111,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_game_settings.cpp" />
     <ClCompile Include="coop\coop_callgate.cpp" />
     <ClCompile Include="coop\coop_sync_api.cpp" />
     <ClCompile Include="coop\coop_router.cpp" />
