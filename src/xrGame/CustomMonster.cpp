@@ -36,6 +36,7 @@
 #include "PHMovementControl.h"
 #include "profiler.h"
 #include "date_time.h"
+#include "../xrEngine/sheduler_viewers.h" // Anomaly Coop
 #include "characterphysicssupport.h"
 #include "ai/monsters/snork/snork.h"
 #include "ai/monsters/burer/burer.h"
@@ -409,6 +410,15 @@ void CCustomMonster::shedule_Update(u32 DT)
 			NET.push_back(uNext);
 		}
 	}
+}
+
+// Anomaly Coop. Movement is integrated in UpdateCL, with a step of at most 100 ms (client_update_fdelta), and UpdateCL runs
+// every frame only for crows. An NPC that is not one walks 100 ms per scheduler step (625 ms far from the camera): 1/6 of its
+// speed. The host's camera is not where the players are, so an NPC next to a client has to be a crow too. The same goes for
+// the client's own character on the host (a stalker, driven in UpdateCL): without it, it moved in jumps.
+BOOL CCustomMonster::AlwaysTheCrow()
+{
+	return g_Alive() && shedule_viewers::frame_update(Position());
 }
 
 void CCustomMonster::net_update::lerp(CCustomMonster::net_update& A, CCustomMonster::net_update& B, float f)

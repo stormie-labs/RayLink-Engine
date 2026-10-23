@@ -10,6 +10,7 @@
 #include "GameObject.h"
 #include "../../xrServerEntities/script_engine.h"
 #include "coop/coop_sound.h" // Anomaly Coop
+#include "../xrEngine/sheduler_viewers.h" // Anomaly Coop: the host also looks at the players' characters
 
 #ifdef	DEBUG
 BOOL debug_step_info = FALSE;
@@ -163,7 +164,9 @@ void CStepManager::update(bool b_hud_view)
 		if (m_step_info.disable) return;
 		if (!m_blend) return;
 
-		float dist = m_object->Position().distance_to(Device.vCameraPosition);
+		// Anomaly Coop: the camera of the machine that runs the world, or a player's character nearer than it (host):
+		// the steps of an NPC next to a client are played too, so the NPCs there hear them. Stock without a session.
+		float dist = shedule_viewers::nearest_distance(m_object->Position());
 		bool b_play = dist < 50.0f; //meters
 
 		// получить параметры шага

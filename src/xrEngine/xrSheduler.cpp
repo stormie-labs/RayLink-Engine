@@ -4,10 +4,106 @@
 #include "IGame_Level.h"
 
 #include "../xrCore/profiler.h"
+#include "sheduler_viewers.h" // Anomaly Coop
+#include "../xrCoop/coop_viewers.h" // Anomaly Coop: the rule (pure code, tests/test_viewers.cpp)
+
+#include <atomic> // Anomaly Coop
 
 float psShedulerCurrent = 10.f;
 float psShedulerTarget = 10.f;
 const float psShedulerReaction = 0.1f;
+
+//-------------------------------------------------------------------------------------
+// Anomaly Coop: viewers of the scheduler (sheduler_viewers.h). Empty = stock, bit for bit.
+namespace shedule_viewers
+{
+namespace
+{
+struct List
+{
+	coop::viewers::Point pos[coop::viewers::kMaxViewers];
+	float range = 0.f;
+	float frame_radius = 0.f;
+	std::atomic<u32> stamp_ms{0};
+	std::atomic<u32> count{0};
+};
+List g_list;
+std::atomic<u64> g_scale_queries{0};
+std::atomic<u64> g_scale_boosted{0};
+std::atomic<u64> g_frame_queries{0};
+std::atomic<u64> g_frame_boosted{0};
+
+coop::viewers::Point point_of(const Fvector& v) { return coop::viewers::Point{v.x, v.y, v.z}; }
+
+// Positions in the list now: 0 when it is empty or nobody has refreshed it for a second (the writer is gone).
+u32 current()
+{
+	const u32 n = g_list.count.load(std::memory_order_acquire);
+	if (!n)
+		return 0;
+	return coop::viewers::fresh(Device.dwTimeGlobal, g_list.stamp_ms.load(std::memory_order_relaxed)) ? n : 0;
+}
+} // namespace
+
+void set(const Fvector* positions, u32 count, float range, float frame_radius)
+{
+	if (!positions || !count || !(range > 0.f))
+	{
+		clear();
+		return;
+	}
+	if (count > coop::viewers::kMaxViewers)
+		count = coop::viewers::kMaxViewers;
+	g_list.count.store(0, std::memory_order_release); // hidden from the readers while it is rewritten
+	for (u32 i = 0; i < count; ++i)
+		g_list.pos[i] = point_of(positions[i]);
+	g_list.range = range;
+	g_list.frame_radius = coop::viewers::frame_radius(range, frame_radius);
+	g_list.stamp_ms.store(Device.dwTimeGlobal, std::memory_order_relaxed);
+	g_list.count.store(count, std::memory_order_release);
+}
+
+void clear() { g_list.count.store(0, std::memory_order_release); }
+
+float nearest_distance(const Fvector& at)
+{
+	const float camera = Device.vCameraPosition.distance_to(at); // the stock distance
+	const u32 n = current();
+	if (!n)
+		return camera;
+	g_scale_queries.fetch_add(1, std::memory_order_relaxed);
+	const float best = coop::viewers::nearest_distance(camera, g_list.pos, n, point_of(at), g_list.range);
+	if (best < camera)
+		g_scale_boosted.fetch_add(1, std::memory_order_relaxed);
+	return best;
+}
+
+bool frame_update(const Fvector& at)
+{
+	const u32 n = current();
+	if (!n)
+		return false;
+	g_frame_queries.fetch_add(1, std::memory_order_relaxed);
+	if (!coop::viewers::within(g_list.pos, n, point_of(at), g_list.frame_radius))
+		return false;
+	if (Device.vCameraPosition.distance_to_sqr(at) >= CROW_RADIUS * CROW_RADIUS)
+		g_frame_boosted.fetch_add(1, std::memory_order_relaxed); // the camera's own circle would not have done it
+	return true;
+}
+
+Stats stats()
+{
+	Stats s;
+	s.viewers = current();
+	s.range = g_list.range;
+	s.frame_radius = g_list.frame_radius;
+	s.scale_queries = g_scale_queries.load(std::memory_order_relaxed);
+	s.scale_boosted = g_scale_boosted.load(std::memory_order_relaxed);
+	s.frame_queries = g_frame_queries.load(std::memory_order_relaxed);
+	s.frame_boosted = g_frame_boosted.load(std::memory_order_relaxed);
+	return s;
+}
+} // namespace shedule_viewers
 
 //-------------------------------------------------------------------------------------
 void CSheduler::Initialize()

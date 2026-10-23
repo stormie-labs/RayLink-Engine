@@ -14,6 +14,8 @@
 
 #include "mp_logging.h"
 #include "xr_collide_form.h"
+#include "sheduler_viewers.h" // Anomaly Coop
+#include "../xrCoop/coop_viewers.h" // Anomaly Coop
 
 #pragma warning(push)
 #pragma warning(disable:4995)
@@ -404,6 +406,13 @@ void CObject::UpdateCL()
 			CROW_RADIUS2))
 			MakeMeCrow();
 	}
+}
+
+// Anomaly Coop: stock is the distance to the camera / 200. In a co-op session the host also looks at the characters of the
+// other players (sheduler_viewers.h, rule in xrCoop/coop_viewers.h): without them the answer is the stock one bit for bit.
+float CObject::shedule_Scale()
+{
+	return coop::viewers::shedule_scale(shedule_viewers::nearest_distance(Position()));
 }
 
 void CObject::shedule_Update(u32 T)

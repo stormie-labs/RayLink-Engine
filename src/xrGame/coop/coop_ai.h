@@ -13,6 +13,9 @@
 //   - "player on my path" (stalker combat) looks at the actor only. Here: every remote player.
 //   - NPC head turning to the player (CAI_Stalker::LookAtActor) on a client: the NPC there is a puppet
 //     without perception. Here: distance and a line-of-sight ray to this machine's player.
+//   - how often the host updates an NPC: by its distance to the HOST'S CAMERA only (shedule_Scale, crow radius), so an NPC
+//     far from the host but next to a client thinks every 625 ms and walks at 1/6 of its speed (owner, build 10).
+//     Here: the characters of the other players are "viewers" of the scheduler (viewers_frame).
 //
 // Threading: on_proxy_frame runs on the main thread (UpdateCL, FrameMove); the queries run on the
 // game thread (schedule) or in bone callbacks. The game thread never runs during FrameMove, so the
@@ -55,6 +58,15 @@ bool player_on_the_path(CAI_Stalker* npc);
 // alive, closer than `max_distance`, the Lua hook allows it and no static geometry is in between.
 // Always false for player characters (their heads follow their players).
 bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance);
+
+// Viewers of the scheduler (xrEngine/sheduler_viewers.h, rule and numbers in xrCoop/coop_viewers.h). Host, main thread,
+// once a frame (sync::frame): lists where the characters of the other players are (alive or down, in the world, not
+// parked), so the objects around them are updated as often as the ones around the host's camera. Anywhere else (a client,
+// no session, a world that is not up) it empties the list, which is the stock behaviour.
+void viewers_frame();
+void viewers_clear();
+// Console: coop_viewer_range (m, 0 = viewers off), coop_viewer_frame_radius (m, 0 = scale only). Host settings.
+void register_console();
 
 void print_status();
 } // namespace npc_ai

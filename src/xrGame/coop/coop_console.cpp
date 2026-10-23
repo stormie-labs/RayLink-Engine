@@ -12,6 +12,7 @@
 #include "coop_death.h"
 #include "coop_rest.h"
 #include "coop_autosave.h"
+#include "coop_ai.h" // scheduler viewers
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -212,5 +213,6 @@ void register_console_commands()
 	rest::register_console();
 	autosave::register_console();
 	presence::register_console();
+	npc_ai::register_console(); // scheduler viewers: coop_viewer_range, coop_viewer_frame_radius
 }
 } // namespace coop

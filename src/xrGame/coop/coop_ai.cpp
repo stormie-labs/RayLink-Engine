@@ -4,6 +4,9 @@
 #include "coop_manager.h"
 #include "coop_world.h"
 #include "coop_players.h"
+#include "coop_join.h"
+#include "coop_survival.h"
+#include "xrCoop/coop_viewers.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -21,6 +24,9 @@
 #include "../xrServerEntities/script_engine.h"
 #include "../xrEngine/IGame_Persistent.h"
 #include "../xrEngine/Environment.h"
+#include "../xrEngine/sheduler_viewers.h"
+#include "../../xrEngine/XR_IOConsole.h"
+#include "../../xrEngine/xr_ioc_cmd.h"
 
 namespace coop
 {
@@ -52,6 +58,10 @@ struct Proxy
 };
 
 xr_map<u16, Proxy> g_proxies; // host: client proxies driven recently, by local id
+
+// Console settings of the scheduler's viewers (coop_viewers.h has the meaning and the defaults).
+float g_viewer_range = viewers::kDefaultRange;
+float g_viewer_frame_radius = viewers::kDefaultFrameRadius;
 
 struct Stats
 {
@@ -251,8 +261,53 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance)
 	return true;
 }
 
+void viewers_clear() { shedule_viewers::clear(); }
+
+void viewers_frame()
+{
+	if (!mgr().is_host() || !world_up())
+	{
+		shedule_viewers::clear();
+		return;
+	}
+	Fvector at[viewers::kMaxViewers];
+	u32 n = 0;
+	for (u32 peer = 1; peer < kMaxPlayers && n < viewers::kMaxViewers; ++peer)
+	{
+		const u16 proxy = join::proxy_of_peer(peer);
+		if (proxy == 0xffff || proxy == 0 || !join::host_player_in_world(proxy) || world::is_parked(proxy))
+			continue; // no character, still loading, or gone: nobody looks at the world from there
+		const survival::Life life = survival::life_of(proxy);
+		if (life != survival::Life::Alive && life != survival::Life::Wounded)
+			continue; // dead, spectating or waiting for the respawn: the world is not seen from the body
+		const CObject* body = Level().Objects.net_Find(proxy);
+		if (!body || body->getDestroy())
+			continue;
+		at[n++] = body->Position();
+	}
+	shedule_viewers::set(at, n, g_viewer_range, g_viewer_frame_radius);
+}
+
+void register_console()
+{
+	CMD4(CCC_Float, "coop_viewer_range", &g_viewer_range, 0.f, viewers::kMaxRange); // host setting
+	CMD4(CCC_Float, "coop_viewer_frame_radius", &g_viewer_frame_radius, 0.f, viewers::kMaxFrameRadius); // host setting
+}
+
 void print_status()
 {
+	const shedule_viewers::Stats v = shedule_viewers::stats();
+	static u64 s_prev_boosted = 0;
+	static u32 s_prev_frame = 0;
+	const u32 frames = Device.dwFrame - s_prev_frame;
+	const double per_frame = frames ? double(v.frame_boosted - s_prev_boosted) / double(frames) : 0.0;
+	s_prev_boosted = v.frame_boosted;
+	s_prev_frame = Device.dwFrame;
+	::Msg("[coop]   ai: scheduler viewers %u listed (range %.0f m, every-frame radius %.0f m; console coop_viewer_range, "
+	      "coop_viewer_frame_radius) | shorter update interval for %llu of %llu asks | NPCs made crows by players: %llu of %llu "
+	      "asks, %.1f NPCs per frame since the last status",
+	    v.viewers, g_viewer_range, viewers::frame_radius(g_viewer_range, g_viewer_frame_radius), v.scale_boosted,
+	    v.scale_queries, v.frame_boosted, v.frame_queries, per_frame);
 	::Msg("[coop]   ai: %u proxies tracked | light: %llu estimates (%llu sun-lit, %llu headlamp), %llu used by vision | "
 	      "player sees: %llu asked, %llu yes | player on path %llu | look-at checks %llu, %llu yes",
 	    (u32)g_proxies.size(), g_stat.light_estimates, g_stat.sun_lit, g_stat.headlamps, g_stat.light_used,

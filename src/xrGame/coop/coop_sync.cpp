@@ -19,6 +19,7 @@
 #include "coop_items.h"
 #include "coop_objects.h"
 #include "coop_remote.h"
+#include "coop_ai.h" // scheduler viewers
 #include "coop_money.h"
 #include "coop_checkpoints.h" // F3
 #include "coop_death.h"
@@ -114,6 +115,7 @@ void on_peer_left(PeerId id)
 
 void reset()
 {
+	npc_ai::viewers_clear(); // the scheduler looks at the host's camera alone again
 	players::reset();
 	entities::reset();
 	world::reset();
@@ -175,6 +177,12 @@ void frame()
 	// world that is not up.
 	const bool up = world_up();
 	const bool gap = world_gap();
+	// Owner, build 10: the host updates the world by its distance to the host's camera alone, so far from the host the NPCs
+	// next to a client think every 625 ms and walk at 1/6 of their speed. The other players' characters are viewers too.
+	if (up)
+		npc_ai::viewers_frame();
+	else
+		npc_ai::viewers_clear();
 	if (up)
 		players::frame();
 	if (!gap)
