@@ -8,8 +8,11 @@
 // Reload: the owner's active weapon entering the reload state goes out as PlayerShot kind Reload; the
 //   others play the weapon's reload sound at the avatar (the reload body motion comes with the owner's
 //   MotionIDs in PlayerState already).
-// Name tags: nick, optional distance and the survival state over every other player, drawn by the HUD
-//   (console coop_nametags 0/1, coop_nametags_dist 0/1).
+// Name tags (HUD v2.1, xrCoop/coop_nametag.h): over every other player, from the head up, an icon (a chevron in his
+//   colour; wounded: the red ring with a cross, pulsing; dead: a grey skull), a line (the distance; wounded: the
+//   bleed-out timer and the distance in red) and the nick in white with a dark outline; the alpha follows the distance,
+//   steps aside at the crosshair, a wounded one shows through walls dimmed (console coop_nametags 0/1,
+//   coop_nametags_dist 0/1; numbers: tag_* lines of [coop_hud_layout]).
 //
 // Wire (ids in host numbering), Lane::Unreliable (cosmetic, latest wins):
 //   PlayerShot  u16 shooter, u16 weapon, u8 kind (0 shot, 1 reload, 2 grenade launcher), u8 count,

@@ -9,6 +9,7 @@
 #include "coop_items.h"
 #include "coop_sound.h"
 #include "coop_requests.h"
+#include "xrCoop/coop_nametag.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -26,6 +27,9 @@
 #include "ParticlesObject.h"
 #include "GamePersistent.h"
 #include "ui_base.h"
+#include "UIStaticItem.h"
+#include "string_table.h"
+#include "ui/UITextureMaster.h"
 
 namespace coop
 {
@@ -122,13 +126,33 @@ Cache& cache()
 int g_nametags = 1;
 int g_nametags_dist = 1;
 
+// HUD v2.1 name tags (owner 2026-10-23 "presentable, the distance under the name, the transparency plays"): what a tag
+// shows and how strongly is xrCoop/coop_nametag.h; here the data of a frame and the drawing.
 struct Tag
 {
-	Fvector pos{};
-	xr_string text;
-	u32 color = 0xffffffff;
+	Fvector pos{}; // the point over the head: the tag stacks upwards from it
+	xr_string nick;
+	xr_string line; // the distance, or "0:42  34 m" for a wounded one; empty: no line
+	nametag::State state = nametag::State::Alive;
+	float dist = 0.f;
+	bool behind_wall = false;
+	u32 rgb = 0xffffff; // the player's colour
 };
 xr_vector<Tag> g_tags;
+
+// [coop_hud_layout] tag_* lines over the header's defaults, read once per session (reset() forgets them).
+nametag::Params g_tag_params;
+bool g_tag_params_loaded = false;
+// "m" / "km" of the string table (st_coop_allies_m / _km, the compass's units), once per session.
+xr_string g_unit_m, g_unit_km;
+
+// The icons of the tag: atlas ids of ui_coop_hud (textures_descr ui_coop_hud.xml), tinted. On the heap, released in
+// reset(): no shader outlives the render device in static teardown.
+struct TagIcons
+{
+	CUIStaticItem item[3]; // nametag::Icon: Chevron, Down, Skull
+};
+TagIcons* g_tag_icons = nullptr;
 
 // W5 C2.3: a tag behind static geometry is hidden; one ray per tag every ~150-200 ms.
 constexpr u32 kOcclusionCheckMs = 150;
@@ -503,11 +527,40 @@ bool tag_hidden(u16 id, const Fvector& from, const Fvector& to)
 	return s.hidden;
 }
 
+void load_tag_settings()
+{
+	if (g_tag_params_loaded)
+		return;
+	g_tag_params_loaded = true;
+	g_tag_params = nametag::Params();
+	g_unit_m = CStringTable().translate("st_coop_allies_m").c_str();
+	g_unit_km = CStringTable().translate("st_coop_allies_km").c_str();
+	if (g_unit_m.empty() || g_unit_m == "st_coop_allies_m")
+		g_unit_m = "m";
+	if (g_unit_km.empty() || g_unit_km == "st_coop_allies_km")
+		g_unit_km = "km";
+	LPCSTR sect = "coop_hud_layout";
+	if (!pSettings->section_exist(sect))
+		return;
+	size_t n = 0;
+	const nametag::ParamKey* keys = nametag::param_keys(n);
+	for (size_t i = 0; i < n; ++i)
+	{
+		if (!pSettings->line_exist(sect, keys[i].key))
+			continue;
+		float v = 0.f;
+		if (sscanf(pSettings->r_string(sect, keys[i].key), "%f", &v) != 1 || !nametag::set_param(g_tag_params, keys[i].key, v))
+			::Msg("! [coop] [coop_hud_layout] %s: not a number in its range (or breaks near < far), the default stays",
+			    keys[i].key);
+	}
+}
+
 void build_tags()
 {
 	g_tags.clear();
 	if (!g_nametags)
 		return;
+	load_tag_settings();
 	xr_vector<survival::PlayerRef> players;
 	survival::collect_players(players, true); // self too: slot_rule = order counts every player
 	const Fvector& cam = Device.vCameraPosition;
@@ -521,43 +574,28 @@ void build_tags()
 		const survival::Life life = survival::life_of(p.local_id);
 		Tag tag;
 		tag.pos = o->Position();
-		tag.pos.y += survival::is_down(life) ? 0.8f : 2.05f;
+		tag.pos.y += survival::is_down(life) ? 0.7f : 2.0f; // just over the head (lying: over the body)
 		const float dist = cam.distance_to(tag.pos);
 		if (dist > kTagRange)
 			continue;
 		const bool behind_wall = tag_hidden(p.local_id, cam, tag.pos);
 		if (behind_wall && life != survival::Life::Wounded)
 			continue; // a downed player stays findable through walls (revive), dimmed
-		string256 text;
-		xr_strcpy(text, p.nick.c_str());
-		if (g_nametags_dist)
-		{
-			string32 d;
-			xr_sprintf(d, "  %.0f m", dist);
-			xr_strcat(text, d);
-		}
-		u32 rgb = player_rgb(p.peer, players);
-		switch (life)
-		{
-		case survival::Life::Wounded:
-		{
-			string64 s;
-			xr_sprintf(s, "  [DOWN %u s]", (survival::bleed_left_ms(p.local_id) + 999) / 1000);
-			xr_strcat(text, s);
-			rgb = g_palette.down;
-			break;
-		}
-		case survival::Life::Dead:
-		case survival::Life::Spectating:
-		case survival::Life::Respawning:
-			xr_strcat(text, "  [DEAD]");
-			rgb = g_palette.dead;
-			break;
-		default: break;
-		}
-		const u32 alpha = behind_wall ? 0x70 : dist > 100.f ? 0x90 : 0xf0;
-		tag.color = (alpha << 24) | rgb;
-		tag.text = text;
+		if (life == survival::Life::Wounded)
+			tag.state = nametag::State::Wounded;
+		else if (life == survival::Life::Alive)
+			tag.state = nametag::State::Alive;
+		else
+			tag.state = nametag::State::Dead; // dead, spectating, returning
+		tag.nick = p.nick.c_str();
+		tag.dist = dist;
+		tag.behind_wall = behind_wall;
+		tag.rgb = player_rgb(p.peer, players);
+		char line[64];
+		nametag::format_line(line, sizeof(line), tag.state, g_nametags_dist != 0, dist,
+		    tag.state == nametag::State::Wounded ? survival::bleed_left_ms(p.local_id) : 0, g_unit_m.c_str(),
+		    g_unit_km.c_str());
+		tag.line = line;
 		g_tags.push_back(tag);
 	}
 }
@@ -618,6 +656,8 @@ void reset()
 	g_tags.clear();
 	g_sight.clear();
 	g_palette = Palette(); // re-read: the next session may run with another mod list
+	g_tag_params_loaded = false; // the tag_* lines too
+	xr_delete(g_tag_icons);
 	xr_delete(g_cache);
 	sound::reset();
 }
@@ -639,32 +679,94 @@ void frame()
 void print_status()
 {
 	::Msg("[coop]   presence: shots out %llu, reloads out %llu; in: %llu events, %llu shots, %llu reloads, %llu "
-	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s",
+	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s (v2.1: %u drawn)",
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
-	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off");
+	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off", u32(g_tags.size()));
 	sound::print_status();
 }
+
+namespace
+{
+// A text line centred on x, its top at y (screen px): a 1 px dark outline, a drop shadow, then the text.
+void tag_text(CGameFont* f, float x, float y, LPCSTR s, u32 rgb, float a, const nametag::Params& P)
+{
+	if (a < 0.004f || !s || !s[0])
+		return;
+	f->SetColor(nametag::argb(a * P.outline_alpha, 0x000000));
+	f->Out(x - 1.f, y, "%s", s);
+	f->Out(x + 1.f, y, "%s", s);
+	f->Out(x, y - 1.f, "%s", s);
+	f->Out(x, y + 1.f, "%s", s);
+	f->SetColor(nametag::argb(a * P.shadow_alpha, 0x000000));
+	f->Out(x + 1.f, y + 1.f, "%s", s);
+	f->SetColor(nametag::argb(a, rgb));
+	f->Out(x, y, "%s", s);
+}
+
+// An icon of the atlas centred on (cx, cy), `size` px square (screen px), tinted `color` (its alpha included).
+void tag_icon(nametag::Icon icon, float cx, float cy, float size, u32 color)
+{
+	if ((color >> 24) == 0 || size <= 0.f)
+		return;
+	if (!g_tag_icons)
+	{
+		g_tag_icons = xr_new<TagIcons>();
+		static const char* const ids[3] = {"coop_hud_chevron", "coop_hud_down", "coop_hud_skull"};
+		for (u32 i = 0; i < 3; ++i)
+			CUITextureMaster::InitTexture(ids[i], &g_tag_icons->item[i]);
+	}
+	CUIStaticItem& it = g_tag_icons->item[u32(icon) % 3];
+	// the static item lives in 1024x768 UI units (the UI scales them to the screen)
+	const float sx = UI_BASE_WIDTH / float(Device.dwWidth), sy = UI_BASE_HEIGHT / float(Device.dwHeight);
+	it.SetSize(Fvector2().set(size * sx, size * sy));
+	it.SetPos((cx - size * 0.5f) * sx, (cy - size * 0.5f) * sy);
+	it.SetTextureColor(color);
+	it.Render();
+}
+} // namespace
 
 void render_hud()
 {
 	if (g_tags.empty() || !g_nametags)
 		return;
-	CGameFont* f = UI().Font().pFontArial14;
-	if (!f)
+	CGameFont* fn = UI().Font().pFontLetterica18Russian; // the nick (Cyrillic; GAMMA's Tactical Fonts replace it)
+	CGameFont* fl = UI().Font().pFontLetterica16Russian; // the line under it
+	if (!fn)
+		fn = UI().Font().pFontArial14;
+	if (!fl)
+		fl = fn;
+	if (!fn)
 		return;
-	f->SetAligment(CGameFont::alCenter);
+	load_tag_settings();
+	const nametag::Params& P = g_tag_params;
+	const float W = float(Device.dwWidth), H = float(Device.dwHeight);
+	const float ui = H / UI_BASE_HEIGHT; // screen px per px at 768 high
+	const u64 now = Device.dwTimeGlobal;
+	const float nick_h = fn->CurrentHeight_(), line_h = fl->CurrentHeight_();
+	fn->SetAligment(CGameFont::alCenter);
+	fl->SetAligment(CGameFont::alCenter);
 	for (const Tag& tag : g_tags)
 	{
 		Fvector4 v;
 		Device.mFullTransform.transform(v, tag.pos);
 		if (v.z < 0.f || v.w < 0.f || v.x < -1.f || v.x > 1.f || v.y < -1.f || v.y > 1.f)
 			continue;
-		const float x = (1.f + v.x) * 0.5f * float(Device.dwWidth);
-		const float y = (1.f - v.y) * 0.5f * float(Device.dwHeight);
-		f->SetColor(tag.color);
-		f->Out(x, y, "%s", tag.text.c_str());
+		const float x = floorf((1.f + v.x) * 0.5f * W + 0.5f); // whole pixels: crisp text
+		const float y = floorf((1.f - v.y) * 0.5f * H + 0.5f);
+		const nametag::Look lk =
+		    nametag::look(tag.state, tag.dist, tag.behind_wall, now, tag.rgb, g_palette.down, g_palette.dead, P);
+		const float aim = nametag::aim_factor(x - W * 0.5f, y - H * 0.5f, H, tag.state, P);
+		const float icon = lk.icon_px * ui;
+		const bool has_line = !tag.line.empty();
+		const nametag::Stack st = nametag::stack(y, nick_h, line_h, icon, P.gap_px * ui, has_line);
+		tag_icon(lk.icon, x, st.icon_cy, icon * lk.icon_scale, nametag::argb(lk.icon_alpha * aim, lk.icon_rgb));
+		if (has_line)
+			tag_text(fl, x, floorf(st.line_y), tag.line.c_str(), lk.line_rgb, lk.line_alpha * aim, P);
+		tag_text(fn, x, floorf(st.nick_y), tag.nick.c_str(), lk.nick_rgb, lk.alpha * aim, P);
 	}
-	f->SetAligment(CGameFont::alLeft); // shared UI font: leave it as found (queued lines keep their alignment)
+	// shared UI fonts: leave them as found (queued lines keep their alignment)
+	fn->SetAligment(CGameFont::alLeft);
+	fl->SetAligment(CGameFont::alLeft);
 }
 } // namespace presence
 } // namespace coop
