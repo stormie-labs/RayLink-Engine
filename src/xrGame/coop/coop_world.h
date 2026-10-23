@@ -19,6 +19,9 @@ void host_scan_proxies();
 void host_mark_proxy(u16 id, PeerId peer);
 // Host: the player left; the character stays where it is, inert and unkillable.
 void host_park_proxy(u16 id);
+// Host, F3 Task 10: the character left the world for good (a retired hardcore character is released). Its id is no
+// player's character any more: ALife may give it to anything spawned later.
+void host_forget_proxy(u16 id);
 // Client: our host-numbered proxy id is the host's avatar here.
 void client_mark_host_avatar(u16 id);
 // Client: another player's avatar (id in local numbering).

@@ -33,7 +33,8 @@
 // coop_death_marker(player_local_id, marker_local_id, "drop" | "corpse"). Lose has no marker.
 // Console (host): coop_death_preview [character id, default 0 = the host [death seq]] logs what a death would take now.
 //
-// Skeleton of F3 Task 2; filled by F3 Task 9. Task 10 adds hardcore's NewCharacter.
+// Skeleton of F3 Task 2; filled by F3 Task 9. Hardcore's new character (F3 Task 10, coop_survival) retires the old one
+// with host_move_to_stash(character, true), host_stash_pending and host_release_character.
 #pragma once
 
 #include "xrCoop/coop_death_rules.h"
@@ -67,9 +68,13 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode);
 // `seq` (kNoSeq: none) is the death whose list of worn items a client's proxy is read with when `everything` is false;
 // without a list (no seq, no report) nothing the player may have on is taken.
 u16 host_move_to_stash(u16 character, bool everything, u16 seq = kNoSeq);
-// True while a stash of `character` waits to be filled: his items are still on him. Task 10 releases a retiring
-// character only once this is false (rewriting his key before that is fine: the same player still plays him).
+// True while a stash of `character` waits to be filled: his items are still on him. Task 10 changes nothing of a
+// retiring character (his key, his player, his release) before this is false (review R2 of T9, death::retire_step).
 bool host_stash_pending(u16 character);
+// F3 Task 10: a retired hardcore character (a client's, never the host's actor) leaves the world: online through
+// GE_DESTROY, as Lua's alife():release does it, offline through ALife. What still hangs on him (the stash takes all of
+// his world items) goes with him, logged. False if there is no player character under the id or it is coming online.
+bool host_release_character(u16 character);
 // The money part of a death (F2 T1: the host's ledger holds every balance): takes `pct` % (0..100, rounded down) of the
 // balance of `character`'s player through money::host_adjust, which sends him the new balance. Returns the amount.
 u32 host_take_money(u16 character, u8 pct);

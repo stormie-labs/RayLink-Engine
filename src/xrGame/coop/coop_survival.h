@@ -8,6 +8,8 @@
 //   Alive --health would reach 0--> Wounded --teammate holds USE with a medkit (host checks)--> Alive
 //   Wounded --bleed-out timer ends / player holds USE to give up--> Dead
 //   Dead --host, coop_death_mode hardcore--> Spectating (out of the run, camera on teammates)
+//        --the owner holds USE 3 s / coop_new_character (F3 Task 10)--> a new character: all he had goes into a stash at
+//        the body; a client then joins again and chooses one (protocol 8), the host stands up at his arrival point
 //   Dead --host, checkpoint: losses (coop_death), money, Evacuate; after coop_respawn_delay--> Respawning
 //        --> Alive at the player's own checkpoint (coop_checkpoints::host_respawn_point)
 // While evacuated the dead player watches a living teammate (Fire / Aim switch), or the place of death from
@@ -21,9 +23,18 @@
 // at his checkpoint; nothing is taken from him a second time. The respawn a checkpoint death owes is kept with
 // the character in the world ([coop_death] respawn = 1 in his custom data, death::debt_after_report) until the
 // owner reports Respawning, so a world saved while he owed it (a level change, an autosave) puts him on his
-// checkpoint at his first Alive there, and a new game or another save does not. Ruling F3-7: until F3 Task 10
-// a character out of a hardcore run stays a spectator at every Alive, whatever the mode is now.
+// checkpoint at his first Alive there, and a new game or another save does not. Ruling F3-7: a character out of a
+// hardcore run stays a spectator at every Alive, whatever the mode is now; the world keeps that too
+// ([coop_death] out = 1, death::learn_out, F3 Task 10), so a level change or a load does not bring him back.
 // The host's actor (character 0) takes the same path.
+//
+// Hardcore's new character (F3 Task 10). Out of the run, the owner holds USE 3 s (or coop_new_character): a client
+// sends Msg::NewCharacter, the host acts for itself. The host checks he is out (death::on_new_character) and moves all
+// he has, worn and quest items included, into a stash at the body (death::host_move_to_stash, DeathMarker). Only when
+// the stash is done (death::retire_step, review R2 of T9) does anything else of him change: a client's character loses
+// his [coop] key (retired = 1), his player joins again (join::host_rejoin_peer) and chooses a new character
+// (coop_menu_char, protocol 8), the old one is released; the host's actor stands up at his arrival point (health 1, no
+// radiation or bleeding, fed, rested, 0 RU) and Lua coop_host_new_character() opens the choice for him.
 //
 // The engine actor never dies during a session, in either mode: while the player is down its health is
 // pinned just above zero (CActorCondition hook) and every kill of it is intercepted (CEntity::KillEntity),
@@ -47,12 +58,13 @@
 //     Refused  host -> reviver       {u16 target, u8 reason}
 //     Evacuate host -> target owner  {u16 target, u16 seq, u32 delay_ms}
 //   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %)
+//   NewCharacter   client -> host  {}: out of a hardcore run, a new character (F3 Task 10; 2 per 5 s)  reliable
 // `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
 // answers, so repeats are no-ops.
 // Console (host rules, CCC_Float unless a token): coop_death_mode checkpoint | hardcore (respawn, respawn_keep =
 // checkpoint), coop_death_drop drop | corpse | lose, coop_bleedout s, coop_revive_health, coop_respawn_delay 0..300 s
 // (30), coop_contusion 0..60 min (10), coop_death_money / coop_death_wear / coop_death_rank 0..100 % (10 / 10 / 0);
-// coop_wound_me (test).
+// coop_new_character (out of a hardcore run: as the hold of USE); coop_wound_me (test).
 #pragma once
 
 #include "xrCoop/coop_session.h"

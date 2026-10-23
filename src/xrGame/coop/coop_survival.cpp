@@ -8,6 +8,8 @@
 #include "coop_script.h"
 #include "coop_death.h"
 #include "coop_checkpoints.h"
+#include "coop_money.h"
+#include "xrCoop/coop_checkpoint_store.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -75,6 +77,10 @@ constexpr float kOverheadTurn = 0.08f; // ... turning this many radians a second
 // custom data, saved with him like his checkpoint slot (coop_checkpoints). death::debt_after_report decides it.
 const char* const kDebtSection = "coop_death";
 const char* const kDebtKey = "respawn";
+// F3 Task 10 (T8 review): out of a hardcore run, kept the same way ([coop_death] out = 1; death::learn_out).
+const char* const kOutKey = "out";
+constexpr u32 kNewCharHoldMs = kGiveUpHoldMs; // an out player holds USE this long to start a new character
+constexpr u32 kNewCharRetryMs = 10000; // no answer from the host (refused, or still retiring): the prompt comes back
 
 enum Op : u8
 {
@@ -215,6 +221,10 @@ struct Local
 	// spectating
 	u16 spectate = 0xffff; // local id of the watched avatar
 	bool next_was_down = false, prev_was_down = false;
+	// out of a hardcore run (F3 Task 10): holding USE for a new character (armed once USE was seen released)
+	u64 newchar_start = 0;
+	bool newchar_armed = false;
+	u64 newchar_asked = 0; // when the request went out (Msg::NewCharacter, or the host's own), 0 = not asked
 };
 Local g_me;
 
@@ -244,6 +254,13 @@ struct HostRec
 	bool debt = false; // the respawn debt as last read / written (coop_status only: the world keeps the real one)
 };
 xr_map<u16, HostRec> g_host;
+// F3 Task 10: characters out of a hardcore run that retire, their things on the way into a stash (death::retire_step).
+struct Retirement
+{
+	u64 since = 0;
+	u16 stash = 0xffff; // death::host_move_to_stash; 0xffff: none was made (nothing to move, or it all dropped)
+};
+xr_map<u16, Retirement> g_retire;
 bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
 u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
@@ -302,6 +319,7 @@ struct Stats
 	u64 states_out = 0, states_in = 0, orders_in = 0, requests_in = 0;
 	u64 kills_intercepted = 0, proxy_kills_refused = 0, guard_fixes = 0, stale_orders = 0;
 	u64 wipes = 0, worn_reports = 0, worn_refused = 0;
+	u64 newchar_asked = 0, newchar_refused = 0, retired = 0; // F3 Task 10
 } g_stat;
 xr_set<u16> g_guard_logged;
 
@@ -858,11 +876,14 @@ void apply_spectate(u16 seq)
 	g_hook_life.store(u8(Life::Spectating));
 	g_me.since = t;
 	g_me.spectate = 0xffff;
+	g_me.newchar_start = 0; // F3 Task 10: the hold for a new character starts over (armed once USE is released)
+	g_me.newchar_armed = false;
+	g_me.newchar_asked = 0;
 	close_menus();
 	hold_controls(a);
 	set_cam(a, 2);
 	++g_stat.spectates;
-	feed("Hardcore: you are out until the host loads a save.");
+	feed("Hardcore: your character is gone. Hold USE to start a new one.");
 	send_my_state(t);
 }
 
@@ -937,7 +958,7 @@ void announce(u16 id, Life from, Life to)
 	{
 	case Life::Wounded: feed("%s is down! Hold USE on them with a medkit to revive.", who.c_str()); break;
 	case Life::Dead: feed("%s died.", who.c_str()); break;
-	case Life::Spectating: feed("%s is out until the host loads a save.", who.c_str()); break;
+	case Life::Spectating: feed("%s is out of the run (hardcore).", who.c_str()); break;
 	case Life::Alive:
 		if (from == Life::Wounded)
 			feed("%s is back on their feet.", who.c_str());
@@ -993,31 +1014,32 @@ CSE_Abstract* character_entity(u16 character)
 
 // Fix round 1 (M-1 / M-3): the respawn debt lives with the character in the world, so it reaches exactly the worlds
 // saved while he owed it (a level change, an autosave) and no new game, no other save, no other entity under his id.
-bool debt_read(u16 character)
+// F3 Task 10 (T8 review): so does "out of a hardcore run" (kOutKey, death::learn_out). [coop_death] <key> = 1.
+bool flag_read(u16 character, const char* key)
 {
 	const CSE_Abstract* e = character_entity(character);
 	if (!e || !e->m_ini_string.size())
 		return false;
 	std::string v;
-	return checkpoint::ini_get(e->m_ini_string.c_str(), kDebtSection, kDebtKey, v) && v == "1";
+	return checkpoint::ini_get(e->m_ini_string.c_str(), kDebtSection, key, v) && v == "1";
 }
 
-void debt_write(u16 character, bool owed)
+void flag_write(u16 character, const char* key, bool on)
 {
 	CSE_Abstract* e = character_entity(character);
 	if (!e)
 	{
-		if (owed)
-			::Msg("! [coop] respawn debt of %u not kept: no character entity (a world change will not bring it back)",
-			    character);
+		if (on)
+			::Msg("! [coop] [%s] %s of %u not kept: no character entity (a world change will not bring it back)",
+			    kDebtSection, key, character);
 		return;
 	}
 	std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
 	const std::string before = text;
-	if (owed)
-		checkpoint::ini_set(text, kDebtSection, kDebtKey, "1");
+	if (on)
+		checkpoint::ini_set(text, kDebtSection, key, "1");
 	else
-		checkpoint::ini_erase(text, kDebtSection, kDebtKey);
+		checkpoint::ini_erase(text, kDebtSection, key);
 	if (text != before)
 		e->m_ini_string = text.c_str();
 }
@@ -1094,16 +1116,22 @@ death::Action host_on_died(u16 id, u16 seq)
 }
 
 // Every life report of a character's owner (the host's own too). The respawn debt follows the report
-// (death::debt_after_report) and is kept in the world; an Alive report is answered by death::on_alive_report: a respawn
-// owed after a leave or a world change (Review Focus 1 / 2), a hardcore spectator sent back to watching (Ruling F3-7).
+// (death::debt_after_report) and is kept in the world, and so is "out of a hardcore run" (F3 Task 10); an Alive report
+// is answered by death::on_alive_report: a respawn owed after a leave or a world change (Review Focus 1 / 2), a hardcore
+// spectator sent back to watching (Ruling F3-7) until he starts a new character.
 void host_on_state(u16 id, Life life, u16 seq)
 {
 	HostRec& h = g_host[id];
+	// F3 Task 10 (T8 review): the world's word on "out" first; a death of an out character then costs nothing again
+	const bool out_before = flag_read(id, kOutKey);
+	death::learn_out(h.tracker, out_before);
 	const death::Action decided = life == Life::Dead ? host_on_died(id, seq) : death::Action::None;
-	const bool before = debt_read(id);
+	if (h.tracker.hardcore_out != out_before)
+		flag_write(id, kOutKey, h.tracker.hardcore_out);
+	const bool before = flag_read(id, kDebtKey);
 	const bool owed = death::debt_after_report(before, u8(life), decided);
 	if (owed != before)
-		debt_write(id, owed);
+		flag_write(id, kDebtKey, owed);
 	h.debt = owed;
 	if (life != Life::Alive)
 	{
@@ -1185,6 +1213,157 @@ void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u
 	host_send_order(target, w);
 }
 
+// ---------------------------------------------------------------- hardcore: a new character (F3 Task 10)
+
+// Where the host's new character stands up: his arrival point on this level (coop_checkpoints keeps it in the actor's
+// custom data, F3 Task 6), else where a respawn would put him (his camp, the previous one, where he stands).
+Fvector host_new_place(CActor* a, const char*& where)
+{
+	const CSE_Abstract* e = character_entity(0);
+	checkpoint::Record r;
+	if (e && e->m_ini_string.size() && checkpoint::arrival_from_ini(std::string(e->m_ini_string.c_str()), r) &&
+	    r.valid() && r.level == Level().name().c_str())
+	{
+		where = "his arrival point";
+		return Fvector().set(r.pos[0], r.pos[1], r.pos[2]);
+	}
+	Fvector pos = a->Position();
+	checkpoint::Kind kind = checkpoint::Kind::None;
+	checkpoints::host_respawn_point(0, nullptr, a->Position(), pos, kind);
+	where = kind == checkpoint::Kind::None ? "where he stands (no arrival point on this level)" : checkpoint::kind_name(kind);
+	return pos;
+}
+
+// Step 4, the host's own new character, his things in the stash now (host_retire_frame): the actor stands up at his
+// arrival point as a fresh one - health 1, no radiation, no bleeding, fed, rested, 0 RU - out of the run no more, and the
+// host's Lua (coop_menu_char) lets him choose faction and kit: coop_host_new_character(). He is his own authority.
+void host_finish_own(u64 t)
+{
+	CActor* a = local_actor();
+	if (!a)
+		return;
+	HostRec& h = g_host[0];
+	h.tracker = death::Tracker(); // a new character: not out, no death decided, nothing owed
+	h.ordered_seq = death::kNoSeq;
+	h.has_worn = false;
+	h.has_anchor = false; // the anchor is where this character is first seen alive
+	h.debt = false;
+	flag_write(0, kOutKey, false); // before stand_up: its Alive report reads the world's word (learn_out)
+	flag_write(0, kDebtKey, false);
+	const char* where = "";
+	Fvector pos = host_new_place(a, where);
+	pos.y += kRespawnLift;
+	Fmatrix m = a->XFORM();
+	m.c.set(pos);
+	a->ForceTransform(m);
+	CActorCondition& c = a->conditions();
+	c.SetSatiety(1.f);
+	c.SetPower(1.f);
+	if (!money::host_set(kHostPeer, 0, "new character"))
+		::Msg("! [coop] new character of the host: his money is not set to 0 (no balance to write)");
+	stand_up(a, 1.f, true, t); // health 1 (up to his maximum), radiation 0, bleeding gone, controls back; Alive goes out
+	::Msg("[coop] the host starts a new character at %s (%.1f, %.1f, %.1f)", where, pos.x, pos.y, pos.z);
+	feed("A new character. Choose faction and gear.");
+	script::queue_callback("coop_host_new_character", {});
+}
+
+// Step 2 for a client's character, his stash done (host_retire_frame): the key goes from his custom data and
+// `retired = 1` comes in (death::retire_custom_data), his player joins the world again - with no character for his key
+// he chooses a new one (protocol 8: CharOffer, coop_menu_char, create_proxy) - and the old character leaves the world.
+void host_finish_client(u16 character)
+{
+	if (CSE_Abstract* e = character_entity(character))
+	{
+		std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
+		size_t at = 0, len = 0;
+		if (find_key_value(text, at, len))
+			join::host_key_retired(text.substr(at, len)); // Ruling F3-9: his new character is not a new key
+		death::retire_custom_data(text);
+		e->m_ini_string = text.c_str();
+	}
+	const PeerId peer = join::peer_of_proxy(character);
+	if (peer == kInvalidPeer)
+		::Msg("[coop] retired character %u: his player is away, his next join makes a new character", character);
+	else if (!join::host_rejoin_peer(peer, "new character"))
+	{
+		// cannot happen (a peer of a proxy is a connected player of this world); his machine still plays this
+		// character, so it stays in the world, keyless: his next join makes a new one
+		::Msg("! [coop] retired character %u: his player #%u could not be sent the world again, kept", character, peer);
+		g_host.erase(character);
+		return;
+	}
+	death::host_release_character(character);
+	world::host_forget_proxy(character); // the id is nobody's character now: ALife may give it to anything
+	g_host.erase(character);
+	g_players.erase(character);
+}
+
+// Review R2 of T9 (death::retire_step): a retiring character's key, his player and his release wait until his stash
+// is no longer pending (death::host_stash_pending). The stash knows its owner by the key, or by the player while the
+// key is off; changing either before it is filled leaves it without an owner, the things stay on the old character and
+// go with him. Only then step 2 (a client's character) or step 4 (the host's own) goes on.
+void host_retire_frame(u64 t)
+{
+	for (auto it = g_retire.begin(); it != g_retire.end();)
+	{
+		const u16 character = it->first;
+		const bool here = character == 0 ? local_actor() != nullptr : character_entity(character) != nullptr;
+		switch (death::retire_step(here, death::host_stash_pending(character)))
+		{
+		case death::RetireStep::Wait: ++it; continue;
+		case death::RetireStep::Void:
+			::Msg("! [coop] retirement of character %u dropped: he is gone", character);
+			break;
+		case death::RetireStep::Finish:
+			if (character == 0)
+				host_finish_own(t);
+			else
+				host_finish_client(character);
+			++g_stat.retired;
+			break;
+		}
+		it = g_retire.erase(it);
+	}
+}
+
+// Steps 2 and 4: the owner of `character` (0: the host himself) asks for a new character. The tracker, with the world's
+// word (learn_out), must say he is out of the hardcore run; then everything he has - worn and quest items included - goes
+// into a stash at the body (DeathMarker when it is in), and the rest waits for it (host_retire_frame). He must be in the
+// world: a character that is not online here has nothing moved, and his release would take his things with him. Ruling
+// F3-9: coop_max_new_characters is not checked - his key had a character (join::host_key_retired).
+void host_new_character(u16 character)
+{
+	HostRec& h = g_host[character];
+	death::learn_out(h.tracker, flag_read(character, kOutKey));
+	const xr_string who = nick_of(character);
+	const char* refused = nullptr;
+	switch (death::on_new_character(h.tracker, g_retire.find(character) != g_retire.end()))
+	{
+	case death::NewCharVerdict::Busy:
+		::Msg("[coop] new character of %s: under way already", who.c_str());
+		return;
+	case death::NewCharVerdict::NotOut: refused = "he is not out of a hardcore run"; break;
+	case death::NewCharVerdict::Start:
+		if (character == 0 ? !local_actor() : !object_here(character))
+			refused = "his character is not in the world here";
+		break;
+	}
+	if (refused)
+	{
+		++g_stat.newchar_refused;
+		::Msg("! [coop] new character of %s (character %u) refused: %s", who.c_str(), character, refused);
+		return;
+	}
+	Retirement r;
+	r.since = now();
+	r.stash = death::host_move_to_stash(character, true); // everything, worn and quest items included
+	g_retire[character] = r;
+	if (r.stash != 0xffff)
+		::Msg("[coop] %s starts a new character: his things go into stash %u first", who.c_str(), r.stash);
+	else
+		::Msg("[coop] %s starts a new character (no stash: nothing to keep, or it dropped at the body)", who.c_str());
+}
+
 void host_broadcast_rules()
 {
 	Writer w(16);
@@ -1201,9 +1380,14 @@ void host_frame(u64 t)
 			g_me.actor = nullptr; // the new actor may reuse the old one's address: frame() must still start it over
 		// A load / level change replaced the world: deaths and anchors start over (the new actors count their falls
 		// from 0). Review Focus 2: whoever was dead or evacuated when this world was saved carries his respawn debt in
-		// it (debt_read) and is put on his checkpoint at his first Alive report here; the losses were taken already.
+		// it (flag_read) and is put on his checkpoint at his first Alive report here; the losses were taken already.
+		// F3 Task 10: whoever was out of a hardcore run carries that too (kOutKey) and watches again. A retirement of
+		// the old world is void (its stash is released empty, death::abandon_stashes): he may ask again here.
 		g_epoch = epoch;
 		g_host.clear();
+		if (!g_retire.empty())
+			::Msg("[coop] a new world: %u retirement(s) of the old one dropped", u32(g_retire.size()));
+		g_retire.clear();
 		g_wipe_fired = false;
 	}
 
@@ -1233,6 +1417,8 @@ void host_frame(u64 t)
 		else
 			++it;
 	}
+
+	host_retire_frame(t); // F3 Task 10: retirements whose stash is done
 
 	// evacuations that are over (orders after the walk: the host's own respawn re-enters host_on_state)
 	xr_vector<u16> due;
@@ -1339,6 +1525,22 @@ void on_revive_msg(PeerId from, Reader& r)
 	}
 	if (mgr().is_live_client() && from == kHostPeer && op != OpRequest)
 		apply_order(op, r);
+}
+
+// Host, F3 Task 10 step 2: Msg::NewCharacter (no payload; bytes after are a newer client's) from a client out of a
+// hardcore run. His character is the one of his peer, never an id he names.
+void on_new_character_msg(PeerId from, Reader&)
+{
+	if (!mgr().is_host())
+		return; // ClientOnly: the session refuses it from the host before any handler
+	const u16 proxy = join::proxy_of_peer(from);
+	if (proxy == 0xffff)
+	{
+		++g_stat.newchar_refused;
+		::Msg("! [coop] NewCharacter from #%u refused: no character of his in this world", from);
+		return;
+	}
+	host_new_character(proxy);
 }
 
 void on_rules_msg(PeerId from, Reader& r)
@@ -1464,6 +1666,49 @@ void overhead_frame(CActor* a)
 	g_over.valid = true;
 }
 
+// F3 Task 10, step 1: out of a hardcore run, ask for a new character (the hold of USE, console coop_new_character). A
+// client asks the host (Msg::NewCharacter, no payload); the host starts its own retirement at once. The answer is the
+// world sent again (a client) or standing up (the host); a refusal is only in the host's log, so after kNewCharRetryMs
+// the prompt comes back. False while a request is that fresh.
+bool request_new_character(u64 t)
+{
+	if (g_me.life != Life::Spectating || (g_me.newchar_asked && t - g_me.newchar_asked < kNewCharRetryMs))
+		return false;
+	g_me.newchar_asked = t;
+	g_me.newchar_start = 0;
+	g_me.newchar_armed = false;
+	++g_stat.newchar_asked;
+	::Msg("[coop] asking for a new character");
+	if (mgr().is_host())
+		host_new_character(0);
+	else
+		net::client_send(Msg::NewCharacter, Writer());
+	return true;
+}
+
+// Spectating: hold USE kNewCharHoldMs (as kGiveUpHoldMs), armed once USE was seen released after the order.
+void newchar_frame(u64 t)
+{
+	if (g_me.newchar_asked)
+	{
+		if (t - g_me.newchar_asked < kNewCharRetryMs)
+			return;
+		g_me.newchar_asked = 0; // no answer: the host refused (its log says why), or it is still at it
+	}
+	if (!action_down(kUSE))
+	{
+		g_me.newchar_armed = true;
+		g_me.newchar_start = 0;
+		return;
+	}
+	if (!g_me.newchar_armed)
+		return;
+	if (!g_me.newchar_start)
+		g_me.newchar_start = t;
+	else if (t - g_me.newchar_start >= kNewCharHoldMs)
+		request_new_character(t);
+}
+
 // Dead and evacuated: watch a living teammate (Fire / Aim switch), nobody alive: look down at the body.
 void evacuated_frame(CActor* a, u64 t)
 {
@@ -1520,6 +1765,7 @@ void local_frame(CActor* a, u64 t)
 	case Life::Spectating:
 		hold_controls(a);
 		spectate_frame(t);
+		newchar_frame(t);
 		break;
 	case Life::Respawning:
 		hold_controls(a);
@@ -1644,20 +1890,28 @@ void build_hud(u64 t)
 		}
 		break;
 	case Life::Respawning: line("Respawning...", 0xfff0f0f0, true); break;
-	case Life::Spectating:
+	case Life::Spectating: // out of a hardcore run: watch the others, or start a new character (F3 Task 10)
 	{
-		bool anyone = false;
+		line(tr("st_coop_hardcore_out", "Your character is gone.").c_str(), 0xffe03c3c, true);
 		if (g_me.spectate != 0xffff)
 		{
-			xr_sprintf(buf, "SPECTATING %s", nick_of(join::to_host(g_me.spectate)).c_str());
-			line(buf, 0xfff0f0f0, true);
+			xr_sprintf(buf, tr_format("st_coop_evac_watch", "Watching: %s", 's').c_str(),
+			    nick_of(join::to_host(g_me.spectate)).c_str());
+			line(buf, 0xfff0f0f0, false);
 			line("Fire: next player   Aim: previous player", 0xffa0a0a0, false);
-			anyone = true;
 		}
-		if (!anyone)
-			line("All players are down. The host must load a save.", 0xffe03c3c, true);
 		else
-			line("You are dead until the host loads a save.", 0xffa0a0a0, false);
+			line(tr("st_coop_evac_no_allies", "Nobody is left alive. The world is not rolled back.").c_str(),
+			    0xffa0a0a0, false);
+		if (g_me.newchar_asked)
+			line("Starting a new character...", 0xffffa040, false);
+		else if (g_me.newchar_start)
+		{
+			xr_sprintf(buf, "New character... %u%%", u32(_min<u64>(100, (t - g_me.newchar_start) * 100 / kNewCharHoldMs)));
+			line(buf, 0xffffa040, false);
+		}
+		else
+			line(tr("st_coop_hardcore_new_hold", "Hold USE for 3 s to start a new character").c_str(), 0xfff0f0f0, false);
 		break;
 	}
 	default: break;
@@ -1701,10 +1955,37 @@ void leave_session()
 		release_controls(a);
 	forget_local();
 	g_host.clear(); // the respawn debts stay in the world (custom data), not here
+	g_retire.clear(); // a stash still waiting is released empty (death::reset); the character stays out
 	g_wipe_fired = false;
 	g_rules_from_host = false;
 	g_hud.clear();
 }
+
+// F3 Task 10: the hold of USE from the console (out of a hardcore run).
+class CCC_CoopNewCharacter : public IConsole_Command
+{
+public:
+	CCC_CoopNewCharacter(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override
+	{
+		if (!local_actor() || !live())
+		{
+			::Msg("! [coop] coop_new_character: only in a co-op session, in a level");
+			return;
+		}
+		if (g_me.life != Life::Spectating)
+		{
+			::Msg("! [coop] coop_new_character: only out of a hardcore run (spectating), now %s", life_name(g_me.life));
+			return;
+		}
+		if (!request_new_character(now()))
+			::Msg("[coop] coop_new_character: asked %llu s ago, waiting for the host", (now() - g_me.newchar_asked) / 1000);
+	}
+	void Info(TInfo& I) override
+	{
+		xr_strcpy(I, "hardcore, out of the run: start a new character (as holding USE for 3 s)");
+	}
+};
 
 class CCC_CoopWoundMe : public IConsole_Command
 {
@@ -1841,6 +2122,7 @@ void install(Session& s)
 	s.on(Msg::PlayerWounded, &on_state_msg);
 	s.on(Msg::PlayerRevive, &on_revive_msg);
 	s.on(Msg::PlayerRules, &on_rules_msg);
+	s.on(Msg::NewCharacter, &on_new_character_msg); // F3 Task 10
 }
 
 void register_console()
@@ -1855,6 +2137,7 @@ void register_console()
 	CMD4(CCC_Float, "coop_death_wear", &g_cv_death_wear, 0.f, 100.f); // %
 	CMD4(CCC_Float, "coop_death_rank", &g_cv_death_rank, 0.f, 100.f); // %
 	CMD1(CCC_CoopWoundMe, "coop_wound_me");
+	CMD1(CCC_CoopNewCharacter, "coop_new_character"); // F3 Task 10
 }
 
 void reset()
@@ -1925,10 +2208,15 @@ void print_status()
 	    g_stat.states_out, g_stat.states_in, g_stat.orders_in, g_stat.requests_in, g_stat.stale_orders,
 	    g_stat.kills_intercepted, g_stat.proxy_kills_refused, g_stat.guard_fixes, g_stat.worn_reports,
 	    g_stat.worn_refused);
+	::Msg("[coop]   survival: new characters asked %llu, refused %llu, retired %llu, %u retiring", g_stat.newchar_asked,
+	    g_stat.newchar_refused, g_stat.retired, u32(g_retire.size()));
 	const u64 t = now();
 	for (const auto& it : g_players)
 		::Msg("[coop]   player %u '%s': %s (fall #%u)%s", it.first, it.second.nick.c_str(), life_name(it.second.life),
 		    it.second.seq, it.second.life == Life::Wounded && it.second.bleed_end > t ? ", bleeding out" : "");
+	for (const auto& it : g_retire)
+		::Msg("[coop]   host: character %u retires, %llu s, stash %u %s", it.first, (t - it.second.since) / 1000,
+		    u32(it.second.stash), death::host_stash_pending(it.first) ? "waits for his things" : "is done");
 	for (const auto& it : g_host)
 	{
 		const death::Tracker& k = it.second.tracker;

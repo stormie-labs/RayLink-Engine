@@ -12,6 +12,7 @@
 #include "coop_script.h"
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_shapes.h"
+#include "xrCoop/coop_death_rules.h" // Ruling F3-9: retired keys, new_key_charge
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_link_hold.h"
 #include "xrCoop/coop_newchar.h"
@@ -103,8 +104,11 @@ struct State
 	// host: how long they wait for it (review of protocol 8: the precache of an unfocused window never ends)
 	link_hold::PrecacheWait precache_clock;
 	// host: Ruling F2-10 b: the keys this session made a new character for (coop_max_new_characters); a new session
-	// starts over (on_host_started)
+	// starts over (on_host_started). Ruling F3-9: only keys that had no character spend it (death::new_key_charge).
 	limits::NewCharacters new_characters;
+	// host, Ruling F3-9: the keys that had a character in this session (a returning player, a new character made, a
+	// retired one); with the retired keys of the world (host_retired_in_world) they neither check nor spend the limit
+	std::set<std::string> had_character;
 	u32 characters_refused = 0; // diagnostics: new keys refused over the limit (the first few logged)
 	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
 	u32 loaded_ignored = 0;
@@ -538,13 +542,38 @@ bool host_key_digest(PeerId from, const PeerInfo& p, std::string& out)
 	return false;
 }
 
+// Ruling F3-9: the key's character retired in this world (a hardcore character, F3 Task 10): the host actor's custom data
+// keeps it (death::note_retired_key, host_key_retired), also for a later session.
+bool host_retired_in_world(const std::string& key_digest)
+{
+	const CSE_ALifeCreatureActor* a = ai().get_alife() ? ai().alife().graph().actor() : nullptr;
+	return a && a->m_ini_string.size() && death::retired_key(a->m_ini_string.c_str(), key_digest);
+}
+
+// Ruling F3-9: the key had a character - in this session (returned to one, got a new one, retired one) or one that
+// retired in this world. Such a key is the same player starting again: coop_max_new_characters is not his.
+bool host_key_had_character(const std::string& key_digest)
+{
+	return g.had_character.count(key_digest) != 0 || host_retired_in_world(key_digest);
+}
+
+// The host made a character for a key the world had none for: it spends the limit only if the key never had one.
+void host_count_new_character(const std::string& key_digest)
+{
+	if (death::new_key_charge(host_key_had_character(key_digest), true).spends)
+		g.new_characters.add(key_digest);
+	g.had_character.insert(key_digest);
+}
+
 // Ruling F2-10 b: the client picks its key; every new one used to get a character (starting kit, money) that stays in
-// the save for good. A session makes coop_max_new_characters (F2 T3 fix round 1: a host setting, read at each join); a
-// returning player costs nothing. False: he is kicked with the reason.
+// the save for good. A session makes coop_max_new_characters (F2 T3 fix round 1: a host setting, read at each join) for
+// keys without a character; a returning player costs nothing, and neither does a key that had a character in this
+// session or retired one in this world (Ruling F3-9: a hardcore player starts again). False: he is kicked with the
+// reason.
 bool host_admits_new_key(PeerId from, const PeerInfo& p, const std::string& key_digest)
 {
 	const u32 max_new = u32(g_coop_max_new_characters);
-	if (g.new_characters.admits(key_digest, max_new))
+	if (death::new_key_charge(host_key_had_character(key_digest), g.new_characters.admits(key_digest, max_new)).admitted)
 		return true;
 	if (++g.characters_refused <= kRefusalsLogged)
 		::Msg("! [coop] '%s' has no character in this world, and this session has made %u new characters "
@@ -616,6 +645,7 @@ bool host_send_world(PeerId from)
 	if (proxy)
 	{
 		::Msg("[coop] '%s' returns to character proxy id %u", p->nick.c_str(), proxy->ID);
+		g.had_character.insert(key_digest); // Ruling F3-9: his next new character costs nothing
 		bring_proxy_to_level(*proxy, p->nick.c_str());
 		return host_send_save(from, *p, *proxy);
 	}
@@ -629,7 +659,7 @@ bool host_send_world(PeerId from)
 		mgr().session().kick(from, RejectReason::HostNotReady, "host could not create a character for you");
 		return false;
 	}
-	g.new_characters.add(key_digest);
+	host_count_new_character(key_digest);
 	return host_send_save(from, *p, *proxy);
 }
 
@@ -763,7 +793,7 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 		host_ask_again(from, p, why.c_str());
 		return;
 	}
-	g.new_characters.add(key_digest);
+	host_count_new_character(key_digest);
 	g.choosers.forget(from);
 	++g.characters_made;
 	::Msg("[coop] '%s' chose %s: character %u made before the world (%u NPC item(s) stripped, %.0f RU), sending the "
@@ -1485,6 +1515,53 @@ bool accept_transition()
 	::Msg("[coop] moving the group to the next level (level exit %u)", id);
 	Level().Send(P, net_flags(TRUE)); // the host's own level change; clients follow via SessionReset
 	return true;
+}
+
+// F3 Task 10 step 3. The epoch does not move: client_on_session_reset takes the one it is in (Session::set_world_epoch is a
+// no-op for it, no WorldEpoch goes out) and so does the host's session for his JoinRequest. The gate (R1 I4, R2 I4) is
+// the one of every join: his join of this world ended with his WorldLoaded, forget voids one still in flight, and a
+// JoinRequest within 5 s of his last admission waits (Later) until due() admits it - so nothing has to wait here.
+bool host_rejoin_peer(PeerId peer, const char* why)
+{
+	if (!mgr().is_host() || peer == kHostPeer || !mgr().session().peer(peer))
+		return false;
+	auto it = g.peers.find(peer);
+	if (it == g.peers.end())
+		return false; // no join of his reached this world: there is nothing to do again
+	g.gate.forget(peer);
+	g.precache_wait.erase(std::remove(g.precache_wait.begin(), g.precache_wait.end(), peer), g.precache_wait.end());
+	g.choosers.forget(peer);
+	const u16 proxy = it->second.proxy;
+	it->second.proxy = kNoId; // set again by his JoinRequest (his character by key, or a new one)
+	it->second.loading = true;
+	it->second.sent_at = mgr().now_ms(); // review R2 C1: the join timeout measures this rejoin
+	if (proxy != kNoId)
+		world::host_park_proxy(proxy); // nobody plays it now (the caller may release it right after)
+	sync::host_begin_join(peer); // queue / drop world traffic to him until he is back
+	Writer w(96);
+	w.str(why && *why ? why : "the host sends you the world again");
+	w.u32(g.epoch);
+	mgr().session().send(peer, Lane::Reliable, Msg::SessionReset, w);
+	host_send_owners(); // R3 В3: nobody plays that character any more
+	const PeerInfo* p = mgr().session().peer(peer);
+	::Msg("[coop] '%s' joins the world again (%s, epoch %u), his character %u is nobody's now", p ? p->nick.c_str() : "?",
+	    why && *why ? why : "-", g.epoch, u32(proxy));
+	return true;
+}
+
+void host_key_retired(const std::string& key_digest)
+{
+	if (!mgr().is_host() || key_digest.empty())
+		return;
+	g.had_character.insert(key_digest);
+	CSE_ALifeCreatureActor* a = ai().get_alife() ? ai().alife().graph().actor() : nullptr;
+	if (!a)
+		return;
+	std::string text = a->m_ini_string.size() ? a->m_ini_string.c_str() : "";
+	const std::string before = text;
+	death::note_retired_key(text, key_digest);
+	if (text != before)
+		a->m_ini_string = text.c_str();
 }
 
 void client_request_level_change(NET_Packet& P)

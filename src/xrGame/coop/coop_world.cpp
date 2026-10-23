@@ -53,6 +53,8 @@ void host_park_proxy(u16 id)
 		it->second.peer = kInvalidPeer;
 }
 
+void host_forget_proxy(u16 id) { g_avatars.erase(id); }
+
 void client_mark_host_avatar(u16 id) { g_avatars[id].peer = kHostPeer; }
 
 void client_mark_avatar(u16 id, PeerId peer) { g_avatars[id].peer = peer; }

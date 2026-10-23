@@ -8,7 +8,8 @@
 // a camp of the faction there, else next to the host: every player is on the host's level until split levels, F3a);
 // the host makes the character there with the faction's community, the script gives the kit and the money, and the
 // world save follows as for a returning player. A refused choice is offered again with the reason; the time to choose
-// is limited (xrCoop/coop_newchar.h).
+// is limited (xrCoop/coop_newchar.h). F3 Task 10: a player whose hardcore character retired goes the same way in the game
+// (host_rejoin_peer); Ruling F3-9: his new character does not count against coop_max_new_characters.
 // Client: loads that save, so every server entity has the same id as on the host. Right after
 // the save is read and before anything goes online, the client swaps roles: its local actor
 // (id 0) takes the data of its own proxy, and the proxy takes the host actor's data — the proxy
@@ -21,7 +22,9 @@ class CALifeObjectRegistry;
 class NET_Packet;
 
 // Host setting (console coop_max_new_characters, Ruling F2-10 b, F2 T3 fix round 1): how many new player characters
-// (a player key the world has no character for) a session makes; default and range in xrCoop/coop_limits.h.
+// (a player key the world has no character for) a session makes; default and range in xrCoop/coop_limits.h. Ruling F3-9:
+// only keys that never had a character count; a key that had one in this session, or whose character retired in this
+// world (hardcore, F3 Task 10), neither checks nor spends it.
 extern int g_coop_max_new_characters;
 
 namespace coop
@@ -76,6 +79,17 @@ u32 world_generation();
 // Host: execute a level change a client asked for (console coop_accept_transition), built from the host's own
 // level changer (R2 I3).
 bool accept_transition();
+// Host, F3 Task 10: player `peer` goes through the join again in the world the host serves now: SessionReset {why,
+// epoch} to him alone, with the epoch he is in already (his session and the host's take it as it is), his entry
+// loading, his world traffic held (sync::host_begin_join), his character nobody's. His JoinRequest finds his character
+// by key, or with none (a retired hardcore character) offers him a new one (protocol 8). A join of his still in flight
+// is void; the 5 s between two admissions hold (a JoinRequest within them waits, JoinGate::Later, and goes after).
+// False if he is not a player of this session in the world (no entry, the host itself).
+bool host_rejoin_peer(PeerId peer, const char* why);
+// Host, Ruling F3-9: the character of player key `key_digest` retired (F3 Task 10). Kept for this session and in the
+// world (the host actor's custom data, [coop_retired], death::note_retired_key): his new character, now or in a later
+// session, neither checks nor spends coop_max_new_characters.
+void host_key_retired(const std::string& key_digest);
 
 // --- client ---
 // Client touched a level exit: the host decides. Only the id of the level changer goes to the host (R2 I3).

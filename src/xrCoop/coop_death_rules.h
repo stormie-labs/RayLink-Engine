@@ -1,7 +1,8 @@
 // Anomaly Coop — death rules (F3, CHECKPOINTS_DEATH.md §3): the host's death settings and their wire form, which items
 // a death takes from the character, the wipe test and the per-player tracker that makes sure one death is handled once
 // (also across a leave/return and a world reload), and the decisions of the host's death flow around it (F3 Task 8: the
-// respawn debt, the answer to an Alive report, the worn-items tail of a client's Dead report, the HUD format check).
+// respawn debt, the answer to an Alive report, the worn-items tail of a client's Dead report, the HUD format check) and
+// hardcore's way back (F3 Task 10: "out" kept by the world, the request of a new character, the retirement of the old).
 // The host decides everything here; the engine layer only feeds in what it sees and carries out the answer.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
@@ -11,8 +12,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
+#include "coop_checkpoint_rules.h" // checkpoint::ini_set / ini_erase: the custom data of a retired character
 #include "coop_wire.h"
 
 namespace coop
@@ -264,7 +267,7 @@ struct Tracker
 	uint16_t decided_seq = 0xffff;
 	uint64_t respawn_at = 0;   // host clock of the respawn; 0 = not waiting
 	bool respawn_due = false;  // the player left while dead: respawn when they are back
-	bool hardcore_out = false; // out of the run for good
+	bool hardcore_out = false; // out of the run until his player starts a new character (F3 Task 10)
 };
 
 enum class Action : uint8_t
@@ -281,7 +284,7 @@ inline Action on_died(Tracker& t, uint16_t seq, uint64_t now_ms, const Rules& r)
 		return Action::None;
 	t.decided_seq = seq;
 	t.respawn_due = false;
-	if (r.mode == Mode::Hardcore)
+	if (r.mode == Mode::Hardcore || t.hardcore_out) // F3 Task 10: out already (learn_out) costs nothing again, any mode
 	{
 		t.hardcore_out = true;
 		t.respawn_at = 0;
@@ -379,8 +382,9 @@ enum class AliveStep : uint8_t
 // The owner reports `t`'s character alive. A respawn is owed when the tracker waited for his return (on_returned) or
 // the world keeps a debt for him (`debt`, debt_after_report); `ordered`: a respawn order for this report's seq is out
 // already (an Alive that crossed it on the wire must not get a second one). on_returned runs before on_alive, which
-// forgets the death. Ruling F3-7: until F3 Task 10 a character out of a hardcore run stays out whatever the mode is now
-// and however often he rejoins: Spectate, never a respawn.
+// forgets the death. Ruling F3-7: a character out of a hardcore run stays out whatever the mode is now and however often
+// he rejoins: Spectate, never a respawn. F3 Task 10: his way back is a new character (on_new_character), and the world
+// keeps him out across a level change or a load (learn_out).
 inline AliveStep on_alive_report(Tracker& t, bool debt, bool ordered)
 {
 	const bool returned = on_returned(t);
@@ -431,6 +435,113 @@ inline WornTail read_worn(Reader& r, std::vector<uint16_t>& out)
 	std::sort(out.begin(), out.end());
 	out.erase(std::unique(out.begin(), out.end()), out.end());
 	return WornTail::Ok;
+}
+
+// ---------------------------------------------------------------- hardcore: out of the run, a new character (F3 Task 10)
+
+// T8 review: "out of a hardcore run" is kept with the character in the world ([coop_death] out = 1 in his custom data),
+// as the respawn debt is. The host's trackers start over with every world it serves (a level change, a load), so the
+// tracker alone forgot it and an out player came back alive after the next level change. The character carries it into
+// every world saved after his death; a new game or a save from before it has none. The engine reads it before each
+// report of the owner is decided and tells the tracker here; what the world keeps after the report is
+// `t.hardcore_out`. Only a new character (the retirement below) takes it away, never the world.
+inline void learn_out(Tracker& t, bool out_in_world)
+{
+	if (out_in_world)
+		t.hardcore_out = true;
+}
+
+// The owner of a character asks for a new one (Msg::NewCharacter; the host's own hold of USE or console the same).
+enum class NewCharVerdict : uint8_t
+{
+	Start, // out of a hardcore run: all he has goes into a stash, the rest follows when it is done (retire_step)
+	NotOut, // he still plays (or waits for a checkpoint respawn): refused, a modified client or a late repeat
+	Busy // his retirement is under way already: the repeat changes nothing
+};
+
+inline NewCharVerdict on_new_character(const Tracker& t, bool retiring)
+{
+	if (retiring)
+		return NewCharVerdict::Busy;
+	return t.hardcore_out ? NewCharVerdict::Start : NewCharVerdict::NotOut;
+}
+
+// Review R2 of T9: a retiring character keeps his key and his player until his stash has his things. A pending stash
+// knows its owner by the key when both sides have one, else by the player who plays him (same_owner,
+// coop_death_items.h). Taking the key off, or sending his player away to make the new character (host_rejoin_peer: the
+// old character then has no player, and create_proxy gives the key to the new one), while the stash still waits would
+// leave it without an owner: it gives up, the things stay with the old character, and his release destroys them.
+enum class RetireStep : uint8_t
+{
+	Wait, // his stash is pending: nothing of him changes yet
+	Finish, // the stash is done (or none was needed): the key goes, his player makes a new character, he leaves the world
+	Void // the character is gone (another world, released already): nothing left to do
+};
+
+inline RetireStep retire_step(bool character_here, bool stash_pending)
+{
+	if (!character_here)
+		return RetireStep::Void;
+	return stash_pending ? RetireStep::Wait : RetireStep::Finish;
+}
+
+// The custom data of a retired character: every `key` line of [coop] goes, so find_key_value finds no player for him and
+// his player's next join makes a new character (protocol 8), and `retired = 1` says why. The rest stays as it is.
+inline void retire_custom_data(std::string& text)
+{
+	checkpoint::ini_erase(text, "coop", "key");
+	checkpoint::ini_set(text, "coop", "retired", "1");
+}
+
+// Ruling F3-9: coop_max_new_characters (Ruling F2-10 b, limits::NewCharacters) stops new player keys, with which the
+// joins could be spammed for kits. A key that had a character - in this session, or one that retired in this world -
+// is the same player starting again: it neither checks nor spends the limit (else a hardcore group got stuck after a
+// session's worth of deaths; starting again gains nothing over dying). `had_character`: such a key; `limit_admits`:
+// limits::NewCharacters::admits for it now.
+struct NewKeyCharge
+{
+	bool admitted = false;
+	bool spends = false; // the host adds the key to limits::NewCharacters once his character is made
+};
+
+inline NewKeyCharge new_key_charge(bool had_character, bool limit_admits)
+{
+	NewKeyCharge c;
+	c.admitted = had_character || limit_admits;
+	c.spends = !had_character && limit_admits;
+	return c;
+}
+
+// The retired keys of a world are kept in the host actor's custom data, [coop_retired] <digest> = 1 (the retired
+// character is released, his key with him), so a player away when his character retired, or one coming in a later
+// session, is still known. One line per player key; only a key digest (kKeyDigestDigits lowercase hex, as
+// coop::kKeyDigestHexDigits, coop_session.h) is a key here.
+constexpr size_t kKeyDigestDigits = 64;
+constexpr const char* kRetiredSection = "coop_retired";
+
+namespace detail
+{
+inline bool is_key_digest(const std::string& s)
+{
+	if (s.size() != kKeyDigestDigits)
+		return false;
+	for (const char c : s)
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+			return false;
+	return true;
+}
+} // namespace detail
+
+inline void note_retired_key(std::string& text, const std::string& digest)
+{
+	if (detail::is_key_digest(digest))
+		checkpoint::ini_set(text, kRetiredSection, digest.c_str(), "1");
+}
+
+inline bool retired_key(const std::string& text, const std::string& digest)
+{
+	std::string v;
+	return detail::is_key_digest(digest) && checkpoint::ini_get(text, kRetiredSection, digest.c_str(), v) && v == "1";
 }
 
 // HUD: a translated format string the engine fills with one value is used only if it has exactly one '%' and that one

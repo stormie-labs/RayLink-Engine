@@ -9,6 +9,7 @@
 #include "coop_money.h"
 #include "coop_script.h"
 #include "coop_survival.h"
+#include "coop_world.h"
 #include "xrCoop/coop_death_items.h"
 #include "xrCoop/coop_ledger.h"
 
@@ -844,6 +845,37 @@ bool host_stash_pending(u16 character)
 		if (p.character == character)
 			return true;
 	return false;
+}
+
+bool host_release_character(u16 character)
+{
+	if (!mgr().is_host() || character == 0 || !ai().get_alife())
+		return false;
+	CSE_ALifeDynamicObject* d = ai().alife().objects().object(character, true);
+	if (!d || !world::is_player_character(d))
+	{
+		::Msg("! [coop] retired character %u not released: no player character under that id", character);
+		return false;
+	}
+	// what still hangs on him goes with him (the stash took the rest): counted for the log
+	u32 left = 0;
+	for (const ALife::_OBJECT_ID id : d->children)
+		if (CSE_ALifeDynamicObject* c = ai().alife().objects().object(id, true))
+			left += smart_cast<CSE_ALifeInventoryItem*>(c) ? 1 : 0;
+	if (CGameObject* go = game_object(character))
+		go->DestroyObject(); // online: the standard event chain destroys the game object, then the entity (as Lua's release)
+	else if (!d->m_bOnline)
+		alife_rw().release(d, true);
+	else
+	{
+		::Msg("! [coop] retired character %u is coming online now: not released", character);
+		return false;
+	}
+	if (left)
+		::Msg("! [coop] retired character %u leaves the world with %u item(s) the stash did not take", character, left);
+	else
+		::Msg("[coop] retired character %u leaves the world", character);
+	return true;
 }
 
 u32 host_take_money(u16 character, u8 pct)

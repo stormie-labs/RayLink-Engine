@@ -131,7 +131,9 @@ constexpr RateRule kClientRateRules[] = {
 // new keys farmed the starting kit and money, and every such character stays in the save for good. A session makes
 // at most the host setting coop_max_new_characters of them (g_coop_max_new_characters, coop_join; F2 T3 fix round 1:
 // a host whose session ran out raises it without a restart). A player whose key has a character in the world costs
-// nothing.
+// nothing. Ruling F3-9: the limit is for keys that never had a character; a key that had one in this session, or whose
+// character retired in this world (hardcore, F3 Task 10: the same player starting again), neither checks nor spends it
+// (coop_join, death::new_key_charge).
 constexpr uint32_t kNewCharactersDefault = 8;
 constexpr uint32_t kNewCharactersMin = 1;
 constexpr uint32_t kNewCharactersMax = 64;
@@ -146,7 +148,8 @@ inline std::string no_new_character_text(uint32_t max)
 }
 
 // Host: the player keys (digests) a session made a new character for. A key that got one already costs nothing
-// again: a load of a save from before he came takes his character away, and he gets a new one.
+// again: a load of a save from before he came takes his character away, and he gets a new one. Ruling F3-9: keys that
+// had a character before are not added here (coop_join, death::new_key_charge).
 class NewCharacters
 {
 public:
