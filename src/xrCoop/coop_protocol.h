@@ -38,6 +38,9 @@ namespace coop
 //    Also in 8 (F2 T12b): leased object ids - IdLease 0x0178 (host -> client), IdLeaseAck 0x0179 (client -> host)
 //    (xrCoop/coop_id_lease.h IdsMsg); ReqSpawn marker 0xC7 (an item the client created under a leased id, and the
 //    weapon a clone replaces; xrCoop/coop_spawn.h)
+//    Also in 8 (HUD v2 part 2): PlayerRevive ops 6..10 - Begin 6 / Cancel 7 (reviver -> host), Reviving 8 / Stopped 9
+//    (host -> the wounded's owner), Done 10 (host -> reviver): the hold of USE on a wounded teammate made visible
+//    (xrCoop/coop_revive_hold.h; the ops 0..5 and the PlayerRevive rate row are unchanged)
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients

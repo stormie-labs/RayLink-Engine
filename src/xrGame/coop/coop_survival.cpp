@@ -10,6 +10,7 @@
 #include "coop_checkpoints.h"
 #include "coop_money.h"
 #include "xrCoop/coop_checkpoint_store.h"
+#include "xrCoop/coop_revive_hold.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -58,8 +59,10 @@ namespace
 // ---------------------------------------------------------------- tuning
 
 constexpr float kDownHealth = 0.01f; // health of a player who is down: alive for the engine, 1% on the HUD
-constexpr u32 kReviveHoldMs = 3000; // hold USE on a wounded teammate
-constexpr u32 kGiveUpHoldMs = 3000; // wounded player holds USE to bleed out at once
+constexpr u32 kReviveHoldMs = revive::kHoldMs; // hold USE on a wounded teammate
+constexpr u32 kGiveUpHoldMs = revive::kGiveUpMs; // wounded player holds USE to bleed out at once
+constexpr u32 kSentShownMs = 3000; // the full ring of a finished hold waits this long for the host's Done (coop.revive_progress)
+constexpr u32 kLuaHudMs = 1000; // the Lua HUD (coop.revive_progress) polled within this long: it draws the down / revive text
 constexpr float kReviveRange = 2.5f; // reviver side
 constexpr float kHostReviveRange = 4.5f; // host check (avatars are rendered 100 ms in the past)
 constexpr u32 kStateRefreshMs = 5000; // own life state and (host) rules / roster resend: P5, late joiners
@@ -83,26 +86,26 @@ constexpr u32 kNewCharHoldMs = kGiveUpHoldMs; // an out player holds USE this lo
 constexpr u32 kNewCharRetryMs = 10000; // no answer from the host (refused, or still retiring): the prompt comes back
 constexpr u32 kReleaseRetryMs = 3000; // fix round 1, C1 / M1: a retired character still there is asked to go again
 
-enum Op : u8
-{
-	OpRequest = 0,
-	OpRevive = 1,
-	OpRespawn = 2,
-	OpSpectate = 3,
-	OpRefused = 4,
-	OpEvacuate = 5,
-};
-
-enum Refusal : u8
-{
-	RefNone = 0,
-	RefNotWounded = 1,
-	RefTooFar = 2,
-	RefNoMedkit = 3,
-	RefBusy = 4,
-	RefYouAreDown = 5,
-	RefSelf = 6,
-};
+// The ops of Msg::PlayerRevive and the refusals live in xrCoop/coop_revive_hold.h (with the hold's messages and machines).
+using revive::OpRequest;
+using revive::OpRevive;
+using revive::OpRespawn;
+using revive::OpSpectate;
+using revive::OpRefused;
+using revive::OpEvacuate;
+using revive::OpBegin;
+using revive::OpCancel;
+using revive::OpReviving;
+using revive::OpStopped;
+using revive::OpDone;
+using revive::Refusal;
+using revive::RefNone;
+using revive::RefNotWounded;
+using revive::RefTooFar;
+using revive::RefNoMedkit;
+using revive::RefBusy;
+using revive::RefYouAreDown;
+using revive::RefSelf;
 
 const char* refusal_text(u8 r)
 {
@@ -219,6 +222,15 @@ struct Local
 	u16 revive_seq = 0;
 	u16 revive_item = 0xffff; // host numbering
 	u64 revive_start = 0;
+	xr_string revive_item_sect; // section of the medkit in hand (the HUD names it)
+	revive::Announcer announce; // when the hold is told to the host (Begin / Cancel)
+	// the hold I finished: the host's Done for this target and fall is its answer (host numbering)
+	u16 sent_target = 0xffff;
+	u16 sent_seq = 0;
+	u64 sent_at = 0;
+	xr_string sent_item_sect;
+	// somebody reviving me: the ring the host's Reviving started, on this machine's clock
+	revive::LiftView lift;
 	// spectating
 	u16 spectate = 0xffff; // local id of the watched avatar
 	bool next_was_down = false, prev_was_down = false;
@@ -245,6 +257,7 @@ struct HostRec
 {
 	death::Tracker tracker; // one decision per death; the evacuation countdown; out of the run (hardcore)
 	u64 revive_pending_until = 0;
+	revive::HostHold hold; // the reviver the host lets hold him (Begin / Cancel), while he is wounded
 	bool has_anchor = false;
 	Fvector anchor{}; // where the player was first seen alive in this world (respawn fallback)
 	// Ruling F3-4: the slot and belt items of the owner's Dead report of death `worn_seq`
@@ -295,6 +308,7 @@ struct HudLine
 	bool big = false;
 };
 xr_vector<HudLine> g_hud;
+u64 g_lua_polled = 0; // when Lua last asked coop.revive_progress (0 = never): its HUD draws the down / revive text then
 struct FeedLine
 {
 	xr_string text;
@@ -325,6 +339,7 @@ struct Stats
 	u64 states_out = 0, states_in = 0, orders_in = 0, requests_in = 0;
 	u64 kills_intercepted = 0, proxy_kills_refused = 0, guard_fixes = 0, stale_orders = 0;
 	u64 wipes = 0, worn_reports = 0, worn_refused = 0;
+	u64 begins_in = 0, begins_refused = 0, holds_shown = 0, dones = 0; // HUD v2 part 2: the revive hold made visible
 	u64 newchar_asked = 0, newchar_refused = 0, retired = 0, retire_cancelled = 0; // F3 Task 10
 } g_stat;
 xr_set<u16> g_guard_logged;
@@ -429,6 +444,19 @@ u16 seq_by_host_id(u16 host_id)
 	const Remote* p = remote(host_id);
 	return p ? p->seq : 0;
 }
+
+// The transport peer driving the character `host_id` (host numbering; 0 = the host's actor), kInvalidPeer if unknown.
+PeerId peer_of_host_id(u16 host_id)
+{
+	if (host_id == 0)
+		return kHostPeer;
+	if (host_id == my_host_id())
+		return mgr().self();
+	return mgr().is_host() ? join::peer_of_proxy(host_id) : world::avatar_peer(join::to_local(host_id));
+}
+
+// The object id of the character `host_id` on this machine (the host numbers its own objects, a client maps them).
+u16 local_of_host_id(u16 host_id) { return mgr().is_host() ? host_id : join::to_local(host_id); }
 
 // ---------------------------------------------------------------- camera effectors
 
@@ -672,6 +700,7 @@ void send_my_state(u64 t)
 }
 
 void apply_order(u8 op, Reader& r);
+void stop_revive_hold(bool notify);
 
 // Host: deliver an order to the owner of `target` (the host itself: applied at once).
 void host_send_order(u16 target, const Writer& w)
@@ -719,7 +748,8 @@ void enter_wounded(CActor* a, u64 t)
 	g_me.bleed_end = t + g_rules.bleedout_ms;
 	g_me.giveup_start = 0;
 	g_me.giveup_armed = false;
-	g_me.revive_target = 0xffff;
+	stop_revive_hold(true); // fell while holding USE on a teammate: the host is told it ended
+	g_me.lift.clear();
 	g_hook_damage.store(0);
 	close_menus();
 	hold_controls(a);
@@ -735,6 +765,7 @@ void enter_dead(CActor* a, u64 t)
 	g_hook_life.store(u8(Life::Dead));
 	g_me.since = t;
 	g_me.giveup_start = 0;
+	g_me.lift.clear();
 	g_me.evac_end = 0;
 	hold_controls(a);
 	set_cam(a, 1);
@@ -748,6 +779,7 @@ void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 	g_me.life = Life::Alive;
 	g_hook_life.store(u8(Life::Alive));
 	g_hook_damage.store(0);
+	g_me.lift.clear();
 	g_me.since = t;
 	g_me.respawn_at = 0;
 	g_me.evac_end = 0;
@@ -798,8 +830,7 @@ void apply_revive(u16 seq, u16 reviver, float health, PeerId reviver_peer, const
 	stand_up(a, health, false, now());
 	feed("%s revived you.", nick_of(reviver).c_str());
 	if (reviver_peer == kInvalidPeer) // a host without the W5 tail: derive it from the character id
-		reviver_peer = reviver == 0 ? kHostPeer
-			: (mgr().is_host() ? join::peer_of_proxy(reviver) : world::avatar_peer(join::to_local(reviver)));
+		reviver_peer = peer_of_host_id(reviver);
 	script::on_actor_revived(reviver_peer, medkit); // Lua coop_actor_revived, from the frame queue
 }
 
@@ -897,9 +928,64 @@ void apply_spectate(u16 seq)
 	send_my_state(t);
 }
 
+// The orders of the revive hold (coop_revive_hold.h): Reviving and Stopped reach the wounded's owner, Done the reviver.
+void apply_hold_order(u8 op, Reader& r)
+{
+	switch (op)
+	{
+	case OpReviving:
+	{
+		revive::RevivingMsg m;
+		if (!m.read(r) || m.target != my_host_id())
+			return;
+		if (g_me.life != Life::Wounded || m.seq != g_me.seq)
+		{
+			++g_stat.stale_orders;
+			return;
+		}
+		if (g_me.lift.on_reviving(now(), m.seq, m.reviver, m.reviver_peer, m.total_ms, m.held_ms))
+			++g_stat.holds_shown;
+		break;
+	}
+	case OpStopped:
+	{
+		revive::StoppedMsg m;
+		if (!m.read(r) || m.target != my_host_id())
+			return;
+		g_me.lift.on_stopped(m.seq, m.reviver);
+		break;
+	}
+	case OpDone:
+	{
+		revive::DoneMsg m;
+		if (!m.read(r))
+			return;
+		if (g_me.sent_target == 0xffff || m.target != g_me.sent_target || m.seq != g_me.sent_seq)
+		{
+			++g_stat.stale_orders;
+			return;
+		}
+		const xr_string section = g_me.sent_item_sect;
+		g_me.sent_target = 0xffff;
+		++g_stat.dones;
+		const PeerId peer = peer_of_host_id(m.target);
+		// Lua coop_revive_done(target_peer, medkit_section) on the reviver's machine: the revive went through (HUD v2)
+		script::queue_callback("coop_revive_done", {peer == kInvalidPeer ? script::cb_nil() : script::cb_int(s64(peer)),
+			script::cb_str(section.empty() ? nullptr : section.c_str())});
+		break;
+	}
+	default: break;
+	}
+}
+
 void apply_order(u8 op, Reader& r)
 {
 	++g_stat.orders_in;
+	if (op == OpReviving || op == OpStopped || op == OpDone)
+	{
+		apply_hold_order(op, r);
+		return;
+	}
 	const u16 target = r.u16();
 	if (op == OpRefused)
 	{
@@ -908,6 +994,12 @@ void apply_order(u8 op, Reader& r)
 			return;
 		++g_stat.refused;
 		feed("Revive of %s refused: %s.", nick_of(target).c_str(), refusal_text(reason));
+		// A Begin the host refused: the hold cannot end well (it would be refused again), so it ends here; the host has
+		// none open for it, nothing to cancel. After a refused Request the hold is over already: nothing happens.
+		if (g_me.revive_target != 0xffff && join::to_host(g_me.revive_target) == target)
+			stop_revive_hold(false);
+		if (g_me.sent_target == target)
+			g_me.sent_target = 0xffff; // the Request of my finished hold was refused: no Done will come
 		return;
 	}
 	const u16 seq = r.u16();
@@ -1132,6 +1224,8 @@ death::Action host_on_died(u16 id, u16 seq)
 void host_on_state(u16 id, Life life, u16 seq)
 {
 	HostRec& h = g_host[id];
+	if (life != Life::Wounded)
+		h.hold.close(); // nobody holds him any more (stood up, or bled out)
 	// F3 Task 10 (T8 review): the world's word on "out" first; a death of an out character then costs nothing again
 	const bool out_before = flag_read(id, kOutKey);
 	death::learn_out(h.tracker, out_before);
@@ -1168,46 +1262,88 @@ void host_on_state(u16 id, Life life, u16 seq)
 	}
 }
 
+// The host's answer to the reviver: himself (applied at once) or a client over the net.
+void host_answer(PeerId reply_to, const Writer& w)
+{
+	if (reply_to == kHostPeer)
+	{
+		Reader r(w.ptr(), w.size());
+		const u8 op = r.u8();
+		apply_order(op, r);
+	}
+	else
+		net::host_send(reply_to, Msg::PlayerRevive, w);
+}
+
+void host_refuse(PeerId reply_to, u16 target, u8 reason)
+{
+	Writer w(8);
+	w.u8(OpRefused);
+	w.u16(target);
+	w.u8(reason);
+	host_answer(reply_to, w);
+}
+
+// The host's check of a revive, for a Begin and for a Request alike (revive::verdict keeps the order of the checks):
+// what is found in the world, `busy` from the caller. `item_obj` is the medkit when it is the reviver's own.
+Refusal host_revive_verdict(u16 reviver, u16 target, u16 seq, u16 item, bool busy, CGameObject*& item_obj)
+{
+	CGameObject* r_obj = object_here(reviver);
+	CGameObject* t_obj = object_here(target);
+	item_obj = object_here(item);
+	revive::Facts f;
+	f.self = reviver == target;
+	f.target_wounded = life_by_host_id(target) == Life::Wounded && seq_by_host_id(target) == seq;
+	f.reviver_down = is_down(life_by_host_id(reviver));
+	f.busy = busy;
+	f.in_range = r_obj && t_obj && r_obj->Position().distance_to(t_obj->Position()) <= kHostReviveRange;
+	f.has_item = item_obj && item_obj->H_Parent() && item_obj->H_Parent()->ID() == reviver &&
+	    is_revive_section(item_obj->cNameSect());
+	return revive::verdict(f);
+}
+
+// The wounded's owner is told the hold on him ended without a revive (the host himself: applied at once).
+void host_tell_stopped(u16 target, u16 seq, u16 reviver)
+{
+	revive::StoppedMsg m;
+	m.target = target;
+	m.seq = seq;
+	m.reviver = reviver;
+	Writer w(8);
+	m.write(w);
+	host_send_order(target, w);
+}
+
+// A record of `id` if the host has one (a request about a character nobody knows does not make one).
+const HostRec* host_rec_if(u16 id)
+{
+	const auto it = g_host.find(id);
+	return it == g_host.end() ? nullptr : &it->second;
+}
+
 void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u16 item)
 {
 	++g_stat.requests_in;
 	const u64 t = now();
-	HostRec& h = g_host[target];
-	CGameObject* r_obj = object_here(reviver);
-	CGameObject* t_obj = object_here(target);
-	CGameObject* i_obj = object_here(item);
-	u8 reason = RefNone;
-	if (reviver == target)
-		reason = RefSelf;
-	else if (life_by_host_id(target) != Life::Wounded || seq_by_host_id(target) != seq)
-		reason = RefNotWounded;
-	else if (is_down(life_by_host_id(reviver)))
-		reason = RefYouAreDown;
-	else if (t < h.revive_pending_until)
-		reason = RefBusy;
-	else if (!r_obj || !t_obj || r_obj->Position().distance_to(t_obj->Position()) > kHostReviveRange)
-		reason = RefTooFar;
-	else if (!i_obj || !i_obj->H_Parent() || i_obj->H_Parent()->ID() != reviver || !is_revive_section(i_obj->cNameSect()))
-		reason = RefNoMedkit;
+	const HostRec* known = host_rec_if(target);
+	CGameObject* i_obj = nullptr;
+	const Refusal reason = host_revive_verdict(reviver, target, seq, item, known && t < known->revive_pending_until, i_obj);
 
 	if (reason != RefNone)
 	{
 		::Msg("[coop] revive of %u by %u refused: %s", target, reviver, refusal_text(reason));
-		Writer w(8);
-		w.u8(OpRefused);
-		w.u16(target);
-		w.u8(reason);
-		if (reply_to == kHostPeer)
+		host_refuse(reply_to, target, reason);
+		if (known)
 		{
-			Reader r(w.ptr(), w.size());
-			const u8 op = r.u8();
-			apply_order(op, r);
+			HostRec& h = g_host[target];
+			if (h.hold.stop(seq, reviver)) // the ring on the wounded ends: his Request was no good
+				host_tell_stopped(target, seq, reviver);
 		}
-		else
-			net::host_send(reply_to, Msg::PlayerRevive, w);
 		return;
 	}
 
+	HostRec& h = g_host[target];
+	h.hold.close(); // the wounded stands up and loses the ring with the Revive
 	i_obj->DestroyObject(); // the medkit is a world item: only the host removes it, clients follow (P7)
 	h.revive_pending_until = t + kRevivePendingMs;
 	::Msg("[coop] %s revives %s with %s", nick_of(reviver).c_str(), nick_of(target).c_str(), i_obj->cNameSect().c_str());
@@ -1221,6 +1357,52 @@ void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u
 	w.u32(reviver == 0 ? kHostPeer : join::peer_of_proxy(reviver));
 	w.str(i_obj->cNameSect().c_str());
 	host_send_order(target, w);
+	// HUD v2: the reviver is told it went through (Lua coop_revive_done: the sound, the flash)
+	revive::DoneMsg done;
+	done.target = target;
+	done.seq = seq;
+	Writer d(8);
+	done.write(d);
+	host_answer(reply_to, d);
+}
+
+// HUD v2 part 2: a reviver's hold has gone on for a while (Begin). The same checks as a Request; a hold that passes is told
+// to the wounded's owner with how long it was held, so his ring fills in the reviver's colour in step with the reviver's.
+void host_on_revive_begin(u16 reviver, PeerId reply_to, const revive::BeginMsg& m)
+{
+	++g_stat.begins_in;
+	const u64 t = now();
+	const HostRec* known = host_rec_if(m.target);
+	const bool busy = known && (t < known->revive_pending_until || known->hold.busy_for(t, m.seq, reviver));
+	CGameObject* i_obj = nullptr;
+	const Refusal reason = host_revive_verdict(reviver, m.target, m.seq, m.item, busy, i_obj);
+	if (reason != RefNone)
+	{
+		++g_stat.begins_refused;
+		host_refuse(reply_to, m.target, reason);
+		return;
+	}
+	HostRec& h = g_host[m.target];
+	h.hold.begin(t, m.seq, reviver, m.held_ms);
+	revive::RevivingMsg out;
+	out.target = m.target;
+	out.seq = m.seq;
+	out.reviver = reviver;
+	out.reviver_peer = reviver == 0 ? kHostPeer : join::peer_of_proxy(reviver);
+	out.total_ms = revive::kHoldMs;
+	out.held_ms = m.held_ms;
+	Writer w(24);
+	out.write(w);
+	host_send_order(m.target, w);
+}
+
+// The reviver let go, went away or fell: the ring on the wounded ends if this reviver's hold was the one on him.
+void host_on_revive_cancel(u16 reviver, u16 target, u16 seq)
+{
+	if (!host_rec_if(target))
+		return;
+	if (g_host[target].hold.stop(seq, reviver))
+		host_tell_stopped(target, seq, reviver);
 }
 
 // ---------------------------------------------------------------- hardcore: a new character (F3 Task 10)
@@ -1479,6 +1661,7 @@ void host_frame(u64 t)
 			death::on_left(h.tracker); // hardcore_out stays: leaving does not bring a dead player back
 			h.ordered_seq = death::kNoSeq;
 			h.revive_pending_until = 0;
+			h.hold.close();
 			it = g_players.erase(it);
 		}
 		else
@@ -1579,18 +1762,42 @@ void on_revive_msg(PeerId from, Reader& r)
 		return;
 	if (mgr().is_host())
 	{
-		if (op != OpRequest)
+		if (!revive::is_client_op(op))
 			return; // orders come only from the host
 		const u16 reviver = join::proxy_of_peer(from);
-		const u16 target = r.u16();
-		const u16 seq = r.u16();
-		const u16 item = r.u16();
-		if (!r.ok() || reviver == 0xffff)
+		if (reviver == 0xffff)
 			return;
-		host_on_revive_request(reviver, from, target, seq, item);
+		switch (op)
+		{
+		case OpRequest:
+		{
+			const u16 target = r.u16();
+			const u16 seq = r.u16();
+			const u16 item = r.u16();
+			if (!r.ok())
+				return;
+			host_on_revive_request(reviver, from, target, seq, item);
+			break;
+		}
+		case OpBegin:
+		{
+			revive::BeginMsg m;
+			if (m.read(r))
+				host_on_revive_begin(reviver, from, m);
+			break;
+		}
+		case OpCancel:
+		{
+			revive::CancelMsg m;
+			if (m.read(r))
+				host_on_revive_cancel(reviver, m.target, m.seq);
+			break;
+		}
+		default: break;
+		}
 		return;
 	}
-	if (mgr().is_live_client() && from == kHostPeer && op != OpRequest)
+	if (mgr().is_live_client() && from == kHostPeer && !revive::is_client_op(op))
 		apply_order(op, r);
 }
 
@@ -1643,6 +1850,51 @@ void send_revive_request(u16 target_host, u16 seq, u16 item)
 	net::client_send(Msg::PlayerRevive, w);
 }
 
+// HUD v2 part 2: the hold goes on long enough to be told to the host (and through it to the wounded's owner), and ends
+// without a revive (Cancel).
+void send_revive_begin(u16 target_host, u16 seq, u16 item, u32 held_ms)
+{
+	revive::BeginMsg m;
+	m.target = target_host;
+	m.seq = seq;
+	m.item = item;
+	m.held_ms = u16(_min(held_ms, u32(0xffff)));
+	if (mgr().is_host())
+	{
+		host_on_revive_begin(0, kHostPeer, m);
+		return;
+	}
+	Writer w(12);
+	m.write(w);
+	net::client_send(Msg::PlayerRevive, w);
+}
+
+void send_revive_cancel(u16 target_host, u16 seq)
+{
+	if (mgr().is_host())
+	{
+		host_on_revive_cancel(0, target_host, seq);
+		return;
+	}
+	revive::CancelMsg m;
+	m.target = target_host;
+	m.seq = seq;
+	Writer w(8);
+	m.write(w);
+	net::client_send(Msg::PlayerRevive, w);
+}
+
+// The revive hold on a teammate ends without a revive (let go, too far, fell, refused): the host is told when it knew of
+// the hold (`notify`: not when the host itself refused the Begin, it has no hold open then).
+void stop_revive_hold(bool notify)
+{
+	const bool cancel = g_me.announce.stop() == revive::Announcer::Act::Cancel;
+	const u16 target = g_me.revive_target == 0xffff ? u16(0xffff) : join::to_host(g_me.revive_target);
+	g_me.revive_target = 0xffff;
+	if (cancel && notify && target != 0xffff)
+		send_revive_cancel(target, g_me.revive_seq);
+}
+
 void reviver_frame(CActor* a, u64 t)
 {
 	if (g_me.revive_target == 0xffff)
@@ -1662,11 +1914,19 @@ void reviver_frame(CActor* a, u64 t)
 	{
 		if (*cancel)
 			feed("Revive cancelled (%s).", cancel);
-		g_me.revive_target = 0xffff;
+		stop_revive_hold(true);
 		return;
 	}
-	if (t - g_me.revive_start < kReviveHoldMs)
+	const u32 held = u32(_min<u64>(t - g_me.revive_start, 0xffffffffu));
+	if (g_me.announce.step(t, held) == revive::Announcer::Act::Begin)
+		send_revive_begin(join::to_host(target), g_me.revive_seq, g_me.revive_item, held);
+	if (held < kReviveHoldMs)
 		return;
+	g_me.announce.done(); // the Request below ends the hold on the host
+	g_me.sent_target = join::to_host(target); // its Done answers this one
+	g_me.sent_seq = g_me.revive_seq;
+	g_me.sent_at = t;
+	g_me.sent_item_sect = g_me.revive_item_sect;
 	g_me.revive_target = 0xffff;
 	send_revive_request(join::to_host(target), g_me.revive_seq, g_me.revive_item);
 }
@@ -1915,10 +2175,14 @@ void build_hud(u64 t)
 		g_hud.push_back(l);
 	};
 	string256 buf;
+	// HUD v2 part 2: a Lua HUD that polls coop.revive_progress draws the down and revive state (ring, timer, texts) itself
+	const bool lua_hud = g_lua_polled && t - g_lua_polled < kLuaHudMs;
 	switch (g_me.life)
 	{
 	case Life::Wounded:
 	{
+		if (lua_hud)
+			break;
 		line("YOU ARE DOWN", 0xffe03c3c, true);
 		const u32 left = g_me.bleed_end > t ? u32((g_me.bleed_end - t + 999) / 1000) : 0;
 		xr_sprintf(buf, "Bleeding out: %u s. A teammate can revive you with a medkit.", left);
@@ -1983,7 +2247,7 @@ void build_hud(u64 t)
 	}
 	default: break;
 	}
-	if (g_me.revive_target != 0xffff)
+	if (g_me.revive_target != 0xffff && !lua_hud)
 	{
 		xr_sprintf(buf, "Reviving %s... %u%%", nick_of(join::to_host(g_me.revive_target)).c_str(),
 		    u32(_min<u64>(100, (t - g_me.revive_start) * 100 / kReviveHoldMs)));
@@ -2172,6 +2436,71 @@ u32 bleed_left_ms(u16 local_id)
 	return p && p->life == Life::Wounded && p->bleed_end > t ? u32(p->bleed_end - t) : 0;
 }
 
+static const char* revive_item_kind(const xr_string& section)
+{
+	for (const char* prefix : kReviveItems)
+		if (section.size() && strstr(section.c_str(), prefix) == section.c_str())
+			return prefix;
+	return "";
+}
+
+bool revive_progress(ReviveProgress& out)
+{
+	out = ReviveProgress();
+	const u64 t = now();
+	g_lua_polled = t ? t : 1; // a Lua HUD is there: the C++ down / revive text steps aside (build_hud)
+	if (!live())
+		return false;
+	if (g_me.revive_target != 0xffff && !is_down(g_me.life))
+	{
+		const u16 target_host = join::to_host(g_me.revive_target);
+		const u64 held = t > g_me.revive_start ? t - g_me.revive_start : 0;
+		out.reviving = true;
+		out.target_local = g_me.revive_target;
+		out.target_peer = peer_of_host_id(target_host);
+		out.target_nick = nick_of(target_host);
+		out.reviving_fraction = revive::fraction(held, kReviveHoldMs);
+		out.reviving_left_ms = held < kReviveHoldMs ? u32(kReviveHoldMs - held) : 0;
+		out.item_kind = revive_item_kind(g_me.revive_item_sect);
+		out.item_section = g_me.revive_item_sect;
+	}
+	else if (g_me.sent_target != 0xffff && t - g_me.sent_at < kSentShownMs && !is_down(g_me.life))
+	{
+		// The hold ran its time, the Request is out: the ring stays full until the host's Done (or its refusal) comes
+		out.reviving = true;
+		out.reviving_sent = true;
+		out.target_local = local_of_host_id(g_me.sent_target);
+		out.target_peer = peer_of_host_id(g_me.sent_target);
+		out.target_nick = nick_of(g_me.sent_target);
+		out.reviving_fraction = 1.f;
+		out.item_kind = revive_item_kind(g_me.sent_item_sect);
+		out.item_section = g_me.sent_item_sect;
+	}
+	if (g_me.life == Life::Wounded)
+	{
+		out.wounded = true;
+		out.bleed_left_ms = g_me.bleed_end > t ? u32(g_me.bleed_end - t) : 0;
+		out.bleed_total_ms = g_rules.bleedout_ms;
+		if (g_me.lift.active(t, g_me.seq))
+		{
+			out.revived_by = true;
+			out.by_peer = g_me.lift.peer() == kInvalidPeer ? peer_of_host_id(g_me.lift.reviver()) : PeerId(g_me.lift.peer());
+			out.by_local = local_of_host_id(g_me.lift.reviver());
+			out.by_nick = nick_of(g_me.lift.reviver());
+			out.by_fraction = g_me.lift.fraction(t);
+			out.by_left_ms = g_me.lift.ms_left(t);
+		}
+		if (g_me.giveup_start)
+		{
+			const u64 held = t > g_me.giveup_start ? t - g_me.giveup_start : 0;
+			out.giving_up = true;
+			out.giveup_fraction = revive::fraction(held, kGiveUpHoldMs);
+			out.giveup_left_ms = held < kGiveUpHoldMs ? u32(kGiveUpHoldMs - held) : 0;
+		}
+	}
+	return out.reviving || out.wounded;
+}
+
 bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 {
 	out.clear();
@@ -2277,6 +2606,9 @@ void print_status()
 	    g_stat.worn_refused);
 	::Msg("[coop]   survival: new characters asked %llu, refused %llu, retired %llu, cancelled %llu, %u retiring",
 	    g_stat.newchar_asked, g_stat.newchar_refused, g_stat.retired, g_stat.retire_cancelled, u32(g_retire.size()));
+	::Msg("[coop]   survival: revive holds: begins %llu (refused %llu), shown to me %llu, done %llu, Lua HUD %s",
+	    g_stat.begins_in, g_stat.begins_refused, g_stat.holds_shown, g_stat.dones,
+	    g_lua_polled && now() - g_lua_polled < kLuaHudMs ? "polling" : "not polling");
 	const u64 t = now();
 	for (const auto& it : g_players)
 		::Msg("[coop]   player %u '%s': %s (fall #%u)%s", it.first, it.second.nick.c_str(), life_name(it.second.life),
@@ -2400,7 +2732,9 @@ bool on_use_person(CInventoryOwner* person)
 	g_me.revive_target = o->ID();
 	g_me.revive_seq = seq_by_host_id(join::to_host(o->ID()));
 	g_me.revive_item = join::to_host(medkit->object().ID());
+	g_me.revive_item_sect = medkit->object().cNameSect().c_str();
 	g_me.revive_start = now();
+	g_me.announce.start();
 	return true;
 }
 

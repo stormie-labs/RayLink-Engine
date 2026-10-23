@@ -1361,6 +1361,81 @@ int l_bleed_left(lua_State* L)
 	lua_pushnumber(L, lua_Number(survival::bleed_left_ms(id)));
 	return 1;
 }
+
+void set_num(lua_State* L, const char* name, lua_Number v)
+{
+	lua_pushnumber(L, v);
+	lua_setfield(L, -2, name);
+}
+
+void set_str(lua_State* L, const char* name, const char* v)
+{
+	lua_pushstring(L, v ? v : "");
+	lua_setfield(L, -2, name);
+}
+
+// HUD v2 part 2 (docs/HUD_V2.md, scripts\coop_hud_revive.script): coop.revive_progress() -> nil | table; nil without a session
+// or when I neither hold USE on a wounded teammate nor lie wounded myself. A table has only the parts that apply:
+//   reviving   = { peer, avatar_id, nick, progress 0..1, ms_left, item = "medkit"|"stimpack", section, sent }  I revive
+//                somebody (sent: the hold is over, the Request is out, up to 3 s until coop_revive_done)
+//   revived_by = { peer, avatar_id, nick, progress 0..1, ms_left }   a teammate holds USE on me (I am wounded)
+//   give_up    = { progress 0..1, ms_left }                          I hold USE to bleed out at once (I am wounded)
+//   bleed      = { left_ms, total_ms }                               I am wounded
+// peer / avatar_id are left out when unknown (avatar_id in this machine's numbering). Calling it tells the engine a Lua HUD
+// draws the down / revive state, so the engine's own text for it is not shown.
+int l_revive_progress(lua_State* L)
+{
+	survival::ReviveProgress p;
+	if (!mgr().active() || !survival::revive_progress(p))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_newtable(L);
+	if (p.reviving)
+	{
+		lua_newtable(L);
+		if (p.target_peer != kInvalidPeer)
+			set_num(L, "peer", lua_Number(p.target_peer));
+		if (p.target_local != 0xffff)
+			set_num(L, "avatar_id", lua_Number(p.target_local));
+		set_str(L, "nick", p.target_nick.c_str());
+		set_num(L, "progress", lua_Number(p.reviving_fraction));
+		set_num(L, "ms_left", lua_Number(p.reviving_left_ms));
+		set_str(L, "item", p.item_kind);
+		set_str(L, "section", p.item_section.c_str());
+		lua_pushboolean(L, p.reviving_sent ? 1 : 0);
+		lua_setfield(L, -2, "sent");
+		lua_setfield(L, -2, "reviving");
+	}
+	if (p.revived_by)
+	{
+		lua_newtable(L);
+		if (p.by_peer != kInvalidPeer)
+			set_num(L, "peer", lua_Number(p.by_peer));
+		if (p.by_local != 0xffff)
+			set_num(L, "avatar_id", lua_Number(p.by_local));
+		set_str(L, "nick", p.by_nick.c_str());
+		set_num(L, "progress", lua_Number(p.by_fraction));
+		set_num(L, "ms_left", lua_Number(p.by_left_ms));
+		lua_setfield(L, -2, "revived_by");
+	}
+	if (p.giving_up)
+	{
+		lua_newtable(L);
+		set_num(L, "progress", lua_Number(p.giveup_fraction));
+		set_num(L, "ms_left", lua_Number(p.giveup_left_ms));
+		lua_setfield(L, -2, "give_up");
+	}
+	if (p.wounded)
+	{
+		lua_newtable(L);
+		set_num(L, "left_ms", lua_Number(p.bleed_left_ms));
+		set_num(L, "total_ms", lua_Number(p.bleed_total_ms));
+		lua_setfield(L, -2, "bleed");
+	}
+	return 1;
+}
 } // namespace
 } // namespace script
 
@@ -1452,6 +1527,7 @@ void register_raw(lua_State* L)
 		{"story_local_task", &l_story_local_task},
 		{"life_of", &l_life_of},
 		{"bleed_left", &l_bleed_left},
+		{"revive_progress", &l_revive_progress}, // HUD v2 part 2: the revive / give-up holds for scripts\coop_hud_revive
 		{"player_safemode", &l_player_safemode},
 		{"talk_holder", &l_talk_holder}, // W11
 		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)

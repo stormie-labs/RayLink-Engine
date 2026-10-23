@@ -60,6 +60,13 @@
 //     Spectate host -> target owner  {u16 target, u16 seq}
 //     Refused  host -> reviver       {u16 target, u8 reason}
 //     Evacuate host -> target owner  {u16 target, u16 seq, u32 delay_ms}
+//     HUD v2 part 2, the hold made visible (layouts, rate and machines: xrCoop/coop_revive_hold.h):
+//     Begin    reviver -> host       {u16 target, u16 seq, u16 item, u16 held_ms}  the hold went on 250 ms, one per 2 s
+//     Cancel   reviver -> host       {u16 target, u16 seq}
+//     Reviving host -> target owner  {u16 target, u16 seq, u16 reviver, u32 reviver_peer, u32 total_ms, u32 held_ms}
+//     Stopped  host -> target owner  {u16 target, u16 seq, u16 reviver}
+//     Done     host -> reviver       {u16 target, u16 seq}  the Request went through (Lua coop_revive_done)
+//              Lua reads it all as coop.revive_progress() (revive_progress below).
 //   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %)
 //   NewCharacter   client -> host  {}: out of a hardcore run, a new character (F3 Task 10; 2 per 5 s)  reliable
 // `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
@@ -117,6 +124,38 @@ void render_hud(); // HUDManager::RenderUI (main thread, render phase): reads da
 Life life_of(u16 local_id);
 // Wounded players: milliseconds of bleed-out left (as last reported), 0 otherwise.
 u32 bleed_left_ms(u16 local_id);
+
+// HUD v2 part 2 (docs/HUD_V2.md "Поднятие союзника"): the holds of USE as this machine's Lua HUD draws them,
+// coop.revive_progress(). Calling it tells the engine a Lua HUD is there, so its own down / revive text steps aside.
+struct ReviveProgress
+{
+	// I hold USE on a wounded teammate (revive::kHoldMs, 3 s)
+	bool reviving = false;
+	bool reviving_sent = false; // the hold is over and the Request is out: the ring is full, waiting for the host's Done
+	u16 target_local = 0xffff; // object id of the wounded on this machine
+	PeerId target_peer = kInvalidPeer;
+	xr_string target_nick;
+	float reviving_fraction = 0.f; // 0..1
+	u32 reviving_left_ms = 0;
+	const char* item_kind = ""; // "medkit" | "stimpack" (prefix of the section I hold)
+	xr_string item_section; // "medkit_army"
+	// I am wounded
+	bool wounded = false;
+	u32 bleed_left_ms = 0, bleed_total_ms = 0;
+	// ... and a teammate holds USE on me (the host's Reviving, animated here)
+	bool revived_by = false;
+	PeerId by_peer = kInvalidPeer;
+	u16 by_local = 0xffff; // object id of the reviver's character on this machine
+	xr_string by_nick;
+	float by_fraction = 0.f;
+	u32 by_left_ms = 0;
+	// ... and I hold USE to give up
+	bool giving_up = false;
+	float giveup_fraction = 0.f;
+	u32 giveup_left_ms = 0;
+};
+// False: nothing to show (no session, or neither reviving nor wounded).
+bool revive_progress(ReviveProgress& out);
 // Host (Ruling F3-4): what the owner of `character` had in his slots and on his belt when he reported his death `seq`,
 // host numbering, sorted, each id once and carried by the character when the report came (at most 40). False when
 // no report of that death brought the list (the host's own actor: its slots and belt are seen directly).

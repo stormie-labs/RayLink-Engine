@@ -145,6 +145,10 @@ constexpr RateRule kClientRateRules[] = {
 	{Msg::PlayerWounded, 16, 250},
 	// A revive request is sent when the USE hold on a wounded teammate has lasted kReviveHoldMs = 3000 (coop_survival.cpp:61,
 	// :1639, :1664): one in 3 s at the most (estimate: 2 in a row, 1 in 3 s). 4 x that: 8 in a row, 1.33 a second.
+	// HUD v2 part 2 (revive::Announcer, coop_revive_hold.h): the same row now also carries Begin and Cancel of the hold, and it
+	// was not raised: a reviver announces a hold after 250 ms of USE, at most one Begin per 2 s, and a Cancel only for an
+	// announced hold, so a Begin + Cancel (or Begin + Request) is a pair per 2 s at the most, one a second, below the row's
+	// 1.33 a second even for a player who mashes the button (tests/test_revive_hold.cpp runs that against this row).
 	{Msg::PlayerRevive, 8, 750},
 	// One per death of the own actor (coop_events.cpp:312 -> coop_requests.cpp:2416, :518); a death is followed by a respawn or
 	// a spectator's wait of seconds (estimate: 2 in a row, one in 2 s). 4 x that: 8 in a row, 2 a second. The host logs each

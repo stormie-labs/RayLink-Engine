@@ -32,8 +32,13 @@
 //   coop.life_of(local_id) -> "alive"|"wounded"|"dead"|"spectating"|"respawning"   (0 = me; nil if no session)
 //   coop.bleed_left(local_id) -> ms             bleed-out left of a wounded player, 0 otherwise
 //   coop.player_safemode(peer) -> bool | nil    weapon lowered (Anomaly safe mode); nil if not known yet
+//   coop.revive_progress() -> nil | { reviving = {peer, avatar_id, nick, progress, ms_left, item, section},
+//     revived_by = {peer, avatar_id, nick, progress, ms_left}, give_up = {progress, ms_left}, bleed = {left_ms, total_ms} }
+//     (HUD v2 part 2: the USE holds of a revive; parts that do not apply are absent; nil: nothing to show / no session;
+//     calling it tells the engine a Lua HUD draws the down / revive state, its own text steps aside)
 // Engine callbacks fired from frame(): coop_main.on_transition_vote(nick) (host), SendScriptCallback
-// "coop_actor_revived" (reviver_peer, medkit_section) and "coop_on_container_opened" (peer, container_id).
+// "coop_actor_revived" (reviver_peer, medkit_section), "coop_revive_done" (target_peer, medkit_section: the reviver's
+// machine, his revive went through; HUD v2 part 2) and "coop_on_container_opened" (peer, container_id).
 // F3 modules fire their own through queue_callback(name, {cb_int(..), cb_str(..), ...}).
 #pragma once
 
