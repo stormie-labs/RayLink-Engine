@@ -18,8 +18,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace coop
@@ -398,6 +400,18 @@ public:
 	}
 
 	bool pending(uint16_t id) const { return m_specs.count(id) != 0; }
+	// Round 1 (review C1): the first id of `ids` whose create the host has not answered (an action about it waits for
+	// the answer: Held), kNoId if none.
+	uint16_t first_pending(std::initializer_list<uint16_t> ids) const
+	{
+		for (uint16_t id : ids)
+			if (id != kNoId && pending(id))
+				return id;
+		return kNoId;
+	}
+	// Round 1 (review C1): a clone of `id` now would be refused or take a source another clone took: the host has not
+	// created it yet, or a pending clone replaces it.
+	bool waiting(uint16_t id) const { return pending(id) || is_source(id); }
 	// A pending clone replaces item `id`: a release of it is the host's part of the clone.
 	bool is_source(uint16_t id) const
 	{
@@ -419,6 +433,98 @@ public:
 
 private:
 	std::map<uint16_t, Spec> m_specs;
+};
+
+// Round 1 (review C1): the requests about an item of ours the host has not created yet (its create waits in the host's
+// budget queue, or for a retry after RateLimited). Sent before the create, the host refuses them (Missing) and creates
+// the item later: a duplicate. They wait here by the id they wait for, in order: released at the host's Ok, dropped at
+// a rollback (the item goes itself).
+template <class T>
+class Held
+{
+public:
+	void hold(uint16_t id, T item) { m_held[id].push_back(std::move(item)); }
+	bool holds(uint16_t id) const { return m_held.count(id) != 0; }
+	// The ones waiting for `id`, in the order they were made; forgotten here.
+	std::vector<T> release(uint16_t id)
+	{
+		std::vector<T> out;
+		const auto it = m_held.find(id);
+		if (it == m_held.end())
+			return out;
+		out = std::move(it->second);
+		m_held.erase(it);
+		return out;
+	}
+	// The create of `id` was taken back: drop(item) for each one waiting for it. Returns how many.
+	template <class Drop>
+	size_t drop(uint16_t id, Drop&& drop)
+	{
+		std::vector<T> gone = release(id);
+		for (T& item : gone)
+			drop(item);
+		return gone.size();
+	}
+	template <class Drop>
+	void clear(Drop&& drop)
+	{
+		for (auto& it : m_held)
+			for (T& item : it.second)
+				drop(item);
+		m_held.clear();
+	}
+	size_t size() const
+	{
+		size_t n = 0;
+		for (const auto& it : m_held)
+			n += it.second.size();
+		return n;
+	}
+
+private:
+	std::map<uint16_t, std::vector<T>> m_held;
+};
+
+// Round 1 (review I2): rolled-back entities kept a while after their release (a script may still hold one) and freed
+// later - but only in the world they were released in: a new world closed the Lua state their script objects live in,
+// and freeing one then runs a destructor in it (an access violation). Those are forgotten instead (a small leak).
+template <class T>
+class Quarantine
+{
+public:
+	void keep(T item, uint64_t now, uint32_t world) { m_items.push_back(Entry{std::move(item), now, world}); }
+	// The ones kept `ms` ago or more (every one with `all`): free(item) when kept in `world`, else leak(item). Returns
+	// how many left the quarantine.
+	template <class Free, class Leak>
+	size_t expire(uint64_t now, uint64_t ms, uint32_t world, bool all, Free&& free, Leak&& leak)
+	{
+		size_t n = 0;
+		for (auto it = m_items.begin(); it != m_items.end();)
+		{
+			if (!all && (now < it->at || now - it->at < ms)) // a clock behind the entry: not due
+			{
+				++it;
+				continue;
+			}
+			if (it->world == world)
+				free(it->item);
+			else
+				leak(it->item);
+			it = m_items.erase(it);
+			++n;
+		}
+		return n;
+	}
+	size_t size() const { return m_items.size(); }
+
+private:
+	struct Entry
+	{
+		T item;
+		uint64_t at;
+		uint32_t world;
+	};
+	std::vector<Entry> m_items;
 };
 } // namespace lease
 } // namespace coop

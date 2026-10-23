@@ -157,7 +157,7 @@ constexpr RateRule kClientRateRules[] = {
 
 	// F2 T12b: ids a client gives back (coop_id_lease.h): the ones an object of his holds when a lease comes, and the id of
 	// each create the host refused. The client sends at most one ack per kAckGapMs = 250 ms with everything gathered
-	// meanwhile (coop_requests.cpp client_send_give_back), so 4 a second; 8 in a row for a lag spike.
+	// meanwhile (coop_requests.cpp client_pump_leases), so 4 a second; 8 in a row for a lag spike.
 	{Msg::IdLeaseAck, 8, 250},
 };
 

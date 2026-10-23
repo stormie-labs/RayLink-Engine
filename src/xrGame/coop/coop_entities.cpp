@@ -590,6 +590,14 @@ void client_on_spawn(PeerId, Reader& r)
 		::Msg("! [coop] id %u is taken here by a local object, mirrored entity skipped", id_host);
 		return;
 	}
+	if (!alife_rw().server().IsFreeID(id))
+	{
+		// F2 T12b round 1 (R2 minor "ID already used"): our generator has it taken with no entity holding it (a leased id
+		// of ours, an entity between its steps): PerformIDgen below would assert
+		++g_missing;
+		::Msg("! [coop] id %u is taken in our id generator, mirrored entity skipped", id_host);
+		return;
+	}
 	if (parent != kNoId && !ai().alife().objects().object(parent, true))
 	{
 		// Its holder is not here (P6): fetch the holder, then this entity again (once).

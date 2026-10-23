@@ -367,24 +367,25 @@ xr_vector<u16> g_give_back; // ids for the next IdLeaseAck
 xr_vector<u16> g_give_back_wait; // ids of refused creates whose object is still here (its destroy takes a frame)
 u32 g_pool_world = 0; // join::world_generation() the ids are reserved in
 u64 g_last_ack = 0;
+// Round 1 (review C1): requests about our items the host has not created yet wait for its answer (lease::Held)
+lease::Held<Action> g_held;
 struct LeaseCounters
 {
 	u64 created = 0, temps = 0, clones = 0, confirmed = 0, retried = 0, rolled_back = 0, released_with_clone = 0;
 	u64 acks = 0, given_back = 0, bad_leases = 0, stale_leases = 0, not_created = 0;
+	u64 held = 0, held_dropped = 0, clones_refused = 0, temps_left = 0, quarantine_left = 0; // round 1
 } g_lc;
+// Round 1 (review I2): the world (join::world_generation) the temporary objects of g_lua_temps were made in
+u32 g_temps_world = 0;
 
 // Rolled-back items (research f2-client-create-ids.md §4.3): released from our ALife and server like any destroyed item
 // (on_unregister cleans the mods' data under the id), but their entity is freed only kQuarantineMs later, as a script
-// may still hold the se_obj it got from the create.
+// may still hold the se_obj it got from the create - and only in the world it was released in (round 1, review I2:
+// lease::Quarantine).
 constexpr u64 kQuarantineMs = 120000;
 xrCriticalSection g_quarantine_lock; // entity_Destroy runs where the release runs
 xr_set<CSE_Abstract*> g_quarantine_marks;
-struct Quarantined
-{
-	CSE_Abstract* e = nullptr;
-	u64 at = 0;
-};
-xr_vector<Quarantined> g_quarantine;
+lease::Quarantine<CSE_Abstract*> g_quarantine;
 
 void push(Action&& a)
 {
@@ -574,6 +575,25 @@ void send_action(const Action& a)
 	}
 }
 
+// F2 T12b round 1 (review C1): the create of ours an action waits for - an item it names the host has not made yet (in
+// its budget queue, or asked again after RateLimited): sent before it, the host would refuse the action (Missing) and
+// make the item later, a duplicate. A leased spawn never waits for itself; a spawn into a pending item does. kNoId: none.
+// Under g_out_lock.
+u16 held_by_locked(const Action& a)
+{
+	switch (a.kind)
+	{
+	case Act::Spawn:
+	case Act::Destroy:
+	case Act::Use:
+	case Act::ItemEvent: return g_specs.first_pending({a.item});
+	case Act::Move: return g_specs.first_pending({a.item, a.from, a.to});
+	case Act::Hit:
+	case Act::Died: return kNoId;
+	}
+	return kNoId;
+}
+
 void client_flush()
 {
 	xr_vector<Action> out;
@@ -583,6 +603,24 @@ void client_flush()
 		const u64 now = mgr().now_ms();
 		for (auto it = g_child_spawns.begin(); it != g_child_spawns.end();)
 			it = now - it->second > kChildSpawnHoldMs ? g_child_spawns.erase(it) : std::next(it);
+		if (g_specs.size())
+		{
+			// F2 T12b round 1 (review C1): what names an item the host has not made yet waits for its answer
+			xr_vector<Action> now_out;
+			now_out.reserve(out.size());
+			for (Action& a : out)
+			{
+				const u16 by = held_by_locked(a);
+				if (by == kNoId)
+					now_out.push_back(std::move(a));
+				else
+				{
+					g_held.hold(by, std::move(a));
+					++g_lc.held;
+				}
+			}
+			out.swap(now_out);
+		}
 	}
 	for (const Action& a : out)
 		send_action(a);
@@ -738,6 +776,24 @@ void lease_sync_world_locked()
 	for (auto& it : g_temp_leases)
 		it.first->ID = kNoId; // still a temporary object (g_lua_temps): its register takes the request path
 	g_temp_leases.clear();
+	g_held.clear([](Action&) {}); // requests about items of the old world (its money holds went with it)
+	xrCriticalSectionGuard guard(g_quarantine_lock);
+	g_quarantine_marks.clear(); // their entities went with the old world, or wait in the quarantine
+}
+
+// Round 1 (review I2): the temporary objects of an old world were made by its Lua VM, which the new world closed: freeing
+// one now runs a luabind destructor in a closed lua_State. They are forgotten (a small leak), not freed.
+void temps_sync_world()
+{
+	const u32 world = join::world_generation();
+	if (world == g_temps_world)
+		return;
+	g_temps_world = world;
+	g_lc.temps_left += g_lua_temps.size();
+	g_lua_temps.clear();
+	g_lua_forwarded.clear();
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_temp_leases.clear(); // keys are those objects; their ids went with the old pool
 }
 
 // What the host's ReqSpawn takes into a player's character (an item class with every line it reads unchecked, not a
@@ -862,18 +918,52 @@ bool take_temp_lease(CSE_Abstract* e, LeasedTemp& out)
 }
 
 // A pending clone of ours replaces item `id` (local numbering): the host releases it with the clone's creation, and keeps
-// it when it refuses the clone. So a release of it now is that clone's part, not a request of its own.
-bool clone_source(u16 id)
+// it when it refuses the clone. So a release of it now is that clone's part, not a request of its own. Under g_out_lock.
+bool clone_source_locked(u16 id)
 {
 	if (id == kNoId)
 		return false;
-	xrCriticalSectionGuard guard(g_out_lock);
 	if (g_specs.is_source(id))
 		return true;
 	for (const auto& it : g_temp_leases)
 		if (it.second.source == id)
 			return true;
 	return false;
+}
+
+bool clone_source(u16 id)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	return clone_source_locked(id);
+}
+
+// Round 1 (review C1): item `id` waits for the host - its create is not answered yet, or a clone of ours replaces it. A
+// clone of it now would be refused or take the source the other clone took (and its scope would go for nothing).
+bool lease_waiting(u16 id)
+{
+	if (id == kNoId)
+		return false;
+	xrCriticalSectionGuard guard(g_out_lock);
+	return g_specs.pending(id) || clone_source_locked(id);
+}
+
+// Round 1 (review M1): a leased id a create could not use. Reserved here and held by nothing: back into the pool (given to
+// the host, it could hand it out again while our generator has it taken: FATAL in client_on_spawn). Free here: the host's
+// again. Held here by an object (should not happen): neither.
+void return_unused_lease(u16 id)
+{
+	xrServer* server = g_pGameLevel ? Level().Server : nullptr;
+	if (!server)
+		return;
+	if (server->IsFreeID(id))
+	{
+		give_back(id);
+		return;
+	}
+	if (server->ID_to_entity(id) || (ai().get_alife() && ai().alife().objects().object(id, true)))
+		return;
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_pool.put_back(id);
 }
 
 // The host refused our create under `id` (or kept rate-limiting it): our item goes - released from our ALife like any
@@ -915,17 +1005,9 @@ void quarantine_expire(bool all)
 	xr_vector<CSE_Abstract*> done;
 	{
 		xrCriticalSectionGuard guard(g_quarantine_lock);
-		const u64 now = mgr().now_ms();
-		for (auto it = g_quarantine.begin(); it != g_quarantine.end();)
-		{
-			if (all || now - it->at >= kQuarantineMs)
-			{
-				done.push_back(it->e);
-				it = g_quarantine.erase(it);
-			}
-			else
-				++it;
-		}
+		// round 1 (review I2): one of another world is left: its script object lives in a Lua state that world closed
+		g_quarantine.expire(mgr().now_ms(), kQuarantineMs, join::world_generation(), all,
+		    [&done](CSE_Abstract* e) { done.push_back(e); }, [](CSE_Abstract*) { ++g_lc.quarantine_left; });
 		if (all)
 			g_quarantine_marks.clear();
 	}
@@ -1028,12 +1110,24 @@ void client_on_result(PeerId, Reader& r)
 	// F2 T12b: the answer to a create of ours under a leased id
 	u16 leased = kNoId;
 	lease::Outcome outcome = lease::Outcome::Unknown;
+	xr_vector<u32> holds; // round 1: money held for upgrades of a rolled-back item
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
 		outcome = g_specs.answer(seq, accepted, reason == u8(Reason::RateLimited), mgr().now_ms(), leased);
 		if (outcome == lease::Outcome::Confirmed || outcome == lease::Outcome::RolledBack)
 			g_spec_actions.erase(leased);
+		if (outcome == lease::Outcome::Confirmed)
+		{
+			// round 1 (review C1): what waited for the item goes out first with the next flush, in its order (an action
+			// that names another pending item waits again there)
+			std::vector<Action> back = g_held.release(leased);
+			g_outbox.insert(g_outbox.begin(), std::make_move_iterator(back.begin()), std::make_move_iterator(back.end()));
+		}
+		else if (outcome == lease::Outcome::RolledBack)
+			g_lc.held_dropped += g_held.drop(leased, [&holds](Action& a) { holds.push_back(a.hold); });
 	}
+	for (u32 hold : holds)
+		money::client_release(hold);
 	switch (outcome)
 	{
 	case lease::Outcome::Confirmed:
@@ -1410,6 +1504,10 @@ void host_free_ids(const std::vector<u16>& ids)
 			server.FreeID(id, Device.TimerAsync());
 }
 
+// Round 1 (review M4): the player's leased creates still waiting for his budget go with his lease (it is freed when he
+// loads the world again; a freed id may come back to him in his new pool, and the old request would create under it).
+void drop_leased_queued(PeerId peer);
+
 // Host frame: every player in the world holds a whole lease (one IdLease per player and frame with what he lacks); a
 // player who loads the world again (a rejoin) gives his back: his machine starts a new pool with its new world.
 void host_pump_leases()
@@ -1425,7 +1523,10 @@ void host_pump_leases()
 		if (sync::host_peer_joining(p.id))
 		{
 			if (g_leases.count(p.id))
+			{
+				drop_leased_queued(p.id); // round 1 (review M4)
 				host_free_ids(g_leases.drop(p.id));
+			}
 			continue;
 		}
 		const u16 proxy = join::proxy_of_peer(p.id);
@@ -1513,6 +1614,16 @@ Reason host_lease_checks(const Req& q, u16 parent, u16 id, u16 source, u32& sour
 }
 
 Reason host_destroy(const Req& q, u16 item);
+
+// Round 1 (review I1): the state a clone is built with - the host's own source, captured as the client's lua_clone
+// copies it (condition, upgrades, addons, magazine), checked like a client's blob (host_apply_spawn_state). Empty when
+// there is no source.
+void clone_state(u16 source, std::vector<u8>& out)
+{
+	out.clear();
+	if (source != kNoId)
+		items::capture_spawn_state(events::find_entity(source), out);
+}
 
 // The leased create is made (`created` is `id`): the id is the world's now. A clone's source goes with it.
 void host_leased_made(const Req& q, u16 id, u16 created, u16 source)
@@ -1698,6 +1809,13 @@ u64 g_spawn_queued = 0, g_spawn_dequeued = 0, g_spawn_queue_dropped = 0;
 
 void drop_queued(spawn::QueuedRequest&) { ++g_spawn_queue_dropped; }
 
+void drop_leased_queued(PeerId peer)
+{
+	const auto leased = [peer](const spawn::QueuedRequest& r) { return PeerId(r.peer) == peer && r.id != kNoId; };
+	for (const std::string& key : g_spawn_queue.keys())
+		g_spawn_queue.drop_if(key, leased, drop_queued);
+}
+
 // The turn of the front request of `key`: everything checked again from what the host knows now (the section, its
 // class and lines, the parent and what it holds, the lists, the item state), the budget charged by judge; Wait while it
 // does not hold it. A refusal after the charge gives it back.
@@ -1754,7 +1872,11 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 	if (holder != Reason::Ok)
 		return refuse(holder);
 	Reason why = Reason::Ok;
-	CSE_Abstract* e = build_spawn(q, r.parent, section, r.pos, r.state.data(), r.state.size(), why);
+	// round 1 (review I1): a clone from the host's source as it is now, never from the client's blob
+	std::vector<u8> source_state;
+	clone_state(r.source, source_state);
+	const spawn::StateRef state = spawn::spawn_state(r.source, r.state.data(), r.state.size(), source_state);
+	CSE_Abstract* e = build_spawn(q, r.parent, section, r.pos, state.data, state.size, why);
 	if (!e)
 		return refuse(why);
 	if (r.source != kNoId && !smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
@@ -1845,7 +1967,12 @@ void host_on_spawn(PeerId from, Reader& r)
 	if (rule && !missing.line)
 	{
 		Reason why = Reason::Ok;
-		e = build_spawn(q, s.parent, section, s.pos, s.state, s.state_size, why);
+		// F2 T12b round 1 (review I1): a clone is built from the host's own source (as lua_clone copies it on the
+		// client), whatever the client's blob says; the budget pays only the price difference
+		std::vector<u8> source_state;
+		clone_state(s.source, source_state);
+		const spawn::StateRef state = spawn::spawn_state(s.source, s.state, s.state_size, source_state);
+		e = build_spawn(q, s.parent, section, s.pos, state.data, state.size, why);
 		if (!e)
 			return reply(q, why, s.parent);
 		if (s.source != kNoId && !smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
@@ -2732,9 +2859,13 @@ void reset()
 	g_spawn_queue.clear(drop_queued); // Ruling F2-21: nothing of the old session is created
 	g_last_launch.clear(); // W3a
 	g_log_count = 0;
-	// Lua may still hold these pointers; reset runs when a session ends, long after any script used them.
-	for (CSE_Abstract* e : g_lua_temps)
-		F_entity_Destroy(e);
+	// Lua may still hold these pointers; reset runs when a session ends, long after any script used them. Round 1 (review
+	// I2): only those of this world; an old world's Lua state is closed.
+	if (g_temps_world == join::world_generation())
+		for (CSE_Abstract* e : g_lua_temps)
+			F_entity_Destroy(e);
+	else
+		g_lc.temps_left += g_lua_temps.size();
 	g_lua_temps.clear();
 	g_lua_forwarded.clear();
 	// F2 T12b: the session's leases go; in the world they came from, back into its generator
@@ -2749,6 +2880,7 @@ void reset()
 		g_temp_leases.clear(); // their objects went with g_lua_temps
 		g_give_back.clear();
 		g_give_back_wait.clear();
+		g_held.clear([](Action&) {}); // money holds go with the session (money::reset)
 	}
 	quarantine_expire(true);
 }
@@ -2872,6 +3004,11 @@ void print_status()
 		xrCriticalSectionGuard guard(g_quarantine_lock);
 		quarantined = g_quarantine.size();
 	}
+	size_t held = 0;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		held = g_held.size();
+	}
 	::Msg("[coop]   leased ids (F2 T12b): %u ready, %llu own items created at once (%llu clones, %llu from create(.., "
 	      "false)), %u waiting for the host, %u temporary objects hold one; %llu confirmed, %llu retried (rate limit), "
 	      "%llu taken back (refused; %u in quarantine), %llu not created (id taken here); %llu releases done by a clone; "
@@ -2879,6 +3016,10 @@ void print_status()
 	    (u32)pool, g_lc.created, g_lc.clones, g_lc.temps, (u32)pending, (u32)temps, g_lc.confirmed, g_lc.retried,
 	    g_lc.rolled_back, (u32)quarantined, g_lc.not_created, g_lc.released_with_clone, g_lc.given_back, g_lc.acks,
 	    (u32)waiting, g_lc.bad_leases, g_lc.stale_leases);
+	::Msg("[coop]   leased ids, round 1: %llu requests waited for their item's create (%u waiting now, %llu dropped with "
+	      "a rollback), %llu clones refused (their weapon waits for the host), %llu temporary objects and %llu "
+	      "quarantined entities of an old world left unfreed",
+	    g_lc.held, (u32)held, g_lc.held_dropped, g_lc.clones_refused, g_lc.temps_left, g_lc.quarantine_left);
 }
 
 // ---------------------------------------------------------------- client API
@@ -3080,6 +3221,7 @@ bool lua_client()
 CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vertex, u16 game_vertex, u16 parent,
     bool register_now, int ammo)
 {
+	temps_sync_world(); // round 1 (review I2)
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	if (!e)
 	{
@@ -3097,6 +3239,7 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 		if (id != kNoId)
 		{
 			e->ID = id; // a script keys its data by it before the register (m_data, item parts)
+			name_with_id(e); // round 1 (review M8): se_obj:name() as in single player
 			xrCriticalSectionGuard guard(g_out_lock);
 			g_temp_leases[e] = LeasedTemp{id, kNoId};
 			++g_lc.temps;
@@ -3107,7 +3250,7 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 	{
 		if (create_leased(e, id, kNoId))
 			return e;
-		give_back(id);
+		return_unused_lease(id); // round 1 (review M1)
 	}
 	lua_forward(e, "alife:create");
 	F_entity_Destroy(e);
@@ -3117,9 +3260,17 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector& pos, u32 level_vertex,
     u16 game_vertex, u16 parent, bool register_now)
 {
+	temps_sync_world(); // round 1 (review I2)
 	CSE_ALifeItemWeaponMagazined* from = smart_cast<CSE_ALifeItemWeaponMagazined*>(source);
 	if (!from)
 		return nullptr; // as the engine: only magazined weapons are cloned
+	// F2 T12b round 1 (review C1): a weapon the host has not made yet, or one a clone of ours replaces already, is not
+	// cloned (nil; coop_mods_guard tells the player before the mod's own creates)
+	if (lease_waiting(from->ID))
+	{
+		++g_lc.clones_refused;
+		return lua_refuse("alife:clone_weapon", "its weapon waits for the host (a create or a clone of ours in flight)");
+	}
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	CSE_ALifeItemWeaponMagazined* clone = smart_cast<CSE_ALifeItemWeaponMagazined*>(e);
 	if (!clone)
@@ -3142,6 +3293,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 		if (id != kNoId)
 		{
 			e->ID = id; // _g.alife_clone_weapon keys m_data and the parts by it before the register
+			name_with_id(e); // round 1 (review M8)
 			xrCriticalSectionGuard guard(g_out_lock);
 			g_temp_leases[e] = LeasedTemp{id, from->ID};
 			++g_lc.temps;
@@ -3152,7 +3304,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	{
 		if (create_leased(e, id, from->ID))
 			return e;
-		give_back(id);
+		return_unused_lease(id); // round 1 (review M1)
 	}
 	lua_forward(e, "alife:clone_weapon");
 	F_entity_Destroy(e);
@@ -3161,6 +3313,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 
 CSE_Abstract* lua_register_spawn(CSE_Abstract* object)
 {
+	temps_sync_world(); // round 1 (review I2)
 	const auto temp = std::find(g_lua_temps.begin(), g_lua_temps.end(), object);
 	if (temp == g_lua_temps.end())
 		return lua_refuse("alife:register", "an object the host did not create");
@@ -3176,7 +3329,14 @@ CSE_Abstract* lua_register_spawn(CSE_Abstract* object)
 			return object;
 		}
 		object->ID = kNoId;
-		give_back(leased.id);
+		return_unused_lease(leased.id); // round 1 (review M1)
+		if (leased.source != kNoId)
+		{
+			// round 1 (review M1): its source's release may have gone with it already (stock _g.alife_clone_weapon releases
+			// before the register): a clone by the request path now would leave both
+			g_lua_forwarded.insert(object);
+			return lua_refuse("alife:register", "a clone whose leased id could not be used here");
+		}
 	}
 	g_lua_forwarded.insert(object);
 	return lua_forward(object, "alife:register");
@@ -3186,6 +3346,7 @@ bool lua_release(CSE_Abstract* object)
 {
 	if (!object)
 		return true;
+	temps_sync_world(); // round 1 (review I2)
 	if (std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
 	{
 		// never created: nothing to release; F2 T12b: its leased id serves the next create
@@ -3234,8 +3395,21 @@ bool keep_released(CSE_Abstract* entity)
 	xrCriticalSectionGuard guard(g_quarantine_lock);
 	if (!g_quarantine_marks.erase(entity))
 		return false;
-	g_quarantine.push_back(Quarantined{entity, mgr().now_ms()});
+	g_quarantine.keep(entity, mgr().now_ms(), join::world_generation());
 	return true;
+}
+
+int lua_lease_waiting(lua_State* L)
+{
+	bool waiting = false;
+	if (lua_isnumber(L, 1) && lease_world_ready())
+	{
+		const lua_Number id = lua_tonumber(L, 1);
+		if (id >= 0 && id < lua_Number(kNoId))
+			waiting = lease_waiting(u16(id));
+	}
+	lua_pushboolean(L, waiting ? 1 : 0);
+	return 1;
 }
 
 int lua_lease_ids(lua_State* L)

@@ -143,6 +143,10 @@ bool keep_released(CSE_Abstract* entity);
 // Lua: coop.lease_ids() -> the leased ids this client can create its own items with now (0 elsewhere). A raw C function
 // for coop::script::register_raw (coop_script.cpp); coop_mods_guard.script lets a weapon's scope swap through with one.
 int lua_lease_ids(lua_State* L);
+// Lua: coop.lease_waiting(id) -> true while item `id` (local numbering) waits for the host: its create under a leased id
+// is not answered yet, or a clone of ours replaces it (round 1, review C1). A clone of it is refused then (nil);
+// coop_mods_guard.script refuses the scope swap before the mod's own creates and tells the player.
+int lua_lease_waiting(lua_State* L);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
 // set_switch_online/offline; W3a; F2 T12 round 1: set_interactive, the restrictions). A wrapper over the call gate
 // (F2 T12): name is the kCalls name ("alife:kill_entity"), target the object id (0xffff = none; else it must exist in

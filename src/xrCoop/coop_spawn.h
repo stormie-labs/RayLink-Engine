@@ -116,6 +116,30 @@ inline void write_state(Writer& w, uint32_t seq, uint16_t parent, const float po
 		w.bytes(state, state_size);
 }
 
+// F2 T12b round 1 (review I1): the item state the host builds a request's entity with. A clone (`source` set) takes the
+// state of the host's own source (`source_state`, as lua_clone copies it on the client), whatever the client's blob says:
+// otherwise a modified client gets upgrades, a full magazine and a repair for the price difference. A create takes the
+// client's blob (checked like any ItemState).
+struct StateRef
+{
+	const uint8_t* data = nullptr;
+	size_t size = 0;
+};
+inline StateRef spawn_state(uint16_t source, const uint8_t* client_state, size_t client_size,
+    const std::vector<uint8_t>& source_state)
+{
+	StateRef s;
+	if (source != kNoId)
+	{
+		s.data = source_state.empty() ? nullptr : source_state.data();
+		s.size = source_state.size();
+		return s;
+	}
+	s.data = client_state;
+	s.size = client_size;
+	return s;
+}
+
 // F2 T12b: the request of an item the client created already under leased `id` (source: a clone's weapon, or kNoId).
 inline void write_leased(Writer& w, uint32_t seq, uint16_t parent, uint16_t id, uint16_t source, const float pos[3],
     std::string_view section, const uint8_t* state, size_t state_size)
