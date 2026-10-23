@@ -858,15 +858,19 @@ void finish_respawn(CActor* a, u64 t)
 	a->ForceTransform(m);
 	++g_stat.respawns;
 	const checkpoint::Kind kind = g_me.respawn_kind;
+	const u16 seq = g_me.seq; // the fall this respawn answers (apply_respawn took it from the host's order)
 	stand_up(a, a->conditions().GetMaxHealth(), true, t);
 	if (kind == checkpoint::Kind::None)
 		feed("You respawned (no camp of yours on this level).");
 	else
 		feed("You are back at your camp (%s).", checkpoint::kind_name(kind));
-	// Lua (F3 Task 15): contusion, rank; the money is the host's (death::host_take_money), Lua only tells it.
+	// Lua (F3 Task 15): contusion, rank; the money is the host's (death::host_take_money), Lua only tells it. R1 I-1 (Ruling
+	// F3-12): the fifth argument is the number of the fall, so that Lua acts once on a repeated order (T8 review M-1) and
+	// on every real fall, however soon after the previous one. The numbers belong to one actor (forget_local starts them
+	// again): Lua forgets the ones it has seen when a world is entered.
 	script::queue_callback("coop_respawned", {script::cb_str(checkpoint::kind_name(kind)),
 		script::cb_int(s64(g_rules.contusion_s)), script::cb_int(s64(g_rules.money_pct)),
-		script::cb_int(s64(g_rules.rank_pct))});
+		script::cb_int(s64(g_rules.rank_pct)), script::cb_int(s64(seq))});
 }
 
 void apply_spectate(u16 seq)

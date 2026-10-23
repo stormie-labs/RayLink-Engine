@@ -14,8 +14,11 @@
 //        --> Alive at the player's own checkpoint (coop_checkpoints::host_respawn_point)
 // While evacuated the dead player watches a living teammate (Fire / Aim switch), or the place of death from
 // above when nobody is alive. On standing up the owner wears its slot items (coop_death_wear) and fires the
-// Lua callback coop_respawned(kind, contusion_s, money_pct, rank_pct): kind is the checkpoint kind name
-// ("campfire", "arrival", ..., "none" for no camp); the money is already taken by the host (death ledger).
+// Lua callback coop_respawned(kind, contusion_s, money_pct, rank_pct, seq): kind is the checkpoint kind name
+// ("campfire", "arrival", ..., "none" for no camp); the money is already taken by the host (death ledger) and how much
+// does not reach the owner, so Lua can only say "up to money_pct %"; seq is the number of the fall (g_me.seq) the respawn
+// answers: the same seq again is the same fall (an order the host sent twice), another one is a new fall. A new actor
+// (level change, load) counts from 0 again, so the numbers mean something inside one world only (F3 T15 round 1, F3-12).
 // Host: coop_group_wipe() once when every present player is dead / spectating / respawning, again only
 // after somebody stood up.
 //
