@@ -9,6 +9,7 @@
 #include "ui/UIActorMenu.h"
 #include "uigamecustom.h"
 #include "inventory_item.h"
+#include "coop/coop_trade.h"
 
 CInventoryBox::CInventoryBox()
 {
@@ -86,6 +87,7 @@ void CInventoryBox::UpdateCL()
 
 void CInventoryBox::net_Destroy()
 {
+	coop::trade::on_inv_box_destroy(*this); // Anomaly Coop: an open search window lets go of the box first (L-1 round 2)
 	inherited::net_Destroy();
 }
 

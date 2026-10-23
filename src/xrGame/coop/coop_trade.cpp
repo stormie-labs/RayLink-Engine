@@ -32,6 +32,7 @@
 #include "script_game_object.h"
 #include "game_object_space.h"
 #include "../xrServerEntities/xrMessages.h"
+#include "UIGameCustom.h"
 #include "ui/UIActorMenu.h"
 #include "ui/UIDragDropListEx.h"
 #include "ui/UICellItem.h"
@@ -1044,6 +1045,31 @@ void on_container_move(u16 from_id, u16 to_id, u16 item_id)
 	if (g_view.moves.size() >= 512)
 		g_view.moves.erase(g_view.moves.begin());
 	g_view.moves.push_back({item_id, to_id, now_ms() + kMoveCheckMs});
+}
+
+void on_inv_box_destroy(CInventoryBox& box)
+{
+	CUIGameCustom* ui = CurrentGameUI();
+	if (!ui)
+		return;
+	CUIActorMenu& menu = ui->GetActorMenu();
+	if (menu.GetInvBox() != &box)
+		return;
+	if (menu.IsShown())
+	{
+		// L-1 round 2: on a client the host released the box (an emptied death bag) or a script did, with the window
+		// open. Show(false) runs inside (CDialogHolder::RemoveDialogToRender): our close goes to the host, the menu's
+		// DeInit clears the box's in_use - all while the box is still whole.
+		ui->HideActorMenu();
+		::Msg("[coop] box %u goes away while it is searched: its window is closed", u32(box.ID()));
+	}
+	if (menu.IsShown())
+	{
+		// Cannot happen while the menu has its holder; SetInvBox would assert on a shown menu.
+		::Msg("! [coop] box %u goes away and its window would not close: the menu still points at it", u32(box.ID()));
+		return;
+	}
+	menu.SetInvBox(nullptr); // a hidden menu keeps the pointer until the next search: never a freed box
 }
 
 void invalidate_views()

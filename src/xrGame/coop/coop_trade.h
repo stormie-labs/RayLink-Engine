@@ -46,6 +46,7 @@ class CUIActorMenu;
 class CUIDragDropListEx;
 class CInventoryItem;
 class CInventoryOwner;
+class CInventoryBox;
 
 namespace coop
 {
@@ -96,6 +97,12 @@ void on_actor_menu_shown(CUIActorMenu& menu, bool shown);
 bool refresh_actor_menu(CUIActorMenu& menu);
 // move_item_from_to (container windows): the move is checked after a while; not applied -> rebuild.
 void on_container_move(u16 from_id, u16 to_id, u16 item_id);
+// CInventoryBox::net_Destroy, first line, on every machine and in single player (L-1 round 2). The actor menu keeps a
+// raw pointer to the box it searches (CUIActorMenu::m_pInvBox) and reads it while shown (refresh_actor_menu, the stock
+// lists, its DeInit). If `box` is that box, a shown menu is closed now, while the box is still whole (HideActorMenu:
+// the window and Lua's hide hook, as the stock item_backpack does before its release; Show(false) runs at once), and the
+// menu forgets the box. A menu closed already (the stock path) only forgets it: no second close.
+void on_inv_box_destroy(CInventoryBox& box);
 
 // For the item layer (WP2): a take/put request was rejected by the host; rebuild the open window.
 void invalidate_views();
