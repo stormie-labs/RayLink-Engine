@@ -33,6 +33,8 @@ namespace coop
 //    Also in 8 (F3 T7 round 1, Rulings F3-5, F3-6, F3-8): CheckpointClaim `what` 1 tent, 2 sleeping bag, 3 pack up;
 //    CheckpointState flags 4 alone = the refusal of the receiver's own claim, {u8 what, u8 reason} and nothing else
 //    (xrCoop/coop_checkpoint_store.h)
+//    Also in 8 (F3 T11): RestState ends with u8 refused (the owner's copy only) and its first byte is the rest::Block
+//    reason; RestSleep goes to the sleepers only
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
