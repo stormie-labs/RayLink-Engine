@@ -1451,6 +1451,7 @@ void register_raw(lua_State* L)
 		{"talk_holder", &l_talk_holder}, // W11
 		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)
 		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter
+		{"lease_ids", &coop::requests::lua_lease_ids}, // F2 T12b: ids this client can create its own items with now
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

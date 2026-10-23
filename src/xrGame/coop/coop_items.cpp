@@ -1789,6 +1789,15 @@ void print_status()
 		::Msg("[coop]   items in: %llu states dropped before live (R2 I2)", s.dropped_before_live);
 }
 
+void client_resend_state(u16 local_id)
+{
+	if (!mgr().is_live_client() || local_id == kNoId)
+		return;
+	g_sent[local_id] = Blob(); // differs from any captured state: the next scan sends ours
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_scan_now = true;
+}
+
 void touch(CInventoryItem* item)
 {
 	if (!item || !mgr().active())

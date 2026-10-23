@@ -103,6 +103,24 @@ public:
 		return (tfGetFromBlock(*I, tValueID));
 	}
 
+	// Anomaly Coop (F2 T12b; R2 minor "ID already used"): whether tfGetID(tValueID) would hand the id out rather than
+	// assert. A scan of its block's free list, O(tBlockSize).
+	IC bool is_free(VALUE_ID tValueID) const
+	{
+		if (tValueID < tMinValue || tValueID > tMaxValue)
+			return false;
+		const SID_Block& l_tID_Block = m_tppBlocks[(tValueID - tMinValue) / tBlockSize];
+		const TYPE_ID l_tValue = TYPE_ID((tValueID - tMinValue) % tBlockSize);
+		return std::find(l_tID_Block.m_tpIDs, l_tID_Block.m_tpIDs + l_tID_Block.m_tCount, l_tValue) !=
+			l_tID_Block.m_tpIDs + l_tID_Block.m_tCount;
+	}
+
+	// Anomaly Coop (F2 T12b): blocks that still have a free id (tfGetID(invalid) asserts at 0).
+	IC u32 available() const
+	{
+		return m_available_count;
+	}
+
 	IC void vfFreeID(VALUE_ID tValueID, TIME_ID tTimeID)
 	{
 		BLOCK_ID l_tBlockID = tfGetBlockByValue(tValueID);

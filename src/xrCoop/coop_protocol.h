@@ -35,6 +35,9 @@ namespace coop
 //    (xrCoop/coop_checkpoint_store.h)
 //    Also in 8 (F3 T11): RestState ends with u8 refused (the owner's copy only) and its first byte is the rest::Block
 //    reason; RestSleep goes to the sleepers only
+//    Also in 8 (F2 T12b): leased object ids - IdLease 0x0178 (host -> client), IdLeaseAck 0x0179 (client -> host)
+//    (xrCoop/coop_id_lease.h IdsMsg); ReqSpawn marker 0xC7 (an item the client created under a leased id, and the
+//    weapon a clone replaces; xrCoop/coop_spawn.h)
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
@@ -143,6 +146,9 @@ enum class Msg : uint16_t
 	Progress = 0x0175, // rank, reputation, stats
 	StoryHash = 0x0176, // host -> clients every 10 s: count + hash per story domain (P5 drift check)
 	StoryResync = 0x0177, // client -> host: send full lists for a domain mask
+	// F2 T12b leased object ids (xrCoop/coop_id_lease.h IdsMsg: u32 epoch, varu n, n x u16 id)
+	IdLease = 0x0178, // host -> client: ids added to his lease (he creates his own items under them at once)
+	IdLeaseAck = 0x0179, // client -> host: ids he gives back (busy on his machine, or his create was refused)
 
 	// dialogs and trade
 	DialogLock = 0x0180, // client -> host: request talk lock on npc

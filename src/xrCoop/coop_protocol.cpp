@@ -78,6 +78,8 @@ const char* msg_name(Msg type)
 	case Msg::TimeRequest: return "TimeRequest";
 	case Msg::StoryHash: return "StoryHash";
 	case Msg::StoryResync: return "StoryResync";
+	case Msg::IdLease: return "IdLease";
+	case Msg::IdLeaseAck: return "IdLeaseAck";
 	case Msg::ItemState: return "ItemState";
 	case Msg::EntitySound: return "EntitySound";
 	case Msg::PlayerRules: return "PlayerRules";
@@ -163,6 +165,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::ZoneState:
 	case Msg::TaskList:
 	case Msg::StoryHash:
+	case Msg::IdLease: // F2 T12b: only the host leases ids
 	case Msg::DialogLockResult:
 	case Msg::DialogPhrases:
 	case Msg::MoneyBalance: // F2 T1: only the host holds balances
@@ -196,6 +199,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::ReqLaunch:
 	case Msg::TimeRequest:
 	case Msg::StoryResync:
+	case Msg::IdLeaseAck: // F2 T12b: a client gives ids back
 	case Msg::DialogLock:
 	case Msg::DialogSelect:
 	case Msg::CheckpointClaim: // F3: a player reports his tent, the host checks it

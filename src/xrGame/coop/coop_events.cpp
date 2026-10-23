@@ -779,6 +779,14 @@ void client_on_entity_local(PeerId, Reader& r)
 	const u16 parent = parent_h == kNoId ? kNoId : join::to_local(parent_h);
 	if (Level().Server->ID_to_entity(id))
 		return; // already here (P6: a repeat is harmless)
+	if (!Level().Server->IsFreeID(id))
+	{
+		// F2 T12b (R2 minor "ID already used"): our generator has it taken without a server entity (an offline ALife
+		// object, a leased id of ours): Process_spawn would assert on it
+		++g_c.local_errors;
+		::Msg("! [coop] local entity %u [?] skipped: its id is taken here", join::to_host(id));
+		return;
+	}
 	if (parent != kNoId && !Level().Server->ID_to_entity(parent))
 		return; // its holder is not online here; it is a transient child, nothing to keep
 	u16 type;

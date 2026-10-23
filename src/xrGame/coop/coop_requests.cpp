@@ -19,6 +19,7 @@
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_hits.h"
 #include "xrCoop/coop_moves.h" // Ruling F2-32 (F2 T12 round 1)
+#include "xrCoop/coop_id_lease.h" // F2 T12b
 
 #include <cstring>
 
@@ -320,6 +321,9 @@ struct Action
 	// that payment held out of the money shown until the host answers (money::client_hold, 0: none)
 	u16 mechanic = kNoId;
 	u32 paid = 0, hold = 0;
+	// Spawn (F2 T12b): the leased id our item has here already (kNoId: the request path, nil to Lua), and the weapon a
+	// clone of ours replaces (local numbering, kNoId: none)
+	u16 lease = kNoId, source = kNoId;
 };
 
 struct Inflight
@@ -346,6 +350,41 @@ struct ClientCounters
 	u64 lua_forwarded = 0, lua_refused = 0;
 	u64 hits_perked = 0, hits_cancelled = 0, perk_errors = 0; // W5 C2.1
 } g_cl;
+
+// ---------------------------------------------------------------- F2 T12b: leased ids, client state
+// Our own items are created here at once under ids the host lent us (xrCoop/coop_id_lease.h). Under g_out_lock: Lua
+// creates may run on the game thread, the answers and the frame come on the main thread.
+lease::ClientPool g_pool; // ids reserved in our generator, ready for a create
+lease::SpecBook g_specs; // our creates the host has not answered yet
+xr_map<u16, Action> g_spec_actions; // the request of each of them, sent again after RateLimited
+struct LeasedTemp
+{
+	u16 id = kNoId;
+	u16 source = kNoId; // a clone's weapon (local numbering)
+};
+xr_map<CSE_Abstract*, LeasedTemp> g_temp_leases; // alife():create / clone_weapon (.., false) objects that hold an id
+xr_vector<u16> g_give_back; // ids for the next IdLeaseAck
+xr_vector<u16> g_give_back_wait; // ids of refused creates whose object is still here (its destroy takes a frame)
+u32 g_pool_world = 0; // join::world_generation() the ids are reserved in
+u64 g_last_ack = 0;
+struct LeaseCounters
+{
+	u64 created = 0, temps = 0, clones = 0, confirmed = 0, retried = 0, rolled_back = 0, released_with_clone = 0;
+	u64 acks = 0, given_back = 0, bad_leases = 0, stale_leases = 0, not_created = 0;
+} g_lc;
+
+// Rolled-back items (research f2-client-create-ids.md §4.3): released from our ALife and server like any destroyed item
+// (on_unregister cleans the mods' data under the id), but their entity is freed only kQuarantineMs later, as a script
+// may still hold the se_obj it got from the create.
+constexpr u64 kQuarantineMs = 120000;
+xrCriticalSection g_quarantine_lock; // entity_Destroy runs where the release runs
+xr_set<CSE_Abstract*> g_quarantine_marks;
+struct Quarantined
+{
+	CSE_Abstract* e = nullptr;
+	u64 at = 0;
+};
+xr_vector<Quarantined> g_quarantine;
 
 void push(Action&& a)
 {
@@ -443,8 +482,16 @@ void send_action(const Action& a)
 		const u32 seq = track(Msg::ReqSpawn, a.item);
 		Writer w(a.bytes.size() + a.section.size() + 32);
 		const float p[3] = {a.pos.x, a.pos.y, a.pos.z};
-		// R3 В6: section + item state, the host builds the entity itself
-		spawn::write_state(w, seq, to_host_id(a.item), p, a.section.c_str(), a.bytes.data(), a.bytes.size());
+		if (a.lease != kNoId)
+		{
+			// F2 T12b: we have the item under this id already; the host creates it with the same one or refuses
+			spawn::write_leased(w, seq, to_host_id(a.item), to_host_id(a.lease), to_host_id(a.source), p,
+			    a.section.c_str(), a.bytes.data(), a.bytes.size());
+			xrCriticalSectionGuard guard(g_out_lock);
+			g_specs.sent(a.lease, seq);
+		}
+		else // R3 В6: section + item state, the host builds the entity itself
+			spawn::write_state(w, seq, to_host_id(a.item), p, a.section.c_str(), a.bytes.data(), a.bytes.size());
 		net::client_send(Msg::ReqSpawn, w);
 		++g_cl.sent[0];
 		break;
@@ -666,6 +713,310 @@ void client_pump_rebuilds()
 	}
 }
 
+// ---------------------------------------------------------------- F2 T12b: leased ids, client
+// The ids the host lent us (Msg::IdLease) are reserved in our generator at once; an own item a script creates
+// (alife():create into our actor, create(.., false) + register, clone_weapon) takes one and is created here at once,
+// registered and online in our inventory, and asked for with the same id (ReqSpawn 0xC7). The host's answer: accepted -
+// nothing to do (its EntitySpawn finds the item here); RateLimited - asked again; refused - our item goes (rollback) and
+// the id goes back (Msg::IdLeaseAck).
+
+bool lease_world_ready() { return mgr().is_live_client() && g_pGameLevel && ai().get_alife() && Level().Server; }
+
+// The ids belong to the generator of the world they were reserved in: another world here (the host's load, a rejoin of
+// ours: join::world_generation) leaves nothing of them, nor of the creates in flight. Under g_out_lock.
+void lease_sync_world_locked()
+{
+	const u32 world = join::world_generation();
+	if (world == g_pool_world)
+		return;
+	g_pool_world = world;
+	g_pool.clear();
+	g_specs.clear();
+	g_spec_actions.clear();
+	g_give_back.clear();
+	g_give_back_wait.clear();
+	for (auto& it : g_temp_leases)
+		it.first->ID = kNoId; // still a temporary object (g_lua_temps): its register takes the request path
+	g_temp_leases.clear();
+}
+
+// What the host's ReqSpawn takes into a player's character (an item class with every line it reads unchecked, not a
+// launcher's rocket, no default upgrades its own tree refuses - FATAL on a new object here as there): anything else
+// takes the request path and its refusal, as before.
+bool lease_section_ok(const char* section)
+{
+	if (!section || !spawnable_section(section))
+		return false;
+	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(section, "class"));
+	return rule && spawn::character_takes(rule->game) && !missing_item_line(section, *rule).line &&
+	    items::section_defaults_ok(shared_str(section));
+}
+
+// A leased id for a new item of `section` in `parent` (local numbering), kNoId for the request path: not live, not
+// into our actor, a section the host refuses there, no id left.
+u16 take_lease(const char* section, u16 parent)
+{
+	if (parent != kActor || !lease_world_ready() || !lease_section_ok(section))
+		return kNoId;
+	xrCriticalSectionGuard guard(g_out_lock);
+	lease_sync_world_locked();
+	return g_pool.take();
+}
+
+void give_back(u16 id)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_give_back.push_back(id);
+}
+
+// The name CALifeSimulatorBase::spawn_item gives a new object: its section and its id, at least 4 digits (the host
+// names a leased item the same way).
+void name_with_id(CSE_Abstract* e)
+{
+	string256 name;
+	xr_sprintf(name, "%s%04u", e->s_name.c_str(), u32(e->ID));
+	e->set_name_replace(name);
+}
+
+// Our holder is online, so the new item comes online in it at once: the steps of entities' bring_child_online for an
+// item the host made (add_online_impl for a child).
+void bring_online_in_holder(CSE_ALifeDynamicObject* e)
+{
+	xrServer& server = alife_rw().server();
+	CSE_ALifeDynamicObject* holder = ai().alife().objects().object(e->ID_Parent, true);
+	if (!holder || !holder->m_bOnline || !server.ID_to_entity(e->ID_Parent))
+		return; // stays offline in its holder, comes online with it
+	ClientID client;
+	client.set(server.GetServerClient() ? server.GetServerClient()->ID.value() : 0);
+	NET_Packet packet;
+	e->s_flags.or(M_SPAWN_UPDATE);
+	CSE_Abstract* abstract = e;
+	server.entity_Destroy(abstract); // frees the id; ALife keeps the entity (m_bALifeControl)
+	e->o_Position = holder->o_Position;
+	e->m_tNodeID = holder->m_tNodeID;
+	server.Process_spawn(packet, client, FALSE, e);
+	e->s_flags.and(u16(-1) ^ M_SPAWN_UPDATE);
+	e->m_bOnline = true;
+}
+
+// `e` (a temporary object of make_temp, its parent our actor) becomes our item now under leased `id`: registered in our
+// ALife, online in our inventory, asked for with the same id. `source`: the weapon a clone replaces (local numbering).
+// False: not created (`e` untouched; the caller gives the id back).
+bool create_leased(CSE_Abstract* e, u16 id, u16 source)
+{
+	CSE_ALifeDynamicObject* d = smart_cast<CSE_ALifeDynamicObject*>(e);
+	CSE_ALifeDynamicObject* holder = lease_world_ready() ? ai().alife().objects().object(e->ID_Parent, true) : nullptr;
+	xrServer* server = Level().Server;
+	// the id is ours: reserved in our generator (never free) and nothing here holds it
+	if (!d || !holder || !server || server->IsFreeID(id) || server->ID_to_entity(id) ||
+	    ai().alife().objects().object(id, true))
+	{
+		++g_lc.not_created;
+		if (log_allowed())
+			::Msg("! [coop] our new [%s] could not take its leased id %u here: asked for without it",
+			    e->s_name.c_str(), id);
+		return false;
+	}
+	Action a;
+	a.kind = Act::Spawn;
+	a.item = e->ID_Parent;
+	a.pos = holder->o_Position;
+	a.section = e->s_name.c_str() ? e->s_name.c_str() : "";
+	a.lease = id;
+	a.source = source;
+	std::vector<u8> state;
+	if (items::capture_spawn_state(e, state)) // the state the script gave it, before our world touches it
+		a.bytes.assign(state.begin(), state.end());
+	{
+		entities::ClientApply apply; // our own world takes it as the host's would: nothing of it is a request
+		e->ID = id;
+		name_with_id(e);
+		e->ID_Phantom = kNoId;
+		d->o_Position = holder->o_Position;
+		d->m_tNodeID = holder->m_tNodeID;
+		d->m_tGraphID = holder->m_tGraphID;
+		d->m_bOnline = false;
+		alife_rw().register_object(d, true);
+		bring_online_in_holder(d);
+	}
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_specs.add(id, source);
+	g_spec_actions[id] = a;
+	g_outbox.push_back(std::move(a));
+	++g_lc.created;
+	g_lc.clones += source != kNoId ? 1 : 0;
+	return true;
+}
+
+// A temporary object of ours holds a leased id (create / clone_weapon (.., false)): taken out of g_temp_leases.
+bool take_temp_lease(CSE_Abstract* e, LeasedTemp& out)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	lease_sync_world_locked();
+	const auto it = g_temp_leases.find(e);
+	if (it == g_temp_leases.end())
+		return false;
+	out = it->second;
+	g_temp_leases.erase(it);
+	return true;
+}
+
+// A pending clone of ours replaces item `id` (local numbering): the host releases it with the clone's creation, and keeps
+// it when it refuses the clone. So a release of it now is that clone's part, not a request of its own.
+bool clone_source(u16 id)
+{
+	if (id == kNoId)
+		return false;
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (g_specs.is_source(id))
+		return true;
+	for (const auto& it : g_temp_leases)
+		if (it.second.source == id)
+			return true;
+	return false;
+}
+
+// The host refused our create under `id` (or kept rate-limiting it): our item goes - released from our ALife like any
+// destroyed item, its entity kept a while (the quarantine) - and the id goes back to the host once it is gone here.
+void rollback_leased(u16 id, u8 reason)
+{
+	++g_lc.rolled_back;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		g_give_back_wait.push_back(id);
+	}
+	CSE_ALifeDynamicObject* e = lease_world_ready() ? ai().alife().objects().object(id, true) : nullptr;
+	if (!e)
+		return;
+	if (log_allowed())
+		::Msg("! [coop] the host refused our new [%s] %u (%s): taken back here", e->s_name.c_str(), id,
+		    reason_name(Reason(_min<u8>(reason, u8(Reason::Count)))));
+	{
+		xrCriticalSectionGuard guard(g_quarantine_lock);
+		g_quarantine_marks.insert(e);
+	}
+	entities::ClientApply apply; // a destroy of our own world: no request of it goes to the host
+	if (e->m_bOnline)
+	{
+		NET_Packet packet;
+		packet.w_begin(M_EVENT);
+		packet.w_u32(Level().timeServer());
+		packet.w_u16(GE_DESTROY);
+		packet.w_u16(id);
+		Level().Send(packet, net_flags(TRUE, TRUE));
+	}
+	else
+		alife_rw().release(e, true);
+}
+
+// Rolled-back entities are freed kQuarantineMs after their release (all of them when the session goes).
+void quarantine_expire(bool all)
+{
+	xr_vector<CSE_Abstract*> done;
+	{
+		xrCriticalSectionGuard guard(g_quarantine_lock);
+		const u64 now = mgr().now_ms();
+		for (auto it = g_quarantine.begin(); it != g_quarantine.end();)
+		{
+			if (all || now - it->at >= kQuarantineMs)
+			{
+				done.push_back(it->e);
+				it = g_quarantine.erase(it);
+			}
+			else
+				++it;
+		}
+		if (all)
+			g_quarantine_marks.clear();
+	}
+	for (CSE_Abstract* e : done)
+		F_entity_Destroy(e);
+}
+
+// Client frame, before the outbox goes: the retries due, the ids to give back (paced: kAckGapMs), the quarantine.
+void client_pump_leases()
+{
+	quarantine_expire(false);
+	if (!lease_world_ready())
+		return;
+	const u64 now = mgr().now_ms();
+	lease::IdsMsg ack;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		lease_sync_world_locked();
+		for (u16 id : g_specs.due(now))
+		{
+			const auto it = g_spec_actions.find(id);
+			if (it == g_spec_actions.end())
+			{
+				g_specs.forget(id);
+				continue;
+			}
+			g_specs.sent(id, 0); // queued: not due again before its answer
+			g_outbox.push_back(it->second);
+		}
+		for (auto it = g_give_back_wait.begin(); it != g_give_back_wait.end();)
+		{
+			if (ai().alife().objects().object(*it, true) || Level().Server->ID_to_entity(*it))
+				++it; // its destroy has not run yet
+			else
+			{
+				g_give_back.push_back(*it);
+				it = g_give_back_wait.erase(it);
+			}
+		}
+		if (g_give_back.empty() || now - g_last_ack < lease::kAckGapMs)
+			return;
+		const size_t n = _min<size_t>(g_give_back.size(), lease::kMaxIdsPerMsg);
+		for (size_t i = 0; i < n; ++i)
+			ack.ids.push_back(to_host_id(g_give_back[i]));
+		g_give_back.erase(g_give_back.begin(), g_give_back.begin() + n);
+		g_last_ack = now;
+	}
+	ack.epoch = mgr().session().world_epoch();
+	Writer w(8 + 2 * ack.ids.size());
+	ack.write(w);
+	net::client_send(Msg::IdLeaseAck, w);
+	++g_lc.acks;
+	g_lc.given_back += ack.ids.size();
+}
+
+// Msg::IdLease: ids added to our lease. Each one is reserved in our generator, or given back when an object of ours holds
+// it (a bolt, a fake missile: the same class as R2's "ID already used").
+void client_on_lease(PeerId from, Reader& r)
+{
+	if (from != kHostPeer || !mgr().is_client())
+		return;
+	lease::IdsMsg m;
+	if (!m.read(r))
+	{
+		++g_lc.bad_leases;
+		return;
+	}
+	if (!lease_world_ready() || m.epoch != mgr().session().world_epoch())
+	{
+		++g_lc.stale_leases; // another world's: the host voided them with it
+		return;
+	}
+	xrServer& server = alife_rw().server();
+	for (u16& id : m.ids)
+		id = to_local_id(id); // identity: a leased id is neither 0 nor our proxy (both are taken in the host's world)
+	std::vector<u16> rejected;
+	xrCriticalSectionGuard guard(g_out_lock);
+	lease_sync_world_locked();
+	g_pool.add(m.epoch, m.ids,
+	    [&server](u16 id)
+	    {
+		    if (!server.IsFreeID(id))
+			    return false; // an object of ours holds it
+		    server.PerformIDgen(id); // reserved: no object of ours takes it now
+		    return true;
+	    },
+	    rejected);
+	g_give_back.insert(g_give_back.end(), rejected.begin(), rejected.end());
+}
+
+
 void client_on_result(PeerId, Reader& r)
 {
 	const u32 seq = r.u32();
@@ -674,6 +1025,25 @@ void client_on_result(PeerId, Reader& r)
 	const u16 subject = r.u16();
 	if (!r.ok())
 		return;
+	// F2 T12b: the answer to a create of ours under a leased id
+	u16 leased = kNoId;
+	lease::Outcome outcome = lease::Outcome::Unknown;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		outcome = g_specs.answer(seq, accepted, reason == u8(Reason::RateLimited), mgr().now_ms(), leased);
+		if (outcome == lease::Outcome::Confirmed || outcome == lease::Outcome::RolledBack)
+			g_spec_actions.erase(leased);
+	}
+	switch (outcome)
+	{
+	case lease::Outcome::Confirmed:
+		++g_lc.confirmed;
+		items::client_resend_state(leased); // what changed on it while the host had not made it yet
+		break;
+	case lease::Outcome::Retry: ++g_lc.retried; break;
+	case lease::Outcome::RolledBack: rollback_leased(leased, reason); break;
+	case lease::Outcome::Unknown: break;
+	}
 	Msg type = Msg::ReqResult;
 	u16 local_item = kNoId;
 	auto it = g_inflight.find(seq);
@@ -1013,6 +1383,153 @@ void refuse_spawn(const Req& q, spawn::SpawnVerdict v, const char* section, cons
 	reply(q, reason, parent);
 }
 
+// ---------------------------------------------------------------- F2 T12b: leased ids, host
+// The host takes free ids out of its generator and leases kLeaseSize of them to each player in the world (Msg::IdLease),
+// a spent one replaced 1:1 (xrCoop/coop_id_lease.h). The leases belong to this world's generator: another world
+// (join::world_generation) voids them, nothing is freed; a player who leaves or loads the world again gives his back.
+lease::HostLeases g_leases;
+struct HostLeaseCounters
+{
+	u64 messages = 0, spawns = 0, clones = 0, not_his = 0, acks = 0, ack_ids = 0, ack_not_his = 0, bad_acks = 0;
+	u64 short_of_ids = 0;
+} g_hl;
+
+void host_sync_leases() { g_leases.set_epoch(join::world_generation()); }
+
+bool host_world_ready() { return g_pGameLevel && ai().get_alife() && Level().Server && !Device.dwPrecacheFrame; }
+
+// Ids the leases held go back to this world's generator. An id it has free already is left alone (a second free would
+// put it into the free list twice).
+void host_free_ids(const std::vector<u16>& ids)
+{
+	if (!g_pGameLevel || !Level().Server)
+		return;
+	xrServer& server = *Level().Server;
+	for (u16 id : ids)
+		if (lease::leasable(id) && !server.IsFreeID(id))
+			server.FreeID(id, Device.TimerAsync());
+}
+
+// Host frame: every player in the world holds a whole lease (one IdLease per player and frame with what he lacks); a
+// player who loads the world again (a rejoin) gives his back: his machine starts a new pool with its new world.
+void host_pump_leases()
+{
+	host_sync_leases();
+	if (!host_world_ready())
+		return;
+	xrServer& server = *Level().Server;
+	for (const PeerInfo& p : mgr().session().peers())
+	{
+		if (p.state != PeerState::Joined)
+			continue;
+		if (sync::host_peer_joining(p.id))
+		{
+			if (g_leases.count(p.id))
+				host_free_ids(g_leases.drop(p.id));
+			continue;
+		}
+		const u16 proxy = join::proxy_of_peer(p.id);
+		if (proxy == kNoId || !join::host_player_in_world(proxy))
+			continue;
+		const size_t want = g_leases.want(p.id);
+		if (!want)
+			continue;
+		std::vector<u16> bad;
+		lease::IdsMsg m;
+		m.epoch = mgr().session().world_epoch();
+		m.ids = g_leases.grant(p.id, want,
+		    [&server]() -> u16
+		    {
+			    // a nearly full world keeps its last blocks (PerformIDgen(0xffff) asserts with none)
+			    return server.AvailableIDBlocks() >= lease::kMinFreeBlocks ? server.PerformIDgen(kNoId) : kNoId;
+		    },
+		    bad);
+		for (u16 id : bad)
+			if (!g_leases.leased(id))
+				server.FreeID(id, Device.TimerAsync()); // picked, not leased
+		if (m.ids.empty())
+		{
+			g_hl.short_of_ids += want == lease::kLeaseSize ? 1 : 0;
+			continue;
+		}
+		Writer w(8 + 2 * m.ids.size());
+		m.write(w);
+		net::host_send(p.id, Msg::IdLease, w);
+		++g_hl.messages;
+	}
+}
+
+// Msg::IdLeaseAck: ids the player gives back (busy on his machine, or his create was refused) go back to the generator.
+void host_on_lease_ack(PeerId from, Reader& r)
+{
+	if (!mgr().is_host())
+		return;
+	lease::IdsMsg m;
+	if (!m.read(r))
+	{
+		++g_hl.bad_acks;
+		return;
+	}
+	host_sync_leases();
+	if (m.epoch != mgr().session().world_epoch() || !host_world_ready())
+		return; // another world's: voided with it
+	++g_hl.acks;
+	std::vector<u16> back;
+	for (u16 id : m.ids)
+	{
+		if (g_leases.give_back(from, id))
+			back.push_back(id);
+		else
+			++g_hl.ack_not_his; // not his, or spent: an entity has it
+	}
+	g_hl.ack_ids += back.size();
+	host_free_ids(back);
+}
+
+// A request with a leased id: the id is the asker's (checked before anything touches the generator), it goes into his
+// character, and a clone's source is a magazined weapon of his (`source_cost`: its cost, what the clone does not pay).
+Reason host_lease_checks(const Req& q, u16 parent, u16 id, u16 source, u32& source_cost)
+{
+	source_cost = 0;
+	host_sync_leases();
+	if (!g_leases.owns(q.from, id))
+	{
+		++g_hl.not_his;
+		return Reason::NotOwner;
+	}
+	if (parent != q.proxy)
+		return Reason::NotAllowed; // a leased create goes into his character only
+	if (source == kNoId)
+		return Reason::Ok;
+	CSE_Abstract* src = events::find_entity(source);
+	if (!src)
+		return Reason::Missing;
+	if (events::root_of(source) != q.proxy)
+		return Reason::NotOwner;
+	if (!smart_cast<CSE_ALifeItemWeaponMagazined*>(src))
+		return Reason::NotAllowed;
+	source_cost = pSettings->line_exist(src->s_name, "cost") ? pSettings->r_u32(src->s_name, "cost") : 0;
+	return Reason::Ok;
+}
+
+Reason host_destroy(const Req& q, u16 item);
+
+// The leased create is made (`created` is `id`): the id is the world's now. A clone's source goes with it.
+void host_leased_made(const Req& q, u16 id, u16 created, u16 source)
+{
+	g_leases.spend(q.from, id);
+	++g_hl.spawns;
+	if (created != id && log_allowed())
+		::Msg("! [coop] ReqSpawn #%u of player #%u was created as %u, not as its leased id %u", q.seq, q.from, created, id);
+	if (source == kNoId)
+		return;
+	++g_hl.clones;
+	const Reason gone = host_destroy(q, source);
+	if (gone != Reason::Ok && log_allowed())
+		::Msg("! [coop] the clone %u of player #%u is made, its source %u stays: %s", created, q.from, source,
+		    reason_name(gone));
+}
+
 // Who would hold a client's new item: checked before anything is constructed (R3 В6 review).
 Reason host_spawn_holder(const Req& q, u16 parent)
 {
@@ -1030,7 +1547,7 @@ Reason host_spawn_holder(const Req& q, u16 parent)
 // Creates `e` (consumed) as a child of `parent` exactly like alife():create with an online parent:
 // the server's Process_spawn with a host id; ALife registration announces it (EntitySpawn), a
 // non-ALife child (fake missile, rocket) is announced with EntityLocal. The holder passed host_spawn_holder.
-Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created)
+Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created, u16 leased = kNoId)
 {
 	created = kNoId;
 	const auto fail = [&](Reason why)
@@ -1046,7 +1563,9 @@ Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created)
 		return fail(Reason::Missing);
 
 	// what a client may not choose
-	e->ID = kNoId;
+	e->ID = leased; // F2 T12b: the id the client created it under already, else the server picks one
+	if (leased != kNoId)
+		name_with_id(e); // as the client named it (CALifeSimulatorBase::spawn_item's name)
 	e->ID_Parent = parent;
 	e->ID_Phantom = kNoId;
 	e->RespawnTime = 0;
@@ -1073,9 +1592,18 @@ Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created)
 	packet.r_begin(dummy);
 	ClientID client;
 	client.set(0xffff);
-	CSE_Abstract* result = Level().Server->Process_spawn(packet, client);
+	xrServer& server = *Level().Server;
+	// F2 T12b: a leased id is out of the generator's free list since its grant; back in it right before Process_spawn
+	// takes it again (E->ID = PerformIDgen(E->ID)), as spawn_item2 does with the id spawn_item took
+	if (leased != kNoId)
+		server.FreeID(leased, 0);
+	CSE_Abstract* result = server.Process_spawn(packet, client);
 	if (!result)
+	{
+		if (leased != kNoId && server.IsFreeID(leased))
+			server.PerformIDgen(leased); // still leased: out of the free list again
 		return Reason::Engine;
+	}
 	created = result->ID;
 	if (!ai().alife().objects().object(result->ID, true))
 	{
@@ -1191,6 +1719,19 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 	spawn::SectionFacts facts = spawn_facts(section);
 	facts.parent_ok = parent_ok_for(q, r.parent, rule, section);
 	facts.launch_child = r.parent != q.proxy && rule != nullptr && facts.parent_ok;
+	if (r.id != kNoId)
+	{
+		// F2 T12b: still his id (a lease he gave back or lost meanwhile refuses it), a clone's source still his
+		u32 source_cost = 0;
+		const Reason leased = host_lease_checks(q, r.parent, r.id, r.source, source_cost);
+		if (leased != Reason::Ok)
+		{
+			reply(q, leased, r.parent);
+			return spawn::Turn::Refused;
+		}
+		if (r.source != kNoId)
+			facts.cost = lease::clone_cost(facts.cost, source_cost);
+	}
 	spawn::CostBudget& budget = g_spawn_budgets.of(key);
 	const spawn::SpawnVerdict verdict =
 	    spawn::judge_queued(rule, missing.line, facts, r, budget, g_spawn_policy, mgr().now_ms());
@@ -1216,10 +1757,17 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 	CSE_Abstract* e = build_spawn(q, r.parent, section, r.pos, r.state.data(), r.state.size(), why);
 	if (!e)
 		return refuse(why);
+	if (r.source != kNoId && !smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
+	{
+		F_entity_Destroy(e);
+		return refuse(Reason::NotAllowed); // F2 T12b: a clone is a magazined weapon
+	}
 	u16 created = kNoId;
-	why = host_spawn(e, r.parent, created); // consumes the entity
+	why = host_spawn(e, r.parent, created, r.id); // consumes the entity
 	if (why != Reason::Ok)
 		return refuse(why);
+	if (r.id != kNoId)
+		host_leased_made(q, r.id, created, r.source);
 	g_spawn_quest_gifts += facts.quest_item && !facts.allow_listed ? 1 : 0;
 	reply(q, Reason::Ok, created);
 	return spawn::Turn::Created;
@@ -1271,6 +1819,15 @@ void host_on_spawn(PeerId from, Reader& r)
 	const Reason holder = host_spawn_holder(q, s.parent);
 	if (holder != Reason::Ok)
 		return reply(q, holder, s.parent);
+	// F2 T12b: a leased id is the asker's, before anything touches the generator; into his character; a clone's source
+	// is his weapon
+	u32 source_cost = 0;
+	if (s.id != kNoId)
+	{
+		const Reason leased = host_lease_checks(q, s.parent, s.id, s.source, source_cost);
+		if (leased != Reason::Ok)
+			return reply(q, leased, s.parent);
+	}
 	// R3 В6: a section the host knows, with a class; then the host builds the entity from its own section.
 	const char* section = s.section.c_str();
 	if (!spawnable_section(section))
@@ -1291,10 +1848,18 @@ void host_on_spawn(PeerId from, Reader& r)
 		e = build_spawn(q, s.parent, section, s.pos, s.state, s.state_size, why);
 		if (!e)
 			return reply(q, why, s.parent);
+		if (s.source != kNoId && !smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
+		{
+			F_entity_Destroy(e);
+			return reply(q, Reason::NotAllowed, s.parent); // F2 T12b: a clone is a magazined weapon
+		}
 	}
 	// F2 T2: deny/allow lists, quest items, the character's cost budget; after the item state, so a malformed one
 	// costs nothing. No rule or a missing line ends here too (judge steps 1-2, nothing was constructed).
 	spawn::SectionFacts facts = spawn_facts(section);
+	// F2 T12b: a clone replaces its source (released with it): the budget pays only what it is worth more
+	if (s.id != kNoId && s.source != kNoId)
+		facts.cost = lease::clone_cost(facts.cost, source_cost);
 	// Review round 2 (Important 1), round 4: into his character any item but a launcher's rocket; into one of his items
 	// only what that item takes, while it has room.
 	facts.parent_ok = parent_ok_for(q, s.parent, rule, section);
@@ -1318,7 +1883,8 @@ void host_on_spawn(PeerId from, Reader& r)
 		F_entity_Destroy(e);
 		e = nullptr;
 		if (g_spawn_queue.push(key, spawn::queued_request(q.seq, q.from, q.proxy, s.parent, s.pos, s.section,
-		                                s.state, s.state_size, join::host_world_epoch(), facts.in_dialog_to_own_actor)))
+		                                s.state, s.state_size, join::host_world_epoch(), facts.in_dialog_to_own_actor,
+		                                s.id, s.source))) // F2 T12b: a leased id stays leased while it waits
 		{
 			if (++g_spawn_queued <= kSpawnLogFirst)
 				::Msg("[coop] ReqSpawn #%u of [%s] from player #%u waits for the cost budget of character %u (%u in "
@@ -1336,9 +1902,11 @@ void host_on_spawn(PeerId from, Reader& r)
 	g_spawn_quest_gifts += gift ? 1 : 0;
 	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
-	const Reason why = host_spawn(e, s.parent, created);
+	const Reason why = host_spawn(e, s.parent, created, s.id);
 	if (why != Reason::Ok && !spawn::budget_free(facts))
 		spawn::refund(budget, facts.cost, g_spawn_policy); // Ruling F2-21 (3): the engine refused what was charged
+	if (why == Reason::Ok && s.id != kNoId)
+		host_leased_made(q, s.id, created, s.source);
 	reply(q, why, why == Reason::Ok ? created : s.parent);
 }
 
@@ -2144,6 +2712,8 @@ void install(Session& s)
 	s.on(Msg::ReqItemEvent, &host_on_item_event); // ReqMoney: coop_money (F2 T1)
 	s.on(Msg::ReqLaunch, &host_on_launch); // W3a
 	s.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_result(from, r); });
+	s.on(Msg::IdLease, &client_on_lease); // F2 T12b
+	s.on(Msg::IdLeaseAck, &host_on_lease_ack); // F2 T12b
 	s.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_player_hit(from, r); });
 }
 
@@ -2167,6 +2737,20 @@ void reset()
 		F_entity_Destroy(e);
 	g_lua_temps.clear();
 	g_lua_forwarded.clear();
+	// F2 T12b: the session's leases go; in the world they came from, back into its generator
+	if (g_leases.total() && g_leases.epoch() == join::world_generation())
+		host_free_ids(g_leases.drop_all());
+	g_leases.clear();
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		g_pool.clear();
+		g_specs.clear();
+		g_spec_actions.clear();
+		g_temp_leases.clear(); // their objects went with g_lua_temps
+		g_give_back.clear();
+		g_give_back_wait.clear();
+	}
+	quarantine_expire(true);
 }
 
 void on_peer_left(PeerId id)
@@ -2175,15 +2759,25 @@ void on_peer_left(PeerId id)
 	const auto his = [id](const spawn::QueuedRequest& r) { return PeerId(r.peer) == id; };
 	for (const std::string& key : g_spawn_queue.keys())
 		g_spawn_queue.drop_if(key, his, drop_queued);
+	if (mgr().is_host())
+	{
+		// F2 T12b: what he still held goes back to this world's generator
+		host_sync_leases();
+		host_free_ids(g_leases.drop(id));
+	}
 }
 
 void frame()
 {
 	if (mgr().is_host())
+	{
 		host_pump_spawns(); // Ruling F2-21
+		host_pump_leases(); // F2 T12b
+	}
 	if (!mgr().is_client())
 		return;
 	client_flush_launches(); // W3a: before the outbox (a launch usually precedes a drop of the launcher)
+	client_pump_leases(); // F2 T12b: retries go out with this frame's outbox
 	client_flush();
 	if (mgr().is_live_client())
 		client_pump_rebuilds(); // F2 T5 fix round 1
@@ -2230,6 +2824,15 @@ void print_status()
 		    u32(spawn::kMaxQueued));
 		::Msg("[coop]   quest allowed in dialog %llu (quest items a player's talk gave his own character, F2-16)",
 		    g_spawn_quest_gifts);
+		const lease::HostLeases::Stats& ls = g_leases.stats();
+		::Msg("[coop]   leased ids (F2 T12b): %u held by %u player(s) (%u each); %llu granted in %llu messages, %llu spent "
+		      "(%llu creates, %llu of them clones), %llu given back in %llu acks (%llu not theirs, %llu bad acks), %llu "
+		      "freed by players who left, %llu voided by a new world; %llu requests with an id not theirs; %llu times "
+		      "short of ids; %u free id blocks",
+		    (u32)g_leases.total(), (u32)g_leases.holders().size(), u32(lease::kLeaseSize), ls.granted, g_hl.messages,
+		    ls.spent, g_hl.spawns, g_hl.clones, g_hl.ack_ids, g_hl.acks, g_hl.ack_not_his, g_hl.bad_acks, ls.dropped,
+		    ls.voided, g_hl.not_his, g_hl.short_of_ids,
+		    g_pGameLevel && Level().Server ? Level().Server->AvailableIDBlocks() : 0u);
 		using ledger::UpgradeVerdict;
 		const auto upgrade_refused = [](UpgradeVerdict v) { return g_upgrades.verdicts[u32(v)]; };
 		::Msg("[coop]   upgrades at a mechanic (F2 T5): %llu bought (%llu RU charged), %llu already there, refused: no "
@@ -2256,6 +2859,26 @@ void print_status()
 	    g_coop_client_hit_perks ? "on" : "off", g_cl.hits_perked, g_cl.hits_cancelled, g_cl.perk_errors);
 	::Msg("[coop]   refused upgrades (F2 T5): %llu items built again from the host's copy (%u waiting, %llu given up)",
 	    g_rebuilt, (u32)g_rebuilds.size(), g_rebuild_lost);
+	size_t pool = 0, pending = 0, temps = 0, waiting = 0;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		pool = g_pool.size();
+		pending = g_specs.size();
+		temps = g_temp_leases.size();
+		waiting = g_give_back.size() + g_give_back_wait.size();
+	}
+	size_t quarantined = 0;
+	{
+		xrCriticalSectionGuard guard(g_quarantine_lock);
+		quarantined = g_quarantine.size();
+	}
+	::Msg("[coop]   leased ids (F2 T12b): %u ready, %llu own items created at once (%llu clones, %llu from create(.., "
+	      "false)), %u waiting for the host, %u temporary objects hold one; %llu confirmed, %llu retried (rate limit), "
+	      "%llu taken back (refused; %u in quarantine), %llu not created (id taken here); %llu releases done by a clone; "
+	      "%llu ids given back in %llu acks (%u to go); leases: %llu malformed, %llu of another world",
+	    (u32)pool, g_lc.created, g_lc.clones, g_lc.temps, (u32)pending, (u32)temps, g_lc.confirmed, g_lc.retried,
+	    g_lc.rolled_back, (u32)quarantined, g_lc.not_created, g_lc.released_with_clone, g_lc.given_back, g_lc.acks,
+	    (u32)waiting, g_lc.bad_leases, g_lc.stale_leases);
 }
 
 // ---------------------------------------------------------------- client API
@@ -2466,10 +3089,25 @@ CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vert
 	if (ammo >= 0)
 		if (CSE_ALifeItemAmmo* box = smart_cast<CSE_ALifeItemAmmo*>(e))
 			box->a_elapsed = u16(_min(ammo, int(box->m_boxSize)));
+	// F2 T12b: an item into our actor takes a leased id and is ours at once (nil only without one)
+	const u16 id = take_lease(section, parent);
 	if (!register_now)
 	{
 		g_lua_temps.push_back(e); // the script edits it, then calls alife():register(se)
+		if (id != kNoId)
+		{
+			e->ID = id; // a script keys its data by it before the register (m_data, item parts)
+			xrCriticalSectionGuard guard(g_out_lock);
+			g_temp_leases[e] = LeasedTemp{id, kNoId};
+			++g_lc.temps;
+		}
 		return e;
+	}
+	if (id != kNoId)
+	{
+		if (create_leased(e, id, kNoId))
+			return e;
+		give_back(id);
 	}
 	lua_forward(e, "alife:create");
 	F_entity_Destroy(e);
@@ -2496,10 +3134,25 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	clone->ammo_type = from->ammo_type;
 	clone->m_upgrades = from->m_upgrades;
 	clone->set_ammo_elapsed(from->get_ammo_elapsed());
+	// F2 T12b: a clone of our own weapon into our actor takes a leased id; the host releases the source with it
+	const u16 id = callgate::is_own(from->ID) ? take_lease(section, parent) : kNoId;
 	if (!register_now)
 	{
 		g_lua_temps.push_back(e);
+		if (id != kNoId)
+		{
+			e->ID = id; // _g.alife_clone_weapon keys m_data and the parts by it before the register
+			xrCriticalSectionGuard guard(g_out_lock);
+			g_temp_leases[e] = LeasedTemp{id, from->ID};
+			++g_lc.temps;
+		}
 		return e;
+	}
+	if (id != kNoId)
+	{
+		if (create_leased(e, id, from->ID))
+			return e;
+		give_back(id);
 	}
 	lua_forward(e, "alife:clone_weapon");
 	F_entity_Destroy(e);
@@ -2508,21 +3161,53 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 
 CSE_Abstract* lua_register_spawn(CSE_Abstract* object)
 {
-	const bool temp = std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end();
-	if (!temp)
+	const auto temp = std::find(g_lua_temps.begin(), g_lua_temps.end(), object);
+	if (temp == g_lua_temps.end())
 		return lua_refuse("alife:register", "an object the host did not create");
-	if (!g_lua_forwarded.insert(object).second)
+	if (g_lua_forwarded.count(object))
 		return lua_refuse("alife:register", "a second register of one object"); // would be a duplicate
+	// F2 T12b: a temporary object with a leased id is ours at once: register answers it, as in single player
+	LeasedTemp leased;
+	if (take_temp_lease(object, leased))
+	{
+		if (create_leased(object, leased.id, leased.source))
+		{
+			g_lua_temps.erase(temp); // our ALife's entity now, not a temporary object to free at the session's end
+			return object;
+		}
+		object->ID = kNoId;
+		give_back(leased.id);
+	}
+	g_lua_forwarded.insert(object);
 	return lua_forward(object, "alife:register");
 }
 
 bool lua_release(CSE_Abstract* object)
 {
-	if (!object || std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
-		return true; // never created: nothing to release
+	if (!object)
+		return true;
+	if (std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
+	{
+		// never created: nothing to release; F2 T12b: its leased id serves the next create
+		LeasedTemp leased;
+		if (take_temp_lease(object, leased))
+		{
+			object->ID = kNoId;
+			xrCriticalSectionGuard guard(g_out_lock);
+			g_pool.put_back(leased.id);
+		}
+		return true;
+	}
+	const u16 id = object->ID;
+	// F2 T12b: the weapon a clone of ours replaces: the host releases it with the clone (and keeps it if it refuses the
+	// clone), so this release is no request of its own (_g.alife_clone_weapon releases it before or after the register)
+	if (clone_source(id))
+	{
+		++g_lc.released_with_clone;
+		return true;
+	}
 	// F2 T12: the call gate decides; our own items (not our actor) have the client_destroy path. Round 1: as before
 	// T12 it never runs the stock release while a host command is applied (the client's ALife copy is the host's).
-	const u16 id = object->ID;
 	callgate::Args args;
 	args.runs_while_applying = false;
 	switch (callgate::client_gate_own("alife:release", calls::own_release(id == kActor, callgate::is_own(id)), args))
@@ -2540,6 +3225,30 @@ CSE_Abstract* lua_refuse(const char* name, const char* why)
 	++g_cl.lua_refused;
 	callgate::note_refused(name, why); // F2 T12: counted and logged with the gate's refusals
 	return nullptr;
+}
+
+bool keep_released(CSE_Abstract* entity)
+{
+	if (!entity)
+		return false;
+	xrCriticalSectionGuard guard(g_quarantine_lock);
+	if (!g_quarantine_marks.erase(entity))
+		return false;
+	g_quarantine.push_back(Quarantined{entity, mgr().now_ms()});
+	return true;
+}
+
+int lua_lease_ids(lua_State* L)
+{
+	size_t n = 0;
+	if (lease_world_ready())
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		lease_sync_world_locked();
+		n = g_pool.size();
+	}
+	lua_pushnumber(L, lua_Number(n));
+	return 1;
 }
 
 bool lua_client_refuse(const char* name, u16 target, bool runs_while_applying)

@@ -24,10 +24,15 @@ namespace spawn
 {
 constexpr uint8_t kMarkerRaw = 0xC5; // raw M_SPAWN bytes (older clients): refused
 constexpr uint8_t kMarkerState = 0xC6; // section + item state
+constexpr uint8_t kMarkerLeased = 0xC7; // section + item state, created on the client under a leased id (F2 T12b)
 constexpr size_t kMaxSection = 255; // string256
+constexpr uint16_t kNoId = 0xffff;
 
 // Wire (client -> host, ids in host numbering):
 //   State   u32 seq, u8 0xC6, u16 parent, vec3 pos, str section, varu n, n bytes item state (coop_items blob)
+//   Leased  u32 seq, u8 0xC7, u16 parent, u16 id, u16 source, vec3 pos, str section, varu n, n bytes item state
+//           id: leased to the asker (xrCoop/coop_id_lease.h), the client has the item under it already; source: the
+//           weapon a clone replaces (alife():clone_weapon; the host releases it with the clone), 0xffff for a create
 //   Legacy  str section, u16 parent, vec3 pos  (no seq)
 //   Raw     u32 seq, u8 0xC5, ...              (refused)
 enum class Layout : uint8_t
@@ -35,6 +40,7 @@ enum class Layout : uint8_t
 	Legacy,
 	State,
 	Raw,
+	Leased, // F2 T12b
 };
 
 // Byte 4 is the marker after u32 seq. The legacy layout starts with a short string (length < 0x80), so its byte 4
@@ -45,6 +51,8 @@ inline Layout detect(const uint8_t* data, size_t size)
 		return Layout::Legacy;
 	if (data[4] == kMarkerState)
 		return Layout::State;
+	if (data[4] == kMarkerLeased)
+		return Layout::Leased;
 	if (data[4] == kMarkerRaw)
 		return Layout::Raw;
 	return Layout::Legacy;
@@ -59,6 +67,8 @@ struct Request
 	std::string section;
 	const uint8_t* state = nullptr; // points into the message
 	size_t state_size = 0;
+	uint16_t id = kNoId; // Leased: the id the client created it under
+	uint16_t source = kNoId; // Leased: the weapon a clone replaces
 };
 
 // Reads what follows u32 seq (State) or the whole message (Legacy). False = malformed, or the Raw layout.
@@ -74,8 +84,15 @@ inline bool read_body(Reader& r, Layout layout, Request& out)
 		r.vec3(out.pos);
 		return r.ok();
 	}
-	r.u8(); // marker
+	const uint8_t marker = r.u8();
 	out.parent = r.u16();
+	if (marker == kMarkerLeased)
+	{
+		out.id = r.u16();
+		out.source = r.u16();
+		if (!r.ok() || out.id == 0 || out.id == kNoId)
+			return false; // 0 is the actor, 0xffff no id: never leased
+	}
 	r.vec3(out.pos);
 	out.section = r.str();
 	const uint64_t n = r.varu();
@@ -92,6 +109,22 @@ inline void write_state(Writer& w, uint32_t seq, uint16_t parent, const float po
 	w.u32(seq);
 	w.u8(kMarkerState);
 	w.u16(parent);
+	w.vec3(pos);
+	w.str(section);
+	w.varu(state_size);
+	if (state && state_size)
+		w.bytes(state, state_size);
+}
+
+// F2 T12b: the request of an item the client created already under leased `id` (source: a clone's weapon, or kNoId).
+inline void write_leased(Writer& w, uint32_t seq, uint16_t parent, uint16_t id, uint16_t source, const float pos[3],
+    std::string_view section, const uint8_t* state, size_t state_size)
+{
+	w.u32(seq);
+	w.u8(kMarkerLeased);
+	w.u16(parent);
+	w.u16(id);
+	w.u16(source);
 	w.vec3(pos);
 	w.str(section);
 	w.varu(state_size);
@@ -1050,11 +1083,13 @@ struct QueuedRequest
 	std::vector<uint8_t> state; // its own copy of the item state blob (coop_items), checked again at its turn
 	uint32_t epoch = 0; // the host world it was asked in
 	bool quest_gift = false; // Ruling F2-16, decided when asked: the talk may be over by its turn
+	uint16_t id = kNoId; // F2 T12b: leased id the client created it under (it stays leased while it waits)
+	uint16_t source = kNoId; // F2 T12b: the weapon a clone replaces
 };
 
 inline QueuedRequest queued_request(uint32_t seq, uint32_t peer, uint16_t character, uint16_t parent,
     const float pos[3], std::string_view section, const uint8_t* state, size_t state_size, uint32_t epoch,
-    bool quest_gift)
+    bool quest_gift, uint16_t id = kNoId, uint16_t source = kNoId)
 {
 	QueuedRequest r;
 	r.seq = seq;
@@ -1068,6 +1103,8 @@ inline QueuedRequest queued_request(uint32_t seq, uint32_t peer, uint16_t charac
 		r.state.assign(state, state + state_size);
 	r.epoch = epoch;
 	r.quest_gift = quest_gift;
+	r.id = id;
+	r.source = source;
 	return r;
 }
 

@@ -8,6 +8,9 @@
 //
 // Wire layouts (client -> host, ids in host numbering, every request starts with u32 seq):
 //   ReqSpawn      u32 seq, u8 0xC6, u16 parent, vec3 pos, str section, varu n, n bytes item state (coop_items blob)
+//                 F2 T12b: u8 0xC7 adds u16 id, u16 source after parent - an item the client created already under an id
+//                 the host leased it (IdLease / IdLeaseAck, xrCoop/coop_id_lease.h), source: the weapon a clone
+//                 replaces (released by the host with the clone; the budget charges only what the clone costs more)
 //                 legacy (no seq): str section, u16 parent, vec3 pos  (entities::intercept_local_spawn)
 //                 The host builds the entity from its own section (it must have `class` and the lines its entity's
 //                 constructor reads unchecked) and applies the item state with the ItemState checks; raw M_SPAWN
@@ -128,6 +131,18 @@ bool lua_release(CSE_Abstract* object);
 // A refusal of the request path after the gate let the call through: counted, logged by the gate (name = a kCalls
 // name such as "alife:register"). Returns nullptr.
 CSE_Abstract* lua_refuse(const char* name, const char* why);
+
+// --- F2 T12b: leased ids (xrCoop/coop_id_lease.h) ---
+// On a live client with a leased id, lua_create into our actor, lua_clone of our weapon and lua_register_spawn of a
+// temporary object that holds an id create our item at once (registered, online in our inventory) and answer it; the
+// host creates it with the same id (ReqSpawn 0xC7) or refuses, and the item is taken back here. A clone's source is
+// released by the host with the clone: lua_release of it while the clone waits sends nothing.
+// xrServer::entity_Destroy hook: true = `entity` is an item of ours the host refused, released just now; it stays
+// allocated kQuarantineMs (a script may still hold its se_obj) and is freed later by this module. Any thread.
+bool keep_released(CSE_Abstract* entity);
+// Lua: coop.lease_ids() -> the leased ids this client can create its own items with now (0 elsewhere). A raw C function
+// for coop::script::register_raw (coop_script.cpp); coop_mods_guard.script lets a weapon's scope swap through with one.
+int lua_lease_ids(lua_State* L);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
 // set_switch_online/offline; W3a; F2 T12 round 1: set_interactive, the restrictions). A wrapper over the call gate
 // (F2 T12): name is the kCalls name ("alife:kill_entity"), target the object id (0xffff = none; else it must exist in

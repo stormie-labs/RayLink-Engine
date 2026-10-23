@@ -154,6 +154,11 @@ constexpr RateRule kClientRateRules[] = {
 	// core message (Session::dispatch, not game_message): Session::handle_chat takes a token of this row itself. Over it: the
 	// line is dropped, counted, logged like the other rows, not logged as chat, not given to Lua (on_chat), not relayed.
 	{Msg::Chat, 20, 125},
+
+	// F2 T12b: ids a client gives back (coop_id_lease.h): the ones an object of his holds when a lease comes, and the id of
+	// each create the host refused. The client sends at most one ack per kAckGapMs = 250 ms with everything gathered
+	// meanwhile (coop_requests.cpp client_send_give_back), so 4 a second; 8 in a row for a lag spike.
+	{Msg::IdLeaseAck, 8, 250},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:

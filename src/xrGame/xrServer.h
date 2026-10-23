@@ -184,6 +184,18 @@ public:
 		return (m_tID_Generator.vfFreeID(ID, time));
 	}
 
+	// Anomaly Coop (F2 T12b): PerformIDgen(ID) would take the id (it is in the generator's free list) instead of asserting
+	// "Requesting ID has already been used!"; how many blocks still have a free id (PerformIDgen(0xffff) asserts at 0).
+	IC bool IsFreeID(u16 ID) const
+	{
+		return m_tID_Generator.is_free(ID);
+	}
+
+	IC u32 AvailableIDBlocks() const
+	{
+		return m_tID_Generator.available();
+	}
+
 	void Perform_connect_spawn(CSE_Abstract* E, xrClientData* to, NET_Packet& P);
 	void Perform_transfer(NET_Packet& PR, NET_Packet& PT, CSE_Abstract* what, CSE_Abstract* from, CSE_Abstract* to);
 	void Perform_reject(CSE_Abstract* what, CSE_Abstract* from, int delta);

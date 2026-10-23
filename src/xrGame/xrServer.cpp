@@ -21,6 +21,7 @@
 #include "screenshot_server.h"
 #include "xrServer_info.h"
 #include "coop/coop_entities.h" // Anomaly Coop (B2)
+#include "coop/coop_requests.h" // Anomaly Coop (F2 T12b): keep_released
 #include <functional>
 
 #pragma warning(push)
@@ -880,6 +881,13 @@ if( dbg_net_Draw_Flags.test( dbg_destroy ) )
 	P->owner = NULL;
 	if (!ai().get_alife() || !P->m_bALifeControl)
 	{
+		// Anomaly Coop (F2 T12b): an item a client created under a leased id and took back after the host refused it
+		// stays allocated for a while (a script may still hold it); requests frees it later.
+		if (coop::requests::keep_released(P))
+		{
+			P = NULL;
+			return;
+		}
 		F_entity_Destroy(P);
 	}
 }

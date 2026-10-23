@@ -73,6 +73,10 @@ void set_weapon_fired_handler(WeaponFiredFn fn);
 // never as raw spawn bytes; the host builds the entity from its own section and applies the blob. ---
 // Client: the blob of an entity that is not created yet. False = not an inventory item (nothing to carry).
 bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob);
+// Client (F2 T12b): the host has just created our item `local_id` that we created at once under a leased id; what we
+// changed on it since (portions, a condition a mod set on the object) goes to the host with the next scan, as if the
+// host knew nothing of it. Main thread.
+void client_resend_state(u16 local_id);
 // Host: applies a client's blob to a fresh entity (not spawned yet) with the ItemState checks: kind, counts,
 // known upgrades and ammo types. False = refused (`why` says why); the entity may be half changed: discard it.
 bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, const char*& why);
