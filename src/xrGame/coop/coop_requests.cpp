@@ -104,6 +104,21 @@ bool spawnable_section(const char* section)
 	    pSettings->line_exist(section, "class");
 }
 
+// F2 T12b round 2 (review N3): `clone` is a variant of `source` (lease::clone_family over their parent_section lines).
+bool clone_variant(LPCSTR source, LPCSTR clone)
+{
+	if (!source || !clone || !pSettings->section_exist(source) || !pSettings->section_exist(clone))
+		return false;
+	const auto parent = [](LPCSTR sec) -> LPCSTR
+	{
+		if (!pSettings->line_exist(sec, "parent_section"))
+			return "";
+		const LPCSTR v = pSettings->r_string(sec, "parent_section");
+		return v ? v : "";
+	};
+	return lease::clone_family(source, parent(source), clone, parent(clone));
+}
+
 // F2 T2 fix round 1 (Ruling F2-17): a section as spawn::missing_line asks about it (xrCoop/coop_spawn.h When). It never
 // reads a missing line, nor a number or flag of an empty value (r_s32 / r_bool of one would itself be FATAL here).
 struct SectionIni
@@ -369,11 +384,15 @@ u32 g_pool_world = 0; // join::world_generation() the ids are reserved in
 u64 g_last_ack = 0;
 // Round 1 (review C1): requests about our items the host has not created yet wait for its answer (lease::Held)
 lease::Held<Action> g_held;
+// Round 2 (review N1): our ReqSpawn go no faster than the host takes them; the rest waits here, in order
+lease::SpawnPacer g_spawn_pacer;
+xr_deque<Action> g_spawn_backlog;
 struct LeaseCounters
 {
 	u64 created = 0, temps = 0, clones = 0, confirmed = 0, retried = 0, rolled_back = 0, released_with_clone = 0;
 	u64 acks = 0, given_back = 0, bad_leases = 0, stale_leases = 0, not_created = 0;
 	u64 held = 0, held_dropped = 0, clones_refused = 0, temps_left = 0, quarantine_left = 0; // round 1
+	u64 queued = 0, resent = 0, unanswered = 0, paced = 0, not_variant = 0; // round 2
 } g_lc;
 // Round 1 (review I2): the world (join::world_generation) the temporary objects of g_lua_temps were made in
 u32 g_temps_world = 0;
@@ -489,7 +508,7 @@ void send_action(const Action& a)
 			spawn::write_leased(w, seq, to_host_id(a.item), to_host_id(a.lease), to_host_id(a.source), p,
 			    a.section.c_str(), a.bytes.data(), a.bytes.size());
 			xrCriticalSectionGuard guard(g_out_lock);
-			g_specs.sent(a.lease, seq);
+			g_specs.sent(a.lease, seq, mgr().now_ms());
 		}
 		else // R3 В6: section + item state, the host builds the entity itself
 			spawn::write_state(w, seq, to_host_id(a.item), p, a.section.c_str(), a.bytes.data(), a.bytes.size());
@@ -621,6 +640,24 @@ void client_flush()
 			}
 			out.swap(now_out);
 		}
+		// round 2 (review N1): spawns no faster than the host takes them (its CatSpawn bucket, the session's row that
+		// drops what is over it without an answer); the others go now, the spawns keep their order
+		xr_vector<Action> paced_out;
+		paced_out.reserve(out.size());
+		for (Action& a : out)
+		{
+			if (a.kind == Act::Spawn)
+				g_spawn_backlog.push_back(std::move(a));
+			else
+				paced_out.push_back(std::move(a));
+		}
+		while (!g_spawn_backlog.empty() && g_spawn_pacer.take(now))
+		{
+			paced_out.push_back(std::move(g_spawn_backlog.front()));
+			g_spawn_backlog.pop_front();
+		}
+		g_lc.paced += g_spawn_backlog.empty() ? 0 : 1;
+		out.swap(paced_out);
 	}
 	for (const Action& a : out)
 		send_action(a);
@@ -968,7 +1005,7 @@ void return_unused_lease(u16 id)
 
 // The host refused our create under `id` (or kept rate-limiting it): our item goes - released from our ALife like any
 // destroyed item, its entity kept a while (the quarantine) - and the id goes back to the host once it is gone here.
-void rollback_leased(u16 id, u8 reason)
+void rollback_leased(u16 id, const char* why)
 {
 	++g_lc.rolled_back;
 	{
@@ -979,8 +1016,7 @@ void rollback_leased(u16 id, u8 reason)
 	if (!e)
 		return;
 	if (log_allowed())
-		::Msg("! [coop] the host refused our new [%s] %u (%s): taken back here", e->s_name.c_str(), id,
-		    reason_name(Reason(_min<u8>(reason, u8(Reason::Count)))));
+		::Msg("! [coop] the host refused our new [%s] %u (%s): taken back here", e->s_name.c_str(), id, why);
 	{
 		xrCriticalSectionGuard guard(g_quarantine_lock);
 		g_quarantine_marks.insert(e);
@@ -1023,10 +1059,13 @@ void client_pump_leases()
 		return;
 	const u64 now = mgr().now_ms();
 	lease::IdsMsg ack;
+	xr_vector<u16> unanswered; // round 2 (review N1): creates the host never answered
+	xr_vector<u32> holds;
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
 		lease_sync_world_locked();
-		for (u16 id : g_specs.due(now))
+		const lease::SpecBook::Due due = g_specs.due(now);
+		for (u16 id : due.resend)
 		{
 			const auto it = g_spec_actions.find(id);
 			if (it == g_spec_actions.end())
@@ -1034,8 +1073,17 @@ void client_pump_leases()
 				g_specs.forget(id);
 				continue;
 			}
-			g_specs.sent(id, 0); // queued: not due again before its answer
+			g_specs.sent(id, 0, now); // in our outbox (paced): not due again before it goes out and is answered
 			g_outbox.push_back(it->second);
+			++g_lc.resent;
+		}
+		for (u16 id : due.rollback)
+		{
+			// round 2 (review N1): kMaxResends requests without an answer: no waiting for ever - taken back, and the
+			// requests that waited for it go too
+			g_spec_actions.erase(id);
+			g_lc.held_dropped += g_held.drop(id, [&holds](Action& a) { holds.push_back(a.hold); });
+			unanswered.push_back(id);
 		}
 		for (auto it = g_give_back_wait.begin(); it != g_give_back_wait.end();)
 		{
@@ -1047,14 +1095,26 @@ void client_pump_leases()
 				it = g_give_back_wait.erase(it);
 			}
 		}
-		if (g_give_back.empty() || now - g_last_ack < lease::kAckGapMs)
-			return;
-		const size_t n = _min<size_t>(g_give_back.size(), lease::kMaxIdsPerMsg);
-		for (size_t i = 0; i < n; ++i)
-			ack.ids.push_back(to_host_id(g_give_back[i]));
-		g_give_back.erase(g_give_back.begin(), g_give_back.begin() + n);
-		g_last_ack = now;
+		if (!g_give_back.empty() && now - g_last_ack >= lease::kAckGapMs)
+		{
+			const size_t n = _min<size_t>(g_give_back.size(), lease::kMaxIdsPerMsg);
+			for (size_t i = 0; i < n; ++i)
+				ack.ids.push_back(to_host_id(g_give_back[i]));
+			g_give_back.erase(g_give_back.begin(), g_give_back.begin() + n);
+			g_last_ack = now;
+		}
 	}
+	for (u32 hold : holds)
+		money::client_release(hold);
+	for (u16 id : unanswered)
+		rollback_leased(id, "no answer from the host"); // its id goes back to the host (IdLeaseAck) once it is gone
+	if (!unanswered.empty())
+	{
+		g_lc.unanswered += unanswered.size();
+		dialog::hud_message("st_coop_lease_lost", "Co-op: the host did not answer, a new item was taken back");
+	}
+	if (ack.ids.empty())
+		return;
 	ack.epoch = mgr().session().world_epoch();
 	Writer w(8 + 2 * ack.ids.size());
 	ack.write(w);
@@ -1107,6 +1167,19 @@ void client_on_result(PeerId, Reader& r)
 	const u16 subject = r.u16();
 	if (!r.ok())
 		return;
+	// F2 T12b round 2 (review N1): the host keeps a create of ours in its budget queue - not an answer yet (it comes
+	// when the create is made or refused); no watchdog for it
+	if (reason == u8(Reason::Queued))
+	{
+		bool ours = false;
+		{
+			xrCriticalSectionGuard guard(g_out_lock);
+			ours = g_specs.queued(seq);
+		}
+		g_lc.queued += ours ? 1 : 0;
+		g_inflight.erase(seq);
+		return;
+	}
 	// F2 T12b: the answer to a create of ours under a leased id
 	u16 leased = kNoId;
 	lease::Outcome outcome = lease::Outcome::Unknown;
@@ -1135,7 +1208,7 @@ void client_on_result(PeerId, Reader& r)
 		items::client_resend_state(leased); // what changed on it while the host had not made it yet
 		break;
 	case lease::Outcome::Retry: ++g_lc.retried; break;
-	case lease::Outcome::RolledBack: rollback_leased(leased, reason); break;
+	case lease::Outcome::RolledBack: rollback_leased(leased, reason_name(Reason(_min<u8>(reason, u8(Reason::Count))))); break;
 	case lease::Outcome::Unknown: break;
 	}
 	Msg type = Msg::ReqResult;
@@ -1282,6 +1355,20 @@ struct Req
 	u16 proxy = kNoId;
 	Msg type = Msg::ReqResult;
 };
+
+// F2 T12b round 2 (review N1): a leased create waits in the budget queue: not an answer (that comes when it is made or
+// refused), so the asker's watchdog does not ask again - a second request with its id would queue twice.
+u64 g_queued_notices = 0;
+void notify_queued(const Req& q, u16 id)
+{
+	Writer w(12);
+	w.u32(q.seq);
+	w.boolean(false);
+	w.u8(u8(Reason::Queued));
+	w.u16(id);
+	net::host_send(q.from, Msg::ReqResult, w);
+	++g_queued_notices;
+}
 
 void reply(const Req& q, Reason why, u16 subject)
 {
@@ -1589,7 +1676,7 @@ void host_on_lease_ack(PeerId from, Reader& r)
 
 // A request with a leased id: the id is the asker's (checked before anything touches the generator), it goes into his
 // character, and a clone's source is a magazined weapon of his (`source_cost`: its cost, what the clone does not pay).
-Reason host_lease_checks(const Req& q, u16 parent, u16 id, u16 source, u32& source_cost)
+Reason host_lease_checks(const Req& q, u16 parent, u16 id, u16 source, const char* section, u32& source_cost)
 {
 	source_cost = 0;
 	host_sync_leases();
@@ -1609,6 +1696,8 @@ Reason host_lease_checks(const Req& q, u16 parent, u16 id, u16 source, u32& sour
 		return Reason::NotOwner;
 	if (!smart_cast<CSE_ALifeItemWeaponMagazined*>(src))
 		return Reason::NotAllowed;
+	if (!clone_variant(src->s_name.c_str(), section))
+		return Reason::NotAllowed; // round 2 (review N3): a variant of the same weapon only
 	source_cost = pSettings->line_exist(src->s_name, "cost") ? pSettings->r_u32(src->s_name, "cost") : 0;
 	return Reason::Ok;
 }
@@ -1841,7 +1930,7 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 	{
 		// F2 T12b: still his id (a lease he gave back or lost meanwhile refuses it), a clone's source still his
 		u32 source_cost = 0;
-		const Reason leased = host_lease_checks(q, r.parent, r.id, r.source, source_cost);
+		const Reason leased = host_lease_checks(q, r.parent, r.id, r.source, r.section.c_str(), source_cost);
 		if (leased != Reason::Ok)
 		{
 			reply(q, leased, r.parent);
@@ -1946,7 +2035,7 @@ void host_on_spawn(PeerId from, Reader& r)
 	u32 source_cost = 0;
 	if (s.id != kNoId)
 	{
-		const Reason leased = host_lease_checks(q, s.parent, s.id, s.source, source_cost);
+		const Reason leased = host_lease_checks(q, s.parent, s.id, s.source, s.section.c_str(), source_cost);
 		if (leased != Reason::Ok)
 			return reply(q, leased, s.parent);
 	}
@@ -2017,6 +2106,8 @@ void host_on_spawn(PeerId from, Reader& r)
 				::Msg("[coop] ReqSpawn #%u of [%s] from player #%u waits for the cost budget of character %u (%u in "
 				      "his queue): answered when created",
 				    q.seq, section, from, q.proxy, u32(g_spawn_queue.size(key)));
+			if (s.id != kNoId)
+				notify_queued(q, s.id); // F2 T12b round 2 (review N1): his watchdog waits for this one
 			return;
 		}
 	}
@@ -2822,6 +2913,7 @@ const char* reason_name(Reason r)
 	case Reason::Offline: return "offline";
 	case Reason::FriendlyFire: return "friendly fire is off";
 	case Reason::Engine: return "engine refused";
+	case Reason::Queued: return "waits for the cost budget";
 	default: return "?";
 	}
 }
@@ -2881,6 +2973,8 @@ void reset()
 		g_give_back.clear();
 		g_give_back_wait.clear();
 		g_held.clear([](Action&) {}); // money holds go with the session (money::reset)
+		g_spawn_backlog.clear(); // round 2
+		g_spawn_pacer.reset();
 	}
 	quarantine_expire(true);
 }
@@ -3020,6 +3114,15 @@ void print_status()
 	      "a rollback), %llu clones refused (their weapon waits for the host), %llu temporary objects and %llu "
 	      "quarantined entities of an old world left unfreed",
 	    g_lc.held, (u32)held, g_lc.held_dropped, g_lc.clones_refused, g_lc.temps_left, g_lc.quarantine_left);
+	size_t backlog = 0;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		backlog = g_spawn_backlog.size();
+	}
+	::Msg("[coop]   leased ids, round 2: %u spawn requests wait for the pace (%llu frames paced), %llu creates in the "
+	      "host's budget queue, %llu asked again for want of an answer, %llu taken back unanswered, %llu clones refused "
+	      "as not a variant",
+	    (u32)backlog, g_lc.paced, g_lc.queued, g_lc.resent, g_lc.unanswered, g_lc.not_variant);
 }
 
 // ---------------------------------------------------------------- client API
@@ -3270,6 +3373,13 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	{
 		++g_lc.clones_refused;
 		return lua_refuse("alife:clone_weapon", "its weapon waits for the host (a create or a clone of ours in flight)");
+	}
+	// round 2 (review N3): a variant of the same weapon only (the host refuses another: its source's rounds would become
+	// another ammo); a plain create would leave the source beside the clone
+	if (!section || !clone_variant(from->s_name.c_str(), section))
+	{
+		++g_lc.not_variant;
+		return lua_refuse("alife:clone_weapon", "not a variant of its weapon (scope, magnifier)");
 	}
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	CSE_ALifeItemWeaponMagazined* clone = smart_cast<CSE_ALifeItemWeaponMagazined*>(e);

@@ -21,6 +21,7 @@
 #include <initializer_list>
 #include <map>
 #include <set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,15 @@ constexpr uint32_t kRetryStepMs = 50; // ... a little later each time, ...
 constexpr uint32_t kRetryMaxMs = 250; // ... never later than this
 constexpr uint32_t kMaxRetries = 40; // about 10 s of RateLimited answers: then the create is taken back
 constexpr uint32_t kAckGapMs = 250; // a client sends at most one IdLeaseAck per this (the host's row: 8, 4 a second)
+// Round 2 (review N1): a request the host neither answered nor queued in kAnswerTimeoutMs is asked again with the same id
+// (coop_requests.cpp kResultTimeoutMs), kMaxResends times; then the create is taken back.
+constexpr uint64_t kAnswerTimeoutMs = 10000;
+constexpr uint32_t kMaxResends = 3;
+// Round 2 (review N1): a client sends ReqSpawn no faster than the host takes it (coop_requests.cpp CatSpawn: 20 a second
+// after 40 in a row; the session's row {ReqSpawn, 80, 25} drops what is over it without an answer): half the host's
+// burst in a row, one per kSpawnPaceMs after (a little slower than its 50 ms: the network bunches messages up).
+constexpr uint32_t kSpawnPaceBurst = 20;
+constexpr uint32_t kSpawnPaceMs = 60;
 
 // 0 is the actor of every machine, 0xffff no id: neither is ever leased.
 inline bool leasable(uint16_t id) { return id != 0 && id != kNoId; }
@@ -52,6 +62,49 @@ inline uint32_t retry_delay(uint32_t tries)
 // What the cost budget (coop_spawn.h) charges for a clone of a weapon: the host releases the source with the clone's
 // creation, so only what the clone is worth more counts (a scope variant); a detached scope comes as an item of its own.
 inline uint32_t clone_cost(uint32_t clone, uint32_t source) { return clone > source ? clone - source : 0; }
+
+// Round 2 (review N3): a clone keeps to its weapon's variants - the same section, or one base (parent_section; a section
+// without one is its own base), or one is the other's base: a scope or magnifier variant, a jam cleared. Another weapon
+// would turn the source's rounds into its own ammo for the price difference.
+inline bool clone_family(std::string_view source, std::string_view source_parent, std::string_view clone,
+    std::string_view clone_parent)
+{
+	const std::string_view source_base = source_parent.empty() ? source : source_parent;
+	const std::string_view clone_base = clone_parent.empty() ? clone : clone_parent;
+	return source == clone || source_base == clone_base || source_base == clone || clone_base == source;
+}
+
+// Round 2 (review N1): the client's ReqSpawn pace (kSpawnPaceBurst in a row, then one per kSpawnPaceMs); a token bucket.
+class SpawnPacer
+{
+public:
+	bool take(uint64_t now)
+	{
+		if (!m_started)
+		{
+			m_started = true;
+			m_tokens = double(kSpawnPaceBurst);
+			m_at = now;
+		}
+		else if (now > m_at)
+		{
+			m_tokens += double(now - m_at) / double(kSpawnPaceMs);
+			if (m_tokens > double(kSpawnPaceBurst))
+				m_tokens = double(kSpawnPaceBurst);
+			m_at = now;
+		}
+		if (m_tokens < 1.)
+			return false;
+		m_tokens -= 1.;
+		return true;
+	}
+	void reset() { m_started = false; }
+
+private:
+	bool m_started = false;
+	double m_tokens = 0.;
+	uint64_t m_at = 0;
+};
 
 // Msg::IdLease (host -> client: ids added to his lease) and Msg::IdLeaseAck (client -> host: ids he gives back).
 // Wire: u32 epoch (the host world, join::host_world_epoch), varu n (<= kMaxIdsPerMsg), n x u16 id.
@@ -328,6 +381,12 @@ enum class Outcome : uint8_t
 };
 
 // The creates of this client the host has not answered yet, by id.
+// Round 2 (review N1): every request sent for a create is remembered (a resend gets a new seq): the Ok of any of them
+// confirms it - the host made it under one, and refuses the others as not his any more; a refusal decides only for the
+// latest one. A request the host put into its budget queue (ReqResult Queued) waits for its answer, however long: a
+// second request with its id would queue twice. Any other request without an answer for kAnswerTimeoutMs is asked again
+// (the session's rate row drops what is over it without an answer), kMaxResends times, then the create is taken back:
+// nothing waits for ever.
 class SpecBook
 {
 public:
@@ -335,10 +394,22 @@ public:
 	{
 		uint16_t id = kNoId;
 		uint16_t source = kNoId; // a clone: the weapon it replaces (the host releases it with the clone's creation)
-		uint32_t seq = 0; // of the request in flight; 0 = not sent yet, or waiting for its retry
+		uint32_t seq = 0; // of the latest request in flight; 0 = in our own outbox, or waiting for its retry
+		std::vector<uint32_t> seqs; // every request sent for it (round 2)
 		uint32_t tries = 0; // RateLimited answers so far
-		uint64_t retry_at = 0; // when due again (seq 0)
+		uint32_t resends = 0; // requests asked again for want of an answer (round 2)
+		uint64_t retry_at = 0; // when due again (waiting)
+		uint64_t sent_at = 0; // when the latest request went out (round 2)
 		bool waiting = false; // a retry is due at retry_at
+		bool queued = false; // the host keeps it in its budget queue (round 2)
+	};
+
+	// What due() found: requests to send again (the caller queues them and calls sent(id, 0, now)), and creates to take
+	// back (no answer after kMaxResends: the records are gone).
+	struct Due
+	{
+		std::vector<uint16_t> resend;
+		std::vector<uint16_t> rollback;
 	};
 
 	// A create under leased `id` (source: the weapon a clone replaces, kNoId otherwise). Twice: one record.
@@ -348,55 +419,88 @@ public:
 		s.id = id;
 		s.source = source;
 	}
-	// Its request went out with `seq` (the first one or a retry): the answer comes for that seq.
-	void sent(uint16_t id, uint32_t seq)
+	// Its request went out with `seq` at `now` (the first one or another); seq 0: it waits in our own outbox (paced).
+	void sent(uint16_t id, uint32_t seq, uint64_t now)
 	{
 		const auto it = m_specs.find(id);
 		if (it == m_specs.end())
 			return;
-		it->second.seq = seq;
-		it->second.waiting = false;
+		Spec& s = it->second;
+		s.seq = seq;
+		s.waiting = false;
+		s.sent_at = now;
+		if (seq)
+			s.seqs.push_back(seq);
 	}
 
-	// The host's answer to request `seq`. accepted: Confirmed (the record goes). rate_limited: Retry, due at now +
+	// Round 2: the host put request `seq` into its budget queue (not an answer yet). False: no request of ours.
+	bool queued(uint32_t seq)
+	{
+		Spec* s = by_seq(seq);
+		if (!s)
+			return false;
+		s->queued = true;
+		return true;
+	}
+
+	// The host's answer to request `seq`. accepted (any request of the create): Confirmed, the record goes. A refusal of
+	// an older request than the latest: Unknown (stale; the latest decides). rate_limited: Retry, due at now +
 	// retry_delay(tries), or RolledBack after kMaxRetries. Any other refusal: RolledBack (the record goes). `id` gets the
-	// create's id (unchanged for Unknown).
+	// create's id (also for a stale one).
 	Outcome answer(uint32_t seq, bool accepted, bool rate_limited, uint64_t now, uint16_t& id)
 	{
-		if (!seq)
+		Spec* s = by_seq(seq);
+		if (!s)
 			return Outcome::Unknown;
-		for (auto it = m_specs.begin(); it != m_specs.end(); ++it)
+		id = s->id;
+		if (accepted)
 		{
-			Spec& s = it->second;
-			if (s.seq != seq)
-				continue;
-			id = s.id;
-			if (accepted)
-			{
-				m_specs.erase(it);
-				return Outcome::Confirmed;
-			}
-			if (rate_limited && ++s.tries < kMaxRetries)
-			{
-				s.seq = 0;
-				s.waiting = true;
-				s.retry_at = now + retry_delay(s.tries);
-				return Outcome::Retry;
-			}
-			m_specs.erase(it);
-			return Outcome::RolledBack;
+			m_specs.erase(s->id);
+			return Outcome::Confirmed;
 		}
-		return Outcome::Unknown;
+		if (seq != s->seq)
+			return Outcome::Unknown;
+		if (rate_limited && ++s->tries < kMaxRetries)
+		{
+			s->seq = 0;
+			s->waiting = true;
+			s->queued = false;
+			s->retry_at = now + retry_delay(s->tries);
+			return Outcome::Retry;
+		}
+		m_specs.erase(s->id);
+		return Outcome::RolledBack;
 	}
 
-	// The creates whose retry is due.
-	std::vector<uint16_t> due(uint64_t now) const
+	// The retries whose time has come, and (round 2) the requests without an answer for kAnswerTimeoutMs that the host
+	// did not queue: asked again, or after kMaxResends taken back (their records go).
+	Due due(uint64_t now)
 	{
-		std::vector<uint16_t> out;
-		for (const auto& it : m_specs)
-			if (it.second.waiting && it.second.retry_at <= now)
-				out.push_back(it.first);
-		return out;
+		Due d;
+		for (auto it = m_specs.begin(); it != m_specs.end();)
+		{
+			Spec& s = it->second;
+			if (s.waiting)
+			{
+				if (s.retry_at <= now)
+					d.resend.push_back(s.id);
+			}
+			else if (s.seq && !s.queued && now >= s.sent_at && now - s.sent_at >= kAnswerTimeoutMs)
+			{
+				if (s.resends >= kMaxResends)
+				{
+					d.rollback.push_back(s.id);
+					it = m_specs.erase(it);
+					continue;
+				}
+				++s.resends;
+				s.seq = 0; // until the caller sends it again
+				s.sent_at = now;
+				d.resend.push_back(s.id);
+			}
+			++it;
+		}
+		return d;
 	}
 
 	bool pending(uint16_t id) const { return m_specs.count(id) != 0; }
@@ -432,6 +536,16 @@ public:
 	void clear() { m_specs.clear(); }
 
 private:
+	Spec* by_seq(uint32_t seq)
+	{
+		if (!seq)
+			return nullptr;
+		for (auto& it : m_specs)
+			if (std::find(it.second.seqs.begin(), it.second.seqs.end(), seq) != it.second.seqs.end())
+				return &it.second;
+		return nullptr;
+	}
+
 	std::map<uint16_t, Spec> m_specs;
 };
 

@@ -80,6 +80,7 @@ enum class Reason : u8
 	Offline, // object or parent is offline on the host
 	FriendlyFire,
 	Engine, // the engine refused the change
+	Queued, // F2 T12b round 2: not an answer - a leased create waits in the host's budget queue (accepted = false)
 	Count
 };
 const char* reason_name(Reason r);
