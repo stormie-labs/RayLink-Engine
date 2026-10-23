@@ -870,18 +870,21 @@ void CGamePersistent::OnEvent(EVENT E, u64 P1, u64 P2)
 		if (Device.Paused())
 			Device.Pause(FALSE, TRUE, TRUE, "eQuickLoad");
 
+		// Live 2026-10-23 (GAMMA new game = tempsave + quickload): the tutorials stop first, while the dialogs they
+		// show are still alive. A stop function of a tutorial item calls Lua that touches its window (Show/Hide);
+		// stopped after HideShownDialogs, that window was already gone - an access violation in CallFunctions.
+		if (g_tutorial)
+			g_tutorial->Stop();
+
+		if (g_tutorial2)
+			g_tutorial2->Stop();
+
 		if (CurrentGameUI())
 		{
 			CurrentGameUI()->HideShownDialogs();
 			CurrentGameUI()->UIMainIngameWnd->reset_ui();
 			CurrentGameUI()->GetPdaMenu().Reset();
 		}
-
-		if (g_tutorial)
-			g_tutorial->Stop();
-
-		if (g_tutorial2)
-			g_tutorial2->Stop();
 
 		LPSTR saved_name = (LPSTR)(P1);
 

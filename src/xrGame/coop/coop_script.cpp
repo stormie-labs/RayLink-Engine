@@ -1042,6 +1042,11 @@ void menu_pending_frame()
 		menu_cancel_pending("a session is already running");
 		return;
 	}
+	// pending-host clock (owner, live 2026-10-23): choosing faction and gear in the new game screen took over 15 min and
+	// the session silently never opened. The main menu up is the start flow, not a forgotten request: no clock there.
+	CMainMenu* pending_menu = MainMenu();
+	if (pending_menu && pending_menu->IsActive())
+		g_menu.pending_ms = now; // pending-host clock: counts from the moment the main menu is gone
 	if (now - g_menu.pending_ms > kPendingMaxMs)
 	{
 		menu_cancel_pending("no game was loaded within 15 minutes");
