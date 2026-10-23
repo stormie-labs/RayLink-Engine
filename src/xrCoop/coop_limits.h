@@ -1,16 +1,20 @@
 // Anomaly Coop — what a host takes from a client: message rates per type (F2 T3) and new player characters per
 // session (Ruling F2-10 b). The game installs the rates (coop_join install) and keeps the character count (coop_join).
 // F2 T14: a client paces itself by the same rates (Pacer; coop_script.cpp script events, coop_sync_api.cpp).
-// F2 T3b: the story, shot, item, trade, object and request messages got rows too (Ruling F2-15); still without one: the
-// join lifecycle, the player stream and life states, TimeRequest and the dialog choice (task-3b-report.md).
+// F2 T3b: the story, shot, item, trade, object and request messages got rows too (Ruling F2-15); F2 T3c: the player stream,
+// the life states and the chat (a core message, taken by Session::handle_chat) did too, and the story outbox of a client
+// (Outbox) merges relations and keeps them in a lane of their own. Still without a row: the join lifecycle, TimeRequest,
+// the dialog choice, PlayerAnim / PlayerGrenade (no handler) and the blobs (their own limits).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 
 #include "coop_protocol.h"
 
@@ -125,6 +129,31 @@ constexpr RateRule kClientRateRules[] = {
 	// One on showing and one on hiding a trade or loot window (coop_trade.cpp:772): a human, estimate 4 a second, 8 in a
 	// row, 4 x that. Each opening runs a callback of the host's Lua.
 	{Msg::ReqContainer, 32, 60},
+
+	// F2 T3c (T3b review I-1, I-2): the player stream, the life states and the chat. The host relays every one of them to the
+	// other players (broadcast), so a modified client's flood is multiplied by the players there are.
+	// The movement: strictly one per kSendIntervalMs = 50 ms, time based, never a catch-up after a hitch (coop_players.cpp:26,
+	// :283, :294-296; the only sender), so 20 a second; the network may bunch them (a lag spike of 2 s: 40). The row is 4 x the
+	// rate and 3.2 s of the stream in a row. A dropped one costs nothing (Unreliable lane, the newest wins), but a log line
+	// "rate limit: PlayerState" for an honest player would send us looking for a fault that is not there.
+	{Msg::PlayerState, 64, 12},
+	// send_my_state (coop_survival.cpp:651): at every change of the life state (:729 down, :743 dead, :765 / :851 up or
+	// respawning, :893 spectating), when the character changes (:2236) and as a refresh every 5 s (:65, :1840). A fall and its end
+	// is 4 in a row (estimate); a fall lasts at least the bleed-out of 5 s (coop_death_rules.h:104), so the honest rate is
+	// below one a second (estimate). 4 x both: 16 in a row, 4 a second. The host decides on each one and broadcasts it
+	// reliably (coop_survival.cpp:1563).
+	{Msg::PlayerWounded, 16, 250},
+	// A revive request is sent when the USE hold on a wounded teammate has lasted kReviveHoldMs = 3000 (coop_survival.cpp:61,
+	// :1639, :1664): one in 3 s at the most (estimate: 2 in a row, 1 in 3 s). 4 x that: 8 in a row, 1.33 a second.
+	{Msg::PlayerRevive, 8, 750},
+	// One per death of the own actor (coop_events.cpp:312 -> coop_requests.cpp:2416, :518); a death is followed by a respawn or
+	// a spectator's wait of seconds (estimate: 2 in a row, one in 2 s). 4 x that: 8 in a row, 2 a second. The host logs each
+	// one and broadcasts it reliably (coop_events.cpp:817-835).
+	{Msg::PlayerDied, 8, 500},
+	// A human (estimate: a paste of 5 lines at once, 2 lines a second at the most), 4 x that: 20 in a row, 8 a second. Chat is a
+	// core message (Session::dispatch, not game_message): Session::handle_chat takes a token of this row itself. Over it: the
+	// line is dropped, counted, logged like the other rows, not logged as chat, not given to Lua (on_chat), not relayed.
+	{Msg::Chat, 20, 125},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
@@ -227,6 +256,139 @@ private:
 		uint64_t at = 0;
 	};
 	std::map<uint16_t, Bucket> m_buckets;
+};
+
+// F2 T3c (T3b review I-3): the outbox of a client's story messages (coop_story.cpp push_out / flush_outbox) as a pure queue.
+// Two lanes with a cap each:
+//  - story: InfoPortion, MapSpot, TaskUpdate, in order, kMaxStoryOutbox (F2 T14 fix 1). What the pacer holds holds the rest
+//    of the lane, as before: one lost or reordered info breaks a quest;
+//  - relations: Msg::Relation, kMaxRelationOutbox. GAMMA's Fluid Relations answers every stalker killed by a stalker with 8-15
+//    set_community_relation calls (game_relations.script:232-236, :361-455), sometimes dozens, and the pacer lets a relation
+//    out at 10 a second. In one queue they held the infos, spots and tasks behind them for seconds and, at the cap, took
+//    the room of every type. Now a relation waits in a lane of its own: it holds back no story message and a full lane
+//    drops only relations.
+// A relation that sets the relation of a pair of communities (RelReqCommRelation) is a fact "from -> to is v": a queued one of
+// the same pair is replaced by the newer value and keeps its place, so the lane holds at most one per pair (32 x 32 in
+// GAMMA) however many calls a fight makes, and the host ends with the value the game last set. Other relations (a goodwill
+// to a player set or changed by a delta) are not facts of a pair: the order and the sum of deltas matter, they are not merged.
+constexpr size_t kMaxStoryOutbox = 4096;
+constexpr size_t kMaxRelationOutbox = 2048; // all 32 x 32 community pairs of GAMMA at once and room for the goodwill changes
+
+struct CommunityPair
+{
+	int32_t from;
+	int32_t to;
+};
+
+// What drops again and again (a full queue) is logged for the first and then for every 100th drop, not for each.
+inline bool drop_logged(uint64_t drops)
+{
+	return drops == 1 || (drops != 0 && drops % 100 == 0);
+}
+
+template <class Item>
+class Outbox
+{
+public:
+	enum class Push : uint8_t
+	{
+		Queued, // waits in its lane
+		Merged, // replaced the queued relation of the same pair
+		Full // its lane is full: dropped and counted (dropped_story, dropped_relation)
+	};
+
+	Outbox()
+	{
+		m_story.cap = kMaxStoryOutbox;
+		m_relations.cap = kMaxRelationOutbox;
+	}
+
+	// `pair` is for Msg::Relation only (the pair a "set the community relation" fact is about); other messages ignore it.
+	Push push(Msg type, Item&& item, const CommunityPair* pair = nullptr)
+	{
+		const bool keyed = pair != nullptr && type == Msg::Relation;
+		Lane& lane = type == Msg::Relation ? m_relations : m_story;
+		if (keyed)
+			for (Entry& e : lane.q)
+				if (e.keyed && e.pair.from == pair->from && e.pair.to == pair->to)
+				{
+					e.item = std::move(item);
+					++m_merged;
+					return Push::Merged;
+				}
+		if (lane.q.size() >= lane.cap)
+		{
+			++lane.dropped;
+			return Push::Full;
+		}
+		lane.q.push_back(Entry{type, keyed, keyed ? *pair : CommunityPair{0, 0}, std::move(item)});
+		return Push::Queued;
+	}
+
+	// One frame of sending. In each lane, in order, `take(type)` says whether the pacer lets the next one out: if not, it and
+	// everything behind it in the lane wait for a later drain (the other lane goes on); if so, `send(item)` gets it. Only what
+	// was queued when the drain began is sent: what `send` queues meanwhile waits for the next one. Returns how many went.
+	template <class Take, class Send>
+	size_t drain(Take&& take, Send&& send)
+	{
+		Lane* lanes[2] = {&m_story, &m_relations};
+		size_t budget[2] = {m_story.q.size(), m_relations.q.size()};
+		size_t sent = 0;
+		bool held = false;
+		for (int i = 0; i < 2; ++i)
+		{
+			Lane& lane = *lanes[i];
+			while (budget[i] > 0 && !lane.q.empty())
+			{
+				if (!take(lane.q.front().type))
+				{
+					held = true;
+					break;
+				}
+				Entry e = std::move(lane.q.front());
+				lane.q.pop_front();
+				--budget[i];
+				send(e.item);
+				++sent;
+			}
+		}
+		if (held)
+			++m_held;
+		return sent;
+	}
+
+	void clear() // the counters stay
+	{
+		m_story.q.clear();
+		m_relations.q.clear();
+	}
+
+	bool empty() const { return m_story.q.empty() && m_relations.q.empty(); }
+	size_t size() const { return m_story.q.size() + m_relations.q.size(); }
+	size_t story_size() const { return m_story.q.size(); }
+	size_t relation_size() const { return m_relations.q.size(); }
+	uint64_t held() const { return m_held; } // drains in which the pacer held something back
+	uint64_t merged() const { return m_merged; } // relations replaced by a newer value of their pair
+	uint64_t dropped_story() const { return m_story.dropped; }
+	uint64_t dropped_relation() const { return m_relations.dropped; }
+	uint64_t dropped_of(Msg type) const { return type == Msg::Relation ? m_relations.dropped : m_story.dropped; }
+
+private:
+	struct Entry
+	{
+		Msg type;
+		bool keyed; // a "set the relation of this pair" fact: merged by `pair`
+		CommunityPair pair;
+		Item item;
+	};
+	struct Lane
+	{
+		std::deque<Entry> q;
+		size_t cap = 0;
+		uint64_t dropped = 0;
+	};
+	Lane m_story, m_relations;
+	uint64_t m_held = 0, m_merged = 0;
 };
 } // namespace limits
 } // namespace coop

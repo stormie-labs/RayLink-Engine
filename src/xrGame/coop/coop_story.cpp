@@ -237,30 +237,40 @@ struct Out
 	shared_str spot_type;
 	u16 spot_id = kNoId; // local numbering
 };
-xr_vector<Out> g_outbox;
 // F2 T14 fix 1 (review M1, Ruling F2-14): a client sends infos and spots only as fast as the host takes them
 // (kClientRateRules InfoPortion, MapSpot): the host drops what exceeds its limit unseen, and a lost info or spot never
 // comes back. What waits stays queued, in order; the queue is bounded (a broken mod must not fill the memory).
-constexpr size_t kMaxOutbox = 4096;
+// F2 T3c (T3b review I-3): the relations wait in a lane of their own (limits::Outbox, coop_limits.h): a fight in GAMMA
+// makes dozens of set_community_relation calls per kill, and behind the relation pacer they held back the infos, spots
+// and tasks and, at the cap, took their room. A queued relation of the same pair of communities is replaced by the newer
+// value.
+limits::Outbox<Out> g_outbox;
 limits::Pacer g_pacer;
-u64 g_out_held = 0, g_out_dropped = 0;
 
-bool outbox_room()
+// F2 T3c: the outbox refused `type` (its lane is full); the outbox counts it, the log gets the first and every 100th.
+void note_outbox_full(Msg type)
 {
-	if (g_outbox.size() < kMaxOutbox)
-		return true;
-	++g_out_dropped;
-	return false;
+	const bool relation = type == Msg::Relation;
+	const u64 drops = g_outbox.dropped_of(type);
+	if (limits::drop_logged(drops))
+		::Msg("! [coop] story: the %s queue is full (%u waiting), a %s was dropped (%llu of that queue so far)",
+		    relation ? "relation" : "info / spot / task", u32(relation ? g_outbox.relation_size() : g_outbox.story_size()),
+		    msg_name(type), drops);
 }
 
-void push_out(Msg type, Writer&& w)
+void queue_out(Out&& o, const limits::CommunityPair* pair = nullptr)
 {
-	if (!outbox_room()) // F2 T14 fix 1
-		return;
+	const Msg type = o.type;
+	if (g_outbox.push(type, std::move(o), pair) == limits::Outbox<Out>::Push::Full)
+		note_outbox_full(type);
+}
+
+void push_out(Msg type, Writer&& w, const limits::CommunityPair* pair = nullptr)
+{
 	Out o;
 	o.type = type;
 	o.w = std::move(w);
-	g_outbox.push_back(std::move(o));
+	queue_out(std::move(o), pair);
 }
 
 void send_out(Msg type, const Writer& w)
@@ -1346,7 +1356,10 @@ bool client_relation_request(u8 op, int a, int b, int v)
 	else
 		w.u16(host_id_of(u16(b)));
 	w.i32(v);
-	push_out(Msg::Relation, std::move(w));
+	// F2 T3c: "the relation of community a to b is v" is a fact of a pair: a queued one is replaced by this value (the
+	// host needs the last). The other ops (a goodwill to a player, by a value or by a delta) are not merged.
+	const limits::CommunityPair pair{a, b};
+	push_out(Msg::Relation, std::move(w), op == RelReqCommRelation ? &pair : nullptr);
 	++g_stats.requests_out;
 	return true;
 }
@@ -1508,52 +1521,48 @@ void host_spot_body(Writer& w, CMapLocation* ml, const shared_str& type, u16 id)
 	write_spot(w, type, id, hint, ml->Serializable(), author);
 }
 
+// One queued message goes out (a map spot is built from the live spot now, not when it was queued).
+void send_queued(Out& o, bool host)
+{
+	if (!o.spot_add)
+	{
+		send_out(o.type, o.w);
+		return;
+	}
+	if (!in_game())
+		return;
+	CMapLocation* ml = spots().GetMapLocation(o.spot_type, o.spot_id);
+	if (!spot_replicable(ml, o.spot_type))
+		return; // gone already, or turned out to be a task spot
+	Writer w(96);
+	w.u8(SpotAdd);
+	if (host)
+	{
+		host_spot_body(w, ml, o.spot_type, o.spot_id);
+		net::host_broadcast(Msg::MapSpot, w);
+		++g_stats.spots_out;
+	}
+	else
+	{
+		const u16 hid = host_id_of(o.spot_id);
+		LPCSTR h = ml->GetHint();
+		write_spot(w, o.spot_type, hid, h ? xr_string(h) : xr_string(), ml->Serializable(), mgr().self());
+		net::client_send(Msg::MapSpot, w);
+		g_spot_pending[SpotKey{o.spot_type, hid}] = mgr().now_ms();
+		++g_stats.requests_out;
+	}
+}
+
 void flush_outbox()
 {
 	if (g_outbox.empty())
 		return;
-	xr_vector<Out> out;
-	out.swap(g_outbox);
 	const bool host = mgr().is_host();
 	const u64 now = mgr().now_ms();
-	for (size_t i = 0; i < out.size(); ++i)
-	{
-		Out& o = out[i];
-		if (!host && !g_pacer.take(o.type, now)) // F2 T14 fix 1: the rest waits for a later frame, in order
-		{
-			g_outbox.insert(g_outbox.begin(), std::make_move_iterator(out.begin() + ptrdiff_t(i)),
-			    std::make_move_iterator(out.end()));
-			++g_out_held;
-			return;
-		}
-		if (!o.spot_add)
-		{
-			send_out(o.type, o.w);
-			continue;
-		}
-		if (!in_game())
-			continue;
-		CMapLocation* ml = spots().GetMapLocation(o.spot_type, o.spot_id);
-		if (!spot_replicable(ml, o.spot_type))
-			continue; // gone already, or turned out to be a task spot
-		Writer w(96);
-		w.u8(SpotAdd);
-		if (host)
-		{
-			host_spot_body(w, ml, o.spot_type, o.spot_id);
-			net::host_broadcast(Msg::MapSpot, w);
-			++g_stats.spots_out;
-		}
-		else
-		{
-			const u16 hid = host_id_of(o.spot_id);
-			LPCSTR h = ml->GetHint();
-			write_spot(w, o.spot_type, hid, h ? xr_string(h) : xr_string(), ml->Serializable(), mgr().self());
-			net::client_send(Msg::MapSpot, w);
-			g_spot_pending[SpotKey{o.spot_type, hid}] = mgr().now_ms();
-			++g_stats.requests_out;
-		}
-	}
+	// F2 T14 fix 1: what the client pacer holds waits for a later frame, in order. F2 T3c: per lane, so the relations
+	// held by their pacer hold back no info, spot or task (limits::Outbox::drain).
+	g_outbox.drain([host, now](Msg type) { return host || g_pacer.take(type, now); },
+	    [host](Out& o) { send_queued(o, host); });
 }
 
 void apply_spot_add(const shared_str& type, u16 host_id, const xr_string& hint, bool ser, PeerId author)
@@ -2448,8 +2457,10 @@ void print_status()
 	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
 	::Msg("[coop] story: held infos %llu (kept here %u, holds left on %llu) | personal tasks %u, local task edits %llu",
 	    g_infos_held, (u32)g_local_infos.size(), g_holds_leaked, (u32)g_local_tasks.size(), g_local_task_edits);
-	::Msg("[coop] story: outbox %u, held for the host's rate %llu frames, dropped (queue full) %llu", // F2 T14 fix 1
-	    (u32)g_outbox.size(), g_out_held, g_out_dropped);
+	::Msg("[coop] story: outbox %u (relations %u), held for the host's rate %llu frames, dropped (queue full) %llu infos / "
+	      "spots / tasks and %llu relations, relations replaced by a newer value of their pair %llu", // F2 T14 fix 1, T3c
+	    (u32)g_outbox.size(), (u32)g_outbox.relation_size(), g_outbox.held(), g_outbox.dropped_story(),
+	    g_outbox.dropped_relation(), g_outbox.merged());
 	for (const auto& it : g_finisher)
 		::Msg("[coop] story:   task '%s' finished at the request of %s", cs(it.first), peer_name(it.second));
 	if (in_game()) // the Lua side of shared tasks (coop_tasks.script, W3c)
@@ -2715,14 +2726,12 @@ void on_spot_added(const shared_str& spot_type, u16 id)
 			return;
 		}
 	}
-	if (!outbox_room()) // F2 T14 fix 1
-		return;
 	Out o;
 	o.type = Msg::MapSpot;
 	o.spot_add = true;
 	o.spot_type = spot_type;
 	o.spot_id = id;
-	g_outbox.push_back(std::move(o));
+	queue_out(std::move(o)); // F2 T14 fix 1, F2 T3c: a full queue is counted and logged there
 }
 
 void on_spot_remove(const shared_str& spot_type, u16 id)

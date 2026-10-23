@@ -101,6 +101,29 @@ std::string sanitize_nick(const std::string& in, const char* fallback)
 	return s.empty() ? std::string(fallback) : s;
 }
 
+// F2 T3c (T3b review I-2): a chat line reaches the log, the HUD and the console as it came, so a line break in it forged a
+// line of the log and an escape or a bell went with it. A tab and the line breaks become a space, the other control
+// characters (below 0x20, DEL) go; everything else, UTF-8 included, stays.
+void sanitize_chat(std::string& s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (unsigned char ch : s)
+	{
+		if (ch == '\t' || ch == '\n' || ch == '\r')
+			out.push_back(' ');
+		else if (ch >= 0x20 && ch != 0x7F)
+			out.push_back(char(ch));
+	}
+	s.swap(out);
+}
+
+// A line with nothing in it to read (empty, or blanks only after the cleaning) is no line: it is not relayed.
+bool chat_blank(const std::string& s)
+{
+	return s.find_first_not_of(' ') == std::string::npos;
+}
+
 const uint32_t* crc_table()
 {
 	static const struct Table
@@ -1166,7 +1189,14 @@ struct Session::Impl
 				malformed(c, "Chat");
 				return;
 			}
+			// F2 T3c (T3b review I-2): Chat is a core message, within_rate never saw it (game_message only). A line over the
+			// client's row (kClientRateRules Chat) goes no further: no copy to the others, no log line, no Lua on_chat.
+			if (!within_rate(c, uint16_t(Msg::Chat)))
+				return;
+			sanitize_chat(text);
 			utf8_truncate(text, kMaxChatBytes);
+			if (chat_blank(text))
+				return; // nothing but control characters and blanks
 			const PeerId from = c.info.id;
 			Writer w;
 			w.u32(from);
@@ -1189,6 +1219,9 @@ struct Session::Impl
 			malformed(c, "Chat");
 			return;
 		}
+		sanitize_chat(text); // F2 T3c: the host cleans what it relays, a client does not rely on that
+		if (chat_blank(text))
+			return;
 		emit([this, from, text] {
 			if (m_self.on_chat)
 				m_self.on_chat(from, text);
