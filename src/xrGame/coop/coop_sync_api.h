@@ -46,7 +46,7 @@ namespace coop
 {
 namespace syncapi
 {
-// Registers the five sync messages. Called once with the manager's session.
+// The five sync messages (F3a T4: installed by role when a session starts, Manager::install_handlers).
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 // The session started or ended, or a client's world is replaced: a client forgets everything of the host's, the host

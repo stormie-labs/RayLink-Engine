@@ -606,8 +606,9 @@ void Manager::print_status() const
 		// F3a T4: the host player's LocalLink; "refused" are the messages not moved onto it yet (the host's direct paths)
 		const LocalLink::Stats& ls = m_link.stats();
 		::Msg("[coop] local link (the host player): to the server %llu, to the host player %llu, refused %llu (not moved "
-		      "onto the link), queued %u / %u",
-		    ls.to_server, ls.to_client, ls.refused, u32(m_link.queued_to_server()), u32(m_link.queued_to_client()));
+		      "onto the link), queued %u / %u, oversize %llu, overflow %llu, stale %llu (an older world)",
+		    ls.to_server, ls.to_client, ls.refused, u32(m_link.queued_to_server()), u32(m_link.queued_to_client()),
+		    ls.oversize, ls.overflow, ls.stale);
 	}
 	for (u16 type : m_session.stats_types())
 	{

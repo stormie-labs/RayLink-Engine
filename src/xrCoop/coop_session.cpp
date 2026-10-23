@@ -36,6 +36,7 @@ constexpr size_t kMaxIncomingBlobsPerPeer = 4;
 constexpr size_t kMaxChatBytes = 1024;
 constexpr size_t kMaxNickBytes = 48;
 constexpr size_t kMaxPacketBytes = 16 * 1024 * 1024; // sanity limit for one game message
+static_assert(LocalLink::kMaxPayloadBytes == kMaxPacketBytes, "F3a T4 R1 4: the LocalLink takes what send() takes");
 constexpr uint32_t kPendingPeerSlots = 16; // transport slots beyond max_players so rejects can be delivered
 constexpr int kMaxEventsPerUpdate = 8192;
 constexpr uint32_t kShutdownMaxMs = 200;
@@ -823,9 +824,25 @@ struct Session::Impl
 			return;
 		// Both drains only queue the messages (emit): no handler runs before both directions are taken, so whatever a
 		// handler pushes, either way, is left for the next update.
-		m_local->drain_server([this](Msg type, Lane, std::vector<uint8_t>& payload) { local_message(true, type, payload); });
-		m_local->drain_client([this](Msg type, Lane, std::vector<uint8_t>& payload) { local_message(false, type, payload); });
+		// R1 1: only what was made in this world epoch; the rest is of a world that is gone (as game_message drops a
+		// client's message of another epoch at receipt).
+		const uint64_t stale_before = m_local->stats().stale;
+		m_local->drain_server(m_epoch, [this](LocalLink::Packet& p) { local_message(true, p.type, p.payload); });
+		m_local->drain_client(m_epoch, [this](LocalLink::Packet& p) { local_message(false, p.type, p.payload); });
+		const uint64_t stale = m_local->stats().stale - stale_before;
+		const uint32_t made_in = m_local->stats().stale_epoch;
+		if (stale && first_time("local-stale:" + std::to_string(made_in) + ":" + std::to_string(m_epoch)))
+			logf("host: %llu message(s) of the local link dropped: made in world epoch %u, the host is in world epoch %u",
+				static_cast<unsigned long long>(stale), unsigned(made_in), unsigned(m_epoch));
 		run_pending();
+	}
+
+	// R1 1: the world epoch of the session, and of the pushes into its LocalLink from now on.
+	void set_epoch(uint32_t epoch)
+	{
+		m_epoch = epoch;
+		if (m_local)
+			m_local->set_epoch(epoch);
 	}
 
 	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else counted, logged, false.
@@ -1248,7 +1265,7 @@ struct Session::Impl
 		}
 		m_cstate = CState::Joined;
 		m_self_id = w.slot;
-		m_epoch = w.world_epoch; // R2 I1: the world the host serves; the game moves it on with SessionReset
+		set_epoch(w.world_epoch); // R2 I1: the world the host serves; the game moves it on with SessionReset
 		m_host_info = PeerInfo();
 		m_host_info.id = kHostPeer;
 		m_host_info.state = PeerState::Joined;
@@ -1809,7 +1826,7 @@ bool Session::host(const SessionConfig& cfg, std::string* err)
 		s.m_role = Role::Host;
 		s.m_host_fp = manifest_fingerprint(s.m_cfg.manifest);
 		s.m_session_token = random_u64();
-		s.m_epoch = 0;
+		s.set_epoch(0);
 		s.logf("host: listening on 0.0.0.0:%u", unsigned(cfg.port));
 		return true;
 	}
@@ -1853,7 +1870,7 @@ bool Session::connect(const SessionConfig& cfg, const std::string& address, uint
 		}
 		s.m_role = Role::Client;
 		s.m_cstate = Impl::CState::Connecting;
-		s.m_epoch = 0;
+		s.set_epoch(0);
 		s.m_deadline_set = false;
 		s.m_transport_up = false;
 		s.m_server_text = address + ":" + std::to_string(unsigned(port));
@@ -1988,6 +2005,8 @@ void Session::clear_handlers()
 void Session::attach_local(LocalLink* link)
 {
 	m->m_local = link;
+	if (link)
+		link->set_epoch(m->m_epoch); // R1 1: its pushes are made in this world
 }
 
 LocalLink* Session::local() const
@@ -2180,7 +2199,7 @@ void Session::set_world_epoch(uint32_t epoch)
 		if (s.m_epoch == epoch)
 			return;
 		const uint32_t old = s.m_epoch;
-		s.m_epoch = epoch;
+		s.set_epoch(epoch); // R1 1: the LocalLink too
 		if (s.m_role == Role::None)
 			return;
 		// Level-change review: a message that waited for the old world's return is void now (coop_world_gate.h)

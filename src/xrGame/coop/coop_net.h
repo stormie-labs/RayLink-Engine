@@ -18,8 +18,8 @@ namespace net
 {
 // Host: to every client that is in the world (live), queued for clients that are loading.
 // `except` skips one peer (the originator of a relayed message).
-// F3a T4: to every player (Session::players()): the host player too, over the LocalLink, unless `except` is 0. The link
-// passes only the messages moved onto it (link_enabled, coop_local_link.h); none yet.
+// F3a T4: to every player: the host player too, over the LocalLink, unless `except` is 0. The link passes only the
+// messages moved onto it (link_enabled, coop_local_link.h); none yet.
 void host_broadcast(Msg type, const Writer& payload, Lane lane = Lane::Reliable, PeerId except = kInvalidPeer);
 // Host: to one client; queued while it loads (reliable lanes only, unreliable is dropped).
 // F3a T4: `to` 0 is the host player, over the LocalLink (only the messages moved onto it; the rest is dropped as before).

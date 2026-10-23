@@ -43,15 +43,18 @@ void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except)
 	if (!mgr().is_host())
 		return;
 	Session& s = mgr().session();
-	for (const PeerInfo& p : s.players()) // F3a T4: the host player (local) too; the link's gate decides
+	for (const PeerInfo& p : s.peers())
 	{
 		if (p.id == except || p.state != PeerState::Joined)
 			continue;
-		if (!p.local && sync::host_peer_joining(p.id))
+		if (sync::host_peer_joining(p.id))
 			queue(p.id, type, payload, lane);
 		else
 			s.send(p.id, lane, type, payload);
 	}
+	// F3a T4: the host player too, over the LocalLink (its gate decides; R1 5: no players() vector per message)
+	if (except != kHostPeer && s.local())
+		s.send(kHostPeer, lane, type, payload);
 }
 
 void host_send(PeerId to, Msg type, const Writer& payload, Lane lane)

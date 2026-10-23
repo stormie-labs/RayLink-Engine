@@ -57,7 +57,7 @@ enum class RejectReason : uint8_t;
 
 namespace script
 {
-// Registers the Msg::ScriptEvent handler. Called once with the manager's session.
+// The Msg::ScriptEvent handler, in both tables (F3a T4: installed by role when a session starts).
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 // Session ended: drops queued events and chat lines, clears counters.

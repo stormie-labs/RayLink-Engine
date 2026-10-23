@@ -20,17 +20,26 @@
 //  - The gate (the game: link_enabled) says which messages travel the link at all; the rest is refused at the push
 //    (counted). The host keeps its direct paths ("if host — itself") until its module is moved onto the link (F3a T7), so
 //    nothing may run twice: a message that is not moved never reaches either side.
+//  - R1 1: every packet carries the world epoch it was made in (set_epoch: the session keeps it current); a pump takes
+//    only the packets of the session's epoch and drops the rest (counted), either way. A remote client's game message of
+//    another epoch is dropped at receipt the same way (Session game_message), and so is a completed blob of another epoch:
+//    a request made for a world that is gone never runs in the next one.
+//  - R1 4: bounded like a connection: a payload over kMaxPayloadBytes (Session::send's limit) and a push over
+//    kMaxQueued waiting in one direction are refused and counted; handlers only for game messages.
 //
-// Pure C++17, header-only, no engine dependencies, single-threaded (the thread that calls Session::update).
+// Pure C++17, header-only, no engine dependencies. Single-threaded: every call on the thread that calls Session::update
+// (the game's main thread), like the Session itself; a debug build asserts it.
 #pragma once
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -68,11 +77,30 @@ public:
 	// Which game messages the link takes; none set = every one (the library's tests). The game sets link_enabled.
 	using Gate = bool (*)(Msg type);
 
+	// R1 4: the same sanity limit for one game message as Session::send (coop_session.cpp kMaxPacketBytes).
+	static constexpr size_t kMaxPayloadBytes = 16 * 1024 * 1024;
+	// R1 4: messages waiting in one direction. A pump empties both every update; this many means nobody pumps (as
+	// net::host_send's cap for a client that never finishes loading).
+	static constexpr size_t kMaxQueued = 50000;
+
 	struct Stats
 	{
 		uint64_t to_server = 0; // pushed by the host player and taken
 		uint64_t to_client = 0; // pushed by the world server and taken
 		uint64_t refused = 0; // pushed either way but not taken: the gate refuses it, or it is no game message
+		uint64_t oversize = 0; // R1 4: not taken, payload over kMaxPayloadBytes
+		uint64_t overflow = 0; // R1 4: not taken, kMaxQueued already waiting in its direction
+		uint64_t stale = 0; // R1 1: taken, then dropped at a pump: made in another world epoch
+		uint32_t stale_epoch = 0; // the world epoch of the last stale one
+	};
+
+	// A message on the link: what a pump hands its function (the payload may be moved out).
+	struct Packet
+	{
+		Msg type = Msg::GameBase;
+		Lane lane = Lane::Reliable;
+		uint32_t epoch = 0; // R1 1: the world epoch it was made in
+		std::vector<uint8_t> payload;
 	};
 
 	LocalLink() = default;
@@ -80,22 +108,31 @@ public:
 	LocalLink& operator=(const LocalLink&) = delete;
 
 	void set_gate(Gate gate) { m_gate = gate; }
-	// True if a push of `type` is taken (either way).
+	// True if a push of `type` is taken (either way), size and queue permitting.
 	bool admits(Msg type) const
 	{
 		return static_cast<uint16_t>(type) >= static_cast<uint16_t>(Msg::GameBase) && (!m_gate || m_gate(type));
 	}
 
+	// R1 1: the world epoch the pushes from now on are made in. The session it is attached to keeps it current
+	// (Session::attach_local, host, set_world_epoch).
+	void set_epoch(uint32_t epoch) { m_epoch = epoch; }
+	uint32_t epoch() const { return m_epoch; }
+
 	// ------------------------------------------------------------------ the host player's end
 
 	// His client-side handlers (install_client of every module in the host's process). Run by the world server's
-	// Session when it pumps the link, after its checks (Session::attach_local).
+	// Session when it pumps the link, after its checks (Session::attach_local). A core message has none (R1 4: as
+	// Session::on, the session handles those itself): ignored.
 	void on(Msg type, Handler h) override
 	{
+		const uint16_t t = static_cast<uint16_t>(type);
+		if (t < static_cast<uint16_t>(Msg::GameBase))
+			return;
 		if (h)
-			m_handlers[static_cast<uint16_t>(type)] = std::move(h);
+			m_handlers[t] = std::move(h);
 		else
-			m_handlers.erase(static_cast<uint16_t>(type));
+			m_handlers.erase(t);
 	}
 	void clear_handlers() { m_handlers.clear(); }
 	// A copy of his handler of `type` (it may re-register itself while it runs), empty if none.
@@ -105,7 +142,8 @@ public:
 		return it == m_handlers.end() ? Handler() : it->second;
 	}
 
-	// The host player -> the world server. false: not taken (the gate, or no game message), counted in stats().refused.
+	// The host player -> the world server, stamped with the current world epoch. false: not taken (the gate, no game
+	// message, too large, too many waiting), counted in stats().
 	bool push_to_server(Msg type, Lane lane, const uint8_t* data, size_t size)
 	{
 		return push(m_to_server, m_stats.to_server, type, lane, data, size);
@@ -127,24 +165,25 @@ public:
 		return push_to_client(type, lane, payload.ptr(), payload.size());
 	}
 
-	// Takes the messages queued toward the server before the call, oldest first, and calls fn(Msg type, Lane lane,
-	// std::vector<uint8_t>& payload) for each (the payload may be moved out). What fn pushes meanwhile stays queued for
-	// the next drain; a clear_queues() from inside fn ends the drain. Returns how many were taken.
+	// Takes the messages queued toward the server before the call, oldest first, and calls fn(Packet&) for each one made
+	// in world epoch `epoch` (the session's); one of another epoch is dropped (stats().stale). What fn pushes meanwhile
+	// stays queued for the next drain; a clear_queues() from inside fn ends the drain. Returns how many were taken
+	// (stale ones included).
 	template <class Fn>
-	size_t drain_server(Fn&& fn)
+	size_t drain_server(uint32_t epoch, Fn&& fn)
 	{
-		return drain(m_to_server, fn);
+		return drain(m_to_server, epoch, fn);
 	}
 	// The same toward the host player.
 	template <class Fn>
-	size_t drain_client(Fn&& fn)
+	size_t drain_client(uint32_t epoch, Fn&& fn)
 	{
-		return drain(m_to_client, fn);
+		return drain(m_to_client, epoch, fn);
 	}
 
 	size_t queued_to_server() const { return m_to_server.size(); }
 	size_t queued_to_client() const { return m_to_client.size(); }
-	// The session ended: what is in flight belongs to a session that is over. Handlers and the gate stay.
+	// The session ended: what is in flight belongs to a session that is over. Handlers, the gate and the epoch stay.
 	void clear_queues()
 	{
 		m_to_server.clear();
@@ -154,23 +193,28 @@ public:
 	const Stats& stats() const { return m_stats; }
 
 private:
-	struct Packet
-	{
-		Msg type = Msg::GameBase;
-		Lane lane = Lane::Reliable;
-		std::vector<uint8_t> payload;
-	};
-
 	bool push(std::deque<Packet>& q, uint64_t& taken, Msg type, Lane lane, const uint8_t* data, size_t size)
 	{
+		check_thread();
 		if (!admits(type))
 		{
 			++m_stats.refused;
 			return false;
 		}
+		if (size > kMaxPayloadBytes)
+		{
+			++m_stats.oversize;
+			return false;
+		}
+		if (q.size() >= kMaxQueued)
+		{
+			++m_stats.overflow;
+			return false;
+		}
 		Packet p;
 		p.type = type;
 		p.lane = lane;
+		p.epoch = m_epoch;
 		if (size)
 			p.payload.assign(data, data + size);
 		q.push_back(std::move(p));
@@ -179,8 +223,9 @@ private:
 	}
 
 	template <class Fn>
-	size_t drain(std::deque<Packet>& q, Fn& fn)
+	size_t drain(std::deque<Packet>& q, uint32_t epoch, Fn& fn)
 	{
+		check_thread();
 		const size_t due = q.size(); // what was queued before the drain began
 		const uint64_t generation = m_generation;
 		size_t taken = 0;
@@ -189,16 +234,35 @@ private:
 			Packet p = std::move(q.front());
 			q.pop_front();
 			++taken;
-			fn(p.type, p.lane, p.payload);
+			if (p.epoch != epoch)
+			{
+				++m_stats.stale;
+				m_stats.stale_epoch = p.epoch;
+				continue;
+			}
+			fn(p);
 		}
 		return taken;
+	}
+
+	// The single-thread contract, checked in a debug build: the first thread that pushes or drains owns the link (not
+	// the one that sets it up: the game may build its Manager on a loader thread, on_blocking_work).
+	void check_thread()
+	{
+#ifndef NDEBUG
+		if (m_owner == std::thread::id())
+			m_owner = std::this_thread::get_id();
+		assert(m_owner == std::this_thread::get_id() && "LocalLink: one thread only (the one that updates its session)");
+#endif
 	}
 
 	Gate m_gate = nullptr;
 	std::map<uint16_t, Handler> m_handlers;
 	std::deque<Packet> m_to_server;
 	std::deque<Packet> m_to_client;
+	uint32_t m_epoch = 0; // R1 1: stamped on every push
 	uint64_t m_generation = 0; // clear_queues() count: a drain stops at a clear
 	Stats m_stats;
+	std::thread::id m_owner; // debug builds: the thread of the first push or drain (check_thread)
 };
 } // namespace coop
