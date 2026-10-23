@@ -43,6 +43,7 @@
 extern string_path g_last_saved_game;
 
 int g_coop_max_new_characters = int(coop::limits::kNewCharactersDefault);
+int g_coop_diag_stacks = 0;
 
 namespace coop
 {
@@ -55,6 +56,8 @@ std::atomic<u32> g_destroyed_object_stacks{0}; // armed and not printed yet
 
 void arm_destroyed_object_stacks()
 {
+	if (!g_coop_diag_stacks)
+		return; // a stack walk stalls this thread for minutes on its first use (console coop_diag_stacks 1)
 	g_destroyed_object_stacks.store(kDestroyedObjectStacks, std::memory_order_relaxed);
 	::Msg("[coop] diagnostics: the next %u accesses to a destroyed object print a C++ stack (a player left)",
 	    kDestroyedObjectStacks);

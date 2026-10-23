@@ -26,6 +26,9 @@ class NET_Packet;
 // only keys that never had a character count; a key that had one in this session, or whose character retired in this
 // world (hardcore, F3 Task 10), neither checks nor spends it.
 extern int g_coop_max_new_characters;
+// 1: print the C++ stacks of coop::diag (dbghelp loads the ~225 MB PDB and stalls the game 1-2 min the first time;
+// live 2026-10-23 a client froze after the host crashed). Off by default.
+extern int g_coop_diag_stacks;
 
 namespace coop
 {
