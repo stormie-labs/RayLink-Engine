@@ -165,20 +165,41 @@ void on_client_live()
 
 void frame()
 {
-	players::frame();
-	survival::frame();
-	checkpoints::frame(); // F3
-	death::frame();
-	rest::frame();
-	autosave::frame();
-	presence::frame();
-	items::frame();
+	// Level-change review (owner 2026-10-23, xrCoop/coop_world_gate.h; live crash 2026-10-23 20:00: a pass met a host
+	// whose level was being built). g_pGameLevel is set at the START of a level's construction and ai().get_alife() at the
+	// start of the simulator's, so neither says that the world is there. A pass that reads or changes the world runs
+	// only while it is UP (world_up: the level is loaded, the simulator and the local actor exist); one that also
+	// cleans up "no level at all" on its own runs unless a level is in the making (!world_gap). Passes below that
+	// check the world themselves (a Lua frame asks lua_ready, story ready, requests host_world_ready) or touch none
+	// (money sends, worldstate asks alife_ready) are called as before; entities and events drop what they recorded for a
+	// world that is not up.
+	const bool up = world_up();
+	const bool gap = world_gap();
+	if (up)
+		players::frame();
+	if (!gap)
+		survival::frame(); // leaves the session's state when there is no level
+	if (up)
+		checkpoints::frame(); // F3
+	if (!gap)
+		death::frame();
+	if (up)
+		rest::frame();
+	if (!gap)
+		autosave::frame();
+	if (!gap)
+		presence::frame(); // sound::frame inside: stops what plays when there is no level
+	if (!gap)
+		items::frame();
 	entities::frame();
 	events::frame(); // after entities: a spawn goes out before its parent change
-	objects::frame();
+	if (up)
+		objects::frame();
 	requests::frame();
-	dialog::frame();
-	trade::frame();
+	if (up)
+		dialog::frame();
+	if (up)
+		trade::frame();
 	money::frame(); // F2 T1
 	worldstate::frame();
 	script::frame();
@@ -215,7 +236,7 @@ void print_status()
 
 void dump_state(LPCSTR args)
 {
-	if (!g_pGameLevel)
+	if (!world_up()) // level-change review: a level in the making has no objects to count
 	{
 		::Msg("[coop-dump] not in a level");
 		return;

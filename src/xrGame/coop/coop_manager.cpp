@@ -180,10 +180,25 @@ Manager& Manager::get()
 Manager::Manager()
 {
 	m_session.set_log(&log_line);
+	m_session.set_world_gate([this] { return world_state(); }); // level-change review: messages for a missing world
 	install_session_callbacks();
 }
 
 u64 Manager::now_ms() const { return GetTickCount64(); }
+
+bool world_up() { return g_pGameLevel && g_pGameLevel->bReady && g_actor && ai().get_alife(); }
+
+bool world_gap() { return g_pGameLevel && !world_up(); }
+
+wgate::World Manager::world_state() const
+{
+	const bool up = world_up();
+	if (m_phase == Phase::Hosting)
+		return up ? wgate::World::Up : wgate::World::Hole; // a world comes back: the host builds it
+	if (m_phase == Phase::Live)
+		return up ? wgate::World::Up : wgate::World::Absent; // its level is gone: it joins again from the host's save
+	return wgate::World::Absent; // connecting, choosing a character, receiving, loading
+}
 
 void Manager::set_phase(Phase p)
 {
@@ -498,7 +513,7 @@ void Manager::autostart()
 	{
 		g_auto.next_status = now + u64(g_auto.status_every_s) * 1000;
 		print_status();
-		if (g_pGameLevel)
+		if (world_up()) // level-change review: Level().Objects of a level that is not up has nothing to count
 			sync::dump_state("summary");
 	}
 	if (g_auto.shots_every_s && level_ready && now >= g_auto.next_shot)
@@ -548,6 +563,25 @@ void Manager::print_status() const
 		const MsgStats& s = m_session.stats(type);
 		::Msg("[coop]   %-18s out %6llu msg %9llu B | in %6llu msg %9llu B", msg_name(type), s.sent_count,
 		    s.sent_bytes, s.recv_count, s.recv_bytes);
+	}
+	// Level-change review: game messages that met a world that was not there (xrCoop/coop_world_gate.h)
+	const Session::WorldGateStats gs = m_session.world_gate_stats();
+	const char* world_now = "up";
+	switch (world_state())
+	{
+	case wgate::World::Up: break;
+	case wgate::World::Hole: world_now = "HOLE (a level is being built or torn down)"; break;
+	case wgate::World::Absent: world_now = "absent (this machine is not in the host's world)"; break;
+	}
+	::Msg("[coop] world now: %s; %llu gap(s) with a game message due; waiting %u (%u B): ran %llu, void %llu (older world), "
+	      "expired %llu, pushed out %llu, sender gone %llu",
+	    world_now, gs.gaps, u32(gs.queued), u32(gs.queued_bytes), gs.hold.replayed, gs.hold.void_epoch, gs.hold.expired,
+	    gs.hold.evicted, gs.hold.gone);
+	for (u16 type : m_session.stats_types())
+	{
+		const MsgStats& s = m_session.stats(type);
+		if (s.world_held || s.world_dropped)
+			::Msg("[coop]   no world: %-18s %6llu waited, %6llu dropped", msg_name(type), s.world_held, s.world_dropped);
 	}
 	join::print_status();
 	sync::print_status();

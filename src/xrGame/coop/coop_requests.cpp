@@ -795,7 +795,8 @@ void client_pump_rebuilds()
 // nothing to do (its EntitySpawn finds the item here); RateLimited - asked again; refused - our item goes (rollback) and
 // the id goes back (Msg::IdLeaseAck).
 
-bool lease_world_ready() { return mgr().is_live_client() && g_pGameLevel && ai().get_alife() && Level().Server; }
+// Level-change review: world_up, not g_pGameLevel (set when a level's construction starts) and a simulator that may be half built
+bool lease_world_ready() { return mgr().is_live_client() && world_up() && Level().Server; }
 
 // The ids belong to the generator of the world they were reserved in: another world here (the host's load, a rejoin of
 // ours: join::world_generation) leaves nothing of them, nor of the creates in flight. Under g_out_lock.
@@ -1577,7 +1578,7 @@ struct HostLeaseCounters
 
 void host_sync_leases() { g_leases.set_epoch(join::world_generation()); }
 
-bool host_world_ready() { return g_pGameLevel && ai().get_alife() && Level().Server && !Device.dwPrecacheFrame; }
+bool host_world_ready() { return world_up() && Level().Server && !Device.dwPrecacheFrame; } // level-change review: world_up
 
 // Ids the leases held go back to this world's generator. An id it has free already is left alone (a second free would
 // put it into the free list twice).
@@ -1988,7 +1989,7 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 // gives the front requests their turns.
 void host_pump_spawns()
 {
-	if (!g_spawn_queue.total() || !g_pGameLevel || !ai().get_alife() || !Level().Server || Device.dwPrecacheFrame)
+	if (!g_spawn_queue.total() || !world_up() || !Level().Server || Device.dwPrecacheFrame) // level-change review: world_up
 		return;
 	const u32 epoch = join::host_world_epoch();
 	const auto gone = [epoch](const spawn::QueuedRequest& r)
@@ -3005,7 +3006,7 @@ void frame()
 	client_flush_launches(); // W3a: before the outbox (a launch usually precedes a drop of the launcher)
 	client_pump_leases(); // F2 T12b: retries go out with this frame's outbox
 	client_flush();
-	if (mgr().is_live_client())
+	if (mgr().is_live_client() && world_up()) // level-change review: it destroys and asks for objects of the world
 		client_pump_rebuilds(); // F2 T5 fix round 1
 }
 

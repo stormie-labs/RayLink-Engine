@@ -1091,9 +1091,17 @@ void frame()
 {
 	if (mgr().is_host())
 	{
+		// Level-change review: what the engine recorded while the world was not up belongs to a world that is gone, or is
+		// being built (every client rejoins from the new world's save): an id of the old one names another object in the
+		// new one. R2 C2 did this when the simulator was null; a level in the making (g_pGameLevel set, simulator half
+		// built, no actor) was not covered.
+		if (!world_up())
+		{
+			g_host_events.clear();
+			return;
+		}
 		host_process_events();
-		if (g_pGameLevel && ai().get_alife()) // R2 C2: the level may outlive the simulator for a frame
-			host_send_snapshots();
+		host_send_snapshots();
 	}
 }
 

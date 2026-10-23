@@ -275,6 +275,14 @@ struct Session::Impl
 	std::deque<std::function<void()>> m_pending;
 	bool m_running_pending = false;
 
+	// Level-change review: game messages for a world that is not there (coop_world_gate.h)
+	std::function<wgate::World()> m_world_fn;
+	wgate::HoldQueue m_held;
+	bool m_gap_open = false; // the world was missing when a game message was due, and is not back yet
+	uint64_t m_gaps = 0;
+	uint64_t m_gap_dropped = 0; // dropped since the gap opened
+	wgate::HoldStats m_gap_base; // m_held.stats() when the gap opened
+
 	// ------------------------------------------------------------------ logging / callbacks
 
 	void logf(const char* fmt, ...)
@@ -336,6 +344,118 @@ struct Session::Impl
 			if (m_self.on_peer_left)
 				m_self.on_peer_left(id, reason);
 		});
+	}
+
+	// ------------------------------------------------------------------ the world gate
+
+	wgate::World world_of() const { return m_world_fn ? m_world_fn() : wgate::World::Up; }
+
+	// The handler of a game message, as game_message() always called it.
+	void run_handler(uint16_t type, PeerId from, const std::shared_ptr<std::vector<uint8_t>>& data)
+	{
+		auto it = m_handlers.find(type);
+		if (it == m_handlers.end())
+			return;
+		Handler h = it->second; // copy: the handler may re-register itself
+		Reader r(data->data() + 2, data->size() - 2);
+		h(from, r);
+	}
+
+	void open_gap(uint16_t type, wgate::World world)
+	{
+		if (m_gap_open)
+			return;
+		m_gap_open = true;
+		++m_gaps;
+		m_gap_dropped = 0;
+		m_gap_base = m_held.stats();
+		if (world == wgate::World::Hole)
+			logf("no world here right now (a level is being built or torn down): game messages that need one wait for it, "
+				 "the first is %s",
+				msg_name(type));
+		else
+			logf("this machine is not in the host's world: game messages that need one are dropped, the first is %s",
+				msg_name(type));
+	}
+
+	void close_gap()
+	{
+		if (!m_gap_open)
+			return;
+		m_gap_open = false;
+		const wgate::HoldStats& now = m_held.stats();
+		logf("world is up again: %llu waiting message(s) ran, %llu void (made in an older world), %llu expired, %llu pushed "
+			 "out, %llu from a player who left; %llu dropped while it was away",
+			static_cast<unsigned long long>(now.replayed - m_gap_base.replayed),
+			static_cast<unsigned long long>(now.void_epoch - m_gap_base.void_epoch),
+			static_cast<unsigned long long>(now.expired - m_gap_base.expired),
+			static_cast<unsigned long long>(now.evicted - m_gap_base.evicted),
+			static_cast<unsigned long long>(now.gone - m_gap_base.gone), static_cast<unsigned long long>(m_gap_dropped));
+	}
+
+	// The world is up: what waited for it runs, in arrival order, in the epoch it was made in.
+	void replay_held()
+	{
+		if (m_held.empty())
+			return;
+		m_held.drain(
+			m_epoch, m_now, [this] { return m_role != Role::None && world_of() == wgate::World::Up; },
+			[this](wgate::Held& h) {
+				Conn* c = find_serial(h.conn);
+				if (!c || !is_joined(*c))
+					return false;
+				run_handler(h.type, peer_id_of(*c), h.bytes);
+				return true;
+			});
+	}
+
+	// Once per update: a gap or a queue with the world back is closed even if no game message follows.
+	void tick_world()
+	{
+		if (m_role == Role::None || (!m_gap_open && m_held.empty()) || !m_world_fn || m_world_fn() != wgate::World::Up)
+			return;
+		emit([this] {
+			replay_held();
+			close_gap();
+		});
+	}
+
+	void deliver_game(uint16_t type, PeerId from, uint64_t serial, uint32_t epoch,
+		const std::shared_ptr<std::vector<uint8_t>>& data)
+	{
+		wgate::World world = world_of();
+		if (world == wgate::World::Up && (!m_held.empty() || m_gap_open))
+		{
+			replay_held(); // what came before goes first
+			close_gap();
+			world = world_of(); // a replayed handler may have started something
+		}
+		switch (wgate::decide(wgate::need_of(static_cast<Msg>(type)), world))
+		{
+		case wgate::Act::Run:
+			run_handler(type, from, data);
+			break;
+		case wgate::Act::Drop:
+			++m_stats[type].world_dropped;
+			++m_gap_dropped;
+			open_gap(type, world);
+			break;
+		case wgate::Act::Hold:
+		{
+			++m_stats[type].world_held;
+			wgate::Held h;
+			h.conn = serial;
+			h.type = type;
+			h.epoch = epoch;
+			h.at_ms = m_now;
+			h.bytes = data;
+			open_gap(type, world);
+			if (m_held.push(std::move(h)) && first_time("held-evict"))
+				logf("the queue of waiting game messages is full (%u entries, %u KiB): the oldest go first",
+					unsigned(m_held.limits().max_entries), unsigned(m_held.limits().max_bytes / 1024));
+			break;
+		}
+		}
 	}
 
 	// ------------------------------------------------------------------ stats
@@ -620,14 +740,10 @@ struct Session::Impl
 		}
 		const PeerId from = peer_id_of(c);
 		auto data = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
-		emit([this, type, from, data] {
-			auto it = m_handlers.find(type);
-			if (it == m_handlers.end())
-				return;
-			Handler h = it->second; // copy: the handler may re-register itself
-			Reader r(data->data() + 2, data->size() - 2);
-			h(from, r);
-		});
+		const uint64_t serial = c.serial;
+		const uint32_t epoch = m_epoch; // host: c.epoch == m_epoch here (checked above)
+		// Level-change review: the handler runs when the world it needs is there (deliver_game, coop_world_gate.h)
+		emit([this, type, from, serial, epoch, data] { deliver_game(type, from, serial, epoch, data); });
 	}
 
 	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else counted, logged, false.
@@ -1467,6 +1583,7 @@ struct Session::Impl
 	void update(uint64_t now_ms)
 	{
 		m_now = now_ms;
+		tick_world();
 		if (!m_tp.active())
 		{
 			run_pending();
@@ -1506,6 +1623,8 @@ struct Session::Impl
 					net::Transport::disconnect_now(c->peer);
 		m_out_q.clear();
 		m_in_q.clear();
+		m_held.clear(); // the world they waited for belongs to a session that is over
+		m_gap_open = false;
 		for (auto& c : m_conns)
 			if (c->peer)
 				net::Transport::set_user(c->peer, nullptr);
@@ -1930,6 +2049,10 @@ void Session::set_world_epoch(uint32_t epoch)
 		s.m_epoch = epoch;
 		if (s.m_role == Role::None)
 			return;
+		// Level-change review: a message that waited for the old world's return is void now (coop_world_gate.h)
+		if (const size_t voided = s.m_held.purge(epoch))
+			s.logf("%u waiting game message(s) made in world epoch %u are void: the world is epoch %u now", unsigned(voided),
+				unsigned(old), unsigned(epoch));
 		s.logf("world epoch %u (was %u)", unsigned(epoch), unsigned(old));
 		// The world those blobs carry is gone: not a byte more of them.
 		for (auto& c : s.m_conns)
@@ -1951,6 +2074,21 @@ void Session::set_world_epoch(uint32_t epoch)
 uint32_t Session::world_epoch() const
 {
 	return m->m_epoch;
+}
+
+void Session::set_world_gate(std::function<wgate::World()> gate)
+{
+	m->m_world_fn = std::move(gate);
+}
+
+Session::WorldGateStats Session::world_gate_stats() const
+{
+	WorldGateStats out;
+	out.hold = m->m_held.stats();
+	out.queued = m->m_held.size();
+	out.queued_bytes = m->m_held.bytes();
+	out.gaps = m->m_gaps;
+	return out;
 }
 
 void Session::send_chat(const std::string& text)

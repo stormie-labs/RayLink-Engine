@@ -849,6 +849,18 @@ void on_player_died(PeerId from, Reader& r)
 
 // ---------------------------------------------------------------- host relay
 
+// Level-change review: what the hooks recorded while the world was not up (a load records the parent changes of the whole
+// new population) belongs to a world that is gone or still being built; every client rejoins from the new world's save,
+// and an id of the old world names another object in the new one.
+void host_discard()
+{
+	xrCriticalSectionGuard guard(g_lock);
+	g_parent_changes.clear();
+	g_drop_positions.clear();
+	g_deaths.clear();
+	g_local_destroyed.clear();
+}
+
 void host_flush()
 {
 	xr_map<u16, u16> changes;
@@ -972,8 +984,13 @@ void reset()
 void frame()
 {
 	if (mgr().is_host())
-		host_flush();
-	else if (mgr().is_live_client())
+	{
+		if (world_up())
+			host_flush();
+		else
+			host_discard();
+	}
+	else if (mgr().is_live_client() && world_up())
 	{
 		client_step_parents();
 		client_step_deaths();

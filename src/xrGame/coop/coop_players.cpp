@@ -243,7 +243,11 @@ bool State::read(Reader& r)
 		return refuse_state("position is not a finite number");
 	if (!validate::speed_ok(v, kMaxSpeed))
 		return refuse_state("speed too high or velocity is not a finite number");
-	if (!g_pGameLevel)
+	// Level-change review: g_pGameLevel is set when a level's construction starts, its geometry box only when the level is
+	// loaded (bReady): live 2026-10-23 the host refused ten states of a client at a level exit as "position outside the
+	// level" while it built the next one. The session no longer hands PlayerState over without a world
+	// (coop_world_gate.h); this is the second line.
+	if (!world_up())
 		return false; // nothing to check the position against yet: not the peer's fault, not counted
 	const Fbox& box = Level().ObjectSpace.GetBoundingVolume();
 	const float lo[3] = {box.x1, box.y1, box.z1};

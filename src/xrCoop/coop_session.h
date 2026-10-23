@@ -12,6 +12,7 @@
 
 #include "coop_protocol.h"
 #include "coop_wire.h"
+#include "coop_world_gate.h"
 
 namespace coop
 {
@@ -62,6 +63,8 @@ struct MsgStats
 	uint64_t sent_count = 0, sent_bytes = 0;
 	uint64_t recv_count = 0, recv_bytes = 0;
 	uint64_t rate_dropped = 0; // host: received but dropped by limit_rate, from all clients (T12 review, Ruling 18)
+	uint64_t world_held = 0; // game message that came while the world was missing and waited for it (coop_world_gate.h)
+	uint64_t world_dropped = 0; // ... and was dropped (void without the world, or a client that is not in the host's world)
 };
 
 // Network condition emulation for tests (applied on send and receive inside Session).
@@ -146,6 +149,22 @@ public:
 	// host() and connect() start at 0.
 	void set_world_epoch(uint32_t epoch);
 	uint32_t world_epoch() const;
+
+	// Level-change review (owner 2026-10-23): a game message is for a world, and the world is not always there (a level
+	// is built or torn down, a client is in the menu or loading). `gate` tells the world of this machine whenever a
+	// handler is due; with none every message runs (the library's tests, a session before the game sets it). The rule
+	// and the table are in coop_world_gate.h: a message whose handler needs a world waits (host) or is dropped (client)
+	// until `gate` says Up; waiting messages made in an older world epoch are void. Held messages run in arrival order,
+	// before any newer one.
+	void set_world_gate(std::function<wgate::World()> gate);
+	struct WorldGateStats
+	{
+		wgate::HoldStats hold;
+		size_t queued = 0; // waiting now
+		size_t queued_bytes = 0;
+		uint64_t gaps = 0; // times the world went missing with a game message due
+	};
+	WorldGateStats world_gate_stats() const;
 
 	// --- callbacks (all optional) ---
 	std::function<void(const PeerInfo&)> on_peer_joined; // host: client accepted; client: other player joined

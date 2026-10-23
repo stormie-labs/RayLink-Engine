@@ -1517,7 +1517,7 @@ void host_on_activate(PeerId from, Reader& r)
 
 void host_on_request(PeerId from, Reader& r)
 {
-	if (!mgr().is_host() || !g_pGameLevel || sync::host_peer_joining(from))
+	if (!mgr().is_host() || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
 		return;
 	switch (RequestKind(r.u8()))
 	{
@@ -1971,7 +1971,7 @@ void reset()
 
 void host_on_peer_ready(PeerId id)
 {
-	if (!mgr().is_host() || !g_pGameLevel)
+	if (!mgr().is_host() || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
 		return;
 	const u64 now = now_ms();
 	u32 zones = 0, bodies = 0, anims = 0;

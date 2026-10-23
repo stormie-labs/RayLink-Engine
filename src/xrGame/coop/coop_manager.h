@@ -56,6 +56,10 @@ public:
 
 	u64 now_ms() const;
 
+	// What the session's world gate asks whenever a game message is due (xrCoop/coop_world_gate.h): the host's world is Up
+	// or in a Hole; a client's is Up only while it is live in the host's world, else Absent. Main thread.
+	wgate::World world_state() const;
+
 private:
 	Manager();
 	void install_session_callbacks();
@@ -71,6 +75,16 @@ private:
 };
 
 inline Manager& mgr() { return Manager::get(); }
+
+// Level-change review (owner 2026-10-23, xrCoop/coop_world_gate.h): the level this machine plays is UP: constructed and
+// loaded (g_pGameLevel->bReady: set at the end of IGame_Level::Load, cleared first thing in CLevel::net_Stop), the ALife
+// simulator and the local actor exist. g_pGameLevel alone says nothing: IGame_Level::IGame_Level() sets it at the START of
+// the construction and ai().get_alife() is set at the start of the simulator's constructor (live 2026-10-23: a handler met
+// ai().alife() null inside CLevel::CLevel()). Actor() may be called in an up world only: it asserts on GameID(). Main thread.
+bool world_up();
+// A level exists but is not up: it is being built or torn down. A pass that cleans up "no level at all" itself still runs
+// when there is none (!g_pGameLevel); in a gap it must not run.
+bool world_gap();
 
 // Registers coop_* console commands (called from CCC_RegisterCommands).
 void register_console_commands();
