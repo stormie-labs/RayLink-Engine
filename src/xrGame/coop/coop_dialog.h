@@ -8,15 +8,21 @@
 //
 // Lock messages (ids in host numbering, reliable lane):
 //   DialogLock        client -> host   u16 npc, u8 keepalive     ask for the lock / refresh it
-//   DialogLockResult  host -> client   u16 npc, u8 LockResult    0 granted, 1 busy, 2 gone, 3 refused
+//   DialogLockResult  host -> client   u16 npc, u8 LockResult    0 granted, 1 busy, 2 gone, 3 refused, 4 too far,
+//                                      [u8 reason]            5 not willing + why (xrCoop/coop_talks.h)
 //   DialogUnlock      client -> host   u16 npc                   release (talk window closed)
 //                     host -> client   u16 npc                   lock revoked (timeout, NPC gone)
-// Host: grants when nobody else (the host included) holds the NPC; a player holds at most one lock.
+// Host: grants when nobody else (the host included) holds the NPC; a player holds at most one lock. B8 (build 10): a
+// client's request is also judged by the host's meet rules for THAT client's character (Lua coop_npc_meet.talk_verdict:
+// wounded, hostile and fighting, the stock "use" rules where the running game applies them); a refusal is "not willing"
+// with the reason. The client's puppet only mirrors a talk flag, it is not asked.
 // Locks are released on DialogUnlock, when the holder leaves, and after 120 s without a keep-alive
 // (clients refresh every 30 s while talking). The host's own talk takes the lock at once and is
 // refused while a client holds the NPC. Repeats change nothing (P6).
 // Client: the talk window does not open until the host granted the lock; then the talk is started
-// again by the engine's own path (CActor::RunTalkDialog). Denied: a HUD message "busy".
+// again by the engine's own path (CActor::RunTalkDialog), with talk switched on for the NPC if its flag here said no (the
+// host's grant decides); a talk that still does not start is logged with the cause. Denied: a HUD line with the reason
+// ("busy", "too far", "he is hostile" ...).
 //
 // Included from UI files: keep it free of engine includes.
 #pragma once

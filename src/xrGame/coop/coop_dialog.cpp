@@ -1,5 +1,6 @@
 // Anomaly Coop — talk lock for NPC dialogs. See coop_dialog.h.
 #include "stdafx.h"
+#include "pch_script.h" // B8: the host asks coop_npc_meet.talk_verdict
 #include "coop_dialog.h"
 #include "coop_manager.h"
 #include "coop_net.h"
@@ -15,6 +16,9 @@
 #include "InventoryOwner.h"
 #include "entity_alive.h"
 #include "UIGameSP.h"
+#include "script_game_object.h"
+#include "ai_space.h"
+#include "script_engine.h"
 #include "string_table.h"
 #include "ui/UIStatic.h"
 #include "ui/UITalkWnd.h"
@@ -35,27 +39,8 @@ constexpr u64 kStartWaitMs = 3000; // client: granted talk waits this long for t
 // as kTradeReach in coop_trade. A lock is the condition for dialog money (coop_money).
 constexpr float kTalkReach = 6.f;
 
-enum LockResult : u8
-{
-	Granted = 0,
-	Busy = 1, // another player talks to this NPC
-	Gone = 2, // no such NPC on the host or it is dead
-	Refused = 3, // not a talk partner (player avatar)
-	TooFar = 4, // F2 T1 fix round 1: the player's character is not by the NPC on the host
-};
-
-const char* result_name(u8 r)
-{
-	switch (r)
-	{
-	case Granted: return "granted";
-	case Busy: return "busy";
-	case Gone: return "gone";
-	case Refused: return "refused";
-	case TooFar: return "too far";
-	default: return "?";
-	}
-}
+// B8: the results and the reason bytes are in xrCoop/coop_talks.h (shared with the unit tests).
+using namespace talks::lock; // Granted, Busy, Gone, Refused, TooFar, NotWilling
 
 // ---------------------------------------------------------------- host state
 struct HostLock
@@ -88,6 +73,7 @@ ClientState g_cl;
 bool g_refused = false;
 
 u64 g_requests = 0, g_grants = 0, g_denies = 0, g_timeouts = 0, g_released_left = 0, g_host_refused = 0;
+u64 g_not_willing = 0, g_verdict_errors = 0, g_forced = 0, g_not_started = 0; // B8
 
 u64 now_ms() { return mgr().now_ms(); }
 
@@ -132,11 +118,10 @@ CUITalkWnd* talk_window()
 
 // ---------------------------------------------------------------- host
 
-void host_send_result(PeerId to, u16 npc, u8 result)
+void host_send_result(PeerId to, u16 npc, u8 result, talks::Reason why = talks::Reason::None)
 {
 	Writer w(4);
-	w.u16(npc);
-	w.u8(result);
+	talks::write_lock_result(w, {npc, result, why}); // NotWilling carries the reason (B8)
 	net::host_send(to, Msg::DialogLockResult, w);
 }
 
@@ -171,7 +156,63 @@ void host_release_peer(PeerId who, u16 keep)
 	}
 }
 
-u8 host_try_lock(u16 npc, PeerId who)
+// B8: under lua_pcall, arg 1 the NPC's game object, arg 2 the game object of the player's character (the proxy). Asks
+// coop_npc_meet.talk_verdict, which judges with the meet rules of the running game for THAT character: returns true, or
+// false and the name of the reason. Without the script: true.
+int lua_talk_verdict(lua_State* L)
+{
+	lua_getglobal(L, "coop_npc_meet"); // _G.__index loads the module if it was not yet
+	if (lua_istable(L, -1))
+	{
+		lua_getfield(L, -1, "talk_verdict");
+		if (lua_isfunction(L, -1))
+		{
+			lua_pushvalue(L, 1);
+			lua_pushvalue(L, 2);
+			lua_call(L, 2, 2);
+			return 2;
+		}
+	}
+	lua_pushboolean(L, 1);
+	lua_pushnil(L);
+	return 2;
+}
+
+// B8: why the host's meet rules refuse the NPC `io` to the character `me` (both host objects); None = allowed. The
+// client's own puppet flags are not asked: they are a mirror, and without the answer of the running game's rules (a
+// stock rule that G.A.M.M.A. does not apply) they muted NPCs the host could talk to. A script that is missing or fails
+// lets the talk through: the checks of this file (alive, distance, one talker) still stand.
+talks::Reason talk_verdict(CInventoryOwner* io, CObject* me)
+{
+	CGameObject* npc = io ? smart_cast<CGameObject*>(io) : nullptr;
+	CGameObject* who = me ? smart_cast<CGameObject*>(me) : nullptr;
+	CScriptGameObject* lua_npc = npc ? npc->lua_game_object() : nullptr;
+	CScriptGameObject* lua_who = who ? who->lua_game_object() : nullptr;
+	lua_State* L = (lua_npc && lua_who) ? ::ai().script_engine().lua() : nullptr;
+	if (!L || !lua_checkstack(L, 8))
+		return talks::Reason::None;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_talk_verdict);
+	::luabind::object(L, lua_npc).pushvalue();
+	::luabind::object(L, lua_who).pushvalue();
+	if (lua_pcall(L, 2, 2, 0) != 0)
+	{
+		if (g_verdict_errors++ < 5)
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] coop_npc_meet.talk_verdict(%u) failed (the talk is let through): %s", id_of(io), err ? err : "?");
+		}
+		lua_settop(L, top);
+		return talks::Reason::None;
+	}
+	talks::Reason why = talks::Reason::None;
+	if (lua_isboolean(L, -2) && !lua_toboolean(L, -2))
+		why = talks::reason_from_name(lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr); // a refusal is never None
+	lua_settop(L, top);
+	return why;
+}
+
+u8 host_try_lock(u16 npc, PeerId who, talks::Reason* why = nullptr)
 {
 	if (world::is_player_proxy(npc))
 		return Refused;
@@ -193,6 +234,20 @@ u8 host_try_lock(u16 npc, PeerId who)
 	// The host's actor may be talking without a lock (talk started before the session).
 	if (who != kHostPeer && actor_talks_to(npc))
 		return Busy;
+	// B8: the decision whether this NPC talks to a client's character is the host's, for THAT character (B8, build 10:
+	// the flag a puppet carries on the client is only a mirror; it muted NPCs the host could talk to). The host's own
+	// talk is decided by the engine (OfferTalk) as always.
+	if (who != kHostPeer)
+	{
+		CObject* me = g_pGameLevel ? Level().Objects.net_Find(join::proxy_of_peer(who)) : nullptr;
+		const talks::Reason r = talk_verdict(io, me);
+		if (r != talks::Reason::None)
+		{
+			if (why)
+				*why = r;
+			return NotWilling;
+		}
+	}
 	host_release_peer(who, npc); // one talk per player
 	const u64 now = now_ms();
 	HostLock& l = g_locks[npc];
@@ -221,14 +276,19 @@ void host_on_lock(PeerId from, Reader& r)
 		return;
 	}
 	++g_requests;
-	const u8 result = host_try_lock(npc, from);
+	talks::Reason why = talks::Reason::None;
+	const u8 result = host_try_lock(npc, from, &why);
 	if (result == Granted)
 		++g_grants;
 	else
 		++g_denies;
+	if (result == NotWilling)
+		++g_not_willing;
 	const PeerInfo* p = mgr().session().peer(from);
-	::Msg("[coop] talk lock %u (%s) for <%s>: %s", npc, name_of(npc), p ? p->nick.c_str() : "?", result_name(result));
-	host_send_result(from, npc, result);
+	const char* tail = result == NotWilling ? talks::reason_name(why) : "";
+	::Msg("[coop] talk lock %u (%s) for <%s>: %s%s%s", npc, name_of(npc), p ? p->nick.c_str() : "?",
+	    talks::lock::name(result), *tail ? " - " : "", tail);
+	host_send_result(from, npc, result, why);
 }
 
 void host_on_unlock(PeerId from, Reader& r)
@@ -308,26 +368,29 @@ void client_release()
 	g_cl.start = kNoId;
 }
 
-void notify_denied(u8 result)
+void notify_denied(u8 result, talks::Reason why = talks::Reason::None)
 {
-	if (result == Busy)
+	if (result == NotWilling) // B8: the host's meet rules for our character say no; the line tells which
+		hud_message(talks::reason_string_id(why), talks::reason_fallback(why));
+	else if (result == Busy)
 		hud_message("st_coop_talk_busy", "Busy: talking to another player");
 	else if (result == Refused)
 		hud_message("st_coop_talk_refused", "You cannot talk to another player this way");
 	else if (result == TooFar) // F2 T6b: the host sees the player's character far from the NPC
 		hud_message("st_coop_talk_too_far", "You are too far away to talk");
 	else
-		::Msg("[coop] talk refused by the host: %s", result_name(result));
+		::Msg("[coop] talk refused by the host: %s", talks::lock::name(result));
 }
 
 void client_on_result(PeerId, Reader& r)
 {
 	if (!mgr().is_client())
 		return;
-	const u16 npc = r.u16();
-	const u8 result = r.u8();
-	if (!r.ok())
+	talks::LockResultMsg msg;
+	if (!talks::read_lock_result(r, msg))
 		return;
+	const u16 npc = msg.npc;
+	const u8 result = msg.result;
 	if (npc != g_cl.pending)
 	{
 		// Late or repeated answer. A lock we do not want must not stay on the host.
@@ -343,7 +406,7 @@ void client_on_result(PeerId, Reader& r)
 	if (result != Granted)
 	{
 		++g_denies;
-		notify_denied(result);
+		notify_denied(result, msg.reason);
 		return;
 	}
 	++g_grants;
@@ -373,6 +436,27 @@ void client_on_revoke(PeerId, Reader& r)
 	}
 }
 
+// B8: one line in the log when a talk the host allowed did not start here, with the cause (talks::start_block). Read
+// right after the attempt, so it is the state that refused.
+void log_not_started(u16 host_npc, u16 local, bool forced)
+{
+	CInventoryOwner* io = find_owner(local);
+	CActor* a = Actor();
+	CUITalkWnd* wnd = talk_window();
+	talks::StartState st;
+	st.npc_found = io != nullptr;
+	st.npc_alive = alive(io);
+	st.actor_alive = a && a->g_Alive();
+	st.paused = Device.Paused();
+	st.actor_talking = a && a->IsTalking();
+	st.window_shown = wnd && wnd->IsShown();
+	st.partner_talking = io && io->IsTalking();
+	st.talk_enabled = io && io->IsTalkEnabled();
+	++g_not_started;
+	::Msg("[coop] talk with %u (%s) was allowed by the host but did not start: %s%s", host_npc, name_of(local),
+	    talks::start_block_name(talks::start_block(st)), forced ? " (talk had to be forced on here)" : "");
+}
+
 void client_frame()
 {
 	const u64 now = now_ms();
@@ -383,24 +467,45 @@ void client_frame()
 	{
 		CUITalkWnd* wnd = talk_window();
 		if (Device.Paused())
+		{
+			log_not_started(g_cl.start, join::to_local(g_cl.start), false); // B8
 			client_release(); // the player went to the menu meanwhile; he clicks again later
+		}
 		else if (wnd && wnd->IsShown())
 		{
 			// The refused window has not hidden yet, or another talk is open.
 			if (now - g_cl.start_at > kStartWaitMs)
+			{
+				log_not_started(g_cl.start, join::to_local(g_cl.start), false); // B8
 				client_release();
+			}
 		}
 		else
 		{
-			const u16 local = join::to_local(g_cl.start);
+			const u16 host_npc = g_cl.start;
+			const u16 local = join::to_local(host_npc);
 			const bool brk = g_cl.start_break;
 			g_cl.start = kNoId;
 			CInventoryOwner* io = find_owner(local);
 			CActor* a = Actor();
+			bool forced = false;
 			if (io && alive(io) && a && a->g_Alive() && !a->IsTalking())
+			{
+				// B8: the host judged this NPC for our character and allowed the talk. The talk flag of a puppet is
+				// only what the host last sent (and a puppet never runs xr_meet); it must not veto the host's answer.
+				if (!io->IsTalkEnabled())
+				{
+					io->EnableTalk();
+					forced = true;
+					++g_forced;
+				}
 				a->RunTalkDialog(io, brk);
+			}
 			if (!actor_talks_to(local))
-				client_release(); // the talk did not start (NPC no longer willing, actor busy)
+			{
+				log_not_started(host_npc, local, forced); // B8: the NPC died, we are busy, the engine refused
+				client_release();
+			}
 		}
 	}
 
@@ -597,9 +702,10 @@ void print_status()
 	if (mgr().is_host())
 	{
 		const u64 now = now_ms();
-		::Msg("[coop]   talk locks: %u held; %llu requests, %llu granted, %llu denied, %llu timeouts, %llu dropped on leave, "
-		    "%llu host talks refused",
-		    (u32)g_locks.size(), g_requests, g_grants, g_denies, g_timeouts, g_released_left, g_host_refused);
+		::Msg("[coop]   talk locks: %u held; %llu requests, %llu granted, %llu denied (%llu the NPC would not talk), "
+		    "%llu timeouts, %llu dropped on leave, %llu host talks refused, %llu rule errors",
+		    (u32)g_locks.size(), g_requests, g_grants, g_denies, g_not_willing, g_timeouts, g_released_left, g_host_refused,
+		    g_verdict_errors);
 		for (const auto& it : g_locks)
 		{
 			::Msg("[coop]     npc %5u %-28s held by #%u for %llus (seen %llus ago)", it.first, name_of(it.first),
@@ -608,8 +714,9 @@ void print_status()
 	}
 	else if (mgr().is_client())
 	{
-		::Msg("[coop]   talk: lock %u, pending %u, start %u; %llu requests, %llu granted, %llu denied", g_cl.granted,
-		    g_cl.pending, g_cl.start, g_requests, g_grants, g_denies);
+		::Msg("[coop]   talk: lock %u, pending %u, start %u; %llu requests, %llu granted, %llu denied; %llu started with talk forced "
+		    "on, %llu allowed but not started", g_cl.granted, g_cl.pending, g_cl.start, g_requests, g_grants, g_denies, g_forced,
+		    g_not_started);
 	}
 }
 } // namespace dialog
