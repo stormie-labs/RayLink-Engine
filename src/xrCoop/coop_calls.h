@@ -306,11 +306,11 @@ inline constexpr Call kCalls[] = {
 	{"game_object:change_character_reputation", CallClass::Owner},
 	{"game_object:change_goodwill", CallClass::World}, // story Relation path (relation_registry.cpp)
 	{"game_object:change_health", CallClass::Owner}, // another's creature: refused (F2 T12 round 1)
-	{"game_object:change_morale", CallClass::Owner},
-	{"game_object:change_power", CallClass::Owner},
-	{"game_object:change_psy_health", CallClass::Owner},
-	{"game_object:change_radiation", CallClass::Owner},
-	{"game_object:change_satiety", CallClass::Owner},
+	{"game_object:change_morale", CallClass::Owner}, // another's creature: refused (F2 T12 round 2, R1-M1)
+	{"game_object:change_power", CallClass::Owner}, // another's creature: refused (F2 T12 round 2, R1-M1)
+	{"game_object:change_psy_health", CallClass::Owner}, // another's creature: refused (F2 T12 round 2, R1-M1)
+	{"game_object:change_radiation", CallClass::Owner}, // another's creature: refused (F2 T12 round 2, R1-M1)
+	{"game_object:change_satiety", CallClass::Owner}, // another's creature: refused (F2 T12 round 2, R1-M1)
 	{"game_object:change_team", CallClass::World},
 	{"game_object:character_community", CallClass::Read},
 	{"game_object:character_dialogs", CallClass::Read},
@@ -959,7 +959,7 @@ inline constexpr Call kCalls[] = {
 	{"level:set_active_cam", CallClass::View},
 	{"level:set_cam_custom_position_direction", CallClass::View},
 	{"level:set_cam_effector_factor", CallClass::View},
-	{"level:set_game_difficulty", CallClass::World}, // the host's setting (coop_settings); no request path
+	{"level:set_game_difficulty", CallClass::World}, // the host's setting; its real path is the console g_game_difficulty (W3d)
 	{"level:set_music_volume", CallClass::View},
 	{"level:set_pp_effector_factor", CallClass::View},
 	{"level:set_snd_volume", CallClass::View},
@@ -1548,8 +1548,13 @@ inline Gate gate(CallClass cls, bool is_client, bool own_target, bool has_reques
 // The whole decision of the engine's gate (coop_callgate.cpp):
 //   not a client in the host's world   run (the host and single player run everything, bad arguments included);
 //   bad arguments (NaN, a missing id)   refused, even while applying: a bad number neither runs nor goes to the host;
-//   applying a host command             run: the engine applies the host's change, our Lua mirrors call world functions
-//                                       to show it (the event router still drops echoes, R4 4);
+//   applying a host command             run: an engine apply scope (entities::ClientApply) or the host's story being
+//                                       applied (story::applying) is the host's change (the event router still drops
+//                                       echoes, R4 4); our Lua mirrors are NOT under it:
+//                                       coop_npc_meet / coop_npc_world get the host's events through
+//                                       coop_script deliver_inbox, outside both scopes (review R1-M2), so a world
+//                                       function they call (enable_talk, explode ...) must stay without a gate until
+//                                       they run under an apply scope;
 //   else                                the class matrix (gate).
 inline Gate decide(CallClass cls, bool is_client, bool applying, bool own_target, bool has_request_path, bool args_ok)
 {

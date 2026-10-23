@@ -19,15 +19,20 @@
 //                               set_community_goodwill, attach_vehicle (a car, coop_events.cpp client_refuse_vehicle);
 //                               round 1: transfer_money, take_item, enable_level_changer, the properties health,
 //                               psy_health, power, satiety, radiation, morale, bleeding, change_health, set_health_ex,
-//                               buy_supplies, destroy_object
+//                               buy_supplies, destroy_object; round 2: change_psy_health, change_power, change_satiety,
+//                               change_radiation, change_morale
 // Every other export runs as in single player; its row only documents it until it gets a hook.
 //
 // Host, single player and a client before the host's world (its own world still runs while the host's downloads):
 // always Run, nothing counted. A client in the host's world (requests::lua_client: LoadingWorld, Live): calls::decide.
 //   - Arguments that fail (a position that is not a number, an id this world does not have) are refused.
-//   - While the client applies a host command (entities::client_applying, story::applying) a call runs: it shows the
-//     host's change (the event router still drops echoes, R4 4). Args::runs_while_applying = false keeps the class
-//     rules then (the alife() spawn and ALife gates, weather and time: their behaviour before T12).
+//   - While the client applies a host command (an engine apply scope entities::ClientApply, or the host's story:
+//     story::applying) a call runs: it is the host's change (the event router still drops echoes, R4 4).
+//     Args::runs_while_applying = false keeps the class rules then (the alife() spawn and ALife gates, weather and
+//     time: their behaviour before T12). Our Lua mirrors are NOT covered (review R1-M2): coop_npc_meet and
+//     coop_npc_world get the host's events through coop_script deliver_inbox, outside both scopes, and call
+//     enable_talk / disable_talk / enable_trade / set_start_dialog / explode / enable_anomaly ... Those must stay
+//     without a gate until the mirrors run under an apply scope (a Lua coop.apply(fn) over ClientApply, say).
 //   - Else the class matrix: Run, Request or Refuse.
 // Each Request and Refuse is counted by name; the first 10 refusals of each name are logged with the name, the rest
 // only counted (coop_status: "calls: refused N, requested N" and the ten most refused names). Requested counts what

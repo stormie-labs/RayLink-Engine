@@ -1409,6 +1409,21 @@ int l_talk_holder(lua_State* L)
 	return 1;
 }
 
+// Ruling F2-34 (F2 T12 round 2): coop.talk_recent(peer, npc_id, ms) -> true if player `peer` holds the talk lock of
+// NPC npc_id (host numbering) now or held it no more than ms ago (ms within 0..60000); false otherwise, on a client and
+// on bad arguments. coop_npc_companions takes a client's recruit only right after a talk.
+int l_talk_recent(lua_State* L)
+{
+	lua_Number peer = 0, npc = 0, ms = 0;
+	const bool ok = mgr().is_host() && arg_id(L, 1, peer) && arg_id(L, 2, npc) && npc < lua_Number(0xffff) &&
+	    lua_type(L, 3) == LUA_TNUMBER;
+	if (ok)
+		ms = lua_tonumber(L, 3);
+	lua_pushboolean(L, ok && ms >= 0 && ms <= 60000 &&
+	    dialog::host_talked_recently(PeerId(peer), u16(npc), u32(ms)) ? 1 : 0);
+	return 1;
+}
+
 void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -1434,6 +1449,7 @@ void register_raw(lua_State* L)
 		{"bleed_left", &l_bleed_left},
 		{"player_safemode", &l_player_safemode},
 		{"talk_holder", &l_talk_holder}, // W11
+		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)
 		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter
 		{nullptr, nullptr},
 	};

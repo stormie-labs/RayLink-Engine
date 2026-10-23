@@ -123,7 +123,8 @@ BIND_FUNCTION10(&object(), CScriptGameObject::Group, CEntity, g_Group, int, -1);
 BIND_FUNCTION10(&object(), CScriptGameObject::GetFOV, CEntityAlive, ffGetFov, float, -1);
 BIND_FUNCTION10(&object(), CScriptGameObject::GetRange, CEntityAlive, ffGetRange, float, -1);
 
-// Anomaly Coop (F2 T12 round 1 gate, review list item 2): the health properties and change_health of another's
+// Anomaly Coop (F2 T12 round 1 gate, review list item 2; round 2: the other change_*, R1-M1): the health properties and
+// change_* of another's
 // creature are the host's on a client (refused: a "corpse" here that the host does not have, a heal the host never
 // sees; healing an NPC from a client is NPC sync, F2 T22). Our actor's run. A BIND_FUNCTION01 with the gate after the
 // class check.
@@ -140,23 +141,23 @@ COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeHealth, CEntityAl
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetPsyHealth, CEntityAlive, conditions().GetPsyHealth, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetPsyHealth, CEntityAlive, conditions().SetPsyHealth, float, float, "game_object:psy_health");
-BIND_FUNCTION01(&object(), CScriptGameObject::ChangePsyHealth, CEntityAlive, conditions().ChangePsyHealth, float, float);
+COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangePsyHealth, CEntityAlive, conditions().ChangePsyHealth, float, float, "game_object:change_psy_health");
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetPower, CEntityAlive, conditions().GetPower, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetPower, CEntityAlive, conditions().SetPower, float, float, "game_object:power");
-BIND_FUNCTION01(&object(), CScriptGameObject::ChangePower, CEntityAlive, conditions().ChangePower, float, float);
+COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangePower, CEntityAlive, conditions().ChangePower, float, float, "game_object:change_power");
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetSatiety, CEntityAlive, conditions().GetSatiety, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetSatiety, CEntityAlive, conditions().SetSatiety, float, float, "game_object:satiety");
-BIND_FUNCTION01(&object(), CScriptGameObject::ChangeSatiety, CEntityAlive, conditions().ChangeSatiety, float, float);
+COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeSatiety, CEntityAlive, conditions().ChangeSatiety, float, float, "game_object:change_satiety");
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetRadiation, CEntityAlive, conditions().GetRadiation, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetRadiation, CEntityAlive, conditions().SetRadiation, float, float, "game_object:radiation");
-BIND_FUNCTION01(&object(), CScriptGameObject::ChangeRadiation, CEntityAlive, conditions().ChangeRadiation, float, float);
+COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeRadiation, CEntityAlive, conditions().ChangeRadiation, float, float, "game_object:change_radiation");
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetMorale, CEntityAlive, conditions().GetEntityMorale, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetMorale, CEntityAlive, conditions().SetEntityMorale, float, float, "game_object:morale");
-BIND_FUNCTION01(&object(), CScriptGameObject::ChangeMorale, CEntityAlive, conditions().ChangeEntityMorale, float, float);
+COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeMorale, CEntityAlive, conditions().ChangeEntityMorale, float, float, "game_object:change_morale");
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetBleeding, CEntityAlive, conditions().BleedingSpeed, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeBleeding, CEntityAlive, conditions().ChangeBleeding, float, float, "game_object:bleeding");

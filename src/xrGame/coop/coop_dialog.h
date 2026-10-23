@@ -55,6 +55,10 @@ u16 client_partner();
 // F2 T1, host: the NPC whose talk lock player `peer` holds (host numbering, kHostPeer: the host's own talk), 0xffff if
 // none or not the host.
 u16 host_lock_of(PeerId peer);
+// Ruling F2-34 (F2 T12 round 2), host: player `peer` holds the talk lock of `npc` (host numbering) now, or his lock on
+// it ended no more than `window_ms` ago (released, replaced, timed out, the NPC gone; xrCoop/coop_talks.h). False on a
+// client. Lua coop.talk_recent: coop_npc_companions takes a recruit only right after a talk.
+bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms);
 
 // --- engine hooks (ui/UITalkWnd.cpp) ---
 // CUITalkWnd::Show(true), before InitTalkDialog. false: do not initialize; the talk state of both

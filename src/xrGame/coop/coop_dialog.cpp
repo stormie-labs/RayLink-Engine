@@ -8,6 +8,7 @@
 #include "coop_sync.h"
 #include "coop_money.h"
 #include "coop_requests.h"
+#include "xrCoop/coop_talks.h" // Ruling F2-34 (F2 T12 round 2)
 
 #include "Level.h"
 #include "Actor.h"
@@ -65,6 +66,9 @@ struct HostLock
 };
 xr_map<u16, HostLock> g_locks; // npc (host id) -> holder
 u16 g_host_talk = kNoId; // npc the host's own actor talks to under a lock
+// Ruling F2-34 (F2 T12 round 2): per player, the NPCs whose lock just ended (talks::Recent keeps the last 2). One entry
+// per player in the session; a player's entry goes when he leaves.
+xr_map<PeerId, talks::Recent> g_recent;
 
 // ---------------------------------------------------------------- client state
 struct ClientState
@@ -143,6 +147,13 @@ void host_send_revoke(PeerId to, u16 npc)
 	net::host_send(to, Msg::DialogUnlock, w);
 }
 
+// Ruling F2-34: the lock of `holder` on `npc` ends now (coop.talk_recent remembers it a while).
+void note_ended(PeerId holder, u16 npc)
+{
+	if (holder != kInvalidPeer)
+		g_recent[holder].ended(npc, now_ms());
+}
+
 // Releases every lock of `who` except the one on `keep`.
 void host_release_peer(PeerId who, u16 keep)
 {
@@ -152,6 +163,7 @@ void host_release_peer(PeerId who, u16 keep)
 		{
 			if (who == kHostPeer && g_host_talk == it->first)
 				g_host_talk = kNoId;
+			note_ended(who, it->first); // F2-34
 			it = g_locks.erase(it);
 		}
 		else
@@ -228,7 +240,10 @@ void host_on_unlock(PeerId from, Reader& r)
 		return;
 	auto it = g_locks.find(npc);
 	if (it != g_locks.end() && it->second.holder == from)
+	{
+		note_ended(from, npc); // F2-34: the talk window closed; a recruit event may arrive right after
 		g_locks.erase(it);
+	}
 }
 
 void host_frame()
@@ -261,6 +276,7 @@ void host_frame()
 		{
 			if (l.holder != kHostPeer)
 				host_send_revoke(l.holder, it->first);
+			note_ended(l.holder, it->first); // F2-34
 			it = g_locks.erase(it);
 		}
 		else
@@ -427,6 +443,7 @@ void frame()
 void reset()
 {
 	g_locks.clear();
+	g_recent.clear(); // F2-34
 	g_host_talk = kNoId;
 	g_cl = ClientState();
 }
@@ -448,6 +465,7 @@ void on_peer_left(PeerId id)
 			++it;
 	}
 	g_released_left += n;
+	g_recent.erase(id); // F2-34: his recent talks go with him
 }
 
 bool may_start_talk(CInventoryOwner* partner, bool disable_break)
@@ -554,6 +572,15 @@ PeerId host_talk_holder(u16 npc) // W11
 }
 
 u16 client_partner() { return mgr().is_client() ? g_cl.granted : kNoId; } // F2 T1
+
+bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms) // Ruling F2-34
+{
+	if (!mgr().is_host() || peer == kInvalidPeer)
+		return false;
+	const auto it = g_recent.find(peer);
+	static const talks::Recent kNone;
+	return talks::talked_recently(host_lock_of(peer), it == g_recent.end() ? kNone : it->second, npc, now_ms(), window_ms);
+}
 
 u16 host_lock_of(PeerId peer) // F2 T1
 {

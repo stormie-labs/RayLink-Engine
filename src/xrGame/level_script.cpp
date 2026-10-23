@@ -292,8 +292,11 @@ float get_time_factor()
 
 void set_game_difficulty(ESingleGameDifficulty dif)
 {
+	// Anomaly Coop (F2 T12 round 1 gate): the difficulty is the host's. Nothing in Lua calls this export: the stock sets
+	// it with the console command g_game_difficulty (game_difficulties.script, exec_console_cmd), and that console path
+	// carries the host's factors (W3d coop_settings); CConsole:execute is a world row without a gate (review R1-M6).
 	if (coop::callgate::client_gate("level:set_game_difficulty", nullptr) == coop::calls::Gate::Refuse)
-		return; // Anomaly Coop (F2 T12 round 1 gate): the difficulty is the host's (coop_settings)
+		return;
 	g_SingleGameDifficulty = dif;
 	game_cl_Single* game = smart_cast<game_cl_Single*>(Level().game);
 	VERIFY(game);
