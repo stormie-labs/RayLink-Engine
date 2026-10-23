@@ -118,20 +118,58 @@ int l_unregister_source(lua_State* L)
 	return 1;
 }
 
-// coop.checkpoint.claim_tent(x, y, z) -> bool: "I put up a tent here" (F3 Task 7). Host: checked at once; client: sent
-// to the host (at most one per 2 s). The answer is a checkpoint (coop_checkpoint_changed) or the host's
-// coop_checkpoint_refused; false outside a session, for a position that is not one, or a claim sent too soon.
+// The kind of a claim from argument `idx`: nothing or nil is a tent, else "tent" | "sleepbag" | "pack" (F3 T7 round 1).
+bool arg_claim_what(lua_State* L, int idx, checkpoint::ClaimWhat& out)
+{
+	const int t = lua_type(L, idx);
+	if (t == LUA_TNONE || t == LUA_TNIL)
+	{
+		out = checkpoint::ClaimWhat::Tent;
+		return true;
+	}
+	if (t != LUA_TSTRING)
+		return false;
+	const char* s = lua_tostring(L, idx);
+	for (const checkpoint::ClaimWhat w :
+	    {checkpoint::ClaimWhat::Tent, checkpoint::ClaimWhat::Sleepbag, checkpoint::ClaimWhat::Pack})
+		if (s && !xr_strcmp(s, checkpoint::claim_what_name(w)))
+		{
+			out = w;
+			return true;
+		}
+	return false;
+}
+
+// coop.checkpoint.claim_tent(x, y, z [, what]) -> bool: "I put up a tent (a sleeping bag) here" or "pack mine up at
+// this spot" (F3 Task 7; what "tent" (default) | "sleepbag" | "pack"). Host: checked at once; client: sent to the host (at
+// most one per 2 s). The answer is his Tent checkpoint (coop_checkpoint_changed), the item back for a pack-up, or
+// coop_checkpoint_refused(reason, what); false outside a session, for a position or kind that is not one, or a claim
+// sent too soon.
 int l_claim_tent(lua_State* L)
 {
 	float p[3] = {0, 0, 0};
-	bool ok = arg_number(L, 1, p[0]) && arg_number(L, 2, p[1]) && arg_number(L, 3, p[2]);
+	checkpoint::ClaimWhat what = checkpoint::ClaimWhat::Tent;
+	bool ok = arg_number(L, 1, p[0]) && arg_number(L, 2, p[1]) && arg_number(L, 3, p[2]) && arg_claim_what(L, 4, what);
 	if (ok)
 	{
 		Fvector pos;
 		pos.set(p[0], p[1], p[2]);
-		ok = sources::claim_tent(pos);
+		ok = sources::claim_tent(what, pos);
 	}
 	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
+// coop.checkpoint.tent_owner(id) -> character id | nil: host, whose tent or sleeping bag `id` is (F3 T7 round 1, for
+// T13: the host's Lua adds a client's tent to item_tent's list); nil on a client, for nobody's or an absent owner's.
+int l_tent_owner(lua_State* L)
+{
+	u16 id = 0;
+	const u16 owner = arg_character(L, 1, id) ? sources::host_tent_owner(id) : u16(0xffff);
+	if (owner == 0xffff)
+		lua_pushnil(L);
+	else
+		lua_pushnumber(L, lua_Number(owner));
 	return 1;
 }
 } // namespace
@@ -145,6 +183,7 @@ void register_lua(lua_State* L)
 		{"register_source", &l_register_source}, // F3 Task 7
 		{"unregister_source", &l_unregister_source},
 		{"claim_tent", &l_claim_tent},
+		{"tent_owner", &l_tent_owner}, // F3 T7 round 1
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

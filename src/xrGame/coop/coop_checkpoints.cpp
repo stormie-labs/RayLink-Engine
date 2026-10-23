@@ -71,7 +71,7 @@ struct Stats
 {
 	u64 sets = 0, refused = 0, arrivals = 0, stories = 0, rollbacks = 0;
 	u64 sent = 0, reloads = 0, fixes = 0, unreadable = 0, vanished = 0;
-	u64 received = 0, malformed = 0, mirror_full = 0;
+	u64 received = 0, malformed = 0, mirror_full = 0, refusals = 0; // refusals: F3 T7 round 1
 };
 Stats g_stat;
 
@@ -472,6 +472,20 @@ void client_on_state(PeerId from, Reader& rd)
 	}
 	++g_stat.received;
 	const u16 local = join::to_local(m.character);
+	if (m.refused()) // F3 T7 round 1 (Ruling F3-5): the answer to my own claim; the mirror does not change
+	{
+		if (local != 0)
+		{
+			++g_stat.malformed;
+			if (log_allowed(g_stat.malformed))
+				::Msg("! [coop] checkpoints: a refused claim of character %u is not mine, ignored", local);
+			return;
+		}
+		++g_stat.refusals;
+		script::queue_callback("coop_checkpoint_refused", {script::cb_str(checkpoint::refusal_name(m.reason)),
+		    script::cb_str(checkpoint::claim_what_name(m.what))});
+		return;
+	}
 	if (!g_mirror.apply(local, m))
 	{
 		++g_stat.mirror_full;
@@ -559,8 +573,8 @@ void print_status()
 	}
 	else if (mgr().is_client())
 	{
-		::Msg("[coop]   checkpoints: %u known, received %llu, malformed %llu, over the bound %llu", u32(g_mirror.size()),
-		    g_stat.received, g_stat.malformed, g_stat.mirror_full);
+		::Msg("[coop]   checkpoints: %u known, received %llu (claims refused %llu), malformed %llu, over the bound %llu",
+		    u32(g_mirror.size()), g_stat.received, g_stat.refusals, g_stat.malformed, g_stat.mirror_full);
 		for (const auto& it : g_mirror.records())
 			::Msg("[coop]   checkpoint of %u: %s", it.first, describe(it.second).c_str());
 	}

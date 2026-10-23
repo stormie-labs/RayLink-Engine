@@ -27,15 +27,81 @@ constexpr size_t kMaxSlots = 256;
 // Flags of CheckpointState: u16 character (host numbering), u8 flags, then the record unless kStateCleared.
 constexpr uint8_t kStateRollback = 1; // the source of the camp was lost: this is the previous one (or none)
 constexpr uint8_t kStateCleared = 2;  // the player has no checkpoint; no record follows (kind None is never sent)
+// F3 T7 round 1 (Ruling F3-5): the host refused the receiver's own CheckpointClaim. Alone, never with the other two:
+// u16 character, u8 flags = 4, u8 what (ClaimWhat), u8 reason (Refusal), nothing else. It goes to the claimant only,
+// and the receiver's mirror of the records does not change.
+constexpr uint8_t kStateRefused = 4;
+
+// CheckpointClaim `what` (client -> host; Rulings F3-6, F3-8). Numbers are sent: do not reorder.
+enum class ClaimWhat : uint8_t
+{
+	Tent = 1, // put up a tent here
+	Sleepbag = 2, // lay out a sleeping bag here
+	Pack = 3 // pack up my tent or sleeping bag at this spot (the host gives back the item it took for it)
+};
+
+// Why the host refused a claim (coop_checkpoint_refused). Numbers are sent: do not reorder.
+enum class Refusal : uint8_t
+{
+	Dead = 1, // the claimant is not alive
+	Far = 2, // the spot is out of his reach (or no tent of his is there to pack)
+	Combat = 3, // an enemy picked him
+	Limit = 4, // he has as many tents and sleeping bags in the world as a player may
+	NoItem = 5, // no tent / sleeping bag item in his inventory
+	Failed = 6 // the host could not do it (spawn, checkpoint, item)
+};
 
 struct StateMsg
 {
 	uint16_t character = 0xffff;
 	uint8_t flags = 0;
-	Record record; // valid unless cleared()
+	Record record; // valid unless cleared() or refused()
+	ClaimWhat what = ClaimWhat::Tent; // refused() only
+	Refusal reason = Refusal::Failed; // refused() only
 	bool rollback() const { return (flags & kStateRollback) != 0; }
 	bool cleared() const { return (flags & kStateCleared) != 0; }
+	bool refused() const { return flags == kStateRefused; }
 };
+
+inline bool claim_what_ok(uint8_t v) { return v >= uint8_t(ClaimWhat::Tent) && v <= uint8_t(ClaimWhat::Pack); }
+
+// "tent" | "sleepbag" | "pack"
+inline const char* claim_what_name(ClaimWhat w)
+{
+	switch (w)
+	{
+	case ClaimWhat::Tent: return "tent";
+	case ClaimWhat::Sleepbag: return "sleepbag";
+	case ClaimWhat::Pack: return "pack";
+	default: return "unknown";
+	}
+}
+
+inline bool refusal_ok(uint8_t v) { return v >= uint8_t(Refusal::Dead) && v <= uint8_t(Refusal::Failed); }
+
+// "dead" | "far" | "combat" | "limit" | "no_item" | "failed"
+inline const char* refusal_name(Refusal r)
+{
+	switch (r)
+	{
+	case Refusal::Dead: return "dead";
+	case Refusal::Far: return "far";
+	case Refusal::Combat: return "combat";
+	case Refusal::Limit: return "limit";
+	case Refusal::NoItem: return "no_item";
+	case Refusal::Failed: return "failed";
+	default: return "unknown";
+	}
+}
+
+// The host's answer "refused" to a claim of `character`.
+inline void write_refusal(Writer& w, uint16_t character, ClaimWhat what, Refusal reason)
+{
+	w.u16(character);
+	w.u8(kStateRefused);
+	w.u8(static_cast<uint8_t>(what));
+	w.u8(static_cast<uint8_t>(reason));
+}
 
 // The current record of a slot as the host sends it: a record that is not valid goes as "cleared".
 inline void write_state(Writer& w, uint16_t character, bool rollback, const Record& cur)
@@ -47,14 +113,27 @@ inline void write_state(Writer& w, uint16_t character, bool rollback, const Reco
 		write(w, cur);
 }
 
-// Strict: a known character id, only the two flag bits, a valid record exactly when not cleared and nothing after it.
-// On false `out` is left as it was.
+// Strict: a known character id, only the two flag bits, a valid record exactly when not cleared and nothing after it;
+// or a refusal alone (kStateRefused: a known what and reason, nothing after). On false `out` is left as it was.
 inline bool read_state(Reader& rd, StateMsg& out)
 {
 	StateMsg m;
 	m.character = rd.u16();
 	m.flags = rd.u8();
-	if (!rd.ok() || m.character == 0xffff || (m.flags & ~(kStateRollback | kStateCleared)) != 0)
+	if (!rd.ok() || m.character == 0xffff)
+		return false;
+	if (m.flags == kStateRefused) // F3 T7 round 1 (Ruling F3-5): alone, a known what and reason, nothing after
+	{
+		const uint8_t what = rd.u8();
+		const uint8_t reason = rd.u8();
+		if (!rd.ok() || rd.remaining() != 0 || !claim_what_ok(what) || !refusal_ok(reason))
+			return false;
+		m.what = static_cast<ClaimWhat>(what);
+		m.reason = static_cast<Refusal>(reason);
+		out = m;
+		return true;
+	}
+	if ((m.flags & ~(kStateRollback | kStateCleared)) != 0)
 		return false;
 	if (!m.cleared() && !read(rd, m.record))
 		return false;

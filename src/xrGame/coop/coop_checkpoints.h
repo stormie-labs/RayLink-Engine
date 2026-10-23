@@ -15,6 +15,9 @@
 //                    the world gets the whole list he may see (his own, everyone's with the group view on) and his
 //                    own id as cleared when he has none. A slot that changed under the store (the character is gone,
 //                    or its id belongs to another character now) is announced like any change (R1 I-1).
+//                    Flags 4 alone (F3 T7 round 1, Ruling F3-5): the host refused the receiver's own CheckpointClaim,
+//                    {u8 what, u8 reason} follow; it goes to the claimant only and the mirror does not change: his
+//                    engine calls coop_checkpoint_refused (coop_checkpoint_sources.h).
 // Callback (owner, and everyone with the group view on; the host too):
 //   coop_checkpoint_changed(local_id, kind, source_local_id or -1, rollback, level or nil). Kind "none" (source -1,
 //   level nil) means the player has no checkpoint any more for this machine: rolled back to nothing, his character

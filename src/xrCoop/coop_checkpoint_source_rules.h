@@ -1,7 +1,9 @@
 // Anomaly Coop — the pure part of the checkpoint sources on the host (F3 Task 7, CHECKPOINTS_DEATH.md §2.2): the
 // settings of mod_system_coop_checkpoints.ltx and their bounds, the CheckpointClaim message, the nearest source a
-// player stands at, the objects mods declare as camps and the book of tents (who owns which one, and the claims that
-// wait for a tent). The engine side is xrGame/coop/coop_checkpoint_sources.cpp.
+// player stands at, the objects mods declare as camps, the mark a tent carries in its custom data (whose it is and
+// the item it was made from), the item a tent is paid with, the sections behind the ids of sources and the book of
+// tents (who owns which one, and the claims that wait for a tent). The engine side is
+// xrGame/coop/coop_checkpoint_sources.cpp.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "coop_checkpoint_rules.h"
+#include "coop_checkpoint_store.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -27,6 +30,9 @@ namespace checkpoint
 constexpr float kMaxSourceRadius = 500.0f;
 // A period of a source: 0..kMaxSourcePeriodMs (10 minutes).
 constexpr uint32_t kMaxSourcePeriodMs = 600000;
+// R1 M-11: a claim waits at least this long — the host's scan runs once a second and the stock tent animation takes
+// 4 s, so a shorter wait never finds the tent.
+constexpr uint32_t kMinClaimMs = 5000;
 // tent_sections keeps at most this many names; a name is 1..64 characters of [A-Za-z0-9_].
 constexpr size_t kMaxTentSections = 16;
 
@@ -35,30 +41,43 @@ struct SourceSettings
 	float campfire_radius = 3.0f; // a lit campfire this close counts
 	uint32_t campfire_dwell_ms = 5000; // stood by it this long, not in a fight
 	float combat_radius = 50.0f; // an enemy that picked the player this close is a fight
-	std::vector<std::string> tent_sections{"ph_tent", "ph_sleepbag"}; // the first one is what the host puts up
+	std::vector<std::string> tent_sections{"ph_tent", "ph_sleepbag"}; // the objects that are tents
+	// R1 (Ruling F3-6): what the host puts up for a client's claim, one of tent_sections each.
+	std::string tent_section = "ph_tent";
+	std::string sleepbag_section = "ph_sleepbag";
 	float tent_rest_radius = 2.0f; // the own tent this close is a rest place
 	float tent_claim_radius = 4.0f; // a claimed spot: this close to the player, the tent this close to the spot
 	uint32_t tent_claim_ms = 15000; // a claim waits this long; the tent appeared at most this long before it
 	std::string cover_list = "misc\\surge_manager.ltx"; // its [list]: the stock surge covers (rest places too)
+	// R1 I-1: its [tent_i_bag_sections] and [sleeping_bag_sections] (the stock TentBagSections / SleepBagSections):
+	// the items a client pays for a tent / a sleeping bag with.
+	std::string item_lists = "items\\settings\\itms_manager.ltx";
 };
 
 inline bool radius_ok(float r) { return std::isfinite(r) && r > 0.0f && r <= kMaxSourceRadius; }
 inline bool period_ok(double ms) { return std::isfinite(ms) && ms >= 0.0 && ms <= double(kMaxSourcePeriodMs); }
+// tent_claim_ms: a whole number of ms in kMinClaimMs..kMaxSourcePeriodMs.
+inline bool claim_period_ok(double ms)
+{
+	return period_ok(ms) && ms >= double(kMinClaimMs) && ms == std::floor(ms);
+}
 
 // "ph_tent, ph_sleepbag" -> {"ph_tent", "ph_sleepbag"}: split at commas, blanks trimmed; an empty, overlong or
 // malformed name and a repeated one are skipped; at most `max_names` are kept, in order.
 std::vector<std::string> split_names(const std::string& list, size_t max_names = kMaxTentSections);
 
+inline bool name_listed(const std::string& name, const std::vector<std::string>& list)
+{
+	return std::find(list.begin(), list.end(), name) != list.end();
+}
+
 // ---------------------------------------------------------------- Msg::CheckpointClaim
 
-// `what` of CheckpointClaim (coop_protocol.h): the player put up a tent at the position (a client: the host puts it
-// up for him, he cannot create a world object).
-constexpr uint8_t kClaimTent = 1;
-
-void write_claim(Writer& w, const float pos[3]);
-// Strict: what = kClaimTent, a position within +-kMaxCoord (NaN and infinity fail), nothing after it. On false `out`
-// is left as it was.
-bool read_claim(Reader& rd, float out[3]);
+// u8 what (ClaimWhat), vec3 pos.
+void write_claim(Writer& w, ClaimWhat what, const float pos[3]);
+// Strict: what is one of ClaimWhat, a position within +-kMaxCoord (NaN and infinity fail), nothing after it. On false
+// the outputs are left as they were.
+bool read_claim(Reader& rd, ClaimWhat& what, float out[3]);
 
 // ---------------------------------------------------------------- the source a player stands at
 
@@ -77,21 +96,86 @@ const SourceSpot* nearest_spot(const std::vector<SourceSpot>& spots, const float
 
 constexpr size_t kMaxModSources = 256;
 
+struct ModSource
+{
+	float radius = 0.0f;
+	std::string section; // of the object when it was registered (R1 M-4: an id given to another object is not it)
+};
+
 // coop.checkpoint.register_source(id, radius): an object a mod declares as a camp ("as a campfire": dwell, no fight).
 class ModSources
 {
 public:
-	// False for "no object" (0xffff), a radius that is not radius_ok, or a new id over kMaxModSources; a known id only
-	// takes the new radius.
-	bool add(uint16_t id, float radius);
+	// False for "no object" (0xffff), a radius that is not radius_ok, or a new id over kMaxModSources; a known id takes
+	// the new radius and section.
+	bool add(uint16_t id, float radius, const std::string& section);
 	bool remove(uint16_t id);
 	bool has(uint16_t id) const;
-	const std::map<uint16_t, float>& all() const { return m_radius; }
-	void clear() { m_radius.clear(); }
+	const std::map<uint16_t, ModSource>& all() const { return m_src; }
+	void clear() { m_src.clear(); }
 
 private:
-	std::map<uint16_t, float> m_radius;
+	std::map<uint16_t, ModSource> m_src;
 };
+
+// ---------------------------------------------------------------- the sections behind ids (R1 M-4)
+
+constexpr size_t kMaxRememberedSources = 2048;
+
+// ALife hands a freed id to the next object it makes. A source is the object it was only while its id still names an
+// object of the same section: the section is remembered when the id is first met.
+class SourceSections
+{
+public:
+	// True if `id` names an object of the section remembered for it (first met: remembered now; over the bound: not
+	// remembered and taken as the same). False when another section is under the id: the old object is gone.
+	bool same(uint16_t id, const std::string& section);
+	// Keeps only these ids.
+	void retain(const std::set<uint16_t>& ids);
+	void forget(uint16_t id) { m_sect.erase(id); }
+	void clear() { m_sect.clear(); }
+	size_t size() const { return m_sect.size(); }
+
+private:
+	std::map<uint16_t, std::string> m_sect;
+};
+
+// ---------------------------------------------------------------- the mark of a tent (its custom data)
+
+// R1 I-2: whose a tent is and what it was made from lives on the tent itself, so it outlasts a load and a level change:
+// section [coop_tent] of its custom data, `owner` = the player key digest of the owner (ledger::character_key) or
+// kHostOwner, `item` = the item section the host took for it (given back when it is packed up; none for the host's own
+// tents, which the stock item_tent puts up and packs).
+constexpr const char* kTentIniSection = "coop_tent";
+constexpr const char* kTentIniOwner = "owner";
+constexpr const char* kTentIniItem = "item";
+constexpr const char* kHostOwner = "host"; // the host's actor has no player key
+constexpr size_t kMaxOwnerKey = 80;
+
+struct TentMark
+{
+	std::string owner;
+	std::string item; // empty: nothing to give back
+};
+
+// An owner key: 1..kMaxOwnerKey characters of [A-Za-z0-9_#] (a 64-digit hex digest, kHostOwner, "#<id>").
+bool owner_key_ok(const std::string& key);
+// Writes the mark (an owner that is not owner_key_ok writes nothing; an item that is not a section name is left out).
+// Other sections, keys and line breaks stay as they are.
+void tent_mark_to_ini(std::string& text, const TentMark& m);
+// The mark of a tent; false if it has no owner (or a malformed one). A malformed item reads as none.
+bool tent_mark_from_ini(const std::string& text, TentMark& out);
+
+// ---------------------------------------------------------------- the item a tent is paid with (R1 I-1)
+
+struct ItemSeen
+{
+	uint16_t id = kNoSource;
+	std::string section;
+};
+
+// The item to take: the lowest id whose section is one of `sections`; kNoSource if none.
+uint16_t pick_item(const std::vector<ItemSeen>& items, const std::vector<std::string>& sections);
 
 // ---------------------------------------------------------------- tents
 
@@ -102,42 +186,55 @@ struct TentSeen
 {
 	uint16_t id = kNoSource;
 	float pos[3] = {0, 0, 0};
+	uint8_t what = 0; // ClaimWhat of its section (tent_section / sleepbag_section); 0: another tent section, either
 };
 
 struct TentMatch
 {
 	uint16_t character = 0xffff;
 	uint16_t tent = kNoSource;
+	ClaimWhat what = ClaimWhat::Tent;
 };
 
-// What the host knows of the tents of a world: when each one appeared, whose it is, and the claims ("I put up a tent
-// here") that wait for one. A claim is closed by the nearest tent within reach of the claimed spot that nobody owns
-// and that appeared at most `fresh_ms` before the claim (or after it); tents that stood when the world was served are
-// never new.
+// A claim that ended without a tent.
+struct ClaimEnd
+{
+	uint16_t character = 0xffff;
+	ClaimWhat what = ClaimWhat::Tent;
+};
+
+// What the host knows of the tents of a world: when each one appeared on the level, whose it is (by owner key: the
+// engine fills it from the tents' marks), and the claims ("I put up a tent here") that wait for one. A claim is closed
+// by the nearest tent of its kind within reach of the claimed spot that nobody owns and that appeared at most
+// `fresh_ms` before the claim (or after it); tents that stood when the world was served are never new.
 class TentBook
 {
 public:
-	// A newly served world: owners and claims are forgotten, and every tent the next observe() sees is old.
+	// A newly served world: tents, owners and claims are forgotten, and every tent the next observe() sees is old.
 	void new_world();
 	// The tents of tent_sections now on the level. A tent not known yet appeared at `now_ms` (old on the first call
 	// after new_world()). False if some were not kept (kMaxTents).
 	bool observe(const std::vector<TentSeen>& tents, uint64_t now_ms);
 	// The tent is gone from the world: forgotten with its owner.
 	void forget(uint16_t tent);
-	// False if the owner is not kept (kMaxTents owners).
-	bool set_owner(uint16_t tent, uint16_t character);
-	uint16_t owner_of(uint16_t tent) const; // 0xffff if nobody's
-	size_t owned_by(uint16_t character) const;
-	// A claim of `character` at `pos`, open for `ttl_ms`; a newer one of the same character replaces his older one.
-	// False if kMaxClaims other characters have one.
-	bool claim(uint16_t character, const float pos[3], uint64_t now_ms, uint32_t ttl_ms);
+	// False for an owner key that is not owner_key_ok, or a new tent over kMaxTents owners.
+	bool set_owner(uint16_t tent, const std::string& key);
+	const std::string& owner_of(uint16_t tent) const; // empty if nobody's
+	size_t owned_by(const std::string& key) const;
+	// R1 I-2: one more tent for this key keeps it within `max` (tents and sleeping bags together).
+	bool may_place(const std::string& key, size_t max) const;
+	// A claim of `character` (owner key `key`) for a tent of `what` at `pos`, open for `ttl_ms`; a newer one of the
+	// same character replaces his older one. False for a key that is not owner_key_ok, Pack, a position that is not one, or
+	// when kMaxClaims other characters have one.
+	bool claim(uint16_t character, const std::string& key, ClaimWhat what, const float pos[3], uint64_t now_ms,
+		uint32_t ttl_ms);
 	bool has_claim(uint16_t character) const;
 	// Closes the claims these tents answer, oldest claim first (see the class); the tent becomes the claimant's.
 	std::vector<TentMatch> match(const std::vector<TentSeen>& tents, float radius, uint32_t fresh_ms);
-	// Drops the claims whose time is up; their characters.
-	std::vector<uint16_t> expire(uint64_t now_ms);
-	// Drops the claims of characters not in `present` (their players left the world); their characters.
-	std::vector<uint16_t> keep_claims_of(const std::set<uint16_t>& present);
+	// Drops the claims whose time is up.
+	std::vector<ClaimEnd> expire(uint64_t now_ms);
+	// Drops the claims of characters not in `present` (their players left the world).
+	std::vector<ClaimEnd> keep_claims_of(const std::set<uint16_t>& present);
 	// Every tent known (for the check that it still exists).
 	std::vector<uint16_t> known() const;
 	size_t tents() const { return m_tents.size(); }
@@ -153,12 +250,14 @@ private:
 	struct Claim
 	{
 		uint16_t character = 0xffff;
+		std::string key;
+		ClaimWhat what = ClaimWhat::Tent;
 		float pos[3] = {0, 0, 0};
 		uint64_t at = 0;
 		uint64_t deadline = 0;
 	};
 	std::map<uint16_t, Tent> m_tents;
-	std::map<uint16_t, uint16_t> m_owner; // tent -> character
+	std::map<uint16_t, std::string> m_owner; // tent -> owner key
 	std::vector<Claim> m_claims; // in the order they came
 	bool m_first = true; // the next observe() is the first of this world
 };
@@ -184,6 +283,12 @@ inline bool pos_ok(const float p[3])
 		if (!std::isfinite(p[i]) || std::fabs(p[i]) > kMaxCoord)
 			return false;
 	return true;
+}
+
+inline const std::string& empty_string()
+{
+	static const std::string s;
+	return s;
 }
 } // namespace detail
 
@@ -211,19 +316,20 @@ inline std::vector<std::string> split_names(const std::string& list, size_t max_
 	return out;
 }
 
-inline void write_claim(Writer& w, const float pos[3])
+inline void write_claim(Writer& w, ClaimWhat what, const float pos[3])
 {
-	w.u8(kClaimTent);
+	w.u8(static_cast<uint8_t>(what));
 	w.vec3(pos);
 }
 
-inline bool read_claim(Reader& rd, float out[3])
+inline bool read_claim(Reader& rd, ClaimWhat& what, float out[3])
 {
-	const uint8_t what = rd.u8();
+	const uint8_t w = rd.u8();
 	float p[3] = {0, 0, 0};
 	rd.vec3(p);
-	if (!rd.ok() || rd.remaining() != 0 || what != kClaimTent || !detail::pos_ok(p))
+	if (!rd.ok() || rd.remaining() != 0 || !claim_what_ok(w) || !detail::pos_ok(p))
 		return false;
+	what = static_cast<ClaimWhat>(w);
 	for (int i = 0; i < 3; ++i)
 		out[i] = p[i];
 	return true;
@@ -249,25 +355,93 @@ inline const SourceSpot* nearest_spot(const std::vector<SourceSpot>& spots, cons
 	return best;
 }
 
-inline bool ModSources::add(uint16_t id, float radius)
+inline bool ModSources::add(uint16_t id, float radius, const std::string& section)
 {
 	if (id == kNoSource || !radius_ok(radius))
 		return false;
-	const auto it = m_radius.find(id);
-	if (it != m_radius.end())
+	const auto it = m_src.find(id);
+	if (it != m_src.end())
 	{
-		it->second = radius;
+		it->second.radius = radius;
+		it->second.section = section;
 		return true;
 	}
-	if (m_radius.size() >= kMaxModSources)
+	if (m_src.size() >= kMaxModSources)
 		return false;
-	m_radius.emplace(id, radius);
+	ModSource s;
+	s.radius = radius;
+	s.section = section;
+	m_src.emplace(id, s);
 	return true;
 }
 
-inline bool ModSources::remove(uint16_t id) { return m_radius.erase(id) != 0; }
+inline bool ModSources::remove(uint16_t id) { return m_src.erase(id) != 0; }
 
-inline bool ModSources::has(uint16_t id) const { return m_radius.count(id) != 0; }
+inline bool ModSources::has(uint16_t id) const { return m_src.count(id) != 0; }
+
+inline bool SourceSections::same(uint16_t id, const std::string& section)
+{
+	const auto it = m_sect.find(id);
+	if (it != m_sect.end())
+		return it->second == section;
+	if (m_sect.size() < kMaxRememberedSources)
+		m_sect.emplace(id, section);
+	return true;
+}
+
+inline void SourceSections::retain(const std::set<uint16_t>& ids)
+{
+	for (auto it = m_sect.begin(); it != m_sect.end();)
+		if (ids.count(it->first))
+			++it;
+		else
+			it = m_sect.erase(it);
+}
+
+inline bool owner_key_ok(const std::string& key)
+{
+	if (key.empty() || key.size() > kMaxOwnerKey)
+		return false;
+	for (const char c : key)
+	{
+		const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+			c == '#';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+inline void tent_mark_to_ini(std::string& text, const TentMark& m)
+{
+	if (!owner_key_ok(m.owner))
+		return;
+	ini_set(text, kTentIniSection, kTentIniOwner, m.owner);
+	if (level_ok(m.item)) // a section name: the alphabet of a level name
+		ini_set(text, kTentIniSection, kTentIniItem, m.item);
+	else
+		ini_erase(text, kTentIniSection, kTentIniItem);
+}
+
+inline bool tent_mark_from_ini(const std::string& text, TentMark& out)
+{
+	TentMark m;
+	if (!ini_get(text, kTentIniSection, kTentIniOwner, m.owner) || !owner_key_ok(m.owner))
+		return false;
+	if (!ini_get(text, kTentIniSection, kTentIniItem, m.item) || !level_ok(m.item))
+		m.item.clear();
+	out = m;
+	return true;
+}
+
+inline uint16_t pick_item(const std::vector<ItemSeen>& items, const std::vector<std::string>& sections)
+{
+	uint16_t best = kNoSource;
+	for (const ItemSeen& it : items)
+		if (it.id != kNoSource && it.id < best && name_listed(it.section, sections))
+			best = it.id;
+	return best;
+}
 
 inline void TentBook::new_world()
 {
@@ -304,40 +478,46 @@ inline void TentBook::forget(uint16_t tent)
 	m_owner.erase(tent);
 }
 
-inline bool TentBook::set_owner(uint16_t tent, uint16_t character)
+inline bool TentBook::set_owner(uint16_t tent, const std::string& key)
 {
-	if (tent == kNoSource)
+	if (tent == kNoSource || !owner_key_ok(key))
 		return false;
 	const auto it = m_owner.find(tent);
 	if (it != m_owner.end())
 	{
-		it->second = character;
+		it->second = key;
 		return true;
 	}
 	if (m_owner.size() >= kMaxTents)
 		return false;
-	m_owner.emplace(tent, character);
+	m_owner.emplace(tent, key);
 	return true;
 }
 
-inline uint16_t TentBook::owner_of(uint16_t tent) const
+inline const std::string& TentBook::owner_of(uint16_t tent) const
 {
 	const auto it = m_owner.find(tent);
-	return it == m_owner.end() ? uint16_t(0xffff) : it->second;
+	return it == m_owner.end() ? detail::empty_string() : it->second;
 }
 
-inline size_t TentBook::owned_by(uint16_t character) const
+inline size_t TentBook::owned_by(const std::string& key) const
 {
 	size_t n = 0;
 	for (const auto& it : m_owner)
-		if (it.second == character)
+		if (it.second == key)
 			++n;
 	return n;
 }
 
-inline bool TentBook::claim(uint16_t character, const float pos[3], uint64_t now_ms, uint32_t ttl_ms)
+inline bool TentBook::may_place(const std::string& key, size_t max) const
 {
-	if (!detail::pos_ok(pos))
+	return owner_key_ok(key) && owned_by(key) < max;
+}
+
+inline bool TentBook::claim(uint16_t character, const std::string& key, ClaimWhat what, const float pos[3],
+	uint64_t now_ms, uint32_t ttl_ms)
+{
+	if (!owner_key_ok(key) || what == ClaimWhat::Pack || !detail::pos_ok(pos))
 		return false;
 	bool had = false;
 	for (auto it = m_claims.begin(); it != m_claims.end(); ++it)
@@ -351,6 +531,8 @@ inline bool TentBook::claim(uint16_t character, const float pos[3], uint64_t now
 		return false;
 	Claim c;
 	c.character = character;
+	c.key = key;
+	c.what = what;
 	for (int i = 0; i < 3; ++i)
 		c.pos[i] = pos[i];
 	c.at = now_ms;
@@ -382,6 +564,8 @@ inline std::vector<TentMatch> TentBook::match(const std::vector<TentSeen>& tents
 			const auto it = m_tents.find(t.id);
 			if (it == m_tents.end() || it->second.old || m_owner.count(t.id))
 				continue; // not observed, stood when the world was served, or somebody's
+			if (t.what != 0 && t.what != static_cast<uint8_t>(c->what))
+				continue; // a sleeping bag is no answer to a tent claim, and the other way round
 			if (it->second.first_seen + fresh_ms < c->at)
 				continue; // put up too long before the claim
 			const double d2 = detail::dist2(t.pos, c->pos);
@@ -393,11 +577,12 @@ inline std::vector<TentMatch> TentBook::match(const std::vector<TentSeen>& tents
 				best_d2 = d2;
 			}
 		}
-		if (best && set_owner(best->id, c->character))
+		if (best && set_owner(best->id, c->key))
 		{
 			TentMatch m;
 			m.character = c->character;
 			m.tent = best->id;
+			m.what = c->what;
 			out.push_back(m);
 			c = m_claims.erase(c);
 		}
@@ -407,13 +592,16 @@ inline std::vector<TentMatch> TentBook::match(const std::vector<TentSeen>& tents
 	return out;
 }
 
-inline std::vector<uint16_t> TentBook::expire(uint64_t now_ms)
+inline std::vector<ClaimEnd> TentBook::expire(uint64_t now_ms)
 {
-	std::vector<uint16_t> out;
+	std::vector<ClaimEnd> out;
 	for (auto c = m_claims.begin(); c != m_claims.end();)
 		if (now_ms >= c->deadline)
 		{
-			out.push_back(c->character);
+			ClaimEnd e;
+			e.character = c->character;
+			e.what = c->what;
+			out.push_back(e);
 			c = m_claims.erase(c);
 		}
 		else
@@ -421,13 +609,16 @@ inline std::vector<uint16_t> TentBook::expire(uint64_t now_ms)
 	return out;
 }
 
-inline std::vector<uint16_t> TentBook::keep_claims_of(const std::set<uint16_t>& present)
+inline std::vector<ClaimEnd> TentBook::keep_claims_of(const std::set<uint16_t>& present)
 {
-	std::vector<uint16_t> out;
+	std::vector<ClaimEnd> out;
 	for (auto c = m_claims.begin(); c != m_claims.end();)
 		if (!present.count(c->character))
 		{
-			out.push_back(c->character);
+			ClaimEnd e;
+			e.character = c->character;
+			e.what = c->what;
+			out.push_back(e);
 			c = m_claims.erase(c);
 		}
 		else

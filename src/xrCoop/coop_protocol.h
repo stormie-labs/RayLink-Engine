@@ -30,6 +30,9 @@ namespace coop
 //    (xrCoop/coop_syncnet.h)
 //    Also in 8 (F2 T6b): MoneyBalance ends with a note (u8 kind, u8 cause, u8 verdict, u32 peer, i32 amount): 19 bytes
 //    instead of 8 (coop_ledger.h MoneyNote: a refusal of the host's, a gift to the receiver)
+//    Also in 8 (F3 T7 round 1, Rulings F3-5, F3-6, F3-8): CheckpointClaim `what` 1 tent, 2 sleeping bag, 3 pack up;
+//    CheckpointState flags 4 alone = the refusal of the receiver's own claim, {u8 what, u8 reason} and nothing else
+//    (xrCoop/coop_checkpoint_store.h)
 constexpr uint32_t kProtocolVersion = 8;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
@@ -158,7 +161,8 @@ enum class Msg : uint16_t
 
 	// F3 checkpoints, shared sleep and death (0x01C0-0x01CF; docs/CHECKPOINTS_DEATH.md). Characters in host numbering.
 	CheckpointState = 0x01C0, // host -> client(s): u16 character, u8 flags (1 rollback, 2 cleared), checkpoint::write(Record)
-	CheckpointClaim = 0x01C1, // client -> host: u8 what (1 = tent placed), vec3 pos
+	                          // or flags 4 alone: u8 what, u8 reason (his own claim refused; F3 T7 round 1)
+	CheckpointClaim = 0x01C1, // client -> host: u8 what (1 tent, 2 sleeping bag, 3 pack up), vec3 pos
 	RestRequest = 0x01C2, // client -> host: u8 op (1 lie down, 2 get up), u8 hours, u8 forced
 	RestState = 0x01C3, // host -> all: u8 world_block, u8 n, n x {u16 character, u8 state, u8 hours}
 	RestSleep = 0x01C4, // host -> all: u8 hours
