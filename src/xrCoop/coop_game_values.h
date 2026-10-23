@@ -1,5 +1,6 @@
 // Anomaly Coop — "Game settings", the part of the engine side that needs no engine (docs/GAME_SETTINGS.md §1.2, §3.4,
-// §3.5). A host's game carries its own values for the 17 console rules of the co-op (friendly fire, death, autosave...).
+// §3.5). A host's game carries its own values for the 19 console rules of the co-op (friendly fire, death, autosave,
+// split levels...).
 // They are set before the world starts and must not stay in the machine's console (user.ltx) when the level is left:
 //   - kGameCvars    the white list: the only console commands Lua may set for a game (coop.game.set_cvars);
 //   - CvarLayer     sets them, remembers the machine's value the first time and gives it back (coop.game.release_cvars,
@@ -23,9 +24,11 @@ namespace game
 {
 // ---------------------------------------------------------------- the white list
 
-// The game rules (§1.2, rows 1..17): the console commands of the co-op host. Everything else (coop_nick, fov, the money
-// limits, the sounds) is the machine's own and stays out of a game. coop_death_share is registered by the death build;
-// a command the console does not know is refused by CvarLayer::apply, so the list may run ahead of the console.
+// The game rules (§1.2, rows 1..19): the console commands of the co-op host. Everything else (coop_nick, fov, the money
+// limits, the sounds, coop_max_map_servers and coop_mapserver_linger of the host's PC) is the machine's own and stays out
+// of a game. coop_death_share is registered by the death build, coop_split_levels and coop_story_together (F3a, rows 18
+// and 19: "split levels" and "story maps together", both on by default) by the split-levels build; a command the console
+// does not know is refused by CvarLayer::apply, so the list may run ahead of the console.
 inline constexpr std::string_view kGameCvars[] = {
 	"coop_friendly_fire",
 	"coop_max_new_characters",
@@ -44,9 +47,11 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_autosave_interval",
 	"coop_autosave_count",
 	"coop_death_share",
+	"coop_split_levels",
+	"coop_story_together",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
-static_assert(kGameCvarCount == 17, "docs/GAME_SETTINGS.md §1.2 lists 17 game rules");
+static_assert(kGameCvarCount == 19, "docs/GAME_SETTINGS.md §1.2 lists 19 game rules");
 
 // The longest value of a rule: a number or a token name (the longest of them, "checkpoint", has ten characters).
 constexpr size_t kMaxCvarValue = 64;
