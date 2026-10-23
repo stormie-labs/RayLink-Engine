@@ -100,7 +100,8 @@ enum class Msg : uint16_t
 
 	// players
 	PlayerState = 0x0110, // unreliable movement snapshot (owner -> host -> others)
-	PlayerVitals = 0x0111, // health, bleeding, radiation, satiety
+	PlayerVitals = 0x0111, // health, bleeding, radiation, satiety; optional tail: the layout of the owner's things
+	                       // (u8 1, varu n, n x {u16 item, u16 tag, u8 place<<6|slot}, xrCoop/coop_gear.h)
 	PlayerEquip = 0x0112, // visual, active slot item, torch, NVG, helmet
 	PlayerAnim = 0x0113, // motion ids by partition
 	PlayerShot = 0x0114, // shot event: weapon, origin, direction
@@ -109,7 +110,8 @@ enum class Msg : uint16_t
 	PlayerWounded = 0x0117, // owner -> host -> all: life state (alive / wounded / dead / spectating), coop_survival
 	PlayerRevive = 0x0118, // revive request / host orders (revive, respawn, spectate, refused)
 	PlayerDied = 0x0119, // engine death of a player character (coop_events relay)
-	PlayerRules = 0x011A, // host -> all: survival rules (death mode, bleed-out, revive health, respawn delay)
+	PlayerRules = 0x011A, // host -> all: survival rules (death mode, bleed-out, revive health, respawn delay); ends
+	                      // with u8 share_pct (coop_death_share); drop 3 = keep (nothing is lost)
 
 	// entities (host -> clients)
 	EntitySpawn = 0x0120, // full CSE state with fixed id
