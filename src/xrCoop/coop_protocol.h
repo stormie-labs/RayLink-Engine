@@ -47,7 +47,13 @@ namespace coop
 // 10 (transition wait, owner 2026-10-23): the waiting point of a level change. TransitionVote is `u8 op, u16 level changer`
 //    (Ready / Cancel, coop_transition.h VoteMsg; protocol 9 sent just the u16), new Msg TransitionState 0x010A (host -> all,
 //    coop_transition.h StateMsg: who waits at which exit)
-constexpr uint32_t kProtocolVersion = 10;
+// 11 (F3a split levels, owner 2026-10-24): every player may be on a different map; the host's process holds the world and
+//    a background map server holds each other map. Msg 0x01D0-0x01DF (LevelMap .. LoadReady: the map table, a player's
+//    leave and his loading barrier, the trunk between the host's process and a map server), MsgSender::TrunkOnly, scopes and
+//    routes (coop_scope.h), the wire layouts in coop_levels_wire.h. Hello ends with `u8 role` (0 player, 1 map server)
+//    and `u8 token[16]`. Also in 11, in the modules that own the layouts: PlayerState + `u16 game_vertex, u32 level_vertex`
+//    (T10), TransitionState + `u8 flags` (T8), WeatherSync + `u8 weather_set` (T15).
+constexpr uint32_t kProtocolVersion = 11;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -189,6 +195,26 @@ enum class Msg : uint16_t
 	DeathMarker = 0x01C5, // host -> all: u16 character, u16 marker object, u8 drop mode
 	NewCharacter = 0x01C6, // client -> host: hardcore, the dead player starts a new character
 
+	// F3a split levels (0x01D0-0x01DF; docs/plans/2026-10-24-f3a-split-levels.md §2.1; layouts: xrCoop/coop_levels_wire.h,
+	// scopes: coop_scope.h). "World server" is the host's process, "map server" a background process of the host's PC
+	// that leads one map for the players on it. Level numbers are game graph level ids.
+	LevelMap = 0x01D0, // world server -> players and map servers: who is on which level, which server leads it, the gates
+	LevelMove = 0x01D1, // player -> world server: leave the level (u8 kind: 1 exit, 2 trip), seq answered by LevelMoveResult
+	LevelMoveResult = 0x01D2, // world server -> player: go / together / refused
+	LevelFlush = 0x01D3, // world server -> map server: send the full state (before a save, a move, a stop)
+	LevelSnapshot = 0x01D4, // map server -> world server: its objects' state (stream, or a full round)
+	LevelEntity = 0x01D5, // map server -> world server: destroy / parent / died / state / item of an object it leads
+	LevelXferUp = 0x01D6, // map server -> world server: the map server's half of an ownership transfer (two-phase)
+	LevelXferDown = 0x01D7, // world server -> map server: the world server's half (the world server repeats it)
+	LevelBrain = 0x01D8, // world server -> map server: assignments of squads to smarts for the squads it leads
+	LevelHash = 0x01D9, // map server -> world server: hash of its set of object ids and of 32 buckets (auditor)
+	LevelResync = 0x01DA, // world server -> map server: send the full state of the buckets in the mask
+	Tunnel = 0x01DB, // host's process <-> map server: a game packet of a player of that map, carried over the trunk
+	MapServerState = 0x01DC, // map server -> world server: loading / ready / draining / stopped, frame times, memory
+	MapServerOrder = 0x01DD, // world server -> map server: serve / drain / stop
+	LoadWait = 0x01DE, // world server -> player on the loading screen: prepared / waiting / enter / cancel, who is ready
+	LoadReady = 0x01DF, // player -> world server: my loading screen is up for this epoch (simultaneous load)
+
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
 	StateDumpRequest = 0x01B0,
@@ -206,6 +232,8 @@ enum class MsgSender : uint8_t
 	Either,
 	HostOnly, // from a client: kicked as malformed before any handler
 	ClientOnly, // from the host: a client logs and ignores it
+	TrunkOnly, // protocol 11: sent by the bridge of a map server to the host's process; from anybody else: kicked as malformed
+	           // (the session's check comes with the bridge, F3a T9: until then no handler takes these)
 };
 MsgSender msg_sender(Msg type);
 
@@ -248,7 +276,17 @@ ManifestDiff diff_manifests(const Manifest& here, const Manifest& host);
 void write_manifest(Writer& w, const Manifest& m);
 bool read_manifest(Reader& r, Manifest& out);
 
+// Protocol 11: who is connecting. A map server is a process of the host's PC that connects to the host's process over
+// the loopback (F3a, plan §1.3); it takes no player slot and proves itself with the token the host's process put on its
+// command line.
+constexpr uint8_t kHelloRolePlayer = 0;
+constexpr uint8_t kHelloRoleMapServer = 1;
+constexpr size_t kHelloTokenSize = 16; // 128 bits
+
 // Client -> host, first message after transport connect.
+// Wire: u32 protocol, str build_id, u64 content_fp, u8 key[16], str nick, u8 role, u8 token[16] (protocol 11). The host
+// reads the protocol first (Session::host_hello), so a protocol 10 Hello, which ends after the nick, still gets its
+// ProtocolMismatch reject; read() of the whole message wants the tail.
 struct HelloMsg
 {
 	uint32_t protocol = kProtocolVersion;
@@ -256,8 +294,11 @@ struct HelloMsg
 	uint64_t content_fp = 0; // manifest_fingerprint of client content
 	PlayerKey key{}; // persistent random player identity
 	std::string nick;
+	uint8_t role = kHelloRolePlayer; // kHelloRolePlayer or kHelloRoleMapServer
+	uint8_t token[kHelloTokenSize] = {}; // map server only: the token of its command line; zeros for a player
 
 	void write(Writer& w) const;
+	// False on overrun or a role that is none of the two.
 	bool read(Reader& r);
 };
 

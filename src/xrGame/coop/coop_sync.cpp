@@ -27,6 +27,7 @@
 #include "coop_autosave.h"
 #include "coop_router.h" // F2 T10
 #include "coop_callgate.h" // F2 T12
+#include "coop_levels.h" // F3a
 
 #include "Level.h"
 #include "Actor.h"
@@ -70,6 +71,7 @@ void install(Session& s)
 	objects::install(s);
 	router::install(); // F2 T10
 	callgate::install(); // F2 T12
+	levels::install(s); // F3a
 }
 
 void on_session_started()
@@ -95,6 +97,7 @@ void on_session_started()
 	objects::reset();
 	router::reset(); // F2 T10: call counters
 	callgate::reset(); // F2 T12: gated call counters, the log budget
+	levels::reset(); // F3a
 	g_joining.clear();
 }
 
@@ -109,6 +112,7 @@ void on_peer_left(PeerId id)
 	money::on_peer_left(id); // F2 T1
 	requests::on_peer_left(id); // F2 T2: his queued spawn requests (F2-21)
 	syncapi::on_peer_left(id); // F2 T14: his request limits
+	levels::on_peer_left(id); // F3a
 	net::host_drop(id);
 	g_joining.erase(id);
 }
@@ -139,6 +143,7 @@ void reset()
 	objects::reset();
 	router::reset(); // F2 T10: call counters
 	callgate::reset(); // F2 T12: gated call counters, the log budget
+	levels::reset(); // F3a
 	g_joining.clear();
 }
 
@@ -213,6 +218,7 @@ void frame()
 	script::frame();
 	syncapi::frame(); // F2 T14
 	story::frame();
+	levels::frame(); // F3a: the registry and the map servers (T10, T9)
 }
 
 void print_status()
@@ -226,6 +232,7 @@ void print_status()
 	syncapi::print_status(); // F2 T14
 	router::print_status(); // F2 T10
 	callgate::print_status(); // F2 T12
+	levels::print_status(); // F3a
 	story::print_status();
 	events::print_status();
 	requests::print_status();

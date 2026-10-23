@@ -114,6 +114,23 @@ const char* msg_name(Msg type)
 	case Msg::DeathMarker: return "DeathMarker";
 	case Msg::NewCharacter: return "NewCharacter";
 
+	case Msg::LevelMap: return "LevelMap";
+	case Msg::LevelMove: return "LevelMove";
+	case Msg::LevelMoveResult: return "LevelMoveResult";
+	case Msg::LevelFlush: return "LevelFlush";
+	case Msg::LevelSnapshot: return "LevelSnapshot";
+	case Msg::LevelEntity: return "LevelEntity";
+	case Msg::LevelXferUp: return "LevelXferUp";
+	case Msg::LevelXferDown: return "LevelXferDown";
+	case Msg::LevelBrain: return "LevelBrain";
+	case Msg::LevelHash: return "LevelHash";
+	case Msg::LevelResync: return "LevelResync";
+	case Msg::Tunnel: return "Tunnel";
+	case Msg::MapServerState: return "MapServerState";
+	case Msg::MapServerOrder: return "MapServerOrder";
+	case Msg::LoadWait: return "LoadWait";
+	case Msg::LoadReady: return "LoadReady";
+
 	case Msg::ScriptEvent: return "ScriptEvent";
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
@@ -178,6 +195,14 @@ MsgSender msg_sender(Msg type)
 	case Msg::RestState: // F3: the host decides the shared sleep
 	case Msg::RestSleep:
 	case Msg::DeathMarker: // F3: the host moves a dead player's things
+	case Msg::LevelMap: // F3a: the world server's table of the levels
+	case Msg::LevelMoveResult:
+	case Msg::LevelFlush: // F3a: orders and halves of the world server toward a map server
+	case Msg::LevelXferDown:
+	case Msg::LevelBrain:
+	case Msg::LevelResync:
+	case Msg::MapServerOrder:
+	case Msg::LoadWait: // F3a: the barrier of a simultaneous load, the world server's word
 	case Msg::StateDump: return MsgSender::HostOnly;
 
 	// a client's requests and reports
@@ -207,6 +232,8 @@ MsgSender msg_sender(Msg type)
 	case Msg::CheckpointClaim: // F3: a player reports his tent, the host checks it
 	case Msg::RestRequest: // F3: a player lies down or gets up
 	case Msg::NewCharacter: // F3: hardcore, a dead player asks for a new character
+	case Msg::LevelMove: // F3a: a player asks to leave his level
+	case Msg::LoadReady: // F3a: a player's loading screen is up
 	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
 
 	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender
@@ -227,7 +254,15 @@ MsgSender msg_sender(Msg type)
 	case Msg::DialogUnlock:
 	case Msg::TradeOp:
 	case Msg::SyncSet: // F2 T14: a client's own data to the host (checked there), the host's changes to clients
+	case Msg::Tunnel: // F3a: both ways over the trunk; the host's process takes it from its bridge only (T9)
 	case Msg::ScriptEvent: return MsgSender::Either;
+
+	// F3a: what a map server's bridge sends to the host's process
+	case Msg::LevelSnapshot:
+	case Msg::LevelEntity:
+	case Msg::LevelXferUp:
+	case Msg::LevelHash:
+	case Msg::MapServerState: return MsgSender::TrunkOnly;
 
 	// core messages: the Session's own dispatch checks them
 	case Msg::Hello:
@@ -371,6 +406,8 @@ void HelloMsg::write(Writer& w) const
 	w.u64(content_fp);
 	w.bytes(key.data(), key.size());
 	w.str(nick);
+	w.u8(role); // protocol 11
+	w.bytes(token, kHelloTokenSize);
 }
 
 bool HelloMsg::read(Reader& r)
@@ -380,7 +417,9 @@ bool HelloMsg::read(Reader& r)
 	content_fp = r.u64();
 	r.bytes(key.data(), key.size());
 	nick = r.str();
-	return r.ok();
+	role = r.u8();
+	r.bytes(token, kHelloTokenSize);
+	return r.ok() && role <= kHelloRoleMapServer;
 }
 
 void WelcomeMsg::write(Writer& w) const

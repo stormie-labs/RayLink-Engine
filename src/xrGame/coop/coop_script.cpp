@@ -16,6 +16,7 @@
 #include "coop_router.h" // F2 T10: router::register_lua (coop.route)
 #include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
 #include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
+#include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 
 #include "ai_space.h"
@@ -1556,6 +1557,7 @@ void register_raw(lua_State* L)
 	syncapi::register_lua(L); // F2 T14: coop.sync.* (coop_sync_api.h)
 	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
 	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
+	levels::register_lua(L); // F3a: coop.levels.*, coop.is_world_server / is_map_authority / is_player / is_mirror (coop_levels.cpp)
 }
 } // namespace
 

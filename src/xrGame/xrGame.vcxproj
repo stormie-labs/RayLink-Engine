@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_levels.h" />
     <ClInclude Include="coop\coop_game_settings.h" />
     <ClInclude Include="coop\coop_callgate.h" />
     <ClInclude Include="coop\coop_sync_api.h" />
@@ -2111,6 +2112,11 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_trunk.cpp" />
+    <ClCompile Include="coop\coop_mapserver.cpp" />
+    <ClCompile Include="coop\coop_levels_xfer.cpp" />
+    <ClCompile Include="coop\coop_levels_alife.cpp" />
+    <ClCompile Include="coop\coop_levels.cpp" />
     <ClCompile Include="coop\coop_game_settings.cpp" />
     <ClCompile Include="coop\coop_callgate.cpp" />
     <ClCompile Include="coop\coop_sync_api.cpp" />

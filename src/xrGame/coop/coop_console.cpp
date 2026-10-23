@@ -13,6 +13,7 @@
 #include "coop_rest.h"
 #include "coop_autosave.h"
 #include "coop_ai.h" // scheduler viewers
+#include "coop_levels.h" // F3a
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -214,5 +215,6 @@ void register_console_commands()
 	autosave::register_console();
 	presence::register_console();
 	npc_ai::register_console(); // scheduler viewers: coop_viewer_range, coop_viewer_frame_radius
+	levels::register_console(); // F3a: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit
 }
 } // namespace coop

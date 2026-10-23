@@ -2502,6 +2502,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_levels.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_game_settings.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7487,6 +7490,21 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_trunk.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_mapserver.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_levels_xfer.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_levels_alife.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_levels.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_game_settings.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

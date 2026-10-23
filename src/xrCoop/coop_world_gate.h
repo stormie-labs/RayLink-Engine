@@ -91,6 +91,15 @@ inline Need need_of(Msg type)
 	case Msg::RestSleep:
 	case Msg::PlayerRules: // survival rules: stored
 	case Msg::PlayerDied: // relay and a log line
+
+	// --- F3a: the tables and the barrier keep their own books (coop_levels, coop_join), a map server's state is a number
+	case Msg::LevelMap: // the newest table is kept; a loading client applies it when its world is there
+	case Msg::LevelMoveResult: // the answer to a request of a player who is in a world
+	case Msg::LevelFlush: // a map server answers from its own world; a hole there means it is loading
+	case Msg::Tunnel: // the inner packet passes its own need_of when it is taken out
+	case Msg::MapServerState:
+	case Msg::MapServerOrder:
+	case Msg::LoadWait: // the loading screen is exactly the time there is no world: the barrier must run in the hole
 	case Msg::StateDump: return Need::Free;
 
 	// --- snapshots and events: the sender sends the next one, or the news is stale when the world is back
@@ -110,7 +119,11 @@ inline Need need_of(Msg type)
 	case Msg::EntityState: // samples and rests repeat, destroyed / broken / explosions are stale visuals
 	case Msg::ZoneState: // the host sends the zones again when a client is live (host_on_peer_ready)
 	case Msg::MoneyBalance: // the host sends the balance again when its player is live (host_on_peer_in_world)
-	case Msg::DeathMarker: return Need::Drop;
+	case Msg::DeathMarker:
+	case Msg::LevelXferDown: // F3a: the world server repeats it until it is acknowledged
+	case Msg::LevelBrain: // 1 Hz, the next one replaces it
+	case Msg::LevelHash: // every 10 s
+	case Msg::LevelResync: return Need::Drop;
 
 	// --- requests, reports of a change and the host's ordered deltas
 	case Msg::PlayerWounded:
@@ -146,6 +159,11 @@ inline Need need_of(Msg type)
 	case Msg::TradeOp:
 	case Msg::CheckpointClaim:
 	case Msg::RestRequest:
+	case Msg::LevelMove: // F3a: a player's leave is a request that changes the world; it waits in a hole, not dropped
+	case Msg::LevelSnapshot: // F3a: a map server's state and its halves of a transfer are deltas, in order
+	case Msg::LevelEntity:
+	case Msg::LevelXferUp:
+	case Msg::LoadReady: // F3a: the same epoch is played after the world is up (plan §1.5 step 7)
 	case Msg::StateDumpRequest: return Need::Hold;
 
 	default: break;

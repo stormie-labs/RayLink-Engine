@@ -76,6 +76,23 @@ private:
 
 inline Manager& mgr() { return Manager::get(); }
 
+// F3a split levels, the roles of this process (docs/plans/2026-10-24-f3a-split-levels.md §1.1). They replace the pair
+// host / client: every check "am I the host" is one of the roles below, whichever the code needs.
+//   world server   the host's process: the world, offline, time, story, money, the save, the registry of levels;
+//   map authority  the host's process for its own level, a map server for the level it serves: the objects, the AI,
+//                  the physics, the requests of the players on that level;
+//   player         the host's process (the host plays) and a remote client;
+//   mirror         a remote client: its objects are copies of an authority's;
+//   map server     a background map server of the host's PC (the key -coop_mapserver, F3a T5/T9).
+// Until a module is moved over, the old names keep their meaning: is_host() = is_world_server() (and the map authority and a
+// player), is_client() = is_mirror() (and a player). A process that is no map server (everything today) is every role of
+// the old host or of the old client. Main thread.
+inline bool is_world_server() { return mgr().is_host(); }
+inline bool is_map_authority() { return mgr().is_host(); } // + a map server, T9
+inline bool is_player() { return mgr().active(); }
+inline bool is_mirror() { return mgr().is_client(); }
+inline bool is_map_server() { return false; } // the map-server key comes with T5/T9
+
 // Level-change review (owner 2026-10-23, xrCoop/coop_world_gate.h): the level this machine plays is UP: constructed and
 // loaded (g_pGameLevel->bReady: set at the end of IGame_Level::Load, cleared first thing in CLevel::net_Stop), the ALife
 // simulator and the local actor exist. g_pGameLevel alone says nothing: IGame_Level::IGame_Level() sets it at the START of

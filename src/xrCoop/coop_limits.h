@@ -165,6 +165,14 @@ constexpr RateRule kClientRateRules[] = {
 	// each create the host refused. The client sends at most one ack per kAckGapMs = 250 ms with everything gathered
 	// meanwhile (coop_requests.cpp client_pump_leases), so 4 a second; 8 in a row for a lag spike.
 	{Msg::IdLeaseAck, 8, 250},
+
+	// F3a split levels. A player asks to leave his level when he steps into an exit or takes a guide's trip; the world
+	// server answers each with LevelMoveResult, and a level change is a load of seconds: 4 in a row (a press and its
+	// retry), then one per second.
+	{Msg::LevelMove, 4, 1000},
+	// One per loading screen of the player (the epoch of the load barrier, plan §1.5); a reconnect repeats it once. 4 in a
+	// row, then one per second.
+	{Msg::LoadReady, 4, 1000},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
