@@ -164,8 +164,8 @@ enum class Msg : uint16_t
 	                          // or flags 4 alone: u8 what, u8 reason (his own claim refused; F3 T7 round 1)
 	CheckpointClaim = 0x01C1, // client -> host: u8 what (1 tent, 2 sleeping bag, 3 pack up), vec3 pos
 	RestRequest = 0x01C2, // client -> host: u8 op (1 lie down, 2 get up), u8 hours, u8 forced
-	RestState = 0x01C3, // host -> all: u8 world_block, u8 n, n x {u16 character, u8 state, u8 hours}
-	RestSleep = 0x01C4, // host -> all: u8 hours
+	RestState = 0x01C3, // host -> all: u8 block, u8 n, n x {u16 character, u8 state, u8 hours}, u8 refused (F3 T11)
+	RestSleep = 0x01C4, // host -> every sleeper: u8 hours (F3 T11)
 	DeathMarker = 0x01C5, // host -> all: u16 character, u16 marker object, u8 drop mode
 	NewCharacter = 0x01C6, // client -> host: hardcore, the dead player starts a new character
 
