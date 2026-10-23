@@ -742,8 +742,11 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 	}
 	if (!mgr().is_client())
 		return false;
-	// F2 T12: the call gate decides (world with the TimeRequest path; an ltx override may run it here)
-	const calls::Gate gate = callgate::client_gate("level:change_game_time", nullptr);
+	// F2 T12: the call gate decides (world with the TimeRequest path; an ltx override may run it here). Round 1: a host
+	// command being applied changes nothing here, as before T12.
+	callgate::Args args;
+	args.runs_while_applying = false;
+	const calls::Gate gate = callgate::client_gate("level:change_game_time", nullptr, args);
 	if (gate == calls::Gate::Run)
 		return false;
 	++g.refused_time;
@@ -772,8 +775,11 @@ bool refuse_script_weather(const char* name)
 	}
 	if (!mgr().is_client())
 		return false;
-	// F2 T12: the call gate decides and logs (world, no request path: the host decides the weather)
-	if (callgate::client_gate(name, nullptr) == calls::Gate::Run)
+	// F2 T12: the call gate decides and logs (world, no request path: the host decides the weather). Round 1: a host
+	// command being applied changes nothing here, as before T12.
+	callgate::Args args;
+	args.runs_while_applying = false;
+	if (callgate::client_gate(name, nullptr, args) == calls::Gate::Run)
 		return false; // an ltx override makes it local
 	++g.refused_weather;
 	return true;

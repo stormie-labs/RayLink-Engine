@@ -1114,8 +1114,11 @@ bool client_refuse_vehicle(CGameObject* holder)
 {
 	if (!holder || !mgr().is_client() || !router_on() || entities::client_applying() || !smart_cast<CCar*>(holder))
 		return false;
-	// F2 T12: the call gate decides and logs (world, no request path: the host drives cars)
-	if (callgate::client_gate("game_object:attach_vehicle", holder) == calls::Gate::Run)
+	// F2 T12: the call gate decides and logs (world, no request path: the host drives cars); round 1: refused while the
+	// host's story is applied too, as before T12 (an engine apply scope returned above)
+	callgate::Args args;
+	args.runs_while_applying = false;
+	if (callgate::client_gate("game_object:attach_vehicle", holder, args) == calls::Gate::Run)
 		return false; // an ltx override lets this client drive
 	g_vehicle_note = true; // the HUD note goes out from frame()
 	++g_c.vehicles_blocked;

@@ -129,9 +129,11 @@ bool lua_release(CSE_Abstract* object);
 // name such as "alife:register"). Returns nullptr.
 CSE_Abstract* lua_refuse(const char* name, const char* why);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
-// set_switch_online/offline; W3a). A wrapper over the call gate (F2 T12): name is the kCalls name ("alife:kill_entity"),
-// target the object id (0xffff = none). true on a coop client = refuse (the gate counted and logged it).
-bool lua_client_refuse(const char* name, u16 target = u16(-1));
+// set_switch_online/offline; W3a; F2 T12 round 1: set_interactive, the restrictions). A wrapper over the call gate
+// (F2 T12): name is the kCalls name ("alife:kill_entity"), target the object id (0xffff = none; else it must exist in
+// this world). runs_while_applying: a host command being applied runs it (the round-1 gates); false keeps the refusal
+// then (the gates before round 1). true on a coop client = refuse (the gate counted and logged it).
+bool lua_client_refuse(const char* name, u16 target = u16(-1), bool runs_while_applying = false);
 
 // --- damage (R-5.1) ---
 // CAI_Stalker::Hit hook. true = do not apply here. Host: a player character never takes damage

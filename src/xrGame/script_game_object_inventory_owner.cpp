@@ -624,7 +624,7 @@ void CScriptGameObject::TransferItem(CScriptGameObject* pItem, CScriptGameObject
 	// comes to us: a mechanic or a box handing it back); the event router sends it as ReqTransfer / ReqTake / ReqDrop
 	// and the host checks owner and reach. Between two others' inventories it is the host's.
 	if (coop::callgate::client_gate_own("game_object:transfer_item",
-			coop::callgate::is_own(pIItem->object().ID()) || coop::callgate::is_own(pForWho->object().ID())) == coop::calls::Gate::Refuse)
+			coop::calls::own_move(coop::callgate::is_own(pIItem->object().ID()), coop::callgate::is_own(pForWho->object().ID()))) == coop::calls::Gate::Refuse)
 		return;
 
 	// выбросить у себя
@@ -653,6 +653,12 @@ void CScriptGameObject::TakeItem(CScriptGameObject* pItem)
 		ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "!CScriptGameObject::TakeItem | Cannot take not CInventoryItem item");
 		return;
 	}
+
+	// Anomaly Coop (F2 T12 round 1 gate, review I2): as transfer_item - the taker or the item is ours (a ReqTake /
+	// ReqTransfer the host checks), else the host's
+	if (coop::callgate::client_gate_own("game_object:take_item",
+			coop::calls::own_move(coop::callgate::is_own(pIItem->object().ID()), coop::callgate::is_own(object().ID()))) == coop::calls::Gate::Refuse)
+		return;
 
 	// In case of an existing parent, transfer item as usual
 	// probably doesn't work on NPC for now and needs fixing if needed in the future
@@ -734,6 +740,16 @@ void CScriptGameObject::TransferMoney(int money, CScriptGameObject* pForWho)
 	{
 		ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "Character does not have enought money");
 		return;
+	}
+
+	// Anomaly Coop (F2 T12 round 1 gate, review I2): on a client only our actor pays: its side goes to the host's money
+	// journal (GE_MONEY, F2 T1); the receiver's money is the host's and is not changed here. Another payer: refused (the
+	// same as give_money on an NPC).
+	switch (coop::callgate::client_gate("game_object:transfer_money", &object()))
+	{
+	case coop::calls::Gate::Refuse: return;
+	case coop::calls::Gate::Request: GiveMoneySafe(pOurOwner, -money, true); return;
+	case coop::calls::Gate::Run: break;
 	}
 
     // Leave negative money transfer possibility intact, unknown how it is used in 3rd party

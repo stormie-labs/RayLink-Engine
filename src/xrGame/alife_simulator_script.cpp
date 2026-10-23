@@ -21,6 +21,10 @@
 #include "level.h"
 #include "coop/coop_requests.h" // Anomaly Coop
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
+#include "coop/coop_story.h" // Anomaly Coop (F2 T12 round 1): alife():give_info of our actor
+#include "coop/coop_manager.h" // Anomaly Coop (F2 T12 round 1)
+#include "Actor.h" // Anomaly Coop (F2 T12 round 1): g_actor
+#include "InventoryOwner.h"
 
 #include <luabind/iterator_policy.hpp>
 #include <luabind/iterator_pair_policy.hpp>
@@ -40,9 +44,10 @@ CALifeSimulator* alife()
 }
 
 // Anomaly Coop (F2 T12): the call gate of a spawning alife() call on a client in the host's world (Run elsewhere).
-// own: the new object's parent is our actor or under it (ReqSpawn only creates items in our own inventory); a
-// temporary object (create/clone_weapon with register = false) passes as own, its alife():register is gated. A
-// refusal returns nil, as the request path does. position (may be null) must be finite; section names the log line.
+// own: calls::own_spawn - the new object's parent is our actor or under it (ReqSpawn only creates items in our own
+// inventory); a temporary object (create/clone_weapon with register = false) passes as own, its alife():register is
+// gated. A refusal returns nil, as the request path does. position (may be null) must be finite; section names the log
+// line. While a host command is applied the class rules still hold (round 1: as before T12, never the stock create).
 static coop::calls::Gate coop_spawn_gate(const char* name, bool own, const Fvector* position, LPCSTR section)
 {
 	if (!coop::requests::lua_client())
@@ -50,7 +55,37 @@ static coop::calls::Gate coop_spawn_gate(const char* name, bool own, const Fvect
 	coop::callgate::Args args;
 	args.pos = position;
 	args.what = section;
+	args.runs_while_applying = false;
 	return coop::callgate::client_gate_own(name, own, args);
+}
+
+// Anomaly Coop (F2 T12 round 1 gate, review I2): alife():give_info / disable_info write the info registry directly,
+// past the story hook, so a client's info of its own actor never reached the host and the story resync took it back.
+// On a client in the host's world: our actor (id 0) takes the story path of db.actor:give_info_portion
+// (story::on_info: sent to the host, or held, or applied here when it is this machine's), another's registry is the
+// host's (refused). Without our actor's game object (a condlist read while loading: xr_logic pick_section_from_condlist
+// with db.actor == nil) the story path cannot be asked: while loading the registry is written here as the story path
+// itself does then (the resync at live heals it); live, it is refused with a log line.
+// True = handled here; false = the stock registry write runs.
+static bool coop_alife_info(const char* name, ALife::_OBJECT_ID id, LPCSTR info_id, bool give)
+{
+	if (!coop::requests::lua_client())
+		return false;
+	coop::callgate::Args args;
+	args.runs_while_applying = false; // the story path itself knows the host's story being applied
+	switch (coop::callgate::client_gate_own(name, id == 0, args))
+	{
+	case coop::calls::Gate::Run: return false;
+	case coop::calls::Gate::Refuse: return true;
+	case coop::calls::Gate::Request: break;
+	}
+	CInventoryOwner* actor = smart_cast<CInventoryOwner*>(g_actor);
+	if (actor)
+		return coop::story::on_info(actor, shared_str(info_id), give);
+	if (!coop::mgr().is_live_client())
+		return false;
+	coop::callgate::note_refused(name, "our actor has no game object: the story path cannot be asked");
+	return true;
 }
 
 CSE_ALifeDynamicObject* alife_object(const CALifeSimulator* self, ALife::_OBJECT_ID object_id)
@@ -165,24 +200,43 @@ void CALifeSimulator__set_switch_offline(CALifeSimulator* self, ALife::_OBJECT_I
 	self->set_switch_offline(id, value);
 }
 
+// Anomaly Coop (F2 T12 round 1 gate, review list item 5): restrictions and set_interactive change the host's ALife (a
+// client's copy is frozen; an id it does not have crashed it): refused on a client, run while a host command is applied.
 void add_in_restriction(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, ALife::_OBJECT_ID id)
 {
+	if (coop::requests::lua_client_refuse("alife:add_in_restriction", monster ? monster->ID : ALife::_OBJECT_ID(-1), true)) return;
 	alife->add_restriction(monster->ID, id, RestrictionSpace::eRestrictorTypeIn);
 }
 
 void add_out_restriction(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, ALife::_OBJECT_ID id)
 {
+	if (coop::requests::lua_client_refuse("alife:add_out_restriction", monster ? monster->ID : ALife::_OBJECT_ID(-1), true)) return;
 	alife->add_restriction(monster->ID, id, RestrictionSpace::eRestrictorTypeOut);
 }
 
 void remove_in_restriction(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, ALife::_OBJECT_ID id)
 {
+	if (coop::requests::lua_client_refuse("alife:remove_in_restriction", monster ? monster->ID : ALife::_OBJECT_ID(-1), true)) return;
 	alife->remove_restriction(monster->ID, id, RestrictionSpace::eRestrictorTypeIn);
 }
 
 void remove_out_restriction(CALifeSimulator* alife, CSE_ALifeMonsterAbstract* monster, ALife::_OBJECT_ID id)
 {
+	if (coop::requests::lua_client_refuse("alife:remove_out_restriction", monster ? monster->ID : ALife::_OBJECT_ID(-1), true)) return;
 	alife->remove_restriction(monster->ID, id, RestrictionSpace::eRestrictorTypeOut);
+}
+
+// Anomaly Coop (F2 T12 round 1): wrappers so a coop client can refuse these (bound as members before)
+void CALifeSimulator__remove_all_restrictions(CALifeSimulator* self, ALife::_OBJECT_ID id, const RestrictionSpace::ERestrictorTypes& type)
+{
+	if (coop::requests::lua_client_refuse("alife:remove_all_restrictions", id, true)) return;
+	self->remove_all_restrictions(id, type);
+}
+
+void CALifeSimulator__set_interactive(CALifeSimulator* self, ALife::_OBJECT_ID id, bool value)
+{
+	if (coop::requests::lua_client_refuse("alife:set_interactive", id, true)) return;
+	self->set_interactive(id, value);
 }
 
 u32 get_level_id(CALifeSimulator* self)
@@ -219,7 +273,7 @@ CSE_Abstract* CALifeSimulator__spawn_item(CALifeSimulator* self, LPCSTR section,
 
 CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent)
 {
-	switch (coop_spawn_gate("alife:create", coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate): player items via the host
+	switch (coop_spawn_gate("alife:create", coop::calls::own_spawn(true, coop::callgate::is_own(id_parent)), &position, section)) // Anomaly Coop (F2 T12 gate): player items via the host
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true);
 	case coop::calls::Gate::Refuse: return nullptr;
@@ -259,7 +313,7 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 //Alundaio: Allows to call alife():register(se_obj) manually afterward so that packet editing can be done safely when spawning object with a parent
 CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, bool reg = true)
 {
-	switch (coop_spawn_gate("alife:create", !reg || coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate): no id until the host creates it
+	switch (coop_spawn_gate("alife:create", coop::calls::own_spawn(reg, coop::callgate::is_own(id_parent)), &position, section)) // Anomaly Coop (F2 T12 gate): no id until the host creates it
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, reg);
 	case coop::calls::Gate::Refuse: return nullptr;
@@ -288,7 +342,7 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 
 CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent, int ammo_to_spawn)
 {
-	switch (coop_spawn_gate("alife:create_ammo", coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate)
+	switch (coop_spawn_gate("alife:create_ammo", coop::calls::own_spawn(true, coop::callgate::is_own(id_parent)), &position, section)) // Anomaly Coop (F2 T12 gate)
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, id_parent, true, ammo_to_spawn);
 	case coop::calls::Gate::Refuse: return nullptr;
@@ -422,6 +476,7 @@ bool dont_has_info(const CALifeSimulator* self, const ALife::_OBJECT_ID& id, LPC
 
 void AlifeGiveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LPCSTR info_id)
 {
+	if (coop_alife_info("alife:give_info", id, info_id, true)) return; // Anomaly Coop (F2 T12 round 1 gate)
 	KNOWN_INFO_VECTOR *known_info = alife->registry().get<CInfoPortionRegistry>().object(id, true);
 	if (!known_info)
 		return;
@@ -439,6 +494,7 @@ void AlifeGiveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LP
 
 void AlifeRemoveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LPCSTR info_id)
 {
+	if (coop_alife_info("alife:disable_info", id, info_id, false)) return; // Anomaly Coop (F2 T12 round 1 gate)
 	KNOWN_INFO_VECTOR	*known_info = alife->registry().get<CInfoPortionRegistry>().object(id, true);
 	if (!known_info)
 		return;
@@ -498,7 +554,7 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
                                   u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id, ALife::_OBJECT_ID id_parent,
                                   bool bRegister = true)
 {
-	switch (coop_spawn_gate("alife:clone_weapon", !bRegister || coop::callgate::is_own(id_parent), &position, section)) // Anomaly Coop (F2 T12 gate)
+	switch (coop_spawn_gate("alife:clone_weapon", coop::calls::own_spawn(bRegister, coop::callgate::is_own(id_parent)), &position, section)) // Anomaly Coop (F2 T12 gate)
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_clone(object, section, position, level_vertex_id, game_vertex_id, id_parent, bRegister);
 	case coop::calls::Gate::Refuse: return nullptr;
@@ -703,7 +759,7 @@ void CALifeSimulator::script_register(lua_State* L)
 		.def("story_object", (CSE_ALifeDynamicObject *(*)(const CALifeSimulator*, ALife::_STORY_ID))(alife_story_object))
 		.def("set_switch_online", &CALifeSimulator__set_switch_online) // Anomaly Coop: gated wrapper
 		.def("set_switch_offline", &CALifeSimulator__set_switch_offline) // Anomaly Coop: gated wrapper
-		.def("set_interactive", (void (CALifeSimulator::*)(ALife::_OBJECT_ID, bool))(&CALifeSimulator::set_interactive))
+		.def("set_interactive", &CALifeSimulator__set_interactive) // Anomaly Coop (F2 T12 round 1): gated wrapper
 		.def("kill_entity", &kill_entity2) // Anomaly Coop: gated wrapper
 		.def("kill_entity", &kill_entity0)
 		.def("kill_entity", &kill_entity1)
@@ -711,7 +767,7 @@ void CALifeSimulator::script_register(lua_State* L)
 		.def("add_out_restriction", &add_out_restriction)
 		.def("remove_in_restriction", &remove_in_restriction)
 		.def("remove_out_restriction", &remove_out_restriction)
-		.def("remove_all_restrictions", &CALifeSimulator::remove_all_restrictions)
+		.def("remove_all_restrictions", &CALifeSimulator__remove_all_restrictions) // Anomaly Coop (F2 T12 round 1): gated wrapper
 		.def("create", &CALifeSimulator__create)
 		.def("create", &CALifeSimulator__spawn_item2)
 		.def("create", &CALifeSimulator__spawn_item)

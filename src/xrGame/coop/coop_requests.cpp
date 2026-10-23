@@ -18,6 +18,7 @@
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_hits.h"
+#include "xrCoop/coop_moves.h" // Ruling F2-32 (F2 T12 round 1)
 
 #include <cstring>
 
@@ -27,6 +28,7 @@
 #include "Entity.h"
 #include "entity_alive.h"
 #include "InventoryOwner.h"
+#include "InventoryBox.h" // Ruling F2-32: box locks
 #include "Hit.h"
 #include "xrServer.h"
 #include "ai/stalker/ai_stalker.h"
@@ -1391,6 +1393,104 @@ Reason apply_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos)
 	return Reason::Ok;
 }
 
+// Ruling F2-32b: under lua_pcall, arg 1 the NPC's game object; returns the id of the player character leading its
+// squad as a companion, or nothing. The leaders are the host's Lua (coop_npc_companions: squad id -> proxy id, saved in
+// m_data.coop_npc_leaders, dropped when the squad stops being a companion squad); leader_of answers for an NPC.
+int lua_companion_leader_id(lua_State* L)
+{
+	lua_getglobal(L, "coop_npc_companions"); // _G.__index loads the module if it was not yet
+	if (!lua_istable(L, -1))
+		return 0;
+	lua_getfield(L, -1, "leader_of");
+	if (!lua_isfunction(L, -1))
+		return 0;
+	lua_pushvalue(L, 1);
+	lua_call(L, 1, 1); // the leader's game object or nil
+	if (lua_isnil(L, -1))
+		return 0;
+	lua_getfield(L, -1, "id");
+	lua_pushvalue(L, -2);
+	lua_call(L, 1, 1);
+	return 1;
+}
+
+// Ruling F2-32b: is the live NPC `npc` (host numbering) a companion of character `proxy` (his squad's leader)? False
+// for an NPC without a game object here, without a leader, or when the Lua call fails (logged).
+bool companion_of(u16 npc, u16 proxy)
+{
+	CGameObject* go = find_go(npc);
+	lua_State* L = go && go->lua_game_object() ? ai().script_engine().lua() : nullptr;
+	if (!L || !lua_checkstack(L, 8))
+		return false;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_companion_leader_id);
+	::luabind::object(L, go->lua_game_object()).pushvalue();
+	if (lua_pcall(L, 1, 1, 0) != 0)
+	{
+		if (log_allowed())
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] coop_npc_companions.leader_of(%u) failed (not a companion here): %s", npc, err ? err : "?");
+		}
+		lua_settop(L, top);
+		return false;
+	}
+	const bool is = lua_isnumber(L, -1) && u16(lua_tonumber(L, -1)) == proxy;
+	lua_settop(L, top);
+	return is;
+}
+
+// Ruling F2-32 (F2 T12 round 1): one side of a move for moves::check (xrCoop/coop_moves.h), from its top owner: the
+// ground, the requester's own character, another player, a live NPC (and whether the requester holds its talk lock or
+// leads its squad, Ruling F2-32b), a corpse or a box with their locks (the game object's flags, the server object's
+// while offline), or anything else.
+moves::Side move_side(const Req& q, u16 id)
+{
+	moves::Side s;
+	if (id == kNoId)
+		return s; // the ground
+	const u16 root = events::root_of(id);
+	if (root == q.proxy)
+	{
+		s.kind = moves::Side::Mine;
+		return s;
+	}
+	if (is_player(root))
+	{
+		s.kind = moves::Side::Player;
+		return s;
+	}
+	CSE_Abstract* e = events::find_entity(root);
+	CGameObject* go = find_go(root);
+	if (CSE_ALifeInventoryBox* box = smart_cast<CSE_ALifeInventoryBox*>(e))
+	{
+		s.kind = moves::Side::Box;
+		const CInventoryBox* online = smart_cast<CInventoryBox*>(go);
+		s.closed = online ? online->closed() : box->m_closed;
+		s.can_take = online ? online->can_take() : box->m_can_take;
+		return s;
+	}
+	if (CSE_ALifeTraderAbstract* trader = smart_cast<CSE_ALifeTraderAbstract*>(e))
+	{
+		const CEntityAlive* alive = smart_cast<CEntityAlive*>(go);
+		const CSE_ALifeCreatureAbstract* creature = smart_cast<CSE_ALifeCreatureAbstract*>(e);
+		if (alive ? !!alive->g_Alive() : (creature && creature->g_Alive()))
+		{
+			s.kind = moves::Side::LiveNpc;
+			s.talking = dialog::host_lock_of(q.from) == root;
+			s.companion = !s.talking && companion_of(root, q.proxy); // Ruling F2-32b
+			return s;
+		}
+		s.kind = moves::Side::Corpse;
+		const CInventoryOwner* owner = smart_cast<CInventoryOwner*>(go);
+		s.closed = owner ? owner->deadbody_closed_status() : trader->m_deadbody_closed;
+		s.can_take = owner ? owner->deadbody_can_take_status() : trader->m_deadbody_can_take;
+		return s;
+	}
+	s.kind = moves::Side::Other;
+	return s;
+}
+
 Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvector& pos)
 {
 	CSE_Abstract* e = events::find_entity(item);
@@ -1412,6 +1512,17 @@ Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvect
 		return Reason::NotOwner; // never out of another player's pockets (gifts are given, R-6.7)
 	if (dst != kNoId && !is_container(dst))
 		return Reason::NotAllowed;
+	// Ruling F2-32 (F2 T12 round 1): with Ruling F2-30 a client moves items out of another's inventory to its actor; a
+	// live NPC's inventory, out or in, only under the requester's talk lock (a mechanic returning a repaired item, a
+	// dialog) or as his own companion (Ruling F2-32b: the stock companion inventory has no dialog), box and corpse locks
+	// as the stock UI keeps them. A stock script that moves against them is refused here, visibly.
+	if (const moves::Verdict side = moves::check(move_side(q, src), move_side(q, dst)); side != moves::Verdict::Ok)
+	{
+		if (log_allowed())
+			::Msg("[coop] %s #%u from player #%u: item %u from %u to %u refused: %s", msg_name(q.type), q.seq, q.from,
+			    item, src, dst, moves::verdict_text(side));
+		return side == moves::Verdict::NotOwner ? Reason::NotOwner : Reason::NotAllowed;
+	}
 	// R3 В8: the range is checked whatever the client's flags say. What a client applied locally (kMoveLocal: a
 	// missile leaving its grenade, a rocket leaving our launcher) only ever leaves our own hands for the world, which
 	// has no far side; with the flag on a take from the world or a container the range still holds.
@@ -2409,9 +2520,12 @@ bool lua_release(CSE_Abstract* object)
 {
 	if (!object || std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
 		return true; // never created: nothing to release
-	// F2 T12: the call gate decides; our own items (not our actor) have the client_destroy path
+	// F2 T12: the call gate decides; our own items (not our actor) have the client_destroy path. Round 1: as before
+	// T12 it never runs the stock release while a host command is applied (the client's ALife copy is the host's).
 	const u16 id = object->ID;
-	switch (callgate::client_gate_own("alife:release", id != kActor && callgate::is_own(id)))
+	callgate::Args args;
+	args.runs_while_applying = false;
+	switch (callgate::client_gate_own("alife:release", calls::own_release(id == kActor, callgate::is_own(id)), args))
 	{
 	case calls::Gate::Run: return false; // an ltx override runs it here
 	case calls::Gate::Refuse: ++g_cl.lua_refused; return true; // the gate logged it
@@ -2428,13 +2542,17 @@ CSE_Abstract* lua_refuse(const char* name, const char* why)
 	return nullptr;
 }
 
-bool lua_client_refuse(const char* name, u16 target)
+bool lua_client_refuse(const char* name, u16 target, bool runs_while_applying)
 {
 	if (!lua_client())
 		return false;
 	// F2 T12: the call gate decides. These calls have no request path, so a client refuses them unless an ltx override
-	// runs them here; the gate counts and logs.
-	if (callgate::client_gate_id(name, target) == calls::Gate::Run)
+	// runs them here (or, round 1, a host command is being applied and the caller allows it); the gate counts and logs.
+	// Round 1 (review M4): the target must exist in this world, a missing id would crash the ALife call.
+	callgate::Args args;
+	args.id = target;
+	args.runs_while_applying = runs_while_applying;
+	if (callgate::client_gate_id(name, target, args) == calls::Gate::Run)
 		return false;
 	++g_cl.lua_refused;
 	return true;

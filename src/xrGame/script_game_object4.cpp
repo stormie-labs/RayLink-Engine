@@ -51,6 +51,7 @@
 #include "antirad.h"
 #include "BottleItem.h"
 #include "WeaponKnife.h"
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
 
 class CWeapon;
 
@@ -383,6 +384,8 @@ CPhysicObject* CScriptGameObject::get_physics_object()
 
 void CScriptGameObject::enable_level_changer(bool b)
 {
+	if (coop::callgate::client_gate("game_object:enable_level_changer", &object()) == coop::calls::Gate::Refuse)
+		return; // Anomaly Coop (F2 T12 round 1 gate): level changers are the group's (the host's TransitionVote)
 	CLevelChanger* lch = smart_cast<CLevelChanger*>(&object());
 	if (lch)
 		lch->EnableLevelChanger(b);
@@ -450,6 +453,8 @@ void CScriptGameObject::SetHealthEx(float hp)
 {
 	CEntity* obj = smart_cast<CEntity*>(&object());
 	if (!obj) return;
+	if (coop::callgate::client_gate("game_object:set_health_ex", &object()) == coop::calls::Gate::Refuse)
+		return; // Anomaly Coop (F2 T12 round 1 gate): another's creature is the host's
 	clamp(hp, -0.01f, 1.0f);
 	obj->SetfHealth(hp);
 }

@@ -3,7 +3,11 @@
 #include "coop_callgate.h"
 #include "coop_manager.h"
 #include "coop_events.h"
+#include "coop_entities.h" // client_applying
+#include "coop_requests.h" // lua_client
+#include "coop_story.h" // applying
 #include "xrCoop/coop_validate.h"
+#include "xrServer_Objects_ALife_Monsters.h"
 
 #include <algorithm>
 #include <string>
@@ -33,7 +37,6 @@ struct State
 	u32 unknown = 0; // overrides of names kCalls does not have (a modded exe's exports, or a typo)
 	u32 errors = 0;
 	calls::Counters counters;
-	bool told_quiet = false; // "further refusals are only counted" written
 };
 
 State g;
@@ -113,28 +116,21 @@ void read_file(const std::string& name)
 	g.files.push_back(name);
 }
 
-// Counts the decision and logs a refusal while the budget lasts. Under g_lock.
+// Counts the decision and logs a refusal while the name's budget lasts (the first kLoggedPerName of each name, review
+// M7). Under g_lock.
 void note(const char* name, Gate gate, const char* why, u16 target, const char* what)
 {
 	g.counters.note(name, gate);
-	if (gate != Gate::Refuse)
+	if (gate != Gate::Refuse || !g.counters.take_log_line(name))
 		return;
-	if (g.counters.take_log_line())
-	{
-		string64 on;
-		if (target != kNoId)
-			xr_sprintf(on, " on object %u", target);
-		else
-			on[0] = 0;
-		::Msg("[coop] calls: %s%s%s%s%s refused on a client: %s", name, what && *what ? " [" : "", what ? what : "",
-			what && *what ? "]" : "", on, why);
-	}
-	else if (!g.told_quiet)
-	{
-		g.told_quiet = true;
-		::Msg("[coop] calls: %u refusals logged; the rest are only counted (coop_status)",
-			u32(calls::Counters::kLoggedRefusals));
-	}
+	string64 on;
+	if (target != kNoId)
+		xr_sprintf(on, " on object %u", target);
+	else
+		on[0] = 0;
+	const bool last = g.counters.logged(name) >= calls::Counters::kLoggedPerName;
+	::Msg("[coop] calls: %s%s%s%s%s refused on a client: %s%s", name, what && *what ? " [" : "", what ? what : "",
+		what && *what ? "]" : "", on, why ? why : "refused", last ? " (its last line; the rest only count in coop_status)" : "");
 }
 
 const char* why_refused(CallClass cls, bool own)
@@ -144,43 +140,43 @@ const char* why_refused(CallClass cls, bool own)
 	return "a world call with no request path; the host's world is only mirrored here";
 }
 
-// own: decided by the caller; target: for the log only (0xffff = none).
+// own: decided by the caller; target: for the log only (0xffff = none). The decision itself is calls::decide.
 Gate decide(const char* name, bool own, u16 target, const Args& args)
 {
-	if (!name || !mgr().is_client())
-		return Gate::Run; // the host and single player run everything
+	// Review M5: one condition for every gate, the alife() ones' before: a client in the host's world (LoadingWorld,
+	// Live). The host, single player and a client whose own world still runs while the host's downloads run everything.
+	if (!name || !requests::lua_client())
+		return Gate::Run;
 	load_overrides();
+	// P8 on the client side too: a bad number is not run here nor sent to the host
+	string128 bad;
+	bad[0] = 0;
+	if (args.pos && !validate::vec_finite(*args.pos))
+		xr_strcpy(bad, "the position is not a number");
+	else if (args.id != kNoId && !events::find_entity(args.id))
+		xr_sprintf(bad, "object %u is not in this world", args.id);
+	// a host command being applied (an engine apply scope, the host's story) runs: it is the host's change
+	const bool applying = args.runs_while_applying && (entities::client_applying() || story::applying());
 	xrCriticalSectionGuard guard(g_lock);
 	const CallClass cls = g.classes.class_of(name);
-	const Gate gate = calls::gate(cls, true, own, calls::has_request_path(name, own));
-	if (gate == Gate::Refuse)
-	{
-		note(name, gate, why_refused(cls, own), target, args.what);
-		return gate;
-	}
-	// P8 on the client side too: a bad number is not run here nor sent to the host
-	if (args.pos && !validate::vec_finite(*args.pos))
-	{
-		note(name, Gate::Refuse, "the position is not a number", target, args.what);
-		return Gate::Refuse;
-	}
-	if (args.id != kNoId && !events::find_entity(args.id))
-	{
-		string128 why;
-		xr_sprintf(why, "object %u is not in this world", args.id);
-		note(name, Gate::Refuse, why, target, args.what);
-		return Gate::Refuse;
-	}
-	note(name, gate, nullptr, target, args.what);
+	const Gate gate = calls::decide(cls, true, applying, own, calls::has_request_path(name, own), !bad[0]);
+	note(name, gate, gate != Gate::Refuse ? nullptr : (bad[0] ? bad : why_refused(cls, own)), target, args.what);
 	return gate;
 }
 } // namespace
 
 bool is_own(u16 id) { return id != kNoId && (id == kActor || events::root_of(id) == kActor); }
 
+bool own_destroy(u16 id)
+{
+	CSE_Abstract* e = events::find_entity(id);
+	const bool free_item = e && e->ID_Parent == kNoId && !smart_cast<CSE_ALifeCreatureAbstract*>(e);
+	return calls::own_destroy(e != nullptr, is_own(id), free_item);
+}
+
 Gate client_gate(const char* name, CObject* target, const Args& args)
 {
-	if (!mgr().is_client())
+	if (!requests::lua_client())
 		return Gate::Run;
 	const u16 id = target ? target->ID() : kNoId;
 	return decide(name, !target || is_own(id), id, args);
@@ -188,21 +184,21 @@ Gate client_gate(const char* name, CObject* target, const Args& args)
 
 Gate client_gate_id(const char* name, u16 target, const Args& args)
 {
-	if (!mgr().is_client())
+	if (!requests::lua_client())
 		return Gate::Run;
 	return decide(name, target == kNoId || is_own(target), target, args);
 }
 
 Gate client_gate_own(const char* name, bool own_target, const Args& args)
 {
-	if (!mgr().is_client())
+	if (!requests::lua_client())
 		return Gate::Run;
 	return decide(name, own_target, kNoId, args);
 }
 
 void note_refused(const char* name, const char* why)
 {
-	if (!name || !mgr().is_client())
+	if (!name || !requests::lua_client())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	note(name, Gate::Refuse, why ? why : "refused by its request path", kNoId, nullptr);
@@ -218,14 +214,12 @@ void install()
 	g.unknown = 0;
 	g.errors = 0;
 	g.counters.clear();
-	g.told_quiet = false;
 }
 
 void reset()
 {
 	xrCriticalSectionGuard guard(g_lock);
 	g.counters.clear();
-	g.told_quiet = false;
 }
 
 void load_overrides()

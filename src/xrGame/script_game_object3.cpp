@@ -60,6 +60,7 @@
 #include "Torch.h"
 #include "Flashlight.h"
 #include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
 
 namespace MemorySpace
 {
@@ -1463,6 +1464,8 @@ void CScriptGameObject::buy_supplies(CScriptIniFile* ini_file, LPCSTR section)
 		return;
 	}
 
+	if (coop::callgate::client_gate("game_object:buy_supplies", &object()) == coop::calls::Gate::Refuse)
+		return; // Anomaly Coop (F2 T12 round 1 gate): a trader's stock is a world spawn (the event router refused it too)
 	inventory_owner->buy_supplies(
 		*ini_file,
 		section
@@ -2101,6 +2104,10 @@ u32 CScriptGameObject::GetSpatialType()
 
 void CScriptGameObject::DestroyObject()
 {
+	// Anomaly Coop (F2 T12 round 1 gate): counted with the other calls; the decision is the event router's on_destroy
+	// (an own or free item goes to the host, an object outside the host's world is local, the rest is the host's)
+	if (coop::callgate::client_gate_own("game_object:destroy_object", coop::callgate::own_destroy(object().ID())) == coop::calls::Gate::Refuse)
+		return;
 	object().DestroyObject();
 }
 

@@ -6,21 +6,32 @@
 //
 // A gated engine function asks first and does what the answer says:
 //   switch (callgate::client_gate("game_object:give_money", &object())) { Run: stock; Request: path; Refuse: return }
-// Gated now (each hook says "Anomaly Coop (F2 T12)"):
+// Gated now (each hook says "Anomaly Coop (F2 T12 ...)"):
 //   alife_simulator_script.cpp  alife:create, create_ammo, clone_weapon, register, release, kill_entity,
-//                               teleport_object, set_switch_online, set_switch_offline (coop_requests.cpp lua_*)
+//                               teleport_object, set_switch_online, set_switch_offline (coop_requests.cpp lua_*);
+//                               round 1: give_info, disable_info (our actor: the story path), set_interactive,
+//                               add/remove_in/out_restriction, remove_all_restrictions
 //   level_script.cpp            level:set_weather, set_weather_fx, set_weather_smooth, set_weather_weight,
-//                               start_weather_fx_from_time, stop_weather_fx, change_game_time (coop_worldstate.cpp)
+//                               start_weather_fx_from_time, stop_weather_fx, change_game_time (coop_worldstate.cpp);
+//                               round 1: set_game_difficulty, spawn_item, spawn_phantom
 //   script_game_object*.cpp     game_object:transfer_item, give_money, kill, set_npc_position, give_info_portion,
 //                               disable_info_portion, set_relation, set_goodwill, force_set_goodwill, change_goodwill,
-//                               set_community_goodwill, attach_vehicle (a car, coop_events.cpp client_refuse_vehicle)
+//                               set_community_goodwill, attach_vehicle (a car, coop_events.cpp client_refuse_vehicle);
+//                               round 1: transfer_money, take_item, enable_level_changer, the properties health,
+//                               psy_health, power, satiety, radiation, morale, bleeding, change_health, set_health_ex,
+//                               buy_supplies, destroy_object
 // Every other export runs as in single player; its row only documents it until it gets a hook.
 //
-// Host and single player: always Run, nothing counted. A client: Run, Request or Refuse by calls::gate; a call whose
-// arguments fail (a position that is not a number, an id this world does not have) is refused too. Each Request and
-// Refuse is counted by name; the first 10 refusals of a session are logged with the function's name, the rest only
-// counted (coop_status: "calls: refused N, requested N" and the ten most refused names). Requested counts what went
-// down a request path; a path that still refuses (note_refused) counts as refused as well.
+// Host, single player and a client before the host's world (its own world still runs while the host's downloads):
+// always Run, nothing counted. A client in the host's world (requests::lua_client: LoadingWorld, Live): calls::decide.
+//   - Arguments that fail (a position that is not a number, an id this world does not have) are refused.
+//   - While the client applies a host command (entities::client_applying, story::applying) a call runs: it shows the
+//     host's change (the event router still drops echoes, R4 4). Args::runs_while_applying = false keeps the class
+//     rules then (the alife() spawn and ALife gates, weather and time: their behaviour before T12).
+//   - Else the class matrix: Run, Request or Refuse.
+// Each Request and Refuse is counted by name; the first 10 refusals of each name are logged with the name, the rest
+// only counted (coop_status: "calls: refused N, requested N" and the ten most refused names). Requested counts what
+// went down a request path; a path that still refuses (note_refused) counts as refused as well.
 //
 // Threading: Lua calls come from one Lua thread at a time (main or the GameThread worker); print_status comes from the
 // console. One lock guards the overrides and the counters.
@@ -43,6 +54,7 @@ struct Args
 	const Fvector* pos = nullptr; // must be finite (validate::vec_finite)
 	u16 id = u16(-1);             // must name an object of this machine's world (events::find_entity)
 	const char* what = nullptr;   // for the log line only: the section of a spawn, ...
+	bool runs_while_applying = true; // a host command being applied runs (false: the class rules still apply)
 };
 
 // The decision for a call on `target`: own when the target is our actor or under it (an item in our inventory, an
@@ -56,6 +68,9 @@ Gate client_gate_own(const char* name, bool own_target, const Args& args = Args(
 
 // Our actor or an object under it (an item in our inventory). False for 0xffff and for objects not in this world.
 bool is_own(u16 id);
+// destroy_object's own target (calls::own_destroy): as the event router's on_destroy - ours, a free item (no parent, not
+// a creature) or an object outside the host's world.
+bool own_destroy(u16 id);
 
 // A request path refused a call the gate let through (alife:register of an object the host did not create, ...):
 // counted and logged like the gate's own refusals.

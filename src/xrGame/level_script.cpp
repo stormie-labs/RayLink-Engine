@@ -32,6 +32,7 @@
 #include "alife_simulator.h"
 #include "alife_time_manager.h"
 #include "coop/coop_worldstate.h" // Anomaly Coop: host-owned clock and weather
+#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
 #include "UI/UIGameTutorial.h"
 #include "string_table.h"
 #include "ui/UIInventoryUtilities.h"
@@ -291,6 +292,8 @@ float get_time_factor()
 
 void set_game_difficulty(ESingleGameDifficulty dif)
 {
+	if (coop::callgate::client_gate("level:set_game_difficulty", nullptr) == coop::calls::Gate::Refuse)
+		return; // Anomaly Coop (F2 T12 round 1 gate): the difficulty is the host's (coop_settings)
 	g_SingleGameDifficulty = dif;
 	game_cl_Single* game = smart_cast<game_cl_Single*>(Level().game);
 	VERIFY(game);
@@ -739,6 +742,10 @@ void enable_input()
 
 void spawn_phantom(const Fvector& position)
 {
+	coop::callgate::Args coop_args; // Anomaly Coop (F2 T12 round 1 gate): a world spawn (filter_spawn refused it too)
+	coop_args.pos = &position;
+	if (coop::callgate::client_gate_own("level:spawn_phantom", false, coop_args) == coop::calls::Gate::Refuse)
+		return;
 	Level().spawn_item("m_phantom", position, u32(-1), u16(-1), false);
 }
 
@@ -1991,6 +1998,13 @@ void g_send(NET_Packet& P, bool bReliable = 0, bool bSequential = 1, bool bHighP
 //can spawn entities like bolts, phantoms, ammo, etc. which normally crash when using alife():create()
 void spawn_section(LPCSTR sSection, Fvector3 vPosition, u32 LevelVertexID, u16 ParentID, bool bReturnItem = false)
 {
+	// Anomaly Coop (F2 T12 round 1 gate): as alife():create - into our own inventory a ReqSpawn (filter_spawn), a world
+	// spawn is the host's (filter_spawn refused it too)
+	coop::callgate::Args coop_args;
+	coop_args.pos = &vPosition;
+	coop_args.what = sSection;
+	if (coop::callgate::client_gate_own("level:spawn_item", coop::calls::own_spawn(true, coop::callgate::is_own(ParentID)), coop_args) == coop::calls::Gate::Refuse)
+		return;
 	Level().spawn_item(sSection, vPosition, LevelVertexID, ParentID, bReturnItem);
 }
 
