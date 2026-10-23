@@ -99,6 +99,10 @@ void on_container_move(u16 from_id, u16 to_id, u16 item_id);
 
 // For the item layer (WP2): a take/put request was rejected by the host; rebuild the open window.
 void invalidate_views();
+// Host: container `id` (host numbering) is open in somebody's window now, a client's (his ReqContainer) or the host's
+// own. Such a window keeps a raw pointer to the container (CUIActorMenu::m_pInvBox) and reads it every frame, so the
+// host does not release it meanwhile (coop_death's empty death bags, L-1 round 1, I1). False on a client.
+bool host_container_open(u16 id);
 
 // --- engine hooks: trader NPC (ai/trader/ai_trader.cpp) ---
 // False on a coop client: the trader's own world changes (picking items up, dropping, rejecting an

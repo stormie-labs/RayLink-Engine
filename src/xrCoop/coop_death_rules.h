@@ -30,8 +30,9 @@ enum class Mode : uint8_t
 	Hardcore = 1
 };
 
-// What happens to the lost items. Drop: they fall where the character died. Corpse: they go into a stash container.
-// Lose: they are gone.
+// What happens to the lost items. Drop: the share goes into a bag (a coop_death_stash) at the body, Ruling L-1; loose
+// at the body only when no bag can be made. Corpse: the whole backpack goes into such a stash. Lose: the share is gone.
+// (death::plan_losses, coop_death_items.h)
 enum class Drop : uint8_t
 {
 	Drop = 0,

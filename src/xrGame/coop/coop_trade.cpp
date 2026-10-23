@@ -1052,6 +1052,16 @@ void invalidate_views()
 		request_rebuild(now_ms());
 }
 
+bool host_container_open(u16 id)
+{
+	if (!mgr().is_host() || id == kNoId)
+		return false;
+	for (const auto& it : g_open)
+		if (it.second.kind != ContNone && it.second.id == id)
+			return true;
+	return false;
+}
+
 bool trader_local_logic() { return !mgr().is_client(); }
 
 void print_status()

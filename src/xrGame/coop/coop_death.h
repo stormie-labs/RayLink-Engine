@@ -29,7 +29,8 @@
 //            L-1 (carried from F3 T15): the stash names its owner in its custom data when it is spawned
 //            ([coop_death_stash] nick = "<nick>", key = <digest>; stash_owner_to_ini), for the host's Lua marks after
 //            a load; once a second the host releases every death stash on its level that is empty, not waiting for its
-//            items and not open in the host's window (release_empty_bag): the stock frees only inv_backpack.
+//            items and not open in anybody's window, the host's or a client's (release_empty_bag,
+//            trade::host_container_open; L-1 round 1, I1): the stock frees only inv_backpack.
 // Never taken: quest items (IsQuestItem, kind i_quest / i_letter), the PDA, helper items, host-only objects. A client's
 // proxy does not show the host where its player keeps his things (an NPC cannot wear an outfit, has no belt and fills
 // its slots in its own order). The owner's Dead report brings the ids of what he has on (Ruling F3-4, F3 T8b,

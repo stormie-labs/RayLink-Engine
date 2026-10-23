@@ -9,6 +9,7 @@
 #include "coop_money.h"
 #include "coop_script.h"
 #include "coop_survival.h"
+#include "coop_trade.h"
 #include "coop_world.h"
 #include "xrCoop/coop_death_items.h"
 #include "xrCoop/coop_ledger.h"
@@ -713,7 +714,9 @@ bool stash_waiting(u16 stash)
 // stock item_backpack.actor_on_item_take_from_box releases only inv_backpack). Once a second the host looks at the
 // boxes on its level - only an online stash can have been emptied, and every take, a client's too, is a parent change
 // on the host - and releases each coop_death_stash that is empty in the server's state and in its box, does not wait
-// for its items (a pending move) and is not open in the host's own window (release_empty_bag). Any death stash: of this
+// for its items (a pending move) and is not open in anybody's window (release_empty_bag: the host's own, in_use, or a
+// player's, trade::host_container_open - L-1 round 1, I1: his window reads the box through a raw pointer every frame,
+// a teammate taking the last item with the window open is the usual case). Any death stash: of this
 // session, of a loaded world, of a hardcore retirement. The release is the usual one (GE_DESTROY), so every client's
 // mirror loses it and the host's Lua drops its mark.
 void release_empty_bags(u64 t)
@@ -738,6 +741,7 @@ void release_empty_bags(u64 t)
 		s.empty = e && e->children.empty() && box->IsEmpty();
 		s.pending = stash_waiting(o->ID());
 		s.in_use = box && box->in_use();
+		s.open_by_player = trade::host_container_open(o->ID()); // L-1 round 1, I1: a client's window too
 		if (release_empty_bag(s))
 			empty.push_back(o->ID());
 	}

@@ -451,14 +451,17 @@ struct BagState
 	bool empty = false; // nothing in it: the server entity has no child and the box lists no item
 	bool pending = false; // a death still waits to move its items into it (host_stash_pending of the stash)
 	bool in_use = false; // the host has it open in his own window
+	// L-1 round 1, I1: a player has it open in his window, as the host knows from ReqContainer (trade::host_container_open).
+	// His window keeps a raw pointer to the box (CUIActorMenu::m_pInvBox) and reads it every frame.
+	bool open_by_player = false;
 };
 
 // The host releases a death bag that is empty and online, and only that: never one that still waits for its items, has
 // something in it, is offline (nobody can empty it there; it is looked at again when it is online), is open in the
-// host's window (it goes when he closes it), or is not a death bag.
+// host's window or in a player's (L-1 round 1, I1; it goes when he closes it), or is not a death bag.
 inline bool release_empty_bag(const BagState& s)
 {
-	return s.death_stash && s.online && s.empty && !s.pending && !s.in_use;
+	return s.death_stash && s.online && s.empty && !s.pending && !s.in_use && !s.open_by_player;
 }
 
 // The owner of a bag in its custom data (carried from F3 T15, concern 4), written by the host when it spawns the bag:
