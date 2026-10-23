@@ -28,14 +28,16 @@ struct State
 	bool read(Reader& r);
 };
 
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void frame(); // capture & send own state, interpolate avatars
 void print_status();
 void on_peer_left(PeerId id);
 
 // Equipment (visual, item in hands, torch) and vitals of players: coop_equip.cpp.
-void equip_install(Session& s);
+void equip_install_server(Session& s); // F3a T4: PlayerEquip, PlayerVitals
+void equip_install_client(Endpoint& e); // F3a T4: PlayerEquip
 void equip_reset();
 void equip_frame();
 void equip_resend(); // force a full resend (after join)

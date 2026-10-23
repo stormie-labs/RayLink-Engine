@@ -47,7 +47,8 @@ namespace coop
 namespace syncapi
 {
 // Registers the five sync messages. Called once with the manager's session.
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 // The session started or ended, or a client's world is replaced: a client forgets everything of the host's, the host
 // keeps world / player / object (the game's data) and drops the session scope. Requests in flight are answered
 // false, "session ended".

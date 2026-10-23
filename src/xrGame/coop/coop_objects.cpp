@@ -1908,11 +1908,15 @@ void client_frame()
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
+void install_server(Session& s)
 {
-	s.on(Msg::EntityState, [](PeerId from, Reader& r) { client_on_state(from, r); });
-	s.on(Msg::ZoneState, [](PeerId from, Reader& r) { client_on_zones(from, r); });
 	s.on(Msg::EntityEvent, [](PeerId from, Reader& r) { host_on_request(from, r); });
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::EntityState, [](PeerId from, Reader& r) { client_on_state(from, r); });
+	e.on(Msg::ZoneState, [](PeerId from, Reader& r) { client_on_zones(from, r); });
 }
 
 void frame()

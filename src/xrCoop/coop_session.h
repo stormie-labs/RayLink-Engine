@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_local_link.h"
 #include "coop_protocol.h"
 #include "coop_wire.h"
 #include "coop_world_gate.h"
@@ -43,6 +44,7 @@ struct PeerInfo
 	uint32_t rtt_ms = 0;
 	float packet_loss = 0.f; // 0..1 as reported by the transport
 	std::string address; // "ip:port"
+	bool local = false; // F3a T4: the host player over the LocalLink (in players() of a host with one attached)
 };
 
 struct SessionConfig
@@ -76,10 +78,12 @@ struct NetSim
 	bool enabled() const { return lag_ms || jitter_ms || loss > 0.f; }
 };
 
-class Session
+// F3a T4: a session connected to a host is the Endpoint of a remote client (its install_client handlers are registered
+// with on()); a hosting session runs the server's handlers (install_server), and the host player's end is its LocalLink.
+class Session final : public Endpoint
 {
 public:
-	using Handler = std::function<void(PeerId from, Reader& payload)>;
+	using Handler = Endpoint::Handler;
 	using LogFn = std::function<void(const char* line)>;
 
 	Session();
@@ -101,14 +105,34 @@ public:
 	PeerId self() const; // host: 0; client: slot from Welcome, kInvalidPeer before
 	bool is_active() const; // host listening, or client joined
 	std::vector<PeerInfo> peers() const; // host: all clients; client: host + list from PeerList
-	const PeerInfo* peer(PeerId id) const;
+	const PeerInfo* peer(PeerId id) const; // one of peers(): the host player (local) is not one
+	// F3a T4. Host: the host player (peer 0, `local`, joined, the host's nick) while a LocalLink is attached, then every
+	// joined client. Client: the same as peers() (the host, who is a player, and the others). peers() stays the remote
+	// ones, so that old code does not count the host twice; modules move to players() one by one.
+	std::vector<PeerInfo> players() const;
 
 	// Game message handlers (type >= Msg::GameBase). One handler per type, last wins.
-	void on(Msg type, Handler h);
+	void on(Msg type, Handler h) override;
+	// F3a T4: every game message handler goes (a process installs the handler table of its role anew when it starts to
+	// host or to connect: the server's on a hosting session, the client's on a connecting one).
+	void clear_handlers();
 
-	// Sends payload as message `type`. Host: to any client. Client: only to kHostPeer.
+	// F3a T4, the internal channel of the host's process (coop_local_link.h): while this session hosts, the host player is
+	// peer 0 (kHostPeer) flagged local. send(0, ...) and broadcast(...) put the message into `link` (it takes only what its
+	// gate admits); what the host player pushes runs the handlers registered here with from = 0, after the same sender
+	// check (he is a client: HostOnly and TrunkOnly are refused, logged) and the same world gate as a remote client's game
+	// message, with no rate limit and always in this world epoch. What the session sends him runs his handlers on the link
+	// (from = 0) after the client's sender check (ClientOnly and TrunkOnly refused) and the same world gate. update() pumps
+	// the link: see coop_local_link.h. Kept across sessions like the handlers; nullptr detaches; a session that is not
+	// hosting leaves it alone; a session that ends empties its queues. The link must outlive the session or be detached.
+	void attach_local(LocalLink* link);
+	LocalLink* local() const;
+
+	// Sends payload as message `type`. Host: to any client, and to the host player (0) over an attached LocalLink.
+	// Client: only to kHostPeer.
 	void send(PeerId to, Lane lane, Msg type, const Writer& payload);
-	// Host: to every joined client except `except`. Client: same as send to host.
+	// Host: to every joined client except `except`, and to the host player over an attached LocalLink unless `except` is
+	// 0. Client: same as send to host.
 	void broadcast(Lane lane, Msg type, const Writer& payload, PeerId except = kInvalidPeer);
 	// Disconnects one client with a reason (host only).
 	void kick(PeerId id, RejectReason reason, const std::string& text);

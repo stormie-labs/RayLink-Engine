@@ -713,15 +713,23 @@ void client_restore_vitals()
 }
 } // namespace
 
-void equip_install(Session& s)
+namespace
 {
-	s.on(Msg::PlayerEquip, [](PeerId from, Reader& r)
-	{
-		if (mgr().is_host() || mgr().is_live_client())
-			on_equip(from, r);
-	});
+// PlayerEquip, in both tables (F3a T4: the lambda of the old install, unchanged)
+void on_equip_msg(PeerId from, Reader& r)
+{
+	if (mgr().is_host() || mgr().is_live_client())
+		on_equip(from, r);
+}
+} // namespace
+
+void equip_install_server(Session& s)
+{
+	s.on(Msg::PlayerEquip, &on_equip_msg);
 	s.on(Msg::PlayerVitals, &host_on_vitals);
 }
+
+void equip_install_client(Endpoint& e) { e.on(Msg::PlayerEquip, &on_equip_msg); }
 
 void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
 {

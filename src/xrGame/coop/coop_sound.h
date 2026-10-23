@@ -26,7 +26,8 @@
 // Both fire only if a Lua script registered the callback name (AddScriptCallback) before.
 //
 // Threading: the engine hooks may run on the game thread (AI think, Lua) and only record; frame() (main thread)
-// sends, plays and calls Lua. Wiring: coop_presence calls install/reset/frame/print_status/register_console.
+// sends, plays and calls Lua. Wiring: coop_presence calls install_server / install_client / reset / frame / print_status
+// / register_console.
 #pragma once
 
 #include "xrCoop/coop_session.h"
@@ -41,7 +42,8 @@ namespace coop
 {
 namespace sound
 {
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void frame();
 void print_status();

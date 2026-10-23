@@ -51,13 +51,15 @@
 namespace coop
 {
 class Session;
+class Endpoint;
 struct ManifestDiff;
 enum class RejectReason : uint8_t;
 
 namespace script
 {
 // Registers the Msg::ScriptEvent handler. Called once with the manager's session.
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 // Session ended: drops queued events and chat lines, clears counters.
 void reset();
 // Main thread, once per frame after the network pump: sends queued events, delivers received ones.

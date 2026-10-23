@@ -515,7 +515,9 @@ int l_suspend(lua_State* L)
 
 // ---------------------------------------------------------------- public
 
-void install(Session&) {}
+void install_server(Session&) {}
+
+void install_client(Endpoint&) {}
 
 void reset()
 {

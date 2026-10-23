@@ -39,7 +39,9 @@ namespace coop
 {
 namespace money
 {
-void install(Session& s);
+void init(); // F3a T4: once per process (sync::init): the money settings and their console commands
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session ended, client's world replaced: nothing kept
 // Host started a session (sync::on_session_started): reset, and the player characters in the world now count as "from
 // the save" — they keep full allowances; one made later in this session starts empty (Ruling F2-10).

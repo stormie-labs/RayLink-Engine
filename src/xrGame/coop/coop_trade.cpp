@@ -776,7 +776,7 @@ void send_container(bool open, u8 kind, u16 local_id)
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
+void install_server(Session& s)
 {
 	s.on(Msg::TradeOp, &on_trade_op);
 	s.on(Msg::ReqContainer, [](PeerId from, Reader& r)
@@ -785,6 +785,8 @@ void install(Session& s)
 			host_on_container(from, r);
 	});
 }
+
+void install_client(Endpoint& e) { e.on(Msg::TradeOp, &on_trade_op); }
 
 void frame()
 {

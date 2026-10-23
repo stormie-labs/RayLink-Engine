@@ -1626,35 +1626,40 @@ void host_enforce(u64 now)
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
+namespace
 {
-	s.on(Msg::ItemState, [](PeerId from, Reader& r)
+// ItemState, in both tables (F3a T4: the lambda of the old install, unchanged)
+void on_item_state(PeerId from, Reader& r)
+{
+	const Op op = Op(r.u8());
+	if (!r.ok())
+		return;
+	if (mgr().is_host())
 	{
-		const Op op = Op(r.u8());
-		if (!r.ok())
+		// Precaching a freshly loaded world: states and unloads made in the old one are dropped
+		// (the pump runs before join::frame() marks the peers as joining).
+		if (!ai().get_alife() || Device.dwPrecacheFrame)
 			return;
-		if (mgr().is_host())
-		{
-			// Precaching a freshly loaded world: states and unloads made in the old one are dropped
-			// (the pump runs before join::frame() marks the peers as joining).
-			if (!ai().get_alife() || Device.dwPrecacheFrame)
-				return;
-			if (op == Op::State)
-				host_on_state(from, r);
-			else if (op == Op::SpawnAmmo)
-				host_on_spawn_ammo(from, r);
-		}
-		else if (mgr().is_client() && op == Op::State)
-		{
-			// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
-			// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
-			if (rules::live_only(Msg::ItemState) && !mgr().is_live_client())
-				++g_stats.dropped_before_live;
-			else
-				client_on_state(r);
-		}
-	});
+		if (op == Op::State)
+			host_on_state(from, r);
+		else if (op == Op::SpawnAmmo)
+			host_on_spawn_ammo(from, r);
+	}
+	else if (mgr().is_client() && op == Op::State)
+	{
+		// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
+		// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
+		if (rules::live_only(Msg::ItemState) && !mgr().is_live_client())
+			++g_stats.dropped_before_live;
+		else
+			client_on_state(r);
+	}
 }
+} // namespace
+
+void install_server(Session& s) { s.on(Msg::ItemState, &on_item_state); }
+
+void install_client(Endpoint& e) { e.on(Msg::ItemState, &on_item_state); }
 
 void reset()
 {

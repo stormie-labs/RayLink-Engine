@@ -27,6 +27,7 @@ struct lua_State;
 namespace coop
 {
 class Session;
+class Endpoint;
 
 namespace levels
 {
@@ -61,8 +62,9 @@ u32 players_on(LevelId level);
 // marks of T10/T11.
 bool online_at_server(u16 id);
 
-// Module lifecycle, as every coop module (sync::install ...).
-void install(Session& s); // sync::install: the handlers of the F3a messages come with their tasks
+// Module lifecycle, as every coop module (sync::install_server / install_client ...).
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void on_peer_left(PeerId id); // sync::on_peer_left
 void frame(); // main thread, every frame (sync::frame)

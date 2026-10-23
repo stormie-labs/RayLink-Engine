@@ -52,8 +52,11 @@ Project root: `D:\Projects\ForEverything\anomaly-coop` (docs: `DESIGN.md` §10, 
 ## Messaging
 - `xrCoop/coop_protocol.h` — `coop::Msg` types (append new ones only in the ranges there), `Writer`/`Reader` in `coop_wire.h`.
 - `coop_net.h` — `net::host_broadcast`, `net::host_send` (queued while a client loads, P6), `net::client_send`.
-- Register handlers in your module's `install(Session&)` via `s.on(Msg::X, handler)`; the lead calls `install` from
-  `coop_sync.cpp`. Handlers get `(PeerId from, Reader& r)`. Check the role (`mgr().is_host()`, `mgr().is_live_client()`).
+- Register handlers in your module's `install_server(Session&)` (messages the world server handles) and
+  `install_client(Endpoint&)` (messages a player handles) via `on(Msg::X, handler)`; `coop_sync.cpp` installs the
+  server table in the host process and the client table everywhere (F3a: the host player is a client of his own
+  server over `xrCoop/coop_local_link.h`; until a message is in `link_enabled`, its client handler in the host
+  process gets nothing). Handlers get `(PeerId from, Reader& r)`. Check the role (`mgr().is_host()`, `mgr().is_live_client()`).
 - Every message must be idempotent (a repeat changes nothing) and must tolerate objects that do not exist yet (P6).
 
 ## Diagnostics (P9)

@@ -84,7 +84,9 @@ bool online_at_server(u16)
 	return false; // the marks come with the transfers (T10/T11, coop_levels_xfer.cpp)
 }
 
-void install(Session&) {}
+void install_server(Session&) {}
+
+void install_client(Endpoint&) {}
 
 void reset() {}
 

@@ -12,7 +12,14 @@ namespace coop
 {
 namespace sync
 {
-void install(Session& s);
+// F3a T4: what the modules set up once per process (Manager's constructor): settings, console commands, the
+// route and call-gate tables. The handler tables come by role when a session starts (Manager::install_handlers).
+void init();
+// The world server's handlers of every module, on the hosting session.
+void install_server(Session& s);
+// The client's handlers of every module: on a remote client's session, or on the host player's LocalLink in the
+// host's process.
+void install_client(Endpoint& e);
 void on_session_started();
 void on_peer_joined(const PeerInfo& p);
 void on_peer_left(PeerId id);

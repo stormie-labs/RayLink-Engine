@@ -48,30 +48,63 @@ namespace
 xr_set<PeerId> g_joining;
 } // namespace
 
-void install(Session& s)
+// F3a T4: what the old install(Session&) set up besides the handlers, once per process, in its order
+void init()
 {
-	players::install(s);
-	entities::install(s);
-	worldstate::install(s);
-	script::install(s);
-	syncapi::install(s); // F2 T14
-	story::install(s);
-	events::install(s);
-	requests::install(s);
-	dialog::install(s);
-	trade::install(s);
-	money::install(s); // F2 T1
-	survival::install(s);
-	checkpoints::install(s); // F3
-	death::install(s);
-	rest::install(s);
-	autosave::install(s);
-	presence::install(s);
-	items::install(s);
-	objects::install(s);
+	story::init();
+	requests::init();
+	money::init(); // F2 T1
+	presence::init();
 	router::install(); // F2 T10
 	callgate::install(); // F2 T12
-	levels::install(s); // F3a
+}
+
+void install_server(Session& s)
+{
+	players::install_server(s);
+	entities::install_server(s);
+	worldstate::install_server(s);
+	script::install_server(s);
+	syncapi::install_server(s); // F2 T14
+	story::install_server(s);
+	events::install_server(s);
+	requests::install_server(s);
+	dialog::install_server(s);
+	trade::install_server(s);
+	money::install_server(s); // F2 T1
+	survival::install_server(s);
+	checkpoints::install_server(s); // F3
+	death::install_server(s);
+	rest::install_server(s);
+	autosave::install_server(s);
+	presence::install_server(s);
+	items::install_server(s);
+	objects::install_server(s);
+	levels::install_server(s); // F3a
+}
+
+void install_client(Endpoint& e)
+{
+	players::install_client(e);
+	entities::install_client(e);
+	worldstate::install_client(e);
+	script::install_client(e);
+	syncapi::install_client(e); // F2 T14
+	story::install_client(e);
+	events::install_client(e);
+	requests::install_client(e);
+	dialog::install_client(e);
+	trade::install_client(e);
+	money::install_client(e); // F2 T1
+	survival::install_client(e);
+	checkpoints::install_client(e); // F3
+	death::install_client(e);
+	rest::install_client(e);
+	autosave::install_client(e);
+	presence::install_client(e);
+	items::install_client(e);
+	objects::install_client(e);
+	levels::install_client(e); // F3a
 }
 
 void on_session_started()

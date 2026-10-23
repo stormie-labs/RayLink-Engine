@@ -2022,19 +2022,24 @@ void client_on_transition_state(PeerId from, Reader& r)
 		g.guide_yes = false;
 }
 
-void install(Session& s)
+// F3a T4: the one handler table split in two (Manager::install_handlers), registrations only
+void install_server(Session& s)
 {
 	for (const limits::RateRule& rule : limits::kClientRateRules)
 		s.limit_rate(rule.type, rule.burst, rule.refill_ms); // R2 I4, T12 review, F2 T3 (host only, per client)
 	s.on(Msg::TransitionVote, &host_on_transition_vote);
-	s.on(Msg::TransitionState, &client_on_transition_state); // protocol 10
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::CharChoice, &host_on_char_choice); // protocol 8
-	s.on(Msg::CharOffer, &client_on_char_offer);
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
-	s.on(Msg::JoinComplete, &client_on_join_complete);
-	s.on(Msg::SessionReset, &client_on_session_reset);
-	s.on(Msg::AvatarList, &client_on_avatar_list); // R3 В3
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::TransitionState, &client_on_transition_state); // protocol 10
+	e.on(Msg::CharOffer, &client_on_char_offer);
+	e.on(Msg::JoinComplete, &client_on_join_complete);
+	e.on(Msg::SessionReset, &client_on_session_reset);
+	e.on(Msg::AvatarList, &client_on_avatar_list); // R3 В3
 }
 
 bool host_can_start()

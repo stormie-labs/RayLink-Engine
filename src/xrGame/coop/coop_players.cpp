@@ -257,10 +257,16 @@ bool State::read(Reader& r)
 	return true;
 }
 
-void install(Session& s)
+void install_server(Session& s)
 {
 	s.on(Msg::PlayerState, &on_player_state);
-	equip_install(s);
+	equip_install_server(s);
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::PlayerState, &on_player_state);
+	equip_install_client(e);
 }
 
 void reset()

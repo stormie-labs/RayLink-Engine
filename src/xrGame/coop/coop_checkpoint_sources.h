@@ -1,8 +1,8 @@
 // Anomaly Coop — where a checkpoint may come from, on the host (F3 Task 7, docs/CHECKPOINTS_DEATH.md §2.2): lit
 // campfires and objects mods declare as camps (stood next to one for campfire_dwell_ms, not in a fight), a player's own
 // tent or sleeping bag (CheckpointClaim), the stock rest zones and surge covers; and who is in a fight. Driven by
-// coop_checkpoints: its install, reset and print_status call these, its frame calls host_frame on the host. Settings:
-// configs\mod_system_coop_checkpoints.ltx ([coop_checkpoints], [coop_rest_zones]; pure rules and bounds:
+// coop_checkpoints: its install_server / install_client, reset and print_status call these, its frame calls host_frame
+// on the host. Settings: configs\mod_system_coop_checkpoints.ltx ([coop_checkpoints], [coop_rest_zones]; pure rules and bounds:
 // xrCoop/coop_checkpoint_source_rules.h; the claim and its answer: xrCoop/coop_checkpoint_store.h).
 //
 // Campfires and mod objects: every 500 ms the host and every living player in the world (join::host_player_in_world)
@@ -56,6 +56,7 @@ class CGameObject;
 namespace coop
 {
 class Session;
+class Endpoint;
 
 namespace checkpoints
 {
@@ -72,7 +73,8 @@ enum class Place : u8
 };
 const char* place_name(Place p);
 
-void install(Session& s); // the CheckpointClaim handler (checkpoints::install)
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void host_frame(u64 now_ms); // host, main thread: checkpoints::frame
 void reset(); // checkpoints::reset
 void print_status(); // checkpoints::print_status

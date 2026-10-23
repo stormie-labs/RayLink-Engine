@@ -54,7 +54,10 @@ enum BlobKind : u32
 	BlobWorldSave = 1,
 };
 
-void install(Session& s);
+// F3a T4: the world server's handlers (the joins, choices and votes of the players; the session's rate limits) and
+// the client's (the world server's answers and its board), installed by role (Manager::install_handlers).
+void install_server(Session& s);
+void install_client(Endpoint& e);
 
 // --- host ---
 bool host_can_start(); // in a level with ALife and a living actor

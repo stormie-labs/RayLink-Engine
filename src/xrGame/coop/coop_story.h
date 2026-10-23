@@ -33,10 +33,13 @@ class CEntityAlive;
 namespace coop
 {
 class Session;
+class Endpoint;
 
 namespace story
 {
-void install(Session& s);
+void init(); // F3a T4: once per process (sync::init): the console commands
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void frame(); // main thread, every frame while a session is active
 void reset(); // session started / ended / world replaced
 void print_status();

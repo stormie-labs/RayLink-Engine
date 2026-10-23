@@ -658,11 +658,12 @@ void enforce_device_time_factor()
 }
 } // namespace
 
-void install(Session& s)
+void install_server(Session& s) { s.on(Msg::TimeRequest, &host_on_time_request); }
+
+void install_client(Endpoint& e)
 {
-	s.on(Msg::TimeSync, &client_on_time_sync);
-	s.on(Msg::WeatherSync, &client_on_weather_sync);
-	s.on(Msg::TimeRequest, &host_on_time_request);
+	e.on(Msg::TimeSync, &client_on_time_sync);
+	e.on(Msg::WeatherSync, &client_on_weather_sync);
 }
 
 void reset() { g = State(); }

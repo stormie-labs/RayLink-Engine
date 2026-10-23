@@ -686,11 +686,12 @@ public:
 
 // ---------------------------------------------------------------- lifecycle
 
-void install(Session& s)
+void install_server(Session& s) { s.on(Msg::RestRequest, &host_on_request); }
+
+void install_client(Endpoint& e)
 {
-	s.on(Msg::RestRequest, &host_on_request);
-	s.on(Msg::RestState, &client_on_state);
-	s.on(Msg::RestSleep, &client_on_sleep);
+	e.on(Msg::RestState, &client_on_state);
+	e.on(Msg::RestSleep, &client_on_sleep);
 }
 
 void reset()

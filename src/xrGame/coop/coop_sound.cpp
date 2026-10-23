@@ -669,10 +669,9 @@ void lua_frame()
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
-{
-	s.on(Msg::EntitySound, &client_on_sound);
-}
+void install_server(Session&) {} // nothing a client sends here
+
+void install_client(Endpoint& e) { e.on(Msg::EntitySound, &client_on_sound); }
 
 void reset()
 {

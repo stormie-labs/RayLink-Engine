@@ -957,13 +957,15 @@ u16 root_of(u16 id)
 	return cur;
 }
 
-void install(Session& s)
+void install_server(Session& s) { s.on(Msg::PlayerDied, &on_player_died); }
+
+void install_client(Endpoint& e)
 {
 	// Client handlers drop these world messages until we are live (R2 I2, before_live).
-	s.on(Msg::EntityParent, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_parent(from, r); });
-	s.on(Msg::EntityDied, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_died(from, r); });
-	s.on(Msg::EntityLocal, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_local(from, r); });
-	s.on(Msg::PlayerDied, &on_player_died);
+	e.on(Msg::EntityParent, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_parent(from, r); });
+	e.on(Msg::EntityDied, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_died(from, r); });
+	e.on(Msg::EntityLocal, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_local(from, r); });
+	e.on(Msg::PlayerDied, &on_player_died);
 }
 
 void reset()

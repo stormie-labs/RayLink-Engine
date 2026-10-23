@@ -2636,12 +2636,18 @@ bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 	return true;
 }
 
-void install(Session& s)
+void install_server(Session& s)
 {
 	s.on(Msg::PlayerWounded, &on_state_msg);
 	s.on(Msg::PlayerRevive, &on_revive_msg);
-	s.on(Msg::PlayerRules, &on_rules_msg);
 	s.on(Msg::NewCharacter, &on_new_character_msg); // F3 Task 10
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::PlayerWounded, &on_state_msg);
+	e.on(Msg::PlayerRevive, &on_revive_msg);
+	e.on(Msg::PlayerRules, &on_rules_msg);
 }
 
 void register_console()

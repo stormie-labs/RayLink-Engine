@@ -45,7 +45,8 @@ namespace coop
 {
 namespace items
 {
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void frame(); // main thread, from the coop pump: capture/send, host tracking, pending applies
 void print_status();

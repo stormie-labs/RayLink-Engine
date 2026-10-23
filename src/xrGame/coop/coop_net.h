@@ -18,10 +18,16 @@ namespace net
 {
 // Host: to every client that is in the world (live), queued for clients that are loading.
 // `except` skips one peer (the originator of a relayed message).
+// F3a T4: to every player (Session::players()): the host player too, over the LocalLink, unless `except` is 0. The link
+// passes only the messages moved onto it (link_enabled, coop_local_link.h); none yet.
 void host_broadcast(Msg type, const Writer& payload, Lane lane = Lane::Reliable, PeerId except = kInvalidPeer);
 // Host: to one client; queued while it loads (reliable lanes only, unreliable is dropped).
+// F3a T4: `to` 0 is the host player, over the LocalLink (only the messages moved onto it; the rest is dropped as before).
 void host_send(PeerId to, Msg type, const Writer& payload, Lane lane = Lane::Reliable);
-// Client: to the host. No-op on the host.
+// Client: to the host.
+// F3a T4: in the host's process the host player is a client of his own world server: what he sends goes over the
+// LocalLink to the server's handlers (from = 0). The link takes only the messages moved onto it (link_enabled): for the
+// rest this stays the no-op it was on the host, which still takes its direct path.
 void client_send(Msg type, const Writer& payload, Lane lane = Lane::Reliable);
 // Host: flush the queue of a client that finished loading.
 void host_flush(PeerId to);

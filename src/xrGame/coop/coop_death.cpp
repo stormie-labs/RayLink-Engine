@@ -1101,7 +1101,9 @@ void host_preview(u16 character, u16 seq)
 	    place.drop.moved ? " above the level vertex (the body is under the ground or off the level graph)" : " (the body)");
 }
 
-void install(Session& s) { s.on(Msg::DeathMarker, &on_marker_msg); }
+void install_server(Session&) {} // nothing a client sends here
+
+void install_client(Endpoint& e) { e.on(Msg::DeathMarker, &on_marker_msg); }
 
 void reset()
 {

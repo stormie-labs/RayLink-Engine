@@ -43,11 +43,11 @@ void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except)
 	if (!mgr().is_host())
 		return;
 	Session& s = mgr().session();
-	for (const PeerInfo& p : s.peers())
+	for (const PeerInfo& p : s.players()) // F3a T4: the host player (local) too; the link's gate decides
 	{
 		if (p.id == except || p.state != PeerState::Joined)
 			continue;
-		if (sync::host_peer_joining(p.id))
+		if (!p.local && sync::host_peer_joining(p.id))
 			queue(p.id, type, payload, lane);
 		else
 			s.send(p.id, lane, type, payload);
@@ -66,9 +66,14 @@ void host_send(PeerId to, Msg type, const Writer& payload, Lane lane)
 
 void client_send(Msg type, const Writer& payload, Lane lane)
 {
-	if (!mgr().is_client())
+	if (mgr().is_client())
+	{
+		mgr().session().send(kHostPeer, lane, type, payload);
 		return;
-	mgr().session().send(kHostPeer, lane, type, payload);
+	}
+	// F3a T4: the host player -> his own world server, over the LocalLink (only the messages moved onto it pass)
+	if (mgr().is_host())
+		mgr().local_link().push_to_server(type, lane, payload);
 }
 
 void host_flush(PeerId to)

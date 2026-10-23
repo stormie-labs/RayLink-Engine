@@ -171,6 +171,21 @@ const char* phase_name(Phase p)
 	return "?";
 }
 
+u8 roles_of(Phase p)
+{
+	switch (p)
+	{
+	case Phase::Off: return 0;
+	case Phase::Hosting: return u8(ProcessRole::WorldServer) | u8(ProcessRole::MapAuthority) | u8(ProcessRole::Player);
+	case Phase::Connecting:
+	case Phase::Handshaked:
+	case Phase::ReceivingWorld:
+	case Phase::LoadingWorld:
+	case Phase::Live: return u8(ProcessRole::Player) | u8(ProcessRole::Mirror);
+	}
+	return 0;
+}
+
 Manager& Manager::get()
 {
 	static Manager instance;
@@ -181,6 +196,10 @@ Manager::Manager()
 {
 	m_session.set_log(&log_line);
 	m_session.set_world_gate([this] { return world_state(); }); // level-change review: messages for a missing world
+	// F3a T4: the host player's link, for the life of the process (a session that does not host leaves it alone). Only
+	// the messages moved onto it pass (link_enabled; none yet): the host keeps its direct paths until T7 moves them.
+	m_link.set_gate(&link_enabled);
+	m_session.attach_local(&m_link);
 	install_session_callbacks();
 }
 
@@ -206,6 +225,7 @@ void Manager::set_phase(Phase p)
 		return;
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
+	m_roles = roles_of(p); // F3a T4
 	set_crash_hook(p != Phase::Off); // R1 I2: a crash releases the link hold
 	if (p != Phase::Off && !g_crash_hook_exit_registered)
 	{
@@ -382,8 +402,29 @@ void Manager::install_session_callbacks()
 		join::on_blob_complete(from, id, kind, data);
 	};
 
-	join::install(m_session);
-	sync::install(m_session);
+	// F3a T4: what the modules set up once per process (settings, console commands, the route and call-gate tables); the
+	// handler tables are installed by role when a session starts (install_handlers).
+	sync::init();
+}
+
+void Manager::install_handlers(bool hosting)
+{
+	m_session.clear_handlers();
+	m_link.clear_handlers();
+	if (hosting)
+	{
+		// the world server: its handlers on the session; the host player, a client of it: his on the link
+		join::install_server(m_session);
+		sync::install_server(m_session);
+		join::install_client(m_link);
+		sync::install_client(m_link);
+	}
+	else
+	{
+		// a remote client (player and mirror): the client's handlers on the session connected to the host
+		join::install_client(m_session);
+		sync::install_client(m_session);
+	}
 }
 
 bool Manager::start_host(u16 port)
@@ -396,6 +437,7 @@ bool Manager::start_host(u16 port)
 	if (!join::host_can_start())
 		return false;
 
+	install_handlers(true); // F3a T4
 	std::string err;
 	if (!m_session.host(make_config(port), &err))
 	{
@@ -415,6 +457,7 @@ bool Manager::start_client(const char* address, u16 port)
 		::Msg("! [coop] already in a session (%s), use coop_disconnect first", phase_name(m_phase));
 		return false;
 	}
+	install_handlers(false); // F3a T4
 	std::string err;
 	if (!m_session.connect(make_config(port), address, port, &err))
 	{
@@ -558,6 +601,14 @@ void Manager::print_status() const
 	const NetSim& sim = m_session.netsim();
 	if (sim.enabled())
 		::Msg("[coop] netsim: lag %u ms, jitter %u ms, loss %.1f%%", sim.lag_ms, sim.jitter_ms, sim.loss * 100.f);
+	if (is_host())
+	{
+		// F3a T4: the host player's LocalLink; "refused" are the messages not moved onto it yet (the host's direct paths)
+		const LocalLink::Stats& ls = m_link.stats();
+		::Msg("[coop] local link (the host player): to the server %llu, to the host player %llu, refused %llu (not moved "
+		      "onto the link), queued %u / %u",
+		    ls.to_server, ls.to_client, ls.refused, u32(m_link.queued_to_server()), u32(m_link.queued_to_client()));
+	}
 	for (u16 type : m_session.stats_types())
 	{
 		const MsgStats& s = m_session.stats(type);

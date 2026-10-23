@@ -951,7 +951,9 @@ const char* place_name(Place p)
 	}
 }
 
-void install(Session& s) { s.on(Msg::CheckpointClaim, &host_on_claim); }
+void install_server(Session& s) { s.on(Msg::CheckpointClaim, &host_on_claim); }
+
+void install_client(Endpoint&) {} // nothing the world server sends here
 
 void host_frame(u64 now_ms)
 {

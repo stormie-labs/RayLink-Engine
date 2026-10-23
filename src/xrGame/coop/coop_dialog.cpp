@@ -524,17 +524,18 @@ void client_frame()
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
+// F3a T4: DialogUnlock went to host_on_unlock on the host and to client_on_revoke on a client through one role switch;
+// the two tables take one each.
+void install_server(Session& s)
 {
 	s.on(Msg::DialogLock, &host_on_lock);
-	s.on(Msg::DialogLockResult, &client_on_result);
-	s.on(Msg::DialogUnlock, [](PeerId from, Reader& r)
-	{
-		if (mgr().is_host())
-			host_on_unlock(from, r);
-		else
-			client_on_revoke(from, r);
-	});
+	s.on(Msg::DialogUnlock, &host_on_unlock);
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::DialogLockResult, &client_on_result);
+	e.on(Msg::DialogUnlock, &client_on_revoke);
 }
 
 void frame()

@@ -630,11 +630,18 @@ void on_weapon_shot(CWeapon* w)
 	g_pending.push_back(e);
 }
 
-void install(Session& s)
+void init() { items::set_weapon_fired_handler(&on_weapon_shot); }
+
+void install_server(Session& s)
 {
 	s.on(Msg::PlayerShot, &on_shot_msg);
-	items::set_weapon_fired_handler(&on_weapon_shot);
-	sound::install(s); // W5 C2: NPC sounds and avatar steps ride on presence (no own line in coop_sync)
+	sound::install_server(s); // W5 C2: NPC sounds and avatar steps ride on presence (no own line in coop_sync)
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::PlayerShot, &on_shot_msg);
+	sound::install_client(e);
 }
 
 void register_console()

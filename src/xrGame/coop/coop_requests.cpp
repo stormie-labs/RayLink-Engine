@@ -2919,9 +2919,10 @@ const char* reason_name(Reason r)
 	}
 }
 
-void install(Session& s)
+void init() { load_spawn_settings(); } // F2 T2
+
+void install_server(Session& s)
 {
-	load_spawn_settings(); // F2 T2
 	s.on(Msg::ReqSpawn, &host_on_spawn);
 	s.on(Msg::ReqDestroy, [](PeerId from, Reader& r) { host_on_destroy_req(from, r, Msg::ReqDestroy); });
 	s.on(Msg::ReqUse, [](PeerId from, Reader& r) { host_on_destroy_req(from, r, Msg::ReqUse); });
@@ -2931,10 +2932,14 @@ void install(Session& s)
 	s.on(Msg::ReqHit, &host_on_hit);
 	s.on(Msg::ReqItemEvent, &host_on_item_event); // ReqMoney: coop_money (F2 T1)
 	s.on(Msg::ReqLaunch, &host_on_launch); // W3a
-	s.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_result(from, r); });
-	s.on(Msg::IdLease, &client_on_lease); // F2 T12b
 	s.on(Msg::IdLeaseAck, &host_on_lease_ack); // F2 T12b
-	s.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_player_hit(from, r); });
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_result(from, r); });
+	e.on(Msg::IdLease, &client_on_lease); // F2 T12b
+	e.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_player_hit(from, r); });
 }
 
 void reset()

@@ -28,7 +28,9 @@ namespace coop
 {
 namespace presence
 {
-void install(Session& s); // also registers on_weapon_shot as the WP9 weapon-fired handler
+void init(); // F3a T4: once per process (sync::init): on_weapon_shot as the WP9 weapon-fired handler
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void register_console(); // from coop::register_console_commands
 void frame(); // main thread, every frame
 void reset(); // session started / ended (drops cached sounds and cartridges)

@@ -85,7 +85,9 @@ enum class Reason : u8
 };
 const char* reason_name(Reason r);
 
-void install(Session& s);
+void init(); // F3a T4: once per process (sync::init): the spawn settings (F2 T2)
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void on_peer_left(PeerId id); // host: the player's spawn requests waiting for his budget go (F2-21)
 void frame();

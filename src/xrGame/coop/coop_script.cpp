@@ -1561,7 +1561,9 @@ void register_raw(lua_State* L)
 }
 } // namespace
 
-void install(Session& s) { s.on(Msg::ScriptEvent, &on_script_event); }
+void install_server(Session& s) { s.on(Msg::ScriptEvent, &on_script_event); }
+
+void install_client(Endpoint& e) { e.on(Msg::ScriptEvent, &on_script_event); }
 
 void reset()
 {

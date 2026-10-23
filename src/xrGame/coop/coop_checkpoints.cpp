@@ -532,10 +532,15 @@ public:
 
 // ---------------------------------------------------------------- lifecycle
 
-void install(Session& s)
+void install_server(Session& s)
 {
-	s.on(Msg::CheckpointState, &client_on_state);
-	sources::install(s); // F3 Task 7: CheckpointClaim
+	sources::install_server(s); // F3 Task 7: CheckpointClaim
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::CheckpointState, &client_on_state);
+	sources::install_client(e);
 }
 
 void reset()

@@ -2466,13 +2466,21 @@ const char* peer_name(PeerId id)
 
 // ================================================================== public
 
-void install(Session& s)
+void init() { register_commands(); }
+
+void install_server(Session& s)
 {
-	const Msg types[] = {Msg::InfoPortion, Msg::TaskList, Msg::TaskUpdate, Msg::MapSpot, Msg::Relation, Msg::Progress,
-		Msg::StoryHash, Msg::StoryResync};
+	const Msg types[] = {Msg::InfoPortion, Msg::TaskUpdate, Msg::MapSpot, Msg::Relation, Msg::Progress, Msg::StoryResync};
 	for (Msg t : types)
 		s.on(t, [t](PeerId from, Reader& r) { dispatch(t, from, r); });
-	register_commands();
+}
+
+void install_client(Endpoint& e)
+{
+	const Msg types[] = {Msg::InfoPortion, Msg::TaskList, Msg::TaskUpdate, Msg::MapSpot, Msg::Relation, Msg::Progress,
+		Msg::StoryHash};
+	for (Msg t : types)
+		e.on(t, [t](PeerId from, Reader& r) { dispatch(t, from, r); });
 }
 
 void reset()

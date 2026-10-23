@@ -683,13 +683,15 @@ int l_talk_lock_of(lua_State* L)
 
 // ---------------------------------------------------------------- API
 
-void install(Session& s)
+void init()
 {
 	load_settings();
 	register_console();
-	s.on(Msg::ReqMoney, &host_on_req);
-	s.on(Msg::MoneyBalance, &client_on_balance);
 }
+
+void install_server(Session& s) { s.on(Msg::ReqMoney, &host_on_req); }
+
+void install_client(Endpoint& e) { e.on(Msg::MoneyBalance, &client_on_balance); }
 
 void reset()
 {

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <set>
 
@@ -283,6 +284,12 @@ struct Session::Impl
 	uint64_t m_gap_dropped = 0; // dropped since the gap opened
 	wgate::HoldStats m_gap_base; // m_held.stats() when the gap opened
 
+	// F3a T4: the host player's LocalLink (coop_local_link.h), used while hosting. Its messages wait in the world gate like
+	// a connection's, under a serial no connection has (connections count up from 1).
+	LocalLink* m_local = nullptr;
+	static constexpr uint64_t kFromLocalPlayer = ~0ull; // the host player -> the server's handlers
+	static constexpr uint64_t kToLocalPlayer = ~0ull - 1; // the server -> the host player's handlers on the link
+
 	// ------------------------------------------------------------------ logging / callbacks
 
 	void logf(const char* fmt, ...)
@@ -350,13 +357,26 @@ struct Session::Impl
 
 	wgate::World world_of() const { return m_world_fn ? m_world_fn() : wgate::World::Up; }
 
-	// The handler of a game message, as game_message() always called it.
-	void run_handler(uint16_t type, PeerId from, const std::shared_ptr<std::vector<uint8_t>>& data)
+	// The handler of a game message, as game_message() always called it; F3a T4: one the session sent the host player
+	// (serial kToLocalPlayer) runs his handler on the LocalLink.
+	void run_handler(uint16_t type, PeerId from, uint64_t serial, const std::shared_ptr<std::vector<uint8_t>>& data)
 	{
-		auto it = m_handlers.find(type);
-		if (it == m_handlers.end())
+		Handler h; // copy: the handler may re-register itself
+		if (serial == kToLocalPlayer)
+		{
+			if (!m_local)
+				return;
+			h = m_local->handler(static_cast<Msg>(type));
+		}
+		else
+		{
+			auto it = m_handlers.find(type);
+			if (it == m_handlers.end())
+				return;
+			h = it->second;
+		}
+		if (!h)
 			return;
-		Handler h = it->second; // copy: the handler may re-register itself
 		Reader r(data->data() + 2, data->size() - 2);
 		h(from, r);
 	}
@@ -401,10 +421,17 @@ struct Session::Impl
 		m_held.drain(
 			m_epoch, m_now, [this] { return m_role != Role::None && world_of() == wgate::World::Up; },
 			[this](wgate::Held& h) {
+				if (h.conn == kFromLocalPlayer || h.conn == kToLocalPlayer) // F3a T4: the host player, both ways
+				{
+					if (!m_local)
+						return false; // the link was detached meanwhile: as a player who left
+					run_handler(h.type, kHostPeer, h.conn, h.bytes);
+					return true;
+				}
 				Conn* c = find_serial(h.conn);
 				if (!c || !is_joined(*c))
 					return false;
-				run_handler(h.type, peer_id_of(*c), h.bytes);
+				run_handler(h.type, peer_id_of(*c), h.conn, h.bytes);
 				return true;
 			});
 	}
@@ -433,7 +460,7 @@ struct Session::Impl
 		switch (wgate::decide(wgate::need_of(static_cast<Msg>(type)), world))
 		{
 		case wgate::Act::Run:
-			run_handler(type, from, data);
+			run_handler(type, from, serial, data);
 			break;
 		case wgate::Act::Drop:
 			++m_stats[type].world_dropped;
@@ -748,6 +775,57 @@ struct Session::Impl
 		const uint32_t epoch = m_epoch; // host: c.epoch == m_epoch here (checked above)
 		// Level-change review: the handler runs when the world it needs is there (deliver_game, coop_world_gate.h)
 		emit([this, type, from, serial, epoch, data] { deliver_game(type, from, serial, epoch, data); });
+	}
+
+	// ------------------------------------------------------------------ F3a T4: the LocalLink of the host player
+
+	// One message of the link, either way, as game_message() takes a joined peer's: the sender rule of the side that gets
+	// it, a handler there, then the world gate. The host player is a client: what only the host sends is refused from him,
+	// what only a client sends is refused toward him (logged once per type; nobody is kicked). TrunkOnly never passes. No
+	// rate limit, no epoch check: the link is always in this world.
+	void local_message(bool to_server, Msg msg, std::vector<uint8_t>& payload)
+	{
+		const uint16_t type = static_cast<uint16_t>(msg);
+		const MsgSender sender = msg_sender(msg);
+		if (sender == MsgSender::TrunkOnly || sender == (to_server ? MsgSender::HostOnly : MsgSender::ClientOnly))
+		{
+			if (first_time(std::string(to_server ? "local-in-refused" : "local-out-refused") + std::to_string(type)))
+				logf(to_server ? "host: %s from the host player over the local link refused: a client does not send it"
+							   : "host: %s to the host player over the local link refused: a client does not take it",
+					msg_name(type));
+			return;
+		}
+		const bool handled = to_server ? m_handlers.find(type) != m_handlers.end() : bool(m_local->handler(msg));
+		if (!handled)
+		{
+			if (first_time(std::string(to_server ? "local-in-nohandler" : "local-out-nohandler") + std::to_string(type)))
+				logf(to_server ? "no handler for message %s (0x%04X) of the host player, dropping"
+							   : "the host player has no handler for message %s (0x%04X), dropping",
+					msg_name(type), unsigned(type));
+			return;
+		}
+		// the packet as the world gate keeps it: the 2-byte type header, then the payload
+		auto data = std::make_shared<std::vector<uint8_t>>();
+		data->reserve(2 + payload.size());
+		data->push_back(uint8_t(type & 0xFF));
+		data->push_back(uint8_t(type >> 8));
+		data->insert(data->end(), payload.begin(), payload.end());
+		const uint64_t serial = to_server ? kFromLocalPlayer : kToLocalPlayer;
+		const uint32_t epoch = m_epoch;
+		emit([this, type, serial, epoch, data] { deliver_game(type, kHostPeer, serial, epoch, data); });
+	}
+
+	// Once per update while hosting: what each direction of the link had queued before this pump runs, the host player's
+	// messages first; what the handlers push meanwhile waits for the next update (one hop per update, no reentrancy).
+	void pump_local()
+	{
+		if (m_role != Role::Host || !m_local)
+			return;
+		// Both drains only queue the messages (emit): no handler runs before both directions are taken, so whatever a
+		// handler pushes, either way, is left for the next update.
+		m_local->drain_server([this](Msg type, Lane, std::vector<uint8_t>& payload) { local_message(true, type, payload); });
+		m_local->drain_client([this](Msg type, Lane, std::vector<uint8_t>& payload) { local_message(false, type, payload); });
+		run_pending();
 	}
 
 	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else counted, logged, false.
@@ -1610,6 +1688,9 @@ struct Session::Impl
 		run_pending();
 		if (!m_tp.active())
 			return;
+		pump_local(); // F3a T4: the host player's LocalLink, once per update (coop_local_link.h)
+		if (!m_tp.active())
+			return;
 		topup_blobs();
 		m_tp.flush();
 		run_pending();
@@ -1628,6 +1709,8 @@ struct Session::Impl
 		m_out_q.clear();
 		m_in_q.clear();
 		m_held.clear(); // the world they waited for belongs to a session that is over
+		if (m_local)
+			m_local->clear_queues(); // F3a T4: the same for the host player's messages, both ways
 		m_gap_open = false;
 		for (auto& c : m_conns)
 			if (c->peer)
@@ -1897,6 +1980,40 @@ void Session::on(Msg type, Handler h)
 		m->m_handlers.erase(t);
 }
 
+void Session::clear_handlers()
+{
+	m->m_handlers.clear();
+}
+
+void Session::attach_local(LocalLink* link)
+{
+	m->m_local = link;
+}
+
+LocalLink* Session::local() const
+{
+	return m->m_local;
+}
+
+std::vector<PeerInfo> Session::players() const
+{
+	std::vector<PeerInfo> out;
+	if (m->m_role == Role::Host && m->m_local)
+	{
+		PeerInfo me;
+		me.id = kHostPeer;
+		me.state = PeerState::Joined;
+		me.nick = m->m_cfg.nick;
+		me.key = m->m_cfg.key;
+		me.address = "local";
+		me.local = true;
+		out.push_back(std::move(me));
+	}
+	std::vector<PeerInfo> remote = peers();
+	out.insert(out.end(), std::make_move_iterator(remote.begin()), std::make_move_iterator(remote.end()));
+	return out;
+}
+
 void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 {
 	Impl& s = *m;
@@ -1908,6 +2025,17 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 		{
 			if (s.first_time("client-send-peer"))
 				s.logf("send(%s): clients can only send to the host (peer 0), ignored", msg_name(type));
+			return;
+		}
+		if (s.m_role == Role::Host && to == kHostPeer && s.m_local)
+		{
+			// F3a T4: the host player, over the link (it takes only what its gate admits), delivered at the next update
+			if (payload.size() > kMaxPacketBytes)
+			{
+				s.logf("send(%s): payload of %zu bytes is too large, dropped", msg_name(type), payload.size());
+				return;
+			}
+			s.m_local->push_to_client(type, lane, payload);
 			return;
 		}
 		Conn* c = s.joined_conn(to);
@@ -1953,6 +2081,8 @@ void Session::broadcast(Lane lane, Msg type, const Writer& payload, PeerId excep
 		for (const auto& kv : s.m_joined)
 			if (kv.first != except && s.may_send(*kv.second, type))
 				s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
+		if (s.m_local && except != kHostPeer)
+			s.m_local->push_to_client(type, lane, payload); // F3a T4: the host player (the link's gate decides)
 	}
 	catch (...)
 	{

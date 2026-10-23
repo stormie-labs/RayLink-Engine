@@ -15,10 +15,12 @@
 namespace coop
 {
 class Session;
+class Endpoint;
 
 namespace worldstate
 {
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void frame(); // main thread, every frame while a session is active
 void reset(); // session started / ended
 void print_status();

@@ -1872,13 +1872,18 @@ void forget_lua()
 }
 } // namespace
 
-void install(Session& s)
+void install_server(Session& s)
 {
 	s.on(Msg::SyncSet, &on_set);
-	s.on(Msg::SyncFull, &on_full);
 	s.on(Msg::SyncRequest, &on_request);
-	s.on(Msg::SyncResult, &on_result);
-	s.on(Msg::SyncCast, &on_cast);
+}
+
+void install_client(Endpoint& e)
+{
+	e.on(Msg::SyncSet, &on_set);
+	e.on(Msg::SyncFull, &on_full);
+	e.on(Msg::SyncResult, &on_result);
+	e.on(Msg::SyncCast, &on_cast);
 }
 
 void reset()

@@ -20,6 +20,27 @@ enum class Phase : u8
 };
 const char* phase_name(Phase p);
 
+// F3a split levels, the roles of this process (docs/plans/2026-10-24-f3a-split-levels.md §1.1) as flags. They replace
+// the pair host / client: every check "am I the host" is one of the roles below, whichever the code needs.
+//   WorldServer   the host's process: the world, offline, time, story, money, the save, the registry of levels;
+//   MapAuthority  the host's process for its own level, a map server for the level it serves: the objects, the AI, the
+//                 physics, the requests of the players on that level;
+//   Player        the host's process (the host player, a client of its own world server over the LocalLink) and a
+//                 remote client;
+//   Mirror        a remote client: its objects are copies of an authority's;
+//   MapServer     a background map server of the host's PC (the key -coop_mapserver, F3a T5/T9).
+enum class ProcessRole : u8
+{
+	WorldServer = 1 << 0,
+	MapAuthority = 1 << 1,
+	Player = 1 << 2,
+	Mirror = 1 << 3,
+	MapServer = 1 << 4,
+};
+// The roles of a phase: hosting = WorldServer | MapAuthority | Player; a client in any phase after its transport start =
+// Player | Mirror; off = none. A map server's (MapAuthority | MapServer) comes with T9.
+u8 roles_of(Phase p);
+
 class Manager
 {
 public:
@@ -37,16 +58,25 @@ public:
 	void set_netsim(const NetSim& sim);
 
 	Phase phase() const { return m_phase; }
-	void set_phase(Phase p);
+	void set_phase(Phase p); // also sets the roles (roles_of)
 	bool active() const { return m_phase != Phase::Off; }
-	bool is_host() const { return m_phase == Phase::Hosting; }
-	// Client in any phase after transport start.
-	bool is_client() const { return m_phase != Phase::Off && m_phase != Phase::Hosting; }
+	// F3a T4: the roles of this process (ProcessRole flags), set with the phase.
+	bool has_role(ProcessRole r) const { return (m_roles & u8(r)) != 0; }
+	u8 roles() const { return m_roles; }
+	// Until a module is moved over, the old names keep their meaning (§1.1): is_host() is the world server (the phase
+	// Hosting), is_client() a mirror (a client in any phase after transport start).
+	bool is_host() const { return has_role(ProcessRole::WorldServer); }
+	bool is_client() const { return has_role(ProcessRole::Mirror); }
 	bool is_live_client() const { return m_phase == Phase::Live; }
 
 	Session& session() { return m_session; }
 	const Session& session() const { return m_session; }
 	PeerId self() const { return m_session.self(); }
+	// F3a T4: the internal channel of the host's process (xrCoop/coop_local_link.h): its world server's session sees the
+	// host player as peer 0 on it, and it is the host player's Endpoint (the client-side handlers). Attached for the
+	// life of the process; it passes only the messages moved onto it (link_enabled). Main thread.
+	LocalLink& local_link() { return m_link; }
+	const LocalLink& local_link() const { return m_link; }
 
 	// Persistent identity of this game folder (appdata\coop_player.key), created on first use.
 	const PlayerKey& player_key();
@@ -63,11 +93,17 @@ public:
 private:
 	Manager();
 	void install_session_callbacks();
+	// F3a T4: the handler tables of the role this process starts in (every module's install_server / install_client):
+	// hosting, the server's on the session and the client's on the host player's LocalLink; connecting, the client's on
+	// the session. What a table had before goes first.
+	void install_handlers(bool hosting);
 	void autostart();
 	SessionConfig make_config(u16 port);
 
+	LocalLink m_link; // declared before m_session: it outlives the session it is attached to
 	Session m_session;
 	Phase m_phase = Phase::Off;
+	u8 m_roles = 0; // ProcessRole flags, set with the phase
 	PlayerKey m_key{};
 	bool m_key_loaded = false;
 	Manifest m_manifest;
@@ -76,22 +112,15 @@ private:
 
 inline Manager& mgr() { return Manager::get(); }
 
-// F3a split levels, the roles of this process (docs/plans/2026-10-24-f3a-split-levels.md §1.1). They replace the pair
-// host / client: every check "am I the host" is one of the roles below, whichever the code needs.
-//   world server   the host's process: the world, offline, time, story, money, the save, the registry of levels;
-//   map authority  the host's process for its own level, a map server for the level it serves: the objects, the AI,
-//                  the physics, the requests of the players on that level;
-//   player         the host's process (the host plays) and a remote client;
-//   mirror         a remote client: its objects are copies of an authority's;
-//   map server     a background map server of the host's PC (the key -coop_mapserver, F3a T5/T9).
-// Until a module is moved over, the old names keep their meaning: is_host() = is_world_server() (and the map authority and a
-// player), is_client() = is_mirror() (and a player). A process that is no map server (everything today) is every role of
-// the old host or of the old client. Main thread.
-inline bool is_world_server() { return mgr().is_host(); }
-inline bool is_map_authority() { return mgr().is_host(); } // + a map server, T9
-inline bool is_player() { return mgr().active(); }
-inline bool is_mirror() { return mgr().is_client(); }
-inline bool is_map_server() { return false; } // the map-server key comes with T5/T9
+// F3a split levels, the roles of this process (ProcessRole above, §1.1). Until a module is moved over, the old names keep
+// their meaning: is_host() = is_world_server() (and the map authority and a player), is_client() = is_mirror() (and a
+// player). A process that is no map server (everything today) is every role of the old host or of the old client. Main
+// thread.
+inline bool is_world_server() { return mgr().has_role(ProcessRole::WorldServer); }
+inline bool is_map_authority() { return mgr().has_role(ProcessRole::MapAuthority); } // + a map server, T9
+inline bool is_player() { return mgr().has_role(ProcessRole::Player); }
+inline bool is_mirror() { return mgr().has_role(ProcessRole::Mirror); }
+inline bool is_map_server() { return mgr().has_role(ProcessRole::MapServer); } // the map-server key comes with T5/T9
 
 // Level-change review (owner 2026-10-23, xrCoop/coop_world_gate.h): the level this machine plays is UP: constructed and
 // loaded (g_pGameLevel->bReady: set at the end of IGame_Level::Load, cleared first thing in CLevel::net_Stop), the ALife

@@ -126,7 +126,8 @@ void collect_players(xr_vector<PlayerRef>& out, bool include_self);
 // Nick of the player whose character has `host_id`, "?" if unknown.
 xr_string nick_of(u16 host_id);
 
-void install(Session& s);
+void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void register_console(); // from coop::register_console_commands (console vars are host rules)
 void frame(); // main thread, every frame
 void reset(); // session started / ended
