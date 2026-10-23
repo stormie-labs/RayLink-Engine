@@ -1454,11 +1454,11 @@ void host_on_transition_vote(PeerId from, Reader& r)
 	::Msg("[coop] '%s' stands at a level exit (%u) and wants the group to move. Host: coop_accept_transition to go",
 	      nick, changer);
 	script::on_transition_vote(nick); // the host's Lua (clients get the chat line below)
-	Writer w(128);
 	string256 text;
 	xr_sprintf(text, "%s wants to move the group to the next level", p ? p->nick.c_str() : "a player");
-	w.str(text);
-	net::host_broadcast(Msg::Chat, w);
+	// T3c review M-2: through the session's own chat (u32 from = host, then the line). A bare str payload had no sender
+	// and every client dropped it as malformed, so only the host ever saw the vote.
+	mgr().session().send_chat(text);
 }
 
 void install(Session& s)
