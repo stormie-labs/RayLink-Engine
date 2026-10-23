@@ -60,7 +60,8 @@ inline bool parse_gate(std::string_view word, Gate& out)
 // The gate that rules a move once the two game rules are known:
 //   split levels off     the group moves as one through the waiting point at every exit (Phase 3 behaviour): Together;
 //   story maps together off  a Together level is only a suggestion: BetterTogether;
-//   otherwise            the gate stands. A value that is none of the three passes through, decide_move refuses it.
+//   otherwise            the gate stands. With split levels on, a value that is none of the three passes through and
+//                        decide_move refuses it; with split levels off every value, valid or not, becomes Together.
 inline Gate effective_gate(Gate g, bool split, bool story_together)
 {
 	if (!split)
@@ -250,11 +251,18 @@ constexpr uint32_t kStartTimeoutMs = 120000; // a process that is not Ready by t
 constexpr uint32_t kStopTimeoutMs = 15000; // a process that has not exited by then after Stop is killed
 constexpr uint32_t kDefaultLingerMs = 60000; // the pause: coop_mapserver_linger = 60 s
 constexpr uint32_t kFlushTimeoutMs = 3000; // a map server that has not sent its snapshot by then is left to its stream
+// A process that dies again and again before it serves anybody must not be started for ever (the players would wait on the
+// loading screen for good): this many deaths in a row without a healthy run, and ServerLife gives up (gave_up()).
+constexpr uint32_t kMaxStartFailures = 3;
+// A process that has lived this long after Ready has proved itself: its failures so far are forgotten, and a later death is a
+// crash (a new start is wanted), not a failed start.
+constexpr uint32_t kHealthyRunMs = 30000;
 
 // One map server of one level, as the world server keeps it. It decides nothing by itself: the caller feeds it what he
 // sees and does what it asks. One tick of the caller:
 //     life.players(table.map_players(level), now);              // the count, every tick
-//     if (life.want_start()) { launch(level); life.started(now); }
+//     if (life.gave_up()) { give the moves to this level up; return the movers to where they were; }
+//     else if (life.want_start()) { launch(level); life.started(now); }
 //     else if (life.want_stop(now))
 //         switch (life.state())
 //         {
@@ -264,7 +272,17 @@ constexpr uint32_t kFlushTimeoutMs = 3000; // a map server that has not sent its
 //         }
 // and, as the reports come: ready() when the process says Ready, stopped() when it says Stopped or exits, lost() when
 // the bridge to it breaks. A report that does not fit the state (late, twice, from an old process) is ignored.
-// The clock is the caller's: `now` in ms, any origin; a value older than one seen before is taken as that one.
+// The clock is the caller's: `now` in ms, any origin; a value older than one seen before is taken as that one. The reports
+// ready(), stopped() and lost() have no clock of their own: they use the latest `now` that players() or started() saw, so
+// players() must be called every tick (a death is judged young, the careful way, if the clock was not told for long).
+//
+// Failed starts. A process that is lost while it loads (Starting), or that is lost fewer than kHealthyRunMs after it was
+// Ready, is a failed start; so is one that exits by itself in those cases. kMaxStartFailures of them in a row and the server
+// "gave up": want_start() is false, the state stays Lost, and the caller must not leave the movers on the loading screen.
+// The series ends (failures() back to 0) when a process has lived kHealthyRunMs after Ready (seen in players()), when one is
+// stopped cleanly, when the players of the level are gone (players(0): the movers went back; the next player who tries gets
+// a fresh series, so a retry always needs a player's action) or when the caller says retry_allowed(). Ready alone does not
+// end it: a map that loads and dies at the first player would otherwise be restarted for ever.
 struct ServerLife
 {
 	uint32_t linger_ms = kDefaultLingerMs; // how long a server with no players stays
@@ -272,13 +290,33 @@ struct ServerLife
 	ServerState state() const { return state_; }
 	uint32_t count() const { return n_; }
 
+	// Failed starts in a row (see above).
+	uint32_t failures() const { return failures_; }
+	// Too many failed starts in a row: no process is launched for these players (want_start() is false).
+	bool gave_up() const { return failures_ >= kMaxStartFailures; }
+	// Forget the failed starts: the next want_start() may launch again (the caller knows something changed).
+	void retry_allowed() { failures_ = 0; }
+
+	// Does this server count against coop_max_map_servers (decide_move's `running`)? Yes while a process is there to serve
+	// or to be served: Starting, Ready, Serving, Draining. No for Off and Lost (no process) and for Stopping (it is on its
+	// way out, its place is free for the next map).
+	bool running() const
+	{
+		return state_ == ServerState::Starting || state_ == ServerState::Ready || state_ == ServerState::Serving ||
+		    state_ == ServerState::Draining;
+	}
+
 	// The players of this server now (Table::map_players). Counts that come back to zero start the pause once; the same
 	// zero again does not restart it; a player in the pause cancels it. Does nothing to a process that is going down.
 	void players(uint32_t n, uint64_t now)
 	{
 		tick(now);
 		n_ = n;
-		if (state_ != ServerState::Ready && state_ != ServerState::Serving && state_ != ServerState::Draining)
+		if (gave_up() && n_ == 0)
+			failures_ = 0; // everybody is gone: the next player to try starts a fresh series
+		if (loaded() && now_ - ready_at_ >= kHealthyRunMs)
+			failures_ = 0; // it has lived: whatever failed before is forgotten
+		if (!loaded())
 			return;
 		if (n_ > 0)
 			state_ = ServerState::Serving;
@@ -289,8 +327,8 @@ struct ServerLife
 		}
 	}
 
-	// Players want a level that no process leads: launch one, then say started().
-	bool want_start() const { return (state_ == ServerState::Off || state_ == ServerState::Lost) && n_ > 0; }
+	// Players want a level that no process leads: launch one, then say started(). Not once the server gave up.
+	bool want_start() const { return (state_ == ServerState::Off || state_ == ServerState::Lost) && n_ > 0 && !gave_up(); }
 
 	// The process was launched. Only an Off or a Lost server is (re)started.
 	void started(uint64_t now)
@@ -307,6 +345,7 @@ struct ServerLife
 	{
 		if (state_ != ServerState::Starting)
 			return;
+		ready_at_ = now_;
 		if (n_ > 0)
 			state_ = ServerState::Serving;
 		else
@@ -317,7 +356,8 @@ struct ServerLife
 	}
 
 	// Time to end this process: the pause is over, or a start or a stop took too long. For Starting and Stopping it means
-	// "kill it"; for the others "order Stop". Never for a server with players.
+	// "kill it" (whatever the number of players: a start or a stop that hangs is ended); for Ready and Draining "order Stop".
+	// Never for a Serving server: one with players is stopped only by the caller's own decision (stopping()).
 	bool want_stop(uint64_t now) const
 	{
 		switch (state_)
@@ -344,16 +384,24 @@ struct ServerLife
 	void stopped()
 	{
 		if (state_ == ServerState::Stopping)
+		{
 			state_ = ServerState::Off;
+			failures_ = 0; // it came up and left cleanly
+		}
 		else if (state_ != ServerState::Off && state_ != ServerState::Lost)
+		{
+			note_death();
 			state_ = ServerState::Lost;
+		}
 	}
 
 	// The process died, hung (killed by the caller) or the bridge to it broke.
 	void lost()
 	{
-		if (state_ != ServerState::Off)
-			state_ = ServerState::Lost;
+		if (state_ == ServerState::Off || state_ == ServerState::Lost)
+			return;
+		note_death();
+		state_ = ServerState::Lost;
 	}
 
 private:
@@ -363,11 +411,29 @@ private:
 			now_ = now;
 	}
 	uint64_t elapsed(uint64_t now) const { return now > since_ ? now - since_ : 0; }
+	bool loaded() const { return state_ == ServerState::Ready || state_ == ServerState::Serving || state_ == ServerState::Draining; }
+
+	// A process that nobody asked to end is gone. While loading, or not yet healthy, that is a failed start; after a healthy
+	// run it is a crash and the series starts over. A death while Stopping is the end it was going to have anyway.
+	void note_death()
+	{
+		if (state_ == ServerState::Starting)
+			++failures_;
+		else if (loaded())
+		{
+			if (now_ - ready_at_ >= kHealthyRunMs)
+				failures_ = 0;
+			else
+				++failures_;
+		}
+	}
 
 	ServerState state_ = ServerState::Off;
 	uint32_t n_ = 0;
+	uint32_t failures_ = 0; // failed starts in a row
 	uint64_t now_ = 0; // the latest clock value seen
 	uint64_t since_ = 0; // when the state that runs a timer was entered
+	uint64_t ready_at_ = 0; // when the process said Ready
 };
 
 // ---------------------------------------------------------------- the flush round before a save

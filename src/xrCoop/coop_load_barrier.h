@@ -6,6 +6,10 @@
 // LoadWait {Enter} and the screens come off together. A laggard does not hold the others for ever: kLoadWaitMs after the
 // start the barrier opens for those who are ready, and he enters alone when he is ready. An answer of an older
 // transition (another epoch) is not an answer to this one.
+// One barrier is one transition to one level: it is fed only by its own new map server (server_ready / server_lost carry
+// the epoch of the transition the server was started for, and a report of another epoch is ignored), so a caller with
+// several transitions at once keeps one LoadBarrier for each. A map server that never comes up does not open the barrier,
+// not even after kLoadWaitMs: server_wait_exceeded() tells the caller to give the move up and return the movers.
 // Pure C++17, header-only, no engine dependencies: used by xrGame and by the unit-test exe.
 #pragma once
 
@@ -54,12 +58,30 @@ public:
 	// epoch, or a transition where the host stays on his map: ignored.
 	void world_up(uint32_t epoch) { ready(host_peer_, epoch); }
 
-	// The new map server reported Ready. Not needed by this barrier: ignored.
-	void server_ready()
+	// The new map server of this transition reported Ready (`epoch` = the epoch the server was started for, the one of
+	// start()). Another epoch (the report of the server of an older transition), a barrier that is not started or waits for
+	// no server: ignored.
+	void server_ready(uint32_t epoch)
 	{
-		if (active_ && wait_server_)
+		if (active_ && wait_server_ && epoch == epoch_)
 			server_ready_ = true;
 	}
+
+	// The map server of this transition died, or its bridge broke, after it had said Ready and before the screens came off:
+	// the barrier closes again (enter() is false) and the wait for the server runs again - server_wait_exceeded() can fire.
+	// Another epoch or a barrier that waits for no server: ignored. A new process of the same level that says Ready
+	// (server_ready) opens it again.
+	void server_lost(uint32_t epoch)
+	{
+		if (active_ && wait_server_ && epoch == epoch_)
+			server_ready_ = false;
+	}
+
+	// The way out when the map server never comes (or does not come back): the barrier waited for it kLoadWaitMs since the
+	// start and it is still not ready. The caller then ends the move - the movers go back to where they were - instead of
+	// leaving them on the loading screen for good. The players' own 60 s do not open the barrier onto a map nobody leads;
+	// this is what ends the wait. False for a barrier that waits for no server, or is not started.
+	bool server_wait_exceeded(uint64_t now) const { return waiting_server() && elapsed(now) >= kLoadWaitMs; }
 
 	// A mover left the session (dropped, kicked): he is not waited for. The map server asked for him still is.
 	void drop(uint32_t peer)
