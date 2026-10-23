@@ -1,5 +1,6 @@
 // Anomaly Coop — what a player's death costs, on the host (F3, docs/CHECKPOINTS_DEATH.md §3.3): a share of the
-// backpack drops at the body, stays in a stash or is gone (death_drop), and every player sees where (DeathMarker).
+// backpack goes into a bag at the body (drop, Ruling L-1), the whole backpack into a stash (corpse) or a share is gone
+// (lose) (death_drop, death::plan_losses), and every player sees where (DeathMarker).
 // Rules, item categories and the death tracker: xrCoop/coop_death_rules.h; which items are candidates, the drop point
 // and the marker's wire form: xrCoop/coop_death_items.h; the death flow itself: coop_survival.
 //
@@ -8,8 +9,11 @@
 //   [coop_death_stash] the stash container (the stock backpack stash).
 // Host: everything here moves items with the engine's own events, as a host deal over a proxy does (coop_trade): the
 // server relays the parent changes (EntityParent) and the ownership mirror carries them to the player's machine.
-//   Drop   - GE_OWNERSHIP_REJECT from the character, item by item; a body that fell through the ground (or has no valid
-//            level vertex) has them put 0.3 m above its level vertex (GE_CHANGE_POS, exact drop position for clients);
+//   Drop   - Ruling L-1 (2026-10-23, the owner's playtest of build 7): the share goes into a coop_death_stash at the body,
+//            the Corpse way below with all its fallbacks; the DeathMarker names the stash and keeps the mode byte drop.
+//            Loose only when no stash can be made or it does not come online in time: GE_OWNERSHIP_REJECT from the
+//            character, item by item; a body that fell through the ground (or has no valid level vertex) has them put
+//            0.3 m above its level vertex (GE_CHANGE_POS, exact drop position for clients);
 //   Lose   - DestroyObject;
 //   Corpse - a coop_death_stash is spawned at the body (ALife, relayed as every host spawn); once it is online
 //            (within 5 s) the items go in by GE_TRADE_SELL from the character + GE_TRADE_BUY to the stash. A stash that
@@ -22,6 +26,10 @@
 //            The stash checks it is still for the same character (same_owner): by the key when both have one,
 //            otherwise by the player who plays it. Task 10 may rewrite the key of a retiring character (no key left:
 //            the player decides), a player who leaves takes his peer away (the key decides).
+//            L-1 (carried from F3 T15): the stash names its owner in its custom data when it is spawned
+//            ([coop_death_stash] nick = "<nick>", key = <digest>; stash_owner_to_ini), for the host's Lua marks after
+//            a load; once a second the host releases every death stash on its level that is empty, not waiting for its
+//            items and not open in the host's window (release_empty_bag): the stock frees only inv_backpack.
 // Never taken: quest items (IsQuestItem, kind i_quest / i_letter), the PDA, helper items, host-only objects. A client's
 // proxy does not show the host where its player keeps his things (an NPC cannot wear an outfit, has no belt and fills
 // its slots in its own order). The owner's Dead report brings the ids of what he has on (Ruling F3-4, F3 T8b,
@@ -55,10 +63,12 @@ void register_console(); // from coop::register_console_commands
 
 // --- host, main thread. `character`: 0 = the host's actor, else a player's proxy (host numbering) ---
 
-// What `character` loses for his death `seq` (death::Tracker decides it once per death) by `mode`: Drop and Lose take
-// floor(n x share) (+1 by chance) of each category of his backpack, Corpse puts the whole backpack into a stash.
-// Returns the number of items dropped, destroyed or on their way to the stash. DeathMarker (Drop: the first dropped
-// item, Corpse: the stash) goes to everybody the next frame. 0 for anything that is not a player character online.
+// What `character` loses for his death `seq` (death::Tracker decides it once per death) by `mode` (plan_losses): Drop
+// and Lose take floor(n x share) (+1 by chance) of each category of his backpack, Drop into a stash at the body (Ruling
+// L-1), Lose destroys them; Corpse puts the whole backpack into a stash. Returns the number of items destroyed or on
+// their way to the stash (or dropped at the body when no stash could be made). DeathMarker (the stash, mode drop or
+// corpse; the first dropped item when they fell loose) goes to everybody once they are in. 0 for anything that is not
+// a player character online.
 // `seq` is the death of the client's Dead report: it picks the list of worn items (see above).
 u32 host_apply_losses(u16 character, u16 seq, Drop mode);
 // Spawns a coop_death_stash at the body of `character` and moves into it his backpack (`everything` false: Corpse) or

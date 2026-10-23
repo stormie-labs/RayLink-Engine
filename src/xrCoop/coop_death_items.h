@@ -393,5 +393,138 @@ inline void stash_presence(uint64_t& deadline, bool& away, Presence character, u
 		deadline = now + kStashWaitMs;
 	}
 }
+
+// ---------------------------------------------------------------- Ruling L-1: the lost share goes into a bag (2026-10-23)
+
+// What a death does with the things it takes (the owner's playtest of build 7: seven small items in the grass are hard
+// to find and to pick up, one bag with a PDA mark is what he expects). Drop: the share pick_losses takes goes into a
+// coop_death_stash at the body; Corpse: the whole backpack (stash_ids) goes there; Lose: the share is destroyed. The
+// engine carries the plan out (coop_death.cpp); every fallback of a stash (no [coop_death_stash], a stash that does not
+// come online in time) still lets the items fall at the body.
+enum class LossMove : uint8_t
+{
+	None, // nothing is taken
+	Stash, // `items` go into a coop_death_stash at the body (Drop: the share, Corpse: the backpack)
+	Destroy // `items` are gone (Lose)
+};
+
+struct LossPlan
+{
+	LossMove move = LossMove::None;
+	std::vector<uint16_t> items;
+	Drop marker = Drop::Drop; // the DeathMarker mode of the stash once filled; Lose: no marker
+	size_t offered = 0; // for the log: the candidates of the pick (Drop, Lose) or the backpack items (Corpse)
+};
+
+// `items`, `kinds` and `layout_known` as for loss_candidates; `shares` and `seed` as for pick_losses (Corpse uses
+// neither). A mode byte Rules::read would never give acts as Drop, the default mode. No item to take: LossMove::None.
+inline LossPlan plan_losses(Drop mode, const std::vector<ItemFacts>& items, const KindTable& kinds, bool layout_known,
+	const Shares& shares, uint32_t seed)
+{
+	LossPlan p;
+	if (mode == Drop::Corpse)
+	{
+		p.items = stash_ids(items, kinds, false, layout_known);
+		p.offered = p.items.size();
+		p.move = LossMove::Stash;
+		p.marker = Drop::Corpse;
+	}
+	else
+	{
+		const std::vector<Candidate> candidates = loss_candidates(items, kinds, layout_known);
+		p.offered = candidates.size();
+		p.items = pick_losses(candidates, shares, seed);
+		p.move = mode == Drop::Lose ? LossMove::Destroy : LossMove::Stash;
+		p.marker = mode == Drop::Lose ? Drop::Lose : Drop::Drop; // a drop bag keeps the drop mode byte (Lua's hint)
+	}
+	if (p.items.empty())
+		p.move = LossMove::None;
+	return p;
+}
+
+// What the host sees of one box on its level, once a second (carried from F3 T15, concern 3: the stock
+// item_backpack.actor_on_item_take_from_box releases only inv_backpack, so an emptied death bag stayed for ever).
+struct BagState
+{
+	bool death_stash = false; // the section is coop_death_stash
+	bool online = false; // its game object is on the level (an inventory box)
+	bool empty = false; // nothing in it: the server entity has no child and the box lists no item
+	bool pending = false; // a death still waits to move its items into it (host_stash_pending of the stash)
+	bool in_use = false; // the host has it open in his own window
+};
+
+// The host releases a death bag that is empty and online, and only that: never one that still waits for its items, has
+// something in it, is offline (nobody can empty it there; it is looked at again when it is online), is open in the
+// host's window (it goes when he closes it), or is not a death bag.
+inline bool release_empty_bag(const BagState& s)
+{
+	return s.death_stash && s.online && s.empty && !s.pending && !s.in_use;
+}
+
+// The owner of a bag in its custom data (carried from F3 T15, concern 4), written by the host when it spawns the bag:
+//   [coop_death_stash]
+//   nick = "<nick>"
+//   key = <the player key digest of the character, none for the host's actor>
+// The host's Lua (coop_death.script, restore_stash_markers) puts the nick on the mark it sets again after a load.
+// The engine reads custom data with CInifile whenever the object spawns (CGameObject::net_Spawn) and Lua through
+// spawn_ini(): an odd '"' there makes it read on past the end of the text (R_ASSERT), ';' and '//' start a comment and
+// blanks outside quotes are dropped. So the nick is written in quotes, without quotes and control characters in it, and
+// at most kMaxStashNickBytes long (a nick is that long at most anyway, coop_session sanitize_nick), never cut inside a
+// UTF-8 character. The custom data goes with every save in one 16 KB packet (w_stringZ): these two lines are all.
+constexpr const char* kStashIniSection = "coop_death_stash";
+constexpr const char* kStashIniNick = "nick";
+constexpr const char* kStashIniKey = "key";
+constexpr size_t kMaxStashNickBytes = 48;
+
+// The nick as it can stand in quotes in custom data.
+inline std::string stash_nick(const std::string& nick)
+{
+	std::string s;
+	s.reserve(nick.size());
+	for (const char ch : nick)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		if (c >= 0x20 && c != 0x7F && c != '"')
+			s.push_back(ch);
+	}
+	if (s.size() > kMaxStashNickBytes)
+	{
+		size_t cut = kMaxStashNickBytes;
+		while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+			--cut; // s[cut] continues a character: the cut goes before its first byte
+		s.resize(cut);
+	}
+	return s;
+}
+
+// Writes the owner: the lines of an earlier owner go, then the nick (if anything is left of it) and the key (if it is a
+// key digest). Other sections and keys stay as they are; nothing to write leaves the text as it was.
+inline void stash_owner_to_ini(std::string& text, const std::string& nick, const std::string& key)
+{
+	checkpoint::ini_erase(text, kStashIniSection, kStashIniNick);
+	checkpoint::ini_erase(text, kStashIniSection, kStashIniKey);
+	const std::string n = stash_nick(nick);
+	if (!n.empty())
+		checkpoint::ini_set(text, kStashIniSection, kStashIniNick, "\"" + n + "\"");
+	if (detail::is_key_digest(key))
+		checkpoint::ini_set(text, kStashIniSection, kStashIniKey, key);
+}
+
+// The owner of a bag: false if its custom data names none (an older bag, or none was known). The nick comes without
+// the quotes it was written in; a key that is not a key digest reads as none.
+inline bool stash_owner_from_ini(const std::string& text, std::string& nick, std::string& key)
+{
+	std::string n, k;
+	if (checkpoint::ini_get(text, kStashIniSection, kStashIniNick, n) && n.size() >= 2 && n.front() == '"' &&
+		n.back() == '"')
+		n = n.substr(1, n.size() - 2);
+	if (!checkpoint::ini_get(text, kStashIniSection, kStashIniKey, k) || !detail::is_key_digest(k))
+		k.clear();
+	if (n.empty() && k.empty())
+		return false;
+	nick = n;
+	key = k;
+	return true;
+}
 } // namespace death
 } // namespace coop

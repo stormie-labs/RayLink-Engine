@@ -146,8 +146,13 @@ struct PendingStash
 	u64 give_up_at = 0; // a player who left: the move waits for him (or for both to go offline) until then
 	bool away = false; // the character was not online at the last check
 	DropPlace died; // where the stash was made: a fallback drop puts the items there (fallback_place)
+	Drop marker = Drop::Corpse; // the DeathMarker mode once filled: Drop for the bag of a drop death (Ruling L-1)
 };
 xr_vector<PendingStash> g_stashes;
+
+// Ruling L-1, carried from F3 T15 (concern 3): an emptied death stash is looked for once a second and released.
+constexpr u64 kBagPollMs = 1000;
+u64 g_next_bag_poll = 0;
 
 struct QueuedMarker
 {
@@ -167,6 +172,7 @@ struct Stats
 {
 	u64 deaths = 0, dropped = 0, moved = 0, destroyed = 0, stashes = 0, stash_fallbacks = 0, stash_lost = 0;
 	u64 stash_abandoned = 0; // released empty at the end of a session or on a new world (review minor 5)
+	u64 bags_released = 0; // Ruling L-1: emptied by the players, released by the host (release_empty_bags)
 	u64 markers_sent = 0, markers_in = 0, markers_refused = 0, markers_dropped = 0;
 	u64 money_taken = 0;
 };
@@ -476,19 +482,25 @@ void send_markers()
 	}
 }
 
-// Spawns the stash and queues the move; falls back to dropping. Returns the stash id (kNoId if none); `count`: items
-// on their way to the stash or dropped.
-u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everything, u16 seq, u32& count)
+// Ruling L-1, carried from F3 T15 (concern 4): the stash names its owner in its custom data ([coop_death_stash] nick /
+// key, stash_owner_to_ini), written when it is spawned, before it goes online or into a save. The host's Lua reads it
+// back when it enters a world (restore_stash_markers), from an entity made anew out of the save.
+void write_owner(CSE_Abstract* e, u16 character, const StashOwner& owner)
+{
+	const xr_string n = survival::nick_of(character);
+	std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
+	stash_owner_to_ini(text, n == "?" ? std::string() : std::string(n.c_str()), owner.key);
+	e->m_ini_string = text.c_str();
+}
+
+// Spawns a stash at the body of `character` for `picked` (his items, host ids) and queues the move; `marker`: the
+// DeathMarker mode once they are in (Drop: the bag of a drop death's share, Ruling L-1; Corpse: the backpack, or all
+// he has when a hardcore character retires). `note`: for the log. Falls back to dropping them at the body. Returns the
+// stash id (kNoId if none); `count`: items on their way to the stash or dropped.
+u16 stash_items(u16 character, CGameObject* body, const std::vector<u16>& picked, Drop marker, const xr_string& note,
+    u32& count)
 {
 	count = 0;
-	const Carried carried = carried_of(character, io, everything, seq);
-	const std::vector<u16> picked = stash_ids(carried.items, g_set.kinds, everything, carried.layout_known);
-	if (picked.empty())
-	{
-		::Msg("[coop] death: %s has nothing for a stash%s", nick(character).c_str(),
-		    layout_note(carried, character).c_str());
-		return kNoId;
-	}
 	const BodyPlace place = body_place(body);
 
 	const char* why = nullptr;
@@ -526,13 +538,33 @@ u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everyt
 	p.deadline = now_ms() + kStashWaitMs;
 	p.give_up_at = now_ms() + kStashAwayWaitMs;
 	p.died = place.drop;
+	p.marker = marker;
+	write_owner(e, character, p.owner);
 	count = u32(p.items.size());
 	g_stashes.push_back(std::move(p));
 	++g_st.stashes;
-	::Msg("[coop] death stash %u for %s at (%.1f, %.1f, %.1f): %u items go in when it is online%s%s", e->ID,
-	    nick(character).c_str(), place.drop.at.x, place.drop.at.y, place.drop.at.z, count,
-	    everything ? " (everything he has)" : "", layout_note(carried, character).c_str());
+	::Msg("[coop] death stash %u (%s) for %s at (%.1f, %.1f, %.1f): %u items go in when it is online%s", e->ID,
+	    marker_kind(marker), nick(character).c_str(), place.drop.at.x, place.drop.at.y, place.drop.at.z, count,
+	    note.c_str());
 	return e->ID;
+}
+
+// host_move_to_stash: the backpack (`everything` false, a corpse death) or all he has (a hardcore retirement) into a
+// stash at the body.
+u16 stash_for(u16 character, CGameObject* body, CInventoryOwner* io, bool everything, u16 seq, u32& count)
+{
+	count = 0;
+	const Carried carried = carried_of(character, io, everything, seq);
+	const std::vector<u16> picked = stash_ids(carried.items, g_set.kinds, everything, carried.layout_known);
+	if (picked.empty())
+	{
+		::Msg("[coop] death: %s has nothing for a stash%s", nick(character).c_str(),
+		    layout_note(carried, character).c_str());
+		return kNoId;
+	}
+	xr_string note = everything ? " (everything he has)" : "";
+	note += layout_note(carried, character);
+	return stash_items(character, body, picked, Drop::Corpse, note, count);
 }
 
 // Where the character is: Online = a player character in the level; Offline = his player left and the character is
@@ -570,7 +602,7 @@ void stash_filled(PendingStash& p, u32 moved, const char* how)
 		release_stash(p.stash);
 		return;
 	}
-	queue_marker(p.character, p.stash, Drop::Corpse);
+	queue_marker(p.character, p.stash, p.marker); // a drop bag keeps the drop mode byte (Ruling L-1)
 }
 
 // Both online: the items go in, as the stock corpse search window moves them (move_item_from_to).
@@ -669,6 +701,55 @@ void abandon_stashes(const char* why)
 	g_stashes.clear();
 }
 
+bool stash_waiting(u16 stash)
+{
+	for (const PendingStash& p : g_stashes)
+		if (p.stash == stash)
+			return true;
+	return false;
+}
+
+// Ruling L-1, carried from F3 T15 (concern 3): a death stash whose last item was taken stayed in the world for ever (the
+// stock item_backpack.actor_on_item_take_from_box releases only inv_backpack). Once a second the host looks at the
+// boxes on its level - only an online stash can have been emptied, and every take, a client's too, is a parent change
+// on the host - and releases each coop_death_stash that is empty in the server's state and in its box, does not wait
+// for its items (a pending move) and is not open in the host's own window (release_empty_bag). Any death stash: of this
+// session, of a loaded world, of a hardcore retirement. The release is the usual one (GE_DESTROY), so every client's
+// mirror loses it and the host's Lua drops its mark.
+void release_empty_bags(u64 t)
+{
+	if (t < g_next_bag_poll)
+		return;
+	g_next_bag_poll = t + kBagPollMs;
+	if (!g_pGameLevel || !ai().get_alife())
+		return;
+	xr_vector<u16> empty;
+	for (u32 i = 0, n = Level().Objects.o_count(); i < n; ++i)
+	{
+		CObject* o = Level().Objects.o_get_by_iterator(i);
+		LPCSTR section = o ? o->cNameSect_str() : nullptr;
+		if (!section || xr_strcmp(section, kStashSection))
+			continue;
+		CInventoryBox* box = smart_cast<CInventoryBox*>(o);
+		const CSE_Abstract* e = box ? events::find_entity(box->ID()) : nullptr;
+		BagState s;
+		s.death_stash = e && !xr_strcmp(e->s_name, kStashSection);
+		s.online = box && !box->getDestroy() && !box->object_removed();
+		s.empty = e && e->children.empty() && box->IsEmpty();
+		s.pending = stash_waiting(o->ID());
+		s.in_use = box && box->in_use();
+		if (release_empty_bag(s))
+			empty.push_back(o->ID());
+	}
+	for (const u16 id : empty) // after the walk: a release must not change the list under it
+	{
+		release_stash(id);
+		++g_st.bags_released;
+		if (log_allowed())
+			::Msg("[coop] death stash %u is empty: released", id);
+	}
+}
+
 void host_frame()
 {
 	const u32 epoch = join::host_world_epoch();
@@ -701,6 +782,7 @@ void host_frame()
 			g_stashes.erase(g_stashes.begin() + i);
 		}
 	}
+	release_empty_bags(now_ms());
 	if (!g_markers.empty())
 		send_markers();
 }
@@ -787,29 +869,24 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode)
 	ensure_settings();
 	++g_st.deaths;
 
-	if (mode == Drop::Corpse)
-	{
-		u32 count = 0;
-		stash_for(character, body, io, false, seq, count);
-		return count;
-	}
-
+	// Ruling L-1 (plan_losses): drop puts its share into a bag at the body, corpse the whole backpack, lose destroys
+	// the share. The seed is the pick of drop and lose; corpse picks nothing.
 	const Carried carried = carried_of(character, io, false, seq);
-	const std::vector<Candidate> candidates = loss_candidates(carried.items, g_set.kinds, carried.layout_known);
 	const u64 game_time = ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0;
 	const u32 seed = loss_seed(character, seq, game_time);
-	const std::vector<u16> picked = pick_losses(candidates, g_set.shares, seed);
-	if (picked.empty())
+	const LossPlan plan = plan_losses(mode, carried.items, g_set.kinds, carried.layout_known, g_set.shares, seed);
+	const xr_string note = layout_note(carried, character);
+	if (plan.move == LossMove::None)
 	{
-		::Msg("[coop] death of %s (seq %u): nothing of %u backpack items is lost%s", nick(character).c_str(), seq,
-		    u32(candidates.size()), layout_note(carried, character).c_str());
+		::Msg("[coop] death of %s (seq %u, %s): nothing of %u backpack items is lost%s", nick(character).c_str(), seq,
+		    mode == Drop::Lose ? "lose" : marker_kind(mode), u32(plan.offered), note.c_str());
 		return 0;
 	}
 
-	if (mode == Drop::Lose)
+	if (plan.move == LossMove::Destroy)
 	{
 		u32 count = 0;
-		for (u16 id : picked)
+		for (u16 id : plan.items)
 		{
 			if (server_parent(id) != character)
 				continue;
@@ -821,15 +898,15 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode)
 		}
 		g_st.destroyed += count;
 		::Msg("[coop] death of %s (seq %u): %u of %u backpack items are gone%s", nick(character).c_str(), seq, count,
-		    u32(candidates.size()), layout_note(carried, character).c_str());
+		    u32(plan.offered), note.c_str());
 		return count;
 	}
 
 	u32 count = 0;
-	const u16 first = drop_all(character, body, picked, count);
-	::Msg("[coop] death of %s (seq %u): %u of %u backpack items dropped%s", nick(character).c_str(), seq, count,
-	    u32(candidates.size()), layout_note(carried, character).c_str());
-	queue_marker(character, first, Drop::Drop);
+	::Msg("[coop] death of %s (seq %u, %s): %u of %u backpack items go into a stash at the body%s",
+	    nick(character).c_str(), seq, marker_kind(plan.marker), u32(plan.items.size()), u32(plan.offered),
+	    note.c_str());
+	stash_items(character, body, plan.items, plan.marker, note, count);
 	return count;
 }
 
@@ -966,7 +1043,7 @@ void host_preview(u16 character, u16 seq)
 		    nick(character).c_str(), character, u32(backpack.size()), u32(candidates.size()),
 		    known ? "" : ", what the player may have on: the host does not see his slots and belt; give the seq of a "
 		                 "death he reported to use his list");
-	::Msg("[coop]   drop / lose now (seed %u): %u items", seed, u32(picked.size()));
+	::Msg("[coop]   drop (into a stash at the body) / lose now (seed %u): %u items", seed, u32(picked.size()));
 	for (u8 c = 0; c < kCategories; ++c)
 	{
 		u32 total = 0;
@@ -1015,6 +1092,7 @@ void reset()
 	abandon_stashes("the session ended"); // review minor 5: an unfilled stash is released, not left empty in the world
 	g_markers.clear();
 	g_epoch = 0xffffffff;
+	g_next_bag_poll = 0;
 	g_st = Stats();
 	g_log_count = 0;
 	g_gave_up.clear();
@@ -1032,10 +1110,11 @@ void print_status()
 	if (mgr().is_host())
 	{
 		::Msg("[coop]   death: %llu deaths charged; items %llu dropped, %llu destroyed, %llu into stashes; %llu stashes "
-		      "(%llu fell back to dropping, %llu given up: items stayed, %llu released empty on a new world), %u "
-		      "waiting; %llu markers sent (%llu not), %llu RU taken",
+		      "(%llu fell back to dropping, %llu given up: items stayed, %llu released empty on a new world, %llu "
+		      "released when emptied), %u waiting; %llu markers sent (%llu not), %llu RU taken",
 		    g_st.deaths, g_st.dropped, g_st.destroyed, g_st.moved, g_st.stashes, g_st.stash_fallbacks, g_st.stash_lost,
-		    g_st.stash_abandoned, u32(g_stashes.size()), g_st.markers_sent, g_st.markers_dropped, g_st.money_taken);
+		    g_st.stash_abandoned, g_st.bags_released, u32(g_stashes.size()), g_st.markers_sent, g_st.markers_dropped,
+		    g_st.money_taken);
 		for (const PendingStash& p : g_stashes)
 			::Msg("[coop]     stash %u of %s: %u items, %lld ms left", p.stash, nick(p.character).c_str(),
 			    u32(p.items.size()), s64(p.deadline) - s64(now_ms()));
