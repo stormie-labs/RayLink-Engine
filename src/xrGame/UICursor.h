@@ -25,6 +25,7 @@ public:
 	virtual void OnScreenResolutionChanged();
 
 	bool IsVisible() { return bVisible; }
-	void Show() { bVisible = true; }
-	void Hide() { bVisible = false; }
+	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): both mirror bVisible into Device.m_ui_cursor_visible
+	void Show();
+	void Hide();
 };

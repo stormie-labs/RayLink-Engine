@@ -235,8 +235,11 @@ PROTECT_API void CRenderDevice::Create()
 	GetClientRect(m_hWnd, &winRect);
 	clientWidth = winRect.right;
 	clientHeight = winRect.bottom;
-	MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-	ClipCursor(&winRect);
+	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	// The stock code clipped here unconditionally (the window is about to become active); WM_ACTIVATE corrects
+	// m_window_focused if it is not.
+	m_window_focused = true;
+	UpdateCursorClip(true);
 	SetActiveWindow(m_hWnd);
 
 	string_path fname;

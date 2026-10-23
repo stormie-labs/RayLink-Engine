@@ -28,6 +28,7 @@
 #include "../Include/xrRender/FactoryPtr.h"
 #include "../Include/xrRender/RenderDeviceRender.h"
 #include "imgui_base.h"
+#include <atomic> // Anomaly Coop: CRenderDevice::m_ui_cursor_visible
 
 #ifdef INGAME_EDITOR
 # include "../Include/editor/interfaces.hpp"
@@ -168,6 +169,11 @@ private:
 	RECT m_rcWindowBounds;
 	RECT m_rcWindowClient;
 
+	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23); see UpdateCursorClip
+	bool m_window_focused = false; // real WM_ACTIVATE state (b_is_Active stays TRUE under g_always_active)
+	bool m_cursor_clipped = false; // what ClipCursor was given last: a rectangle (true) or NULL (false)
+	RECT m_cursor_clip_rect = {};  // that rectangle, in screen coordinates
+
 	//u32 Timer_MM_Delta;
 	//CTimer_paused Timer;
 	//CTimer_paused TimerGlobal;
@@ -189,6 +195,15 @@ public:
 	// BOOL b_is_Ready;
 	// BOOL b_is_Active;
 	void OnWM_Activate(WPARAM wParam, LPARAM lParam);
+
+	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	// The one place that calls ClipCursor: cursor_should_clip() (cursor_policy.h) decides, the last state is cached.
+	// force = apply again even if nothing changed (device reset, resize, activation: the rectangle may have moved).
+	// Main thread only.
+	void UpdateCursorClip(bool force = false);
+	// Copy of CUICursor::IsVisible() (menu, inventory, PDA or dialog open), kept by CUICursor::Show / Hide: xrEngine
+	// cannot see xrGame. Atomic: the scheduler can open a dialog from a worker thread.
+	std::atomic<bool> m_ui_cursor_visible{ false };
 public:
 	//ref_shader m_WireShader;
 	//ref_shader m_SelectionShader;

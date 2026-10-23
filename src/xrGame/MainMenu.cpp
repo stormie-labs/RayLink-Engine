@@ -548,10 +548,7 @@ extern u32 g_screenmode;
 
 void CMainMenu::OnDeviceCreate()
 {
-	RECT winRect;
-	GetClientRect(Device.m_hWnd, &winRect);
-	MapWindowPoints(Device.m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-	ClipCursor(&winRect);
+	Device.UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 }
 
 

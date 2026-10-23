@@ -30,6 +30,7 @@ void CRenderDevice::Destroy(void)
 
 	ShowCursor(TRUE);
 	ClipCursor(NULL);
+	m_cursor_clipped = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): released on purpose, the cache must forget the clip
 	m_pRender->ValidateHW();
 
 	_Destroy(FALSE);
@@ -119,8 +120,7 @@ void CRenderDevice::Reset(bool precache)
 	GetClientRect(m_hWnd, &winRect);
 	clientWidth = winRect.right;
 	clientHeight = winRect.bottom;
-	MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-	ClipCursor(&winRect);
+	UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 #endif
 
 	m_imgui.OnDeviceResetEnd();
@@ -194,8 +194,7 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 	GetClientRect(m_hWnd, &winRect);
 	clientWidth  = winRect.right;
 	clientHeight = winRect.bottom;
-	MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-	ClipCursor(&winRect);
+	UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 #endif
 
 	m_imgui.OnDeviceResetEnd();

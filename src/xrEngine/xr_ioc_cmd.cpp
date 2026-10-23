@@ -658,8 +658,7 @@ public:
 		GetClientRect(Device.m_hWnd, &winRect);
 		Device.clientWidth = winRect.right;
 		Device.clientHeight = winRect.bottom;
-		MapWindowPoints(Device.m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-		ClipCursor(&winRect);
+		Device.UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 	}
 };
 //-----------------------------------------------------------------------
@@ -1064,6 +1063,7 @@ extern float g_dispersion_base;
 extern float g_dispersion_factor;
 extern int g_ai_unlimited_ammo;
 float g_AimLookFactor = 1.f;
+int g_free_cursor = 1; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): 1 = the cursor leaves a windowed game window while a menu is open, 0 = stock lock
 
 int ps_framelimiter = 0;
 extern u32 g_crosshair_color;
@@ -1146,6 +1146,7 @@ void CCC_Register()
 	CMD4(CCC_Float, "g_dispersion_base", &g_dispersion_base, 0.0f, 5.0f);
 	CMD4(CCC_Float, "g_dispersion_factor", &g_dispersion_factor, 0.1f, 10.0f);
 	CMD4(CCC_Integer, "g_ai_unlimited_ammo", &g_ai_unlimited_ammo, 0, 1);
+	CMD4(CCC_Integer, "g_free_cursor", &g_free_cursor, 0, 1); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 
 	// Render device states
 	CMD4(CCC_Integer, "r__supersample", &ps_r__Supersample, 1, 4);

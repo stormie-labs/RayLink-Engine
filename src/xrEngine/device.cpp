@@ -37,6 +37,7 @@
 
 #include "CustomHUD.h"
 #include "EngineThreading.h"
+#include "cursor_policy.h" // Anomaly Coop: free cursor in windowed menus
 #include "IGame_Level.h"
 
 #include "Rain.h"
@@ -309,6 +310,7 @@ float GetMonitorRefresh()
 
 extern int ps_framelimiter;
 extern u32 g_screenmode;
+extern int g_free_cursor; // Anomaly Coop: console g_free_cursor 0/1 (xr_ioc_cmd.cpp)
 
 CTimer FreezeTimer;
 void mt_FreezeThread(void *ptr) {
@@ -722,6 +724,9 @@ void CRenderDevice::FrameMove()
 	START_PROFILE("Process seqFrame");
 	Device.seqFrame.Process(rp_Frame);
 	STOP_PROFILE;
+
+	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): a menu may have opened or closed this frame
+	UpdateCursorClip();
 	
 	g_bLoaded = TRUE;
 	
@@ -805,11 +810,43 @@ bool CRenderDevice::Paused()
 	return g_pauseMngr().Paused();
 }
 
+// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+// The one place that calls ClipCursor while the game runs: the render layers, the screenmode console command, device
+// create / reset and the main menu all come here. cursor_should_clip() decides; ClipCursor runs only when the answer
+// or the client rectangle changes. `force` re-applies it regardless (after a reset, a resize or an activation the
+// rectangle may have moved). Main thread only. ShowCursor is not touched here.
+void CRenderDevice::UpdateCursorClip(bool force)
+{
+	if (!m_hWnd)
+		return;
+
+	const bool want_clip = cursor_should_clip(m_window_focused, g_screenmode, m_ui_cursor_visible.load(),
+		static_cast<u32>(g_free_cursor));
+
+	RECT rect = {};
+	if (want_clip)
+	{
+		GetClientRect(m_hWnd, &rect);
+		MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&rect), 2);
+	}
+
+	if (!force && want_clip == m_cursor_clipped && (!want_clip || EqualRect(&rect, &m_cursor_clip_rect)))
+		return;
+
+	if (!ClipCursor(want_clip ? &rect : nullptr))
+		return; // refused (another desktop is active, say): keep the cache as it was, the next call tries again
+
+	m_cursor_clipped = want_clip;
+	m_cursor_clip_rect = rect;
+}
+
 void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 {
 	u16 fActive = LOWORD(wParam);
 	BOOL fMinimized = (BOOL)HIWORD(wParam);
 	BOOL bActive = ((fActive != WA_INACTIVE) && (!fMinimized)) ? TRUE : FALSE;
+
+	m_window_focused = (bActive != FALSE); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 
 	if (psDeviceFlags2.test(rsAlwaysActive) && g_screenmode != 2)
 	{
@@ -822,19 +859,13 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 			if (Device.b_hide_cursor)
 			{
 				ShowCursor(FALSE);
-				if (m_hWnd)
-				{
-					RECT winRect;
-					GetClientRect(m_hWnd, &winRect);
-					MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-					ClipCursor(&winRect);
-				}
+				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 				pInput->OnAppActivate();
 			}
 			else
 			{
 				ShowCursor(TRUE);
-				ClipCursor(NULL);
+				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 				pInput->OnAppDeactivate();
 			}
 		}
@@ -856,13 +887,7 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
             if (!editor())
 # endif // #ifdef INGAME_EDITOR
 			ShowCursor(FALSE);
-			if (m_hWnd)
-			{
-				RECT winRect;
-				GetClientRect(m_hWnd, &winRect);
-				MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-				ClipCursor(&winRect);
-			}
+			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 #endif // #ifndef DEDICATED_SERVER
 		}
 		else
@@ -870,7 +895,7 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 			app_inactive_time_start = TimerMM.GetElapsed_ms();
 			Device.seqAppDeactivate.Process(rp_AppDeactivate);
 			ShowCursor(TRUE);
-			ClipCursor(NULL);
+			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 		}
 	}
 }

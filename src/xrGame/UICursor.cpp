@@ -11,6 +11,7 @@ CUICursor::CUICursor()
 	: m_static(NULL), m_b_use_win_cursor(false)
 {
 	bVisible = false;
+	Device.m_ui_cursor_visible = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 	vPrevPos.set(0.0f, 0.0f);
 	vPos.set(0.f, 0.f);
 	InitInternal();
@@ -21,9 +22,27 @@ CUICursor::CUICursor()
 //--------------------------------------------------------------------
 CUICursor::~CUICursor()
 {
+	Device.m_ui_cursor_visible = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 	xr_delete(m_static);
 	Device.seqRender.Remove(this);
 	Device.seqResolutionChanged.Remove(this);
+}
+
+// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+// bVisible is the one fact "a menu / inventory / PDA / dialog is open" (the main menu, StartMenu / StopMenu,
+// CleanInternals and the scripts all go through Show / Hide). xrEngine cannot see xrGame, so the device keeps a copy:
+// CRenderDevice::UpdateCursorClip lets the system cursor out of a windowed game window while it is set. Show and Hide
+// are the only writers of bVisible, so the copy cannot drift; the constructor and the destructor clear it as well.
+void CUICursor::Show()
+{
+	bVisible = true;
+	Device.m_ui_cursor_visible = true;
+}
+
+void CUICursor::Hide()
+{
+	bVisible = false;
+	Device.m_ui_cursor_visible = false;
 }
 
 void CUICursor::OnScreenResolutionChanged()

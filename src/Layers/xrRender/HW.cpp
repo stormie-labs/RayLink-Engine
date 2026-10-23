@@ -668,10 +668,7 @@ void CHW::updateWindowProps(HWND m_hWnd)
 	{
 		ShowCursor(FALSE);
 		SetForegroundWindow(m_hWnd);
-		RECT winRect;
-		GetClientRect(m_hWnd, &winRect);
-		MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&winRect), 2);
-		ClipCursor(&winRect);
+		Device.UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
 	}
 #endif
 }
