@@ -41,7 +41,10 @@ namespace coop
 //    Also in 8 (HUD v2 part 2): PlayerRevive ops 6..10 - Begin 6 / Cancel 7 (reviver -> host), Reviving 8 / Stopped 9
 //    (host -> the wounded's owner), Done 10 (host -> reviver): the hold of USE on a wounded teammate made visible
 //    (xrCoop/coop_revive_hold.h; the ops 0..5 and the PlayerRevive rate row are unchanged)
-constexpr uint32_t kProtocolVersion = 8;
+// 9 (game settings T3, owner 2026-10-23): the faction is part of the world, the player does not choose it:
+//    CharOffer ends with `str faction` (the world's), the host ignores CharChoice::faction (coop_newchar.h
+//    character_faction). The CharChoice layout is unchanged.
+constexpr uint32_t kProtocolVersion = 9;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -318,7 +321,7 @@ struct AvatarListMsg
 constexpr size_t kMaxCharName = 64;
 bool char_name_valid(const std::string& s, size_t max = kMaxCharName);
 
-// Host -> client. Wire: u8 eco, u32 points, u8 flags, str level, str refusal.
+// Host -> client. Wire: u8 eco, u32 points, u8 flags, str level, str refusal, str faction (protocol 9).
 struct CharOfferMsg
 {
 	static constexpr size_t kMaxLevel = 64;
@@ -334,9 +337,14 @@ struct CharOfferMsg
 	uint8_t flags = 0;
 	std::string level; // the host's level ("l01_escape"): every player is on it until split levels (F3a); may be empty
 	std::string refusal; // reason code of the choice the host refused ("points", "busy", ...); empty in a first offer
+	// Protocol 9: the world's faction, which the host picked when it made the world (character_faction in
+	// coop_newchar.h). The window shows it; the player does not choose. Always a name: the window picks a texture and a
+	// string id by it.
+	std::string faction;
 
 	void write(Writer& w) const;
-	// False on overrun, eco outside 1..3, unknown flags, a level or a refusal that is not a name or too long.
+	// False on overrun, eco outside 1..3, unknown flags, a level, a refusal or a faction that is not a name or too long
+	// (the faction is never empty).
 	bool read(Reader& r);
 };
 
@@ -345,7 +353,9 @@ struct CharChoiceMsg
 {
 	static constexpr size_t kMaxBuy = 64; // the window cannot buy more: a faction lists a few dozen items
 
-	std::string faction; // stalker, bandit, ... (the host's Lua checks it is one a player may pick)
+	// stalker, bandit, ... Protocol 9: the host ignores it - the new character gets the world's faction (CharOffer::faction,
+	// newchar::character_faction). It stays on the wire so that a choice of faction can come back without a new layout.
+	std::string faction;
 	std::vector<std::string> buy; // sections bought with points, one entry per copy; the free kit is not listed
 
 	// What the host reads: a faction and at most kMaxBuy sections, every one a name. The client sends only a valid one.

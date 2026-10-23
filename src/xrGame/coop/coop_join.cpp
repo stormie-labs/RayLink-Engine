@@ -2,6 +2,7 @@
 #include "pch_script.h"
 #include "coop_join.h"
 #include "coop_death.h" // Ruling F3-10: host_new_kit
+#include "coop_game_settings.h" // protocol 9: game::world_faction
 #include "coop_manager.h"
 #include "coop_sync.h"
 #include "coop_world.h"
@@ -23,6 +24,7 @@
 #include "script_engine.h"
 #include "level_graph.h"
 #include "Level.h"
+#include "Actor.h" // protocol 9: host_actor_faction
 #include "level_changer.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
@@ -602,6 +604,31 @@ bool host_admits_new_key(PeerId from, const PeerInfo& p, const std::string& key_
 
 bool host_send_save(PeerId from, const PeerInfo& p, CSE_ALifeHumanStalker& proxy_ref);
 
+// Protocol 9: the faction of the host's own character, as the stock new game wrote it into the community of the actor
+// (actor_<faction>): the second source of a new character's faction when the world has none (an old save,
+// newchar::character_faction). "" when there is none to read: no level, no actor yet (a CharOffer can come in the main
+// menu or while the world is still loading) or a community that is not a faction.
+// Ruling GS-2: the level first, then Actor(): Actor() asserts on GameID(), which dereferences Level().game (a dead pointer
+// without a level: access violation, as coop_money.cpp did before c3783bd). A hostile client must not get another faction
+// out of a failing read: character_faction ignores what the client sent and falls back to stalker.
+std::string host_actor_faction()
+{
+	if (!g_pGameLevel || !Level().game || !g_actor)
+		return std::string();
+	const CActor* actor = Actor();
+	if (!actor)
+		return std::string();
+	const shared_str id = actor->CharacterInfo().Community().id();
+	if (!id.size())
+		return std::string();
+	static const char kActorPrefix[] = "actor_";
+	const size_t prefix = sizeof(kActorPrefix) - 1;
+	const std::string community = id.c_str();
+	if (community.compare(0, prefix, kActorPrefix) == 0)
+		return community.substr(prefix); // may be empty: "actor_" alone is no faction
+	return community == "actor" ? std::string() : community; // the bare hero community names no faction
+}
+
 // Protocol 8: player `from` has no character in this world: he chooses one before the world (Msg::CharOffer; again
 // after a refused choice, `refusal` is its reason code). False if the host's game has no choice window
 // (coop_menu_char.script): his character is made next to the host as before.
@@ -638,12 +665,16 @@ bool host_offer_character(PeerId from, const PeerInfo& p, const char* refusal)
 		m.level = level.c_str();
 	if (refusal && *refusal)
 		m.refusal = char_name_valid(refusal, CharOfferMsg::kMaxRefusal) ? refusal : "busy";
+	// Protocol 9: the faction is the world's; the player does not choose it. Never empty on the wire: the client refuses
+	// an offer without a name.
+	m.faction = newchar::character_faction(coop::game::world_faction(), host_actor_faction(), std::string());
 	Writer w(96);
 	m.write(w);
 	mgr().session().send(from, Lane::Reliable, Msg::CharOffer, w);
 	g.choosers.offer(from, mgr().now_ms());
-	::Msg("[coop] '%s' has no character in this world: he chooses one before the world (economy %u, %u points, %s)%s%s%s",
-	    p.nick.c_str(), u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(),
+	::Msg("[coop] '%s' has no character in this world: he chooses one before the world (economy %u, %u points, %s, "
+	      "world faction %s)%s%s%s",
+	    p.nick.c_str(), u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.faction.c_str(),
 	    bare ? ", hardcore: no kit, no money" : "", m.refusal.empty() ? "" : ", refused: ", m.refusal.c_str());
 	return true;
 }
@@ -741,10 +772,19 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 		return;
 	}
 
+	// Protocol 9 (owner, 2026-10-23: the faction is part of creating the world, other clients do not choose it): the
+	// character gets the world's faction. What the client sent in m.faction is only logged, never used - not for the plan,
+	// not for set_faction, not for host_make_character.
+	const std::string faction =
+	    newchar::character_faction(coop::game::world_faction(), host_actor_faction(), m.faction);
+	if (m.faction != faction)
+		::Msg("! [coop] '%s' sent %s, the world's faction is %s: ignored", p.nick.c_str(), m.faction.c_str(),
+		    faction.c_str());
+
 	const std::string buy = newchar::buy_csv(m);
 	auto push_choice = [&](lua_State* L) {
 		lua_pushnumber(L, lua_Number(from));
-		lua_pushlstring(L, m.faction.data(), m.faction.size());
+		lua_pushlstring(L, faction.data(), faction.size());
 		lua_pushlstring(L, buy.data(), buy.size());
 		return 3;
 	};
@@ -767,7 +807,7 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	if (planned != LuaCall::Done || !plan.ok)
 	{
 		++g.choices_refused;
-		::Msg("[coop] '%s' chose %s: refused (%s), asked again", p.nick.c_str(), m.faction.c_str(),
+		::Msg("[coop] '%s' chose %s: refused (%s), asked again", p.nick.c_str(), faction.c_str(),
 		    planned == LuaCall::Done ? plan.reason.c_str() : "the host's script failed");
 		host_ask_again(from, p, plan.reason.c_str());
 		return;
@@ -782,8 +822,8 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 		return;
 	}
 	const u32 stripped = strip_supplies(*proxy);
-	if (!set_faction(*proxy, m.faction))
-		::Msg("! [coop] community '%s' is not in game_relations.ltx: the character keeps its profile's", m.faction.c_str());
+	if (!set_faction(*proxy, faction))
+		::Msg("! [coop] community '%s' is not in game_relations.ltx: the character keeps its profile's", faction.c_str());
 	// money::host_set (coop.money_set) finds a player's character by his peer: his entry knows it from here
 	const bool had_entry = g.peers.find(from) != g.peers.end();
 	HostPeer& hp = g.peers[from];
@@ -797,7 +837,7 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	    [&](lua_State* L) {
 		    lua_pushnumber(L, lua_Number(from));
 		    lua_pushnumber(L, lua_Number(proxy_id));
-		    lua_pushlstring(L, m.faction.data(), m.faction.size());
+		    lua_pushlstring(L, faction.data(), faction.size());
 		    lua_pushlstring(L, buy.data(), buy.size());
 		    lua_pushboolean(L, kit);
 		    return 5;
@@ -824,7 +864,7 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	++g.characters_made;
 	::Msg("[coop] '%s' chose %s: character %u made before the world (%u NPC item(s) stripped, %.0f RU), sending the "
 	      "world",
-	    p.nick.c_str(), m.faction.c_str(), u32(proxy_id), stripped, plan.money);
+	    p.nick.c_str(), faction.c_str(), u32(proxy_id), stripped, plan.money);
 	if (!host_send_save(from, p, *proxy))
 		g.gate.forget(from);
 }
@@ -1125,9 +1165,10 @@ void client_on_char_offer(PeerId from, Reader& r)
 	g.char_step = State::CharStep::Offered;
 	g.char_next_try = 0;
 	g.receive_started = mgr().now_ms(); // the time to choose is the host's (newchar::kChoiceTimeoutMs)
-	::Msg("[coop] the host has no character for us: choose faction and gear (economy %u, %u points, level %s)%s%s",
-	    u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.refusal.empty() ? "" : ", last choice refused: ",
-	    m.refusal.c_str());
+	::Msg("[coop] the host has no character for us: choose gear (economy %u, %u points, level %s, the world's faction "
+	      "%s)%s%s",
+	    u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.faction.c_str(),
+	    m.refusal.empty() ? "" : ", last choice refused: ", m.refusal.c_str());
 }
 
 // Protocol 8, client: names the branch client_char_frame took when it is not the one named last, so every exit is in
@@ -1177,7 +1218,8 @@ void client_char_frame()
 			    lua_pushlstring(L, o.level.data(), o.level.size());
 			    lua_pushlstring(L, o.refusal.data(), o.refusal.size());
 			    lua_pushnumber(L, lua_Number(o.flags));
-			    return 5;
+			    lua_pushlstring(L, o.faction.data(), o.faction.size()); // protocol 9: the world's faction
+			    return 6;
 		    },
 		    1, [&shown](lua_State* L, int at) { shown = lua_toboolean(L, at) != 0; });
 		if (call != LuaCall::Missing)

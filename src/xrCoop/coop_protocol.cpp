@@ -481,6 +481,7 @@ void CharOfferMsg::write(Writer& w) const
 	w.u8(flags);
 	w.str(level);
 	w.str(refusal);
+	w.str(faction);
 }
 
 bool CharOfferMsg::read(Reader& r)
@@ -490,11 +491,14 @@ bool CharOfferMsg::read(Reader& r)
 	flags = r.u8();
 	level = r.str();
 	refusal = r.str();
+	faction = r.str();
 	if (!r.ok() || eco < 1 || eco > 3 || (flags & ~uint8_t(Known)) != 0)
 		return false;
 	if (!level.empty() && !char_name_valid(level, kMaxLevel))
 		return false;
-	return refusal.empty() || char_name_valid(refusal, kMaxRefusal);
+	if (!refusal.empty() && !char_name_valid(refusal, kMaxRefusal))
+		return false;
+	return char_name_valid(faction); // protocol 9: always there, always a name
 }
 
 bool CharChoiceMsg::valid() const

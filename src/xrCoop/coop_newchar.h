@@ -7,6 +7,7 @@
 // reason; a player who does not choose in kChoiceTimeoutMs is dropped.
 // Client (coop_join.cpp): shows the offer in the choice window (coop_menu_char.join_offer, main menu) and sends what
 // the window gives back (join_choice) as a CharChoice.
+// Protocol 9: the faction is the world's (CharOffer::faction), character_faction below; the host ignores the client's.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -130,6 +131,23 @@ inline std::string buy_csv(const CharChoiceMsg& c)
 		out += s;
 	}
 	return out;
+}
+
+// Protocol 9 (owner, 2026-10-23): the faction is part of the world; a client does not choose it. The faction of a new
+// character, on the host: the world's (the host picked it when it made the game), else the host's own character's (a save
+// from before the world had one), else stalker. A candidate counts only if it is a name (char_name_valid): an empty
+// string ("no level", "no Actor() yet", no record) or a corrupt one is passed over.
+// `sent` is what the client's CharChoice carried. It is deliberately not read, whoever the client is and whatever it
+// sent: a hostile client must not make itself a monolith in a stalker world. The parameter stays so that every caller
+// passes the client's value through here, where the tests (newchar_sent_never_used) pin that it changes nothing.
+inline std::string character_faction(const std::string& world, const std::string& host_actor,
+    const std::string& /*sent*/)
+{
+	if (char_name_valid(world))
+		return world;
+	if (char_name_valid(host_actor))
+		return host_actor;
+	return "stalker";
 }
 } // namespace newchar
 } // namespace coop
