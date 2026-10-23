@@ -332,8 +332,11 @@ u64 g_mirror_broken_holder = 0; // children left offline: their holder is online
 u64 g_mirror_stale = 0; // stale child ids of a gone entity taken out of a holder's list before an EntitySpawn
 u64 g_mirror_lost = 0; // child ids with no server entity met by a holder leaving the server (mirror_lost_child)
 u64 g_mirror_listed_destroys = 0; // entities that left the server while their holder still listed them
-u32 g_mirror_log = 0;
-bool mirror_log_allowed() { return ++g_mirror_log <= 20 || (g_mirror_log % 100) == 0; }
+// B2 review M2: two budgets. The routine "comes online in its holder" line fires for a whole inventory at a world's
+// load and must not use up the lines of the repairs (the "!" lines a live run is read for).
+u32 g_mirror_log = 0, g_mirror_log_info = 0;
+bool log_allowed(u32& n) { return ++n <= 20 || (n % 100) == 0; }
+bool mirror_log_allowed() { return log_allowed(g_mirror_log); }
 
 struct ApplyGuard
 {
@@ -655,7 +658,7 @@ void client_on_spawn(PeerId, Reader& r)
 		if (!online)
 		{
 			++g_mirror_with_holder;
-			if (mirror_log_allowed())
+			if (log_allowed(g_mirror_log_info))
 				::Msg("[coop] mirror: %u [%s] comes online in its holder %u [%s] here (offline on the host, where its "
 				      "holder is offline)",
 				    id_host, section, parent_host, holder->name_replace());
