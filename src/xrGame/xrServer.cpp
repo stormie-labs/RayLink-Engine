@@ -20,6 +20,7 @@
 #include "file_transfer.h"
 #include "screenshot_server.h"
 #include "xrServer_info.h"
+#include "coop/coop_entities.h" // Anomaly Coop (B2)
 #include <functional>
 
 #pragma warning(push)
@@ -869,6 +870,7 @@ if( dbg_net_Draw_Flags.test( dbg_destroy ) )
 		Msg	("xrServer::entity_Destroy : [%d][%s][%s]",P->ID,P->name(),P->name_replace());
 #endif
 	R_ASSERT(P);
+	coop::entities::mirror_on_destroy(*this, P); // Anomaly Coop (B2): logs a client's entity still listed by its holder
 	entities.erase(P->ID);
 	m_tID_Generator.vfFreeID(P->ID, Device.TimerAsync());
 

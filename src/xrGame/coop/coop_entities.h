@@ -12,6 +12,7 @@ class CSE_Abstract;
 class CSE_ALifeDynamicObject;
 class NET_Packet;
 class IKinematicsAnimated;
+class xrServer;
 
 namespace coop
 {
@@ -45,6 +46,14 @@ bool client_wants_online(u16 id);
 // otherwise the local switch manager takes it offline at once; an item put into an inventory leaves it.
 void client_on_holder_changed(u16 id, u16 new_parent, bool host_online);
 void on_client_live();
+// B2 (xrCoop/coop_mirror.h), engine hooks of xrServer::Perform_destroy and Process_event_destroy: `holder` leaves the
+// server and lists `child`, which has no server entity here. False outside a mirror (single player, the host: the
+// stock assert). On a mirror (join::world_is_mirror, also after the session ended) it logs the child as ALife knows it
+// and takes the id out of holder->children (an offline item of that holder the ALife way, graph().detach), no FATAL.
+bool mirror_lost_child(CSE_Abstract* holder, u16 child);
+// B2 diagnostics, engine hook of xrServer::entity_Destroy: on a mirror, logs an entity that leaves the server while
+// its holder still lists it (the holder's next teardown would meet a lost child).
+void mirror_on_destroy(xrServer& server, CSE_Abstract* entity);
 // True if `id` is an object whose behaviour comes from the host (any creature on a client).
 bool is_mirrored(u16 id);
 // Local spawn attempt on a client (see sync::intercept_local_spawn).

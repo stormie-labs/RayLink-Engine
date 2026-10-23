@@ -161,6 +161,7 @@ constexpr u64 kVoteNoticeMs = 10000;
 constexpr float kVoteReachM = 5.f;
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
+u32 g_mirror_generation = 0; // B2: g_world_generation of the world loaded from a host's save (0: none), outlives State
 
 // ---------------------------------------------------------------- protocol 8: the choice window's script
 // scripts\coop_menu_char.script: the host checks a choice and picks the start there, the client shows the offer and
@@ -1677,6 +1678,13 @@ u16 my_proxy() { return g.my_proxy; }
 
 bool client_loading_world() { return mgr().phase() == Phase::LoadingWorld; }
 
+bool world_is_mirror()
+{
+	if (mgr().is_host())
+		return false; // a mirror kept after a dropped session and hosted from: the world is this machine's now
+	return client_loading_world() || (g_mirror_generation != 0 && g_mirror_generation == g_world_generation);
+}
+
 void on_session_lost(const char*)
 {
 	// F0 final review (task 14): the players leave with the session (a client that was in the host's world leaves
@@ -1860,6 +1868,10 @@ void print_status()
 
 void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 {
+	// B2: the world being loaded is the host's; on_world_created, at the end of this simulator's constructor, gives it
+	// the next generation. It stays a mirror after the session ends, until another world replaces it.
+	if (client_loading_world())
+		g_mirror_generation = g_world_generation + 1;
 	if (!client_loading_world() || g.my_proxy == kNoId)
 		return;
 

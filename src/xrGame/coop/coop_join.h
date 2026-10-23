@@ -123,5 +123,10 @@ void print_status();
 void on_alife_objects_loaded(CALifeObjectRegistry& objects);
 // True while a coop client is loading the host's world.
 bool client_loading_world();
+// B2: this machine's world is a mirror of a host's: loaded from the host's save as a co-op client (also while it loads).
+// It stays so after the session ends (the client leaves the session before the level is torn down, SLS_Clear runs with
+// the phase Off), until another world (a load, a level change, a new game) replaces it or this machine hosts it. Any
+// thread.
+bool world_is_mirror();
 } // namespace join
 } // namespace coop

@@ -8,6 +8,7 @@
 #include "coop_remote.h"
 #include "coop_requests.h"
 #include "coop_sync_api.h" // F2 T14
+#include "xrCoop/coop_mirror.h" // B2
 
 #include "Level.h"
 #include "GameObject.h"
@@ -325,6 +326,14 @@ xr_set<u16> g_refetched; // entities asked again because their holder was missin
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
 u64 g_unbound_dropped = 0; // member ids forgotten by squads from the wire (released, dead, switched alone, disbanded)
+// B2 (live 2026-10-23, FATAL "child registered but not found" at a client's exit): the mirror's holder/child books.
+u64 g_mirror_with_holder = 0; // children the host had offline, brought online with their holder here (mirror::placement)
+u64 g_mirror_broken_holder = 0; // children left offline: their holder is online here without a server entity
+u64 g_mirror_stale = 0; // stale child ids of a gone entity taken out of a holder's list before an EntitySpawn
+u64 g_mirror_lost = 0; // child ids with no server entity met by a holder leaving the server (mirror_lost_child)
+u64 g_mirror_listed_destroys = 0; // entities that left the server while their holder still listed them
+u32 g_mirror_log = 0;
+bool mirror_log_allowed() { return ++g_mirror_log <= 20 || (g_mirror_log % 100) == 0; }
 
 struct ApplyGuard
 {
@@ -618,11 +627,50 @@ void client_on_spawn(PeerId, Reader& r)
 	e->m_tNodeID = node;
 	e->m_tGraphID = graph_id;
 	e->m_bOnline = false;
+	CSE_ALifeDynamicObject* holder = parent == kNoId ? nullptr : ai().alife().objects().object(parent, true);
+	if (holder)
+	{
+		// B2: the id is neither in ALife nor on the server here, so a holder still listing it keeps a stale id of a gone
+		// entity; register_object would list it twice and the holder's teardown would meet the stale one.
+		xr_vector<u16>& list = holder->children;
+		const auto stale = std::remove(list.begin(), list.end(), id);
+		if (stale != list.end())
+		{
+			list.erase(stale, list.end());
+			++g_mirror_stale;
+			if (mirror_log_allowed())
+				::Msg("! [coop] mirror: holder %u [%s] still listed %u, a gone entity, before its EntitySpawn: taken out",
+				    parent_host, holder->name_replace(), id_host);
+		}
+	}
 	alife_rw().register_object(e, true);
-	if (online && parent == kNoId)
+	// B2: a child follows its holder HERE; the host's flag of a child is its holder's state there (xrCoop/coop_mirror.h).
+	switch (mirror::placement(parent != kNoId, online, holder && holder->m_bOnline,
+	    holder && alife_rw().server().ID_to_entity(parent)))
+	{
+	case mirror::Placement::SwitchVote:
 		g_online.insert(id);
-	else if (online)
+		break;
+	case mirror::Placement::WithHolder:
+		if (!online)
+		{
+			++g_mirror_with_holder;
+			if (mirror_log_allowed())
+				::Msg("[coop] mirror: %u [%s] comes online in its holder %u [%s] here (offline on the host, where its "
+				      "holder is offline)",
+				    id_host, section, parent_host, holder->name_replace());
+		}
 		bring_child_online(e);
+		break;
+	case mirror::Placement::HolderBroken:
+		++g_mirror_broken_holder;
+		if (mirror_log_allowed())
+			::Msg("! [coop] mirror: %u [%s] stays offline: its holder %u [%s] is online here without a server entity",
+			    id_host, section, parent_host, holder->name_replace());
+		break;
+	case mirror::Placement::Offline:
+		break;
+	}
 	++g_client_spawns;
 }
 
@@ -879,6 +927,61 @@ void client_on_holder_changed(u16 id, u16 new_parent, bool host_online)
 
 void on_client_live() { g_tracks.clear(); }
 
+bool mirror_lost_child(CSE_Abstract* holder, u16 child)
+{
+	if (!holder)
+		return false;
+	CSE_ALifeDynamicObject* c = ai().get_alife() ? ai().alife().objects().object(child, true) : nullptr;
+	CSE_ALifeDynamicObject* h = ai().get_alife() ? ai().alife().objects().object(holder->ID, true) : nullptr;
+	CSE_ALifeInventoryItem* item = smart_cast<CSE_ALifeInventoryItem*>(c);
+	const bool detachable =
+	    item && h == holder && ai().get_game_graph() && ai().game_graph().valid_vertex_id(h->m_tGraphID);
+	const mirror::LostChild what = mirror::lost_child(join::world_is_mirror(), c != nullptr, c && c->m_bOnline,
+	    c && c->ID_Parent == holder->ID, detachable);
+	if (what == mirror::LostChild::Fatal)
+		return false; // single player, the host: the stock assert
+	++g_mirror_lost;
+	if (mirror_log_allowed())
+	{
+		string256 known;
+		if (c)
+			xr_sprintf(known, "[%s] in ALife, %s, held by %u", c->s_name.c_str(), c->m_bOnline ? "online" : "offline",
+			    c->ID_Parent);
+		else
+			xr_strcpy(known, "neither in ALife");
+		::Msg("! [coop] mirror: holder %u [%s][%s] lists child %u with no server entity here (%s): %s (local ids, 0 = "
+		      "our actor)",
+		    holder->ID, holder->name_replace(), holder->s_name.c_str(), child, known,
+		    what == mirror::LostChild::Detach ? "taken out of it in ALife, it lies free and offline here"
+		                                      : "dropped from its list");
+	}
+	if (what == mirror::LostChild::Detach)
+		alife_rw().graph().detach(*h, item, h->m_tGraphID, true, true); // takes the id out of h->children
+	else
+	{
+		xr_vector<u16>& list = holder->children;
+		const auto it = std::find(list.rbegin(), list.rend(), child); // the last one: Perform_destroy reads back()
+		if (it != list.rend())
+			list.erase(std::next(it).base());
+	}
+	return true;
+}
+
+void mirror_on_destroy(xrServer& server, CSE_Abstract* entity)
+{
+	if (!entity || entity->ID_Parent == kNoId || !join::world_is_mirror() || server.ID_to_entity(entity->ID) != entity)
+		return; // not on the server: add_online / bring_child_online free the id of an offline entity before its spawn
+	CSE_Abstract* holder = ai().get_alife() ? ai().alife().objects().object(entity->ID_Parent, true) : nullptr;
+	if (!holder)
+		holder = server.ID_to_entity(entity->ID_Parent);
+	if (!holder || std::find(holder->children.begin(), holder->children.end(), entity->ID) == holder->children.end())
+		return;
+	++g_mirror_listed_destroys;
+	if (mirror_log_allowed())
+		::Msg("! [coop] mirror: %u [%s] leaves the server while its holder %u [%s] still lists it (frame %u, local ids)",
+		    entity->ID, entity->s_name.c_str(), entity->ID_Parent, holder->name_replace(), Device.dwFrame);
+}
+
 bool is_mirrored(u16 id) { return mgr().is_client() && id != 0; }
 
 bool client_applying() { return g_applying > 0; }
@@ -1007,6 +1110,10 @@ void print_status()
 			}
 		::Msg("[coop]   squads from the wire: %u now (%u unbound member ids), %llu ids forgotten", wire_squads, wire_ids,
 		    g_unbound_dropped);
+		::Msg("[coop]   mirror holders (B2): %llu children online with their holder (offline on the host), %llu left "
+		      "offline in a holder without a server entity, %llu stale ids taken out, %llu lost children met, %llu left "
+		      "the server still listed",
+		    g_mirror_with_holder, g_mirror_broken_holder, g_mirror_stale, g_mirror_lost, g_mirror_listed_destroys);
 	}
 }
 } // namespace entities

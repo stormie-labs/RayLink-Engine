@@ -8,6 +8,7 @@
 #include "ai_space.h"
 #include "alife_object_registry.h"
 #include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_entities.h" // Anomaly Coop (B2)
 
 xr_string xrServer::ent_name_safe(u16 eid)
 {
@@ -62,7 +63,12 @@ void xrServer::Process_event_destroy(NET_Packet& P, ClientID sender, u32 time, u
 		if (!pEventPack) pEventPack = &P2;
 
 		while (!e_dest->children.empty())
+		{
+			if (!game->get_entity_from_eid(*e_dest->children.begin()) &&
+			    coop::entities::mirror_lost_child(e_dest, *e_dest->children.begin()))
+				continue; // Anomaly Coop (B2): a lost child of a client's mirror; stock would loop here for ever
 			Process_event_destroy(P, sender, time, *e_dest->children.begin(), pEventPack);
+		}
 	};
 
 	if (0xffff == parent_id && NULL == pEventPack)

@@ -5,6 +5,7 @@
 #include "xrServer.h"
 #include "xrmessages.h"
 #include "ai_space.h"
+#include "coop/coop_entities.h" // Anomaly Coop
 
 void xrServer::Perform_destroy(CSE_Abstract* object, u32 mode)
 {
@@ -29,6 +30,8 @@ void xrServer::Perform_destroy(CSE_Abstract* object, u32 mode)
 	while (!object->children.empty())
 	{
 		CSE_Abstract* child = game->get_entity_from_eid(object->children.back());
+		if (!child && coop::entities::mirror_lost_child(object, object->children.back()))
+			continue; // Anomaly Coop (B2): a co-op client's mirror logs it and takes it off the list, no FATAL
 		R_ASSERT2(child, make_string("child registered but not found [%d]",object->children.back()));
 		//		Msg					("SLS-CLEAR : REJECT  [%s][%s] FROM [%s][%s]",child->name(),child->name_replace(),object->name(),object->name_replace());
 		Perform_reject(child, object, 2 * NET_Latency);
