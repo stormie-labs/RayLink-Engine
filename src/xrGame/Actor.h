@@ -340,6 +340,9 @@ public:
 
 	void g_SetAnimation(u32 mstate_rl);
 	void g_SetSprintAnimation(u32 mstate_rl, MotionID& head, MotionID& torso, MotionID& legs);
+	// Anomaly Coop (build 10): forget the motions g_SetAnimation played, so that its next call plays them again (it
+	// plays a cycle only when the MotionID changes). The co-op calls it when the actor stands up after a lying pose.
+	void ResetAnimationCache();
 public:
 	virtual void OnHUDDraw(CCustomHUD* hud, IDSGraphManager* DM);
 	BOOL HUDview() const;

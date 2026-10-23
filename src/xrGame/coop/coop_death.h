@@ -1,6 +1,7 @@
 // Anomaly Coop — what a player's death costs, on the host (F3, docs/CHECKPOINTS_DEATH.md §3.3): a share of the
-// backpack goes into a bag at the body (drop, Ruling L-1), the whole backpack into a stash (corpse) or a share is gone
-// (lose) (death_drop, death::plan_losses), and every player sees where (DeathMarker).
+// backpack goes into a bag at the body (drop, Ruling L-1), the whole backpack into a stash (corpse), a share is gone
+// (lose) or nothing is taken (keep, build 10) (death_drop, death::plan_losses), and every player sees where
+// (DeathMarker). The shares of drop and lose are scaled by the host's coop_death_share (build 10, scale_shares).
 // Rules, item categories and the death tracker: xrCoop/coop_death_rules.h; which items are candidates, the drop point
 // and the marker's wire form: xrCoop/coop_death_items.h; the death flow itself: coop_survival.
 //
@@ -15,6 +16,7 @@
 //            character, item by item; a body that fell through the ground (or has no valid level vertex) has them put
 //            0.3 m above its level vertex (GE_CHANGE_POS, exact drop position for clients);
 //   Lose   - DestroyObject;
+//   Keep   - build 10: nothing is taken, no stash, no marker (the money, the wear and the rank by their own rules);
 //   Corpse - a coop_death_stash is spawned at the body (ALife, relayed as every host spawn); once it is online
 //            (within 5 s) the items go in by GE_TRADE_SELL from the character + GE_TRADE_BUY to the stash. A stash that
 //            does not come online in time is released and the items drop at the body instead. If the player leaves
@@ -66,12 +68,13 @@ void register_console(); // from coop::register_console_commands
 
 // What `character` loses for his death `seq` (death::Tracker decides it once per death) by `mode` (plan_losses): Drop
 // and Lose take floor(n x share) (+1 by chance) of each category of his backpack, Drop into a stash at the body (Ruling
-// L-1), Lose destroys them; Corpse puts the whole backpack into a stash. Returns the number of items destroyed or on
-// their way to the stash (or dropped at the body when no stash could be made). DeathMarker (the stash, mode drop or
-// corpse; the first dropped item when they fell loose) goes to everybody once they are in. 0 for anything that is not
-// a player character online.
-// `seq` is the death of the client's Dead report: it picks the list of worn items (see above).
-u32 host_apply_losses(u16 character, u16 seq, Drop mode);
+// L-1), Lose destroys them; Corpse puts the whole backpack into a stash; Keep (build 10) takes nothing. Returns the
+// number of items destroyed or on their way to the stash (or dropped at the body when no stash could be made).
+// DeathMarker (the stash, mode drop or corpse; the first dropped item when they fell loose) goes to everybody once they
+// are in. 0 for anything that is not a player character online.
+// `seq` is the death of the client's Dead report: it picks the list of worn items (see above). `share_pct` is
+// coop_death_share (build 10): the [coop_death_drop] shares of Drop and Lose x share_pct / 100 (scale_shares).
+u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct);
 // Spawns a coop_death_stash at the body of `character` and moves into it his backpack (`everything` false: Corpse) or
 // all he has, worn and quest items included (`everything` true: a hardcore character retires, Task 10). Returns the
 // stash id, 0xffff if none was made (nothing to move, or the items dropped at the body instead). The items go in when
@@ -98,8 +101,9 @@ bool host_new_kit();
 // The money part of a death (F2 T1: the host's ledger holds every balance): takes `pct` % (0..100, rounded down) of the
 // balance of `character`'s player through money::host_adjust, which sends him the new balance. Returns the amount.
 u32 host_take_money(u16 character, u8 pct);
-// Console coop_death_preview: logs what a death of `character` would take now in each mode; moves nothing. `seq`
-// (kNoSeq: none): for a client's proxy, the death whose reported list of worn items is applied.
+// Console coop_death_preview: logs what a death of `character` would take now in each mode, with the coop_death_share
+// in force (survival::rules); moves nothing. `seq` (kNoSeq: none): for a client's proxy, the death whose reported list
+// of worn items is applied.
 void host_preview(u16 character, u16 seq = kNoSeq);
 } // namespace death
 } // namespace coop

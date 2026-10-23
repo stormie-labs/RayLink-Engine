@@ -32,13 +32,27 @@ enum class Mode : uint8_t
 
 // What happens to the lost items. Drop: the share goes into a bag (a coop_death_stash) at the body, Ruling L-1; loose
 // at the body only when no bag can be made. Corpse: the whole backpack goes into such a stash. Lose: the share is gone.
-// (death::plan_losses, coop_death_items.h)
+// Keep (build 10, the owner's request of 2026-10-23): nothing is taken, no bag, no PDA mark; the money, the wear and
+// the rank go by their own rules. (death::plan_losses, coop_death_items.h)
 enum class Drop : uint8_t
 {
 	Drop = 0,
 	Corpse = 1,
-	Lose = 2
+	Lose = 2,
+	Keep = 3
 };
+
+// The console token of a drop mode ("drop", "corpse", "lose", "keep"); "drop" for a byte that is none of them.
+inline const char* drop_name(Drop d)
+{
+	switch (d)
+	{
+	case Drop::Corpse: return "corpse";
+	case Drop::Lose: return "lose";
+	case Drop::Keep: return "keep";
+	default: return "drop";
+	}
+}
 
 namespace detail
 {
@@ -47,6 +61,12 @@ inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 } // namespace detail
+
+// Build 10, coop_death_share: the host's multiplier of the loss shares of drop and lose, in % (100 = the ltx shares as
+// they are; scale_shares). Corpse and keep do not use it.
+constexpr float kShareDefaultPct = 100.0f;
+constexpr float kShareMaxPct = 200.0f;
+constexpr uint32_t kShareMaxByte = 200; // Rules::share_pct on the wire
 
 // The host's death settings; one copy, sent to every client (Msg::DeathRules). The defaults are the plan's numbers
 // (Ruling 22): T = 30 s, contusion 10 min, 10 % of the money, 10 % wear, no rank or reputation loss.
@@ -59,15 +79,17 @@ struct Rules
 	uint32_t delay_ms = 30000;     // T: how long a dead player waits for the others before the respawn
 	uint32_t contusion_s = 600;    // the debuff after a respawn
 	uint8_t money_pct = 10, wear_pct = 10, rank_pct = 0;
+	uint8_t share_pct = 100; // build 10, coop_death_share: drop and lose take ltx share x share_pct / 100 (scale_shares)
 
 	bool operator==(const Rules& o) const
 	{
 		return mode == o.mode && drop == o.drop && bleedout_ms == o.bleedout_ms && revive_health == o.revive_health &&
 			delay_ms == o.delay_ms && contusion_s == o.contusion_s && money_pct == o.money_pct &&
-			wear_pct == o.wear_pct && rank_pct == o.rank_pct;
+			wear_pct == o.wear_pct && rank_pct == o.rank_pct && share_pct == o.share_pct;
 	}
 
-	// mode, drop (u8), bleedout_ms (u32), revive_health (f32), delay_ms (u32), contusion_s (u32), money, wear, rank (u8).
+	// mode, drop (u8), bleedout_ms (u32), revive_health (f32), delay_ms (u32), contusion_s (u32), money, wear, rank,
+	// share (u8). Build 10: drop 3 = keep, the share byte closes the packet.
 	void write(Writer& w) const
 	{
 		w.u8(static_cast<uint8_t>(mode));
@@ -79,11 +101,12 @@ struct Rules
 		w.u8(money_pct);
 		w.u8(wear_pct);
 		w.u8(rank_pct);
+		w.u8(share_pct);
 	}
 
 	// A short packet, an unknown mode or drop, or a health that is not a number: false, the rules stay as they were.
 	// Out-of-range values are cut to the range: bleedout 5000..600000 ms, revive 0.05..1, delay 0..300000 ms,
-	// contusion 0..3600 s, every percentage 0..100.
+	// contusion 0..3600 s, money, wear and rank 0..100 %, the share 0..200 %.
 	bool read(Reader& r)
 	{
 		const uint8_t m = r.u8();
@@ -96,7 +119,8 @@ struct Rules
 		n.money_pct = r.u8();
 		n.wear_pct = r.u8();
 		n.rank_pct = r.u8();
-		if (!r.ok() || m > static_cast<uint8_t>(Mode::Hardcore) || d > static_cast<uint8_t>(Drop::Lose))
+		n.share_pct = r.u8();
+		if (!r.ok() || m > static_cast<uint8_t>(Mode::Hardcore) || d > static_cast<uint8_t>(Drop::Keep))
 			return false;
 		if (!std::isfinite(n.revive_health))
 			return false;
@@ -109,6 +133,7 @@ struct Rules
 		n.money_pct = static_cast<uint8_t>(detail::clamp_u32(n.money_pct, 0, 100));
 		n.wear_pct = static_cast<uint8_t>(detail::clamp_u32(n.wear_pct, 0, 100));
 		n.rank_pct = static_cast<uint8_t>(detail::clamp_u32(n.rank_pct, 0, 100));
+		n.share_pct = static_cast<uint8_t>(detail::clamp_u32(n.share_pct, 0, kShareMaxByte));
 		*this = n;
 		return true;
 	}
@@ -247,6 +272,23 @@ inline std::vector<uint16_t> pick_losses(const std::vector<Candidate>& items, co
 	return out;
 }
 
+// The shares a drop or lose death picks with (build 10, coop_death_share): each ltx share x pct / 100, cut to 0..1.
+// `pct` is cut to 0..kShareMaxPct first (NaN and a negative count as 0: nothing is lost); a share that is not a number,
+// or negative, counts as 0.
+inline Shares scale_shares(const Shares& base, float pct)
+{
+	double k = 0.0; // NaN and negatives: 0
+	if (pct > 0.0f)
+		k = pct < kShareMaxPct ? double(pct) : double(kShareMaxPct); // +inf: the top
+	Shares out{};
+	for (size_t i = 0; i < out.size(); ++i)
+	{
+		const double s = base[i] > 0.0f ? double(base[i]) * k / 100.0 : 0.0; // NaN: 0
+		out[i] = s < 1.0 ? float(s) : 1.0f;
+	}
+	return out;
+}
+
 // Lives as survival::Life numbers (coop_survival.h): 0 Alive, 1 Wounded, 2 Dead, 3 Spectating, 4 Respawning.
 // A wipe is when there is somebody present and every one of them is dead, spectating or being respawned.
 inline bool is_wipe(const std::vector<uint8_t>& lives_of_present_players)
@@ -356,6 +398,31 @@ inline void on_alive(Tracker& t)
 
 // survival::Life numbers (coop_survival.h), as is_wipe takes them.
 constexpr uint8_t kLifeAlive = 0, kLifeWounded = 1, kLifeDead = 2, kLifeSpectating = 3, kLifeRespawning = 4;
+
+// Build 10 (the owner's live test of build 9): how a player's character lies by his life, the same for his avatar on the
+// other machines and for his own actor (the overhead and spectator cameras show it). Standing: his own motions play.
+enum class BodyPose : uint8_t
+{
+	Standing,
+	Wounded, // a wounded pose (kWoundedPoses)
+	Dead // a dead pose (kDeadPoses): dead, out of the run, being respawned
+};
+
+inline BodyPose body_pose(uint8_t life)
+{
+	if (life == kLifeWounded)
+		return BodyPose::Wounded;
+	if (life == kLifeDead || life == kLifeSpectating || life == kLifeRespawning)
+		return BodyPose::Dead;
+	return BodyPose::Standing; // alive, or a number no Life has
+}
+
+// The own camera does not turn with the mouse (and the body with it): dead, out of the run, being respawned. A wounded
+// player looks around. Fire / Aim still switch the watched teammate (they are keys, not the mouse).
+inline bool look_locked(uint8_t life)
+{
+	return life == kLifeDead || life == kLifeSpectating || life == kLifeRespawning;
+}
 
 // The respawn a character is owed in his world (fix round 1, M-1 and M-3). The engine keeps it with the character (his
 // custom data), so a save written while he is dead or evacuated carries it to the world loaded from that save (a level

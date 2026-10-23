@@ -67,18 +67,26 @@
 //     Stopped  host -> target owner  {u16 target, u16 seq, u16 reviver}
 //     Done     host -> reviver       {u16 target, u16 seq}  the Request went through (Lua coop_revive_done)
 //              Lua reads it all as coop.revive_progress() (revive_progress below).
-//   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %)
+//   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %, and
+//                  since build 10 the share multiplier; drop 3 = keep)
 //   NewCharacter   client -> host  {}: out of a hardcore run, a new character (F3 Task 10; 2 per 5 s)  reliable
 // `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
 // answers, so repeats are no-ops.
 // Console (host rules, CCC_Float unless a token): coop_death_mode checkpoint | hardcore (respawn, respawn_keep =
-// checkpoint), coop_death_drop drop | corpse | lose, coop_bleedout s, coop_revive_health, coop_respawn_delay 0..300 s
-// (30), coop_contusion 0..60 min (10), coop_death_money / coop_death_wear / coop_death_rank 0..100 % (10 / 10 / 0);
-// coop_new_character (out of a hardcore run: as the hold of USE); coop_wound_me (test).
+// checkpoint), coop_death_drop drop | corpse | lose | keep (build 10: nothing is lost), coop_bleedout s,
+// coop_revive_health, coop_respawn_delay 0..300 s (30), coop_contusion 0..60 min (10), coop_death_money /
+// coop_death_wear / coop_death_rank 0..100 % (10 / 10 / 0), coop_death_share 0..200 % (100; build 10: the loss shares
+// of drop and lose x this / 100); coop_new_character (out of a hardcore run: as the hold of USE); coop_wound_me (test).
+//
+// The body while down (build 10): a wounded player's character lies in a wounded pose, a dead, spectating or
+// respawning one in a dead pose (death::body_pose), his avatar on the other machines and his own actor alike (the own
+// one is seen by the overhead and spectator cameras). While dead, spectating or respawning the mouse turns nothing
+// (death::look_locked). Standing up gives the actor its own motions back.
 #pragma once
 
 #include "xrCoop/coop_session.h"
 
+class CActor;
 class CActorCondition;
 class CEntity;
 class CAI_Stalker;
@@ -86,6 +94,11 @@ class CInventoryOwner;
 
 namespace coop
 {
+namespace death
+{
+struct Rules;
+}
+
 namespace survival
 {
 enum class Life : u8
@@ -122,6 +135,9 @@ void render_hud(); // HUDManager::RenderUI (main thread, render phase): reads da
 
 // Life of the player whose character has `local_id` on this machine (0 = me). Alive if unknown.
 Life life_of(u16 local_id);
+// The death rules in force here: the host's console on the host, the host's last PlayerRules on a client (the client's
+// own console until they come). Main thread.
+const death::Rules& rules();
 // Wounded players: milliseconds of bleed-out left (as last reported), 0 otherwise.
 u32 bleed_left_ms(u16 local_id);
 
@@ -179,5 +195,14 @@ bool on_use_person(CInventoryOwner* person);
 // players::drive_avatar (lead hook): a wounded / dead player's avatar plays a lying pose instead of the
 // owner's motions. True = pose handled, skip the snapshot motions.
 bool avatar_pose_override(CAI_Stalker* avatar);
+// Build 10 (the owner's live test of build 9: "I do not lie, and the mouse turns me"). My own actor lies as my avatar
+// does on the other machines (death::body_pose; frame() plays the pose). CActor::g_SetAnimation (lead hook, first
+// line): true while that pose holds on `actor` - its own motions must not play over it (it plays a new cycle whenever
+// its MotionID changes: the weapon put away at the fall, a turn, a landing). May run on the GameThread worker (the
+// scheduler): it reads one atomic.
+bool own_pose_held(const CActor* actor);
+// CActor::IR_OnMouseMove (lead hook, before the camera moves): true while my player is dead, out of the run or being
+// respawned (death::look_locked) - the mouse turns neither the camera nor the body. A wounded player looks around.
+bool look_locked();
 } // namespace survival
 } // namespace coop

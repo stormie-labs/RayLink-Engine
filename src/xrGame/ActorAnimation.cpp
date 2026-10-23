@@ -22,6 +22,7 @@
 #include "player_hud.h"
 #include "WeaponKnife.h"
 #include "Pda.h"
+#include "coop/coop_survival.h" // Anomaly Coop
 
 static const float y_spin0_factor = 0.0f;
 static const float y_spin1_factor = 0.4f;
@@ -341,8 +342,21 @@ char* mov_state[] = {
 	"sprint",
 };
 
+void CActor::ResetAnimationCache()
+{
+	m_current_legs.invalidate();
+	m_current_torso.invalidate();
+	m_current_head.invalidate();
+	m_current_legs_blend = NULL; // the lying pose faded these blends out: never read them again
+	m_current_torso_blend = NULL;
+	m_current_jump_blend = NULL;
+	m_bAnimTorsoPlayed = FALSE; // a one-shot torso motion cut short by the pose never reached its end callback
+}
+
 void CActor::g_SetAnimation(u32 mstate_rl)
 {
+	if (coop::survival::own_pose_held(this)) // Anomaly Coop (build 10): a lying pose of the co-op holds, not our motions
+		return;
 	if (!g_Alive())
 	{
 		if (m_current_legs || m_current_torso)

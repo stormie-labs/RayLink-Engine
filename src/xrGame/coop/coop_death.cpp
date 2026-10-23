@@ -859,7 +859,7 @@ public:
 
 // ---------------------------------------------------------------- public
 
-u32 host_apply_losses(u16 character, u16 seq, Drop mode)
+u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 {
 	if (!mgr().is_host())
 		return 0;
@@ -872,18 +872,25 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode)
 	}
 	ensure_settings();
 	++g_st.deaths;
+	if (mode == Drop::Keep) // build 10: nothing is taken, no stash, no marker
+	{
+		::Msg("[coop] death of %s (seq %u, keep): nothing is lost", nick(character).c_str(), seq);
+		return 0;
+	}
 
 	// Ruling L-1 (plan_losses): drop puts its share into a bag at the body, corpse the whole backpack, lose destroys
-	// the share. The seed is the pick of drop and lose; corpse picks nothing.
+	// the share. The seed is the pick of drop and lose; corpse picks nothing. Build 10: the shares of drop and lose are
+	// x share_pct / 100 (coop_death_share).
 	const Carried carried = carried_of(character, io, false, seq);
 	const u64 game_time = ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0;
 	const u32 seed = loss_seed(character, seq, game_time);
-	const LossPlan plan = plan_losses(mode, carried.items, g_set.kinds, carried.layout_known, g_set.shares, seed);
+	const LossPlan plan = plan_losses(mode, carried.items, g_set.kinds, carried.layout_known, g_set.shares, seed,
+	    float(share_pct));
 	const xr_string note = layout_note(carried, character);
 	if (plan.move == LossMove::None)
 	{
-		::Msg("[coop] death of %s (seq %u, %s): nothing of %u backpack items is lost%s", nick(character).c_str(), seq,
-		    mode == Drop::Lose ? "lose" : marker_kind(mode), u32(plan.offered), note.c_str());
+		::Msg("[coop] death of %s (seq %u, %s, share %u%%): nothing of %u backpack items is lost%s",
+		    nick(character).c_str(), seq, drop_name(mode), u32(share_pct), u32(plan.offered), note.c_str());
 		return 0;
 	}
 
@@ -1036,7 +1043,12 @@ void host_preview(u16 character, u16 seq)
 	const std::vector<Candidate> candidates = loss_candidates(backpack, g_set.kinds, known);
 	const u64 game_time = ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0;
 	const u32 seed = loss_seed(character, 0, game_time);
-	const std::vector<u16> picked = pick_losses(candidates, g_set.shares, seed);
+	// build 10: the rules in force, the shares of drop and lose x coop_death_share / 100
+	const Rules& rules = survival::rules();
+	const Shares shares = scale_shares(g_set.shares, float(rules.share_pct));
+	const std::vector<u16> picked = pick_losses(candidates, shares, seed);
+	::Msg("[coop] death preview: the host's mode is %s%s, coop_death_share %u%%", drop_name(rules.drop),
+	    rules.drop == Drop::Keep ? " (nothing is lost; the other modes below)" : "", u32(rules.share_pct));
 	if (carried.reported)
 		::Msg("[coop] death preview of %s (character %u): %u items carried, %u may be lost (the rest: %u on him by the "
 		      "list of death %u, quest items, the PDA)",
@@ -1078,8 +1090,8 @@ void host_preview(u16 character, u16 seq)
 			else if (list.size() < kMaxPreviewLine + 4)
 				list += ", ...";
 		}
-		::Msg("[coop]     %s: %u of %u (share %.2f)%s%s", category_name(c), taken, total, g_set.shares[c],
-		    list.empty() ? "" : ": ", list.c_str());
+		::Msg("[coop]     %s: %u of %u (share %.2f: %.2f in the ltx x %u%%)%s%s", category_name(c), taken, total,
+		    shares[c], g_set.shares[c], u32(rules.share_pct), list.empty() ? "" : ": ", list.c_str());
 	}
 	const u32 corpse = u32(stash_ids(backpack, g_set.kinds, false, known).size());
 	const u32 all = u32(stash_ids(collect(io, true), g_set.kinds, true, known).size());

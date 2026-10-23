@@ -456,6 +456,8 @@ void CActor::IR_OnMouseMove(int dx, int dy)
 
 	if (Remote()) return;
 
+	if (coop::survival::look_locked()) return; // Anomaly Coop (build 10): dead, spectating or respawning: no look around
+
 	if (m_holder)
 	{
 		m_holder->OnMouseMove(dx, dy);

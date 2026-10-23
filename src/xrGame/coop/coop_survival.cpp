@@ -141,6 +141,7 @@ float g_cv_contusion_min = 10.f;
 float g_cv_death_money = 10.f; // percentages: CCC_Float like the other host rules (the options page reads floats)
 float g_cv_death_wear = 10.f;
 float g_cv_death_rank = 0.f;
+float g_cv_death_share = death::kShareDefaultPct; // build 10: the loss shares of drop and lose x this / 100 (0..200 %)
 
 // The WP8 modes respawn / respawn_keep live on in old user.ltx files: both mean checkpoint now (plan decision 11).
 // CCC_Token shows and saves the first name of a value, so they come back as "checkpoint".
@@ -156,28 +157,28 @@ xr_token g_death_drop_tokens[] = {
 	{"drop", int(death::Drop::Drop)},
 	{"corpse", int(death::Drop::Corpse)},
 	{"lose", int(death::Drop::Lose)},
+	{"keep", int(death::Drop::Keep)}, // build 10: nothing is lost
 	{nullptr, 0},
 };
 
 const char* mode_name(death::Mode m) { return m == death::Mode::Hardcore ? "hardcore" : "checkpoint"; }
 
-const char* drop_name(death::Drop d)
-{
-	switch (d)
-	{
-	case death::Drop::Corpse: return "corpse";
-	case death::Drop::Lose: return "lose";
-	default: return "drop";
-	}
-}
-
 u8 console_pct(float v) { return u8(iFloor(clampr(v, 0.f, 100.f) + 0.5f)); }
+
+// coop_death_share as Rules::share_pct: 0..200, rounded; not a number (the console reads it with atof, and a NaN passes
+// the range check of CCC_Float) is 0, nothing is lost.
+u8 console_share(float v)
+{
+	if (!(v > 0.f))
+		return 0;
+	return u8(iFloor(_min(v, death::kShareMaxPct) + 0.5f));
+}
 
 death::Rules console_rules()
 {
 	death::Rules r;
 	r.mode = g_cv_death_mode == u32(death::Mode::Hardcore) ? death::Mode::Hardcore : death::Mode::Checkpoint;
-	r.drop = death::Drop(_min(g_cv_death_drop, u32(death::Drop::Lose)));
+	r.drop = death::Drop(_min(g_cv_death_drop, u32(death::Drop::Keep)));
 	r.bleedout_ms = u32(g_cv_bleedout_s * 1000.f);
 	r.revive_health = g_cv_revive_health;
 	r.delay_ms = u32(clampr(g_cv_respawn_delay_s, 0.f, 300.f) * 1000.f);
@@ -185,6 +186,7 @@ death::Rules console_rules()
 	r.money_pct = console_pct(g_cv_death_money);
 	r.wear_pct = console_pct(g_cv_death_wear);
 	r.rank_pct = console_pct(g_cv_death_rank);
+	r.share_pct = console_share(g_cv_death_share);
 	return r;
 }
 
@@ -285,14 +287,22 @@ u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
 u64 g_last_guard = 0;
 
-// Avatar poses (local ids).
+// Lying poses (hold_pose): avatars by local id, and my own actor.
 struct Pose
 {
 	Life life = Life::Alive;
 	MotionID motion;
 	bool missing = false; // the visual has none of the candidate motions
+	const IKinematicsAnimated* visual = nullptr; // the visual `motion` was looked up in (compared, never called)
+	bool logged = false; // a missing pose was told (once, until the character stands up)
 };
 xr_map<u16, Pose> g_poses;
+// Build 10: my own actor's pose (own_pose_frame). While it holds, g_pose_actor names that actor: its own motions are off
+// (CActor::g_SetAnimation asks own_pose_held, maybe on the GameThread worker: an atomic), and so is the aiming twist of
+// its spine and head when g_my_twist_off (the bone callbacks follow the camera's pitch and would bend the lying body).
+Pose g_my_pose;
+std::atomic<const CActor*> g_pose_actor{nullptr};
+bool g_my_twist_off = false;
 
 // Written by the condition hook (maybe on the GameThread worker), consumed by frame().
 std::atomic<u8> g_hook_life{u8(Life::Alive)};
@@ -577,7 +587,8 @@ public:
 			return cmd == kTORCH || cmd == kNIGHT_VISION;
 		return false;
 	}
-	float mouse_scale_factor() override { return g_me.life == Life::Wounded ? 0.5f : 1.f; }
+	// CActor::IR_OnMouseMove divides the look speed by this (GetLookFactor): 2 = a wounded player turns at half speed
+	float mouse_scale_factor() override { return g_me.life == Life::Wounded ? 2.f : 1.f; }
 };
 DownInput g_input;
 
@@ -617,8 +628,24 @@ void hold_controls(CActor* a)
 		c.SetHealth(kDownHealth); // GodMode or no condition update this frame
 }
 
+// Build 10: my actor gets its own motions and its aiming twist back (it stands up, the session ends, or its visual has no
+// pose). CActor::g_SetAnimation plays a cycle only when its MotionID changes, and they did not change while it lay: its
+// cache is cleared (CActor::ResetAnimationCache), or the actor would go on lying.
+void own_pose_off(CActor* a)
+{
+	if (!a || g_pose_actor.load() != a)
+		return;
+	g_pose_actor.store(nullptr);
+	if (g_my_twist_off)
+		a->SetCallbacks();
+	g_my_twist_off = false;
+	a->ResetAnimationCache();
+}
+
 void release_controls(CActor* a)
 {
+	own_pose_off(a);
+	g_my_pose = Pose(); // the next fall looks its pose up again (and tells a missing one again)
 	if (g_me.input_installed)
 	{
 		if (a && a->input_external_handler_installed())
@@ -1205,10 +1232,10 @@ death::Action host_on_died(u16 id, u16 seq)
 	case death::Action::Spectate: host_order_spectate(id, seq); break;
 	case death::Action::LossesAndEvacuate:
 	{
-		const u32 items = death::host_apply_losses(id, seq, g_rules.drop);
+		const u32 items = death::host_apply_losses(id, seq, g_rules.drop, g_rules.share_pct);
 		const u32 money = death::host_take_money(id, g_rules.money_pct);
-		::Msg("[coop] death of %s (fall #%u): %u item(s) (%s), %u RU; respawn in %u s", nick_of(id).c_str(), seq, items,
-		    drop_name(g_rules.drop), money, g_rules.delay_ms / 1000);
+		::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(),
+		    seq, items, death::drop_name(g_rules.drop), u32(g_rules.share_pct), money, g_rules.delay_ms / 1000);
 		host_order_evacuate(id, seq, g_rules.delay_ms);
 		break;
 	}
@@ -1861,10 +1888,11 @@ void on_rules_msg(PeerId from, Reader& r)
 	if (!rules.read(r))
 		return;
 	if (!g_rules_from_host || !(rules == g_rules))
-		::Msg("[coop] host survival rules: death mode %s, drop %s, bleed-out %u s, revive health %.2f, respawn delay "
-		      "%u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
-		    mode_name(rules.mode), drop_name(rules.drop), rules.bleedout_ms / 1000, rules.revive_health,
-		    rules.delay_ms / 1000, rules.contusion_s, u32(rules.money_pct), u32(rules.wear_pct), u32(rules.rank_pct));
+		::Msg("[coop] host survival rules: death mode %s, drop %s (share %u%%), bleed-out %u s, revive health %.2f, "
+		      "respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
+		    mode_name(rules.mode), death::drop_name(rules.drop), u32(rules.share_pct), rules.bleedout_ms / 1000,
+		    rules.revive_health, rules.delay_ms / 1000, rules.contusion_s, u32(rules.money_pct), u32(rules.wear_pct),
+		    u32(rules.rank_pct));
 	g_rules = rules;
 	g_rules_from_host = true;
 }
@@ -2174,6 +2202,62 @@ MotionID find_pose(IKinematicsAnimated* ka, Life life)
 	return MotionID();
 }
 
+// The lying pose of a player's character by his life (death::body_pose): the avatar of another player
+// (avatar_pose_override) and my own actor (own_pose_frame) by one rule and the same motions. False: his life shows none
+// (alive), or the visual has none of the motions (one '!' line until he stands up) - his own motions play on.
+bool hold_pose(Pose& p, IKinematicsAnimated* ka, Life life, const char* who, u16 id)
+{
+	const death::BodyPose want = death::body_pose(u8(life));
+	if (want == death::BodyPose::Standing)
+		return false;
+	const Life pose_life = want == death::BodyPose::Wounded ? Life::Wounded : Life::Dead;
+	if (p.life != pose_life || p.visual != ka)
+	{
+		p.life = pose_life;
+		p.visual = ka;
+		p.motion = find_pose(ka, pose_life);
+		p.missing = !p.motion.valid();
+		if (p.missing && !p.logged)
+		{
+			p.logged = true;
+			::Msg("! [coop] %s %u: no %s animation in its visual, it stands (its own motions play)", who, id,
+			    pose_life == Life::Wounded ? "wounded" : "lying");
+		}
+	}
+	if (p.missing)
+		return false;
+	if (!blend_playing(ka, p.motion))
+		ka->PlayCycle(p.motion, TRUE);
+	return true;
+}
+
+// Build 10 (the owner's live test of build 9: the overhead camera showed his own body standing): my actor lies as my
+// avatar lies on the other machines. While the pose holds, the actor's own motions are off (own_pose_held: g_SetAnimation
+// would play its idle, a turn or a landing over the pose whenever the MotionID changes - the weapon put away at the fall
+// is one) and so is the aiming twist of the spine and head (not in a vehicle or at a mounted gun: those set their own
+// bone callbacks). The first-person camera stands on the actor's position, not on a bone (CActor::cam_Update): the pose
+// does not move it. own_pose_off gives it all back.
+void own_pose_frame(CActor* a)
+{
+	IKinematicsAnimated* ka = smart_cast<IKinematicsAnimated*>(a->Visual());
+	if (!ka || !hold_pose(g_my_pose, ka, g_me.life, "own actor", a->ID()))
+	{
+		own_pose_off(a); // standing, or no pose in the visual: the body stands as before
+		return;
+	}
+	if (g_pose_actor.load() == a)
+		return;
+	g_pose_actor.store(a);
+	// The step manager reads the legs blend of the last g_SetAnimation every frame and does not see the pose fade it out
+	// (unlike the legs IK, which drops a freed blend): a fall while running would go on making footsteps from it.
+	a->CStepManager::on_animation_start(MotionID(), nullptr); // no blend: no steps until g_SetAnimation plays legs again
+	if (!a->Holder())
+	{
+		a->ResetCallbacks();
+		g_my_twist_off = true;
+	}
+}
+
 // Players' characters must never lose health on this machine: each owner computes its own damage
 // (proxies on the host and avatars on clients are puppets; WP1 makes them unharmable, this keeps it so).
 void guard_frame(u64 t)
@@ -2310,6 +2394,9 @@ void forget_local(CActor* next = nullptr)
 	g_spec.valid = false;
 	g_over.valid = false;
 	g_poses.clear();
+	g_my_pose = Pose(); // the old actor's pose and twist are gone with it (never called into)
+	g_pose_actor.store(nullptr);
+	g_my_twist_off = false;
 	g_players.clear();
 }
 
@@ -2568,6 +2655,7 @@ void register_console()
 	CMD4(CCC_Float, "coop_death_money", &g_cv_death_money, 0.f, 100.f); // %
 	CMD4(CCC_Float, "coop_death_wear", &g_cv_death_wear, 0.f, 100.f); // %
 	CMD4(CCC_Float, "coop_death_rank", &g_cv_death_rank, 0.f, 100.f); // %
+	CMD4(CCC_Float, "coop_death_share", &g_cv_death_share, 0.f, 200.f); // % of the ltx loss shares (build 10)
 	CMD1(CCC_CoopWoundMe, "coop_wound_me");
 	CMD1(CCC_CoopNewCharacter, "coop_new_character"); // F3 Task 10
 }
@@ -2605,7 +2693,10 @@ void frame()
 			send_my_state(t); // tell everybody this character is alive (rejoin, new world)
 	}
 	if (a)
+	{
 		local_frame(a, t);
+		own_pose_frame(a); // build 10: my own body lies while I am down
+	}
 	reviver_frame(a, t);
 
 	if (mgr().is_live_client())
@@ -2625,12 +2716,12 @@ void frame()
 
 void print_status()
 {
-	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, drop %s, bleed-out %u s, revive health %.2f, "
-	      "respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
+	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, drop %s (share %u%%), bleed-out %u s, revive health "
+	      "%.2f, respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
 	    life_name(g_me.life), g_me.seq, mode_name(g_rules.mode),
-	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", drop_name(g_rules.drop),
-	    g_rules.bleedout_ms / 1000, g_rules.revive_health, g_rules.delay_ms / 1000, g_rules.contusion_s,
-	    u32(g_rules.money_pct), u32(g_rules.wear_pct), u32(g_rules.rank_pct));
+	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", death::drop_name(g_rules.drop),
+	    u32(g_rules.share_pct), g_rules.bleedout_ms / 1000, g_rules.revive_health, g_rules.delay_ms / 1000,
+	    g_rules.contusion_s, u32(g_rules.money_pct), u32(g_rules.wear_pct), u32(g_rules.rank_pct));
 	::Msg("[coop]   survival: falls %llu, deaths %llu, revived %llu, refused %llu, evacuated %llu, respawns %llu, "
 	      "spectate %llu, wipes %llu",
 	    g_stat.falls, g_stat.deaths, g_stat.revives, g_stat.refused, g_stat.evacuations, g_stat.respawns,
@@ -2790,21 +2881,13 @@ bool avatar_pose_override(CAI_Stalker* avatar)
 	IKinematicsAnimated* ka = smart_cast<IKinematicsAnimated*>(avatar->Visual());
 	if (!ka)
 		return false;
-	const Life pose_life = l == Life::Wounded ? Life::Wounded : Life::Dead;
-	Pose& p = g_poses[id];
-	if (p.life != pose_life)
-	{
-		p.life = pose_life;
-		p.motion = find_pose(ka, pose_life);
-		p.missing = !p.motion.valid();
-		if (p.missing)
-			::Msg("! [coop] avatar %u: no lying animation in its visual, it keeps the player's motions", id);
-	}
-	if (p.missing)
-		return false;
-	if (!blend_playing(ka, p.motion))
-		ka->PlayCycle(p.motion, TRUE);
-	return true;
+	return hold_pose(g_poses[id], ka, l, "avatar", id); // the same pose as my own actor's (build 10)
 }
+
+bool own_pose_held(const CActor* actor) { return actor && g_pose_actor.load() == actor; }
+
+bool look_locked() { return live() && g_me.actor && death::look_locked(u8(g_me.life)); }
+
+const death::Rules& rules() { return g_rules; }
 } // namespace survival
 } // namespace coop

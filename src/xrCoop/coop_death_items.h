@@ -254,7 +254,7 @@ inline Point spread(size_t i)
 }
 
 // Msg::DeathMarker (host -> all): u16 character, u16 marker object, u8 drop mode; host numbering. Only Drop (the
-// marker is the first dropped item) and Corpse (the stash) have a marker; Lose leaves nothing.
+// marker is the first dropped item) and Corpse (the stash) have a marker; Lose and Keep (build 10) leave nothing.
 struct Marker
 {
 	uint16_t character = 0xffff;
@@ -271,7 +271,8 @@ inline void write(Writer& w, const Marker& m)
 	w.u8(static_cast<uint8_t>(m.drop));
 }
 
-// False on a short packet, a missing id (0xffff) or a mode without a marker (Lose, unknown); `m` is then unchanged.
+// False on a short packet, a missing id (0xffff) or a mode without a marker (Lose, Keep, unknown); `m` is then
+// unchanged.
 inline bool read(Reader& r, Marker& m)
 {
 	Marker n;
@@ -412,16 +413,23 @@ struct LossPlan
 {
 	LossMove move = LossMove::None;
 	std::vector<uint16_t> items;
-	Drop marker = Drop::Drop; // the DeathMarker mode of the stash once filled; Lose: no marker
+	Drop marker = Drop::Drop; // the DeathMarker mode of the stash once filled; Lose, Keep: no marker
 	size_t offered = 0; // for the log: the candidates of the pick (Drop, Lose) or the backpack items (Corpse)
 };
 
 // `items`, `kinds` and `layout_known` as for loss_candidates; `shares` and `seed` as for pick_losses (Corpse uses
-// neither). A mode byte Rules::read would never give acts as Drop, the default mode. No item to take: LossMove::None.
+// neither). Build 10: `share_pct` is coop_death_share, the shares of Drop and Lose are scale_shares(shares, share_pct);
+// Keep takes nothing (LossMove::None, marker Keep: no marker). A mode byte Rules::read would never give acts as Drop,
+// the default mode. No item to take: LossMove::None.
 inline LossPlan plan_losses(Drop mode, const std::vector<ItemFacts>& items, const KindTable& kinds, bool layout_known,
-	const Shares& shares, uint32_t seed)
+	const Shares& shares, uint32_t seed, float share_pct = kShareDefaultPct)
 {
 	LossPlan p;
+	if (mode == Drop::Keep)
+	{
+		p.marker = Drop::Keep;
+		return p; // nothing is offered: the money, the wear and the rank go by their own rules
+	}
 	if (mode == Drop::Corpse)
 	{
 		p.items = stash_ids(items, kinds, false, layout_known);
@@ -433,7 +441,7 @@ inline LossPlan plan_losses(Drop mode, const std::vector<ItemFacts>& items, cons
 	{
 		const std::vector<Candidate> candidates = loss_candidates(items, kinds, layout_known);
 		p.offered = candidates.size();
-		p.items = pick_losses(candidates, shares, seed);
+		p.items = pick_losses(candidates, scale_shares(shares, share_pct), seed);
 		p.move = mode == Drop::Lose ? LossMove::Destroy : LossMove::Stash;
 		p.marker = mode == Drop::Lose ? Drop::Lose : Drop::Drop; // a drop bag keeps the drop mode byte (Lua's hint)
 	}
