@@ -308,6 +308,12 @@ float CGamePersistent::OnRainSound(LPCSTR file)
 	return 1.0f;
 }
 
+// Anomaly Coop: a device reset (an options change of the resolution, vid_restart) blocks the frame loop for 10-20 s with
+// GAMMA, longer than the session's silence timeout (10 s): the host dropped a client for it (live 2026-10-23, 16.7 s) and
+// the client rejoined. Arming the link hold lets the keep-alive thread answer for the stalled thread; the first frames
+// after the reset (precache) keep it (Manager::frame, coop_link_hold.h).
+void CGamePersistent::OnDeviceResetBegin() { coop::on_blocking_work(); }
+
 void CGamePersistent::WeathersUpdate()
 {
 	PROF_EVENT("CGamePersistent WeathersUpdate");

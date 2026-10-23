@@ -3,6 +3,9 @@
 
 #include "xrCoop/coop_session.h"
 
+struct SInvItemPlace;
+class CSE_Abstract;
+
 namespace coop
 {
 namespace players
@@ -37,6 +40,10 @@ void equip_reset();
 void equip_frame();
 void equip_resend(); // force a full resend (after join)
 void equip_print_status();
+// CInventoryItem::net_Spawn hook: while a client loads the world it came back to, the things of its own character
+// (children of its actor) get the place they had (slot, belt, backpack) from the layout the host kept
+// (xrCoop/coop_gear.h), before the engine takes them into the inventory. Nothing on the host or outside that load.
+void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& spawn_entity);
 
 // Called every frame for each avatar object from its UpdateCL (see CAI_Stalker hook):
 // moves the visual to the interpolated state. Returns false if no state yet.

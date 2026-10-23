@@ -1215,6 +1215,112 @@ void send_relation_list(PeerId to)
 	++g_stats.rel_out;
 }
 
+// Diagnosis of a relations hash that never agrees. Live 2026-10-23 (build 9, GAMMA): 1034 entries on both sides
+// (10 personal + the 32 x 32 community matrix), different hashes (fd3a671d8653ce08 here, d3e65d1c4d38200c host) from the
+// join to the end, the same pair in two sessions, through every full resync. Right after a full list is applied, when the
+// hash has been wrong for several checks, say where three things stand: the list the host just sent (hashed here with the
+// formula of hash_relations), the hash the host said, and what this machine holds; and the first entries of this
+// machine that differ from the list. List == host hash but != here: the apply does not stick (a hook, a clamp, the id
+// swap). List != host hash: the host's list and its own hash disagree.
+struct RelTriple
+{
+	int a, b, v; // personal: from, to (host numbering); community: community, to; the matrix is a separate table
+};
+DomainHash g_rel_host_hash; // client: the relations entry of the last StoryHash
+bool g_rel_diag_wanted = false;
+
+DomainHash hash_of_relation_list(const xr_vector<RelTriple>& personal, const xr_vector<RelTriple>& community, u32 n,
+                                 const xr_vector<int>& table)
+{
+	DomainHash d;
+	for (const RelTriple& t : personal)
+	{
+		Fnv f;
+		f.pod(u8(RelPersonal));
+		f.pod(u16(t.a));
+		f.pod(u16(t.b));
+		f.pod(CHARACTER_GOODWILL(t.v));
+		d.add(f.h);
+	}
+	for (const RelTriple& t : community)
+	{
+		Fnv f;
+		f.pod(u8(RelCommunity));
+		f.pod(int(t.a));
+		f.pod(u16(t.b));
+		f.pod(CHARACTER_GOODWILL(t.v));
+		d.add(f.h);
+	}
+	if (table.size() == size_t(n) * n)
+		for (u32 a = 0; a < n; ++a)
+			for (u32 b = 0; b < n; ++b)
+			{
+				Fnv f;
+				f.pod(u8(RelCommRelation));
+				f.pod(int(a));
+				f.pod(int(b));
+				f.pod(CHARACTER_GOODWILL(table[a * n + b]));
+				d.add(f.h);
+			}
+	return d;
+}
+
+void diagnose_relations(const xr_vector<RelTriple>& personal, const xr_vector<RelTriple>& community, u32 n,
+                        const xr_vector<int>& table)
+{
+	const DomainHash list = hash_of_relation_list(personal, community, n, table);
+	const DomainHash here = hash_relations();
+	::Msg("[coop] story: relations diagnosis: the host's list %u/%016llx, the host's hash %u/%016llx, this machine %u/%016llx",
+	      list.count, list.hash, g_rel_host_hash.count, g_rel_host_hash.hash, here.count, here.hash);
+	if (here == list)
+	{
+		::Msg("[coop] story: relations diagnosis: this machine holds exactly the list; the difference is between the "
+		      "host's list and the host's own hash");
+		return;
+	}
+	u32 shown = 0, differ = 0;
+	const auto say = [&](const char* what, int a, int b, int host, int mine)
+	{
+		++differ;
+		if (shown++ < 8)
+			::Msg("[coop] story: relations diagnosis: %s %d -> %d: list %d, here %d", what, a, b, host, mine);
+	};
+	// the matrix
+	if (table.size() == size_t(n) * n && n == u32(CHARACTER_COMMUNITY::GetMaxIndex()) + 1)
+		for (u32 a = 0; a < n; ++a)
+			for (u32 b = 0; b < n; ++b)
+			{
+				const int mine = RELATION_REGISTRY().GetCommunityRelation(int(a), int(b));
+				if (mine != table[a * n + b])
+					say("matrix", int(a), int(b), table[a * n + b], mine);
+			}
+	// personal entries, in host numbering, as hash_relations counts them
+	xr_map<std::pair<int, int>, int> held;
+	if (const CRelationRegistry::OBJECT_REGISTRY* all = rel_all())
+		for (const auto& it : *all)
+		{
+			const bool from_player = is_player(it.first);
+			for (const auto& p : it.second.personal)
+				if (p.second.Goodwill() != NEUTRAL_GOODWILL && (from_player || is_player(p.first)))
+					held[{int(host_id_of(it.first)), int(host_id_of(p.first))}] = p.second.Goodwill();
+		}
+	xr_map<std::pair<int, int>, int> listed;
+	for (const RelTriple& t : personal)
+		listed[{t.a, t.b}] = t.v;
+	for (const auto& l : listed)
+	{
+		const auto h = held.find(l.first);
+		if (h == held.end())
+			say("personal missing here", l.first.first, l.first.second, l.second, 0);
+		else if (h->second != l.second)
+			say("personal", l.first.first, l.first.second, l.second, h->second);
+	}
+	for (const auto& h : held)
+		if (listed.find(h.first) == listed.end())
+			say("personal not in the list", h.first.first, h.first.second, 0, h.second);
+	::Msg("[coop] story: relations diagnosis: %u entr%s of this machine differ from the list", differ, differ == 1 ? "y" : "ies");
+}
+
 void client_apply_relation_list(Reader& r)
 {
 	struct P
@@ -1289,6 +1395,16 @@ void client_apply_relation_list(Reader& r)
 		for (u32 a = 0; a < n; ++a)
 			for (u32 b = 0; b < n; ++b)
 				client_set_comm_relation(int(a), int(b), table[a * n + b]);
+	if (g_rel_diag_wanted) // the hash was wrong several times in a row (client_on_hash): one diagnosis per streak
+	{
+		g_rel_diag_wanted = false;
+		xr_vector<RelTriple> pp, cc;
+		for (const P& p : personal)
+			pp.push_back(RelTriple{int(p.from), int(p.to), p.v});
+		for (const C& c : community)
+			cc.push_back(RelTriple{c.comm, int(c.to), c.v});
+		diagnose_relations(pp, cc, n, table);
+	}
 	++g_stats.rel_in;
 	::Msg("[coop] story: relations resynced from the host: %u personal, %u community", np, nc);
 }
@@ -2004,6 +2120,12 @@ void client_on_hash(Reader& r)
 		}
 		++g_streak[i];
 		++g_stats.mismatches;
+		if (i == 2)
+		{
+			g_rel_host_hash = host[i];
+			if (g_streak[i] == 4) // the next full list (asked for below) is diagnosed once
+				g_rel_diag_wanted = true;
+		}
 		// Persistent differences (e.g. a spot on an object this machine never got) back off to 1/min.
 		if (g_streak[i] > 3 && g_streak[i] % 6)
 			continue;

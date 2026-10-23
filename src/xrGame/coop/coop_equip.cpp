@@ -8,6 +8,11 @@
 // PlayerVitals (reliable, every 2 s, client -> host): health, satiety, radiation, psy, power,
 //   bleeding. The host stores them in the proxy's custom data ([coop] section), i.e. inside the
 //   host save (P4). On join the client restores its actor from there.
+//   Tail (xrCoop/coop_gear.h, live 2026-10-23): where the owner's things sit (slots, belt, the backpack things that
+//   would not stay there by themselves). The host keeps it as `gear = ...` in the same custom data; the client's items
+//   are given their place while they spawn after a rejoin (on_item_spawn), as the engine does it from the client data
+//   of a saved game. Without it a returning player's outfit, helmet, backpack, artefacts and detector land in the
+//   backpack: the proxy on the host is a CAI_Stalker that holds none of it.
 #include "stdafx.h"
 #include "coop_players.h"
 #include "coop_manager.h"
@@ -17,6 +22,8 @@
 #include "coop_net.h"
 #include "coop_alife.h"
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_gear.h"
+#include "xrCoop/coop_checkpoint_rules.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -43,6 +50,9 @@ namespace
 constexpr u32 kEquipCheckMs = 500;
 constexpr u32 kEquipRefreshMs = 5000;
 constexpr u32 kVitalsMs = 2000;
+// The layout of the owner's things rides on PlayerVitals when it changes and at least this often: the host's world can
+// be replaced (a loaded save has the proxy without the line), and the next report puts it back.
+constexpr u32 kGearRefreshMs = 30000;
 
 constexpr size_t kMaxLightSection = 64;
 constexpr size_t kMaxVisual = 200;
@@ -134,6 +144,15 @@ xr_map<u16, Equip> g_pending;
 xr_map<u16, Equip> g_applied;
 bool g_vitals_restored = false;
 u64 g_equip_in = 0, g_equip_out = 0, g_vitals_out = 0, g_vitals_in = 0;
+// Layout of the owner's things (xrCoop/coop_gear.h). Client: what was last reported and when. Client, while its world
+// loads: the host's copy, by item. Host: how many reports it took / refused.
+std::vector<gear::Entry> g_gear_sent;
+u64 g_gear_sent_at = 0;
+gear::Table g_gear_table;
+bool g_gear_table_built = false;
+u32 g_gear_placed[4] = {}; // by eItemPlace: [1] slot, [2] belt, [3] backpack; [0] left to the engine (slot taken)
+bool g_gear_logged = false;
+u64 g_gear_out = 0, g_gear_in = 0, g_gear_bad = 0;
 
 bool capture_equip(Equip& e)
 {
@@ -513,6 +532,33 @@ void store_vitals(u16 proxy, const Vitals& v)
 	e->m_ini_string = ini.c_str();
 }
 
+// --- layout of the owner's things (slots, belt) ---
+
+// The last slot of an inventory on this machine (system.ltx lists them: GAMMA has more than stock). Host and clients
+// run the same configs.
+u8 last_slot_here()
+{
+	const u16 last = g_actor ? g_actor->inventory().LastSlot() : u16(gear::kMaxSlotId);
+	return u8(last < gear::kMaxSlotId ? last : gear::kMaxSlotId);
+}
+
+// Host: the layout goes next to the vitals, as `gear = ...` of the [coop] block of the proxy's custom data.
+void store_gear(u16 proxy, const std::vector<gear::Entry>& layout)
+{
+	if (!ai().get_alife()) // see store_vitals: the simulator is rebuilt on a level change
+		return;
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
+	if (!e || !world::is_player_proxy(proxy))
+		return;
+	std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
+	const std::string value = gear::to_text(layout);
+	std::string have;
+	if (checkpoint::ini_get(text, "coop", "gear", have) && have == value)
+		return; // the same layout again (the 30 s refresh): nothing to rewrite
+	checkpoint::ini_set(text, "coop", "gear", value);
+	e->m_ini_string = text.c_str();
+}
+
 void host_on_vitals(PeerId from, Reader& r)
 {
 	Vitals v;
@@ -523,6 +569,89 @@ void host_on_vitals(PeerId from, Reader& r)
 		return;
 	store_vitals(proxy, v);
 	++g_vitals_in;
+	// What follows the floats is the layout of his things; a sender without it ends here (the host keeps what it has).
+	std::vector<gear::Entry> layout;
+	switch (gear::read_tail(r, layout, last_slot_here()))
+	{
+	case gear::TailRead::Ok:
+		store_gear(proxy, layout);
+		++g_gear_in;
+		break;
+	case gear::TailRead::Bad:
+		if (++g_gear_bad <= 10)
+			::Msg("! [coop] the layout of the equipment from peer #%u is malformed, ignored", from);
+		break;
+	case gear::TailRead::Absent: break;
+	}
+}
+
+// Client: slots first, then the belt, then the backpack things that would not stay there by themselves (a weapon:
+// the engine puts it in its slot when it can), in host numbering.
+void capture_gear(CActor& actor, std::vector<gear::Entry>& out)
+{
+	out.clear();
+	CInventory& inv = actor.inventory();
+	const auto add = [&out](PIItem item, gear::Place place, u16 slot)
+	{
+		if (!item || item->object().getDestroy() || out.size() >= gear::kMaxEntries)
+			return;
+		const u16 id = join::to_host(item->object().ID());
+		if (id == 0xffff)
+			return;
+		gear::Entry e;
+		e.item = id;
+		e.tag = gear::tag_of(item->object().cNameSect().c_str());
+		e.place = place;
+		e.slot = u8(slot);
+		out.push_back(e);
+	};
+	for (u16 slot = inv.FirstSlot(); slot <= inv.LastSlot(); ++slot)
+		add(inv.ItemFromSlot(slot), gear::Place::Slot, slot);
+	for (PIItem item : inv.m_belt)
+		add(item, gear::Place::Belt, 0);
+	for (PIItem item : inv.m_ruck)
+		if (item && !item->RuckDefault())
+			add(item, gear::Place::Ruck, 0);
+}
+
+// Client, with a vitals report: the layout, when it changed or is due again. A live player always has something in
+// his slots; an inventory that shows none was not read (coop_death.cpp carried_of, T8b review N2) and must not
+// replace what the host keeps.
+void append_gear(Writer& w, CActor& actor, u64 now)
+{
+	std::vector<gear::Entry> layout;
+	capture_gear(actor, layout);
+	bool worn = false;
+	for (const gear::Entry& e : layout)
+		worn = worn || e.place != gear::Place::Ruck;
+	if (!worn || (layout == g_gear_sent && now - g_gear_sent_at < kGearRefreshMs))
+		return;
+	gear::write_tail(w, layout);
+	g_gear_sent = layout;
+	g_gear_sent_at = now;
+	++g_gear_out;
+}
+
+// Client, while the world it came back to loads: the host's copy of the layout, read once from the custom data of its
+// former proxy (now the host's avatar here), where the host keeps it.
+const gear::Table& gear_table()
+{
+	if (g_gear_table_built || !ai().get_alife())
+		return g_gear_table;
+	const CSE_ALifeDynamicObject* e = ai().alife().objects().object(join::my_proxy(), true);
+	if (!e)
+		return g_gear_table; // not loaded yet: asked again by the next item
+	g_gear_table_built = true;
+	std::string value;
+	if (e->m_ini_string.size() && checkpoint::ini_get(e->m_ini_string.c_str(), "coop", "gear", value))
+	{
+		std::vector<gear::Entry> layout;
+		const size_t refused = gear::from_text(value, layout, last_slot_here());
+		g_gear_table.load(layout);
+		::Msg("[coop] gear: the host kept %u placement(s) of my equipment%s", (u32)g_gear_table.size(),
+		      refused ? " (some entries were refused)" : "");
+	}
+	return g_gear_table;
 }
 
 void client_send_vitals()
@@ -540,6 +669,7 @@ void client_send_vitals()
 	v.bleeding = c.BleedingSpeed();
 	Writer w(32);
 	write_vitals(w, v);
+	append_gear(w, *actor, mgr().now_ms());
 	net::client_send(Msg::PlayerVitals, w);
 	++g_vitals_out;
 }
@@ -593,6 +723,46 @@ void equip_install(Session& s)
 	s.on(Msg::PlayerVitals, &host_on_vitals);
 }
 
+void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
+{
+	// Only the things of a client's own character in the world it came back to: they spawn as children of its actor
+	// (parent 0 after the role swap, coop_join on_alife_objects_loaded). Everything else keeps what the engine gave it.
+	if (e.ID_Parent != 0 || !mgr().is_client() || !join::client_loading_world())
+		return;
+	if (!g_gear_table_built)
+	{
+		g_gear_logged = false;
+		for (u32& n : g_gear_placed)
+			n = 0;
+	}
+	const gear::Entry* g = gear_table().find(e.ID, gear::tag_of(e.s_name.c_str()));
+	if (!g)
+		return;
+	CActor* actor = smart_cast<CActor*>(Level().Objects.net_Find(0));
+	if (!actor)
+		return;
+	switch (g->place)
+	{
+	case gear::Place::Slot:
+	{
+		// Inventory::Take with strict placement trusts the place: a slot another item took first (one the layout does not
+		// know, e.g. picked up after the last report) would be overwritten and that item left with a slot it is not in.
+		CInventory& inv = actor->inventory();
+		if (g->slot > inv.LastSlot() || inv.ItemFromSlot(g->slot))
+		{
+			++g_gear_placed[0];
+			return; // the engine's own default
+		}
+		place.type = eItemPlaceSlot;
+		place.slot_id = g->slot;
+		break;
+	}
+	case gear::Place::Belt: place.type = eItemPlaceBelt; break;
+	case gear::Place::Ruck: place.type = eItemPlaceRuck; break;
+	}
+	++g_gear_placed[u32(place.type) & 3u];
+}
+
 bool avatar_safemode(u16 avatar_id, bool& lowered)
 {
 	auto it = g_applied.find(avatar_id);
@@ -616,6 +786,11 @@ void equip_reset()
 	g_applied.clear();
 	g_last_check = g_last_refresh = g_last_vitals = 0;
 	g_vitals_restored = false;
+	g_gear_sent.clear(); // the next session reports the layout at once
+	g_gear_sent_at = 0;
+	g_gear_table.clear();
+	g_gear_table_built = false;
+	g_gear_logged = true;
 }
 
 void equip_frame()
@@ -627,6 +802,19 @@ void equip_frame()
 
 	if (mgr().is_live_client() && !g_vitals_restored)
 		client_restore_vitals();
+
+	// The world loaded: the host's copy of the layout did its work (on_item_spawn), say what it did and let it go.
+	if (mgr().is_live_client() && g_gear_table_built)
+	{
+		if (!g_gear_logged && (g_gear_table.size() || g_gear_placed[0]))
+			::Msg("[coop] gear: %u thing(s) put where they were (slots %u, belt %u, backpack %u), %u left to the engine "
+			      "(the slot was taken)",
+			      g_gear_placed[1] + g_gear_placed[2] + g_gear_placed[3], g_gear_placed[1], g_gear_placed[2],
+			      g_gear_placed[3], g_gear_placed[0]);
+		g_gear_logged = true;
+		g_gear_table.clear();
+		g_gear_table_built = false;
+	}
 
 	if (now - g_last_check >= kEquipCheckMs)
 	{
@@ -665,6 +853,9 @@ void equip_print_status()
 {
 	::Msg("[coop]   equipment: %llu out, %llu in, %u pending, %llu visuals refused; vitals: %llu out, %llu in",
 	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_visual_bad, g_vitals_out, g_vitals_in);
+	::Msg("[coop]   equipment layout: %llu out, %llu in, %llu malformed; last placed on a rejoin: slots %u, belt %u, "
+	      "backpack %u, %u left to the engine",
+	      g_gear_out, g_gear_in, g_gear_bad, g_gear_placed[1], g_gear_placed[2], g_gear_placed[3], g_gear_placed[0]);
 	::Msg("[coop]   hand lights: %u on, %llu made, %llu unknown sections | my flashlight %s, safe mode %s",
 	      (u32)g_lights.size(), g_lights_made, g_lights_bad, g_last_sent.hand_light ? g_last_sent.light_section.c_str() : "off",
 	      g_last_sent.safemode ? "on" : "off");

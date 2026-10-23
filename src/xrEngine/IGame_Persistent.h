@@ -203,6 +203,9 @@ public:
 	virtual float OnThunderboltSound(LPCSTR file, float distance) { return 1.0f; }
 	// looped rain ambient volume gate, overridden by the game layer to ask Lua. Returns 1.0 for vanilla.
 	virtual float OnRainSound(LPCSTR file) { return 1.0f; }
+	// Anomaly Coop: called before a device reset (vid_restart, a resolution change, a monitor switch) starts. The reset
+	// blocks the frame loop for 10-20 s with GAMMA; the game layer keeps its co-op session link alive meanwhile.
+	virtual void OnDeviceResetBegin() {}
 
 	struct pda_data
 	{

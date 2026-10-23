@@ -25,6 +25,7 @@
 #include "ai_object_location.h"
 #include "object_broker.h"
 #include "../xrEngine/igame_persistent.h"
+#include "coop/coop_players.h" // Anomaly Coop
 
 
 #ifdef DEBUG
@@ -359,6 +360,10 @@ BOOL CInventoryItem::net_Spawn(CSE_Abstract* DC)
 
 	CSE_ALifeInventoryItem* pSE_InventoryItem = smart_cast<CSE_ALifeInventoryItem*>(e);
 	if (!pSE_InventoryItem) return TRUE;
+
+	// Anomaly Coop: a client that came back gets its own things where they were (slot, belt, backpack): the host's
+	// proxy kept none of it, and with no place CInventory::Take puts every default_to_ruck item in the backpack
+	coop::players::on_item_spawn(m_ItemCurrPlace, *e);
 
 	//!!!
 	m_fCondition = pSE_InventoryItem->m_fCondition;

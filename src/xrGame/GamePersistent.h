@@ -57,6 +57,7 @@ class CGamePersistent :
 public:
 	virtual float OnThunderboltSound(LPCSTR file, float distance);
 	virtual float OnRainSound(LPCSTR file);
+	virtual void OnDeviceResetBegin(); // Anomaly Coop: keep the session link alive through the reset
 
 private:
 

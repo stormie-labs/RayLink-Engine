@@ -70,6 +70,8 @@ extern ENGINE_API u32 psCurrentVidMode[];
 void CRenderDevice::Reset(bool precache)
 {
 	PROF_EVENT("CRenderDevice::Reset");
+	if (g_pGamePersistent)
+		g_pGamePersistent->OnDeviceResetBegin(); // Anomaly Coop: the reset stalls the frame loop, keep the session alive
 	if (use_reshade)
 		unregister_reshade();
 
@@ -153,6 +155,8 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 		~SwapGuard() { flag = false; }
 	} guard(s_swap_in_progress);
 
+	if (g_pGamePersistent)
+		g_pGamePersistent->OnDeviceResetBegin(); // Anomaly Coop: the swap stalls the frame loop, keep the session alive
 	if (use_reshade)
 		unregister_reshade();
 	use_reshade = false;
