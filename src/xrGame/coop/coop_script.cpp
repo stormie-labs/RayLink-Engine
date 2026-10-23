@@ -1555,6 +1555,7 @@ void register_raw(lua_State* L)
 	router::register_lua(L); // F2 T10: coop.route.of / runs / note / none_functions (scripts\coop_route.script)
 	syncapi::register_lua(L); // F2 T14: coop.sync.* (coop_sync_api.h)
 	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
+	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
 }
 } // namespace
 

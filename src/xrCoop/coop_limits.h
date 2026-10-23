@@ -36,8 +36,10 @@ constexpr RateRule kClientRateRules[] = {
 	// R2 I4: a client asks for an entity it misses (P3); a modified one could ask for the whole world in a loop, each
 	// answer a full spawn packet. 20 per second after a burst.
 	{Msg::StateDumpRequest, 64, 50},
-	// T12 review (Ruling 18): an honest client votes when it touches a level exit (once, or each time the player says
-	// yes to the stock dialog, which comes back every 5 s while he stays inside). One per 2 s after a burst.
+	// T12 review (Ruling 18): an honest client votes when it touches a level exit. Protocol 10 (the waiting point of a
+	// level change): ready when he steps into the zone, cancel when he steps out, "still here" every kClaimRefreshMs, and the
+	// client asks again only when the host's board does not show what he did (transition::Intent, paced by Pacer: 2 in a row,
+	// then one per 2.5 s). One per 2 s after a burst of 4 on the host.
 	{Msg::TransitionVote, 4, 2000},
 	// F2 T3: sent on a change and every 5 s, checked every 500 ms (coop_equip.cpp kEquipCheckMs, kEquipRefreshMs).
 	{Msg::PlayerEquip, 8, 400},

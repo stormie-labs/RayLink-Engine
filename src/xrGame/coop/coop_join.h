@@ -20,6 +20,7 @@
 
 class CALifeObjectRegistry;
 class NET_Packet;
+struct lua_State;
 
 // Host setting (console coop_max_new_characters, Ruling F2-10 b, F2 T3 fix round 1): how many new player characters
 // (a player key the world has no character for) a session makes; default and range in xrCoop/coop_limits.h. Ruling F3-9:
@@ -79,9 +80,31 @@ u32 host_world_epoch();
 void on_world_created();
 // Number of worlds created in this process (any role).
 u32 world_generation();
-// Host: execute a level change a client asked for (console coop_accept_transition), built from the host's own
-// level changer (R2 I3).
+// Host: move the group at once through the exit somebody waits at (console coop_accept_transition, the chat's /go),
+// whoever is missing. The level change is built from the host's own level changer (R2 I3).
 bool accept_transition();
+
+// --- the waiting point of a level change (protocol 10; rule and messages in xrCoop/coop_transition.h) ---
+// Until the split levels (F3a) the whole group changes level together: a player who stands in the zone of an exit is
+// ready for it, the group goes when every player in the world is (5 s countdown), the host may go at once. Both roles run
+// it from frame(); the placard reads coop.transition() (scripts\coop_hud_transition.script).
+// Hook of CLevelChanger (the stock "go?" dialog and the silent change of its zone): true = the group waits here, the
+// stock reaction stays off. False for a disabled exit (its own message stays), outside a session and for a host nobody
+// has joined.
+bool transition_owns_exit(bool exit_enabled);
+// Hook of game_sv_Single::change_level, the one place every level change of the host goes through (the zone, the
+// dialog, jump_to_level of a guide): true = held, the group waits (a guide trip, which has no exit, needs everybody's
+// yes); false = the stock change goes on (no players besides the host, or the board's own change). `P` is read, not
+// consumed.
+bool host_gate_level_change(NET_Packet& P);
+// Console coop_transition_go (host): the key held at an exit: the group goes now. coop_transition_cancel (any player):
+// the key held while ready: withdraw (no claim until he leaves the zone); a guide trip: not confirmed. coop_transition_confirm
+// (client): yes to the host's guide trip.
+bool transition_go_now();
+bool transition_cancel();
+bool transition_confirm();
+// coop.transition() for Lua (coop_script.cpp register_raw).
+void register_lua(lua_State* L);
 // Host, F3 Task 10: player `peer` goes through the join again in the world the host serves now: SessionReset {why,
 // epoch} to him alone, with the epoch he is in already (his session and the host's take it as it is), his entry
 // loading, his world traffic held (sync::host_begin_join), his character nobody's. His JoinRequest finds his character

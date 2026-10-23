@@ -11,6 +11,7 @@
 #include "../xrEngine/x_ray.h"
 #include "../xrEngine/dedicated_server_only.h"
 #include "../xrEngine/no_single.h"
+#include "coop/coop_join.h" // Anomaly Coop: the host's level change waits for the group
 
 game_sv_Single::game_sv_Single()
 {
@@ -233,6 +234,8 @@ void game_sv_Single::SetEnvironmentGameTimeFactor(const float fTimeFactor)
 
 bool game_sv_Single::change_level(NET_Packet& net_packet, ClientID sender)
 {
+	if (coop::join::host_gate_level_change(net_packet))
+		return (false); // Anomaly Coop: every level change of the host waits for the group (the zone, the dialog, a guide)
 	if (ai().get_alife())
 		return (alife().change_level(net_packet));
 	else

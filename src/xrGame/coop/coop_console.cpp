@@ -151,7 +151,32 @@ class CCC_CoopAcceptTransition : public IConsole_Command
 public:
 	CCC_CoopAcceptTransition(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
 	void Execute(LPCSTR) override { join::accept_transition(); }
-	void Info(TInfo& I) override { xr_strcpy(I, "host: move the group through the level exit a player asked for"); }
+	void Info(TInfo& I) override { xr_strcpy(I, "host: move the group now through the level exit somebody waits at"); }
+};
+
+// The keys of the waiting point of a level change (scripts\coop_hud_transition.script holds them and runs these).
+class CCC_CoopTransitionGo : public IConsole_Command
+{
+public:
+	CCC_CoopTransitionGo(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { join::transition_go_now(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "host, waiting at a level exit: the group goes now, whoever is missing"); }
+};
+
+class CCC_CoopTransitionCancel : public IConsole_Command
+{
+public:
+	CCC_CoopTransitionCancel(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { join::transition_cancel(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "waiting at a level exit: not ready any more (until you leave the zone)"); }
+};
+
+class CCC_CoopTransitionConfirm : public IConsole_Command
+{
+public:
+	CCC_CoopTransitionConfirm(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { join::transition_confirm(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "client: yes to the host's trip to another level (a guide)"); }
 };
 
 class CCC_CoopDump : public IConsole_Command
@@ -173,6 +198,9 @@ void register_console_commands()
 	CMD1(CCC_CoopNetSim, "coop_netsim");
 	CMD1(CCC_CoopDump, "coop_dump");
 	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
+	CMD1(CCC_CoopTransitionGo, "coop_transition_go");
+	CMD1(CCC_CoopTransitionCancel, "coop_transition_cancel");
+	CMD1(CCC_CoopTransitionConfirm, "coop_transition_confirm");
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));
 	CMD4(CCC_Integer, "coop_friendly_fire", &g_coop_friendly_fire, 0, 1); // host setting
 	CMD4(CCC_Integer, "coop_diag_stacks", &g_coop_diag_stacks, 0, 1); // C++ stacks of coop::diag (stall 1-2 min)

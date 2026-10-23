@@ -34,6 +34,7 @@ const char* msg_name(Msg type)
 	case Msg::AvatarList: return "AvatarList";
 	case Msg::CharOffer: return "CharOffer";
 	case Msg::CharChoice: return "CharChoice";
+	case Msg::TransitionState: return "TransitionState";
 
 	case Msg::PlayerState: return "PlayerState";
 	case Msg::PlayerVitals: return "PlayerVitals";
@@ -145,6 +146,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::LevelChange:
 	case Msg::AvatarList:
 	case Msg::CharOffer: // protocol 8: the host offers a new character before the world
+	case Msg::TransitionState: // protocol 10: the host's board of who waits at a level exit
 	case Msg::PlayerHit:
 	case Msg::PlayerRules:
 	case Msg::EntitySpawn:

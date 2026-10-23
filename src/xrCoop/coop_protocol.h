@@ -44,7 +44,10 @@ namespace coop
 // 9 (game settings T3, owner 2026-10-23): the faction is part of the world, the player does not choose it:
 //    CharOffer ends with `str faction` (the world's), the host ignores CharChoice::faction (coop_newchar.h
 //    character_faction). The CharChoice layout is unchanged.
-constexpr uint32_t kProtocolVersion = 9;
+// 10 (transition wait, owner 2026-10-23): the waiting point of a level change. TransitionVote is `u8 op, u16 level changer`
+//    (Ready / Cancel, coop_transition.h VoteMsg; protocol 9 sent just the u16), new Msg TransitionState 0x010A (host -> all,
+//    coop_transition.h StateMsg: who waits at which exit)
+constexpr uint32_t kProtocolVersion = 10;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -89,10 +92,11 @@ enum class Msg : uint16_t
 	JoinComplete = 0x0103, // host -> client: catch-up done, live sync on
 	SessionReset = 0x0104, // host -> clients: world replaced (host load): str reason, u32 new world epoch; rejoin
 	LevelChange = 0x0105, // host -> clients: group transition, rejoin after
-	TransitionVote = 0x0106, // client -> host: u16 level changer (host numbering) the client stands in
+	TransitionVote = 0x0106, // client -> host: u8 op (ready / cancel), u16 level changer (host numbering), coop_transition.h VoteMsg
 	AvatarList = 0x0107, // host -> clients: AvatarListMsg, who plays each player character in the world (R3 В3)
 	CharOffer = 0x0108, // host -> client: CharOfferMsg, his key has no character here: choose one (protocol 8)
 	CharChoice = 0x0109, // client -> host: CharChoiceMsg, faction and bought gear; the host answers with the world
+	TransitionState = 0x010A, // host -> all: coop_transition.h StateMsg, who waits at which exit for the group (protocol 10)
 
 	// players
 	PlayerState = 0x0110, // unreliable movement snapshot (owner -> host -> others)

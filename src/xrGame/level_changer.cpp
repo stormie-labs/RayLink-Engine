@@ -19,6 +19,7 @@
 
 #include "UIGameSP.h"
 #include "../xrengine/xr_collide_form.h"
+#include "coop/coop_join.h" // Anomaly Coop: the group waits at an exit
 
 xr_vector<CLevelChanger*> g_lchangers;
 
@@ -124,6 +125,8 @@ void CLevelChanger::feel_touch_new(CObject* tpObject)
 	VERIFY(l_tpActor);
 	if (!l_tpActor->g_Alive())
 		return;
+	if (coop::join::transition_owns_exit(m_b_enabled))
+		return; // Anomaly Coop: in a session the group waits at the exit (join::frame): no dialog, no change of our own
 
 	if (m_bSilentMode)
 	{
@@ -183,6 +186,7 @@ bool CLevelChanger::feel_touch_contact(CObject* object)
 void CLevelChanger::update_actor_invitation()
 {
 	if (m_bSilentMode) return;
+	if (coop::join::transition_owns_exit(m_b_enabled)) return; // Anomaly Coop: see feel_touch_new
 	xr_vector<CObject*>::iterator it = feel_touch.begin();
 	xr_vector<CObject*>::iterator it_e = feel_touch.end();
 
