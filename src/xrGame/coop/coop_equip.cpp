@@ -492,6 +492,10 @@ bool read_vitals(Reader& r, Vitals& v)
 // Host: keep the player's vitals in the proxy custom data (inside the world save).
 void store_vitals(u16 proxy, const Vitals& v)
 {
+	// A level change rebuilds the simulator while the session keeps pumping: a report that comes then is dropped (the
+	// client sends its vitals again). Live 2026-10-23 (build 9, GAMMA): ai().alife() here during CLevel::CLevel = AV.
+	if (!ai().get_alife())
+		return;
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
 	if (!e || !world::is_player_proxy(proxy))
 		return; // never rewrite the custom data (logic) of anything but a player character
