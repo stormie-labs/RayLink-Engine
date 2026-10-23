@@ -1,6 +1,8 @@
 // Anomaly Coop — what a host takes from a client: message rates per type (F2 T3) and new player characters per
 // session (Ruling F2-10 b). The game installs the rates (coop_join install) and keeps the character count (coop_join).
 // F2 T14: a client paces itself by the same rates (Pacer; coop_script.cpp script events, coop_sync_api.cpp).
+// F2 T3b: the story, shot, item, trade, object and request messages got rows too (Ruling F2-15); still without one: the
+// join lifecycle, the player stream and life states, TimeRequest and the dialog choice (task-3b-report.md).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -71,6 +73,58 @@ constexpr RateRule kClientRateRules[] = {
 	// F2 T14: coop.sync.request runs a handler of the host's Lua; per handler name the host limits it again (20 in a row,
 	// 10 per second by default, coop.sync.limit). 20 per second in all after a burst.
 	{Msg::SyncRequest, 32, 50},
+
+	// F2 T3b (Ruling F2-15): the rest of what a client sends. An honest sender is never dropped: a row is above the honest
+	// cadence of the sender's code, or, where the code does not bound it, at 4 x the best estimate (marked "estimate"
+	// here and in task-3b-report.md). The story outbox goes by Pacer (T14), so its rows only need to take what the
+	// pacer lets out: a backlog waits in the outbox (coop_story.cpp flush_outbox).
+	// A quest step gives a few tasks at once and completes some (estimate: 8, about one a second), 4 x that.
+	{Msg::TaskUpdate, 32, 250},
+	// A fight: every kill changes a few relations (estimate: 3 a second, a grenade killing five at once: 15), 4 x that.
+	{Msg::Relation, 64, 80},
+	// progress_frame sends at most once per 1000 ms, and only when rank or reputation changed (coop_story.cpp:47, :1833).
+	// 2 a second after a burst of 4 (a lag spike of 3 s delivers three together).
+	{Msg::Progress, 4, 500},
+	// One PlayerShot per frame and weapon, shots of one frame merged (coop_presence.cpp:583), so the weapon's rate of fire
+	// bounds it (estimate: 1200 rpm = 20 a second), plus one per reload. 4 x that, 32 in a row (1.6 s of full fire).
+	{Msg::PlayerShot, 32, 12},
+	// Entering the world sends the state of every item of the inventory in one frame, unpaced (coop_items.cpp:1725-1745,
+	// scan_local(true)), and a drop here is a silent loss of the inventory's state. Ruling F2-33: at least 4096 in a row.
+	// The weight does not bound a GAMMA inventory: the base max_weight is 35 kg, one carried item can add up to 124.8 kg
+	// (additional_inventory_weight), and GAMMA has 41 item lines of 0.01 kg and 38 of weight 0 (inv_weight in
+	// E:\GAMMA\mods, checked 2026-10-23). No real maximum is known (estimate: a hoarder 400-1000 items), so 4096 is a
+	// reserve, not a measure.
+	// The rate stays that of the honest stream after the join: the changed items per scan, every 100 ms after a change
+	// (kModifyScanMs, :50), a weapon and its ammo box in a reload, estimate 20 a second, 100 a second here. A Pacer or
+	// batches in scan_local (T20) would let the burst come down.
+	{Msg::ItemState, 4096, 10},
+	// One deal per press of the Sell, Buy or donate control (coop_trade.cpp:645): a human, estimate 8 presses in the first
+	// second then 5 a second, 4 x that.
+	{Msg::TradeOp, 32, 50},
+	// Pushes of bodies in contact: one per body per 100 ms (kPushIntervalMs, coop_objects.cpp:68, :897), estimate 3 bodies =
+	// 30 a second and a pile of 8 in a check, 4 x the rate. Uses, artefact activations and throws are single presses.
+	{Msg::EntityEvent, 64, 8},
+
+	// Requests. The host has its own buckets for them (coop_requests.cpp kRate / kBurst per client, :772-773 at engine
+	// 4df7bd6: spawns 20 a second after 40, moves and destroys 30 after 60, hits 80 after 160, the rest 20 after 40;
+	// launches one per 100 ms, :1863) and answers a request over one with a ReqResult RateLimited: the client logs it and
+	// shows the real content of the container again (:699). A request dropped here gets no answer at all: the client
+	// only waits out kResultTimeoutMs (:74). So these rows are an outer guard at twice the host's bucket, a flood stopper
+	// before the handler, and an honest client runs into the host's answer first. Take, Drop and Transfer share the
+	// host's moves bucket (Destroy and Use the destroys one), but each type has its own bucket here.
+	{Msg::ReqSpawn, 80, 25},
+	{Msg::ReqDestroy, 120, 16},
+	{Msg::ReqUse, 120, 16},
+	{Msg::ReqTake, 120, 16},
+	{Msg::ReqDrop, 120, 16},
+	{Msg::ReqTransfer, 120, 16},
+	{Msg::ReqHit, 320, 6},
+	{Msg::ReqItemEvent, 80, 25},
+	// A launch needs a rocket the launcher holds: at most the host's 10 a second, a six-shot launcher in a row.
+	{Msg::ReqLaunch, 16, 50},
+	// One on showing and one on hiding a trade or loot window (coop_trade.cpp:772): a human, estimate 4 a second, 8 in a
+	// row, 4 x that. Each opening runs a callback of the host's Lua.
+	{Msg::ReqContainer, 32, 60},
 };
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:

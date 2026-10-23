@@ -605,7 +605,7 @@ struct Session::Impl
 		});
 	}
 
-	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else logged once and false.
+	// R2 I4, host: true if the client may send one more `type` now (its token bucket); else counted, logged, false.
 	bool within_rate(Conn& c, uint16_t type)
 	{
 		const auto rule = m_rates.find(type);
@@ -629,12 +629,15 @@ struct Session::Impl
 			b.tokens -= 1.;
 			return true;
 		}
-		++m_stats[type].rate_dropped; // T12 review (Ruling 18): every drop counts (coop_status), the log line is once
-		if (!b.logged)
+		const uint64_t drops = ++m_stats[type].rate_dropped; // T12 review (Ruling 18): every drop counts (coop_status)
+		// F2 T3b (Ruling F2-33): a drop is logged the first time per client and type, then at every 100th drop of the type
+		if (!b.logged || drops % 100 == 0)
 		{
 			b.logged = true;
-			logf("host: rate limit: %s from peer %u dropped (more than %u in a row, then one per %u ms)",
-				msg_name(type), unsigned(c.info.id), unsigned(rule->second.burst), unsigned(rule->second.refill_ms));
+			logf("host: rate limit: %s from peer %u '%s' dropped (%llu of this type so far; more than %u in a row, then one "
+				 "per %u ms)",
+				msg_name(type), unsigned(c.info.id), c.info.nick.c_str(), static_cast<unsigned long long>(drops),
+				unsigned(rule->second.burst), unsigned(rule->second.refill_ms));
 		}
 		return false;
 	}
