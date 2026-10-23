@@ -48,7 +48,7 @@ constexpr size_t kMaxWorldReason = 64; // set_world_block: a short reason ("emis
 constexpr const char* kChangedCallback = "coop_rest_changed";
 constexpr const char* kSleepCallback = "coop_rest_sleep";
 constexpr const char* kRefusedCallback = "coop_rest_refused";
-constexpr size_t kRefusals = size_t(Refusal::Busy) + 1;
+constexpr size_t kRefusals = size_t(Refusal::Camp) + 1;
 
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
 
@@ -103,7 +103,7 @@ WorldBlock g_world_block;
 struct Stats
 {
 	u64 lie_downs = 0, get_ups = 0, refused[kRefusals] = {}, cancelled[kRefusals] = {}, left = 0;
-	u64 sleeps = 0, woke = 0, camps = 0, camps_refused = 0, sent = 0, malformed = 0, not_in_world = 0;
+	u64 sleeps = 0, woke = 0, camps = 0, sent = 0, malformed = 0, not_in_world = 0;
 	u64 asked = 0, held = 0, received = 0, refusals = 0, sleeps_seen = 0, sleeps_ignored = 0; // client
 };
 Stats g_stat;
@@ -142,16 +142,27 @@ checkpoint::Kind kind_of(Place p)
 
 xr_string nick_of_local(u16 local_id) { return survival::nick_of(join::to_host(local_id)); }
 
-// coop_rest_changed for every difference between what the Lua here was told and `now` (local numbering, ascending).
-// Only in the world: after a new world they go out once this machine is back in it (step 5), from the told list of
-// the old one ("awake" for everybody who rested there).
-void tell_lua(const std::vector<Entry>& now)
+// coop_rest_changed for every difference between what the Lua here was told and `now` (local numbering, ascending),
+// then coop_rest_refused(refused) when this machine's player was refused (T11 review M4: one order on the host and on a
+// client, rest::news). The changes only in the world: after a new world they go out once this machine is back in it
+// (step 5), from the told list of the old one ("awake" for everybody who rested there). A refusal is queued anyway (the
+// queue delivers it in the world).
+void tell_lua(const std::vector<Entry>& now, Refusal refused = Refusal::None)
 {
 	if (!in_world())
+	{
+		if (refused != Refusal::None)
+			script::queue_callback(kRefusedCallback, {script::cb_str(refusal_name(refused))});
 		return;
-	for (const Change& c : changes(g_told, now))
-		script::queue_callback(kChangedCallback,
-		    {script::cb_int(c.id), script::cb_str(state_name(c.state)), script::cb_int(c.hours)});
+	}
+	for (const Note& n : news(g_told, now, refused))
+	{
+		if (n.refusal)
+			script::queue_callback(kRefusedCallback, {script::cb_str(refusal_name(n.refused))});
+		else
+			script::queue_callback(kChangedCallback, {script::cb_int(n.change.id),
+			    script::cb_str(state_name(n.change.state)), script::cb_int(n.change.hours)});
+	}
 	g_told = now;
 }
 
@@ -198,12 +209,13 @@ void host_send_state(u64 now, bool force)
 	++g_stat.sent;
 }
 
-// The player of `character` learns why: the host's own Lua at once, a client in his copy of RestState.
+// The player of `character` learns why: the host's own Lua at once (the changes first, as on a client: M4), a client in
+// his copy of RestState.
 void tell_owner(u16 character, Refusal why)
 {
 	if (character == 0)
 	{
-		script::queue_callback(kRefusedCallback, {script::cb_str(refusal_name(why))});
+		tell_lua(g_host.group.entries(), why);
 		return;
 	}
 	const PeerId peer = join::peer_of_proxy(character);
@@ -216,12 +228,15 @@ void tell_owner(u16 character, Refusal why)
 	net::host_send(peer, Msg::RestState, w);
 }
 
+// A refused lie-down. T11 review M1: a rest he was waiting in ends with it (Group::on_refused), a running sleep stays.
 void refuse(u16 character, Refusal why)
 {
+	const bool ended = g_host.group.on_refused(character);
 	u64& n = g_stat.refused[size_t(why)];
 	++n;
 	if (log_allowed(n))
-		::Msg("[coop] rest: character %u may not lie down (%s)", character, refusal_name(why));
+		::Msg("[coop] rest: character %u may not lie down (%s)%s", character, refusal_name(why),
+		    ended ? ", his earlier rest ends" : "");
 	tell_owner(character, why);
 }
 
@@ -249,18 +264,20 @@ void host_request(u16 character, const Request& rq)
 	Place place = Place::None;
 	if (alive && !rq.forced)
 		place = checkpoints::sources::rest_place(character, source);
-	const Refusal why = check_lie_down(alive, g_host.group.sleeping(), rq.forced, fight, place != Place::None);
+	Refusal why = check_lie_down(alive, g_host.group.sleeping(), rq.forced, fight, place != Place::None);
+	if (why == Refusal::None && !g_host.group.may_lie_down(character))
+		why = Refusal::Busy; // asked before the camp is set: a camp never comes without the rest
 	if (why != Refusal::None)
 		return refuse(character, why);
-	if (!g_host.group.lie_down(character, int(rq.hours), rq.forced, fight))
-		return refuse(character, Refusal::Busy);
-	if (!rq.forced) // passing out of tiredness is a rest without a camp
+	// T11 review M2: a rest that is not a faint always comes with his camp there (CHECKPOINTS_DEATH §4.1). A camp the
+	// store refuses (host_set logged why: off the AI map, not this level...) refuses the lie-down, and he is told "camp".
+	if (!rq.forced)
 	{
-		if (checkpoints::host_set(character, checkpoints::record_here(obj, kind_of(place), source)))
-			++g_stat.camps;
-		else
-			++g_stat.camps_refused; // host_set logged why; the rest stands
+		if (!checkpoints::host_set(character, checkpoints::record_here(obj, kind_of(place), source)))
+			return refuse(character, Refusal::Camp);
+		++g_stat.camps;
 	}
+	g_host.group.lie_down(character, int(rq.hours), rq.forced, fight); // may_lie_down said it takes him
 	if (log_allowed(g_stat.lie_downs))
 		::Msg("[coop] rest: character %u rests %u h (%s%s)", character, u32(g_host.group.hours_of(character)),
 		    rq.forced ? "passed out" : checkpoints::sources::place_name(place), fight ? ", in a fight" : "");
@@ -333,7 +350,13 @@ void host_tick(u64 now)
 		s.in_combat = s.alive && checkpoints::sources::in_combat(obj);
 		present.push_back(s);
 	}
-	const Tick t = g_host.group.tick(present, !world_block_reason().empty(), now);
+	// T11 review M1: when everybody rests, each rest that is not a faint is looked at once more (Group::tick calls this
+	// once per sleep, not on every tick): one who walked away from his camp loses his rest ("place").
+	const Group::PlaceCheck at_place = [](uint16_t id) {
+		u16 source = checkpoint::kNoSource;
+		return checkpoints::sources::rest_place(id, source) != Place::None;
+	};
+	const Tick t = g_host.group.tick(present, !world_block_reason().empty(), now, at_place);
 	for (const Cancel& c : t.cancelled)
 	{
 		if (c.reason == Refusal::None)
@@ -446,12 +469,9 @@ void client_on_state(PeerId from, Reader& rd)
 	std::sort(m.entries.begin(), m.entries.end(), [](const Entry& a, const Entry& b) { return a.character < b.character; });
 	g_mirror.block = m.block;
 	g_mirror.entries = m.entries;
-	tell_lua(g_mirror.entries);
 	if (m.refused != Refusal::None)
-	{
 		++g_stat.refusals;
-		script::queue_callback(kRefusedCallback, {script::cb_str(refusal_name(m.refused))});
-	}
+	tell_lua(g_mirror.entries, m.refused); // the changes, then why (M4: as on the host)
 }
 
 void client_on_sleep(PeerId from, Reader& rd)
@@ -703,13 +723,13 @@ void print_status()
 		    g_host.group.sleeping() ? "running" : "no");
 		const u64* r = g_stat.refused;
 		const u64* c = g_stat.cancelled;
-		::Msg("[coop]   rest: lie-downs %llu (refused place %llu, combat %llu, dead %llu, busy %llu), get-ups %llu, camps "
-		      "%llu (refused %llu); rests ended: combat %llu, dead %llu, busy %llu, left %llu; sleeps %llu (last %u h), "
-		      "woke %llu; RestState sent %llu; malformed %llu, without a character %llu",
+		::Msg("[coop]   rest: lie-downs %llu (refused place %llu, combat %llu, dead %llu, busy %llu, camp %llu), get-ups "
+		      "%llu, camps set %llu; rests ended: place at the start %llu, combat %llu, dead %llu, busy %llu, left %llu; "
+		      "sleeps %llu (last %u h), woke %llu; RestState sent %llu; malformed %llu, without a character %llu",
 		    g_stat.lie_downs, r[size_t(Refusal::Place)], r[size_t(Refusal::Combat)], r[size_t(Refusal::Dead)],
-		    r[size_t(Refusal::Busy)], g_stat.get_ups, g_stat.camps, g_stat.camps_refused, c[size_t(Refusal::Combat)],
-		    c[size_t(Refusal::Dead)], c[size_t(Refusal::Busy)], g_stat.left, g_stat.sleeps, u32(g_host.sleep_hours),
-		    g_stat.woke, g_stat.sent, g_stat.malformed, g_stat.not_in_world);
+		    r[size_t(Refusal::Busy)], r[size_t(Refusal::Camp)], g_stat.get_ups, g_stat.camps, c[size_t(Refusal::Place)],
+		    c[size_t(Refusal::Combat)], c[size_t(Refusal::Dead)], c[size_t(Refusal::Busy)], g_stat.left, g_stat.sleeps,
+		    u32(g_host.sleep_hours), g_stat.woke, g_stat.sent, g_stat.malformed, g_stat.not_in_world);
 		for (const Entry& e : g_host.group.entries())
 		{
 			string256 buf;
