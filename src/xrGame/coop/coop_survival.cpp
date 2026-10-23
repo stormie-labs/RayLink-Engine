@@ -81,6 +81,7 @@ const char* const kDebtKey = "respawn";
 const char* const kOutKey = "out";
 constexpr u32 kNewCharHoldMs = kGiveUpHoldMs; // an out player holds USE this long to start a new character
 constexpr u32 kNewCharRetryMs = 10000; // no answer from the host (refused, or still retiring): the prompt comes back
+constexpr u32 kReleaseRetryMs = 3000; // fix round 1, C1 / M1: a retired character still there is asked to go again
 
 enum Op : u8
 {
@@ -259,6 +260,11 @@ struct Retirement
 {
 	u64 since = 0;
 	u16 stash = 0xffff; // death::host_move_to_stash; 0xffff: none was made (nothing to move, or it all dropped)
+	// fix round 1, C1 / M1: a client's character is retired (key off, his player sent the world again) and is asked to
+	// leave the world until his entity is gone
+	bool releasing = false;
+	u64 next_try = 0;
+	u32 tries = 0;
 };
 xr_map<u16, Retirement> g_retire;
 bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
@@ -319,7 +325,7 @@ struct Stats
 	u64 states_out = 0, states_in = 0, orders_in = 0, requests_in = 0;
 	u64 kills_intercepted = 0, proxy_kills_refused = 0, guard_fixes = 0, stale_orders = 0;
 	u64 wipes = 0, worn_reports = 0, worn_refused = 0;
-	u64 newchar_asked = 0, newchar_refused = 0, retired = 0; // F3 Task 10
+	u64 newchar_asked = 0, newchar_refused = 0, retired = 0, retire_cancelled = 0; // F3 Task 10
 } g_stat;
 xr_set<u16> g_guard_logged;
 
@@ -1264,13 +1270,15 @@ void host_finish_own(u64 t)
 	stand_up(a, 1.f, true, t); // health 1 (up to his maximum), radiation 0, bleeding gone, controls back; Alive goes out
 	::Msg("[coop] the host starts a new character at %s (%.1f, %.1f, %.1f)", where, pos.x, pos.y, pos.z);
 	feed("A new character. Choose faction and gear.");
-	script::queue_callback("coop_host_new_character", {});
+	// Ruling F3-10: kit 1 only with coop_hardcore_new_kit on; else he starts with nothing (the window offers a faction only)
+	script::queue_callback("coop_host_new_character", {script::cb_int(death::host_new_kit() ? 1 : 0)});
 }
 
 // Step 2 for a client's character, his stash done (host_retire_frame): the key goes from his custom data and
 // `retired = 1` comes in (death::retire_custom_data), his player joins the world again - with no character for his key
-// he chooses a new one (protocol 8: CharOffer, coop_menu_char, create_proxy) - and the old character leaves the world.
-void host_finish_client(u16 character)
+// he chooses a new one (protocol 8: CharOffer, coop_menu_char, create_proxy) - and the old character is asked to leave
+// the world (host_release_step confirms it). False: he stays (his player could not be sent the world again).
+bool host_finish_client(u16 character)
 {
 	if (CSE_Abstract* e = character_entity(character))
 	{
@@ -1290,36 +1298,91 @@ void host_finish_client(u16 character)
 		// character, so it stays in the world, keyless: his next join makes a new one
 		::Msg("! [coop] retired character %u: his player #%u could not be sent the world again, kept", character, peer);
 		g_host.erase(character);
-		return;
+		return false;
 	}
-	death::host_release_character(character);
-	world::host_forget_proxy(character); // the id is nobody's character now: ALife may give it to anything
-	g_host.erase(character);
-	g_players.erase(character);
+	death::host_release_character(character); // C1: done when his entity is gone (host_release_step)
+	return true;
+}
+
+// Fix round 1, C1 / M1: a retired client's character is gone when no player character that says `retired = 1` is under
+// his id any more (the id may name his player's new character by then). Only then is the id forgotten as a player's
+// character (world::host_forget_proxy) and his records go; until then the release is asked again every
+// kReleaseRetryMs, logged. True when he is gone.
+bool host_release_step(u16 character, Retirement& r, u64 t)
+{
+	const CSE_Abstract* e = character_entity(character);
+	const bool still_there = e && e->m_ini_string.size() && death::is_retired(e->m_ini_string.c_str());
+	if (!still_there)
+	{
+		world::host_forget_proxy(character);
+		g_host.erase(character);
+		g_players.erase(character);
+		++g_stat.retired;
+		::Msg("[coop] retired character %u is gone from the world (%u attempt(s))", character, r.tries);
+		return true;
+	}
+	if (t < r.next_try)
+		return false;
+	r.next_try = t + kReleaseRetryMs;
+	++r.tries;
+	const bool asked = death::host_release_character(character);
+	if (r.tries <= 3 || r.tries % 20 == 0)
+		::Msg("! [coop] retired character %u is still in the world after %u attempt(s)%s", character, r.tries,
+		    asked ? ", asked again" : ", cannot be released now");
+	return false;
 }
 
 // Review R2 of T9 (death::retire_step): a retiring character's key, his player and his release wait until his stash
-// is no longer pending (death::host_stash_pending). The stash knows its owner by the key, or by the player while the
+// is no longer pending (death::host_stash_outcome). The stash knows its owner by the key, or by the player while the
 // key is off; changing either before it is filled leaves it without an owner, the things stay on the old character and
-// go with him. Only then step 2 (a client's character) or step 4 (the host's own) goes on.
+// go with him. Fix round 1, I1: a client's character whose stash gave up, or who still carries world items
+// (death::host_items_on, the server's word), is not retired at all - he stays out with his things and may ask again.
+// Only then step 2 (a client's character, then host_release_step) or step 4 (the host's own) goes on.
 void host_retire_frame(u64 t)
 {
 	for (auto it = g_retire.begin(); it != g_retire.end();)
 	{
 		const u16 character = it->first;
-		const bool here = character == 0 ? local_actor() != nullptr : character_entity(character) != nullptr;
-		switch (death::retire_step(here, death::host_stash_pending(character)))
+		Retirement& r = it->second;
+		if (r.releasing)
+		{
+			it = host_release_step(character, r, t) ? g_retire.erase(it) : std::next(it);
+			continue;
+		}
+		const bool client = character != 0;
+		const bool here = client ? character_entity(character) != nullptr : local_actor() != nullptr;
+		const death::StashOutcome stash = death::host_stash_outcome(character);
+		const u32 left = client && stash != death::StashOutcome::Pending ? death::host_items_on(character) : 0;
+		switch (death::retire_step(here, stash, left != 0, client))
 		{
 		case death::RetireStep::Wait: ++it; continue;
 		case death::RetireStep::Void:
 			::Msg("! [coop] retirement of character %u dropped: he is gone", character);
 			break;
+		case death::RetireStep::Cancel:
+			++g_stat.retire_cancelled;
+			::Msg("! [coop] retirement of %s (character %u) cancelled: %s; he keeps his character and his things, stays "
+			      "out and may ask again",
+			    nick_of(character).c_str(), character,
+			    stash == death::StashOutcome::GaveUp ? "his stash gave up (his player stayed away)" : "things are still on him");
+			if (left)
+				::Msg("! [coop]   %u item(s) still on character %u", left, character);
+			break;
 		case death::RetireStep::Finish:
-			if (character == 0)
+			if (!client)
+			{
 				host_finish_own(t);
-			else
-				host_finish_client(character);
-			++g_stat.retired;
+				++g_stat.retired;
+				break;
+			}
+			if (host_finish_client(character))
+			{
+				r.releasing = true;
+				r.tries = 1;
+				r.next_try = t + kReleaseRetryMs;
+				++it; // gone on a later frame (host_release_step)
+				continue;
+			}
 			break;
 		}
 		it = g_retire.erase(it);
@@ -2208,15 +2271,16 @@ void print_status()
 	    g_stat.states_out, g_stat.states_in, g_stat.orders_in, g_stat.requests_in, g_stat.stale_orders,
 	    g_stat.kills_intercepted, g_stat.proxy_kills_refused, g_stat.guard_fixes, g_stat.worn_reports,
 	    g_stat.worn_refused);
-	::Msg("[coop]   survival: new characters asked %llu, refused %llu, retired %llu, %u retiring", g_stat.newchar_asked,
-	    g_stat.newchar_refused, g_stat.retired, u32(g_retire.size()));
+	::Msg("[coop]   survival: new characters asked %llu, refused %llu, retired %llu, cancelled %llu, %u retiring",
+	    g_stat.newchar_asked, g_stat.newchar_refused, g_stat.retired, g_stat.retire_cancelled, u32(g_retire.size()));
 	const u64 t = now();
 	for (const auto& it : g_players)
 		::Msg("[coop]   player %u '%s': %s (fall #%u)%s", it.first, it.second.nick.c_str(), life_name(it.second.life),
 		    it.second.seq, it.second.life == Life::Wounded && it.second.bleed_end > t ? ", bleeding out" : "");
 	for (const auto& it : g_retire)
 		::Msg("[coop]   host: character %u retires, %llu s, stash %u %s", it.first, (t - it.second.since) / 1000,
-		    u32(it.second.stash), death::host_stash_pending(it.first) ? "waits for his things" : "is done");
+		    u32(it.second.stash), it.second.releasing ? "done, leaving the world" :
+		    death::host_stash_pending(it.first) ? "waits for his things" : "is done");
 	for (const auto& it : g_host)
 	{
 		const death::Tracker& k = it.second.tracker;

@@ -71,10 +71,19 @@ u16 host_move_to_stash(u16 character, bool everything, u16 seq = kNoSeq);
 // True while a stash of `character` waits to be filled: his items are still on him. Task 10 changes nothing of a
 // retiring character (his key, his player, his release) before this is false (review R2 of T9, death::retire_step).
 bool host_stash_pending(u16 character);
-// F3 Task 10: a retired hardcore character (a client's, never the host's actor) leaves the world: online through
-// GE_DESTROY, as Lua's alife():release does it, offline through ALife. What still hangs on him (the stash takes all of
-// his world items) goes with him, logged. False if there is no player character under the id or it is coming online.
+// Fix round 1, I1: how the stash of `character` ended since his last host_move_to_stash: Pending while it waits, GaveUp if
+// T9 gave it up (his things stayed on him), else Done (filled, dropped at the body, or none was needed).
+StashOutcome host_stash_outcome(u16 character);
+// The world items `character` carries in the server's state right now (ownership events change it at once).
+u32 host_items_on(u16 character);
+// F3 Task 10: a retired hardcore character (a client's, never the host's actor; his custom data says retired = 1,
+// death::is_retired) leaves the world: offline through ALife at once, online by the server's GE_DESTROY (fix round 1,
+// C1: his proxy is a remote puppet, DestroyObject sends nothing), done on a later frame. The caller confirms he is gone
+// and asks again if not. False if no retired player character is under the id.
 bool host_release_character(u16 character);
+// Ruling F3-10: the new character of a retired key gets the faction's kit and money: console coop_hardcore_new_kit 1 or
+// [coop_hardcore] new_kit = 1 in mod_system_coop_death.ltx (either turns it on). Off by default: he starts with nothing.
+bool host_new_kit();
 // The money part of a death (F2 T1: the host's ledger holds every balance): takes `pct` % (0..100, rounded down) of the
 // balance of `character`'s player through money::host_adjust, which sends him the new balance. Returns the amount.
 u32 host_take_money(u16 character, u8 pct);

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_join.h"
+#include "coop_death.h" // Ruling F3-10: host_new_kit
 #include "coop_manager.h"
 #include "coop_sync.h"
 #include "coop_world.h"
@@ -109,6 +110,9 @@ struct State
 	// host, Ruling F3-9: the keys that had a character in this session (a returning player, a new character made, a
 	// retired one); with the retired keys of the world (host_retired_in_world) they neither check nor spend the limit
 	std::set<std::string> had_character;
+	// host, Ruling F3-10: the keys whose character retired in this session (with [coop_retired] of the world: a bare new
+	// character unless coop_hardcore_new_kit is on)
+	std::set<std::string> retired;
 	u32 characters_refused = 0; // diagnostics: new keys refused over the limit (the first few logged)
 	u32 joins_refused = 0; // diagnostics: refused JoinRequest / WorldLoaded / TransitionVote (the first few logged)
 	u32 loaded_ignored = 0;
@@ -550,6 +554,18 @@ bool host_retired_in_world(const std::string& key_digest)
 	return a && a->m_ini_string.size() && death::retired_key(a->m_ini_string.c_str(), key_digest);
 }
 
+// Ruling F3-10: the key's character retired - in this session, or in this world (the newest kMaxRetiredKeys).
+bool host_key_was_retired(const std::string& key_digest)
+{
+	return g.retired.count(key_digest) != 0 || host_retired_in_world(key_digest);
+}
+
+// Ruling F3-10: the new character of this key starts with nothing (no kit, no faction money).
+bool host_bare_character(const std::string& key_digest)
+{
+	return death::new_character_bare(host_key_was_retired(key_digest), death::host_new_kit());
+}
+
 // Ruling F3-9: the key had a character - in this session (returned to one, got a new one, retired one) or one that
 // retired in this world. Such a key is the same player starting again: coop_max_new_characters is not his.
 bool host_key_had_character(const std::string& key_digest)
@@ -608,6 +624,13 @@ bool host_offer_character(PeerId from, const PeerInfo& p, const char* refusal)
 	CharOfferMsg m;
 	m.eco = u8(eco >= 3 ? 3 : (eco >= 2 ? 2 : 1));
 	m.points = points > 0 ? u32(_min(points, lua_Number(1e9))) : 0u;
+	// Ruling F3-10: a retired key's new character starts with nothing. The offer says it with 0 points (a tier never
+	// gives 0: coop_menu_char reads a join offer of 0 points as a bare one) - no protocol change; a flag of its own in
+	// CharOfferMsg::Flags would be the clean way.
+	std::string key_digest;
+	const bool bare = key_digest_hex(p.key, key_digest) && host_bare_character(key_digest);
+	if (bare)
+		m.points = 0;
 	m.flags = story ? CharOfferMsg::StoryMode : 0;
 	const xr_string level = g_pGameLevel ? Level().name().c_str() : "";
 	if (char_name_valid(level.c_str(), CharOfferMsg::kMaxLevel))
@@ -618,9 +641,9 @@ bool host_offer_character(PeerId from, const PeerInfo& p, const char* refusal)
 	m.write(w);
 	mgr().session().send(from, Lane::Reliable, Msg::CharOffer, w);
 	g.choosers.offer(from, mgr().now_ms());
-	::Msg("[coop] '%s' has no character in this world: he chooses one before the world (economy %u, %u points, %s)%s%s",
-	    p.nick.c_str(), u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(), m.refusal.empty() ? "" : ", refused: ",
-	    m.refusal.c_str());
+	::Msg("[coop] '%s' has no character in this world: he chooses one before the world (economy %u, %u points, %s)%s%s%s",
+	    p.nick.c_str(), u32(m.eco), m.points, m.level.empty() ? "?" : m.level.c_str(),
+	    bare ? ", hardcore: no kit, no money" : "", m.refusal.empty() ? "" : ", refused: ", m.refusal.c_str());
 	return true;
 }
 
@@ -768,13 +791,15 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	bool made = false;
 	std::string why = "busy";
 	const u16 proxy_id = proxy->ID;
+	const bool kit = !host_bare_character(key_digest); // Ruling F3-10
 	const LuaCall given = call_char("host_make_character",
 	    [&](lua_State* L) {
 		    lua_pushnumber(L, lua_Number(from));
 		    lua_pushnumber(L, lua_Number(proxy_id));
 		    lua_pushlstring(L, m.faction.data(), m.faction.size());
 		    lua_pushlstring(L, buy.data(), buy.size());
-		    return 4;
+		    lua_pushboolean(L, kit);
+		    return 5;
 	    },
 	    2, [&](lua_State* L, int at) {
 		    made = lua_toboolean(L, at) != 0;
@@ -1554,6 +1579,7 @@ void host_key_retired(const std::string& key_digest)
 	if (!mgr().is_host() || key_digest.empty())
 		return;
 	g.had_character.insert(key_digest);
+	g.retired.insert(key_digest);
 	CSE_ALifeCreatureActor* a = ai().get_alife() ? ai().alife().graph().actor() : nullptr;
 	if (!a)
 		return;

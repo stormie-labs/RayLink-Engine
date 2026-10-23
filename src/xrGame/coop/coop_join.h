@@ -87,8 +87,9 @@ bool accept_transition();
 // False if he is not a player of this session in the world (no entry, the host itself).
 bool host_rejoin_peer(PeerId peer, const char* why);
 // Host, Ruling F3-9: the character of player key `key_digest` retired (F3 Task 10). Kept for this session and in the
-// world (the host actor's custom data, [coop_retired], death::note_retired_key): his new character, now or in a later
-// session, neither checks nor spends coop_max_new_characters.
+// world (the host actor's custom data, [coop_retired], death::note_retired_key: the newest 64): his new character, now
+// or in a later session, neither checks nor spends coop_max_new_characters, and (Ruling F3-10) starts with nothing -
+// no kit, no faction money, the offer has 0 points - unless coop_hardcore_new_kit is on (death::host_new_kit).
 void host_key_retired(const std::string& key_digest);
 
 // --- client ---

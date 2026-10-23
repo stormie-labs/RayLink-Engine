@@ -57,6 +57,7 @@ constexpr size_t kMaxPreviewLine = 900; // section lists in coop_death_preview a
 const char* const kShareSection = "coop_death_drop";
 const char* const kKindSection = "coop_death_kinds";
 const char* const kStashSection = "coop_death_stash";
+const char* const kHardcoreSection = "coop_hardcore"; // Ruling F3-10: new_kit
 // The plan's shares (T9 step 1), used for a line the ltx does not have.
 const float kDefaultShares[kCategories] = {0.5f, 0.5f, 0.5f, 0.25f, 0.1f, 0.1f, 0.25f};
 
@@ -68,6 +69,7 @@ struct Settings
 	Shares shares{};
 	KindTable kinds;
 	bool stash_section = false; // [coop_death_stash] exists: a stash can be spawned
+	bool new_kit = false; // Ruling F3-10: [coop_hardcore] new_kit = 1 (a mod pack's default; the console may turn it on)
 };
 Settings g_set;
 
@@ -114,6 +116,7 @@ void load_settings()
 	g_set.stash_section = !!pSettings->section_exist(kStashSection);
 	if (!g_set.stash_section)
 		::Msg("! [coop] [%s] not found: the corpse mode drops the backpack at the body instead", kStashSection);
+	g_set.new_kit = pSettings->line_exist(kHardcoreSection, "new_kit") && pSettings->r_bool(kHardcoreSection, "new_kit");
 
 	::Msg("[coop] death losses: materials %.2f, ammo %.2f, consumables %.2f, gear %.2f, artefacts %.2f, tools %.2f, "
 	      "other %.2f; %u item kinds",
@@ -154,6 +157,11 @@ struct QueuedMarker
 xr_vector<QueuedMarker> g_markers;
 
 u32 g_epoch = 0xffffffff; // join::host_world_epoch() the pending work belongs to
+// Fix round 1, I1: characters whose last stash gave up (give_up): his things stayed on him (host_stash_outcome). A new
+// stash for him (host_move_to_stash) starts over.
+xr_set<u16> g_gave_up;
+// Ruling F3-10: console coop_hardcore_new_kit (host): the new character of a retired key gets the kit and the money.
+int g_cv_new_kit = 0;
 
 struct Stats
 {
@@ -632,6 +640,7 @@ void give_up(PendingStash& p, bool owner_same, Presence character)
 	                                                             : "his player stayed away";
 	::Msg("! [coop] death stash %u given up (%s): the items stay with character %u", p.stash, why, p.character);
 	++g_st.stash_lost;
+	g_gave_up.insert(p.character);
 	release_stash(p.stash);
 }
 
@@ -670,6 +679,7 @@ void host_frame()
 		g_epoch = epoch;
 		abandon_stashes("a new world");
 		g_markers.clear();
+		g_gave_up.clear();
 	}
 	if (!g_stashes.empty() && ai().get_alife())
 	{
@@ -835,6 +845,7 @@ u16 host_move_to_stash(u16 character, bool everything, u16 seq)
 		return kNoId;
 	}
 	ensure_settings();
+	g_gave_up.erase(character); // a new stash: its own outcome
 	u32 count = 0;
 	return stash_for(character, body, io, everything, seq, count);
 }
@@ -847,35 +858,59 @@ bool host_stash_pending(u16 character)
 	return false;
 }
 
+StashOutcome host_stash_outcome(u16 character)
+{
+	if (host_stash_pending(character))
+		return StashOutcome::Pending;
+	return g_gave_up.find(character) != g_gave_up.end() ? StashOutcome::GaveUp : StashOutcome::Done;
+}
+
+u32 host_items_on(u16 character)
+{
+	const CSE_Abstract* e = events::find_entity(character);
+	if (!e || !ai().get_alife())
+		return 0;
+	u32 n = 0;
+	for (const u16 id : e->children)
+		if (smart_cast<CSE_ALifeInventoryItem*>(ai().alife().objects().object(id, true)))
+			++n;
+	return n;
+}
+
 bool host_release_character(u16 character)
 {
-	if (!mgr().is_host() || character == 0 || !ai().get_alife())
+	if (!mgr().is_host() || character == 0 || !ai().get_alife() || !g_pGameLevel)
 		return false;
 	CSE_ALifeDynamicObject* d = ai().alife().objects().object(character, true);
-	if (!d || !world::is_player_character(d))
+	if (!d || !world::is_player_character(d) || !d->m_ini_string.size() || !is_retired(d->m_ini_string.c_str()))
 	{
-		::Msg("! [coop] retired character %u not released: no player character under that id", character);
+		::Msg("! [coop] character %u not released: no retired player character under that id", character);
 		return false;
 	}
-	// what still hangs on him goes with him (the stash took the rest): counted for the log
-	u32 left = 0;
-	for (const ALife::_OBJECT_ID id : d->children)
-		if (CSE_ALifeDynamicObject* c = ai().alife().objects().object(id, true))
-			left += smart_cast<CSE_ALifeInventoryItem*>(c) ? 1 : 0;
-	if (CGameObject* go = game_object(character))
-		go->DestroyObject(); // online: the standard event chain destroys the game object, then the entity (as Lua's release)
-	else if (!d->m_bOnline)
-		alife_rw().release(d, true);
-	else
+	if (!d->m_bOnline)
 	{
-		::Msg("! [coop] retired character %u is coming online now: not released", character);
-		return false;
+		alife_rw().release(d, true); // offline: ALife at once
+		::Msg("[coop] retired character %u leaves the world (offline)", character);
+		return true;
 	}
-	if (left)
-		::Msg("! [coop] retired character %u leaves the world with %u item(s) the stash did not take", character, left);
-	else
-		::Msg("[coop] retired character %u leaves the world", character);
+	// Fix round 1, C1: a player's proxy is a remote puppet on the host (coop_remote make_remote: setLocal(FALSE)), and
+	// CGameObject::DestroyObject sends nothing for a non-local object. The server's own GE_DESTROY, as the stock
+	// alife():release (CALifeSimulator__release) and objects::host_destroy_entity send it, removes the game object and
+	// the entity; the caller sees him gone (survival: the entity is no longer there) on a later frame.
+	NET_Packet P;
+	P.w_begin(M_EVENT);
+	P.w_u32(Level().timeServer());
+	P.w_u16(GE_DESTROY);
+	P.w_u16(character);
+	Level().Send(P, net_flags(TRUE, TRUE));
+	::Msg("[coop] retired character %u: GE_DESTROY sent", character);
 	return true;
+}
+
+bool host_new_kit()
+{
+	ensure_settings();
+	return g_cv_new_kit != 0 || g_set.new_kit;
 }
 
 u32 host_take_money(u16 character, u8 pct)
@@ -982,6 +1017,7 @@ void reset()
 	g_epoch = 0xffffffff;
 	g_st = Stats();
 	g_log_count = 0;
+	g_gave_up.clear();
 	g_set.loaded = false; // read again at the first death (DLTX may differ between game starts)
 }
 
@@ -1008,6 +1044,10 @@ void print_status()
 		::Msg("[coop]   death: %llu markers from the host, %llu refused", g_st.markers_in, g_st.markers_refused);
 }
 
-void register_console() { CMD1(CCC_CoopDeathPreview, "coop_death_preview"); }
+void register_console()
+{
+	CMD1(CCC_CoopDeathPreview, "coop_death_preview");
+	CMD4(CCC_Integer, "coop_hardcore_new_kit", &g_cv_new_kit, 0, 1); // host setting, Ruling F3-10
+}
 } // namespace death
 } // namespace coop

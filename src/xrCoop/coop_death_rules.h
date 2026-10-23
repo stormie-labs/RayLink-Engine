@@ -475,14 +475,48 @@ enum class RetireStep : uint8_t
 {
 	Wait, // his stash is pending: nothing of him changes yet
 	Finish, // the stash is done (or none was needed): the key goes, his player makes a new character, he leaves the world
-	Void // the character is gone (another world, released already): nothing left to do
+	Void, // the character is gone (another world, released already): nothing left to do
+	Cancel // fix round 1, I1: his things are still on him and he would be released with them: not now, he stays out
 };
 
-inline RetireStep retire_step(bool character_here, bool stash_pending)
+// What became of the stash of a retiring character (death::host_stash_outcome).
+enum class StashOutcome : uint8_t
+{
+	Pending, // it still waits for his things
+	Done, // filled, dropped at the body instead, or none was needed (nothing to move)
+	GaveUp // T9 StashStep::GiveUp: his player stayed away while it was online, or he is someone else now: his things
+	       // are still on him
+};
+
+// `released`: the character leaves the world when he retires (a client's); the host's actor stays and keeps whatever
+// the stash could not take. `items_left`: world items still on him (the server's word, after the stash). Fix round 1,
+// I1: a client's character whose stash gave up, or who still carries world items, is not retired - the key, the player
+// and the character stay, he is still out of the run and may ask again (better than his things going with him).
+inline RetireStep retire_step(bool character_here, StashOutcome stash, bool items_left, bool released)
 {
 	if (!character_here)
 		return RetireStep::Void;
-	return stash_pending ? RetireStep::Wait : RetireStep::Finish;
+	if (stash == StashOutcome::Pending)
+		return RetireStep::Wait;
+	if (released && (stash == StashOutcome::GaveUp || items_left))
+		return RetireStep::Cancel;
+	return RetireStep::Finish;
+}
+
+// Fix round 1, C1: the custom data of a character retired by retire_custom_data. His release is confirmed by his entity
+// being gone; the id may meanwhile name another character (his player's new one), so only an entity that still says
+// this is the old one.
+inline bool is_retired(const std::string& text)
+{
+	std::string v;
+	return checkpoint::ini_get(text, "coop", "retired", v) && v == "1";
+}
+
+// Ruling F3-10: a retirement is no farm. The new character of a retired key starts with no kit and no faction money
+// unless the host turns coop_hardcore_new_kit on; every other new key gets the kit as before.
+inline bool new_character_bare(bool retired_key, bool new_kit_option)
+{
+	return retired_key && !new_kit_option;
 }
 
 // The custom data of a retired character: every `key` line of [coop] goes, so find_key_value finds no player for him and
@@ -515,8 +549,11 @@ inline NewKeyCharge new_key_charge(bool had_character, bool limit_admits)
 // The retired keys of a world are kept in the host actor's custom data, [coop_retired] <digest> = 1 (the retired
 // character is released, his key with him), so a player away when his character retired, or one coming in a later
 // session, is still known. One line per player key; only a key digest (kKeyDigestDigits lowercase hex, as
-// coop::kKeyDigestHexDigits, coop_session.h) is a key here.
+// coop::kKeyDigestHexDigits, coop_session.h) is a key here. Fix round 1, I2: the actor's custom data goes into one
+// 16 KB NET_Packet with every save (CSE_ALifeObject::STATE_Write), so at most kMaxRetiredKeys are kept, the oldest
+// noted goes first (that key only spends a slot of coop_max_new_characters again, Ruling F3-9).
 constexpr size_t kKeyDigestDigits = 64;
+constexpr unsigned kMaxRetiredKeys = 64; // about 4.4 KB of custom data
 constexpr const char* kRetiredSection = "coop_retired";
 
 namespace detail
@@ -532,10 +569,41 @@ inline bool is_key_digest(const std::string& s)
 }
 } // namespace detail
 
+// The retired keys in the text, oldest first (the order of the lines), each once.
+inline std::vector<std::string> retired_keys(const std::string& text)
+{
+	namespace ini = checkpoint::detail;
+	std::vector<std::string> out;
+	bool in = false;
+	size_t pos = 0;
+	ini::Line l;
+	while (ini::next_line(text, pos, l))
+	{
+		const ini::Parsed p = ini::parse_line(text, l);
+		if (p.kind == ini::LineKind::Section)
+		{
+			in = ini::ieq(text, p.name_b, p.name_e, kRetiredSection);
+			continue;
+		}
+		if (!in || p.kind != ini::LineKind::Pair || text.compare(p.val_b, p.val_e - p.val_b, "1") != 0)
+			continue;
+		const std::string name = text.substr(p.name_b, p.name_e - p.name_b);
+		if (detail::is_key_digest(name) && std::find(out.begin(), out.end(), name) == out.end())
+			out.push_back(name);
+	}
+	return out;
+}
+
+// Notes a retired key as the newest; beyond kMaxRetiredKeys the oldest go.
 inline void note_retired_key(std::string& text, const std::string& digest)
 {
-	if (detail::is_key_digest(digest))
-		checkpoint::ini_set(text, kRetiredSection, digest.c_str(), "1");
+	if (!detail::is_key_digest(digest))
+		return;
+	checkpoint::ini_erase(text, kRetiredSection, digest.c_str()); // noted again: it becomes the newest
+	checkpoint::ini_set(text, kRetiredSection, digest.c_str(), "1");
+	const std::vector<std::string> keys = retired_keys(text);
+	for (size_t i = 0; i + kMaxRetiredKeys < keys.size(); ++i)
+		checkpoint::ini_erase(text, kRetiredSection, keys[i].c_str());
 }
 
 inline bool retired_key(const std::string& text, const std::string& digest)
