@@ -33,8 +33,12 @@ int g_enet_refs = 0;
 std::recursive_mutex g_io;
 using IoLock = std::lock_guard<std::recursive_mutex>;
 
-constexpr uint32_t kKeepAliveTickMs = 50; // helper thread wake-up period
-constexpr uint64_t kOwnerStallMs = 150; // the owner is "busy" when it has not serviced for this long
+// Owner 2026-10-24: "frames must not affect the ping". The helper keeps the link prompt between the owner's frames:
+// acks and pings go out within ~1 ms of a packet (the engine runs the Windows timer at 1 ms), and what the owner sent
+// leaves at once instead of at its next frame. RTT is the network's again, not network + both sides' frame times.
+constexpr uint32_t kKeepAliveTickMs = 1; // helper thread wake-up period
+constexpr uint64_t kOwnerAliveMs = 1000; // the owner pumped this recently: it is alive, the helper keeps the link prompt
+constexpr size_t kMaxInbox = 4096; // events waiting for the owner; past it the helper only acks (ENet keeps the rest)
 
 uint64_t steady_ms()
 {
@@ -194,6 +198,7 @@ void Transport::destroy()
 		IoLock io(g_io);
 		enet_host_destroy(m_host);
 		m_host = nullptr;
+		m_inbox.clear(); // their peers are gone with the host
 	}
 	if (m_enet_ref)
 	{
@@ -202,21 +207,51 @@ void Transport::destroy()
 	}
 }
 
-int Transport::service(Event& ev, uint32_t wait_ms)
+// True when ENet's next event is a DISCONNECT: the first peer in the dispatch queue with something to hand out
+// (enet_protocol_dispatch_incoming_commands' order) is a zombie.
+static bool disconnect_next(ENetHost* host)
 {
-	if (!m_host)
-		return 0;
-	ev = Event();
-	ENetEvent e;
-	int rc;
+	for (ENetListIterator it = enet_list_begin(&host->dispatchQueue); it != enet_list_end(&host->dispatchQueue);
+		it = enet_list_next(it))
 	{
-		IoLock io(g_io);
-		m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
-		rc = enet_host_service(m_host, &e, wait_ms);
+		const ENetPeer* peer = reinterpret_cast<const ENetPeer*>(it); // dispatchList is ENetPeer's first member
+		switch (peer->state)
+		{
+		case ENET_PEER_STATE_ZOMBIE:
+			return true;
+		case ENET_PEER_STATE_CONNECTION_PENDING:
+		case ENET_PEER_STATE_CONNECTION_SUCCEEDED:
+			return false;
+		case ENET_PEER_STATE_CONNECTED:
+			if (!enet_list_empty(&peer->dispatchedCommands))
+				return false;
+			break;
+		default:
+			break;
+		}
 	}
-	if (rc <= 0)
-		return rc;
+	return false;
+}
 
+// The connection `link` (its ENet connectID) is still the peer's, and the owner has not reset or closed it.
+static bool link_alive(const ENetPeer* peer, uint32_t link)
+{
+	if (peer->connectID != link)
+		return false;
+	switch (peer->state)
+	{
+	case ENET_PEER_STATE_CONNECTED:
+	case ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT: // the remote's goodbye
+	case ENET_PEER_STATE_ZOMBIE:
+		return true;
+	default: // reset, or closing on the owner's word (disconnect, disconnect_later)
+		return false;
+	}
+}
+
+// An ENet event as the owner gets it (a packet's bytes are copied and the packet freed).
+static void take_event(ENetEvent& e, Event& ev)
+{
 	ev.peer = e.peer;
 	ev.channel = e.channelID;
 	ev.data = e.data;
@@ -240,6 +275,35 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 		ev.type = Event::Type::None;
 		break;
 	}
+}
+
+int Transport::service(Event& ev, uint32_t wait_ms)
+{
+	if (!m_host)
+		return 0;
+	ev = Event();
+	ENetEvent e;
+	int rc;
+	{
+		IoLock io(g_io);
+		m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
+		while (!m_inbox.empty()) // what the helper took out of ENet comes first: the order stays ENet's
+		{
+			Taken t = std::move(m_inbox.front());
+			m_inbox.pop_front();
+			// A packet of a link the owner has reset (its slot may be someone else's now) or is closing itself is
+			// dropped, as ENet drops what it still holds then. One from a peer that has left since comes before its
+			// DISCONNECT: the owner gets the last word (a Reject, a Bye) the goodbye would have wiped in ENet.
+			if (t.ev.type == Event::Type::Receive && !link_alive(t.ev.peer, t.link))
+				continue;
+			ev = std::move(t.ev);
+			return 1;
+		}
+		rc = enet_host_service(m_host, &e, wait_ms);
+	}
+	if (rc <= 0)
+		return rc;
+	take_event(e, ev);
 	return 1;
 }
 
@@ -434,17 +498,29 @@ void Transport::keepalive_loop()
 				return;
 		}
 		const uint64_t now = steady_ms();
-		if (!m_hold.held(now))
-			continue; // not held (released, expired, sealed by a crash): a stalled owner must look dead to its peers
-		if (m_last_service_ms.load(std::memory_order_relaxed) + kOwnerStallMs > now)
-			continue; // the owner pumps by itself
+		if (m_hold.sealed())
+			continue; // a crash: the link dies with the process
+		const bool alive = m_last_service_ms.load(std::memory_order_relaxed) + kOwnerAliveMs > now;
+		if (!alive && !m_hold.held(now))
+			continue; // a stalled owner without a hold (released, expired) must look dead to its peers
 		// Never wait for the lock: the owner (or another transport's helper) is using ENet right now.
 		std::unique_lock<std::recursive_mutex> io(g_io, std::try_to_lock);
 		if (!io.owns_lock() || !m_host)
 			continue;
-		// No event structure: ENet sends acks and pings, checks timeouts and queues whatever it receives (and any
-		// state change) for the owner's next enet_host_service.
+		// Acks, pings, sends, receives, timeouts. With no event structure ENet queues every state change (a timeout
+		// too) for dispatch instead of handing it out here.
 		enet_host_service(m_host, nullptr, 0);
+		// Then the queued events in order into the inbox, up to the first goodbye: ENet frees a peer's slot when it
+		// hands out its DISCONNECT, and the owner may still send to that peer until it has seen it. The goodbye and
+		// what follows wait in ENet for the owner's own enet_host_service. A full inbox (an owner held by a long
+		// load) leaves the rest in ENet too.
+		ENetEvent e;
+		while (m_inbox.size() < kMaxInbox && !disconnect_next(m_host) && enet_host_check_events(m_host, &e) > 0)
+		{
+			m_inbox.emplace_back();
+			m_inbox.back().link = e.peer ? e.peer->connectID : 0;
+			take_event(e, m_inbox.back().ev);
+		}
 		m_ka_services.fetch_add(1, std::memory_order_relaxed);
 	}
 }

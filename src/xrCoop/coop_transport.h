@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -113,13 +114,14 @@ public:
 	static uint32_t ms_since_receive(PeerHandle peer);
 	static std::string address_of(PeerHandle peer); // "ip:port"
 
+	// A helper thread services ENet every millisecond while the owner lives (it called service() within the last
+	// 1 s) or while held: acks and pings go out at once, so the RTT is the network's, not the frame times'. Events it
+	// takes wait for the owner's next service(), in ENet's order; it never hands out a DISCONNECT (ENet frees the
+	// peer's slot then, and the owner must see the goodbye before a newcomer can take the slot).
 	// Keep-alive for long blocking work on the owner thread (a level load does not pump the network for tens of
-	// seconds). While held, a helper thread services ENet whenever the owner has not called service() for a
-	// short while: acknowledgements and pings keep flowing, so peers do not time us out; received packets stay
-	// queued in ENet for the owner's next service(); no events are delivered from the helper. hold(ms) holds the
-	// link for `ms` from now (a new call replaces the deadline), hold(0) releases. A process that stops pumping
-	// without a hold (stuck on a crash dialog, hung) goes silent and its peers drop it after the silence timeout.
-	// Safe to call from any thread.
+	// seconds): hold(ms) keeps the helper going for `ms` from now (a new call replaces the deadline), hold(0)
+	// releases. A process that stops pumping without a hold (stuck on a crash dialog, hung) goes silent 1 s later
+	// and its peers drop it after the silence timeout. Safe to call from any thread.
 	void hold(uint32_t ms);
 	// A crash: the hold is released at once and every later hold() is refused, for the life of this transport (a new
 	// listen/connect does not lift it). Atomic with hold() (link_hold::HoldWord): a hold racing with it cannot re-arm.
@@ -140,6 +142,15 @@ private:
 	std::condition_variable m_ka_cv;
 	bool m_ka_stop = false;
 	std::atomic<uint64_t> m_last_service_ms{0}; // steady clock of the owner's last service()
+	// Events the helper took out of ENet, in ENet's order (2026-10-24: the helper pumps between the owner's frames).
+	// `link` is the peer's ENet connectID then: a packet of a link the owner has since reset is not handed out.
+	// Guarded by the I/O lock.
+	struct Taken
+	{
+		Event ev;
+		uint32_t link = 0;
+	};
+	std::deque<Taken> m_inbox;
 	link_hold::HoldWord m_hold; // steady clock deadline; released; or sealed by a crash
 	std::atomic<uint64_t> m_ka_services{0};
 };
