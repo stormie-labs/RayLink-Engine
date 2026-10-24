@@ -36,6 +36,7 @@ void host_on_event(NET_Packet& event); // GE_* event processed by the host serve
 
 // Host: ids of all top-level ALife objects that are online right now (sent with the world).
 void host_collect_online(xr_vector<u16>& out);
+void host_send_online_to(PeerId to); // F3a T8: the host's online set to a mover of a simultaneous load, once he is in
 
 // --- client ---
 // Online set of the host at the moment of the world snapshot (host numbering).

@@ -1160,6 +1160,8 @@ void host_on_world_loaded(PeerId from, Reader&)
 	bring_online(it->second.proxy); // W9: his character was kept out of the world while he was away or loading
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
+	if (prepared)
+		entities::host_send_online_to(from); // F3a T8: his prepared save knew only the host's actor online (live 2026-10-24)
 	host_send_owners(); // R3 В3: everybody learns whose character this is, the newcomer who plays the others
 	players::equip_resend(); // the newcomer needs everybody's look
 	objects::host_on_peer_ready(from); // zone phases, door/physics poses: not all of it is in the save

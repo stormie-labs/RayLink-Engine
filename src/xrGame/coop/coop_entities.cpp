@@ -106,9 +106,8 @@ void host_send_spawn(CSE_ALifeDynamicObject* e)
 	++g_host_spawns;
 }
 
-void host_send_switch(CSE_ALifeDynamicObject* e, bool online)
+void write_switch(Writer& w, CSE_ALifeDynamicObject* e, bool online)
 {
-	Writer w(256);
 	w.u16(e->ID);
 	w.boolean(online);
 	write_placement(w, e);
@@ -116,6 +115,12 @@ void host_send_switch(CSE_ALifeDynamicObject* e, bool online)
 	update.w_begin(M_UPDATE);
 	e->UPDATE_Write(update);
 	write_packet(w, update);
+}
+
+void host_send_switch(CSE_ALifeDynamicObject* e, bool online)
+{
+	Writer w(256);
+	write_switch(w, e, online);
 	net::host_broadcast(Msg::EntitySwitch, w);
 	++g_host_switches;
 }
@@ -879,6 +884,29 @@ void on_peer_left(PeerId) {}
 
 void host_begin_join(PeerId) {}
 void host_end_join(PeerId) {}
+
+// F3a T8 (live 2026-10-24: "the client sees nobody, dogs killed him unseen"): a mover of a simultaneous load got the
+// prepared save with the host's actor as its only online object (the host's new world was not loaded yet), and the
+// objects the host's world brought online while it loaded never reached him as switches. Once he is in, he gets the
+// host's whole online set, as a joiner gets it in his world save (client_set_initial_online). A repeat changes nothing.
+void host_send_online_to(PeerId to)
+{
+	if (!ai().get_alife())
+		return;
+	u32 sent = 0;
+	for (const auto& it : ai().alife().objects().objects())
+	{
+		CSE_ALifeDynamicObject* e = it.second;
+		if (!e || !e->m_bOnline || e->ID_Parent != kNoId || e->ID == 0)
+			continue; // the host's actor is the client's proxy of him: no switch ever (host_on_switch skips 0)
+		Writer w(256);
+		write_switch(w, e, true);
+		net::host_send(to, Msg::EntitySwitch, w);
+		++sent;
+	}
+	g_host_switches += sent;
+	::Msg("[coop] online set of the new world -> #%u: %u object(s)", to, sent);
+}
 
 void host_collect_online(xr_vector<u16>& out)
 {
