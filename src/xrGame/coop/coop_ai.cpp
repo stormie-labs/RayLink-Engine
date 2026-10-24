@@ -16,6 +16,7 @@
 #include "ai/stalker/ai_stalker.h"
 #include "memory_manager.h"
 #include "visual_memory_manager.h"
+#include "actor_memory.h" // audit A6: the actor's visual memory (player_sees_now)
 #include "stalker_movement_manager_smart_cover.h"
 #include "Inventory.h"
 #include "inventory_item.h"
@@ -360,6 +361,32 @@ void viewers_frame()
 		l.ms = now;
 		++g_stat.creature_estimates;
 	}
+}
+
+u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers])
+{
+	u32 n = 0;
+	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && g_actor->Position().distance_to(pos) <= max_dist)
+		out[n++] = g_actor;
+	if (!mgr().is_host() || !world_up())
+		return n;
+	for (u32 peer = 1; peer < kMaxPlayers && n < kMaxNearPlayers; ++peer)
+	{
+		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
+		if (body && body->g_Alive() && body->Position().distance_to(pos) <= max_dist)
+			out[n++] = body;
+	}
+	return n;
+}
+
+bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster)
+{
+	if (!player || !monster)
+		return false;
+	if (player == g_actor)
+		return g_actor->memory().visual().visible_now(monster);
+	bool sees = false;
+	return player_sees(player, monster, sees) && sees;
 }
 
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist)

@@ -11,6 +11,7 @@
 #include "ai_monster_squad_manager.h"
 #include "../../Actor.h"
 #include "../../actor_memory.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop: players_near, player_sees_now
 
 CMonsterEnemyMemory::CMonsterEnemyMemory()
 {
@@ -61,8 +62,14 @@ void CMonsterEnemyMemory::update()
 		}
 	}
 
-	if (monster->SoundMemory.IsRememberSound() && g_actor
-		&& g_actor->memory().visual().visible_now(monster))
+	// Anomaly Coop (audit A6, 2026-10-24): the stock remembers a dangerous sound only while the host's actor looks at the
+	// monster; any player who makes the sound and sees it counts (a client's shots woke nothing far from the host).
+	CEntityAlive* const sound_who =
+	    monster->SoundMemory.IsRememberSound() ? smart_cast<CEntityAlive*>(monster->SoundMemory.GetSound().who) : nullptr;
+	const bool sound_seen = sound_who && coop::npc_ai::is_player(sound_who) ?
+	    coop::npc_ai::player_sees_now(sound_who, monster) :
+	    (g_actor && g_actor->memory().visual().visible_now(monster));
+	if (monster->SoundMemory.IsRememberSound() && sound_seen)
 	{
 		SoundElem sound;
 		bool dangerous;
@@ -105,17 +112,21 @@ void CMonsterEnemyMemory::update()
 	}
 
 	float const feel_enemy_max_distance = monster->get_feel_enemy_max_distance();
-	if (g_actor)
+	// Anomaly Coop (audit A6): every player who walks up to the monster and sees it, not only the host's actor.
+	CEntityAlive* near_players[coop::npc_ai::kMaxNearPlayers];
+	const u32 near_count = coop::npc_ai::players_near(monster->Position(), feel_enemy_max_distance + 10.f, near_players);
+	for (u32 i = 0; i < near_count; ++i)
 	{
-		float const xz_dist = monster->Position().distance_to_xz(g_actor->Position());
-		float const y_dist = _abs(monster->Position().y - g_actor->Position().y);
+		CEntityAlive* const player = near_players[i];
+		float const xz_dist = monster->Position().distance_to_xz(player->Position());
+		float const y_dist = _abs(monster->Position().y - player->Position().y);
 
 		if (xz_dist < feel_enemy_max_distance &&
 			y_dist < 10 &&
-			monster->memory().enemy().is_useful(g_actor) &&
-			g_actor->memory().visual().visible_now(monster))
+			monster->memory().enemy().is_useful(player) &&
+			coop::npc_ai::player_sees_now(player, monster))
 		{
-			add_enemy(g_actor);
+			add_enemy(player);
 		}
 	}
 

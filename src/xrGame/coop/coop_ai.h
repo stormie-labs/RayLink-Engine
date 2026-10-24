@@ -72,6 +72,12 @@ void viewers_frame();
 // character of a player who is in the world, alive or downed; nullptr when none. Engine code that only knew Actor()
 // (the poltergeist's senses) asks this.
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
+// Audit A6: every such player within `max_dist` of `pos` (this machine's actor first); returns how many were written.
+constexpr u32 kMaxNearPlayers = 8;
+u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers]);
+// Does `player` (this machine's actor or a remote player's character) see `monster` now? The actor: its visual memory;
+// a remote player: his reported view and the line of sight (player_sees).
+bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster);
 void viewers_clear();
 // Console: coop_viewer_range (m, 0 = viewers off), coop_viewer_frame_radius (m, 0 = scale only). Host settings.
 void register_console();
