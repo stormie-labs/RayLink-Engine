@@ -44,6 +44,10 @@ void on_proxy_frame(CGameObject* proxy);
 // Vision: true (and `lum` 0..1 set) for a remote player's character with a fresh light estimate; the
 // caller then uses it instead of the render lighting.
 bool player_luminocity(const CGameObject* obj, float& lum);
+// Audit A3 (2026-10-24): the same light estimate for any other creature near a player who is not the host (the
+// render refreshes the light of objects on the host's screen only: off it a creature stays dark and is seen ~30 s
+// late, so fights by a far client went on half blind). True and `lum` when a fresh estimate exists.
+bool creature_luminocity(const CGameObject* obj, float& lum);
 
 // "Does player `player` see `observer` now?" for a remote player's character (false = not one, use the
 // stock answer). `sees`: `observer` sees the player (line of sight is mutual) and is inside the player's

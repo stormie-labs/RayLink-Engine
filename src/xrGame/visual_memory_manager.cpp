@@ -324,7 +324,8 @@ float CVisualMemoryManager::object_luminocity(const CGameObject* game_object) co
 	if (!smart_cast<CEntityAlive const*>(game_object)) //Alundaio
 		return (1.f);
 	float luminocity;
-	if (!coop::npc_ai::player_luminocity(game_object, luminocity)) // Anomaly Coop: a remote player's render light is stale off the host's screen
+	if (!coop::npc_ai::player_luminocity(game_object, luminocity) && // Anomaly Coop: a remote player's render light is stale off the host's screen
+	    !coop::npc_ai::creature_luminocity(game_object, luminocity)) // audit A3: so is any creature's near a far player
 		luminocity = const_cast<CGameObject*>(game_object)->ROS()->get_luminocity();
 	float power = log(luminocity > .001f ? luminocity : .001f) * current_state().m_luminocity_factor;
 	return (exp(power));

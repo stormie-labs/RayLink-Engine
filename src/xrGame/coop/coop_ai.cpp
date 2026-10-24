@@ -59,13 +59,28 @@ struct Proxy
 
 xr_map<u16, Proxy> g_proxies; // host: client proxies driven recently, by local id
 
+// Audit A3: creatures near the other players' characters and away from the host's camera, lit by the same estimate.
+constexpr u32 kLitListMs = 1000; // the list of such creatures is rebuilt this often
+constexpr u32 kLitPerFrame = 6; // estimates per frame (two ray tests each)
+constexpr u32 kLitFreshMs = 2000; // an older estimate is not used
+constexpr float kLitRange = 60.f; // around a player's character
+constexpr float kHostLitRange = 60.f; // nearer to the host's camera the render's own light is trusted
+struct Lit
+{
+	u32 ms = 0;
+	float lum = 0.f;
+};
+xr_map<u16, Lit> g_lit; // host: creature id -> its estimate
+xr_vector<u16> g_lit_queue; // creatures to estimate, round robin
+u32 g_lit_next = 0, g_lit_list_ms = 0;
+
 // Console settings of the scheduler's viewers (coop_viewers.h has the meaning and the defaults).
 float g_viewer_range = viewers::kDefaultRange;
 float g_viewer_frame_radius = viewers::kDefaultFrameRadius;
 
 struct Stats
 {
-	u64 light_estimates = 0, light_used = 0, sun_lit = 0, headlamps = 0;
+	u64 light_estimates = 0, light_used = 0, sun_lit = 0, headlamps = 0, creature_estimates = 0, creature_used = 0;
 	u64 sees_asked = 0, sees_yes = 0, on_path = 0, look_checks = 0, look_yes = 0;
 } g_stat;
 
@@ -179,6 +194,18 @@ bool player_luminocity(const CGameObject* obj, float& lum)
 	return true;
 }
 
+bool creature_luminocity(const CGameObject* obj, float& lum)
+{
+	if (!obj || !mgr().is_host())
+		return false;
+	auto it = g_lit.find(obj->ID());
+	if (it == g_lit.end() || Device.dwTimeGlobal - it->second.ms > kLitFreshMs)
+		return false;
+	lum = it->second.lum;
+	++g_stat.creature_used;
+	return true;
+}
+
 bool player_sees(const CEntityAlive* player, const CCustomMonster* observer, bool& sees)
 {
 	if (!player || !is_remote_player(player))
@@ -261,7 +288,13 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance)
 	return true;
 }
 
-void viewers_clear() { shedule_viewers::clear(); }
+void viewers_clear()
+{
+	shedule_viewers::clear();
+	g_lit.clear(); // audit A3: the estimates belong to the world that was up
+	g_lit_queue.clear();
+	g_lit_next = 0;
+}
 
 // Host: the character of `peer` if that player looks at the world from it (in the world, alive or downed), else nullptr.
 CObject* viewer_body(u32 peer)
@@ -289,6 +322,44 @@ void viewers_frame()
 		if (const CObject* body = viewer_body(peer))
 			at[n++] = body->Position();
 	shedule_viewers::set(at, n, g_viewer_range, g_viewer_frame_radius);
+
+	// Audit A3: light estimates for the creatures around the players (main thread, like on_proxy_frame).
+	const u32 now = Device.dwTimeGlobal;
+	if (now - g_lit_list_ms >= kLitListMs)
+	{
+		g_lit_list_ms = now;
+		g_lit_queue.clear();
+		g_lit_next = 0;
+		xr_vector<CObject*> near_list;
+		for (u32 i = 0; i < n; ++i)
+		{
+			near_list.clear();
+			Level().ObjectSpace.GetNearest(near_list, at[i], kLitRange, nullptr);
+			for (CObject* o : near_list)
+			{
+				const CEntityAlive* e = smart_cast<const CEntityAlive*>(o);
+				if (!e || !e->g_Alive() || e->getDestroy() || is_player(o))
+					continue;
+				if (o->Position().distance_to(Device.vCameraPosition) < kHostLitRange)
+					continue; // by the host: the render keeps its light
+				if (std::find(g_lit_queue.begin(), g_lit_queue.end(), o->ID()) == g_lit_queue.end())
+					g_lit_queue.push_back(o->ID());
+			}
+		}
+		for (auto it = g_lit.begin(); it != g_lit.end();)
+			it = now - it->second.ms > kLitFreshMs ? g_lit.erase(it) : std::next(it);
+	}
+	for (u32 k = 0; k < kLitPerFrame && g_lit_next < g_lit_queue.size(); ++k)
+	{
+		CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(g_lit_queue[g_lit_next++]));
+		if (!o || o->getDestroy())
+			continue;
+		Proxy scratch;
+		Lit& l = g_lit[o->ID()];
+		l.lum = estimate_light(o, scratch);
+		l.ms = now;
+		++g_stat.creature_estimates;
+	}
 }
 
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
