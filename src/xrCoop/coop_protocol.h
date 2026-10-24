@@ -53,7 +53,9 @@ namespace coop
 //    routes (coop_scope.h), the wire layouts in coop_levels_wire.h. Hello ends with `u8 role` (0 player, 1 map server)
 //    and `u8 token[16]`. Also in 11, in the modules that own the layouts: PlayerState + `u16 game_vertex, u32 level_vertex`
 //    (T10), TransitionState + `u8 flags` (T8), WeatherSync + `u8 weather_set` (T15).
-constexpr uint32_t kProtocolVersion = 11;
+// 12 (live 2026-10-24: a client never saw an NPC raise its weapon): EntitySnapshot carries a stalker's item in hands,
+//    CreatureHolds (+ CreatureStrapped) and a u16 id after the anims.
+constexpr uint32_t kProtocolVersion = 12;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -462,6 +464,8 @@ bool sound_path_valid(const std::string& path);
 enum CreatureFlags : uint8_t
 {
 	CreatureTorchLit = 1, // the creature's head torch is on
+	CreatureHolds = 2, // a stalker's active item: its u16 id follows the anims (protocol 12)
+	CreatureStrapped = 4, // that item is a weapon carried on the back, not in the hands
 };
 constexpr uint8_t pack_anim_byte(uint8_t anim_count, uint8_t creature_flags)
 {

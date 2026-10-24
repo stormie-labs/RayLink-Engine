@@ -19,6 +19,8 @@
 #include "InventoryOwner.h"
 #include "Inventory.h"
 #include "Torch.h"
+#include "Weapon.h"
+#include "inventory_item.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "alife_graph_registry.h"
@@ -211,13 +213,27 @@ CTorch* attached_torch(CGameObject* obj)
 	return nullptr;
 }
 
-u8 creature_flags(CGameObject* obj)
+// Live 2026-10-24 (owner): "on the client you do not see an NPC raise its weapon at whoever aimed at it". A puppet runs
+// no object handler of its own: its torso plays the host's aim, but its hands stayed empty. The item in hands rides in
+// the snapshot (`held`, the host id, when CreatureHolds is set).
+u8 creature_flags(CGameObject* obj, u16& held)
 {
 	u8 flags = 0;
-	if (obj->cast_stalker())
-		if (CTorch* t = attached_torch(obj))
-			if (t->torch_active())
-				flags |= CreatureTorchLit;
+	held = kNoId;
+	CAI_Stalker* stalker = obj->cast_stalker();
+	if (!stalker)
+		return flags;
+	if (CTorch* t = attached_torch(obj))
+		if (t->torch_active())
+			flags |= CreatureTorchLit;
+	if (PIItem item = stalker->inventory().ActiveItem())
+	{
+		held = item->object().ID();
+		flags |= CreatureHolds;
+		if (CWeapon* w = smart_cast<CWeapon*>(item))
+			if (w->strapped_mode())
+				flags |= CreatureStrapped;
+	}
 	return flags;
 }
 
@@ -235,18 +251,36 @@ CTorch* puppet_torch(CGameObject* obj)
 	return nullptr;
 }
 
-// True when the puppet shows what the host reported (or there is nothing to show yet: no torch and none wanted).
-bool apply_creature_flags(CGameObject* obj, u8 flags)
+// True when the puppet shows what the host reported; false when an item has not arrived yet (EntitySpawn): try again
+// later. The item in hands goes through the puppet's object handler, as an avatar's does (coop_equip apply_equip).
+bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 {
-	if (!obj->cast_stalker())
+	CAI_Stalker* stalker = obj->cast_stalker();
+	if (!stalker)
 		return true;
+	bool done = true;
 	const bool lit = (flags & CreatureTorchLit) != 0;
-	CTorch* t = puppet_torch(obj);
-	if (!t)
-		return !lit; // the torch item has not arrived yet (EntitySpawn): try again later
-	if (t->torch_active() != lit)
-		t->Switch(lit);
-	return true;
+	if (CTorch* t = puppet_torch(obj))
+	{
+		if (t->torch_active() != lit)
+			t->Switch(lit);
+	}
+	else if (lit)
+		done = false;
+
+	CGameObject* item = nullptr;
+	if (flags & CreatureHolds)
+	{
+		CObject* o = held != kNoId ? Level().Objects.net_Find(held) : nullptr;
+		if (o && o->H_Parent() == obj)
+			item = smart_cast<CGameObject*>(o);
+		if (!item)
+			return false; // not in its inventory here yet
+	}
+	ClientApply scope; // local inventory moves of the puppet pass the client router
+	stalker->CObjectHandler::set_goal(
+		(flags & CreatureStrapped) ? MonsterSpace::eObjectActionStrapped : MonsterSpace::eObjectActionIdle, item);
+	return done;
 }
 
 void host_send_snapshots()
@@ -289,12 +323,16 @@ void host_send_snapshots()
 		w.u8(u8(clampr(alive ? alive->GetfHealth() : 1.f, 0.f, 1.f) * 255.f));
 		AnimState a;
 		capture_anims(obj, a);
-		w.u8(pack_anim_byte(a.count, creature_flags(obj))); // W5 C2.6: torch state in the high nibble
+		u16 held;
+		const u8 flags = creature_flags(obj, held);
+		w.u8(pack_anim_byte(a.count, flags)); // W5 C2.6: creature flags in the high nibble
 		for (u8 k = 0; k < a.count; ++k)
 		{
 			w.u32(a.motion[k]);
 			w.u16(a.time_ms[k]);
 		}
+		if (flags & CreatureHolds)
+			w.u16(held);
 		if (++in_packet >= 255 || w.size() >= kSnapshotBudget)
 			flush();
 	}
@@ -314,6 +352,7 @@ struct MirrorSample
 	float health = 1.f;
 	AnimState anims;
 	u8 flags = 0; // CreatureFlags (W5 C2.6)
+	u16 held = kNoId; // local id of the item in hands (CreatureHolds)
 };
 struct MirrorTrack
 {
@@ -323,6 +362,7 @@ struct MirrorTrack
 	u32 last_remote = 0;
 	u32 applied[kMaxPartitions] = {};
 	u8 flags_shown = 0xff; // W5 C2.6: creature flags the puppet shows; 0xff = not applied yet
+	u16 held_shown = kNoId; // the item it holds
 	u64 flags_retry = 0; // a failed apply (torch not here yet) is tried again from this time
 	u64 flags_check = 0; // and the shown state is re-checked from time to time (local engine paths may switch it)
 };
@@ -784,6 +824,8 @@ void client_on_snapshot(PeerId, Reader& r)
 			s.anims.motion[k] = r.u32();
 			s.anims.time_ms[k] = r.u16();
 		}
+		if (s.flags & CreatureHolds)
+			s.held = join::to_local(r.u16());
 		if (!r.ok() || id == 0)
 			break;
 		MirrorTrack& t = g_tracks[id];
@@ -1086,13 +1128,16 @@ bool drive_mirror(CGameObject* obj)
 	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
 	MirrorTrack& track = it->second;
 	const u8 want = track.samples.back().flags;
+	const u16 want_held = track.samples.back().held;
 	const u64 now = mgr().now_ms();
-	if ((want != track.flags_shown && now >= track.flags_retry) || now >= track.flags_check)
+	if (((want != track.flags_shown || want_held != track.held_shown) && now >= track.flags_retry)
+		|| now >= track.flags_check)
 	{
 		track.flags_check = now + 2000;
-		if (apply_creature_flags(obj, want))
+		if (apply_creature_flags(obj, want, want_held))
 		{
 			track.flags_shown = want;
+			track.held_shown = want_held;
 			track.flags_retry = 0;
 		}
 		else
