@@ -9,7 +9,8 @@
 //   Wounded --bleed-out timer ends / player holds USE to give up--> Dead
 //   Dead --host, coop_death_mode hardcore--> Spectating (out of the run, camera on teammates)
 //        --the owner holds USE 3 s / coop_new_character (F3 Task 10)--> a new character: all he had goes into a stash at
-//        the body; a client then joins again and chooses one (protocol 8), the host stands up at his arrival point
+//        the body; a client then joins again and chooses one (protocol 8), the host player is ordered up at his
+//        arrival point
 //   Dead --host, checkpoint: losses (coop_death), money, Evacuate; after coop_respawn_delay--> Respawning
 //        --> Alive at the player's own checkpoint (coop_checkpoints::host_respawn_point)
 // While evacuated the dead player watches a living teammate (Fire / Aim switch), or the place of death from
@@ -29,15 +30,21 @@
 // checkpoint at his first Alive there, and a new game or another save does not. Ruling F3-7: a character out of a
 // hardcore run stays a spectator at every Alive, whatever the mode is now; the world keeps that too
 // ([coop_death] out = 1, death::learn_out, F3 Task 10), so a level change or a load does not bring him back.
-// The host's actor (character 0) takes the same path.
+// The host's actor (character 0) takes the same path. F3a T7: and the same messages - the host player is a client of
+// the world server in his own process (peer 0 over the LocalLink): his reports, revive requests and NewCharacter go to
+// it over the internal channel and its orders and rules come back the same way, at the next pump (character_of_peer /
+// peer_of_character below). Nothing of his is applied directly any more.
 //
-// Hardcore's new character (F3 Task 10). Out of the run, the owner holds USE 3 s (or coop_new_character): a client
-// sends Msg::NewCharacter, the host acts for itself. The host checks he is out (death::on_new_character) and moves all
-// he has, worn and quest items included, into a stash at the body (death::host_move_to_stash, DeathMarker). Only when
+// Hardcore's new character (F3 Task 10). Out of the run, the owner holds USE 3 s (or coop_new_character): every player
+// sends Msg::NewCharacter (the host player over the internal channel). The host checks he is out
+// (death::on_new_character) and moves all he has, worn and quest items included, into a stash at the body
+// (death::host_move_to_stash, DeathMarker). Only when
 // the stash is done (death::retire_step, review R2 of T9) does anything else of him change: a client's character loses
 // his [coop] key (retired = 1), his player joins again (join::host_rejoin_peer) and chooses a new character
-// (coop_menu_char, protocol 8), the old one is released; the host's actor stands up at his arrival point (health 1, no
-// radiation or bleeding, fed, rested, 0 RU) and Lua coop_host_new_character() opens the choice for him.
+// (coop_menu_char, protocol 8), the old one is released. The host player's actor stays in the world: the world starts his
+// character over (not out, nothing owed, 0 RU) and orders his owner with a Respawn at his arrival point (F3a T7, see
+// Respawn below: he stands up fresh - health 1, no radiation or bleeding, fed, rested); the world's Lua
+// coop_host_new_character() offers him the choice (menu.char_offer to peer 0, coop_menu_char).
 //
 // The engine actor never dies during a session, in either mode: while the player is down its health is
 // pinned just above zero (CActorCondition hook) and every kill of it is intercepted (CEntity::KillEntity),
@@ -56,7 +63,8 @@
 //     Request  reviver -> host       {u16 target, u16 seq, u16 item}
 //     Revive   host -> target owner  {u16 target, u16 seq, u16 reviver, f32 health}
 //     Respawn  host -> target owner  {u16 target, u16 seq, vec3 pos, u8 checkpoint kind}
-//              (to a Dead owner after the evacuation; to an Alive one that came back to the world while dead)
+//              (to a Dead owner after the evacuation; to an Alive one that came back to the world while dead; F3a T7:
+//              to a Spectating owner, only as his new character after a hardcore run - nothing of the death is charged)
 //     Spectate host -> target owner  {u16 target, u16 seq}
 //     Refused  host -> reviver       {u16 target, u8 reason}
 //     Evacuate host -> target owner  {u16 target, u16 seq, u32 delay_ms}
@@ -68,7 +76,8 @@
 //     Done     host -> reviver       {u16 target, u16 seq}  the Request went through (Lua coop_revive_done)
 //              Lua reads it all as coop.revive_progress() (revive_progress below).
 //   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %, and
-//                  since build 10 the share multiplier; drop 3 = keep)
+//                  since build 10 the share multiplier; drop 3 = keep). F3a T7: the host player takes them too; the
+//                  world server decides by its own (rules() on the host)
 //   NewCharacter   client -> host  {}: out of a hardcore run, a new character (F3 Task 10; 2 per 5 s)  reliable
 // `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
 // answers, so repeats are no-ops.
@@ -125,6 +134,16 @@ struct PlayerRef
 void collect_players(xr_vector<PlayerRef>& out, bool include_self);
 // Nick of the player whose character has `host_id`, "?" if unknown.
 xr_string nick_of(u16 host_id);
+
+// F3a T7, the world server (the host's process; elsewhere 0xffff / kInvalidPeer / false). Its players are the host player,
+// peer 0 over the internal channel (LocalLink), who plays the host's actor (character 0), and the remote clients, who play
+// their proxies. A handler of a player's message finds his character by the peer it came from, never by the packet; an
+// answer to a character goes to his peer (net::host_send: peer 0 over the link).
+u16 character_of_peer(PeerId peer); // 0xffff: no character of his in this world
+PeerId peer_of_character(u16 character); // kInvalidPeer: nobody plays it now
+// The player of `character` is in the served world: the host player while the host's level and actor are up, a client once
+// he has loaded it (join::host_player_in_world).
+bool player_in_world(u16 character);
 
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)

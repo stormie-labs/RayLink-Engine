@@ -209,16 +209,11 @@ void host_send_state(u64 now, bool force)
 	++g_stat.sent;
 }
 
-// The player of `character` learns why: the host's own Lua at once (the changes first, as on a client: M4), a client in
-// his copy of RestState.
+// The player of `character` learns why in his copy of RestState (F3a T7: the host player too, over the internal channel;
+// his Lua hears it from his copy at the next pump, the changes first, as on a client: M4).
 void tell_owner(u16 character, Refusal why)
 {
-	if (character == 0)
-	{
-		tell_lua(g_host.group.entries(), why);
-		return;
-	}
-	const PeerId peer = join::peer_of_proxy(character);
+	const PeerId peer = survival::peer_of_character(character);
 	if (peer == kInvalidPeer)
 		return; // he left meanwhile
 	StateMsg m = host_state();
@@ -299,8 +294,7 @@ void start_sleep(u64 now, u8 hours)
 {
 	++g_stat.sleeps;
 	g_host.sleep_hours = hours;
-	host_send_state(now, true); // the clients read "sleeping" before their RestSleep
-	tell_lua(g_host.group.entries()); // and the host's Lua before its coop_rest_sleep
+	host_send_state(now, true); // every player reads "sleeping" before his RestSleep (the host player too: one lane)
 	skip_time(hours);
 	Writer w;
 	write_sleep(w, hours);
@@ -310,14 +304,9 @@ void start_sleep(u64 now, u8 hours)
 		if (e.state != State::Sleeping)
 			continue;
 		++sleepers;
-		if (e.character == 0)
-			script::queue_callback(kSleepCallback, {script::cb_int(hours)});
-		else
-		{
-			const PeerId peer = join::peer_of_proxy(e.character);
-			if (peer != kInvalidPeer)
-				net::host_send(peer, Msg::RestSleep, w);
-		}
+		const PeerId peer = survival::peer_of_character(e.character); // F3a T7: the host player's over the link
+		if (peer != kInvalidPeer)
+			net::host_send(peer, Msg::RestSleep, w);
 	}
 	autosave::request(autosave::Reason::Sleep); // written once the host is awake again (autosave: busy while asleep)
 	::Msg("[coop] rest: %u player(s) sleep %u h, the time is skipped", sleepers, u32(hours));
@@ -381,28 +370,23 @@ void host_tick(u64 now)
 		start_sleep(now, t.hours);
 }
 
+// The world server's book. F3a T7: the host player's word is no longer taken here: it comes as his RestRequest over the
+// internal channel (player_frame), and his Lua hears the book from his copy of RestState (client_on_state).
 void host_frame()
 {
 	host_sync_world();
 	if (!host_world_ready())
 		return;
 	const u64 now = mgr().now_ms();
-	if (g_pending.on)
-	{
-		const Pending p = g_pending;
-		g_pending = Pending();
-		if (p.world == join::world_generation())
-			host_request(0, p.rq);
-	}
 	if (now >= g_host.next_tick_ms)
 	{
 		g_host.next_tick_ms = now + kTickMs;
 		host_tick(now);
 	}
 	host_send_state(now, false);
-	tell_lua(g_host.group.entries());
 }
 
+// A player's lie-down or get-up (F3a T7: the host player's from peer 0 over the internal channel).
 void host_on_request(PeerId from, Reader& rd)
 {
 	if (!mgr().is_host())
@@ -415,18 +399,18 @@ void host_on_request(PeerId from, Reader& rd)
 			::Msg("! [coop] rest: malformed RestRequest from #%u ignored", from);
 		return;
 	}
-	const u16 proxy = join::proxy_of_peer(from); // never the packet's word
-	if (proxy == kNoId || proxy == 0 || !join::host_player_in_world(proxy))
+	const u16 character = survival::character_of_peer(from); // never the packet's word
+	if (character == kNoId || !survival::player_in_world(character))
 	{
 		++g_stat.not_in_world;
 		if (log_allowed(g_stat.not_in_world))
 			::Msg("[coop] rest: RestRequest from #%u without a character in the world ignored", from);
 		return;
 	}
-	host_request(proxy, rq);
+	host_request(character, rq);
 }
 
-// ---------------------------------------------------------------- client
+// ---------------------------------------------------------------- a player (a client, and the host player: F3a T7)
 
 // The mirror belongs to one world: a newly loaded world starts with everybody awake (the host's next RestState fills
 // it), and a word said in the old one is dropped.
@@ -451,7 +435,7 @@ const Entry* mirror_find(u16 local_id)
 
 void client_on_state(PeerId from, Reader& rd)
 {
-	if (!mgr().is_client() || from != kHostPeer)
+	if (!is_player() || from != kHostPeer)
 		return; // HostOnly: the session kicks a client that sends it
 	client_sync_world();
 	StateMsg m;
@@ -476,7 +460,7 @@ void client_on_state(PeerId from, Reader& rd)
 
 void client_on_sleep(PeerId from, Reader& rd)
 {
-	if (!mgr().is_client() || from != kHostPeer)
+	if (!is_player() || from != kHostPeer)
 		return;
 	client_sync_world();
 	u8 hours = 0;
@@ -500,10 +484,14 @@ void client_on_sleep(PeerId from, Reader& rd)
 	script::queue_callback(kSleepCallback, {script::cb_int(hours)});
 }
 
-void client_frame()
+// This machine's player: his word goes to the world server (F3a T7: the host player's over the internal channel, at the
+// pace a client keeps), his Lua hears his copy of the book.
+bool player_live() { return mgr().is_host() || mgr().is_live_client(); }
+
+void player_frame()
 {
 	client_sync_world();
-	if (g_pending.on && mgr().is_live_client())
+	if (g_pending.on && player_live())
 	{
 		if (g_pacer.take(Msg::RestRequest, mgr().now_ms()))
 		{
@@ -519,7 +507,7 @@ void client_frame()
 			++g_stat.held;
 		}
 	}
-	if (mgr().is_live_client())
+	if (player_live())
 		tell_lua(g_mirror.entries);
 }
 
@@ -710,8 +698,8 @@ void frame()
 {
 	if (mgr().is_host())
 		host_frame();
-	else if (mgr().is_client())
-		client_frame();
+	if (is_player())
+		player_frame();
 }
 
 void print_status()
@@ -737,6 +725,9 @@ void print_status()
 			entry_line(e, e.character, buf);
 			::Msg("[coop]   rest of %s%s", buf, g_host.group.forced(e.character) ? " (passed out)" : "");
 		}
+		::Msg("[coop]   rest (the host player, over the internal channel): asked %llu (held back %llu), RestState "
+		      "received %llu (refusals %llu), sleeps %llu (ignored %llu)",
+		    g_stat.asked, g_stat.held, g_stat.received, g_stat.refusals, g_stat.sleeps_seen, g_stat.sleeps_ignored);
 	}
 	else if (mgr().is_client())
 	{

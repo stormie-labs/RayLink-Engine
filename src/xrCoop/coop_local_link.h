@@ -60,15 +60,31 @@ public:
 	virtual void on(Msg type, Handler h) = 0;
 };
 
-// The messages moved onto the link (F3a T7 adds them module by module, together with the removal of the host's direct
-// path in that module). Empty: nothing travels the link yet, the host process behaves exactly as before the link.
-inline constexpr std::array<Msg, 0> kLinkMessages{};
+// The messages moved onto the link, module by module, together with the removal of the host's direct path in that
+// module (F3a T7, T8). A type is in here for both ways at once (one gate for push_to_server and push_to_client). A list
+// whose length the compiler counts: every task adds its own lines.
+inline constexpr Msg kLinkMessages[] = {
+	// F3a T7: the host player's rest, checkpoint claims, life and revives, new character, the rules, death markers,
+	// money transfers, coop.sync requests and Lua events to peer 0. Kept off on purpose: SyncSet / SyncFull / SyncCast
+	// (one store in the host's process), PlayerShot, PlayerDied (task-7-report.md).
+	Msg::RestRequest, Msg::RestState, Msg::RestSleep, // coop_rest
+	Msg::CheckpointClaim, Msg::CheckpointState, // coop_checkpoints, coop_checkpoint_sources
+	Msg::PlayerWounded, Msg::PlayerRevive, Msg::PlayerRules, Msg::NewCharacter, // coop_survival
+	Msg::DeathMarker, // coop_death
+	Msg::ReqMoney, Msg::MoneyBalance, // coop_money
+	Msg::SyncRequest, Msg::SyncResult, // coop_sync_api
+	Msg::ScriptEvent, // coop_script: coop.send_event to peer 0 in the host's process
+	// F3a T8: the board (the host player's vote, his placard) and the simultaneous load (his LoadWait, his LoadReady)
+	Msg::TransitionVote, Msg::TransitionState, // coop_join: the waiting point
+	Msg::LoadWait, Msg::LoadReady, // coop_join: the simultaneous load
+};
 
 // The game's gate of the link (LocalLink::set_gate): the world server sends the host player only these messages over the
 // link and takes only these from him.
 inline bool link_enabled(Msg type)
 {
-	return std::find(kLinkMessages.begin(), kLinkMessages.end(), type) != kLinkMessages.end();
+	const Msg* end = kLinkMessages + sizeof(kLinkMessages) / sizeof(kLinkMessages[0]);
+	return std::find(kLinkMessages, end, type) != end;
 }
 
 class LocalLink final : public Endpoint

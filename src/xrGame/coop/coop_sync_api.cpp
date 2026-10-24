@@ -95,11 +95,12 @@ struct Call
 // Host: a request waiting for the host's Lua.
 struct HostCall
 {
-	PeerId from = kHostPeer; // kHostPeer: the host's own coop.sync.request
+	PeerId from = kHostPeer; // the player who asked (F3a T7: kHostPeer is the host player, over the internal channel)
 	u32 id = 0;
 	std::string name;
 	Value args;
-	Waiting fn; // the host's own request: its callback
+	bool here = false; // a request of this machine's own Lua outside a session (single player): answered here
+	Waiting fn; // `here`: its callback
 };
 
 struct Watch
@@ -132,6 +133,7 @@ sn::RequestLimits g_limits; // host
 sn::Requests<Waiting> g_requests; // client: requests in flight
 limits::Pacer g_pacer; // client
 std::deque<Out> g_out;
+std::deque<Writer> g_player_out; // F3a T7, host: the host player's SyncRequests for his world server (sent by frame())
 std::deque<Call> g_calls;
 std::deque<HostCall> g_host_calls;
 std::vector<Watch> g_watches;
@@ -186,6 +188,7 @@ void follow_role()
 	g_as_client = c;
 	g_core.clear();
 	g_out.clear();
+	g_player_out.clear();
 	g_pacer.reset();
 	g_peer_digest.clear();
 	g_resync = false;
@@ -239,9 +242,12 @@ PeerId player_peer_of(const ScopeId& s)
 	return kInvalidPeer;
 }
 
-// Host: a client that is in the world (not loading it).
+// Host: a client that is in the world (not loading it). F3a T7: the host player (peer 0, over the internal channel)
+// while the host's level and actor are up.
 bool in_world(PeerId peer)
 {
+	if (peer == kHostPeer)
+		return mgr().is_host() && mgr().session().local() && g_pGameLevel && g_actor;
 	const PeerInfo* p = mgr().session().peer(peer);
 	return p && p->state == PeerState::Joined && !sync::host_peer_joining(peer);
 }
@@ -819,7 +825,7 @@ void host_flush()
 		g_out.pop_front();
 		if (o.everyone)
 			net::host_broadcast(o.type, o.payload, Lane::Reliable, o.except);
-		else if (o.peer != kHostPeer)
+		else if (o.peer != kHostPeer || o.type == Msg::SyncResult) // F3a T7: the host player's answers over the link
 			net::host_send(o.peer, o.type, o.payload, Lane::Reliable);
 	}
 }
@@ -839,6 +845,27 @@ void client_flush(u64 now)
 		}
 		net::client_send(o.type, o.payload, Lane::Reliable);
 		g_out.pop_front();
+	}
+}
+
+// F3a T7: the host player's requests go to his world server over the internal channel (main thread); one not answered in
+// time gets false, "timeout", as a client's.
+void host_player_frame(u64 now)
+{
+	while (!g_player_out.empty())
+	{
+		net::client_send(Msg::SyncRequest, g_player_out.front(), Lane::Reliable);
+		g_player_out.pop_front();
+	}
+	for (auto& w : g_requests.expire(now))
+	{
+		Call c;
+		c.kind = Call::Answer;
+		c.fn = w.second;
+		c.ok = false;
+		c.value = ss::make_string("timeout");
+		queue_call(std::move(c));
+		++g_stats.requests_timed_out;
 	}
 }
 
@@ -998,10 +1025,11 @@ void on_request(PeerId from, Reader& r)
 	g_host_calls.push_back(std::move(h));
 }
 
+// A player: the answer to his request (F3a T7: the host player's over the internal channel).
 void on_result(PeerId from, Reader& r)
 {
 	follow_role();
-	if (!client() || from != kHostPeer)
+	if (!(client() || mgr().is_host()) || from != kHostPeer)
 		return;
 	sn::Result m;
 	if (!sn::read_result(r, m))
@@ -1169,7 +1197,7 @@ void deliver_calls()
 	}
 }
 
-// Host: requests run their handlers (the host's own and the clients'), answers go back.
+// Host: requests run their handlers (the players', the host player's too; single player: its own), answers go back.
 void run_host_calls()
 {
 	u32 budget = kHostCallsPerFrame;
@@ -1213,7 +1241,7 @@ void run_host_calls()
 					    why.c_str());
 			}
 		}
-		if (h.from == kHostPeer)
+		if (h.here)
 		{
 			Call c;
 			c.kind = Call::Answer;
@@ -1223,7 +1251,7 @@ void run_host_calls()
 			queue_call(std::move(c));
 		}
 		else
-			send_result(h.from, h.id, ok, std::move(result));
+			send_result(h.from, h.id, ok, std::move(result)); // F3a T7: the host player's over the link
 	}
 }
 
@@ -1516,11 +1544,14 @@ int l_request(lua_State* L)
 		return fail(L, why);
 	if (!(lua_isnoneornil(L, 3) || lua_type(L, 3) == LUA_TFUNCTION))
 		return fail(L, "bad arguments");
-	if (client())
+	// A player asks the world server: a client over the net, F3a T7 the host player over the internal channel (sent by
+	// frame()); its handler, its limits and its answer are the same. Outside a session the machine runs its own handler.
+	const bool player = client() || mgr().is_host();
+	if (player)
 	{
 		if (g_requests.full())
 			return fail(L, "too many requests waiting");
-		if (g_out.size() >= kMaxOutbox)
+		if ((client() ? g_out.size() : g_player_out.size()) >= kMaxOutbox)
 			return fail(L, "too many messages waiting for the host");
 	}
 	else if (g_host_calls.size() >= kMaxHostCalls)
@@ -1528,7 +1559,7 @@ int l_request(lua_State* L)
 	Waiting w;
 	w.gen = g_lua_gen;
 	arg_function(L, 3, w.ref);
-	if (client())
+	if (player)
 	{
 		sn::Request q;
 		q.id = g_requests.add(mgr().now_ms(), w);
@@ -1536,12 +1567,16 @@ int l_request(lua_State* L)
 		q.args = std::move(args);
 		Writer out(32 + q.name.size() + ss::encoded_size(q.args));
 		sn::write_request(out, q);
-		out_to(kHostPeer, Msg::SyncRequest, std::move(out));
+		if (client())
+			out_to(kHostPeer, Msg::SyncRequest, std::move(out));
+		else
+			g_player_out.push_back(std::move(out));
 		++g_stats.requests_out;
 		return done(L);
 	}
 	HostCall h;
 	h.from = kHostPeer;
+	h.here = true;
 	h.name = std::move(name);
 	h.args = std::move(args);
 	h.fn = w;
@@ -1891,6 +1926,7 @@ void reset()
 	follow_role();
 	const bool was_client = client();
 	g_out.clear();
+	g_player_out.clear();
 	g_pacer.reset();
 	g_resync = false;
 	g_was_live = false;
@@ -1898,7 +1934,7 @@ void reset()
 	g_peer_digest.clear();
 	end_requests("session ended");
 	for (auto it = g_host_calls.begin(); it != g_host_calls.end();)
-		it = it->from != kHostPeer ? g_host_calls.erase(it) : std::next(it); // their players are gone
+		it = !it->here ? g_host_calls.erase(it) : std::next(it); // their players are gone (the host player too)
 	if (was_client)
 	{
 		g_core.clear(); // nothing of the host's stays
@@ -1947,6 +1983,8 @@ void frame()
 		if (g_resync && mgr().is_host())
 			resync_all();
 		g_resync = false;
+		if (mgr().is_host())
+			host_player_frame(now);
 	}
 	if (lua_ready())
 	{
@@ -2008,6 +2046,10 @@ void print_status()
 		      "%llu, malformed %llu | handler errors %llu, bad results %llu, answers sent %llu, waiting %u",
 		    s.host_requests, s.no_handler, s.rate_limited, s.busy, s.not_in_world, s.bad_requests, s.handler_errors,
 		    s.bad_results, s.results_out, u32(g_host_calls.size()));
+		::Msg("[coop-sync] requests of the host player (over the internal channel): sent %llu, answered %llu, timed out "
+		      "%llu, ended %llu, waiting %u, unknown answers %llu",
+		    s.requests_out, s.requests_answered, s.requests_timed_out, s.requests_ended, u32(g_requests.size()),
+		    s.answers_unknown);
 	}
 	::Msg("[coop-sync] effects: broadcasts %llu (to %llu machines), received %llu, handler calls %llu | lua calls %llu, "
 	      "errors %llu, dropped %llu, stale %llu, waiting %u | on_change %u, handlers %u, effect names %u, limits %u | "

@@ -463,7 +463,8 @@ void fire_marker_callback(u16 player_local, u16 object_local, Drop drop)
 }
 
 // The items' EntityParent / the stash's EntitySpawn go out in this frame's events / entities pass, after this module:
-// a marker waits one frame so that every client has its object before the marker names it.
+// a marker waits one frame so that every client has its object before the marker names it. F3a T7: the host player gets
+// it as a client does, over the internal channel (on_marker_msg fires his callback at the next pump).
 void send_markers()
 {
 	for (size_t i = 0; i < g_markers.size();)
@@ -477,7 +478,6 @@ void send_markers()
 		Writer w(kMarkerSize);
 		write(w, m);
 		net::host_broadcast(Msg::DeathMarker, w);
-		fire_marker_callback(m.character, m.object, m.drop); // host numbering is the local one here
 		++g_st.markers_sent;
 		g_markers.erase(g_markers.begin() + i);
 	}
@@ -791,13 +791,11 @@ void host_frame()
 		send_markers();
 }
 
-// ---------------------------------------------------------------- client
+// ---------------------------------------------------------------- a player (a client, and the host player: F3a T7)
 
 void on_marker_msg(PeerId from, Reader& r)
 {
-	if (mgr().is_host())
-		return; // host-only: the session refuses it from a client before any handler
-	if (!mgr().is_live_client() || from != kHostPeer)
+	if (!(mgr().is_host() || mgr().is_live_client()) || from != kHostPeer)
 	{
 		++g_st.markers_refused;
 		return;
@@ -1005,7 +1003,7 @@ u32 host_take_money(u16 character, u8 pct)
 {
 	if (!mgr().is_host() || pct == 0)
 		return 0;
-	const PeerId peer = character == 0 ? kHostPeer : join::peer_of_proxy(character);
+	const PeerId peer = survival::peer_of_character(character); // F3a T7: the host player's balance goes over the link
 	if (peer == kInvalidPeer)
 	{
 		::Msg("! [coop] death money of %u not taken: no player plays this character now", character);
@@ -1137,7 +1135,7 @@ void print_status()
 			::Msg("[coop]     stash %u of %s: %u items, %lld ms left", p.stash, nick(p.character).c_str(),
 			    u32(p.items.size()), s64(p.deadline) - s64(now_ms()));
 	}
-	else if (mgr().is_client())
+	if (mgr().is_host() || mgr().is_client()) // F3a T7: the host player takes them too
 		::Msg("[coop]   death: %llu markers from the host, %llu refused", g_st.markers_in, g_st.markers_refused);
 }
 

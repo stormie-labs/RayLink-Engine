@@ -6,6 +6,10 @@
 // that uses coop.sync works there, and its world / player / object data go into the save the same way). A client holds
 // what the host sends it (world, session, every object, his own player scope) and shows his own changes at once until
 // the host answers them.
+// F3a T7: the host player is a client of the world server for requests: his coop.sync.request is a SyncRequest from peer
+// 0 over the internal channel, run by the same handler under the same limits, and answered by a SyncResult over the
+// link (a timeout as a client's). The store and the effects stay one copy in the host's process: his set / get / keys /
+// on_change / broadcast work on it directly (SyncSet, SyncFull and SyncCast are not on the link).
 //
 // Lua (coop.sync.*; a refusal returns false and a reason, it never raises):
 //   set(scope, key, value) -> true | false, why       nil removes; a value of at most 16 KiB encoded

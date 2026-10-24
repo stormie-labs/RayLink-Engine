@@ -41,7 +41,8 @@
 // items) is taken, as before.
 // Msg::DeathMarker (host -> all, the frame after the move, so the EntityParent / EntitySpawn of the items is ahead of
 // it): u16 character, u16 marker object, u8 drop mode. Every machine (the host too) fires the Lua callback
-// coop_death_marker(player_local_id, marker_local_id, "drop" | "corpse"). Lose has no marker.
+// coop_death_marker(player_local_id, marker_local_id, "drop" | "corpse"). Lose has no marker. F3a T7: the host's process
+// fires it once, from the host player's copy over the internal channel, at the next pump.
 // Console (host): coop_death_preview [character id, default 0 = the host [death seq]] logs what a death would take now.
 //
 // Skeleton of F3 Task 2; filled by F3 Task 9. Hardcore's new character (F3 Task 10, coop_survival) retires the old one

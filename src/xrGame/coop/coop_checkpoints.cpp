@@ -57,13 +57,15 @@ struct Host
 	checkpoint::HostStore store; // cache of the slots (host numbering) and the changes frame() announces
 	Record arrival; // the host's own arrival point (actor custom data, key `arrival`)
 	xr_set<u16> in_world; // characters whose players were in the world at the last frame (at most kMaxPlayers)
+	bool player_served = false; // F3a T7: the host player was in the world at the last frame (his list went to him)
 	int group_served = -1; // coop_checkpoints_group the players in the world were last served with
 	u64 next_sweep_ms = 0;
 	xr_set<u16> unreadable_told; // R1 M-2: characters whose unreadable record was logged in this world (<= kMaxSlots)
 };
 Host g_host;
 
-// Client: what the host shares, by local id (sources stay in host numbering, get() converts them).
+// A player: what the host shares, by local id (sources stay in host numbering, get() converts them). F3a T7: the host
+// player's copy too (his callbacks come from it); the host's get() reads the store.
 checkpoint::Mirror g_mirror;
 u32 g_mirror_world = 0; // join::world_generation() of the world the mirror belongs to
 
@@ -299,6 +301,7 @@ bool ensure_loaded()
 	g_host.epoch = epoch;
 	g_host.store.clear_cache(); // changes still queued go out (the host's own arrival of the level change)
 	g_host.in_world.clear(); // every player in this world gets the whole list again
+	g_host.player_served = false; // the host player too (F3a T7)
 	g_host.unreadable_told.clear();
 	const std::string level = current_level();
 	g_host.arrival = Record();
@@ -369,10 +372,10 @@ void refresh_all()
 }
 
 // The whole list for one player in the world (checkpoint::HostStore::view_for): what he may see, his own id cleared
-// when he has none.
+// when he has none. F3a T7: the host player's (character 0) over the internal channel.
 void send_view(u16 proxy, bool group, bool clear_others)
 {
-	const PeerId peer = join::peer_of_proxy(proxy);
+	const PeerId peer = survival::peer_of_character(proxy);
 	if (peer == kInvalidPeer)
 		return;
 	for (const checkpoint::Outgoing& o : g_host.store.view_for(proxy, group, clear_others))
@@ -386,16 +389,16 @@ void flush_outbox(bool group)
 		Record cur;
 		if (const Slot* s = slot_of(p.character))
 			cur = s->cur; // the state now: several changes of one frame go out as one
+		// F3a T7: the host player hears it like a client, from his copy (client_on_state): everybody's over the link with
+		// the group view on, his own to him alone otherwise. Nothing is told to the host's Lua from here.
 		if (group)
 			send_state(kInvalidPeer, p.character, p.rollback, cur);
-		else if (p.character != 0)
+		else
 		{
-			const PeerId owner = join::peer_of_proxy(p.character);
+			const PeerId owner = survival::peer_of_character(p.character);
 			if (owner != kInvalidPeer)
 				send_state(owner, p.character, p.rollback, cur);
 		}
-		if (checkpoint::may_see(0, p.character, group)) // on the host, host numbering is local numbering
-			fire_changed(p.character, p.rollback, cur, cur.valid() ? cur.source : kNoSource);
 	}
 }
 
@@ -424,11 +427,6 @@ void host_frame()
 	{
 		::Msg("[coop] checkpoints: the group view is %s", group ? "on" : "off");
 		refresh_all();
-		// R1 M-8: the host's own Lua learns it as the clients do (the others' records, or "none")
-		for (const auto& it : g_host.store.slots())
-			if (it.first != 0)
-				fire_changed(it.first, false, group ? it.second.cur : Record(),
-				    group && it.second.cur.valid() ? it.second.cur.source : kNoSource);
 	}
 	for (u16 proxy : now)
 		if (switched || !g_host.in_world.count(proxy))
@@ -438,6 +436,16 @@ void host_frame()
 			send_view(proxy, group, switched && !group);
 		}
 	g_host.in_world.swap(now);
+	// F3a T7: the host player (character 0, peer 0 over the internal channel) is served as a client is - the whole list
+	// when he comes into the world, again when the group view is switched (R1 M-8: the others' records, or "none").
+	const bool me_now = survival::player_in_world(0);
+	if (me_now && (switched || !g_host.player_served))
+	{
+		if (!switched)
+			slot_of(0);
+		send_view(0, group, switched && !group);
+	}
+	g_host.player_served = me_now;
 	g_host.group_served = int(group);
 	sources::host_frame(now_ms); // F3 Task 7: campfires, tents, mod objects, lost sources; its changes go out below
 	flush_outbox(group);
@@ -459,7 +467,7 @@ void client_sync_world()
 
 void client_on_state(PeerId from, Reader& rd)
 {
-	if (!mgr().is_client() || from != kHostPeer)
+	if (!is_player() || from != kHostPeer)
 		return; // HostOnly: the session kicks a client that sends it
 	client_sync_world();
 	checkpoint::StateMsg m;
@@ -556,8 +564,11 @@ void frame()
 {
 	if (mgr().is_host())
 		host_frame();
-	else if (mgr().is_client())
-		client_sync_world();
+	if (is_player())
+	{
+		client_sync_world(); // F3a T7: the host player's copy too
+		sources::player_frame(); // and his claim goes out over the internal channel
+	}
 }
 
 void print_status()
@@ -575,6 +586,9 @@ void print_status()
 		for (const auto& it : st.slots())
 			::Msg("[coop]   checkpoint of %u: %s | prev %s", it.first, describe(it.second.cur).c_str(),
 			    describe(it.second.prev).c_str());
+		::Msg("[coop]   checkpoints (the host player, over the internal channel): %u known, received %llu (claims "
+		      "refused %llu), malformed %llu",
+		    u32(g_mirror.size()), g_stat.received, g_stat.refusals, g_stat.malformed);
 	}
 	else if (mgr().is_client())
 	{

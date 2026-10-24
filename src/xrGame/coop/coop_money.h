@@ -21,8 +21,13 @@
 // whose change it was, a gift to the receiver. Each is told by the Lua callback coop_money_note on the machine of that
 // player (the host's own too, for a gift to him): ("received", giver_peer, amount) or
 // ("refused", receiver_peer | -1, change, why, cause).
+// F3a T7: the host player is a client of the world server over the internal channel for the transfers: his money_give is
+// a ReqMoney (Transfer) from peer 0, settled by the same ledger, rules and rates as a client's, and every answer to him is
+// a MoneyBalance over the link that tells him its note. His actor's money stays the world's balance of kHostPeer (one
+// object in the process): his other changes are not sent, and a MoneyBalance does not set it.
 // Lua (coop.*):
-//   money_give(peer, amount) -> ok, why    any machine: our money to another player (the host checks it)
+//   money_give(peer, amount) -> ok, why    any machine: our money to another player (the host checks it, the answer comes
+//                                          later as a note)
 //   money_grant(peer, amount) -> ok, why   host: adds (or, negative, takes) money, never below 0
 //   money_set(peer, amount) -> ok, why     host: sets the balance
 //   money_set_rules(enabled, max) -> ok, why  host: the transfer rules between players (F2 T6b); `max` per transfer

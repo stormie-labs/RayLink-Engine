@@ -265,18 +265,12 @@ void fire_note(const ledger::MoneyNote& n)
 		    cb_int(n.amount), cb_str(verdict_name(n.verdict)), cb_str(cause_name(n.cause))});
 }
 
-// The player's balance (and a note about it). The host's own balance is on his screen already, so only the note is
-// told, on this machine (a gift to the host).
+// The player's balance (and a note about it). F3a T7: the host player's too, over the internal channel: his actor holds
+// the balance already (one object in the process), his machine is told the note from it (client_on_balance).
 void send_balance(PeerId to, u32 balance, const ledger::MoneyNote& note = ledger::MoneyNote())
 {
 	if (note.kind != ledger::NoteKind::None)
 		++g_h.notes_sent;
-	if (to == kHostPeer)
-	{
-		if (note.kind == ledger::NoteKind::Received)
-			fire_note(note);
-		return;
-	}
 	ledger::MoneyBalanceMsg m;
 	m.balance = balance;
 	m.acked_seq = g_book.acked(to);
@@ -356,9 +350,11 @@ ledger::Receiver receiver_of(PeerId to)
 	return r;
 }
 
+// A player's change of his money (F3a T7: the host player's from peer 0 over the internal channel - his transfers; his
+// other changes are the world's own, made on his actor directly).
 void host_on_req(PeerId from, Reader& r)
 {
-	if (!mgr().is_host() || from == kHostPeer)
+	if (!mgr().is_host())
 		return;
 	// A change made in a world that was replaced: the client dropped it at SessionReset, the save holds the money.
 	if (sync::host_peer_joining(from) || Device.dwPrecacheFrame)
@@ -455,9 +451,30 @@ void queue_change(s64 delta, Cause cause, PeerId ref)
 	g_cl.pending.push_back({q.seq, q.delta});
 }
 
+// Under g_cl_lock. F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a
+// loop is refused over and over: only one refusal of a cause in a few seconds is told.
+bool note_allowed(const ledger::MoneyNote& n)
+{
+	if (n.kind == ledger::NoteKind::Refused)
+		return g_cl.refusals.allow(n.cause, mgr().now_ms());
+	return n.kind == ledger::NoteKind::Received;
+}
+
+void tell_note(const ledger::MoneyNote& n, bool tell)
+{
+	if (n.kind == ledger::NoteKind::Received && tell)
+		++g_c.gifts;
+	else if (n.kind == ledger::NoteKind::Refused)
+		++(tell ? g_c.refusals : g_c.refusals_muted);
+	if (tell)
+		fire_note(n);
+}
+
+// A player: the host's MoneyBalance. A remote client shows it (ledger::client_view) and is told its note. F3a T7: the
+// host player's actor holds his balance itself (the world wrote it: one object in the process): he is only told the note.
 void client_on_balance(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !(mgr().is_client() || mgr().is_host()))
 		return;
 	ledger::MoneyBalanceMsg m;
 	if (!ledger::read(r, m))
@@ -466,6 +483,17 @@ void client_on_balance(PeerId from, Reader& r)
 		// T6b review M6: the layout of MoneyBalance grew inside protocol 8; a host of an older build sends 8 bytes
 		if (log_allowed())
 			::Msg("! [coop] malformed MoneyBalance from the host: is its build of the game different from ours?");
+		return;
+	}
+	if (mgr().is_host())
+	{
+		++g_c.balances;
+		bool tell = false;
+		{
+			xrCriticalSectionGuard guard(g_cl_lock);
+			tell = note_allowed(m.note);
+		}
+		tell_note(m.note, tell);
 		return;
 	}
 	// Live first: Actor() asserts on GameID(), which has no level in the main menu. Protocol 8 makes a new player's
@@ -500,19 +528,9 @@ void client_on_balance(PeerId from, Reader& r)
 		xrCriticalSectionGuard guard(g_cl_lock);
 		g_cl.anchored = true;
 		g_cl.last = a->get_money();
-		// F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a loop is
-		// refused over and over: only one refusal of a cause in a few seconds is told.
-		if (m.note.kind == ledger::NoteKind::Refused)
-			tell = g_cl.refusals.allow(m.note.cause, mgr().now_ms());
-		else
-			tell = m.note.kind == ledger::NoteKind::Received;
+		tell = note_allowed(m.note);
 	}
-	if (m.note.kind == ledger::NoteKind::Received && tell)
-		++g_c.gifts;
-	else if (m.note.kind == ledger::NoteKind::Refused)
-		++(tell ? g_c.refusals : g_c.refusals_muted);
-	if (tell)
-		fire_note(m.note);
+	tell_note(m.note, tell);
 }
 
 // ---------------------------------------------------------------- Lua
@@ -554,21 +572,26 @@ int done(lua_State* L)
 	return 1;
 }
 
-int host_give(lua_State* L, PeerId to, u32 amount)
+// F3a T7: the host player gives money as a client does - a ReqMoney (Transfer) to his world server over the internal
+// channel, from the next frame (client_flush); the world settles it by the same rules and rates as a client's and
+// answers him with a MoneyBalance (a refusal is his note). His actor's money is the world's balance: nothing is taken
+// here (the world takes it when it settles), only checked.
+int host_player_give(lua_State* L, PeerId to, u32 amount)
 {
 	if (to == kHostPeer)
 		return refuse(L, "yourself");
+	if (!mgr().session().peer(to))
+		return refuse(L, "no such player");
 	u32 balance = 0;
 	if (!read_balance(holder_of(kHostPeer), balance))
 		return refuse(L, "no character");
-	u32 credit = 0;
-	const Verdict v = ledger::check_transfer(kHostPeer, receiver_of(to), -s64(amount), balance, credit, policy());
-	if (v != Verdict::Applied)
-		return refuse(L, v == Verdict::Malformed ? "no such player" : verdict_name(v));
-	WorldBalances world;
-	world.giver = kHostPeer;
-	ledger::settle_transfer(world, kHostPeer, balance, to, credit); // giver first (review round 2)
-	++g_h.transfers;
+	if (balance < amount)
+		return refuse(L, verdict_name(Verdict::Insufficient));
+	xrCriticalSectionGuard guard(g_cl_lock);
+	const s32 delta = s32(-_min(s64(amount), s64(INT_MAX))); // as queue_change: out of range is refused there
+	const ledger::MoneyReq q{++g_cl_seq, delta, Cause::Transfer, to}; // no pending: there is no view to correct
+	g_cl.outbox.push_back(q);
+	++g_c.gives;
 	return done(L);
 }
 
@@ -610,7 +633,7 @@ int l_money_give(lua_State* L)
 	s64 amount = 0;
 	if (!arg_peer(L, 1, to) || !arg_int(L, 2, 1.0, double(max_money()), amount))
 		return refuse(L, "bad arguments");
-	return mgr().is_host() ? host_give(L, to, u32(amount)) : client_give(L, to, u32(amount));
+	return mgr().is_host() ? host_player_give(L, to, u32(amount)) : client_give(L, to, u32(amount));
 }
 
 // coop.money_grant(peer, amount) -> ok, why: host; a negative amount takes money (never below 0).
@@ -724,7 +747,7 @@ void on_session_started()
 
 void frame()
 {
-	if (mgr().is_live_client())
+	if (mgr().is_live_client() || mgr().is_host()) // F3a T7: the host player's transfers go out too
 		client_flush();
 }
 
@@ -788,6 +811,9 @@ void print_status()
 			    it.first, nick_of(it.first), host_balance(it.first), it.second, holder, saved ? "from the save" : "new",
 			    shown(a ? &a->script : nullptr, p.script_gain_burst), shown(a ? &a->dialog : nullptr, p.dialog_gain_cap));
 		}
+		::Msg("[coop]   money (the host player, over the internal channel): transfers asked %llu, sent %llu, balances in "
+		      "%llu; told: %llu gifts, %llu refusals (%llu muted)",
+		    g_c.gives, g_c.sent, g_c.balances, g_c.gifts, g_c.refusals, g_c.refusals_muted);
 		return;
 	}
 	if (!mgr().is_client())
@@ -878,7 +904,7 @@ void client_on_actor_money(u32 money)
 
 void client_flush()
 {
-	if (!mgr().is_live_client())
+	if (!mgr().is_live_client() && !mgr().is_host())
 		return;
 	xr_vector<ledger::MoneyReq> out;
 	{

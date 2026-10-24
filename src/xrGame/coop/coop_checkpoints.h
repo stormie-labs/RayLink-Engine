@@ -2,6 +2,8 @@
 // checkpoint (campfire, own tent, rest place, level arrival, story event); death sends him back to it and never rolls
 // the world back. The host keeps them by character and decides every change; a client only reports (CheckpointClaim)
 // and mirrors what the host sends (CheckpointState). Record format and rules: xrCoop/coop_checkpoint_rules.h.
+// F3a T7: so does the host player, over the internal channel (peer 0): his claims are CheckpointClaim, his callbacks come
+// from his copy of CheckpointState at the next pump; the host's get() reads the store.
 //
 // Store (F3 Task 6): one slot (current and previous camp) per character, in host numbering (0 = the host's actor, else
 // a player's character). Until the player scope of F2 has a C++ API the slot lives in the character's custom data

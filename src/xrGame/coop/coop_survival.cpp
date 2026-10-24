@@ -190,7 +190,11 @@ death::Rules console_rules()
 	return r;
 }
 
-death::Rules g_rules; // in force: host = console, client = last PlayerRules from the host
+// F3a T7: two copies, as a listen server has them. g_world_rules are the world server's (its console; its decisions use
+// them, it sends them as PlayerRules); g_rules are this machine's player's: the world server's last PlayerRules - the host
+// player takes them over the internal channel like a client - and the console's own until they come.
+death::Rules g_world_rules; // the world server's (the host's process)
+death::Rules g_rules; // this machine's player's
 bool g_rules_from_host = false;
 
 // ---------------------------------------------------------------- state
@@ -216,6 +220,7 @@ struct Local
 	Fvector respawn_pos{};
 	checkpoint::Kind respawn_kind = checkpoint::Kind::None;
 	u64 respawn_at = 0;
+	bool respawn_fresh = false; // F3a T7: the respawn is a new character after a hardcore run (apply_respawn)
 	// give up while wounded (armed once USE was seen released after the fall)
 	u64 giveup_start = 0;
 	bool giveup_armed = false;
@@ -268,6 +273,7 @@ struct HostRec
 	xr_vector<u16> worn;
 	u16 ordered_seq = death::kNoSeq; // a respawn order for this fall is out (cleared by any report but Alive, and by a leave)
 	bool debt = false; // the respawn debt as last read / written (coop_status only: the world keeps the real one)
+	u16 reported_seq = death::kNoSeq; // F3a T7: the fall of his last report (the order of his new character names it)
 };
 xr_map<u16, HostRec> g_host;
 // F3 Task 10: characters out of a hardcore run that retire, their things on the way into a stash (death::retire_step).
@@ -701,8 +707,8 @@ void write_worn(Writer& w, CActor& a)
 	death::write_worn(w, ids); // the first death::kMaxWornIds
 }
 
-void host_on_state(u16 id, Life life, u16 seq);
-
+// My life to the world server, which decides on it and relays it to the others. F3a T7: the host player's too, over the
+// internal channel (net::client_send in the host's process): the world takes his report as a client's, at the next pump.
 void send_my_state(u64 t)
 {
 	g_me.last_sent = t;
@@ -712,34 +718,22 @@ void send_my_state(u64 t)
 	const u32 left = g_me.life == Life::Wounded && g_me.bleed_end > t ? u32(g_me.bleed_end - t) : 0;
 	Writer w(32);
 	write_state(w, id, g_me.life, g_me.seq, left, mgr().nick());
-	if (mgr().is_host())
-	{
-		net::host_broadcast(Msg::PlayerWounded, w);
-		host_on_state(0, g_me.life, g_me.seq);
-	}
-	else
-	{
-		if (g_me.life == Life::Dead && g_me.actor)
-			write_worn(w, *g_me.actor); // the host takes the death's losses on this report (no actor: no list)
-		net::client_send(Msg::PlayerWounded, w);
-	}
+	// A client's proxy does not show the world what he wears (Ruling F3-4): the losses of his death read this list. The
+	// host's actor is the world's own object: its slots and belt are read there (no actor: no list).
+	if (g_me.life == Life::Dead && g_me.actor && is_mirror())
+		write_worn(w, *g_me.actor);
+	net::client_send(Msg::PlayerWounded, w);
 	++g_stat.states_out;
 }
 
 void apply_order(u8 op, Reader& r);
 void stop_revive_hold(bool notify);
 
-// Host: deliver an order to the owner of `target` (the host itself: applied at once).
+// Host: an order to the owner of `target`. F3a T7: the host player's goes over the internal channel like a client's and is
+// applied by his handler at the next pump (client_on_revive), never here.
 void host_send_order(u16 target, const Writer& w)
 {
-	if (target == 0)
-	{
-		Reader r(w.ptr(), w.size());
-		const u8 op = r.u8();
-		apply_order(op, r);
-		return;
-	}
-	const PeerId peer = join::peer_of_proxy(target);
+	const PeerId peer = peer_of_character(target);
 	if (peer != kInvalidPeer)
 		net::host_send(peer, Msg::PlayerRevive, w);
 }
@@ -883,10 +877,14 @@ void apply_evacuate(u16 seq, u32 delay_ms)
 // evacuation is over; an Alive one when it came back to the world while dead (a rejoin, a world change) and the
 // host still owes it the respawn (its seq is the one it reported alive). The items were taken once, by the host,
 // when the death was decided.
+// F3a T7: a Spectating owner gets it only as his new character after a hardcore run (Ruling F3-7: out of the run he is
+// never respawned): the host player's, whose actor stays in the world (host_order_new_life; a client's new character
+// comes by a new join instead). Nothing of the death is charged then (no wear, no coop_respawned).
 void apply_respawn(u16 seq, const Fvector& pos, checkpoint::Kind kind)
 {
 	CActor* a = local_actor();
-	if (!a || (g_me.life != Life::Dead && g_me.life != Life::Alive) || seq != g_me.seq)
+	const bool fresh = g_me.life == Life::Spectating;
+	if (!a || (g_me.life != Life::Dead && g_me.life != Life::Alive && !fresh) || seq != g_me.seq)
 	{
 		++g_stat.stale_orders;
 		return;
@@ -897,16 +895,38 @@ void apply_respawn(u16 seq, const Fvector& pos, checkpoint::Kind kind)
 		close_menus();
 		hold_controls(a); // as every Respawning frame (local_frame); the camera stays where it is
 	}
+	if (fresh)
+	{
+		g_me.spectate = 0xffff;
+		g_me.newchar_start = 0;
+		g_me.newchar_armed = false;
+		g_me.newchar_asked = 0;
+	}
 	g_me.life = Life::Respawning;
 	g_hook_life.store(u8(Life::Respawning));
 	g_me.since = t;
 	g_me.respawn_pos = pos;
 	g_me.respawn_kind = kind;
 	g_me.respawn_at = t + kRespawnSettleMs;
-	const u32 worn = wear_worn_items(a, g_rules.wear_pct);
+	g_me.respawn_fresh = fresh;
+	const u32 worn = fresh ? 0 : wear_worn_items(a, g_rules.wear_pct);
 	if (worn)
 		::Msg("[coop] death wear: %u worn item(s) lose %u%% condition", worn, u32(g_rules.wear_pct));
 	send_my_state(t);
+}
+
+// F3a T7: the host player's new character after a hardcore run, ordered by the world server (host_order_new_life): his
+// actor stands up where the order says as a fresh one - health 1 (up to his maximum), no radiation, no bleeding, fed and
+// rested, controls back; his money is 0 already (the world set it). The world's Lua offers him faction and kit.
+void finish_new_life(CActor* a, u64 t)
+{
+	CActorCondition& c = a->conditions();
+	c.SetSatiety(1.f);
+	c.SetPower(1.f);
+	stand_up(a, 1.f, true, t); // Alive goes out: the world's tracker starts over with it
+	::Msg("[coop] my new character stands up at (%.1f, %.1f, %.1f)", g_me.respawn_pos.x, g_me.respawn_pos.y,
+	    g_me.respawn_pos.z);
+	feed("A new character. Choose faction and gear.");
 }
 
 void finish_respawn(CActor* a, u64 t)
@@ -914,6 +934,12 @@ void finish_respawn(CActor* a, u64 t)
 	Fmatrix m = a->XFORM();
 	m.c.set(g_me.respawn_pos);
 	a->ForceTransform(m);
+	if (g_me.respawn_fresh)
+	{
+		g_me.respawn_fresh = false;
+		finish_new_life(a, t);
+		return;
+	}
 	++g_stat.respawns;
 	const checkpoint::Kind kind = g_me.respawn_kind;
 	const u16 seq = g_me.seq; // the fall this respawn answers (apply_respawn took it from the host's order)
@@ -1200,7 +1226,7 @@ bool host_order_respawn(u16 id, u16 seq)
 	if (!body)
 		return false;
 	HostRec& h = g_host[id];
-	h.ordered_seq = seq; // before the order: the host's own Respawning comes back inside host_send_order and clears it
+	h.ordered_seq = seq; // before the order: the owner's Respawning report clears it (the host player's too, F3a T7)
 	Fvector pos;
 	checkpoint::Kind kind = checkpoint::Kind::None;
 	if (!checkpoints::host_respawn_point(id, h.has_anchor ? &h.anchor : nullptr, body->Position(), pos, kind))
@@ -1221,22 +1247,24 @@ bool host_order_respawn(u16 id, u16 seq)
 
 // The host's answer to a death (death::Tracker: once per death). Checkpoint: the items (coop_death, by
 // coop_death_drop) and the money go now, the owner is evacuated for coop_respawn_delay, host_frame respawns him.
-// Hardcore: he is out and watches. The host's own actor (0) takes the same path: host_send_order applies to itself.
+// Hardcore: he is out and watches. The host player (character 0) takes the same path: his orders go to him over the
+// internal channel (F3a T7).
 death::Action host_on_died(u16 id, u16 seq)
 {
 	HostRec& h = g_host[id];
-	const death::Action a = death::on_died(h.tracker, seq, now(), g_rules);
+	const death::Action a = death::on_died(h.tracker, seq, now(), g_world_rules);
 	switch (a)
 	{
 	case death::Action::None: return a; // decided already (state repeats are normal)
 	case death::Action::Spectate: host_order_spectate(id, seq); break;
 	case death::Action::LossesAndEvacuate:
 	{
-		const u32 items = death::host_apply_losses(id, seq, g_rules.drop, g_rules.share_pct);
-		const u32 money = death::host_take_money(id, g_rules.money_pct);
+		const u32 items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
+		const u32 money = death::host_take_money(id, g_world_rules.money_pct);
 		::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(),
-		    seq, items, death::drop_name(g_rules.drop), u32(g_rules.share_pct), money, g_rules.delay_ms / 1000);
-		host_order_evacuate(id, seq, g_rules.delay_ms);
+		    seq, items, death::drop_name(g_world_rules.drop), u32(g_world_rules.share_pct), money,
+		    g_world_rules.delay_ms / 1000);
+		host_order_evacuate(id, seq, g_world_rules.delay_ms);
 		break;
 	}
 	}
@@ -1244,13 +1272,14 @@ death::Action host_on_died(u16 id, u16 seq)
 	return a;
 }
 
-// Every life report of a character's owner (the host's own too). The respawn debt follows the report
-// (death::debt_after_report) and is kept in the world, and so is "out of a hardcore run" (F3 Task 10); an Alive report
-// is answered by death::on_alive_report: a respawn owed after a leave or a world change (Review Focus 1 / 2), a hardcore
-// spectator sent back to watching (Ruling F3-7) until he starts a new character.
+// Every life report of a character's owner (the host player's too, over the internal channel). The respawn debt follows
+// the report (death::debt_after_report) and is kept in the world, and so is "out of a hardcore run" (F3 Task 10); an
+// Alive report is answered by death::on_alive_report: a respawn owed after a leave or a world change (Review Focus 1 /
+// 2), a hardcore spectator sent back to watching (Ruling F3-7) until he starts a new character.
 void host_on_state(u16 id, Life life, u16 seq)
 {
 	HostRec& h = g_host[id];
+	h.reported_seq = seq;
 	if (life != Life::Wounded)
 		h.hold.close(); // nobody holds him any more (stood up, or bled out)
 	// F3 Task 10 (T8 review): the world's word on "out" first; a death of an out character then costs nothing again
@@ -1289,18 +1318,8 @@ void host_on_state(u16 id, Life life, u16 seq)
 	}
 }
 
-// The host's answer to the reviver: himself (applied at once) or a client over the net.
-void host_answer(PeerId reply_to, const Writer& w)
-{
-	if (reply_to == kHostPeer)
-	{
-		Reader r(w.ptr(), w.size());
-		const u8 op = r.u8();
-		apply_order(op, r);
-	}
-	else
-		net::host_send(reply_to, Msg::PlayerRevive, w);
-}
+// The host's answer to the reviver's peer: a client over the net, the host player over the internal channel (F3a T7).
+void host_answer(PeerId reply_to, const Writer& w) { net::host_send(reply_to, Msg::PlayerRevive, w); }
 
 void host_refuse(PeerId reply_to, u16 target, u8 reason)
 {
@@ -1388,8 +1407,8 @@ void host_on_revive_request(u16 reviver, PeerId reply_to, u16 target, u16 seq, u
 	w.u16(target);
 	w.u16(seq);
 	w.u16(reviver);
-	w.f32(g_rules.revive_health);
-	w.u32(reviver == 0 ? kHostPeer : join::peer_of_proxy(reviver));
+	w.f32(g_world_rules.revive_health);
+	w.u32(peer_of_character(reviver));
 	w.str(i_obj->cNameSect().c_str());
 	host_send_order(target, w);
 	// HUD v2: the reviver is told it went through (Lua coop_revive_done: the sound, the flash)
@@ -1430,7 +1449,7 @@ void host_on_revive_begin(u16 reviver, PeerId reply_to, const revive::BeginMsg& 
 	out.target = m.target;
 	out.seq = m.seq;
 	out.reviver = reviver;
-	out.reviver_peer = reviver == 0 ? kHostPeer : join::peer_of_proxy(reviver);
+	out.reviver_peer = peer_of_character(reviver);
 	out.total_ms = revive::kHoldMs;
 	out.held_ms = m.held_ms;
 	Writer w(24);
@@ -1465,9 +1484,9 @@ void host_drop_reviver(u16 reviver)
 
 // ---------------------------------------------------------------- hardcore: a new character (F3 Task 10)
 
-// Where the host's new character stands up: his arrival point on this level (coop_checkpoints keeps it in the actor's
-// custom data, F3 Task 6), else where a respawn would put him (his camp, the previous one, where he stands).
-Fvector host_new_place(CActor* a, const char*& where)
+// Where the host player's new character stands up: his arrival point on this level (coop_checkpoints keeps it in the
+// actor's custom data, F3 Task 6), else where a respawn would put him (his camp, the previous one, where he stands).
+Fvector host_new_place(const Fvector& stands, const char*& where, checkpoint::Kind& kind)
 {
 	const CSE_Abstract* e = character_entity(0);
 	checkpoint::Record r;
@@ -1475,47 +1494,55 @@ Fvector host_new_place(CActor* a, const char*& where)
 	    r.valid() && r.level == Level().name().c_str())
 	{
 		where = "his arrival point";
+		kind = checkpoint::Kind::Arrival;
 		return Fvector().set(r.pos[0], r.pos[1], r.pos[2]);
 	}
-	Fvector pos = a->Position();
-	checkpoint::Kind kind = checkpoint::Kind::None;
-	checkpoints::host_respawn_point(0, nullptr, a->Position(), pos, kind);
+	Fvector pos = stands;
+	kind = checkpoint::Kind::None;
+	checkpoints::host_respawn_point(0, nullptr, stands, pos, kind);
 	where = kind == checkpoint::Kind::None ? "where he stands (no arrival point on this level)" : checkpoint::kind_name(kind);
 	return pos;
 }
 
-// Step 4, the host's own new character, his things in the stash now (host_retire_frame): the actor stands up at his
-// arrival point as a fresh one - health 1, no radiation, no bleeding, fed, rested, 0 RU - out of the run no more, and the
-// host's Lua (coop_menu_char) lets him choose faction and kit: coop_host_new_character(). He is his own authority.
-void host_finish_own(u64 t)
+// Step 4 for the host player's character (0), his things in the stash now (host_retire_frame). His actor stays in the
+// world (a client's new character comes by a new join instead), so the world starts it over: not out, no death decided,
+// nothing owed, 0 RU (money::host_set: his balance goes to him over the internal channel), and orders his owner, over the
+// internal channel like any order (F3a T7), to stand up at his arrival point as a fresh one: a Respawn to his spectating
+// owner (apply_respawn, finish_new_life). The world's Lua (coop_menu_char) offers him faction and kit:
+// coop_host_new_character() (menu.char_offer to peer 0). False when his actor is not here.
+bool host_order_new_life(u16 character)
 {
-	CActor* a = local_actor();
-	if (!a)
-		return;
-	HostRec& h = g_host[0];
+	CGameObject* body = object_here(character);
+	if (!body)
+		return false;
+	HostRec& h = g_host[character];
+	const u16 seq = h.reported_seq; // the fall he is out at: the order must name it
 	h.tracker = death::Tracker(); // a new character: not out, no death decided, nothing owed
 	h.ordered_seq = death::kNoSeq;
 	h.has_worn = false;
 	h.has_anchor = false; // the anchor is where this character is first seen alive
 	h.debt = false;
-	flag_write(0, kOutKey, false); // before stand_up: its Alive report reads the world's word (learn_out)
-	flag_write(0, kDebtKey, false);
+	flag_write(character, kOutKey, false); // before his Alive report: it reads the world's word (learn_out)
+	flag_write(character, kDebtKey, false);
 	const char* where = "";
-	Fvector pos = host_new_place(a, where);
+	checkpoint::Kind kind = checkpoint::Kind::None;
+	Fvector pos = host_new_place(body->Position(), where, kind);
 	pos.y += kRespawnLift;
-	Fmatrix m = a->XFORM();
-	m.c.set(pos);
-	a->ForceTransform(m);
-	CActorCondition& c = a->conditions();
-	c.SetSatiety(1.f);
-	c.SetPower(1.f);
-	if (!money::host_set(kHostPeer, 0, "new character"))
-		::Msg("! [coop] new character of the host: his money is not set to 0 (no balance to write)");
-	stand_up(a, 1.f, true, t); // health 1 (up to his maximum), radiation 0, bleeding gone, controls back; Alive goes out
-	::Msg("[coop] the host starts a new character at %s (%.1f, %.1f, %.1f)", where, pos.x, pos.y, pos.z);
-	feed("A new character. Choose faction and gear.");
+	if (!money::host_set(peer_of_character(character), 0, "new character"))
+		::Msg("! [coop] new character of %s: his money is not set to 0 (no balance to write)", nick_of(character).c_str());
+	Writer w(24);
+	w.u8(OpRespawn);
+	w.u16(character);
+	w.u16(seq);
+	const float p[3] = {pos.x, pos.y, pos.z};
+	w.vec3(p);
+	w.u8(u8(kind));
+	host_send_order(character, w);
+	::Msg("[coop] %s starts a new character at %s (%.1f, %.1f, %.1f), fall #%u", nick_of(character).c_str(), where, pos.x,
+	    pos.y, pos.z, seq);
 	// Ruling F3-10: kit 1 only with coop_hardcore_new_kit on; else he starts with nothing (the window offers a faction only)
 	script::queue_callback("coop_host_new_character", {script::cb_int(death::host_new_kit() ? 1 : 0)});
+	return true;
 }
 
 // Step 2 for a client's character, his stash done (host_retire_frame): the key goes from his custom data and
@@ -1581,7 +1608,8 @@ bool host_release_step(u16 character, Retirement& r, u64 t)
 // key is off; changing either before it is filled leaves it without an owner, the things stay on the old character and
 // go with him. Fix round 1, I1: a client's character whose stash gave up, or who still carries world items
 // (death::host_items_on, the server's word), is not retired at all - he stays out with his things and may ask again.
-// Only then step 2 (a client's character, then host_release_step) or step 4 (the host's own) goes on.
+// Only then step 2 (a client's character, then host_release_step) or step 4 (the host player's, host_order_new_life)
+// goes on.
 void host_retire_frame(u64 t)
 {
 	for (auto it = g_retire.begin(); it != g_retire.end();)
@@ -1615,8 +1643,8 @@ void host_retire_frame(u64 t)
 		case death::RetireStep::Finish:
 			if (!client)
 			{
-				host_finish_own(t);
-				++g_stat.retired;
+				if (host_order_new_life(character))
+					++g_stat.retired;
 				break;
 			}
 			if (host_finish_client(character))
@@ -1633,7 +1661,7 @@ void host_retire_frame(u64 t)
 	}
 }
 
-// Steps 2 and 4: the owner of `character` (0: the host himself) asks for a new character. The tracker, with the world's
+// Steps 2 and 4: the owner of `character` (0: the host player) asks for a new character. The tracker, with the world's
 // word (learn_out), must say he is out of the hardcore run; then everything he has - worn and quest items included - goes
 // into a stash at the body (DeathMarker when it is in), and the rest waits for it (host_retire_frame). He must be in the
 // world: a character that is not online here has nothing moved, and his release would take his things with him. Ruling
@@ -1674,7 +1702,7 @@ void host_new_character(u16 character)
 void host_broadcast_rules()
 {
 	Writer w(16);
-	g_rules.write(w);
+	g_world_rules.write(w);
 	net::host_broadcast(Msg::PlayerRules, w);
 }
 
@@ -1699,10 +1727,10 @@ void host_frame(u64 t)
 	}
 
 	const death::Rules r = console_rules();
-	if (!(r == g_rules))
+	if (!(r == g_world_rules))
 	{
-		const bool mode_changed = r.mode != g_rules.mode;
-		g_rules = r;
+		const bool mode_changed = r.mode != g_world_rules.mode;
+		g_world_rules = r;
 		host_broadcast_rules();
 		if (mode_changed)
 			feed("Death mode: %s.", mode_name(r.mode));
@@ -1733,7 +1761,7 @@ void host_frame(u64 t)
 
 	host_retire_frame(t); // F3 Task 10: retirements whose stash is done
 
-	// evacuations that are over (orders after the walk: the host's own respawn re-enters host_on_state)
+	// evacuations that are over (orders after the walk: an order may touch the records)
 	xr_vector<u16> due;
 	for (auto& it : g_host)
 		if (death::due(it.second.tracker, t))
@@ -1788,101 +1816,120 @@ void host_read_worn(u16 proxy, u16 seq, Reader& r)
 	++g_stat.worn_reports;
 }
 
-void on_state_msg(PeerId from, Reader& r)
+// The world server: a player's life report (F3a T7: the host player's comes over the internal channel from peer 0). His
+// character is the one of his peer, never the id he claims; the report is decided on (host_on_state) and relayed to the
+// others. A remote player's record is kept here (apply_remote_state: the world's view, which is the host player's view of
+// him too: one process); the host player's own life is g_me, which his report comes from.
+void server_on_state(PeerId from, Reader& r)
 {
-	u16 id = r.u16();
+	r.u16(); // the id a player claims: never trusted
+	const u8 life = r.u8();
+	const u16 seq = r.u16();
+	const u32 left = r.u32();
+	const std::string nick = r.str();
+	if (!r.ok() || life > u8(Life::Respawning) || !mgr().is_host())
+		return;
+	const u16 id = character_of_peer(from);
+	if (id == 0xffff)
+		return;
+	const PeerInfo* p = mgr().session().peer(from);
+	const xr_string name = p ? p->nick.c_str() : nick.c_str();
+	if (Life(life) == Life::Dead)
+		host_read_worn(id, seq, r); // before the decision: the losses of this death read it
+	if (id != 0)
+		apply_remote_state(id, Life(life), seq, left, name.c_str());
+	host_on_state(id, Life(life), seq);
+	Writer w(32);
+	write_state(w, id, Life(life), seq, left, name.c_str());
+	net::host_broadcast(Msg::PlayerWounded, w, Lane::Reliable, from);
+}
+
+// A client: the world server's relay of another player's life. F3a T7: in the host's process the world server applied
+// it already (server_on_state: one record of every player in the process), so the host player's copy is not applied
+// twice: only a remote client (a mirror) takes it.
+void client_on_state(PeerId from, Reader& r)
+{
+	const u16 id = r.u16();
 	const u8 life = r.u8();
 	const u16 seq = r.u16();
 	const u32 left = r.u32();
 	const std::string nick = r.str();
 	if (!r.ok() || life > u8(Life::Respawning))
 		return;
-	if (mgr().is_host())
-	{
-		id = join::proxy_of_peer(from); // never trust the id a client claims
-		if (id == 0xffff)
-			return;
-		const PeerInfo* p = mgr().session().peer(from);
-		const xr_string name = p ? p->nick.c_str() : nick.c_str();
-		if (Life(life) == Life::Dead)
-			host_read_worn(id, seq, r); // before the decision: the losses of this death read it
-		apply_remote_state(id, Life(life), seq, left, name.c_str());
-		host_on_state(id, Life(life), seq);
-		Writer w(32);
-		write_state(w, id, Life(life), seq, left, name.c_str());
-		net::host_broadcast(Msg::PlayerWounded, w, Lane::Reliable, from);
-		return;
-	}
 	if (!mgr().is_live_client() || from != kHostPeer || id == my_host_id())
 		return; // our own state is ours
 	apply_remote_state(id, Life(life), seq, left, nick.c_str());
 }
 
-void on_revive_msg(PeerId from, Reader& r)
+// The world server: a reviver's request, hold or cancel (F3a T7: the host player's over the internal channel).
+void server_on_revive(PeerId from, Reader& r)
 {
 	const u8 op = r.u8();
-	if (!r.ok())
+	if (!r.ok() || !mgr().is_host() || !revive::is_client_op(op))
+		return; // orders come only from the world server
+	const u16 reviver = character_of_peer(from);
+	if (reviver == 0xffff)
 		return;
-	if (mgr().is_host())
+	switch (op)
 	{
-		if (!revive::is_client_op(op))
-			return; // orders come only from the host
-		const u16 reviver = join::proxy_of_peer(from);
-		if (reviver == 0xffff)
+	case OpRequest:
+	{
+		const u16 target = r.u16();
+		const u16 seq = r.u16();
+		const u16 item = r.u16();
+		if (!r.ok())
 			return;
-		switch (op)
-		{
-		case OpRequest:
-		{
-			const u16 target = r.u16();
-			const u16 seq = r.u16();
-			const u16 item = r.u16();
-			if (!r.ok())
-				return;
-			host_on_revive_request(reviver, from, target, seq, item);
-			break;
-		}
-		case OpBegin:
-		{
-			revive::BeginMsg m;
-			if (m.read(r))
-				host_on_revive_begin(reviver, from, m);
-			break;
-		}
-		case OpCancel:
-		{
-			revive::CancelMsg m;
-			if (m.read(r))
-				host_on_revive_cancel(reviver, m.target, m.seq);
-			break;
-		}
-		default: break;
-		}
-		return;
+		host_on_revive_request(reviver, from, target, seq, item);
+		break;
 	}
-	if (mgr().is_live_client() && from == kHostPeer && !revive::is_client_op(op))
+	case OpBegin:
+	{
+		revive::BeginMsg m;
+		if (m.read(r))
+			host_on_revive_begin(reviver, from, m);
+		break;
+	}
+	case OpCancel:
+	{
+		revive::CancelMsg m;
+		if (m.read(r))
+			host_on_revive_cancel(reviver, m.target, m.seq);
+		break;
+	}
+	default: break;
+	}
+}
+
+// A player: the world server's order to his owner (F3a T7: the host player takes his over the internal channel).
+void client_on_revive(PeerId from, Reader& r)
+{
+	const u8 op = r.u8();
+	if (r.ok() && live() && from == kHostPeer && !revive::is_client_op(op))
 		apply_order(op, r);
 }
 
-// Host, F3 Task 10 step 2: Msg::NewCharacter (no payload; bytes after are a newer client's) from a client out of a
-// hardcore run. His character is the one of his peer, never an id he names.
+// The world server, F3 Task 10 step 2: Msg::NewCharacter (no payload; bytes after are a newer client's) from a player out
+// of a hardcore run (F3a T7: the host player's over the internal channel). His character is the one of his peer, never
+// an id he names.
 void on_new_character_msg(PeerId from, Reader&)
 {
 	if (!mgr().is_host())
 		return; // ClientOnly: the session refuses it from the host before any handler
-	const u16 proxy = join::proxy_of_peer(from);
-	if (proxy == 0xffff)
+	const u16 character = character_of_peer(from);
+	if (character == 0xffff)
 	{
 		++g_stat.newchar_refused;
 		::Msg("! [coop] NewCharacter from #%u refused: no character of his in this world", from);
 		return;
 	}
-	host_new_character(proxy);
+	host_new_character(character);
 }
 
+// A player: the world server's rules (F3a T7: the host player takes them over the internal channel like a client; the
+// world server's own are g_world_rules).
 void on_rules_msg(PeerId from, Reader& r)
 {
-	if (mgr().is_host() || from != kHostPeer)
+	if (!is_player() || from != kHostPeer)
 		return;
 	death::Rules rules = g_rules;
 	if (!rules.read(r))
@@ -1899,13 +1946,9 @@ void on_rules_msg(PeerId from, Reader& r)
 
 // ---------------------------------------------------------------- per-frame parts
 
+// The reviver's requests go to the world server: F3a T7, the host player's over the internal channel like a client's.
 void send_revive_request(u16 target_host, u16 seq, u16 item)
 {
-	if (mgr().is_host())
-	{
-		host_on_revive_request(0, kHostPeer, target_host, seq, item);
-		return;
-	}
 	Writer w(8);
 	w.u8(OpRequest);
 	w.u16(target_host);
@@ -1923,11 +1966,6 @@ void send_revive_begin(u16 target_host, u16 seq, u16 item, u32 held_ms)
 	m.seq = seq;
 	m.item = item;
 	m.held_ms = u16(_min(held_ms, u32(0xffff)));
-	if (mgr().is_host())
-	{
-		host_on_revive_begin(0, kHostPeer, m);
-		return;
-	}
 	Writer w(12);
 	m.write(w);
 	net::client_send(Msg::PlayerRevive, w);
@@ -1935,11 +1973,6 @@ void send_revive_begin(u16 target_host, u16 seq, u16 item, u32 held_ms)
 
 void send_revive_cancel(u16 target_host, u16 seq)
 {
-	if (mgr().is_host())
-	{
-		host_on_revive_cancel(0, target_host, seq);
-		return;
-	}
 	revive::CancelMsg m;
 	m.target = target_host;
 	m.seq = seq;
@@ -2070,10 +2103,7 @@ bool request_new_character(u64 t)
 	g_me.newchar_armed = false;
 	++g_stat.newchar_asked;
 	::Msg("[coop] asking for a new character");
-	if (mgr().is_host())
-		host_new_character(0);
-	else
-		net::client_send(Msg::NewCharacter, Writer());
+	net::client_send(Msg::NewCharacter, Writer()); // F3a T7: the host player's over the internal channel
 	return true;
 }
 
@@ -2542,6 +2572,33 @@ xr_string nick_of(u16 host_id)
 	return "?";
 }
 
+u16 character_of_peer(PeerId peer)
+{
+	if (!mgr().is_host())
+		return 0xffff;
+	if (peer == kHostPeer)
+		return mgr().session().local() ? u16(0) : u16(0xffff); // the host player, over the internal channel
+	return join::proxy_of_peer(peer);
+}
+
+PeerId peer_of_character(u16 character)
+{
+	if (!mgr().is_host() || character == 0xffff)
+		return kInvalidPeer;
+	if (character == 0)
+		return mgr().session().local() ? kHostPeer : kInvalidPeer;
+	return join::peer_of_proxy(character);
+}
+
+bool player_in_world(u16 character)
+{
+	if (!mgr().is_host() || character == 0xffff)
+		return false;
+	if (character == 0)
+		return mgr().session().local() && g_pGameLevel && local_actor();
+	return join::host_player_in_world(character);
+}
+
 Life life_of(u16 local_id)
 {
 	if (local_id == 0)
@@ -2636,17 +2693,19 @@ bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 	return true;
 }
 
+// F3a T7: PlayerWounded and PlayerRevive go both ways (Either): each side has its own function, so that the host
+// player's copy on the internal channel never runs the world server's part.
 void install_server(Session& s)
 {
-	s.on(Msg::PlayerWounded, &on_state_msg);
-	s.on(Msg::PlayerRevive, &on_revive_msg);
+	s.on(Msg::PlayerWounded, &server_on_state);
+	s.on(Msg::PlayerRevive, &server_on_revive);
 	s.on(Msg::NewCharacter, &on_new_character_msg); // F3 Task 10
 }
 
 void install_client(Endpoint& e)
 {
-	e.on(Msg::PlayerWounded, &on_state_msg);
-	e.on(Msg::PlayerRevive, &on_revive_msg);
+	e.on(Msg::PlayerWounded, &client_on_state);
+	e.on(Msg::PlayerRevive, &client_on_revive);
 	e.on(Msg::PlayerRules, &on_rules_msg);
 }
 
@@ -2670,6 +2729,7 @@ void reset()
 {
 	leave_session();
 	g_rules = console_rules();
+	g_world_rules = g_rules;
 	g_epoch = 0xffffffff;
 	g_last_roster = g_last_guard = 0;
 	g_feed.clear();
@@ -2687,8 +2747,8 @@ void frame()
 	const u64 t = now();
 	if (mgr().is_host())
 		host_frame(t);
-	else if (!g_rules_from_host)
-		g_rules = console_rules(); // until the host's rules arrive
+	if (!g_rules_from_host)
+		g_rules = console_rules(); // until the world server's rules arrive (F3a T7: the host player's too, over the link)
 
 	CActor* a = local_actor();
 	if (a != g_me.actor)
@@ -2722,12 +2782,13 @@ void frame()
 
 void print_status()
 {
+	const death::Rules& shown = rules(); // the world server's on the host, the player's copy on a client
 	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, drop %s (share %u%%), bleed-out %u s, revive health "
 	      "%.2f, respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
-	    life_name(g_me.life), g_me.seq, mode_name(g_rules.mode),
-	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", death::drop_name(g_rules.drop),
-	    u32(g_rules.share_pct), g_rules.bleedout_ms / 1000, g_rules.revive_health, g_rules.delay_ms / 1000,
-	    g_rules.contusion_s, u32(g_rules.money_pct), u32(g_rules.wear_pct), u32(g_rules.rank_pct));
+	    life_name(g_me.life), g_me.seq, mode_name(shown.mode),
+	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", death::drop_name(shown.drop),
+	    u32(shown.share_pct), shown.bleedout_ms / 1000, shown.revive_health, shown.delay_ms / 1000,
+	    shown.contusion_s, u32(shown.money_pct), u32(shown.wear_pct), u32(shown.rank_pct));
 	::Msg("[coop]   survival: falls %llu, deaths %llu, revived %llu, refused %llu, evacuated %llu, respawns %llu, "
 	      "spectate %llu, wipes %llu",
 	    g_stat.falls, g_stat.deaths, g_stat.revives, g_stat.refused, g_stat.evacuations, g_stat.respawns,
@@ -2894,6 +2955,6 @@ bool own_pose_held(const CActor* actor) { return actor && g_pose_actor.load() ==
 
 bool look_locked() { return live() && g_me.actor && death::look_locked(u8(g_me.life)); }
 
-const death::Rules& rules() { return g_rules; }
+const death::Rules& rules() { return mgr().is_host() ? g_world_rules : g_rules; }
 } // namespace survival
 } // namespace coop

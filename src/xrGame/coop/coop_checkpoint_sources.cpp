@@ -63,7 +63,6 @@ constexpr const char* kRestZonesSection = "coop_rest_zones";
 constexpr const char* kCoverListSection = "list"; // of the file named by cover_list
 constexpr const char* kTentItemsSection = "tent_i_bag_sections"; // of the file named by item_lists (stock lists)
 constexpr const char* kSleepbagItemsSection = "sleeping_bag_sections";
-constexpr const char* kRefusedCallback = "coop_checkpoint_refused";
 constexpr const char* kPlacedCallback = "coop_tent_placed";
 constexpr u64 kTickMs = 500; // players against campfires and mod objects (plan F3 Task 7, step 3)
 constexpr u64 kScanMs = 1000; // the level's campfires and tents, claims, lost sources (steps 2, 4, 5)
@@ -327,6 +326,11 @@ struct Client
 {
 	bool sent_any = false;
 	u64 last_ms = 0;
+	// F3a T7: the host player's claim waits here for the main thread's frame (Lua may claim from the game thread; the
+	// internal channel is the main thread's), then goes over the link like a client's (player_frame)
+	bool queued = false;
+	ClaimWhat queued_what = ClaimWhat::Tent;
+	float queued_pos[3] = {0, 0, 0};
 };
 Client g_client;
 
@@ -335,9 +339,9 @@ constexpr size_t kRefusals = size_t(Refusal::Failed) + 1;
 struct Stats
 {
 	u64 camps = 0, camps_refused = 0; // dwell done: host_set took it / refused it
-	u64 claims = 0, malformed = 0, not_in_world = 0, claims_full = 0;
+	u64 claims = 0, malformed = 0, not_in_world = 0;
 	u64 refused[kRefusals] = {};
-	u64 matched = 0, placed = 0, packed = 0, expired = 0, dropped_left = 0;
+	u64 placed = 0, packed = 0;
 	u64 lost = 0, reused = 0, tents_over = 0;
 	u64 mods_added = 0, mods_refused = 0;
 	u64 sent = 0, held = 0; // client
@@ -446,21 +450,15 @@ u16 character_of_key(const std::string& key)
 	return kNoId;
 }
 
-// The answer "refused" to a claim (Ruling F3-5): the host's own as a callback here; a client's as CheckpointState flag
-// 4 to him alone, and his engine calls the callback there.
+// The answer "refused" to a claim (Ruling F3-5): CheckpointState flag 4 to the claimant alone, and his engine calls the
+// callback there (F3a T7: the host player's over the internal channel, coop_checkpoints client_on_state).
 void refuse(u16 character, ClaimWhat what, Refusal reason)
 {
 	++g_stat.refused[size_t(reason)];
 	if (log_allowed(g_stat.refused[size_t(reason)]))
 		::Msg("[coop] checkpoint sources: the %s claim of character %u is refused (%s)",
 		    checkpoint::claim_what_name(what), character, checkpoint::refusal_name(reason));
-	if (character == 0)
-	{
-		script::queue_callback(kRefusedCallback,
-		    {script::cb_str(checkpoint::refusal_name(reason)), script::cb_str(checkpoint::claim_what_name(what))});
-		return;
-	}
-	const PeerId peer = join::peer_of_proxy(character);
+	const PeerId peer = survival::peer_of_character(character);
 	if (peer == kInvalidPeer)
 		return; // he left meanwhile
 	Writer w;
@@ -691,41 +689,6 @@ void sweep_lost(const xr_vector<SourceRef>& refs)
 	}
 }
 
-// The host's own tent turned up for his claim: marked his, his camp.
-void on_tent_matched(const checkpoint::TentMatch& m)
-{
-	++g_stat.matched;
-	if (CSE_ALifeDynamicObject* e = entity(m.tent))
-	{
-		checkpoint::TentMark mark;
-		mark.owner = key_of(m.character);
-		write_mark(e, mark); // no item: the stock item_tent took it and packs the tent up
-	}
-	const CGameObject* obj = object_here(m.character);
-	if (!obj || !alive(m.character) || !host_set(m.character, record_here(obj, Kind::Tent, m.tent)))
-		return refuse(m.character, m.what, obj && !alive(m.character) ? Refusal::Dead : Refusal::Failed);
-	::Msg("[coop] checkpoint sources: tent %u is character %u's camp", m.tent, m.character);
-}
-
-void settle_claims(u64 now_ms)
-{
-	const xr_vector<u16> in_world = characters_in_world();
-	// Polled, not told: sync::on_peer_left does not reach the F3 modules, and a player who only left the world (a
-	// reload) must lose his claim too. Nobody to answer.
-	for (const checkpoint::ClaimEnd& c : g.book.keep_claims_of(std::set<u16>(in_world.begin(), in_world.end())))
-	{
-		++g_stat.dropped_left;
-		::Msg("[coop] checkpoint sources: the tent claim of character %u dropped, he left the world", c.character);
-	}
-	for (const checkpoint::ClaimEnd& c : g.book.expire(now_ms))
-	{
-		++g_stat.expired;
-		refuse(c.character, c.what, Refusal::Failed); // one answer per claim: no tent turned up
-	}
-	for (const checkpoint::TentMatch& m : g.book.match(g.tents, g_set.v.tent_claim_radius, g_set.v.tent_claim_ms))
-		on_tent_matched(m);
-}
-
 // The level and game vertex for a new object at `pos` next to `obj`: the vertex under the spot, else under him.
 bool vertices_at(const CGameObject* obj, const Fvector& pos, u32& lv, GameGraph::_GRAPH_ID& gv)
 {
@@ -802,8 +765,8 @@ void release_object(u16 id)
 		alife_rw().release(e, true);
 }
 
-// A client's tent or sleeping bag (Rulings F3-6, I-1): paid with an item of his, put up by the host (he cannot create a
-// world object until F2 Task 12b), marked his and made his camp — or nothing at all.
+// A player's tent or sleeping bag (Rulings F3-6, I-1): paid with an item of his, put up by the host (he cannot create a
+// world object until F2 Task 12b), marked his and made his camp — or nothing at all. F3a T7: the host player's too.
 void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& pos)
 {
 	const std::string key = key_of(character);
@@ -865,8 +828,10 @@ void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& p
 	script::queue_callback(kPlacedCallback, {script::cb_int(e->ID), script::cb_int(character)}); // T13: spawned_tents
 }
 
-// Ruling F3-8: a client packs up his own tent or sleeping bag at the spot: the host releases it and gives back the very
-// item it took for it; the checkpoint on it rolls back as with stock.
+// Ruling F3-8: a player packs up his own tent or sleeping bag at the spot: the host releases it and gives back the very
+// item it took for it; the checkpoint on it rolls back as with stock. F3a T7: the host player's too. A tent of his that
+// the stock put up before (his claim named it: owner kHostOwner, no item on the mark) gives back the stock item of its
+// kind, as the stock tent bag and compression bag do.
 void pack_for(u16 character, const Fvector& pos)
 {
 	const std::string key = key_of(character);
@@ -893,7 +858,14 @@ void pack_for(u16 character, const Fvector& pos)
 	if (tent == kNoId)
 		return refuse(character, ClaimWhat::Pack, Refusal::Far); // none of his within reach of the spot
 	checkpoint::TentMark mark;
-	if (!read_mark(tent, mark) || mark.item.empty() || !give_item(mark.item, character))
+	const bool marked = read_mark(tent, mark);
+	if (marked && mark.item.empty() && key == checkpoint::kHostOwner)
+	{
+		const CGameObject* t = object_here(tent);
+		const bool bag = t && what_of(t->cNameSect()) == u8(ClaimWhat::Sleepbag);
+		mark.item = bag ? g_set.sleepbag_items.front() : g_set.tent_items.front(); // read_item_lists: never empty
+	}
+	if (!marked || mark.item.empty() || !give_item(mark.item, character))
 	{
 		::Msg("! [coop] checkpoint sources: tent %u of character %u not packed up: %s", tent, character,
 		    mark.item.empty() ? "nothing to give back for it" : "the item could not be given");
@@ -922,8 +894,8 @@ void host_on_claim(PeerId from, Reader& rd)
 			::Msg("! [coop] checkpoint sources: malformed CheckpointClaim from #%u ignored", from);
 		return;
 	}
-	const u16 proxy = join::proxy_of_peer(from); // never the packet's word
-	if (proxy == kNoId || proxy == 0)
+	const u16 character = survival::character_of_peer(from); // never the packet's word (F3a T7: peer 0 is the host player)
+	if (character == kNoId)
 	{
 		++g_stat.not_in_world;
 		if (log_allowed(g_stat.not_in_world))
@@ -932,7 +904,7 @@ void host_on_claim(PeerId from, Reader& rd)
 	}
 	Fvector pos;
 	pos.set(p[0], p[1], p[2]);
-	host_claim_tent(proxy, what, pos);
+	host_claim_tent(character, what, pos);
 }
 } // namespace
 
@@ -966,13 +938,24 @@ void host_frame(u64 now_ms)
 		xr_vector<SourceRef> refs;
 		host_record_sources(refs);
 		sweep_lost(refs);
-		settle_claims(now_ms);
 	}
 	if (now_ms >= g.next_tick_ms)
 	{
 		g.next_tick_ms = now_ms + kTickMs;
 		tick_players(now_ms);
 	}
+}
+
+void player_frame()
+{
+	if (!g_client.queued)
+		return;
+	g_client.queued = false;
+	if (!mgr().is_host())
+		return; // the session ended or turned: the claim has nobody to go to
+	Writer w;
+	checkpoint::write_claim(w, g_client.queued_what, g_client.queued_pos);
+	net::client_send(Msg::CheckpointClaim, w); // F3a T7: to the world server over the internal channel
 }
 
 void reset()
@@ -994,20 +977,19 @@ void print_status()
 		    v.tent_claim_ms, u32(v.tent_sections.size()), v.tent_section.c_str(), v.sleepbag_section.c_str(),
 		    u32(g_set.rest_names.size()));
 		::Msg("[coop]   checkpoint sources: world %s (epoch %u), %u campfire(s), %u tent(s) here, %u known, %u "
-		      "owned, %u claim(s) waiting, %u mod source(s), %u rest zone(s), %u player(s) timed",
+		      "owned, %u mod source(s), %u rest zone(s), %u player(s) timed",
 		    g.world ? "served" : "none", g.epoch, u32(g.campfires.size()), u32(g.tents.size()), u32(g.book.tents()),
-		    u32(g.book.owners()), u32(g.book.claims()), u32(mods().all().size()), u32(g.rest_zones.size()),
-		    u32(g.dwell.size()));
+		    u32(g.book.owners()), u32(mods().all().size()), u32(g.rest_zones.size()), u32(g.dwell.size()));
 		const u64* r = g_stat.refused;
-		::Msg("[coop]   checkpoint sources: camps %llu (refused %llu); claims %llu: matched %llu, put up %llu, packed "
-		      "%llu, expired %llu, left %llu, full %llu, malformed %llu, no character %llu; refused dead %llu, far "
-		      "%llu, combat %llu, limit %llu, no item %llu, failed %llu; sources gone %llu (id reused %llu); mods "
-		      "%llu (refused %llu); tents over the bound %llu",
-		    g_stat.camps, g_stat.camps_refused, g_stat.claims, g_stat.matched, g_stat.placed, g_stat.packed,
-		    g_stat.expired, g_stat.dropped_left, g_stat.claims_full, g_stat.malformed, g_stat.not_in_world,
+		::Msg("[coop]   checkpoint sources: camps %llu (refused %llu); claims %llu: put up %llu, packed %llu, malformed "
+		      "%llu, no character %llu; refused dead %llu, far %llu, combat %llu, limit %llu, no item %llu, failed "
+		      "%llu; sources gone %llu (id reused %llu); mods %llu (refused %llu); tents over the bound %llu; the host "
+		      "player's claims sent %llu, held back %llu",
+		    g_stat.camps, g_stat.camps_refused, g_stat.claims, g_stat.placed, g_stat.packed, g_stat.malformed,
+		    g_stat.not_in_world,
 		    r[size_t(Refusal::Dead)], r[size_t(Refusal::Far)], r[size_t(Refusal::Combat)], r[size_t(Refusal::Limit)],
 		    r[size_t(Refusal::NoItem)], r[size_t(Refusal::Failed)], g_stat.lost, g_stat.reused, g_stat.mods_added,
-		    g_stat.mods_refused, g_stat.tents_over);
+		    g_stat.mods_refused, g_stat.tents_over, g_stat.sent, g_stat.held);
 	}
 	else if (mgr().is_client())
 		::Msg("[coop]   checkpoint sources: tent claims sent %llu, held back %llu", g_stat.sent, g_stat.held);
@@ -1126,8 +1108,7 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 		return;
 	++g_stat.claims;
 	CGameObject* obj = object_here(character);
-	const bool in_world = character == 0 || (join::peer_of_proxy(character) != kInvalidPeer &&
-		join::host_player_in_world(character));
+	const bool in_world = survival::player_in_world(character);
 	if (!pos_ok(pos) || !obj || !in_world)
 	{
 		++g_stat.not_in_world;
@@ -1141,31 +1122,13 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 	if (obj->Position().distance_to(pos) > g_set.v.tent_claim_radius)
 		return refuse(character, what, Refusal::Far);
 	if (what == ClaimWhat::Pack)
-	{
-		if (character == 0)
-		{
-			::Msg("[coop] checkpoint sources: the host packs up his tents with the stock tent bag");
-			return refuse(character, what, Refusal::Failed);
-		}
-		return pack_for(character, pos);
-	}
+		return pack_for(character, pos); // F3a T7: the host player's Fold too
 	if (in_combat(obj))
 		return refuse(character, what, Refusal::Combat);
-	if (character != 0)
-	{
-		// F2 Task 12b (ids leased to clients) lets a client create the tent himself; then this branch goes and his
-		// claim waits for his tent like the host's.
-		return place_for(character, what, obj, pos);
-	}
-	float p[3];
-	to_array(pos, p);
-	if (!g.book.claim(character, key_of(character), what, p, mgr().now_ms(), g_set.v.tent_claim_ms))
-	{
-		++g_stat.claims_full;
-		::Msg("! [coop] checkpoint sources: %u tent claims wait already, the one of character %u is dropped",
-		    u32(checkpoint::kMaxClaims), character);
-		refuse(character, what, Refusal::Failed);
-	}
+	// F3a T7: every player's tent is put up here, the host player's too (the stock item_tent no longer puts his up:
+	// coop_tent_guard.script sends him the client's way). F2 Task 12b (ids leased to clients) may let a player create
+	// the tent himself.
+	place_for(character, what, obj, pos);
 }
 
 u16 host_tent_owner(u16 tent)
@@ -1180,12 +1143,7 @@ u16 host_tent_owner(u16 tent)
 
 bool claim_tent(ClaimWhat what, const Fvector& pos)
 {
-	if (mgr().is_host())
-	{
-		host_claim_tent(0, what, pos);
-		return true;
-	}
-	if (!mgr().is_live_client() || !pos_ok(pos))
+	if (!(mgr().is_host() || mgr().is_live_client()) || !pos_ok(pos))
 		return false;
 	const u64 now = mgr().now_ms();
 	if (g_client.sent_any && now - g_client.last_ms < kClaimSpacingMs)
@@ -1195,9 +1153,20 @@ bool claim_tent(ClaimWhat what, const Fvector& pos)
 	}
 	float p[3];
 	to_array(pos, p);
-	Writer w;
-	checkpoint::write_claim(w, what, p);
-	net::client_send(Msg::CheckpointClaim, w);
+	if (mgr().is_host())
+	{
+		// F3a T7: the host player claims like a client, over the internal channel from the next frame (player_frame)
+		g_client.queued = true;
+		g_client.queued_what = what;
+		for (int i = 0; i < 3; ++i)
+			g_client.queued_pos[i] = p[i];
+	}
+	else
+	{
+		Writer w;
+		checkpoint::write_claim(w, what, p);
+		net::client_send(Msg::CheckpointClaim, w);
+	}
 	g_client.sent_any = true;
 	g_client.last_ms = now;
 	++g_stat.sent;

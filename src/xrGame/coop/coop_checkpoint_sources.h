@@ -10,20 +10,19 @@
 // radius; checkpoint::dwell_update decides, the camp goes through checkpoints::host_set (kind Campfire / Mod, the
 // object as its source, the player's own position).
 //
-// Tents and sleeping bags (a "tent" below is either: an object of tent_sections). A claim — the host's own Lua:
-// coop.checkpoint.claim_tent; a client: CheckpointClaim, his character from join::proxy_of_peer, never from the packet —
-// says what (ClaimWhat: tent 1, sleeping bag 2, pack up 3) and where. It is checked in this order: the player is alive
-// ("dead"), the spot is within tent_claim_radius of him ("far"), then
-//   - tent / sleeping bag: he is not in a fight ("combat");
-//     - the host's own claim waits tent_claim_ms for the nearest new tent of that kind within tent_claim_radius of the
-//       spot that nobody owns (the stock item_tent of the host puts it up and took the item);
-//     - a client's claim (Ruling F3-6, R1 I-1): at most 8 tents of his in the world ("limit"), an item of the stock
-//       TentBagSections / SleepBagSections in his inventory ("no_item"); the host puts up tent_section /
-//       sleepbag_section at the spot, makes it his camp, and only then takes the item: everything or nothing
-//       ("failed"). A client cannot create a world object himself until F2 Task 12b.
-//   - pack up (Ruling F3-8, clients only): his own tent within tent_claim_radius of the spot ("far"); the host gives
-//     him back the item it took for it, releases the tent, and the camp on it rolls back as with stock ("failed" if the
-//     item cannot be given).
+// Tents and sleeping bags (a "tent" below is either: an object of tent_sections). A claim — CheckpointClaim of a player,
+// his character from his peer (survival::character_of_peer), never from the packet; F3a T7: the host player's too, from
+// peer 0 over the internal channel (coop.checkpoint.claim_tent in his Lua) — says what (ClaimWhat: tent 1, sleeping bag
+// 2, pack up 3) and where. It is checked in this order: the player is alive ("dead"), the spot is within
+// tent_claim_radius of him ("far"), then
+//   - tent / sleeping bag: he is not in a fight ("combat"); then (Ruling F3-6, R1 I-1): at most 8 tents of his in the
+//     world ("limit"), an item of the stock TentBagSections / SleepBagSections in his inventory ("no_item"); the host
+//     puts up tent_section / sleepbag_section at the spot, makes it his camp, and only then takes the item: everything
+//     or nothing ("failed"). A player cannot create a world object himself until F2 Task 12b. F3a T7: the host player
+//     too - the stock item_tent no longer puts his tent up (coop_tent_guard.script), the wait for a stock tent is gone;
+//   - pack up (Ruling F3-8): his own tent within tent_claim_radius of the spot ("far"); the host gives him back the item
+//     it took for it (a tent of the host player's that the stock put up before F3a T7: the stock item of its kind),
+//     releases the tent, and the camp on it rolls back as with stock ("failed" if the item cannot be given).
 // A tent's owner (his player key, ledger::character_key) and the item it was paid with are on the tent's custom data
 // ([coop_tent] owner / item), so they outlast loads and level changes (R1 I-2); the limit counts his tents in the
 // world.
@@ -37,15 +36,17 @@
 //
 // Callbacks:
 //   coop_checkpoint_refused(reason, what) — the claimant's machine: reason "dead" | "far" | "combat" | "limit" |
-//     "no_item" | "failed", what "tent" | "sleepbag" | "pack". The host calls it for his own claims; a client's engine
-//     for his, from CheckpointState flag 4 (Ruling F3-5). The callback queue is shared and bounded: a hint.
-//   coop_tent_placed(tent, character) — the host: the host put up a tent or sleeping bag for a client (its Lua may add it
-//     to item_tent.spawned_tents, so the stock tent bag of the host packs it up: CHECKPOINTS_DEATH §10.2).
+//     "no_item" | "failed", what "tent" | "sleepbag" | "pack". A player's engine calls it from CheckpointState flag 4
+//     (Ruling F3-5; F3a T7: the host player's from his copy over the internal channel). The callback queue is shared and
+//     bounded: a hint.
+//   coop_tent_placed(tent, character) — the host: the host put up a tent or sleeping bag for a player (its world Lua adds
+//     it to item_tent.spawned_tents, CHECKPOINTS_DEATH §10.2).
 // Lua: coop.checkpoint.register_source(id, radius) -> bool and unregister_source(id) -> bool (the host, or the game
 //      before it hosts; false on a client). They are kept for the world they were made in, across the session's start
 //      and end: every load or level change forgets them, and a mod registers again (actor_on_first_update).
-//      coop.checkpoint.claim_tent(x, y, z [, "tent" | "sleepbag" | "pack"]) -> bool (host: checked now; client:
-//      CheckpointClaim sent, at most one per 2 s; false outside a session).
+//      coop.checkpoint.claim_tent(x, y, z [, "tent" | "sleepbag" | "pack"]) -> bool (a player: CheckpointClaim sent, at
+//      most one per 2 s - F3a T7: the host player's over the internal channel at the next frame; false outside a
+//      session).
 //      coop.checkpoint.tent_owner(id) -> character id | nil (host: whose tent or sleeping bag it is).
 #pragma once
 
@@ -76,6 +77,7 @@ const char* place_name(Place p);
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void host_frame(u64 now_ms); // host, main thread: checkpoints::frame
+void player_frame(); // F3a T7, a player, main thread (checkpoints::frame): the host player's claim goes out
 void reset(); // checkpoints::reset
 void print_status(); // checkpoints::print_status
 

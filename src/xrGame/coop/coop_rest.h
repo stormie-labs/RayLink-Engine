@@ -3,8 +3,10 @@
 // present player rests, nobody is in a fight and no emission runs (rest::decide, xrCoop/coop_rest_rules.h), and
 // tells everybody who rests (RestState).
 //
-// F3 Task 11. The host keeps the book (rest::Group) in host numbering; a client only asks and mirrors.
-//   Lie down (RestRequest op 1, or the host's own Lua): checked in this order (rest::check_lie_down): the player is
+// F3 Task 11. The host keeps the book (rest::Group) in host numbering; a client only asks and mirrors. F3a T7: so does the
+// host player - he asks his world server over the internal channel (RestRequest from peer 0) and his Lua hears his copy
+// of RestState / RestSleep at the next pump; the host's state_of / hours_of / block / waiting_for still read the book.
+//   Lie down (RestRequest op 1): checked in this order (rest::check_lie_down): the player is
 //     Alive (survival::life_of; wounded, dead, respawning: "dead"), the group is not asleep ("busy"), and unless forced
 //     (passing out of tiredness) he is not in a fight ("combat", checkpoint_sources::in_combat) and stands at a rest
 //     place ("place", checkpoint_sources::rest_place). Then he is Resting with his hours (1..24); a rest that is not
@@ -21,7 +23,7 @@
 //     is looked at once more (rest_place, once per sleep, review M1): one who walked away from his camp loses his rest
 //     ("place") and nobody sleeps on this tick. Else everybody present is Sleeping, the host
 //     marks a TimeSync (worldstate::intercept_time_jump), skips the hours as stock change_game_time does (environment
-//     and ALife clock), sends RestSleep to every sleeper (its own Lua: coop_rest_sleep), asks for an autosave
+//     and ALife clock), sends RestSleep to every sleeper (the host player too), asks for an autosave
 //     (autosave::request(Reason::Sleep): written once the host is awake again), and 12 s later (rest::kSleepMs)
 //     everybody asleep is awake. The sleep also ends as soon as nobody sleeps any more.
 //   A new world (a load or level change: join::host_world_epoch) or the session's start / end wakes everybody (Review
@@ -53,7 +55,7 @@
 //   coop_rest_refused(reason)                   the player's own machine: "place" | "combat" | "dead" | "busy" |
 //     "camp" (review M2: no checkpoint could be set where he lies). A new reason may be added later: an unknown one is
 //     shown as a refusal all the same.
-// One update gives one order on the host and on a client (rest::news, review M4): the coop_rest_changed first, then
+// One update gives one order on every player's machine (rest::news, review M4): the coop_rest_changed first, then
 // coop_rest_refused. The end of the session sends no callback (script::reset drops the queue): a doze window polls state_of(0) and
 // closes on "awake", which is all a machine outside a session answers.
 // Console: coop_rest_status.

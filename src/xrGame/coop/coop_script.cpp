@@ -356,58 +356,74 @@ void host_relay(PeerId origin, s32 target, const std::string& name, const std::s
 	++g_stats.relayed;
 }
 
-void on_script_event(PeerId from, Reader& r)
+bool read_event(PeerId from, Reader& r, PeerId& wire_origin, s32& target, std::string& name, std::string& payload)
 {
-	const PeerId wire_origin = r.u32();
-	const s32 target = r.i32();
-	std::string name = r.str();
-	std::string payload = r.str();
-	if (!r.ok() || !valid_name(name.data(), name.size()) || payload.size() > kMaxPayload)
+	wire_origin = r.u32();
+	target = r.i32();
+	name = r.str();
+	payload = r.str();
+	if (r.ok() && valid_name(name.data(), name.size()) && payload.size() <= kMaxPayload)
+		return true;
+	++g_stats.drop_invalid;
+	if (log_allowed(g_stats.drop_invalid))
+		::Msg("! [coop] malformed script event from #%u dropped", from);
+	return false;
+}
+
+// The world server (the host's process): a player's event. F3a T7: the host player's comes from peer 0 over the internal
+// channel (his coop.send_event to 0); the Lua of the host's process is the world server's and the host player's at once,
+// so an event to 0 from either side is one delivery there, with from = 0.
+void server_on_script_event(PeerId from, Reader& r)
+{
+	PeerId wire_origin = kInvalidPeer;
+	s32 target = kTargetAll;
+	std::string name, payload;
+	if (!read_event(from, r, wire_origin, target, name, payload) || !mgr().is_host())
+		return;
+	// P6: the sender must be in the world; a loading client has no business sending game events.
+	const bool ready = from == kHostPeer ? mgr().session().local() != nullptr :
+	    mgr().session().peer(from) != nullptr && !sync::host_peer_joining(from);
+	if (!ready)
+	{
+		++g_stats.drop_not_ready;
+		if (log_allowed(g_stats.drop_not_ready))
+			::Msg("! [coop] script event '%s' from #%u dropped: sender is not in the world yet", name.c_str(), from);
+		return;
+	}
+	const PeerId origin = from; // the wire origin of a client is never trusted
+	++g_stats.received;
+	if (target == kTargetAll)
+	{
+		host_relay(origin, target, name, payload);
+		if (from != kHostPeer) // the host player's own event to everybody else: not back to the Lua that sent it
+			deliver_later(origin, std::move(name), std::move(payload));
+	}
+	else if (target == s32(kHostPeer))
+		deliver_later(origin, std::move(name), std::move(payload));
+	else if (target < 0 || PeerId(target) == from || !mgr().session().peer(PeerId(target)))
 	{
 		++g_stats.drop_invalid;
 		if (log_allowed(g_stats.drop_invalid))
-			::Msg("! [coop] malformed script event from #%u dropped", from);
-		return;
+			::Msg("! [coop] script event '%s' from #%u to #%d dropped: no such player", name.c_str(), from, target);
 	}
+	else
+		host_relay(origin, target, name, payload);
+}
 
-	if (mgr().is_host())
-	{
-		// P6: the sender must be in the world; a loading client has no business sending game events.
-		const PeerInfo* sender = mgr().session().peer(from);
-		if (!sender || sync::host_peer_joining(from))
-		{
-			++g_stats.drop_not_ready;
-			if (log_allowed(g_stats.drop_not_ready))
-				::Msg("! [coop] script event '%s' from #%u dropped: sender is not in the world yet", name.c_str(), from);
-			return;
-		}
-		const PeerId origin = from; // the wire origin of a client is never trusted
-		++g_stats.received;
-		if (target == kTargetAll)
-		{
-			host_relay(origin, target, name, payload);
-			deliver_later(origin, std::move(name), std::move(payload));
-		}
-		else if (target == s32(kHostPeer))
-			deliver_later(origin, std::move(name), std::move(payload));
-		else if (target < 0 || PeerId(target) == from || !mgr().session().peer(PeerId(target)))
-		{
-			++g_stats.drop_invalid;
-			if (log_allowed(g_stats.drop_invalid))
-				::Msg("! [coop] script event '%s' from #%u to #%d dropped: no such player", name.c_str(), from, target);
-		}
-		else
-			host_relay(origin, target, name, payload);
+// A client: an event the world server relays. F3a T7: in the host's process the world server delivered every event its
+// Lua is to get already (server_on_script_event): the copy a broadcast puts on the internal channel is not delivered
+// twice, only a remote client takes it.
+void client_on_script_event(PeerId from, Reader& r)
+{
+	PeerId wire_origin = kInvalidPeer;
+	s32 target = kTargetAll;
+	std::string name, payload;
+	if (!read_event(from, r, wire_origin, target, name, payload) || !mgr().is_client())
 		return;
-	}
-
-	if (mgr().is_client())
-	{
-		if (from != kHostPeer)
-			return; // star topology: everything comes through the host
-		++g_stats.received;
-		deliver_later(wire_origin, std::move(name), std::move(payload));
-	}
+	if (from != kHostPeer)
+		return; // star topology: everything comes through the host
+	++g_stats.received;
+	deliver_later(wire_origin, std::move(name), std::move(payload));
 }
 
 // F2 T14 (Ruling F2-14): a client sends events only as fast as the host takes them (kClientRateRules ScriptEvent): the
@@ -439,8 +455,12 @@ void flush_outbox()
 		write_event(w, mgr().self(), o.target, o.name, o.payload);
 		if (host)
 		{
+			// F3a T7: to every other player, the host player being the sender; to 0, over the internal channel to the
+			// world server, which delivers it to the one Lua of the host's process (server_on_script_event)
 			if (o.target == kTargetAll)
-				net::host_broadcast(Msg::ScriptEvent, w);
+				net::host_broadcast(Msg::ScriptEvent, w, Lane::Reliable, kHostPeer);
+			else if (o.target == s32(kHostPeer))
+				net::client_send(Msg::ScriptEvent, w);
 			else if (mgr().session().peer(PeerId(o.target)))
 				net::host_send(PeerId(o.target), Msg::ScriptEvent, w);
 			else
@@ -769,10 +789,13 @@ int l_send_event(lua_State* L)
 	const bool host = mgr().is_host();
 	if (!host && !mgr().is_live_client())
 		return send_fail(L, "not in a co-op world"); // P6: sender must be ready
+	// F3a T7: in the host's process 0 is the world server and the host player at once (one Lua): an event to 0 goes over
+	// the internal channel and comes back to this Lua with from = 0, as a client's event to the host does there.
+	const bool to_own_world = host && target == s32(kHostPeer);
 	const PeerId self = mgr().self();
-	if (target != kTargetAll && PeerId(target) == self)
+	if (target != kTargetAll && PeerId(target) == self && !to_own_world)
 		return send_fail(L, "target is this machine");
-	if (target != kTargetAll && !mgr().session().peer(PeerId(target)))
+	if (target != kTargetAll && !to_own_world && !mgr().session().peer(PeerId(target)))
 		return send_fail(L, "no such player");
 	if (g_outbox.size() >= kMaxOutbox)
 		return send_fail(L, "send queue is full");
@@ -1561,9 +1584,11 @@ void register_raw(lua_State* L)
 }
 } // namespace
 
-void install_server(Session& s) { s.on(Msg::ScriptEvent, &on_script_event); }
+// F3a T7: ScriptEvent goes both ways (Either): each side has its own function, so that the host player's copy on the
+// internal channel never runs the world server's part.
+void install_server(Session& s) { s.on(Msg::ScriptEvent, &server_on_script_event); }
 
-void install_client(Endpoint& e) { e.on(Msg::ScriptEvent, &on_script_event); }
+void install_client(Endpoint& e) { e.on(Msg::ScriptEvent, &client_on_script_event); }
 
 void reset()
 {

@@ -5,6 +5,9 @@
 //   coop.send_event(name, payload, target)   target: -1 everyone else, 0 host, N peer N
 //   -> coop_main.on_event(name, payload, from) on the receiving machine(s).
 // Clients talk only to the host; the host relays client -> client events (star topology).
+// F3a T7: in the host's process 0 is the world server and the host player at once (one Lua state): an event to 0 there
+// goes over the internal channel (peer 0 -> the world server) and comes back to that Lua once, with from = 0, at the next
+// pump. Its -1 goes to every other player (the host player is the sender).
 //
 // Threading: Lua may call coop.* from the GameThread worker, so send_event only queues; frame()
 // (main thread, after Session::update) sends the queue and delivers received events to Lua.
