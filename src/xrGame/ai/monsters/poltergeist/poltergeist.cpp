@@ -8,6 +8,7 @@
 #include "poltergeist_movement.h"
 #include "../../../detail_path_manager.h"
 #include "../monster_velocity_space.h"
+#include "../../../coop/coop_ai.h" // Anomaly Coop: nearest_player, is_player
 #include "../../../level.h"
 #include "../../../level_debug.h"
 #include "../control_animation_base.h"
@@ -192,7 +193,18 @@ void CPoltergeist::update_detection()
 	//-------------------------------------------------------------------
 	// calculate detection level and turn on/off post processing effect
 	//-------------------------------------------------------------------
-	Fvector const actor_pos = Actor()->Position();
+	// Anomaly Coop (audit A4, 2026-10-24): the senses follow the nearest player, not only the host's actor (a client's
+	// character was never detected: the poltergeist stayed at rest next to him). Without a session: the actor, as before.
+	CEntityAlive* target = coop::npc_ai::nearest_player(Position(), get_detection_far_range());
+	if (!target)
+		target = Actor();
+	if (target->ID() != m_target_id)
+	{
+		m_target_id = target->ID();
+		m_last_actor_pos = target->Position(); // no speed from a jump between two players
+	}
+	const bool host_actor = target == Actor();
+	Fvector const actor_pos = target->Position();
 	float const dist2actor = actor_pos.distance_to(Position());
 
 	float const time_passed_sec = float(Device.dwTimeGlobal - m_last_detection_time) / 1000.f;
@@ -212,7 +224,7 @@ void CPoltergeist::update_detection()
 
 		float const speed = powf(1.f + raw_speed, speed_factor) - 1.f;
 
-		float const actor_psy_immunity = Actor()->conditions().GetHitImmunity(ALife::eHitTypeTelepatic);
+		float const actor_psy_immunity = target->conditions().GetHitImmunity(ALife::eHitTypeTelepatic);
 		m_current_detection_level += time_passed_sec * 0.03f * actor_psy_immunity * range_factor * speed;
 	}
 
@@ -225,9 +237,9 @@ void CPoltergeist::update_detection()
 	if (time_passed_sec != 0.f)
 		m_last_actor_pos = actor_pos;
 
-	SetActorVisibility(ID(), get_post_process_factor());
+	SetActorVisibility(ID(), host_actor ? get_post_process_factor() : 0.f); // the host's own HUD indicator
 
-	if (m_current_detection_level > 0.01f && m_detection_pp_effector_name && m_detection_pp_effector_name[0])
+	if (host_actor && m_current_detection_level > 0.01f && m_detection_pp_effector_name && m_detection_pp_effector_name[0])
 	{
 		if (!m_detection_pp_type_index)
 		{
@@ -244,6 +256,15 @@ void CPoltergeist::update_detection()
 		RemoveEffector(Actor(), m_detection_pp_type_index);
 		m_detection_pp_type_index = 0;
 	}
+}
+
+CEntityAlive* CPoltergeist::detection_target() const
+{
+	if (m_target_id != u16(-1))
+		if (CEntityAlive* e = smart_cast<CEntityAlive*>(Level().Objects.net_Find(m_target_id)))
+			if (!e->getDestroy() && e->g_Alive())
+				return e;
+	return Actor();
 }
 
 bool CPoltergeist::detected_enemy()
@@ -424,9 +445,11 @@ void CPoltergeist::Hit(SHit* pHDS)
 {
 	ability()->on_hit(pHDS);
 
-	if (pHDS->who == Actor())
+	if (pHDS->who == Actor() || coop::npc_ai::is_player(pHDS->who)) // Anomaly Coop: a client's shot wakes it too
 	{
 		m_current_detection_level = m_detection_max_level;
+		if (pHDS->who)
+			m_target_id = pHDS->who->ID();
 	}
 
 	inherited::Hit(pHDS);

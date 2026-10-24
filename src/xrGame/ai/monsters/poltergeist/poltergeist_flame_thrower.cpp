@@ -221,7 +221,7 @@ void CPolterFlame::update_schedule()
 
 	bool const detected = m_object->get_current_detection_level() >= m_object->get_detection_success_level();
 
-	CEntityAlive const* enemy = Actor();
+	CEntityAlive const* enemy = m_object->detection_target(); // Anomaly Coop: the player it senses
 	// check if we can create another flame
 	if (m_object->g_Alive() &&
 		enemy &&

@@ -64,6 +64,10 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance);
 // parked), so the objects around them are updated as often as the ones around the host's camera. Anywhere else (a client,
 // no session, a world that is not up) it empties the list, which is the stock behaviour.
 void viewers_frame();
+// Audit A4 (2026-10-24): the nearest living player to `pos` within `max_dist` - this machine's actor or (host) the
+// character of a player who is in the world, alive or downed; nullptr when none. Engine code that only knew Actor()
+// (the poltergeist's senses) asks this.
+CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
 void viewers_clear();
 // Console: coop_viewer_range (m, 0 = viewers off), coop_viewer_frame_radius (m, 0 = scale only). Host settings.
 void register_console();

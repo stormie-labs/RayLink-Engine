@@ -263,6 +263,19 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance)
 
 void viewers_clear() { shedule_viewers::clear(); }
 
+// Host: the character of `peer` if that player looks at the world from it (in the world, alive or downed), else nullptr.
+CObject* viewer_body(u32 peer)
+{
+	const u16 proxy = join::proxy_of_peer(peer);
+	if (proxy == 0xffff || proxy == 0 || !join::host_player_in_world(proxy) || world::is_parked(proxy))
+		return nullptr; // no character, still loading, or gone: nobody looks at the world from there
+	const survival::Life life = survival::life_of(proxy);
+	if (life != survival::Life::Alive && life != survival::Life::Wounded)
+		return nullptr; // dead, spectating or waiting for the respawn: the world is not seen from the body
+	CObject* body = Level().Objects.net_Find(proxy);
+	return body && !body->getDestroy() ? body : nullptr;
+}
+
 void viewers_frame()
 {
 	if (!mgr().is_host() || !world_up())
@@ -273,19 +286,39 @@ void viewers_frame()
 	Fvector at[viewers::kMaxViewers];
 	u32 n = 0;
 	for (u32 peer = 1; peer < kMaxPlayers && n < viewers::kMaxViewers; ++peer)
-	{
-		const u16 proxy = join::proxy_of_peer(peer);
-		if (proxy == 0xffff || proxy == 0 || !join::host_player_in_world(proxy) || world::is_parked(proxy))
-			continue; // no character, still loading, or gone: nobody looks at the world from there
-		const survival::Life life = survival::life_of(proxy);
-		if (life != survival::Life::Alive && life != survival::Life::Wounded)
-			continue; // dead, spectating or waiting for the respawn: the world is not seen from the body
-		const CObject* body = Level().Objects.net_Find(proxy);
-		if (!body || body->getDestroy())
-			continue;
-		at[n++] = body->Position();
-	}
+		if (const CObject* body = viewer_body(peer))
+			at[n++] = body->Position();
 	shedule_viewers::set(at, n, g_viewer_range, g_viewer_frame_radius);
+}
+
+CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
+{
+	CEntityAlive* best = nullptr;
+	float best_d = max_dist;
+	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy())
+	{
+		const float d = g_actor->Position().distance_to(pos);
+		if (d <= best_d)
+		{
+			best = g_actor;
+			best_d = d;
+		}
+	}
+	if (!mgr().is_host() || !world_up())
+		return best;
+	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
+	{
+		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
+		if (!body || !body->g_Alive())
+			continue;
+		const float d = body->Position().distance_to(pos);
+		if (d <= best_d)
+		{
+			best = body;
+			best_d = d;
+		}
+	}
+	return best;
 }
 
 void register_console()

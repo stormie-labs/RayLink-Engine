@@ -36,6 +36,7 @@ class CPoltergeist : public CBaseMonster,
 
 	TTime m_last_detection_time;
 	Fvector m_last_actor_pos;
+	u16 m_target_id = u16(-1); // Anomaly Coop (audit A4): the player the senses follow (nearest); -1 = the actor
 	char const* m_detection_pp_effector_name;
 	u32 m_detection_pp_type_index;
 	float m_detection_near_range_factor;
@@ -129,6 +130,7 @@ private:
 	float m_fly_around_change_direction_time;
 
 	float get_current_detection_level() const { return m_current_detection_level; }
+	CEntityAlive* detection_target() const; // Anomaly Coop: the player it senses and attacks (the actor alone: as before)
 	bool check_work_condition() const;
 	void remove_pp_effector();
 	void update_detection();
