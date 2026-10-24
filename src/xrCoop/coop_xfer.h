@@ -22,35 +22,51 @@
 // nobody commits for kGrantTimeoutMs is aborted.
 //
 // Rulings (F3a T2; the reasons are in task-2-report.md):
-//   R1 gens: one counter for all ids (the world epoch in the top 8 bits, the next epoch after every load). Every
-//      transfer takes a fresh gen and all its replies carry it; a release is keyed by the Ack's new gen, a destroy
-//      answered by a new gen - so a late reply of an earlier transfer never passes for a later one's.
+//   R1 gens: one counter for all ids (the world epoch in the top bits, the next epoch after every load, below the
+//      top bit). Every transfer takes a fresh gen and all its replies carry it; a release is keyed by the Ack's new
+//      gen, a destroy answered by a new gen, every record - a remade one too - starts with a fresh gen; so a late
+//      reply of an earlier transfer never passes for a later one's.
 //   R2 a map server declines (AbortAck) only a grant it does not write; it never declines while it holds an older
 //      incarnation (Held: the newer grant replaces it; Spawning/Releasing: no answer, the world's abort will come).
+//      Every AbortAck - to an Abort in any state, or to a grant declined - is a promise kept by Holder::decline: that
+//      gen is never made there later (review C1).
 //   R3 SpawnPrepare registers at its arrival (atomic: the record itself goes into the save, "SpawnPrepare:
 //      completed"); the journal keeps no spawn entry.
 //   R4 a destroy tombstones the id for kTombstoneMs: a late SpawnPrepare or TakeReq gets nothing back; Destroy {0}
-//      of a spawn the world has not seen tombstones it as well.
+//      of a spawn the world has not seen tombstones it for that map server, anew even over an older tombstone that
+//      ends sooner. A tombstone must outlive every packet in the network (60 s against an ordered loopback channel;
+//      the fuzzer drops packets older than 5 s and keeps tombstones >= 6 s).
 //   R5 ReleasePrepare or Destroy with the gen of a grant still Granting to that map server is its TakeCommit too (it
 //      can only have that gen from the Grant). While Aborting the abort wins: the object stays the world's at its
 //      last confirmed state.
 //   R6 the journal (Granting, Aborting, Releasing) stays within kJournalMaxEntries and kJournalMaxBytes of text: a
 //      transfer that does not fit is not started (no Grant, no Ack) - the map server repeats until it fits.
 //   R7 server_lost means gone: its process is dead or its connection closed for good and its Holder is never used
-//      again. Its objects go back to the world at once; the Drops it returns are best effort.
+//      again. Its objects go back to the world at once (a prepared release completed, a grant or an abort to it
+//      resolved as if acknowledged); the Drops it returns are best effort. Its late messages are ignored from then on;
+//      server_joined takes the peer id back when a new connection gets it.
 //   R8 after a load (resolve_after_load) every map server is gone: Releasing - completed with the journal's state;
 //      Granting/Aborting - rolled back; an object owned by a map server - back to the world at its last confirmed
 //      state. A Releasing entry whose object the save lacks is recreated from its state; a Granting entry whose
 //      object the save lacks is a violation (nothing to roll back to).
 //   R9 audit() takes a report that is current: everything the map server sent before it was handled before it (one
-//      ordered channel). Transfers in flight are never judged. A Lost heal bumps the gen and sends Drop too, so even
-//      a stale report cannot leave two writers.
+//      ordered channel). Transfers in flight are never judged. A Lost heal takes the object back two-phase - Aborting
+//      under a new gen, Abort repeated until the map server's AbortAck - so the world writes it again only once the map
+//      server has let go: even a stale report cannot leave two writers. A Duplicate heal's Drop is one-shot; the next
+//      audit repeats it while the duplicate is there.
+//   R10 a late ReleaseCommit of a release the world finished before the object's current transfer gets Done again;
+//      nothing is applied twice. Every record, a remade one too, starts with a fresh gen, so this always holds.
+//   R11 a Destroy the world does not take (a late copy, an incarnation not given to that map server, an aborted
+//      grant) gets Drop: the object is gone there already, the map server only stops asking.
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
-#include "coop_level_hash.h"
+#include "coop_xfer_base.h"
+#include "coop_xfer_holder.h"
+#include "coop_xfer_journal.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -64,236 +80,6 @@ namespace coop
 {
 namespace xfer
 {
-using Peer = uint32_t;
-constexpr Peer kWorld = 0;
-
-struct Key
-{
-	uint16_t id;
-	uint32_t gen;
-};
-
-enum class Op : uint8_t
-{
-	TakeReq, // map -> world
-	Grant, // world -> map: payload = state
-	TakeCommit, // map -> world
-	Done, // world -> map: TakeCommit, ReleaseCommit, Destroy answered
-	ReleasePrepare, // map -> world: key.gen = the gen held, payload = state
-	Ack, // world -> map: ReleasePrepare (key.gen = the release's gen), SpawnPrepare (key.gen = the spawn's gen)
-	ReleaseCommit, // map -> world
-	SpawnPrepare, // map -> world: key.gen = 0, payload = state
-	Destroy, // map -> world: key.gen = the gen held, 0 for a spawn not answered yet
-	Abort, // world -> map
-	AbortAck, // map -> world
-	Drop, // world -> map
-	Snapshot // map -> world: snapshot_payload(seq, state); world -> map: the ack, snapshot_payload(seq, {})
-};
-
-struct Packet
-{
-	Op op;
-	Key key;
-	Peer from, to;
-	std::vector<uint8_t> payload;
-};
-
-constexpr uint32_t kRetryFirstMs = 250;
-constexpr uint32_t kRetryMaxMs = 2000;
-constexpr uint32_t kGrantTimeoutMs = 10000;
-constexpr uint32_t kTombstoneMs = 60000;
-constexpr size_t kJournalMaxEntries = 64;
-constexpr size_t kJournalMaxBytes = 256 * 1024;
-constexpr uint32_t kEpochShift = 24;
-
-inline const char* op_name(Op op)
-{
-	switch (op)
-	{
-	case Op::TakeReq: return "TakeReq";
-	case Op::Grant: return "Grant";
-	case Op::TakeCommit: return "TakeCommit";
-	case Op::Done: return "Done";
-	case Op::ReleasePrepare: return "ReleasePrepare";
-	case Op::Ack: return "Ack";
-	case Op::ReleaseCommit: return "ReleaseCommit";
-	case Op::SpawnPrepare: return "SpawnPrepare";
-	case Op::Destroy: return "Destroy";
-	case Op::Abort: return "Abort";
-	case Op::AbortAck: return "AbortAck";
-	case Op::Drop: return "Drop";
-	case Op::Snapshot: return "Snapshot";
-	}
-	return "?";
-}
-
-// FNV-1a 64 of a state; never 0 (0 means "not compared" in an Entry).
-inline uint64_t digest(const std::vector<uint8_t>& state)
-{
-	uint64_t h = 0xCBF29CE484222325ull;
-	for (uint8_t b : state)
-	{
-		h ^= b;
-		h *= 0x100000001B3ull;
-	}
-	return h ? h : 1;
-}
-
-// Snapshot payload: u32 seq (little-endian), then the state (empty in the world's ack).
-inline std::vector<uint8_t> snapshot_payload(uint32_t seq, const std::vector<uint8_t>& state)
-{
-	std::vector<uint8_t> p(4 + state.size());
-	for (int i = 0; i < 4; ++i)
-		p[size_t(i)] = uint8_t(seq >> (8 * i));
-	std::copy(state.begin(), state.end(), p.begin() + 4);
-	return p;
-}
-
-inline bool read_snapshot(const std::vector<uint8_t>& payload, uint32_t& seq, std::vector<uint8_t>& state)
-{
-	if (payload.size() < 4)
-		return false;
-	seq = 0;
-	for (int i = 0; i < 4; ++i)
-		seq |= uint32_t(payload[size_t(i)]) << (8 * i);
-	state.assign(payload.begin() + 4, payload.end());
-	return true;
-}
-
-namespace detail
-{
-inline Packet packet(Op op, uint16_t id, uint32_t gen, Peer from, Peer to, std::vector<uint8_t> payload = {})
-{
-	return Packet{op, Key{id, gen}, from, to, std::move(payload)};
-}
-
-// The wait before repeat number `tries` + 1: kRetryFirstMs, doubling, at most kRetryMaxMs.
-inline uint64_t backoff(uint32_t tries)
-{
-	const uint64_t d = uint64_t(kRetryFirstMs) << std::min<uint32_t>(tries, 8);
-	return d < kRetryMaxMs ? d : kRetryMaxMs;
-}
-
-constexpr char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-inline size_t base64_size(size_t n) { return (n + 2) / 3 * 4; }
-
-inline std::string base64(const std::vector<uint8_t>& in)
-{
-	std::string out;
-	out.reserve(base64_size(in.size()));
-	size_t i = 0;
-	for (; i + 2 < in.size(); i += 3)
-	{
-		const uint32_t v = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8) | in[i + 2];
-		out += kB64[(v >> 18) & 63];
-		out += kB64[(v >> 12) & 63];
-		out += kB64[(v >> 6) & 63];
-		out += kB64[v & 63];
-	}
-	if (i + 1 == in.size())
-	{
-		const uint32_t v = uint32_t(in[i]) << 16;
-		out += kB64[(v >> 18) & 63];
-		out += kB64[(v >> 12) & 63];
-		out += "==";
-	}
-	else if (i + 2 == in.size())
-	{
-		const uint32_t v = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8);
-		out += kB64[(v >> 18) & 63];
-		out += kB64[(v >> 12) & 63];
-		out += kB64[(v >> 6) & 63];
-		out += '=';
-	}
-	return out;
-}
-
-inline int base64_value(char c)
-{
-	if (c >= 'A' && c <= 'Z')
-		return c - 'A';
-	if (c >= 'a' && c <= 'z')
-		return c - 'a' + 26;
-	if (c >= '0' && c <= '9')
-		return c - '0' + 52;
-	if (c == '+')
-		return 62;
-	if (c == '/')
-		return 63;
-	return -1;
-}
-
-// Strict: whole quads, the alphabet only, '=' only as the padding of the last quad.
-inline bool unbase64(const std::string& in, std::vector<uint8_t>& out)
-{
-	out.clear();
-	if (in.size() % 4)
-		return false;
-	out.reserve(in.size() / 4 * 3);
-	for (size_t i = 0; i < in.size(); i += 4)
-	{
-		const bool last = i + 4 == in.size();
-		int v[4];
-		int pad = 0;
-		for (int k = 0; k < 4; ++k)
-		{
-			const char c = in[i + size_t(k)];
-			if (c == '=' && last && k >= 2)
-			{
-				v[k] = 0;
-				++pad;
-				continue;
-			}
-			if (pad)
-				return false; // data after a '='
-			v[k] = base64_value(c);
-			if (v[k] < 0)
-				return false;
-		}
-		const uint32_t q = (uint32_t(v[0]) << 18) | (uint32_t(v[1]) << 12) | (uint32_t(v[2]) << 6) | uint32_t(v[3]);
-		out.push_back(uint8_t(q >> 16));
-		if (pad < 2)
-			out.push_back(uint8_t(q >> 8));
-		if (pad < 1)
-			out.push_back(uint8_t(q));
-	}
-	return true;
-}
-
-// Strict unsigned decimal within [0, max].
-inline bool parse_u32(const std::string& s, uint32_t max, uint32_t& out)
-{
-	if (s.empty() || s.size() > 10)
-		return false;
-	uint64_t v = 0;
-	for (char c : s)
-	{
-		if (c < '0' || c > '9')
-			return false;
-		v = v * 10 + uint64_t(c - '0');
-	}
-	if (v > max)
-		return false;
-	out = uint32_t(v);
-	return true;
-}
-
-inline std::string trim(const std::string& s)
-{
-	size_t b = 0, e = s.size();
-	while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
-		++b;
-	while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
-		--e;
-	return s.substr(b, e - b);
-}
-
-// Upper bounds of the journal text: the header and one entry line besides its base64.
-constexpr size_t kHeaderBytes = 64;
-constexpr size_t kEntryBytes = 64;
-} // namespace detail
-
 enum class Phase : uint8_t
 {
 	Stable,
@@ -330,13 +116,42 @@ class Ledger
 public:
 	struct Counters
 	{
-		uint64_t in_flight; // journal entries now
-		uint64_t retries; // grants and aborts repeated
-		uint64_t completed; // journal entries completed by a resolution (a release applied after a loss or a load)
-		uint64_t rolled_back; // grants undone, objects of a gone map server back at their last confirmed state
-		uint64_t resyncs; // drifts healed by a snapshot of the owner
-		uint64_t violations; // duplicates and losses healed, spawns refused under a taken id, broken journal entries
+		// Journal entries now: transfers Granting, Aborting or Releasing, plus loaded entries not resolved yet.
+		uint64_t in_flight;
+		// The world's own repeats: Grant and Abort sent again by tick. A map server counts its own (Holder::retries).
+		uint64_t retries;
+		// Releases completed by a resolution with their state applied: a lost map server's prepared release, a
+		// Releasing entry of a loaded journal.
+		uint64_t completed;
+		// Transfers undone by a resolution: a grant or an abort to a lost map server, a Granting or Aborting entry of a
+		// loaded journal, an object a lost map server owned (back at its last confirmed state).
+		uint64_t rolled_back;
+		// Drifts healed by asking the owner for a snapshot.
+		uint64_t resyncs;
+		// Duplicates and losses healed, (id, map server) pairs refused a spawn under a taken id, Granting entries of a
+		// loaded journal whose object the save lacks.
+		uint64_t violations;
 	};
+
+	// The ledger's limits: the plan's values by default; smaller ones let the fuzzer reach them.
+	struct Limits
+	{
+		size_t journal_entries = kJournalMaxEntries; // at most kJournalMaxEntries
+		size_t journal_bytes = kJournalMaxBytes; // at most kJournalMaxBytes
+		uint32_t tombstone_ms = kTombstoneMs;
+		uint32_t grant_timeout_ms = kGrantTimeoutMs;
+	};
+
+	Ledger() = default;
+	explicit Ledger(const Limits& limits) : m_limits(limits)
+	{
+		m_limits.journal_entries = std::min(m_limits.journal_entries, kJournalMaxEntries);
+		m_limits.journal_bytes = std::min(m_limits.journal_bytes, kJournalMaxBytes);
+	}
+
+	// A map server connected under a peer id that server_lost retired: its messages count again (the old connection is
+	// closed for good, nothing of it can arrive any more).
+	void server_joined(Peer server) { m_lost.erase(server); }
 
 	// An object of the world (start, load, the world's own spawn). Creates it owned by the world; an existing one keeps
 	// its owner and takes the state only when the world writes it. Clears a tombstone of the id.
@@ -346,10 +161,7 @@ public:
 		auto it = m_recs.find(id);
 		if (it == m_recs.end())
 		{
-			Rec r;
-			r.state = std::move(state);
-			m_recs.emplace(id, std::move(r));
-			m_owned[kWorld].insert(id);
+			make_world_record(id, std::move(state)); // R10: a fresh gen, above every gen of the id's earlier life
 			return;
 		}
 		if (it->second.owner == kWorld && it->second.phase == Phase::Stable)
@@ -380,8 +192,8 @@ public:
 	std::vector<Packet> on_packet(const Packet& p, uint64_t now)
 	{
 		std::vector<Packet> out;
-		if (p.from == kWorld || p.to != kWorld)
-			return out;
+		if (p.from == kWorld || p.to != kWorld || m_lost.count(p.from))
+			return out; // R7: nothing of a lost map server counts any more
 		switch (p.op)
 		{
 		case Op::TakeReq: on_take_req(p, now, out); break;
@@ -401,10 +213,22 @@ public:
 	std::vector<Packet> tick(uint64_t now)
 	{
 		std::vector<Packet> out;
+		std::vector<uint16_t> gone;
 		for (uint16_t id : m_busy)
 		{
 			Rec& r = m_recs.at(id);
-			if (r.phase == Phase::Granting && now >= r.since + kGrantTimeoutMs)
+			if (m_lost.count(r.peer))
+			{
+				gone.push_back(id); // cannot happen through server_lost (it resolves them); kept as a guard
+				continue;
+			}
+			if (r.next_retry == 0) // a heal's abort: its first repeat counts from the first tick
+			{
+				r.next_retry = now + detail::backoff(0);
+				if (r.phase == Phase::Aborting)
+					continue;
+			}
+			if (r.phase == Phase::Granting && now >= r.since + m_limits.grant_timeout_ms)
 			{
 				r.phase = Phase::Aborting;
 				arm(r, now);
@@ -420,12 +244,14 @@ public:
 			}
 			// Releasing: the map server drives it
 		}
+		for (uint16_t id : gone)
+			resolve_lost(id, m_recs.at(id), m_recs.at(id).peer);
 		if (now >= m_next_sweep)
 		{
 			m_next_sweep = now + 1000;
 			for (auto it = m_dead.begin(); it != m_dead.end();)
 			{
-				if (now >= it->second.at + kTombstoneMs)
+				if (now >= it->second.at + m_limits.tombstone_ms)
 					it = m_dead.erase(it);
 				else
 					++it;
@@ -453,6 +279,7 @@ public:
 		std::vector<Packet> out;
 		if (server == kWorld)
 			return out;
+		m_lost.insert(server);
 		std::vector<uint16_t> ids;
 		for (const auto& kv : m_recs)
 			if (kv.second.owner == server || (kv.second.phase != Phase::Stable && kv.second.peer == server))
@@ -461,26 +288,7 @@ public:
 		{
 			Rec& r = m_recs.at(id);
 			const uint32_t held = r.gen;
-			if (r.phase == Phase::Releasing)
-			{
-				r.state = std::move(r.pending);
-				settle(id, r);
-				set_owner(id, r, kWorld);
-				r.gen = next_gen();
-				++m_counters.completed;
-			}
-			else if (r.phase == Phase::Granting || r.phase == Phase::Aborting)
-			{
-				settle(id, r);
-				++m_counters.rolled_back;
-			}
-			else
-			{
-				set_owner(id, r, kWorld);
-				r.gen = next_gen();
-				++m_counters.rolled_back;
-			}
-			r.snap_seq = 0;
+			resolve_lost(id, r, server);
 			out.push_back(detail::packet(Op::Drop, id, held, kWorld, server));
 		}
 		return out;
@@ -494,108 +302,25 @@ public:
 	//   x<i> = <G|A|R>,<id>,<map server>,<gen>,<gen it held before the release>,<state in base64, R only>
 	std::string save_journal() const
 	{
-		std::vector<Job> list;
+		std::vector<JournalEntry> list;
 		for (uint16_t id : m_busy)
 		{
 			const Rec& r = m_recs.at(id);
-			list.push_back(Job{kind_of(r.phase), id, r.peer, r.gen, r.from_gen, r.pending});
+			list.push_back(JournalEntry{kind_of(r.phase), id, r.peer, r.gen, r.from_gen, r.pending});
 		}
-		for (const Job& j : m_loaded)
+		for (const JournalEntry& j : m_loaded)
 			list.push_back(j);
-		std::sort(list.begin(), list.end(), [](const Job& a, const Job& b) { return a.id < b.id; });
-		std::string s = "[coop_xfer]\nv = 1\ngen = " + std::to_string(m_gen) + "\nn = " + std::to_string(list.size());
-		s += "\n";
-		for (size_t i = 0; i < list.size(); ++i)
-		{
-			const Job& j = list[i];
-			s += "x" + std::to_string(i) + " = " + j.kind + "," + std::to_string(j.id) + "," + std::to_string(j.peer);
-			s += "," + std::to_string(j.gen) + "," + std::to_string(j.from_gen) + ",";
-			s += detail::base64(j.payload) + "\n";
-		}
-		return s;
+		return write_journal(m_gen, std::move(list));
 	}
 
 	// Reads a journal written by save_journal (other sections may surround [coop_xfer]); the entries wait for
 	// resolve_after_load. False, and nothing taken, for anything malformed.
 	bool load_journal(const std::string& text)
 	{
-		if (text.size() > kJournalMaxBytes)
+		uint32_t gen = 0;
+		std::vector<JournalEntry> loaded;
+		if (!read_journal(text, gen, loaded))
 			return false;
-		std::vector<std::string> lines;
-		bool in = false, found = false;
-		size_t pos = 0;
-		while (pos < text.size())
-		{
-			size_t nl = text.find('\n', pos);
-			if (nl == std::string::npos)
-				nl = text.size();
-			const std::string line = detail::trim(text.substr(pos, nl - pos));
-			pos = nl + 1;
-			if (line.empty())
-				continue;
-			if (line[0] == '[')
-			{
-				if (found)
-					break; // the next section
-				in = found = line == "[coop_xfer]";
-				continue;
-			}
-			if (in)
-				lines.push_back(line);
-		}
-		if (!found)
-			return false;
-		std::map<std::string, std::string> kv;
-		for (const std::string& line : lines)
-		{
-			const size_t eq = line.find('=');
-			if (eq == std::string::npos)
-				return false;
-			const std::string key = detail::trim(line.substr(0, eq));
-			if (key.empty() || !kv.emplace(key, detail::trim(line.substr(eq + 1))).second)
-				return false;
-		}
-		uint32_t version = 0, gen = 0, n = 0;
-		if (!kv.count("v") || !detail::parse_u32(kv["v"], 1, version) || version != 1)
-			return false;
-		if (!kv.count("gen") || !detail::parse_u32(kv["gen"], 0xffffffffu, gen))
-			return false;
-		if (!kv.count("n") || !detail::parse_u32(kv["n"], uint32_t(kJournalMaxEntries), n))
-			return false;
-		if (kv.size() != 3 + size_t(n))
-			return false;
-		std::vector<Job> loaded;
-		std::set<uint16_t> seen;
-		for (uint32_t i = 0; i < n; ++i)
-		{
-			auto it = kv.find("x" + std::to_string(i));
-			if (it == kv.end())
-				return false;
-			std::vector<std::string> f;
-			for (size_t b = 0;;)
-			{
-				const size_t c = it->second.find(',', b);
-				f.push_back(it->second.substr(b, c == std::string::npos ? std::string::npos : c - b));
-				if (c == std::string::npos)
-					break;
-				b = c + 1;
-			}
-			if (f.size() != 6 || f[0].size() != 1 || (f[0][0] != 'G' && f[0][0] != 'A' && f[0][0] != 'R'))
-				return false;
-			Job j;
-			j.kind = f[0][0];
-			uint32_t id = 0;
-			if (!detail::parse_u32(f[1], 0xffff, id) || !detail::parse_u32(f[2], 0xffffffffu, j.peer) ||
-			    j.peer == kWorld || !detail::parse_u32(f[3], 0xffffffffu, j.gen) || j.gen == 0 || j.gen > gen ||
-			    !detail::parse_u32(f[4], 0xffffffffu, j.from_gen) || !detail::unbase64(f[5], j.payload))
-				return false;
-			if (j.kind != 'R' && (!j.payload.empty() || j.from_gen != 0))
-				return false;
-			j.id = uint16_t(id);
-			if (!seen.insert(j.id).second)
-				return false;
-			loaded.push_back(std::move(j));
-		}
 		m_loaded = std::move(loaded);
 		m_gen = std::max(m_gen, gen);
 		return true;
@@ -605,30 +330,7 @@ public:
 	// epoch of gens begins.
 	void resolve_after_load()
 	{
-		for (Job& j : m_loaded)
-		{
-			Rec* r = find(j.id);
-			if (j.kind == 'R')
-			{
-				if (!r)
-				{
-					Rec n;
-					n.state = std::move(j.payload);
-					m_recs.emplace(j.id, std::move(n));
-					m_owned[kWorld].insert(j.id);
-				}
-				else if (r->owner == kWorld && r->phase == Phase::Stable)
-					r->state = std::move(j.payload);
-				++m_counters.completed;
-			}
-			else
-			{
-				if (!r)
-					++m_counters.violations; // a grant of an object the save does not have: nothing to roll back to
-				++m_counters.rolled_back;
-			}
-		}
-		m_loaded.clear();
+		// Every map server is gone: whatever this ledger still had with them goes back to the world first ...
 		std::set<Peer> peers;
 		for (const auto& kv : m_recs)
 		{
@@ -639,9 +341,32 @@ public:
 		}
 		for (Peer p : peers)
 			server_lost(p, 0);
+		// ... so every record is the world's and settled, and each loaded entry applies.
+		for (JournalEntry& j : m_loaded)
+		{
+			Rec* r = find(j.id);
+			if (j.kind == 'R')
+			{
+				if (r)
+					r->state = std::move(j.payload);
+				else
+					make_world_record(j.id, std::move(j.payload));
+				++m_counters.completed;
+			}
+			else
+			{
+				if (!r)
+					++m_counters.violations; // a grant of an object the save does not have: nothing to roll back to
+				++m_counters.rolled_back;
+			}
+		}
+		m_loaded.clear();
 		m_dead.clear();
+		m_lost.clear(); // a load starts a new world: every map server connects anew
+		// A new epoch below the top bit: each session starts at most at 127 << kEpochShift and has more than 2^31 gens
+		// ahead (one per transfer - centuries at any real rate), so next_gen never wraps.
 		const uint64_t epoch = (uint64_t(m_gen) >> kEpochShift) + 1;
-		m_gen = epoch < 256 ? uint32_t(epoch << kEpochShift) : uint32_t(1) << kEpochShift;
+		m_gen = uint32_t((epoch < 128 ? epoch : 1) << kEpochShift);
 	}
 
 	// How many of the ledger's owner sets hold `id`: exactly 1 for a registered id, 0 otherwise.
@@ -737,6 +462,7 @@ private:
 		uint32_t snap_seq = 0; // the newest Snapshot taken in this gen
 		uint32_t spawn_gen = 0; // registered by a SpawnPrepare under this gen (0: not a spawn)
 		Peer spawned_by = kWorld;
+		Peer refused = kWorld; // the last map server refused a spawn under this id
 		uint64_t since = 0, next_retry = 0;
 		uint32_t tries = 0;
 		size_t bytes = 0; // journal text reserved
@@ -748,31 +474,20 @@ private:
 		uint32_t from_gen; // the gen the Destroy named
 		uint64_t at;
 	};
-	struct Job // a journal entry
-	{
-		char kind = 'G'; // G Granting, A Aborting, R Releasing
-		uint16_t id = 0;
-		Peer peer = kWorld;
-		uint32_t gen = 0;
-		uint32_t from_gen = 0;
-		std::vector<uint8_t> payload;
-	};
 
 	std::map<uint16_t, Rec> m_recs;
 	std::map<Peer, std::set<uint16_t>> m_owned; // owner -> ids
 	std::set<uint16_t> m_busy; // ids in a transfer (the journal)
+	std::set<Peer> m_lost; // map servers lost for good (R7): their messages are ignored
 	std::map<uint16_t, Tomb> m_dead;
-	std::vector<Job> m_loaded; // read by load_journal, waiting for resolve_after_load
+	std::vector<JournalEntry> m_loaded; // read by load_journal, waiting for resolve_after_load
 	uint32_t m_gen = 0;
 	size_t m_journal_bytes = detail::kHeaderBytes;
 	uint64_t m_next_sweep = 0;
 	Counters m_counters{};
+	Limits m_limits;
 
 	static char kind_of(Phase p) { return p == Phase::Releasing ? 'R' : p == Phase::Aborting ? 'A' : 'G'; }
-	static size_t cost_of(const std::vector<uint8_t>& payload)
-	{
-		return detail::kEntryBytes + detail::base64_size(payload.size());
-	}
 
 	Rec* find(uint16_t id)
 	{
@@ -785,12 +500,50 @@ private:
 		return it == m_recs.end() ? nullptr : &it->second;
 	}
 
+	// A fresh gen. Never wraps in practice: a session starts below 2^31 (resolve_after_load), and 2^31 transfers do not
+	// happen; the assert says so in debug builds.
 	uint32_t next_gen()
 	{
+		assert(m_gen != 0xffffffffu && "xfer: the gen counter is exhausted");
 		++m_gen;
 		if (!m_gen)
 			m_gen = uint32_t(1) << kEpochShift;
 		return m_gen;
+	}
+
+	void make_world_record(uint16_t id, std::vector<uint8_t> state)
+	{
+		Rec r;
+		r.gen = next_gen();
+		r.state = std::move(state);
+		m_recs.emplace(id, std::move(r));
+		m_owned[kWorld].insert(id);
+	}
+
+	// `r` was with map server `server`, which is gone (R7): a prepared release is completed with its state, a grant or
+	// an abort is resolved as if acknowledged, an object it owned goes back to the world at its last confirmed state.
+	void resolve_lost(uint16_t id, Rec& r, Peer server)
+	{
+		if (r.phase == Phase::Releasing && r.peer == server)
+		{
+			r.state = std::move(r.pending);
+			settle(id, r);
+			set_owner(id, r, kWorld);
+			r.gen = next_gen();
+			++m_counters.completed;
+		}
+		else if ((r.phase == Phase::Granting || r.phase == Phase::Aborting) && r.peer == server)
+		{
+			settle(id, r);
+			++m_counters.rolled_back;
+		}
+		else if (r.phase == Phase::Stable && r.owner == server)
+		{
+			set_owner(id, r, kWorld);
+			r.gen = next_gen();
+			++m_counters.rolled_back;
+		}
+		r.snap_seq = 0;
 	}
 
 	static void arm(Rec& r, uint64_t now)
@@ -802,8 +555,8 @@ private:
 	// The journal takes `entries` more and `bytes` more text (R6).
 	bool fits(size_t entries, size_t bytes) const
 	{
-		return m_busy.size() + m_loaded.size() + entries <= kJournalMaxEntries &&
-		       m_journal_bytes + bytes <= kJournalMaxBytes;
+		return m_busy.size() + m_loaded.size() + entries <= m_limits.journal_entries &&
+		       m_journal_bytes + bytes <= m_limits.journal_bytes;
 	}
 
 	void open(uint16_t id, Rec& r, size_t bytes)
@@ -934,7 +687,7 @@ private:
 		const bool granted = r->phase == Phase::Granting && r->peer == p.from && r->gen == p.key.gen; // R5
 		if (!owns && !granted)
 			return;
-		const size_t bytes = cost_of(p.payload);
+		const size_t bytes = journal_entry_bytes(p.payload);
 		if (!fits(granted ? 0 : 1, bytes - (granted ? r->bytes : 0)))
 			return; // R6: the map server repeats
 		if (granted)
@@ -988,8 +741,13 @@ private:
 					out.push_back(detail::packet(Op::Ack, id, r->gen, kWorld, p.from));
 				return;
 			}
-			// The id is someone else's (a lease fault): refused, the map server lets go of its object.
-			++m_counters.violations;
+			// The id is someone else's (a lease fault): refused, the map server lets go of its object. One violation
+			// per map server and id, however often it repeats.
+			if (r->refused != p.from)
+			{
+				r->refused = p.from;
+				++m_counters.violations;
+			}
 			out.push_back(detail::packet(Op::Drop, id, 0, kWorld, p.from));
 			return;
 		}
@@ -1033,9 +791,10 @@ private:
 				out.push_back(detail::packet(Op::Done, id, d->second.gen, kWorld, p.from)); // repeated
 				return;
 			}
-			if (d == m_dead.end() && p.key.gen == 0)
+			if (p.key.gen == 0)
 			{
-				// R4: destroyed before the world saw the spawn - tombstoned, a late SpawnPrepare registers nothing.
+				// R4: destroyed before the world saw the spawn - tombstoned for this spawn (anew, even over an older
+				// tombstone of the id that ends sooner), so a late SpawnPrepare copy registers nothing.
 				const uint32_t g = next_gen();
 				m_dead[id] = Tomb{g, p.from, 0, now};
 				out.push_back(detail::packet(Op::Done, id, g, kWorld, p.from));
@@ -1066,522 +825,6 @@ private:
 	}
 };
 
-// A map server's side: what it owns, asks for, gives back; it repeats until answered. The engine creates the object on
-// a Create event, deletes it on Remove, freezes it while frozen(); Refused ends a request (no such object, or aborted).
-class Holder
-{
-public:
-	struct Event
-	{
-		enum class Kind : uint8_t
-		{
-			Create, // a grant accepted: make the object from `state`
-			Remove, // delete the object (released, aborted, dropped)
-			Refused // a request ended without an object
-		};
-		Kind kind;
-		uint16_t id;
-		std::vector<uint8_t> state;
-	};
-
-	explicit Holder(Peer self) : m_self(self) {}
-
-	// A player came near: the object should be online here.
-	std::vector<Packet> want_online(uint16_t id, uint64_t now)
-	{
-		auto it = m_objs.find(id);
-		if (it != m_objs.end())
-		{
-			if (it->second.st == St::Releasing || it->second.st == St::Committing)
-				it->second.again = true; // taken again once the release is through
-			return {};
-		}
-		Obj o;
-		o.st = St::Requesting;
-		arm(o, now);
-		m_objs.emplace(id, std::move(o));
-		return {out(Op::TakeReq, id, 0)};
-	}
-
-	// The object should go back to the world with `state` (frozen from now on). For a request not answered yet: the
-	// request is taken back (a grant that still comes is declined); for a spawn not answered yet: released right after.
-	std::vector<Packet> want_offline(uint16_t id, std::vector<uint8_t> state, uint64_t now)
-	{
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return {};
-		Obj& o = it->second;
-		switch (o.st)
-		{
-		case St::Requesting:
-			m_objs.erase(it);
-			return {};
-		case St::Spawning:
-			if (!o.release_after) // frozen from the first call on: its state stays
-			{
-				o.release_after = true;
-				o.state = std::move(state);
-			}
-			return {};
-		case St::Held:
-			o.st = St::Releasing;
-			o.state = std::move(state);
-			arm(o, now);
-			return {out(Op::ReleasePrepare, id, o.gen, o.state)};
-		case St::Releasing:
-		case St::Committing:
-			o.again = false;
-			return {};
-		case St::Destroying:
-			return {};
-		}
-		return {};
-	}
-
-	// The map server made an object under a leased id.
-	std::vector<Packet> spawned(uint16_t id, std::vector<uint8_t> state, uint64_t now)
-	{
-		if (m_objs.count(id))
-			return {};
-		Obj o;
-		o.st = St::Spawning;
-		o.state = std::move(state);
-		arm(o, now);
-		auto& ref = m_objs.emplace(id, std::move(o)).first->second;
-		return {out(Op::SpawnPrepare, id, 0, ref.state)};
-	}
-
-	// The engine destroyed the object (it is gone here already).
-	std::vector<Packet> destroyed(uint16_t id, uint64_t now)
-	{
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return {};
-		Obj& o = it->second;
-		if (o.st != St::Held && !(o.st == St::Spawning && !o.release_after))
-			return {}; // frozen for a release, deleted already, or only asked for
-		o.st = St::Destroying; // a spawn not answered yet: gen 0 (R4)
-		o.state.clear();
-		arm(o, now);
-		return {out(Op::Destroy, id, o.gen)};
-	}
-
-	// The state changed within ownership: streamed to the world (repeated until acknowledged).
-	std::vector<Packet> changed(uint16_t id, std::vector<uint8_t> state, uint64_t now)
-	{
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return {};
-		Obj& o = it->second;
-		if (o.st != St::Held && !(o.st == St::Spawning && !o.release_after))
-			return {}; // frozen or not here
-		o.state = std::move(state);
-		++o.seq;
-		if (o.st != St::Held || !o.committed)
-			return {}; // sent once the world has answered
-		arm(o, now);
-		return {out(Op::Snapshot, id, o.gen, snapshot_payload(o.seq, o.state))};
-	}
-
-	std::vector<Packet> on_packet(const Packet& p, uint64_t now)
-	{
-		if (p.to != m_self || p.from != kWorld)
-			return {};
-		switch (p.op)
-		{
-		case Op::Grant: return on_grant(p, now);
-		case Op::Done: return on_done(p, now);
-		case Op::Ack: return on_ack(p, now);
-		case Op::Abort: return on_abort(p);
-		case Op::Drop: on_drop(p); return {};
-		case Op::Snapshot: return on_snapshot_ack(p, now);
-		default: return {};
-		}
-	}
-
-	std::vector<Packet> tick(uint64_t now)
-	{
-		std::vector<Packet> v;
-		for (auto& kv : m_objs)
-		{
-			Obj& o = kv.second;
-			const uint16_t id = kv.first;
-			if (now < o.next_retry)
-				continue;
-			switch (o.st)
-			{
-			case St::Requesting: v.push_back(out(Op::TakeReq, id, 0)); break;
-			case St::Spawning: v.push_back(out(Op::SpawnPrepare, id, 0, o.state)); break;
-			case St::Held:
-				if (!o.committed)
-					v.push_back(out(Op::TakeCommit, id, o.gen));
-				else if (o.acked < o.seq)
-					v.push_back(out(Op::Snapshot, id, o.gen, snapshot_payload(o.seq, o.state)));
-				else
-				{
-					o.next_retry = kNever;
-					continue;
-				}
-				break;
-			case St::Releasing: v.push_back(out(Op::ReleasePrepare, id, o.gen, o.state)); break;
-			case St::Committing: v.push_back(out(Op::ReleaseCommit, id, o.gen)); break;
-			case St::Destroying: v.push_back(out(Op::Destroy, id, o.gen)); break;
-			}
-			++o.tries;
-			o.next_retry = now + detail::backoff(o.tries);
-		}
-		return v;
-	}
-
-	// Writes the object: it exists here and nobody else may run it (frozen ones included, until the world's Ack).
-	bool authors(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && (o->st == St::Held || o->st == St::Releasing || o->st == St::Spawning);
-	}
-	// Frozen for its release: AI and physics stop, requests on it are refused (Reason::Moving).
-	bool frozen(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && (o->st == St::Releasing || (o->st == St::Spawning && o->release_after));
-	}
-	// Something is still going on for the id (a request, a transfer, a destroy, an unacknowledged change).
-	bool busy(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && !settled(*o);
-	}
-	bool idle() const
-	{
-		for (const auto& kv : m_objs)
-			if (!settled(kv.second))
-				return false;
-		return true;
-	}
-	bool requesting(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && o->st == St::Requesting;
-	}
-	std::vector<uint16_t> ids() const
-	{
-		std::vector<uint16_t> v;
-		v.reserve(m_objs.size());
-		for (const auto& kv : m_objs)
-			v.push_back(kv.first);
-		return v;
-	}
-	const std::vector<uint8_t>* state(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && authors(id) ? &o->state : nullptr;
-	}
-	// The gen it holds the object under (0: not held, or a spawn not answered yet).
-	uint32_t gen(uint16_t id) const
-	{
-		const Obj* o = find(id);
-		return o && authors(id) ? o->gen : 0;
-	}
-	// Everything it writes, for the auditor and the level hash (parent and alive are the engine's to fill).
-	std::vector<Entry> report() const
-	{
-		std::vector<Entry> v;
-		for (const auto& kv : m_objs)
-			if (authors(kv.first))
-				v.push_back(Entry{kv.first, kv.second.gen, kNoParent, true, digest(kv.second.state)});
-		return v;
-	}
-	std::vector<Event> take_events()
-	{
-		std::vector<Event> e;
-		e.swap(m_events);
-		return e;
-	}
-	Peer self() const { return m_self; }
-
-private:
-	enum class St : uint8_t
-	{
-		Requesting, // TakeReq until Grant
-		Spawning, // SpawnPrepare until Ack (writes it)
-		Held, // writes it; TakeCommit until Done, then the snapshot stream
-		Releasing, // frozen, ReleasePrepare until Ack (still writes it)
-		Committing, // deleted, ReleaseCommit until Done
-		Destroying // deleted, Destroy until Done
-	};
-	struct Obj
-	{
-		St st = St::Requesting;
-		uint32_t gen = 0; // Held/Releasing/Destroying: the gen held; Committing: the release's gen; Spawning: 0
-		bool committed = false; // Held: the world answered the take (Done) or the spawn (Ack)
-		bool release_after = false; // Spawning: give it back as soon as the spawn is answered
-		bool again = false; // Releasing/Committing: ask for it again once the release is through
-		std::vector<uint8_t> state;
-		uint32_t seq = 0, acked = 0; // the snapshot stream
-		uint64_t next_retry = 0;
-		uint32_t tries = 0;
-	};
-	static constexpr uint64_t kNever = ~uint64_t(0);
-
-	Peer m_self;
-	std::map<uint16_t, Obj> m_objs;
-	std::map<uint16_t, uint32_t> m_tomb; // per id: the newest gen finished here, never made again
-	std::vector<Event> m_events;
-
-	const Obj* find(uint16_t id) const
-	{
-		auto it = m_objs.find(id);
-		return it == m_objs.end() ? nullptr : &it->second;
-	}
-	static bool settled(const Obj& o) { return o.st == St::Held && o.committed && o.acked >= o.seq; }
-	uint32_t tomb(uint16_t id) const
-	{
-		auto it = m_tomb.find(id);
-		return it == m_tomb.end() ? 0 : it->second;
-	}
-	void bury(uint16_t id, uint32_t gen)
-	{
-		uint32_t& t = m_tomb[id];
-		t = std::max(t, gen);
-	}
-	static void arm(Obj& o, uint64_t now)
-	{
-		o.tries = 0;
-		o.next_retry = now + detail::backoff(0);
-	}
-	Packet out(Op op, uint16_t id, uint32_t gen, std::vector<uint8_t> payload = {}) const
-	{
-		return detail::packet(op, id, gen, m_self, kWorld, std::move(payload));
-	}
-
-	std::vector<Packet> on_grant(const Packet& p, uint64_t now)
-	{
-		const uint16_t id = p.key.id;
-		const uint32_t x = p.key.gen;
-		if (x == 0)
-			return {};
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-		{
-			if (x < tomb(id))
-				return {}; // a stale copy
-			bury(id, x); // not wanted (any more): declined, never made here (R2)
-			return {out(Op::AbortAck, id, x)};
-		}
-		Obj& o = it->second;
-		switch (o.st)
-		{
-		case St::Requesting:
-			if (x <= tomb(id))
-				return x == tomb(id) ? std::vector<Packet>{out(Op::AbortAck, id, x)} : std::vector<Packet>{};
-			o.st = St::Held;
-			o.gen = x;
-			o.committed = false;
-			o.state = p.payload;
-			o.seq = o.acked = 0;
-			arm(o, now);
-			m_events.push_back(Event{Event::Kind::Create, id, o.state});
-			return {out(Op::TakeCommit, id, x)};
-		case St::Held:
-			if (x == o.gen)
-				return {out(Op::TakeCommit, id, x)}; // the grant repeated: the commit repeated
-			if (x > o.gen)
-			{
-				// The world grants a newer incarnation: it holds that this one is not here. Follow the world (R2).
-				bury(id, o.gen);
-				m_events.push_back(Event{Event::Kind::Remove, id, {}});
-				o.gen = x;
-				o.committed = false;
-				o.state = p.payload;
-				o.seq = o.acked = 0;
-				arm(o, now);
-				m_events.push_back(Event{Event::Kind::Create, id, o.state});
-				return {out(Op::TakeCommit, id, x)};
-			}
-			return {};
-		case St::Spawning:
-		case St::Releasing:
-			return {}; // writes an incarnation of it: never declined (R2); the world's abort will come
-		case St::Committing:
-		case St::Destroying:
-			if (x < tomb(id) || x <= o.gen)
-				return {};
-			bury(id, x); // deleted here: declined
-			return {out(Op::AbortAck, id, x)};
-		}
-		return {};
-	}
-
-	std::vector<Packet> on_done(const Packet& p, uint64_t now)
-	{
-		const uint16_t id = p.key.id;
-		const uint32_t x = p.key.gen;
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return {};
-		Obj& o = it->second;
-		switch (o.st)
-		{
-		case St::Held:
-			if (x == o.gen && !o.committed)
-			{
-				o.committed = true;
-				if (o.acked < o.seq)
-				{
-					arm(o, now);
-					return {out(Op::Snapshot, id, o.gen, snapshot_payload(o.seq, o.state))};
-				}
-			}
-			return {};
-		case St::Committing:
-			if (x == o.gen)
-			{
-				const bool again = o.again;
-				bury(id, x);
-				m_objs.erase(it);
-				if (again)
-					return want_online(id, now);
-			}
-			return {};
-		case St::Destroying:
-			if (x > std::max(o.gen, tomb(id)))
-			{
-				bury(id, x);
-				m_objs.erase(it);
-			}
-			return {};
-		default:
-			return {};
-		}
-	}
-
-	std::vector<Packet> on_ack(const Packet& p, uint64_t now)
-	{
-		const uint16_t id = p.key.id;
-		const uint32_t x = p.key.gen;
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return {};
-		Obj& o = it->second;
-		switch (o.st)
-		{
-		case St::Spawning:
-			if (x <= tomb(id))
-				return {};
-			o.st = St::Held;
-			o.gen = x;
-			o.committed = true;
-			o.acked = 0;
-			if (o.release_after)
-			{
-				o.st = St::Releasing;
-				arm(o, now);
-				return {out(Op::ReleasePrepare, id, x, o.state)};
-			}
-			if (o.seq)
-			{
-				arm(o, now);
-				return {out(Op::Snapshot, id, x, snapshot_payload(o.seq, o.state))};
-			}
-			return {};
-		case St::Releasing:
-			if (x <= o.gen)
-				return {};
-			bury(id, o.gen);
-			m_events.push_back(Event{Event::Kind::Remove, id, {}});
-			o.st = St::Committing;
-			o.gen = x;
-			o.state.clear();
-			arm(o, now);
-			return {out(Op::ReleaseCommit, id, x)};
-		case St::Committing:
-			if (x == o.gen)
-				return {out(Op::ReleaseCommit, id, x)}; // the Ack repeated
-			return {};
-		default:
-			return {};
-		}
-	}
-
-	std::vector<Packet> on_abort(const Packet& p)
-	{
-		const uint16_t id = p.key.id;
-		const uint32_t x = p.key.gen;
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-		{
-			bury(id, x);
-			return {out(Op::AbortAck, id, x)}; // nothing of it here
-		}
-		Obj& o = it->second;
-		switch (o.st)
-		{
-		case St::Requesting:
-			m_events.push_back(Event{Event::Kind::Refused, id, {}});
-			bury(id, x);
-			m_objs.erase(it);
-			return {out(Op::AbortAck, id, x)};
-		case St::Held:
-		case St::Releasing:
-		case St::Destroying:
-			if (o.gen != 0 && x >= o.gen)
-			{
-				// The world takes back the grant this incarnation came from (never committed).
-				if (o.st != St::Destroying)
-					m_events.push_back(Event{Event::Kind::Remove, id, {}});
-				bury(id, x);
-				m_objs.erase(it);
-			}
-			return {out(Op::AbortAck, id, x)};
-		default:
-			return {out(Op::AbortAck, id, x)}; // it holds no incarnation up to x
-		}
-	}
-
-	void on_drop(const Packet& p)
-	{
-		const uint16_t id = p.key.id;
-		const uint32_t x = p.key.gen;
-		auto it = m_objs.find(id);
-		if (it == m_objs.end())
-			return;
-		Obj& o = it->second;
-		const bool writes = o.st == St::Held || o.st == St::Releasing || o.st == St::Spawning;
-		if ((writes || o.st == St::Destroying) && o.gen <= x)
-		{
-			if (writes)
-				m_events.push_back(Event{Event::Kind::Remove, id, {}});
-			bury(id, o.gen);
-			m_objs.erase(it);
-		}
-	}
-
-	std::vector<Packet> on_snapshot_ack(const Packet& p, uint64_t now)
-	{
-		const uint16_t id = p.key.id;
-		auto it = m_objs.find(id);
-		if (it == m_objs.end() || it->second.st != St::Held || it->second.gen != p.key.gen)
-			return {};
-		Obj& o = it->second;
-		uint32_t seq = 0;
-		std::vector<uint8_t> unused;
-		if (!read_snapshot(p.payload, seq, unused))
-			return {};
-		o.committed = true; // the world takes snapshots from the owner only
-		if (seq == 0)
-		{
-			// The world asks for the state (a resync).
-			if (!o.seq)
-				o.seq = 1;
-			o.acked = 0;
-			arm(o, now);
-			return {out(Op::Snapshot, id, o.gen, snapshot_payload(o.seq, o.state))};
-		}
-		o.acked = std::max(o.acked, std::min(seq, o.seq));
-		return {};
-	}
-};
-
 // The auditor (R9): compares what `server` reports (its objects in `buckets`) with the ledger.
 //   Duplicate - it writes an object the ledger gives to someone else, or one the ledger does not have;
 //   Lost      - the ledger gives it an object (settled, in `buckets`) it does not report, or under another gen;
@@ -1590,6 +833,8 @@ inline std::vector<Finding> audit(const Ledger& ledger, Peer server, const std::
 	uint32_t buckets)
 {
 	std::vector<Finding> f;
+	if (ledger.m_lost.count(server))
+		return f; // R7: gone, nothing of it counts
 	std::set<uint16_t> seen;
 	for (const Entry& e : reported)
 	{
@@ -1645,6 +890,8 @@ inline std::vector<Packet> heal(Ledger& ledger, const std::vector<Finding>& find
 		switch (f.kind)
 		{
 		case Violation::Duplicate:
+			if (ledger.m_lost.count(f.server))
+				break; // gone (R7)
 			if (r && r->owner == f.server && !(r->phase == Phase::Stable && r->gen != f.gen))
 				break; // it is the owner now
 			++ledger.m_counters.violations;
@@ -1656,16 +903,27 @@ inline std::vector<Packet> heal(Ledger& ledger, const std::vector<Finding>& find
 			}
 			break;
 		case Violation::Lost:
-			if (!r || r->owner != f.server || r->phase != Phase::Stable)
-				break; // moved since
+			if (!r || r->owner != f.server || r->phase != Phase::Stable || ledger.m_lost.count(f.server))
+				break; // moved since, or the map server is gone (server_lost has done it)
+			if (!ledger.fits(1, detail::kEntryBytes))
+				break; // R6: the journal is full - the next audit finds it again
+			// R9: taken back two-phase - Aborting under a new gen (above any gen the map server can hold), Abort
+			// repeated by tick until AbortAck; the world writes it again only then.
 			++ledger.m_counters.violations;
 			ledger.set_owner(f.id, *r, kWorld);
-			out.push_back(detail::packet(Op::Drop, f.id, std::max(f.gen, r->gen), kWorld, f.server));
 			r->gen = ledger.next_gen();
+			r->phase = Phase::Aborting;
+			r->peer = f.server;
+			r->since = 0;
+			r->tries = 0;
+			r->next_retry = 0; // armed by the next tick
 			r->snap_seq = 0;
+			ledger.open(f.id, *r, detail::kEntryBytes);
+			out.push_back(detail::packet(Op::Abort, f.id, r->gen, kWorld, f.server));
 			break;
 		case Violation::Drift:
-			if (!r || r->owner != f.server || r->phase != Phase::Stable || r->gen != f.gen)
+			if (!r || r->owner != f.server || r->phase != Phase::Stable || r->gen != f.gen ||
+			    ledger.m_lost.count(f.server))
 				break;
 			++ledger.m_counters.resyncs;
 			r->snap_seq = 0;
