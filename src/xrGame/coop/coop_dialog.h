@@ -80,5 +80,7 @@ void on_talk_window_closed();
 // Short HUD line (and a console line) for the local player. `string_id` is looked up in the string
 // table; if it is missing, `fallback` is shown. Shared by coop_trade.
 void hud_message(const char* string_id, const char* fallback);
+// The same HUD line with one number: the translation of `string_id` (or `fallback`) is a format with one %u. No log line.
+void hud_message_n(const char* string_id, const char* fallback, u32 n);
 } // namespace dialog
 } // namespace coop

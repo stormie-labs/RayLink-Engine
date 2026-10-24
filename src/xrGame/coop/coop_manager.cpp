@@ -5,6 +5,7 @@
 #include "coop_sync.h"
 #include "coop_script.h"
 #include "coop_autosave.h" // F3
+#include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "xrCoop/coop_link_hold.h"
 
 #include <atomic>
@@ -17,12 +18,19 @@ namespace coop
 {
 namespace
 {
+void host_silence_off(); // below, by Manager::frame
 void log_line(const char* line) { ::Msg("%s", line); }
 
 // W9: silence before a peer is dropped. A process that stops pumping without a hold (crash dialog, hang) is gone
 // after this; ENet rounds it up to its next retransmission (10-16 s). Was 120 s, which kept a crashed client
 // "connected" for two minutes.
 constexpr u32 kPeerTimeoutMs = 10000;
+// Live 2026-10-24 (owner): "if the server does not answer, everything freezes on the client and he cannot move; out only
+// after 30 seconds". A live client whose host has said nothing (not even an acknowledgement) for kHostSilenceFreezeMs
+// pauses its game and shows the seconds left; the host back - it runs on. A client's own silence timeout is
+// kHostSilenceLeaveMs: then on_disconnected takes him out of the host's world (join::on_session_lost).
+constexpr u32 kHostSilenceFreezeMs = 2000;
+constexpr u32 kHostSilenceLeaveMs = 30000;
 // W9: how long one loading activity holds the link (re-armed by every load stage and by every frame until this machine
 // plays normally again, coop_link_hold.h): the longest single stage we wait for, e.g. the texture upload of a big
 // level on a slow disk.
@@ -381,6 +389,7 @@ void Manager::install_session_callbacks()
 	m_session.on_disconnected = [this](const std::string& reason)
 	{
 		::Msg("! [coop] disconnected: %s", reason.c_str());
+		host_silence_off(); // the pause of a silent host does not outlive the session
 		script::on_session_end(reason.c_str()); // W4 menu: last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
@@ -459,7 +468,9 @@ bool Manager::start_client(const char* address, u16 port)
 	}
 	install_handlers(false); // F3a T4
 	std::string err;
-	if (!m_session.connect(make_config(port), address, port, &err))
+	SessionConfig cfg = make_config(port);
+	cfg.peer_timeout_ms = kHostSilenceLeaveMs; // the client waits for a silent host this long (frozen meanwhile)
+	if (!m_session.connect(cfg, address, port, &err))
 	{
 		::Msg("! [coop] cannot connect to %s:%u: %s", address, port, err.c_str());
 		return false;
@@ -566,6 +577,47 @@ void Manager::autostart()
 	}
 }
 
+namespace
+{
+bool g_silence_paused = false;
+u32 g_silence_shown = ~0u;
+
+void host_silence_off()
+{
+	if (!g_silence_paused)
+		return;
+	g_silence_paused = false;
+	g_silence_shown = ~0u;
+	if (Device.Paused())
+		Device.Pause(FALSE, TRUE, TRUE, "coop_host_silent");
+	::Msg("[coop] the host answers again: the game runs on");
+}
+
+void host_silence_step()
+{
+	const u32 silent = mgr().is_live_client() && g_pGameLevel ? mgr().session().ms_since_host_heard() : 0;
+	if (silent < kHostSilenceFreezeMs)
+	{
+		host_silence_off();
+		return;
+	}
+	if (!g_silence_paused)
+	{
+		g_silence_paused = true;
+		if (!Device.Paused())
+			Device.Pause(TRUE, TRUE, TRUE, "coop_host_silent");
+		::Msg("! [coop] the host does not answer (%u ms): the game waits for it, out after %u s", silent,
+		    kHostSilenceLeaveMs / 1000);
+	}
+	const u32 left = silent >= kHostSilenceLeaveMs ? 0 : (kHostSilenceLeaveMs - silent + 999) / 1000;
+	if (left != g_silence_shown)
+	{
+		g_silence_shown = left;
+		dialog::hud_message_n("st_coop_host_silent", "No connection to the host - waiting %u s", left);
+	}
+}
+} // namespace
+
 void Manager::frame()
 {
 	autostart();
@@ -584,6 +636,7 @@ void Manager::frame()
 	fs.crashed = g_crashed.load();
 	m_session.hold_connection(link_hold::keep_held(fs) ? kLoadHoldMs : 0);
 	m_session.update(now_ms());
+	host_silence_step(); // live 2026-10-24: a silent host freezes the client
 	join::frame();
 	sync::frame();
 }

@@ -146,6 +146,8 @@ public:
 	// (atomic with hold_connection: one racing with it cannot re-arm). Thread-safe, also mid-crash.
 	void seal_connection_hold();
 	uint64_t keepalive_services() const; // helper services so far (diagnostics)
+	// A client: ms since anything (an acknowledgement too) came from the host; 0 when not a connected client.
+	uint32_t ms_since_host_heard() const;
 
 	// Bulk transfer of an arbitrary byte blob in chunks over Lane::Bulk, with CRC32 check.
 	// Returns the blob id. R1 I4: a blob of the same kind still queued or streaming to that peer is cancelled, the

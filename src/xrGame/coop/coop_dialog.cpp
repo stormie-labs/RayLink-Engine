@@ -669,6 +669,19 @@ void hud_message(const char* string_id, const char* fallback)
 		s->wnd()->TextItemControl()->SetText(text);
 }
 
+void hud_message_n(const char* string_id, const char* fallback, u32 n)
+{
+	if (!g_pGameLevel || !CurrentGameUI())
+		return;
+	const shared_str tr = CStringTable().translate(string_id);
+	const char* fmt = (tr.size() && xr_strcmp(tr.c_str(), string_id) != 0) ? tr.c_str() : fallback;
+	string512 text;
+	xr_sprintf(text, fmt, n);
+	StaticDrawableWrapper* s = CurrentGameUI()->AddCustomStatic("item_used", true);
+	if (s && s->wnd())
+		s->wnd()->TextItemControl()->SetText(text);
+}
+
 PeerId host_talk_holder(u16 npc) // W11
 {
 	if (!mgr().is_host())

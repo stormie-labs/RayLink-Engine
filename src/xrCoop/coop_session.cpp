@@ -2287,6 +2287,14 @@ uint64_t Session::keepalive_services() const
 	return m->m_tp.keepalive_services();
 }
 
+uint32_t Session::ms_since_host_heard() const
+{
+	if (m->m_role != Role::Client || !m->m_server)
+		return 0;
+	const uint32_t ms = net::Transport::ms_since_receive(m->m_server->peer);
+	return ms == UINT32_MAX ? 0 : ms;
+}
+
 void Session::set_log(LogFn fn)
 {
 	m->m_log = std::move(fn);
