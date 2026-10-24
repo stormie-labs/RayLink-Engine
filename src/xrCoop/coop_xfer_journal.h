@@ -3,6 +3,7 @@
 //   [coop_xfer]
 //   v = 1
 //   gen = <the ledger's gen counter>
+//   peer = <the next map server peer the ledger will register>
 //   n = <entries>
 //   x<i> = <G|A|R>,<id>,<map server>,<gen>,<gen it held before the release>,<state in base64, R only>
 // The reader is strict: anything malformed refuses the whole text (the objects then load at their last confirmed
@@ -163,11 +164,11 @@ inline size_t journal_entry_bytes(const std::vector<uint8_t>& payload)
 	return detail::kEntryBytes + detail::base64_size(payload.size());
 }
 
-inline std::string write_journal(uint32_t gen, std::vector<JournalEntry> list)
+inline std::string write_journal(uint32_t gen, Peer next_peer, std::vector<JournalEntry> list)
 {
 	std::sort(list.begin(), list.end(), [](const JournalEntry& a, const JournalEntry& b) { return a.id < b.id; });
-	std::string s = "[coop_xfer]\nv = 1\ngen = " + std::to_string(gen) + "\nn = " + std::to_string(list.size());
-	s += "\n";
+	std::string s = "[coop_xfer]\nv = 1\ngen = " + std::to_string(gen) + "\npeer = " + std::to_string(next_peer);
+	s += "\nn = " + std::to_string(list.size()) + "\n";
 	for (size_t i = 0; i < list.size(); ++i)
 	{
 		const JournalEntry& j = list[i];
@@ -178,9 +179,10 @@ inline std::string write_journal(uint32_t gen, std::vector<JournalEntry> list)
 	return s;
 }
 
-// Reads a text written by write_journal (other sections may surround [coop_xfer]). False, and `gen_out`/`out`
-// untouched, for anything malformed.
-inline bool read_journal(const std::string& text, uint32_t& gen_out, std::vector<JournalEntry>& out)
+// Reads a text written by write_journal (other sections may surround [coop_xfer]). False, and the outputs untouched,
+// for anything malformed.
+inline bool read_journal(const std::string& text, uint32_t& gen_out, Peer& next_peer_out,
+	std::vector<JournalEntry>& out)
 {
 	if (text.size() > kJournalMaxBytes)
 		return false;
@@ -218,14 +220,16 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, std::vector
 		if (key.empty() || !kv.emplace(key, detail::trim(line.substr(eq + 1))).second)
 			return false;
 	}
-	uint32_t version = 0, gen = 0, n = 0;
+	uint32_t version = 0, gen = 0, next_peer = 0, n = 0;
 	if (!kv.count("v") || !detail::parse_u32(kv["v"], 1, version) || version != 1)
 		return false;
 	if (!kv.count("gen") || !detail::parse_u32(kv["gen"], 0xffffffffu, gen))
 		return false;
+	if (!kv.count("peer") || !detail::parse_u32(kv["peer"], 0xffffffffu, next_peer) || next_peer == kWorld)
+		return false;
 	if (!kv.count("n") || !detail::parse_u32(kv["n"], uint32_t(kJournalMaxEntries), n))
 		return false;
-	if (kv.size() != 3 + size_t(n))
+	if (kv.size() != 4 + size_t(n))
 		return false;
 	std::vector<JournalEntry> loaded;
 	std::set<uint16_t> seen;
@@ -249,7 +253,8 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, std::vector
 		j.kind = f[0][0];
 		uint32_t id = 0;
 		if (!detail::parse_u32(f[1], 0xffff, id) || !detail::parse_u32(f[2], 0xffffffffu, j.peer) ||
-		    j.peer == kWorld || !detail::parse_u32(f[3], 0xffffffffu, j.gen) || j.gen == 0 || j.gen > gen ||
+		    j.peer == kWorld || j.peer >= next_peer || !detail::parse_u32(f[3], 0xffffffffu, j.gen) || j.gen == 0 ||
+		    j.gen > gen ||
 		    !detail::parse_u32(f[4], 0xffffffffu, j.from_gen) || !detail::unbase64(f[5], j.payload))
 			return false;
 		if (j.kind != 'R' && (!j.payload.empty() || j.from_gen != 0))
@@ -261,6 +266,7 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, std::vector
 	}
 	out = std::move(loaded);
 	gen_out = gen;
+	next_peer_out = next_peer;
 	return true;
 }
 } // namespace xfer

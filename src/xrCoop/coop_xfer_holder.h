@@ -368,7 +368,12 @@ private:
 				return {out(Op::TakeCommit, id, x)};
 			case St::Committing:
 			case St::Destroying:
-				break; // deleted here
+				// Deleted here. A copy of the grant of its own incarnation (or an older one) gets no answer:
+				// declining it would let the world take the object back and undo the destroy (review round 2, H1).
+				// A newer one is declined below.
+				if (x <= o.gen)
+					return {};
+				break;
 			}
 		}
 		// Not wanted, deleted here, or barred: declined - it will never hold this gen (R2).
@@ -466,16 +471,16 @@ private:
 		}
 	}
 
-	// Every answer is an AbortAck and every AbortAck is a promise kept by decline(): (id, x) is never made here later,
-	// whatever state the id is in (review C1: Committing, Spawning, Destroying too).
+	// Every AbortAck is a promise kept by decline(): (id, x) is never made here later, whatever state the id is in
+	// (review C1: Committing, Spawning, Destroying too). The one Abort not confirmed is the abort of the grant whose
+	// object it is destroying: the destroy wins (R5) and its Destroy, repeated, ends the world's abort.
 	std::vector<Packet> on_abort(const Packet& p, uint64_t now)
 	{
 		const uint16_t id = p.key.id;
 		const uint32_t x = p.key.gen;
-		std::vector<Packet> v{decline(id, x)};
 		auto it = m_objs.find(id);
 		if (it == m_objs.end())
-			return v; // nothing of it here
+			return {decline(id, x)}; // nothing of it here
 		Obj& o = it->second;
 		switch (o.st)
 		{
@@ -483,20 +488,28 @@ private:
 			// Refused (no such object) or the grant it never got was taken back.
 			m_events.push_back(Event{Event::Kind::Refused, id, {}});
 			m_objs.erase(it);
-			return v;
+			return {decline(id, x)};
+		case St::Destroying:
+			if (o.gen != 0 && x == o.gen)
+				return {}; // R5: the destroy wins - the world takes the Destroy while Aborting
+			if (o.gen != 0 && x > o.gen)
+			{
+				bury(id, o.gen); // a newer abort (a heal): let go
+				m_objs.erase(it);
+			}
+			return {decline(id, x)};
 		case St::Held:
 		case St::Releasing:
-		case St::Destroying:
-			if (o.gen != 0 && x >= o.gen)
+		{
+			std::vector<Packet> v{decline(id, x)};
+			if (x >= o.gen)
 			{
-				// The world takes back the grant this incarnation came from (never committed). The engine drops the
-				// object and the request it came from ends without it (Refused); a wish to take it again stays.
+				// The world takes back the grant this incarnation came from (never committed), or a heal reclaims it.
+				// The engine drops the object and the request it came from ends without it (Refused); a wish to take it
+				// again stays.
 				const bool again = o.st == St::Releasing && o.again;
-				if (o.st != St::Destroying)
-				{
-					m_events.push_back(Event{Event::Kind::Remove, id, {}});
-					m_events.push_back(Event{Event::Kind::Refused, id, {}});
-				}
+				m_events.push_back(Event{Event::Kind::Remove, id, {}});
+				m_events.push_back(Event{Event::Kind::Refused, id, {}});
 				bury(id, o.gen);
 				m_objs.erase(it);
 				if (again)
@@ -506,11 +519,21 @@ private:
 				}
 			}
 			return v;
-		case St::Spawning:
-		case St::Committing:
-			return v; // it holds no incarnation up to x; Committing keeps its `again`
 		}
-		return v;
+		case St::Spawning:
+			// An Abort with a gen while spawning: the world registered this spawn and takes it back (a heal - the
+			// spawn's gen is below any gen of an abort sent after it). Let go, like any incarnation up to x (review
+			// round 2, item 3). Gen 0 refuses a request for an id the world never knew: nothing to let go.
+			if (x != 0)
+			{
+				m_events.push_back(Event{Event::Kind::Remove, id, {}});
+				m_objs.erase(it);
+			}
+			return {decline(id, x)};
+		case St::Committing:
+			return {decline(id, x)}; // it holds no incarnation up to x; Committing keeps its `again`
+		}
+		return {decline(id, x)};
 	}
 
 	void on_drop(const Packet& p)

@@ -35,16 +35,20 @@
 //   R4 a destroy tombstones the id for kTombstoneMs: a late SpawnPrepare or TakeReq gets nothing back; Destroy {0}
 //      of a spawn the world has not seen tombstones it for that map server, anew even over an older tombstone that
 //      ends sooner. A tombstone must outlive every packet in the network (60 s against an ordered loopback channel;
-//      the fuzzer drops packets older than 5 s and keeps tombstones >= 6 s).
+//      the fuzzer loses every packet older than the run's tombstone less a second).
 //   R5 ReleasePrepare or Destroy with the gen of a grant still Granting to that map server is its TakeCommit too (it
-//      can only have that gen from the Grant). While Aborting the abort wins: the object stays the world's at its
-//      last confirmed state.
+//      can only have that gen from the Grant). While Aborting the abort wins over a release (the object stays the
+//      world's at its last confirmed state) but a destroy wins over the abort: the map server's engine has destroyed
+//      the object, and a destroy is never undone (review round 2, H1) - the world takes Destroy {g} while Aborting
+//      {g}, the map server does not confirm the abort of the gen it is destroying.
 //   R6 the journal (Granting, Aborting, Releasing) stays within kJournalMaxEntries and kJournalMaxBytes of text: a
 //      transfer that does not fit is not started (no Grant, no Ack) - the map server repeats until it fits.
-//   R7 server_lost means gone: its process is dead or its connection closed for good and its Holder is never used
-//      again. Its objects go back to the world at once (a prepared release completed, a grant or an abort to it
-//      resolved as if acknowledged); the Drops it returns are best effort. Its late messages are ignored from then on;
-//      server_joined takes the peer id back when a new connection gets it.
+//   R7 a map server is known to the ledger by a peer register_server gives each connection: never reused (the next
+//      one is kept in the journal across loads), so nothing of an earlier connection can pass for a later one's. The
+//      ledger hears only registered peers that are not lost. server_lost means gone: its process is dead or its
+//      connection closed for good and its Holder is never used again. Its objects go back to the world at once (a
+//      prepared release completed, a grant or an abort to it resolved as if acknowledged); the Drops it returns are
+//      best effort; its late messages are ignored.
 //   R8 after a load (resolve_after_load) every map server is gone: Releasing - completed with the journal's state;
 //      Granting/Aborting - rolled back; an object owned by a map server - back to the world at its last confirmed
 //      state. A Releasing entry whose object the save lacks is recreated from its state; a Granting entry whose
@@ -149,9 +153,15 @@ public:
 		m_limits.journal_bytes = std::min(m_limits.journal_bytes, kJournalMaxBytes);
 	}
 
-	// A map server connected under a peer id that server_lost retired: its messages count again (the old connection is
-	// closed for good, nothing of it can arrive any more).
-	void server_joined(Peer server) { m_lost.erase(server); }
+	// A map server connected: the peer the ledger knows it by from now on (R7). Never reused - the engine maps the
+	// session slot of the connection to it, and a new connection in the same slot gets a new peer.
+	Peer register_server()
+	{
+		assert(m_next_peer != 0 && "xfer: the peer counter is exhausted");
+		const Peer p = m_next_peer++;
+		m_live.insert(p);
+		return p;
+	}
 
 	// An object of the world (start, load, the world's own spawn). Creates it owned by the world; an existing one keeps
 	// its owner and takes the state only when the world writes it. Clears a tombstone of the id.
@@ -192,8 +202,8 @@ public:
 	std::vector<Packet> on_packet(const Packet& p, uint64_t now)
 	{
 		std::vector<Packet> out;
-		if (p.from == kWorld || p.to != kWorld || m_lost.count(p.from))
-			return out; // R7: nothing of a lost map server counts any more
+		if (p.from == kWorld || p.to != kWorld || !m_live.count(p.from))
+			return out; // R7: only registered map servers that are not lost are heard
 		switch (p.op)
 		{
 		case Op::TakeReq: on_take_req(p, now, out); break;
@@ -217,7 +227,7 @@ public:
 		for (uint16_t id : m_busy)
 		{
 			Rec& r = m_recs.at(id);
-			if (m_lost.count(r.peer))
+			if (!m_live.count(r.peer))
 			{
 				gone.push_back(id); // cannot happen through server_lost (it resolves them); kept as a guard
 				continue;
@@ -279,7 +289,7 @@ public:
 		std::vector<Packet> out;
 		if (server == kWorld)
 			return out;
-		m_lost.insert(server);
+		m_live.erase(server);
 		std::vector<uint16_t> ids;
 		for (const auto& kv : m_recs)
 			if (kv.second.owner == server || (kv.second.phase != Phase::Stable && kv.second.peer == server))
@@ -310,7 +320,7 @@ public:
 		}
 		for (const JournalEntry& j : m_loaded)
 			list.push_back(j);
-		return write_journal(m_gen, std::move(list));
+		return write_journal(m_gen, m_next_peer, std::move(list));
 	}
 
 	// Reads a journal written by save_journal (other sections may surround [coop_xfer]); the entries wait for
@@ -318,11 +328,13 @@ public:
 	bool load_journal(const std::string& text)
 	{
 		uint32_t gen = 0;
+		Peer next_peer = 0;
 		std::vector<JournalEntry> loaded;
-		if (!read_journal(text, gen, loaded))
+		if (!read_journal(text, gen, next_peer, loaded))
 			return false;
 		m_loaded = std::move(loaded);
 		m_gen = std::max(m_gen, gen);
+		m_next_peer = std::max(m_next_peer, next_peer);
 		return true;
 	}
 
@@ -362,7 +374,7 @@ public:
 		}
 		m_loaded.clear();
 		m_dead.clear();
-		m_lost.clear(); // a load starts a new world: every map server connects anew
+		m_live.clear(); // a load starts a new world: every map server registers anew (with a new peer)
 		// A new epoch below the top bit: each session starts at most at 127 << kEpochShift and has more than 2^31 gens
 		// ahead (one per transfer - centuries at any real rate), so next_gen never wraps.
 		const uint64_t epoch = (uint64_t(m_gen) >> kEpochShift) + 1;
@@ -478,7 +490,8 @@ private:
 	std::map<uint16_t, Rec> m_recs;
 	std::map<Peer, std::set<uint16_t>> m_owned; // owner -> ids
 	std::set<uint16_t> m_busy; // ids in a transfer (the journal)
-	std::set<Peer> m_lost; // map servers lost for good (R7): their messages are ignored
+	std::set<Peer> m_live; // registered map servers not lost (R7): the only ones heard
+	Peer m_next_peer = 1; // never reused (kWorld = 0 is the world)
 	std::map<uint16_t, Tomb> m_dead;
 	std::vector<JournalEntry> m_loaded; // read by load_journal, waiting for resolve_after_load
 	uint32_t m_gen = 0;
@@ -621,9 +634,10 @@ private:
 		Rec* r = find(id);
 		if (!r)
 		{
-			// No such object (destroyed, or never made): refused, so the map server stops asking.
-			auto d = m_dead.find(id);
-			out.push_back(detail::packet(Op::Abort, id, d != m_dead.end() ? d->second.gen : 0, kWorld, p.from));
+			// No such object (destroyed, or never made): refused with gen 0, so the map server stops asking. Gen 0
+			// says "no incarnation of yours": a refusal that arrives late, when that map server spawns the id
+			// meanwhile, must not read as taking the spawn back (an Abort with a gen does - round 2, item 3).
+			out.push_back(detail::packet(Op::Abort, id, 0, kWorld, p.from));
 			return;
 		}
 		if (r->phase == Phase::Granting && r->peer == p.from)
@@ -774,9 +788,9 @@ private:
 			const bool own_spawn =
 				p.key.gen == 0 && r->spawned_by == p.from && r->spawn_gen != 0 && r->gen == r->spawn_gen;
 			const bool owns = r->phase == Phase::Stable && r->owner == p.from && (p.key.gen == r->gen || own_spawn);
-			const bool granted =
-				r->phase == Phase::Granting && r->peer == p.from && p.key.gen != 0 && r->gen == p.key.gen;
-			if (owns || granted) // R5: a destroy of the incarnation granted is its commit too
+			const bool granted = (r->phase == Phase::Granting || r->phase == Phase::Aborting) && r->peer == p.from &&
+			                     p.key.gen != 0 && r->gen == p.key.gen;
+			if (owns || granted) // R5: a destroy of the incarnation granted is its commit too, and wins over an abort
 			{
 				const uint32_t g = bury(id, p.from, p.key.gen, now);
 				out.push_back(detail::packet(Op::Done, id, g, kWorld, p.from));
@@ -833,8 +847,8 @@ inline std::vector<Finding> audit(const Ledger& ledger, Peer server, const std::
 	uint32_t buckets)
 {
 	std::vector<Finding> f;
-	if (ledger.m_lost.count(server))
-		return f; // R7: gone, nothing of it counts
+	if (!ledger.m_live.count(server))
+		return f; // R7: not registered or gone, nothing of it counts
 	std::set<uint16_t> seen;
 	for (const Entry& e : reported)
 	{
@@ -890,7 +904,7 @@ inline std::vector<Packet> heal(Ledger& ledger, const std::vector<Finding>& find
 		switch (f.kind)
 		{
 		case Violation::Duplicate:
-			if (ledger.m_lost.count(f.server))
+			if (!ledger.m_live.count(f.server))
 				break; // gone (R7)
 			if (r && r->owner == f.server && !(r->phase == Phase::Stable && r->gen != f.gen))
 				break; // it is the owner now
@@ -903,7 +917,7 @@ inline std::vector<Packet> heal(Ledger& ledger, const std::vector<Finding>& find
 			}
 			break;
 		case Violation::Lost:
-			if (!r || r->owner != f.server || r->phase != Phase::Stable || ledger.m_lost.count(f.server))
+			if (!r || r->owner != f.server || r->phase != Phase::Stable || !ledger.m_live.count(f.server))
 				break; // moved since, or the map server is gone (server_lost has done it)
 			if (!ledger.fits(1, detail::kEntryBytes))
 				break; // R6: the journal is full - the next audit finds it again
@@ -923,7 +937,7 @@ inline std::vector<Packet> heal(Ledger& ledger, const std::vector<Finding>& find
 			break;
 		case Violation::Drift:
 			if (!r || r->owner != f.server || r->phase != Phase::Stable || r->gen != f.gen ||
-			    ledger.m_lost.count(f.server))
+			    !ledger.m_live.count(f.server))
 				break;
 			++ledger.m_counters.resyncs;
 			r->snap_seq = 0;
