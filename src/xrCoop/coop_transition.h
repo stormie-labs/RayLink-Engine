@@ -3,10 +3,17 @@
 //
 // Until the split levels of F3a every player is on the host's level and the whole group changes level together. The
 // stock exit zone is where the group meets for that: a player who stands in the zone of an exit is READY for it (his
-// "claim"); when every player who is in the world is ready for the same exit the group goes after kCountdownMs, by the
-// path coop_accept_transition always took. The host may go at once (the hold of a key), a player may step back out of
-// the zone and so withdraw. Any level change of the host's own (the stock zone, the "go?" dialog, jump_to_level of a guide)
-// goes through the same board while somebody else is in the session (coop_join.cpp host_gate_level_change).
+// "claim"); when every player who is in the world is ready for the same exit the group goes, by the path
+// coop_accept_transition always took. A player may step back out of the zone and so withdraw. Any level change of the
+// host's own (the stock zone, the "go?" dialog, jump_to_level of a guide) goes through the same board while somebody else
+// is in the session (coop_join.cpp host_gate_level_change).
+//
+// The live test of 2026-10-24 (owner: "we wait for the second player as long as it takes while we stand in the transition
+// radius; the screen darkens only when we actually start moving; holding a key for a quick transition is fine, but only for
+// those who are NOT standing in the transition zone"): no countdown, no "go now" key of the host, the darkening at the go
+// only (every moving player's, the host player's too: the board's Going state, coop_hud_transition.script), a key held by a
+// player who is not at the exit = he comes along ("consent"), and the stock route exits (sr_teleport restrictors whose drop
+// point lies in a level changer) are that changer's exit while a player stands in them (no fade, no teleport).
 //
 // The rule (docs in the report, tests/test_transition_wait.cpp):
 //  - who must be ready: every player in the world and alive. A downed, dead or spectating player does not block (he cannot
@@ -16,19 +23,22 @@
 //    like everybody);
 //  - the exit: players ready for different exits do not add up; the exit whose claim is the oldest leads, the others wait
 //    "at another exit";
-//  - the countdown: kCountdownMs from the moment nobody is missing; anybody stepping back, or a player who gets into the
-//    world and is not ready, stops it ("cancelled");
-//  - go now: the host holds the key at his exit (kHostGoHoldMs): the group goes at once if somebody (the host) stands at
-//    that exit;
+//  - the go: on the tick nobody is missing, however long that took (State::Going; the host's own load follows kGoFadeMs
+//    later while every moving player's screen darkens, coop_join.cpp host_board_step); the chat's /go (force) goes at once
+//    through the exit somebody waits at, whoever is missing;
+//  - three kinds of claim, the "place" the host measures him against: at the exit (the changer's own zone: the changer), in
+//    a route restrictor that leads into it (the restrictor: kRoutePlace | id), or "go with the group" (kNoPlace: no
+//    distance at all, only to an exit somebody else stands at - zone or route -, and it ends with the last of them: Board::
+//    anchored). A claim of the same exit another way replaces the old one and keeps its age;
 //  - a client's claim is kept alive by his refresh every kClaimRefreshMs and lapses kClaimLapseMs after the last one; the
-//    host also drops it when the host's own view of the player is further than kLeaveM from the exit (he walked away and the
-//    cancel got lost); an exit's claim needs him within kReachM when he makes it (coop_join.cpp checks that, it needs the
-//    world);
+//    host also drops it when the host's own view of the player is further than kLeaveM from its place (he walked away and
+//    the cancel got lost); a claim at a place needs him within kReachM of it when he makes it (coop_join.cpp gives the
+//    distances, it needs the world);
 //  - a guide trip (kGuideGoal: no exit zone, the host's script asked for the move) has the host as its first claim and
 //    the others confirm it; it lapses after kGuideLifeMs without everybody's yes.
-// Wire (protocol 10): TransitionVote = u8 op + u16 level changer (host numbering; kNoChanger = no exit, a "ready" without
-// one confirms the guide trip); TransitionState (host -> all) = StateMsg below, at most every kStateEveryMs while the board
-// is not idle, plus once when it goes idle.
+// Wire (protocol 11): TransitionVote = u8 op + u16 level changer (host numbering; kNoChanger = no exit, a "ready" without
+// one confirms the guide trip) + for VoteRoute a u16 route restrictor; TransitionState (host -> all) = StateMsg below, at most
+// every kStateEveryMs while the board is not idle, plus once when it goes idle.
 //
 // F3a T8 (docs/plans/2026-10-24-f3a-split-levels.md §1.2, §1.5, §1.10):
 //  - the host player is a client of his own world server over the local link: he is peer 0 of the server's players(), a
@@ -61,9 +71,7 @@ namespace transition
 {
 constexpr uint16_t kNoChanger = 0xffff;
 constexpr uint32_t kGuideGoal = 0x10000; // one guide trip at a time (a goal is a level changer id, or this)
-constexpr uint32_t kCountdownMs = 5000; // nobody missing -> this long -> the group goes
 constexpr uint32_t kLoadWaitMs = 60000; // a player who is still loading holds the group this long at most
-constexpr uint32_t kHostGoHoldMs = 1500; // the host holds the key this long to go at once (like the revive hold)
 constexpr uint32_t kGuideLifeMs = 60000; // a guide trip lives this long without everybody's yes
 constexpr uint32_t kClaimLapseMs = 20000; // a client's claim lapses this long after his last refresh
 constexpr uint32_t kClaimRefreshMs = 5000; // a client says "still ready" this often
@@ -73,15 +81,30 @@ constexpr uint32_t kIntentSettleMs = 1200; // a client waits this long for the h
 constexpr uint32_t kStateEveryMs = 500; // the host's TransitionState while the board is not idle
 constexpr uint16_t kUnknownDist = 0xffff;
 constexpr size_t kMaxLevelName = 64; // a stock level name is "l01_escape"
+// 2026-10-24: the go. The board's Going state reaches every player (the host player over the local link) and his screen
+// darkens (sleep_fade.ppe, coop_hud_transition.script); the host's own level change starts this long after it, so that the
+// darkening is on the screen before the host's process stops drawing while it writes the transition's save.
+constexpr uint32_t kGoFadeMs = 1000;
+// A route of sr_teleport_sections.ltx whose drop point is within this of a level changer's shapes drops its traveller into
+// that changer (the stock teleport puts the actor there and his body, ~1 m around the point, touches the zone).
+constexpr float kRouteDropM = 2.f;
+constexpr size_t kMaxRoutes = 64; // route restrictors a machine remembers per world (a level has a handful)
+// What the host measures a claim against (its "place"): the exit's own goal (the changer's zone), a route restrictor
+// (kRoutePlace | its id), or nothing (kNoPlace: "go with the group" from afar). A guide trip's claims are never measured.
+constexpr uint32_t kNoPlace = 0xffffffffu;
+constexpr uint32_t kRoutePlace = 0x20000u;
 
 inline uint32_t goal_of_exit(uint16_t changer) { return changer; }
 inline bool is_guide(uint32_t goal) { return goal == kGuideGoal; }
+inline uint32_t place_of_route(uint16_t restrictor) { return kRoutePlace | restrictor; }
+inline bool is_route_place(uint32_t place) { return place != kNoPlace && (place & kRoutePlace) != 0; }
+inline uint16_t route_of_place(uint32_t place) { return uint16_t(place & 0xffffu); }
 
 enum class State : uint8_t
 {
 	Idle = 0, // nobody waits
 	Waiting = 1, // somebody is ready, somebody is missing
-	Counting = 2, // nobody is missing: the countdown runs
+	Going = 2, // nobody is missing (or the chat's /go): the group goes, the screens darken (was the countdown's value)
 };
 
 enum class Mark : uint8_t
@@ -104,8 +127,10 @@ struct Member
 	bool other_map = false; // F3a §1.10: he is on another map: his yes is a remote one (no distance), his row says so
 };
 
-// The high bit of a row's mark byte on the wire: the row's player is on another map (F3a; the layout stays 7 bytes a row).
+// The high bits of a row's mark byte on the wire: the row's player is on another map (F3a), he comes along from afar
+// ("go with the group", 2026-10-24). The layout stays 7 bytes a row.
 constexpr uint8_t kRowOtherMap = 0x80;
+constexpr uint8_t kRowConsent = 0x40;
 
 struct Row
 {
@@ -113,6 +138,7 @@ struct Row
 	Mark mark = Mark::Away;
 	uint16_t dist_m = kUnknownDist; // metres to the leading exit, as the host sees him
 	bool other_map = false; // F3a: on another map (Member::other_map)
+	bool consent = false; // ready from afar: he comes along (a claim without a place)
 };
 
 struct Status
@@ -120,41 +146,48 @@ struct Status
 	State state = State::Idle;
 	uint32_t goal = 0; // the leading exit (a level changer id or kGuideGoal)
 	uint32_t ready = 0, total = 0; // total: who counts (everybody but the downed, and the loaders after their minute)
-	uint32_t countdown_ms = 0; // left, Counting only
 	uint32_t load_ms = 0; // left of the loaders' minute, Waiting for loaders only
-	bool go = false; // the group goes now (the claims are gone with it)
-	bool cancelled = false; // a countdown that ran was stopped by this tick
+	bool go = false; // the group goes now (the claims are gone with it; the state is Going)
 	bool expired = false; // a guide trip timed out by this tick
 	std::vector<Row> rows; // by player id; empty when Idle
 };
 
-// Metres from player `id` to the exit `goal`, or < 0 if unknown (the host's view, coop_join.cpp).
-using DistFn = std::function<float(uint32_t id, uint32_t goal)>;
+// Metres from player `id` to `where`, or < 0 if unknown (the host's view, coop_join.cpp). `where` is a goal (an exit: the
+// distance to its changer's shapes; a row's metres) or a claim's place (also kRoutePlace | a route restrictor's id).
+using DistFn = std::function<float(uint32_t id, uint32_t where)>;
 
 class Board
 {
 public:
-	// `id` is ready for `goal`. The same claim again is a refresh (it keeps its age); another goal replaces the old one.
-	void claim(uint32_t id, uint32_t goal, uint64_t now)
-	{
-		auto it = m_claims.find(id);
-		if (it != m_claims.end() && it->second.goal == goal)
-		{
-			it->second.seen = now;
-			return;
-		}
-		m_claims[id] = Claim{goal, now, now};
-	}
+	// `id` stands at the exit `goal` (its changer's own zone). The same claim again is a refresh (it keeps its age); another
+	// goal replaces the old one; the same goal another way (a route, a consent) becomes this one and keeps its age.
+	void claim(uint32_t id, uint32_t goal, uint64_t now) { put(id, goal, goal, now); }
+	// `id` stands in route restrictor `route`, whose drop point lies in the changer of `goal`: measured against the restrictor.
+	void claim_route(uint32_t id, uint32_t goal, uint16_t route, uint64_t now) { put(id, goal, place_of_route(route), now); }
+	// `id` comes along to `goal` from wherever he is ("go with the group"): no distance; it ends when nobody stands at that
+	// exit any more (tick). apply_vote takes it only for an exit somebody else stands at (anchored).
+	void consent(uint32_t id, uint32_t goal, uint64_t now) { put(id, goal, kNoPlace, now); }
 	// His claim ends. False if he had none.
 	bool release(uint32_t id) { return m_claims.erase(id) != 0; }
-	bool claimed(uint32_t id, uint32_t* goal = nullptr) const
+	bool claimed(uint32_t id, uint32_t* goal = nullptr, uint32_t* place = nullptr) const
 	{
 		const auto it = m_claims.find(id);
 		if (it == m_claims.end())
 			return false;
 		if (goal)
 			*goal = it->second.goal;
+		if (place)
+			*place = it->second.place;
 		return true;
+	}
+	// Somebody but `except` stands at exit `goal` (its zone or a route into it), or answers for it from another map: he is
+	// what "go with the group" comes along to. A consent is nobody's anchor.
+	bool anchored(uint32_t goal, uint32_t except) const
+	{
+		for (const auto& c : m_claims)
+			if (c.first != except && c.second.goal == goal && c.second.place != kNoPlace)
+				return true;
+		return false;
 	}
 	void forget(uint32_t id) { m_claims.erase(id); }
 	// A guide trip: the host `id` is the first yes; the others confirm with claim(id, kGuideGoal). Already running: kept.
@@ -167,7 +200,8 @@ public:
 		}
 		claim(id, kGuideGoal, now);
 	}
-	// The host holds the key at exit `goal`: the next tick lets the group go at once if somebody claimed that exit.
+	// The chat's /go (coop_accept_transition) at exit `goal`: the next tick lets the group go at once if somebody claimed
+	// that exit, whoever is missing.
 	void force(uint32_t goal)
 	{
 		m_forced = true;
@@ -179,7 +213,6 @@ public:
 		m_claims.clear();
 		m_guide = false;
 		m_forced = false;
-		m_counting = false;
 		m_loading = false;
 	}
 	bool empty() const { return m_claims.empty(); }
@@ -187,7 +220,6 @@ public:
 	Status tick(const std::vector<Member>& members, const DistFn& dist, uint64_t now)
 	{
 		Status st;
-		const bool was_counting = m_counting;
 		auto member_of = [&members](uint32_t id) -> const Member*
 		{
 			for (const Member& m : members)
@@ -203,14 +235,22 @@ public:
 			bool drop = !m || !m->in_world || !m->alive || m->on_target;
 			if (!drop && m->remote && now > it->second.seen && now - it->second.seen > kClaimLapseMs)
 				drop = true;
-			// F3a: a yes from another map is not near the exit at all: no distance drops it
-			if (!drop && !m->other_map && !is_guide(it->second.goal) && dist)
+			// F3a: a yes from another map is not near the exit at all: no distance drops it; nor does any drop "go with the
+			// group" (no place)
+			if (!drop && !m->other_map && !is_guide(it->second.goal) && it->second.place != kNoPlace && dist)
 			{
-				const float d = dist(it->first, it->second.goal);
+				const float d = dist(it->first, it->second.place);
 				if (d >= 0.f && d > kLeaveM)
 					drop = true;
 			}
 			it = drop ? m_claims.erase(it) : std::next(it);
+		}
+		// 1b. "go with the group" to an exit nobody stands at any more: that wait is over
+		for (auto it = m_claims.begin(); it != m_claims.end();)
+		{
+			const bool lost = it->second.place == kNoPlace && !is_guide(it->second.goal) &&
+			    !anchored(it->second.goal, it->first);
+			it = lost ? m_claims.erase(it) : std::next(it);
 		}
 		// 2. the guide trip's life
 		if (m_guide)
@@ -250,9 +290,7 @@ public:
 		m_forced = false; // a force is for this tick only
 		if (!have_lead)
 		{
-			m_counting = false;
 			m_loading = false;
-			st.cancelled = was_counting;
 			return st; // Idle
 		}
 		st.goal = lead;
@@ -271,6 +309,7 @@ public:
 			if (c != m_claims.end())
 			{
 				r.mark = c->second.goal == lead ? Mark::Ready : Mark::Elsewhere;
+				r.consent = c->second.place == kNoPlace;
 				++(r.mark == Mark::Ready ? st.ready : blockers);
 			}
 			else if (!m.in_world)
@@ -294,26 +333,18 @@ public:
 			st.rows.push_back(r);
 		}
 		st.total = st.ready + blockers + loaders;
-		// 5. the go-now key of the host
+		// 5. the chat's /go
 		if (forced && std::any_of(m_claims.begin(), m_claims.end(),
 		                         [forced_goal](const auto& c) { return c.second.goal == forced_goal; }))
 		{
-			st.go = true;
 			st.goal = forced_goal;
-			st.state = State::Counting;
-			m_claims.clear();
-			m_guide = false;
-			m_counting = false;
-			m_loading = false;
-			return st;
+			return go(st);
 		}
 		// 6. who is missing
 		if (blockers > 0)
 		{
-			m_counting = false;
 			m_loading = false;
 			st.state = State::Waiting;
-			st.cancelled = was_counting;
 			return st;
 		}
 		if (loaders > 0)
@@ -326,82 +357,94 @@ public:
 			const uint64_t waited = now > m_load_since ? now - m_load_since : 0;
 			if (waited < kLoadWaitMs)
 			{
-				m_counting = false;
 				st.state = State::Waiting;
 				st.load_ms = uint32_t(kLoadWaitMs - waited);
-				st.cancelled = was_counting;
 				return st;
 			}
 			st.total -= loaders; // the minute is over: the group does not wait for them any more
 		}
 		else
 			m_loading = false;
-		// 7. nobody is missing: the countdown
-		if (!m_counting)
-		{
-			m_counting = true;
-			m_count_since = now;
-		}
-		const uint64_t elapsed = now > m_count_since ? now - m_count_since : 0;
-		st.state = State::Counting;
-		if (elapsed >= kCountdownMs)
-		{
-			st.go = true;
-			st.countdown_ms = 0;
-			m_claims.clear();
-			m_guide = false;
-			m_counting = false;
-			m_loading = false;
-		}
-		else
-			st.countdown_ms = uint32_t(kCountdownMs - elapsed);
-		return st;
+		// 7. nobody is missing: the group goes on this tick (owner 2026-10-24: no waiting timer)
+		return go(st);
 	}
 
 private:
 	struct Claim
 	{
 		uint32_t goal = 0;
+		uint32_t place = 0; // what the host measures it against: the goal, kRoutePlace | a restrictor, kNoPlace
 		uint64_t since = 0, seen = 0;
 	};
+	void put(uint32_t id, uint32_t goal, uint32_t place, uint64_t now)
+	{
+		auto it = m_claims.find(id);
+		if (it != m_claims.end() && it->second.goal == goal)
+		{
+			it->second.place = place; // the same exit, maybe another way: the claim keeps its age
+			it->second.seen = now;
+			return;
+		}
+		m_claims[id] = Claim{goal, place, now, now};
+	}
+	Status& go(Status& st)
+	{
+		st.go = true;
+		st.state = State::Going;
+		m_claims.clear();
+		m_guide = false;
+		m_loading = false;
+		return st;
+	}
 	std::map<uint32_t, Claim> m_claims;
 	bool m_guide = false;
 	uint64_t m_guide_since = 0;
 	bool m_forced = false;
 	uint32_t m_forced_goal = 0;
-	bool m_counting = false;
-	uint64_t m_count_since = 0;
 	bool m_loading = false;
 	uint64_t m_load_since = 0;
 };
 
 // ---------------------------------------------------------------- messages
 
-// Client -> host (Msg::TransitionVote, protocol 10): u8 op, u16 level changer in HOST numbering. Ready at an exit (the host
-// checks the exit, that the player is in the world and within kReachM of it), Ready without an exit = "yes" to the host's
-// guide trip, Cancel = "not any more" (the changer is not read).
+// Client -> host (Msg::TransitionVote, protocol 11): u8 op, u16 level changer in HOST numbering, and for VoteRoute a u16
+// route restrictor (host numbering). Ready at an exit (the host checks the exit, that the player is in the world and within
+// kReachM of it), Ready without an exit = "yes" to the host's guide trip, Cancel = "not any more" (the changer is not read),
+// Consent = "go with the group" to that exit from afar (2026-10-24: no distance, only to an exit somebody else stands at),
+// Route = he stands in a route restrictor whose drop point lies in that exit's changer (within kReachM of the restrictor).
 enum VoteOp : uint8_t
 {
 	VoteReady = 0,
 	VoteCancel = 1,
+	VoteConsent = 2,
+	VoteRoute = 3,
 };
 
 struct VoteMsg
 {
 	uint8_t op = VoteReady;
 	uint16_t changer = kNoChanger;
+	uint16_t route = kNoChanger; // VoteRoute only
 
-	static bool is_client_op(uint8_t o) { return o == VoteReady || o == VoteCancel; }
+	static bool is_client_op(uint8_t o) { return o == VoteReady || o == VoteCancel || o == VoteConsent || o == VoteRoute; }
 	void write(Writer& w) const
 	{
 		w.u8(op);
 		w.u16(changer);
+		if (op == VoteRoute)
+			w.u16(route);
 	}
 	bool read(Reader& r)
 	{
 		op = r.u8();
 		changer = r.u16();
-		return r.ok() && is_client_op(op);
+		route = op == VoteRoute ? r.u16() : kNoChanger;
+		if (!r.ok() || !is_client_op(op))
+			return false;
+		// coming along, or a route, always into an exit; a route always names its restrictor
+		if ((op == VoteConsent || op == VoteRoute) && changer == kNoChanger)
+			return false;
+		return op != VoteRoute || route != kNoChanger;
 	}
 };
 
@@ -414,19 +457,24 @@ struct VoteFacts
 	float dist = -1.f; // metres from his character to that exit, < 0 unknown
 	bool other_map = false; // he is on another map (the together entry of split levels): a yes from there, no distance
 	bool guide_running = false; // a guide trip runs and its starter still says yes
+	bool route_known = false; // VoteRoute: the restrictor he names is a space restrictor of the server's level
+	float route_dist = -1.f; // VoteRoute: metres from his character to that restrictor, < 0 unknown
 };
 
 // What a vote did to the board (the server logs the refusals).
 enum class Verdict : uint8_t
 {
-	Claimed, // he is ready now (a new claim, or one for another exit)
+	Claimed, // he is ready now (a new claim, one for another exit, or the same exit another way)
 	Refreshed, // the same claim again: it keeps its age
 	Released, // a cancel took his claim
 	Nothing, // a cancel of one who had no claim
 	NotInWorld, // a ready from one who is not in the world
 	NoExit, // a ready at an exit the server's level does not have
-	TooFar, // a ready from further than kReachM of the exit, or from an unknown distance, on the exit's map
+	TooFar, // a ready from further than kReachM of the exit (or its route restrictor), or from an unknown distance, on the
+	        // exit's map
 	NoGuide, // a yes to a guide trip that does not run
+	NotWaited, // "go with the group" to an exit nobody else stands at
+	NoRoute, // a route restrictor the server's level does not have
 };
 
 // The server's rule for a TransitionVote of player `from` (VoteMsg read and checked by the caller).
@@ -437,6 +485,7 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 	if (!f.in_world)
 		return Verdict::NotInWorld;
 	uint32_t goal = kGuideGoal;
+	uint32_t place = kGuideGoal;
 	if (v.changer == kNoChanger)
 	{
 		if (!f.guide_running)
@@ -446,22 +495,49 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 	{
 		if (!f.exit_known)
 			return Verdict::NoExit;
-		// T12 review (Ruling 18): on the exit's map only within kReachM of it (an unknown distance is no claim); F3a: a yes
-		// from another map is the together entry's remote one, no distance
-		if (!f.other_map && !(f.dist >= 0.f && f.dist <= kReachM))
-			return Verdict::TooFar;
 		goal = goal_of_exit(v.changer);
+		if (v.op == VoteConsent)
+		{
+			// 2026-10-24: one who is not at the exit comes along, from anywhere; to an exit somebody else stands at
+			if (!b.anchored(goal, from))
+				return Verdict::NotWaited;
+			place = kNoPlace;
+		}
+		else if (v.op == VoteRoute)
+		{
+			// 2026-10-24: the route restrictor is the exit's mark (its drop point is in the changer, maybe far behind it): he
+			// is measured against the restrictor, as against the zone of the changer itself
+			if (!f.route_known)
+				return Verdict::NoRoute;
+			if (!f.other_map && !(f.route_dist >= 0.f && f.route_dist <= kReachM))
+				return Verdict::TooFar;
+			place = place_of_route(v.route);
+		}
+		else
+		{
+			// T12 review (Ruling 18): on the exit's map only within kReachM of it (an unknown distance is no claim); F3a: a
+			// yes from another map is the together entry's remote one, no distance
+			if (!f.other_map && !(f.dist >= 0.f && f.dist <= kReachM))
+				return Verdict::TooFar;
+			place = goal;
+		}
 	}
-	uint32_t before = 0;
-	const bool again = b.claimed(from, &before) && before == goal;
-	b.claim(from, goal, now);
+	uint32_t before = 0, before_place = 0;
+	const bool again = b.claimed(from, &before, &before_place) && before == goal && before_place == place;
+	if (place == kNoPlace)
+		b.consent(from, goal, now);
+	else if (is_route_place(place))
+		b.claim_route(from, goal, route_of_place(place), now);
+	else
+		b.claim(from, goal, now);
 	return again ? Verdict::Refreshed : Verdict::Claimed;
 }
 
 // Host -> all (Msg::TransitionState): the board as every machine's placard shows it. `level` is the stock name of the level
 // the leading exit leads to ("l01_escape"; the Lua side translates it), empty when the exit has none (read: unknown).
-//   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms, u32 load_ms,
-//   u8 n, n x { u32 player, u8 mark (| kRowOtherMap: on another map, F3a), u16 dist_m }
+//   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms (always 0 since the
+//   countdown is gone, 2026-10-24: the layout of protocol 11 stays), u32 load_ms,
+//   u8 n, n x { u32 player, u8 mark (| kRowOtherMap: on another map, F3a; | kRowConsent: comes along), u16 dist_m }
 struct StateMsg
 {
 	State state = State::Idle;
@@ -469,7 +545,8 @@ struct StateMsg
 	uint16_t changer = kNoChanger;
 	std::string level;
 	uint16_t ready = 0, total = 0;
-	uint32_t countdown_ms = 0, load_ms = 0;
+	uint32_t countdown_ms = 0; // always 0 (the layout of protocol 11)
+	uint32_t load_ms = 0;
 	std::vector<Row> rows;
 
 	void write(Writer& w) const
@@ -487,7 +564,7 @@ struct StateMsg
 		for (size_t i = 0; i < n; ++i)
 		{
 			w.u32(rows[i].id);
-			w.u8(uint8_t(uint8_t(rows[i].mark) | (rows[i].other_map ? kRowOtherMap : 0u)));
+			w.u8(uint8_t(uint8_t(rows[i].mark) | (rows[i].other_map ? kRowOtherMap : 0u) | (rows[i].consent ? kRowConsent : 0u)));
 			w.u16(rows[i].dist_m);
 		}
 	}
@@ -502,7 +579,7 @@ struct StateMsg
 		countdown_ms = r.u32();
 		load_ms = r.u32();
 		const uint8_t n = r.u8();
-		if (!r.ok() || s > uint8_t(State::Counting) || kind > 1 || level.size() > kMaxLevelName || n > kMaxPlayers)
+		if (!r.ok() || s > uint8_t(State::Going) || kind > 1 || level.size() > kMaxLevelName || n > kMaxPlayers)
 			return false;
 		state = State(s);
 		rows.clear();
@@ -512,11 +589,12 @@ struct StateMsg
 			row.id = r.u32();
 			const uint8_t byte = r.u8();
 			row.dist_m = r.u16();
-			const uint8_t m = uint8_t(byte & ~kRowOtherMap);
+			const uint8_t m = uint8_t(byte & ~(kRowOtherMap | kRowConsent));
 			if (!r.ok() || m > uint8_t(Mark::Elsewhere))
 				return false;
 			row.mark = Mark(m);
 			row.other_map = (byte & kRowOtherMap) != 0;
+			row.consent = (byte & kRowConsent) != 0;
 			rows.push_back(row);
 		}
 		return r.ok();
@@ -535,7 +613,6 @@ inline StateMsg state_message(const Status& s, const std::string& level)
 	m.level = level.size() > kMaxLevelName ? level.substr(0, kMaxLevelName) : level;
 	m.ready = uint16_t(s.ready);
 	m.total = uint16_t(s.total);
-	m.countdown_ms = s.countdown_ms;
 	m.load_ms = s.load_ms;
 	m.rows = s.rows;
 	if (m.rows.size() > kMaxPlayers)
@@ -593,14 +670,16 @@ enum class Send : uint8_t
 };
 
 // The client keeps saying what its player wants until the host's board agrees (a message may be dropped by the host's rate
-// row or lost): `want` / `goal` is what the player does (stands in an exit's zone, or confirmed the guide trip), the view is
-// what the host's last TransitionState says about this player. The caller paces what it sends (limits::Pacer) and calls
-// sent() only when something went out.
+// row or lost): `want` / `goal` is what the player does (stands in an exit's zone or a route restrictor into it, comes along
+// from afar, or confirmed the guide trip), `op` the vote that says it (VoteReady / VoteRoute / VoteConsent), the view is what
+// the host's last TransitionState says about this player. The caller paces what it sends (limits::Pacer) and calls sent()
+// only when something went out.
 struct Intent
 {
 	uint64_t last = 0; // 0: nothing sent since the last reset
+	uint8_t said = VoteReady; // the op of the last ready that went out
 
-	Send wants(bool want, uint32_t goal, bool view_ready, uint32_t view_goal, uint64_t now) const
+	Send wants(bool want, uint32_t goal, bool view_ready, uint32_t view_goal, uint64_t now, uint8_t op = VoteReady) const
 	{
 		if (last != 0 && now >= last && now - last < kIntentSettleMs)
 			return Send::Nothing; // what went out a moment ago is still on its way to the board
@@ -608,12 +687,103 @@ struct Intent
 			return view_ready ? Send::Cancel : Send::Nothing;
 		if (!view_ready || view_goal != goal)
 			return Send::Ready;
+		if (last != 0 && op != said)
+			return Send::Ready; // the same exit another way (into the zone from afar, from the route into the zone itself)
 		if (last != 0 && now >= last && now - last >= kClaimRefreshMs)
 			return Send::Ready; // still here: the host's claim of a client lapses without this
 		return Send::Nothing;
 	}
-	void sent(uint64_t now) { last = now; }
+	void sent(uint64_t now, uint8_t op = VoteReady)
+	{
+		last = now;
+		said = op;
+	}
 	void reset() { last = 0; }
+};
+
+// ---------------------------------------------------------------- route exits (2026-10-24)
+
+// The stock route exits of Anomaly / G.A.M.M.A. are space restrictors (sr_teleport_sections.ltx, logic
+// scripts\sr_teleport_logic.ltx: on_actor_inside = %=sr_teleport%) whose effect fades the screen and, 3 s later, puts the
+// actor at the route's drop point, which lies inside the real level changer. In a session with company that is no exit of
+// the group's: the fade comes when one walks up, and everybody who walks up is put at the same point. Instead the player's
+// own machine (scripts\coop_transition_route.script) asks the engine which level changer holds the drop point
+// (coop.transition_route); while his actor is inside that restrictor he stands at that changer's exit (coop_join.cpp
+// transition_step, VoteRoute), nothing is faded or moved, and the group's level change is the changer's own.
+
+// A level changer of this level and the metres from a route's drop point to its shapes (< 0 or infinite: unknown).
+struct ExitDistance
+{
+	uint16_t changer = kNoChanger;
+	float dist = -1.f;
+};
+
+// The exit a route drops its traveller into: the nearest within kRouteDropM (a tie: the lower id), kNoChanger if none (a
+// route inside the level: the stock teleport stays).
+inline uint16_t route_exit(const std::vector<ExitDistance>& exits)
+{
+	uint16_t best = kNoChanger;
+	float best_d = 0.f;
+	for (const ExitDistance& e : exits)
+	{
+		if (e.changer == kNoChanger || !(e.dist >= 0.f && e.dist <= kRouteDropM))
+			continue;
+		if (best == kNoChanger || e.dist < best_d || (e.dist == best_d && e.changer < best))
+		{
+			best = e.changer;
+			best_d = e.dist;
+		}
+	}
+	return best;
+}
+
+// The route restrictors this machine has learned (this machine's numbering), each with the level changer its drop point is
+// in; for one world (a new one forgets them). At most kMaxRoutes.
+class Routes
+{
+public:
+	struct Entry
+	{
+		uint16_t restrictor = kNoChanger;
+		uint16_t changer = kNoChanger;
+	};
+	// False: nothing to remember, or full.
+	bool add(uint16_t restrictor, uint16_t changer)
+	{
+		if (restrictor == kNoChanger || changer == kNoChanger)
+			return false;
+		for (Entry& e : m_entries)
+			if (e.restrictor == restrictor)
+			{
+				e.changer = changer;
+				return true;
+			}
+		if (m_entries.size() >= kMaxRoutes)
+			return false;
+		m_entries.push_back(Entry{restrictor, changer});
+		return true;
+	}
+	bool forget(uint16_t restrictor)
+	{
+		const auto it = std::find_if(m_entries.begin(), m_entries.end(),
+		    [restrictor](const Entry& e) { return e.restrictor == restrictor; });
+		if (it == m_entries.end())
+			return false;
+		m_entries.erase(it);
+		return true;
+	}
+	uint16_t changer_of(uint16_t restrictor) const
+	{
+		for (const Entry& e : m_entries)
+			if (e.restrictor == restrictor)
+				return e.changer;
+		return kNoChanger;
+	}
+	void clear() { m_entries.clear(); }
+	const std::vector<Entry>& all() const { return m_entries; }
+
+private:
+	std::vector<Entry> m_entries;
 };
 
 // ---------------------------------------------------------------- F3a T8: the simultaneous load of a group transition

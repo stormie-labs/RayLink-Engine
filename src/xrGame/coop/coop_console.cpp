@@ -157,12 +157,12 @@ public:
 };
 
 // The keys of the waiting point of a level change (scripts\coop_hud_transition.script holds them and runs these).
-class CCC_CoopTransitionGo : public IConsole_Command
+class CCC_CoopTransitionConsent : public IConsole_Command
 {
 public:
-	CCC_CoopTransitionGo(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
-	void Execute(LPCSTR) override { join::transition_go_now(); }
-	void Info(TInfo& I) override { xr_strcpy(I, "host, waiting at a level exit: the group goes now, whoever is missing"); }
+	CCC_CoopTransitionConsent(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { join::transition_consent(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "away from the level exit the group waits at: go with the group from here"); }
 };
 
 class CCC_CoopTransitionCancel : public IConsole_Command
@@ -200,7 +200,7 @@ void register_console_commands()
 	CMD1(CCC_CoopNetSim, "coop_netsim");
 	CMD1(CCC_CoopDump, "coop_dump");
 	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
-	CMD1(CCC_CoopTransitionGo, "coop_transition_go");
+	CMD1(CCC_CoopTransitionConsent, "coop_transition_consent");
 	CMD1(CCC_CoopTransitionCancel, "coop_transition_cancel");
 	CMD1(CCC_CoopTransitionConfirm, "coop_transition_confirm");
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));

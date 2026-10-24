@@ -33,6 +33,7 @@
 #include "Level.h"
 #include "Actor.h" // protocol 9: host_actor_faction
 #include "level_changer.h"
+#include "space_restrictor.h" // 2026-10-24: a route restrictor is an exit while the actor is inside it
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "alife_graph_registry.h"
@@ -182,13 +183,28 @@ struct State
 	u64 load_pumped_at = 0; // R1 5, host: the go's saves went to the network (the reload watchdog counts from here)
 	std::string screen_line_was;
 	u32 load_waits_bad = 0; // unreadable LoadWait
-	// both: this player. `want` is what he does (stands in an exit's zone, or said yes to a guide trip).
+	// host, 2026-10-24: the go. The board said go (TransitionState Going: every moving player's screen darkens); the host's
+	// own level change follows transition::kGoFadeMs later (host_board_step), no claim is taken meanwhile.
+	bool going = false;
+	u64 going_at = 0;
+	u32 going_goal = 0;
+	transition::Status going_status;
+	// both: this player. `want` is what he does (stands in an exit's zone or a route restrictor into it, comes along from
+	// afar, or said yes to a guide trip).
 	bool want = false;
 	u32 want_goal = 0;
-	bool zone_in = false; // his actor touches an enabled exit
+	bool zone_in = false; // his actor touches an enabled exit, or stands in a route restrictor into one
 	u16 zone_changer = kNoId; // ... that one (host numbering)
+	u16 zone_route = kNoId; // ... through this route restrictor (host numbering), kNoId: the changer's own zone
 	u16 withdrawn_from = kNoId; // he cancelled at this exit with the key: no claim until he leaves its zone
 	bool guide_yes = false; // client: he said yes to the host's guide trip
+	// 2026-10-24: he held the key away from the exit the board waits at: he comes along ("go with the group") to consent_goal
+	// (host numbering) until he holds it again, walks into an exit, or that wait is over (client_on_transition_state)
+	bool consent = false;
+	u32 consent_goal = 0;
+	// 2026-10-24: the route restrictors (sr_teleport) this machine learned this world, each with the level changer its drop
+	// point is in (coop.transition_route, scripts\coop_transition_route.script; this machine's numbering)
+	transition::Routes routes;
 	u64 zone_scanned = 0;
 	float my_dist = -1.f; // metres from him to the leading exit (< 0 unknown)
 	Fvector exit_pos = {0.f, 0.f, 0.f}; // the leading exit, this machine's numbering
@@ -231,7 +247,7 @@ constexpr u32 kRefusalsLogged = 5;
 // and one-way latency): 2-3 m back at a sprint. 5 m covers both (transition::kReachM, tested).
 constexpr float kVoteReachM = transition::kReachM;
 // Host: after the group is sent off the old world still runs a few frames (the level change is a message the world takes in
-// the next frames); nobody claims an exit in them, or the countdown would start over for a world that is about to go.
+// the next frames); nobody claims an exit in them, or the group would go again from a world that is about to go.
 constexpr u64 kAfterReleaseMs = 4000;
 
 void transition_world_replaced(); // below, with the waiting point of a level change
@@ -1512,7 +1528,8 @@ u16 level_changer_of(NET_Packet& P)
 
 // T12 review (Ruling 18), host: metres from `p` to the nearest shape of a level exit (shapes::kFar if it has none).
 // The exit's transform is built as CGameObject::net_Spawn builds its XFORM, each box as CCF_Shape::Contact does.
-float distance_to_exit(const CSE_ALifeLevelChanger& lc, const Fvector& p)
+// 2026-10-24: any space restrictor's (a level changer is one): a route restrictor's, a route's drop point to a changer's.
+float distance_to_shapes(const CSE_ALifeSpaceRestrictor& lc, const Fvector& p)
 {
 	Fmatrix xf;
 	xf.setXYZ(lc.o_Angle);
@@ -1547,10 +1564,12 @@ float distance_to_exit(const CSE_ALifeLevelChanger& lc, const Fvector& p)
 
 // ---------------------------------------------------------------- the waiting point of a level change (protocol 10)
 // xrCoop/coop_transition.h has the rule and the messages. Every machine runs transition_step() each frame: it finds the
-// exit zone its player stands in (the stock zone of a CLevelChanger), says so (the host to its own board, a client with
-// TransitionVote), keeps the player from walking off the edge of the level while he waits, and keeps the numbers the Lua
-// placard reads (coop.transition()). The host also runs the board (host_board_step): who is ready, when the group goes
-// (host_release, the same level change coop_accept_transition always made), and tells everybody (TransitionState).
+// exit zone its player stands in (the stock zone of a CLevelChanger, or since 2026-10-24 a route restrictor that leads into
+// one: route_touched), says so (TransitionVote: the host player's over the local link), or that he comes along from afar
+// (the key held away from the exit: transition_consent), keeps the player from walking off the edge of the level while he
+// waits, and keeps the numbers the Lua placard reads (coop.transition()). The host also runs the board (host_board_step):
+// who is ready, when the group goes (the Going state: every screen darkens; kGoFadeMs later host_release, the same level
+// change coop_accept_transition always made), and tells everybody (TransitionState).
 
 // The stock name of the level game vertex `gv` is on ("l01_escape"), empty if unreadable.
 std::string level_name_of(GameGraph::_GRAPH_ID gv)
@@ -1599,6 +1618,50 @@ u16 exit_touched(CActor* a)
 	for (CLevelChanger* lc : g_lchangers)
 		if (lc && lc->IsLevelChangerEnabled() && lc->feel_touch_contact(a))
 			return to_host(lc->ID());
+	return kNoId;
+}
+
+// 2026-10-24, host: a space restrictor of the level the host is on that is no level changer (a route's mark), nullptr if
+// `id` is none.
+CSE_ALifeSpaceRestrictor* restrictor_here(u16 id)
+{
+	if (id == kNoId || !g_pGameLevel || !ai().get_alife())
+		return nullptr;
+	CSE_ALifeSpaceRestrictor* r = smart_cast<CSE_ALifeSpaceRestrictor*>(ai().alife().objects().object(id, true));
+	if (!r || smart_cast<CSE_ALifeLevelChanger*>(r))
+		return nullptr;
+	const CGameGraph& gg = ai().game_graph();
+	if (!gg.valid_vertex_id(r->m_tGraphID) || gg.vertex(r->m_tGraphID)->level_id() != ai().alife().graph().level().level_id())
+		return nullptr;
+	return r;
+}
+
+// 2026-10-24: the route restrictor (one this machine learned, coop.transition_route) this actor stands in, whose level
+// changer is enabled: that changer in HOST numbering, kNoId if none; `route` gets the restrictor (host numbering). Inside is
+// the restrictor's own test of the actor's position (as the stock on_actor_inside asks it, CScriptGameObject::inside), every
+// frame: the restrictor's logic fires its sr_teleport once per entry of ANY player (coop_npc_logic evaluates it for the
+// group), so a second player who walks in while the first stands there would never be told.
+u16 route_touched(CActor* a, u16& route)
+{
+	route = kNoId;
+	if (!a->g_Alive() || g.routes.all().empty())
+		return kNoId;
+	Fsphere at;
+	at.P = a->Position();
+	at.R = EPS_L;
+	for (const transition::Routes::Entry& e : g.routes.all())
+	{
+		CObject* object = Level().Objects.net_Find(e.restrictor);
+		const CSpaceRestrictor* r = object ? object->cast_restrictor() : nullptr;
+		if (!r || !r->inside(at))
+			continue;
+		CObject* door = Level().Objects.net_Find(e.changer);
+		const CLevelChanger* lc = door ? door->cast_level_changer() : nullptr;
+		if (!lc || !lc->IsLevelChangerEnabled())
+			continue;
+		route = to_host(e.restrictor);
+		return to_host(e.changer);
+	}
 	return kNoId;
 }
 
@@ -2248,7 +2311,7 @@ bool host_release(u32 goal)
 	return true;
 }
 
-// Host: what the board shows changed (who is ready, the state, the exit)? The countdown and the distances do not count.
+// Host: what the board shows changed (who is ready and how, the state, the exit)? The distances do not count.
 u32 board_signature(const transition::Status& st)
 {
 	u32 sig = 17u;
@@ -2258,7 +2321,7 @@ u32 board_signature(const transition::Status& st)
 	sig = sig * 31u + st.total;
 	sig = sig * 31u + (st.load_ms != 0 ? 1u : 0u);
 	for (const transition::Row& r : st.rows)
-		sig = sig * 31u + r.id * 8u + u32(r.mark);
+		sig = sig * 31u + r.id * 16u + u32(r.mark) * 2u + (r.consent ? 1u : 0u);
 	return sig;
 }
 
@@ -2299,6 +2362,20 @@ void host_board_step(u64 now)
 		return; // the group is on its way: the old world is about to go
 	if (!g_pGameLevel || !ai().get_alife() || g.world_seen != g_world_generation)
 		return; // no world (a level change, a load): nothing to run, the board was cleared with the old world
+	// 2026-10-24: the group goes. Every player's screen darkens on the board's Going state (coop_hud_transition.script, the
+	// host player's over the local link); the host's own level change starts kGoFadeMs after the go, so that his darkening is
+	// on the screen before his process stops drawing to write the transition's save. Nothing else runs meanwhile.
+	if (g.going)
+	{
+		if (now - g.going_at >= transition::kGoFadeMs)
+		{
+			g.going = false;
+			host_release(g.going_goal);
+		}
+		else
+			host_board_send(g.going_status, now); // the Going state again (every kStateEveryMs): a lost one is no darkening
+		return;
+	}
 	const bool company = host_has_company();
 	if (!company && g.board.empty() && g.board_view.state == transition::State::Idle)
 		return;
@@ -2332,26 +2409,40 @@ void host_board_step(u64 now)
 		// on_target / other_map stay off: one map for everybody until split levels run (F3a T10 sets them by coop_levels)
 		members.push_back(m);
 	}
-	const transition::DistFn dist = [](u32 id, u32 goal) -> float
+	// metres from a player to an exit's changer, or to the route restrictor a claim of his stands in (its place)
+	const transition::DistFn dist = [](u32 id, u32 where) -> float
 	{
-		if (transition::is_guide(goal))
+		if (transition::is_guide(where) || where == transition::kNoPlace)
 			return -1.f;
-		const CSE_ALifeLevelChanger* lc = level_changer_here(u16(goal));
 		CObject* body = id == 0 ? (g_actor ? Actor() : nullptr) : Level().Objects.net_Find(proxy_of_peer(id));
-		return lc && body ? distance_to_exit(*lc, body->Position()) : -1.f;
+		if (!body)
+			return -1.f;
+		if (transition::is_route_place(where))
+		{
+			const CSE_ALifeSpaceRestrictor* r = restrictor_here(transition::route_of_place(where));
+			return r ? distance_to_shapes(*r, body->Position()) : -1.f;
+		}
+		const CSE_ALifeLevelChanger* lc = level_changer_here(u16(where));
+		return lc ? distance_to_shapes(*lc, body->Position()) : -1.f;
 	};
 	const transition::Status st = g.board.tick(members, dist, now);
 	g.board_lead_known = st.state != transition::State::Idle;
 	g.board_lead = st.goal;
-	if (st.cancelled)
-		::Msg("[coop] transition: cancelled (somebody stepped back or is not ready)");
 	if (st.expired)
 		::Msg("[coop] transition: the guide trip lapsed, not everybody said yes in %u s", transition::kGuideLifeMs / 1000);
-	if (st.state == transition::State::Idle && !st.cancelled)
+	if (st.state == transition::State::Idle)
 		g.guide.set = false;
-	host_board_send(st, now);
 	if (st.go)
-		host_release(st.goal);
+	{
+		g.board_sent_at = 0; // the Going state goes out now, whatever went out a moment ago
+		g.going = true;
+		g.going_at = now;
+		g.going_goal = st.goal;
+		g.going_status = st;
+		::Msg("[coop] transition: %u of %u ready, the group goes to '%s' (the screens darken, the load in %u ms)", st.ready,
+		    st.total, goal_level_name(st.goal).c_str(), transition::kGoFadeMs);
+	}
+	host_board_send(st, now);
 }
 
 // Both roles, every frame. See the header of this section.
@@ -2363,26 +2454,45 @@ void transition_step(u64 now)
 		g.want = false;
 		g.zone_in = false;
 		g.zone_changer = kNoId;
+		g.zone_route = kNoId;
 		g.withdrawn_from = kNoId;
 		g.guide_yes = false;
+		g.consent = false;
 		g.hold.reset();
 		g.intent.reset();
 		return; // the host's board drops his claim by itself (host_board_step)
 	}
-	const u16 touched = exit_touched(a);
+	u16 route = kNoId;
+	u16 touched = exit_touched(a);
+	if (touched == kNoId)
+		touched = route_touched(a, route); // 2026-10-24: a route restrictor into a changer is that changer's exit
 	const bool alive = a->g_Alive() && survival::life_of(0) == survival::Life::Alive;
 	if (touched == kNoId || touched != g.withdrawn_from)
 		g.withdrawn_from = kNoId; // he left the zone he had withdrawn from (or stands in another one)
 	g.zone_in = touched != kNoId && alive;
 	g.zone_changer = touched;
+	g.zone_route = g.zone_in ? route : kNoId;
 	bool want = g.zone_in && touched != g.withdrawn_from;
 	u32 goal = want ? transition::goal_of_exit(touched) : 0;
+	u8 op = route != kNoId ? transition::VoteRoute : transition::VoteReady;
+	// 2026-10-24: at an exit he is there (it replaces "go with the group"); away from it, the key he held (transition_consent)
+	// says he comes along while the board waits at that exit (client_on_transition_state ends it with that wait)
+	if (g.zone_in)
+		g.consent = false;
+	else if (g.consent && alive && g.view.state != transition::State::Idle && g.view.kind == 0 &&
+	    u32(g.view.changer) == g.consent_goal)
+	{
+		want = true;
+		goal = g.consent_goal;
+		op = transition::VoteConsent;
+	}
 	// A yes to the guide trip on the board (a client's confirm; the host player's game asked for the trip, host_gate_level_change)
 	// holds while the board shows that trip; the board's message clears it when the trip is over (client_on_transition_state).
 	if (g.guide_yes && g.view.state != transition::State::Idle && g.view.kind == 1)
 	{
 		want = true;
 		goal = transition::kGuideGoal;
+		op = transition::VoteReady;
 	}
 	if (want && !g.want)
 		g.held_note = false;
@@ -2397,24 +2507,26 @@ void transition_step(u64 now)
 			for (const transition::Row& r : g.view.rows)
 				view_ready = view_ready || (r.id == self && r.mark == transition::Mark::Ready);
 		const u32 view_goal = g.view.kind == 1 ? transition::kGuideGoal : u32(g.view.changer);
-		const transition::Send send = g.intent.wants(want, goal, view_ready, view_goal, now);
+		const transition::Send send = g.intent.wants(want, goal, view_ready, view_goal, now, op);
 		if (send != transition::Send::Nothing && g.vote_pacer.take(Msg::TransitionVote, now))
 		{
+			const bool ready = send == transition::Send::Ready;
 			transition::VoteMsg v;
-			v.op = send == transition::Send::Ready ? transition::VoteReady : transition::VoteCancel;
-			v.changer = (send == transition::Send::Ready && !transition::is_guide(goal)) ? u16(goal) : transition::kNoChanger;
+			v.op = ready ? op : transition::VoteCancel;
+			v.changer = (ready && !transition::is_guide(goal)) ? u16(goal) : transition::kNoChanger;
+			v.route = ready && op == transition::VoteRoute ? g.zone_route : transition::kNoChanger;
 			Writer w(8);
 			v.write(w);
 			net::client_send(Msg::TransitionVote, w);
-			g.intent.sent(now);
+			g.intent.sent(now, ready ? op : g.intent.said);
 			++g.votes_sent;
 		}
 	}
-	// The hold: a player waiting at an exit does not walk off the edge of the level.
+	// The hold: a player waiting at an exit does not walk off the edge of the level (one who comes along from afar is free).
 	const Fvector pos = a->Position();
 	const float at[3] = {pos.x, pos.y, pos.z};
 	float back[3] = {0.f, 0.f, 0.f};
-	if (g.hold.step(want && !transition::is_guide(goal), g.zone_in, on_map(pos), at, back))
+	if (g.hold.step(want && !transition::is_guide(goal) && op != transition::VoteConsent, g.zone_in, on_map(pos), at, back))
 	{
 		Fvector to;
 		to.set(back[0], back[1], back[2]);
@@ -2442,7 +2554,7 @@ void transition_step(u64 now)
 			{
 				g.exit_known = true;
 				g.exit_pos = lc->o_Position;
-				g.my_dist = distance_to_exit(*lc, pos);
+				g.my_dist = distance_to_shapes(*lc, pos);
 			}
 		}
 	}
@@ -2461,8 +2573,12 @@ void transition_world_replaced()
 	g.want = false;
 	g.zone_in = false;
 	g.zone_changer = kNoId;
+	g.zone_route = kNoId;
 	g.withdrawn_from = kNoId;
 	g.guide_yes = false;
+	g.consent = false;
+	g.going = false; // 2026-10-24: a go whose level change never came (a load meanwhile) is over with its world
+	g.routes.clear(); // the route restrictors were the old level's
 	g.exit_known = false;
 	g.my_dist = -1.f;
 	g.hold.reset();
@@ -2501,12 +2617,12 @@ void set_lua_bool(lua_State* L, const char* key, bool v)
 }
 
 // coop.transition() -> nil | table, the board as this player's placard shows it (scripts/coop_hud_transition.script):
-//   state "waiting" | "counting", kind "exit" | "guide", level (stock name, "l01_escape"), changer (exit id, host numbering),
-//   ready, total, countdown_ms (left, counting), load_ms (left of the loaders' minute, 0 = none),
+//   state "waiting" | "going" (2026-10-24: the group goes now, the screen darkens), kind "exit" | "guide", level (stock name,
+//   "l01_escape"), changer (exit id, host numbering), ready, total, load_ms (left of the loaders' minute, 0 = none),
 //   rows = { {peer, mark "ready"|"away"|"loading"|"down"|"elsewhere", dist (m, to the exit; left out if unknown),
-//            other (true: on another map, F3a; left out otherwise)}, ... },
-//   me = { peer, host, in_zone (I stand in an exit's zone), ready (the board has me ready), dist (m to the exit),
-//          confirm (a guide trip I can say yes to) },
+//            other (true: on another map, F3a), consent (true: he comes along from afar); left out otherwise}, ... },
+//   me = { peer, host, in_zone (I stand in an exit's zone or a route restrictor into it), ready (the board has me ready),
+//          dist (m to the exit), confirm (a guide trip I can say yes to), consent (I held the key to come along) },
 //   pos = {x, y, z} of the exit on this machine (left out for a guide trip).
 // nil when nobody waits, outside a session, or when the host's board has been silent for 3 s.
 int l_transition(lua_State* L)
@@ -2522,14 +2638,13 @@ int l_transition(lua_State* L)
 	const u64 age = now > g.view_at ? now - g.view_at : 0;
 	const u32 self = mgr().self();
 	lua_newtable(L);
-	set_lua_string(L, "state", v.state == transition::State::Counting ? "counting" : "waiting");
+	set_lua_string(L, "state", v.state == transition::State::Going ? "going" : "waiting");
 	set_lua_string(L, "kind", v.kind == 1 ? "guide" : "exit");
 	set_lua_string(L, "level", v.level.c_str());
 	if (v.kind == 0)
 		set_lua_number(L, "changer", lua_Number(v.changer));
 	set_lua_number(L, "ready", lua_Number(v.ready));
 	set_lua_number(L, "total", lua_Number(v.total));
-	set_lua_number(L, "countdown_ms", lua_Number(v.countdown_ms > age ? v.countdown_ms - age : 0));
 	set_lua_number(L, "load_ms", lua_Number(v.load_ms > age ? v.load_ms - age : 0));
 	bool me_ready = false;
 	lua_newtable(L);
@@ -2543,6 +2658,8 @@ int l_transition(lua_State* L)
 			set_lua_number(L, "dist", lua_Number(r.dist_m));
 		if (r.other_map)
 			set_lua_bool(L, "other", true); // F3a: on another map (the together entry of split levels)
+		if (r.consent)
+			set_lua_bool(L, "consent", true); // 2026-10-24: he comes along from afar
 		lua_rawseti(L, -2, ++index);
 		me_ready = me_ready || (r.id == self && r.mark == transition::Mark::Ready);
 	}
@@ -2555,6 +2672,7 @@ int l_transition(lua_State* L)
 	if (g.my_dist >= 0.f && g.my_dist < 1.0e6f)
 		set_lua_number(L, "dist", lua_Number(g.my_dist));
 	set_lua_bool(L, "confirm", v.kind == 1 && !me_ready && !g.guide_yes);
+	set_lua_bool(L, "consent", g.consent);
 	lua_setfield(L, -2, "me");
 	if (g.exit_known)
 	{
@@ -2564,6 +2682,54 @@ int l_transition(lua_State* L)
 		set_lua_number(L, "z", lua_Number(g.exit_pos.z));
 		lua_setfield(L, -2, "pos");
 	}
+	return 1;
+}
+
+// 2026-10-24: coop.transition_route(restrictor_id, x, y, z) -> level changer id | nil (this machine's numbering). A route
+// restrictor of sr_teleport_sections.ltx (scripts\coop_transition_route.script) drops its traveller at (x, y, z): the enabled
+// level changer of this level that holds that point (transition::route_exit). While the group waits at exits here
+// (group_waits_here: a client in the host's world, a host with company) the pair is remembered for this world and the
+// player who stands inside that restrictor stands at that changer's exit (transition_step); the script then leaves the stock
+// fade and teleport out. nil: no session with company, not a space restrictor, or a route inside the level (the stock
+// teleport stays).
+int l_transition_route(lua_State* L)
+{
+	const bool args = lua_type(L, 1) == LUA_TNUMBER && lua_type(L, 2) == LUA_TNUMBER && lua_type(L, 3) == LUA_TNUMBER &&
+	    lua_type(L, 4) == LUA_TNUMBER;
+	const lua_Number id = args ? lua_tonumber(L, 1) : -1.;
+	if (!args || !mgr().active() || !group_waits_here() || !g_pGameLevel || !ai().get_alife() || !(id >= 0. && id < 65535.))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const u16 restrictor = u16(id);
+	CObject* object = Level().Objects.net_Find(restrictor);
+	Fvector drop;
+	drop.set(float(lua_tonumber(L, 2)), float(lua_tonumber(L, 3)), float(lua_tonumber(L, 4)));
+	if (!object || !object->cast_restrictor() || object->cast_level_changer() || !_valid(drop))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	std::vector<transition::ExitDistance> exits;
+	for (CLevelChanger* lc : g_lchangers)
+	{
+		if (!lc || !lc->IsLevelChangerEnabled())
+			continue;
+		const CSE_ALifeLevelChanger* se = level_changer_here(lc->ID());
+		exits.push_back(transition::ExitDistance{lc->ID(), se ? distance_to_shapes(*se, drop) : -1.f});
+	}
+	const u16 changer = transition::route_exit(exits);
+	if (changer == transition::kNoChanger)
+	{
+		g.routes.forget(restrictor);
+		lua_pushnil(L);
+		return 1;
+	}
+	if (g.routes.changer_of(restrictor) != changer && g.routes.add(restrictor, changer))
+		::Msg("[coop] transition: route '%s' leads into level exit %u: standing in it is standing at that exit",
+		    object->cName().c_str(), u32(to_host(changer)));
+	lua_pushnumber(L, lua_Number(changer));
 	return 1;
 }
 
@@ -2588,7 +2754,8 @@ CObject* player_body(PeerId id)
 
 // Host: a player's TransitionVote, the host player's over the local link included (F3a T8: one rule for all,
 // transition::apply_vote). Ready at an exit (checked: an exit of this level, the player is in the world and within
-// kVoteReachM of it), Ready without an exit (a yes to the host's guide trip), Cancel.
+// kVoteReachM of it), Ready without an exit (a yes to the host's guide trip), Route (within kVoteReachM of a route
+// restrictor of this level into that exit), Consent ("go with the group" to an exit somebody else stands at), Cancel.
 void host_on_transition_vote(PeerId from, Reader& r)
 {
 	if (!mgr().is_host())
@@ -2603,11 +2770,11 @@ void host_on_transition_vote(PeerId from, Reader& r)
 	const std::string nick = nick_of_peer(from);
 	const u64 now = mgr().now_ms();
 	transition::VoteFacts f;
-	if (v.op == transition::VoteReady)
+	if (v.op != transition::VoteCancel)
 	{
 		if (!g_pGameLevel || !ai().get_alife())
 			return;
-		if (g.released_at != 0 && now - g.released_at < kAfterReleaseMs)
+		if (g.going || (g.released_at != 0 && now - g.released_at < kAfterReleaseMs))
 			return; // the group is on its way, the old world is about to go: no new claim in it
 		// T12 review (Ruling 18): only a player who is in the world claims, and only at that exit (R2 I3: a level changer of
 		// the host's own level)
@@ -2618,7 +2785,14 @@ void host_on_transition_vote(PeerId from, Reader& r)
 			const CSE_ALifeLevelChanger* lc = level_changer_here(v.changer);
 			f.exit_known = lc != nullptr;
 			if (lc && body)
-				f.dist = distance_to_exit(*lc, body->Position());
+				f.dist = distance_to_shapes(*lc, body->Position());
+		}
+		if (v.op == transition::VoteRoute)
+		{
+			const CSE_ALifeSpaceRestrictor* route = restrictor_here(v.route);
+			f.route_known = route != nullptr;
+			if (route && body)
+				f.route_dist = distance_to_shapes(*route, body->Position());
 		}
 		uint32_t starter = 0;
 		f.guide_running = g.guide.set && g.board.claimed(0, &starter) && transition::is_guide(starter);
@@ -2634,7 +2808,13 @@ void host_on_transition_vote(PeerId from, Reader& r)
 		break;
 	case transition::Verdict::Claimed:
 		g.board_ticked = 0;
-		if (v.changer != transition::kNoChanger)
+		if (v.op == transition::VoteConsent)
+			::Msg("[coop] transition: '%s' goes with the group through level exit %u (from %.0f m)", nick.c_str(), v.changer,
+			    f.dist);
+		else if (v.op == transition::VoteRoute)
+			::Msg("[coop] transition: '%s' is ready at level exit %u, in its route %u (%.1f m)", nick.c_str(), v.changer,
+			    v.route, f.route_dist);
+		else if (v.changer != transition::kNoChanger)
 			::Msg("[coop] transition: '%s' is ready at level exit %u (%.1f m)", nick.c_str(), v.changer, f.dist);
 		break;
 	case transition::Verdict::Refreshed:
@@ -2652,12 +2832,22 @@ void host_on_transition_vote(PeerId from, Reader& r)
 		break;
 	case transition::Verdict::TooFar:
 		if (++g.votes_refused <= kRefusalsLogged)
-			::Msg("! [coop] '%s' says he is ready at level exit %u from %.1f m away (at most %.0f m): ignored", nick.c_str(),
-			    v.changer, f.dist, kVoteReachM);
+			::Msg("! [coop] '%s' says he is ready at level exit %u from %.1f m away (at most %.0f m%s): ignored", nick.c_str(),
+			    v.changer, v.op == transition::VoteRoute ? f.route_dist : f.dist, kVoteReachM,
+			    v.op == transition::VoteRoute ? " of its route" : "");
 		break;
 	case transition::Verdict::NoGuide:
 		if (++g.votes_refused <= kRefusalsLogged)
 			::Msg("! [coop] '%s' says yes to a guide trip but there is none: ignored", nick.c_str());
+		break;
+	case transition::Verdict::NotWaited:
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' goes with the group through level exit %u, where nobody waits: ignored", nick.c_str(),
+			    v.changer);
+		break;
+	case transition::Verdict::NoRoute:
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' says he stands in route %u, which is no restrictor here: ignored", nick.c_str(), v.route);
 		break;
 	}
 }
@@ -2679,6 +2869,9 @@ void client_on_transition_state(PeerId from, Reader& r)
 	g.view_at = mgr().now_ms();
 	if (m.state == transition::State::Idle || m.kind != 1)
 		g.guide_yes = false;
+	// 2026-10-24: "go with the group" is for the exit the board waits at; another exit, a guide trip, or no wait ends it
+	if (m.state == transition::State::Idle || m.kind != 0 || u32(m.changer) != g.consent_goal)
+		g.consent = false;
 }
 
 // F3a T8, host: a player's loading screen of the simultaneous load is up (the host player's over the local link; his
@@ -2822,7 +3015,7 @@ u32 world_generation() { return g_world_generation; }
 bool accept_transition()
 {
 	// The waiting point's fallback (the chat's /go, the console): the group goes at once through the exit somebody waits
-	// at, whoever is missing (the host's own hold of the key does the same, transition_go_now).
+	// at, whoever is missing (owner 2026-10-24: the host has no key of his own for it any more).
 	if (!mgr().is_host() || !g_pGameLevel || !ai().get_alife() || !g.board_lead_known)
 	{
 		::Msg("! [coop] no pending transition: nobody waits at a level exit");
@@ -2834,17 +3027,17 @@ bool accept_transition()
 	return true;
 }
 
-bool transition_go_now()
+bool transition_consent()
 {
-	uint32_t goal = 0;
-	if (!mgr().is_host() || !g_pGameLevel || !ai().get_alife() || !g.board.claimed(0, &goal))
-	{
-		::Msg("! [coop] transition: you are not waiting at an exit");
+	// 2026-10-24: one who is NOT at the exit the board waits at goes with the group from where he is (no distance); at the
+	// exit there is nothing to hold (he withdraws by stepping out)
+	if (!group_waits_here() || g.zone_in || g.view.state != transition::State::Waiting || g.view.kind != 0 ||
+	    g.view.changer == transition::kNoChanger)
 		return false;
-	}
-	g.board.force(goal);
-	g.board_ticked = 0;
-	::Msg("[coop] the host holds the key: the group goes now (exit %u)", goal);
+	g.consent = true;
+	g.consent_goal = u32(g.view.changer);
+	g.intent.reset(); // it goes out at the next frame (the host player's over the local link too)
+	::Msg("[coop] transition: you go with the group through level exit %u", g.consent_goal);
 	return true;
 }
 
@@ -2853,6 +3046,7 @@ bool transition_cancel()
 	if (!group_waits_here())
 		return false;
 	g.guide_yes = false;
+	g.consent = false;
 	if (g.zone_in)
 		g.withdrawn_from = g.zone_changer; // no claim until he leaves this zone
 	g.intent.reset(); // the cancel goes out at the next frame (F3a T8: the host player's over the local link too)
@@ -2921,6 +3115,8 @@ void register_lua(lua_State* L)
 	}
 	lua_pushcfunction(L, &l_transition);
 	lua_setfield(L, -2, "transition"); // coop.transition()
+	lua_pushcfunction(L, &l_transition_route);
+	lua_setfield(L, -2, "transition_route"); // coop.transition_route(restrictor, x, y, z), 2026-10-24
 	lua_pop(L, 1); // coop
 }
 
@@ -3076,6 +3272,14 @@ void on_session_lost(const char*)
 	// it, the host takes the characters of its players out below). Called before the phase goes Off.
 	if (mgr().is_live_client() || (mgr().is_host() && !g.peers.empty()))
 		diag::arm_destroyed_object_stacks();
+	// Live 2026-10-24: "the host closed the connection and the client stays in the game, talking to NPCs". A client's
+	// world is the host's, mirrored: without the host it is nobody's (none of it is saved, its NPCs only stand there).
+	// The client leaves it for the main menu; the co-op window tells why (script::on_session_end, before this call).
+	if (mgr().is_client() && g_pGameLevel)
+	{
+		::Msg("[coop] the session is over: leaving the host's world for the main menu");
+		Console->Execute("disconnect"); // the engine defers it (KERNEL:disconnect): safe from a network callback
+	}
 	client_char_closed("session"); // protocol 8: a choice window of this session closes with it (none: nothing)
 	// W9, host: the session is over, nobody else is in the world. Clients take the avatars out through their own
 	// switch vote (coop::switch_vote: no session = no player in the world).
@@ -3301,7 +3505,7 @@ void print_status()
 		    g.characters_made, u32(g.choosers.count()), g.choices_refused, g.choices_ignored);
 		const transition::StateMsg& b = g.board_view;
 		if (b.state != transition::State::Idle)
-			::Msg("[coop]   transition: %s at %s (exit %u), %u of %u ready%s", b.state == transition::State::Counting ? "counting down" : "waiting",
+			::Msg("[coop]   transition: %s at %s (exit %u), %u of %u ready%s", b.state == transition::State::Going ? "going" : "waiting",
 			    b.level.c_str(), u32(b.changer), u32(b.ready), u32(b.total), b.kind == 1 ? " (a guide trip)" : "");
 		// F3a T8: the simultaneous load of the group's transition
 		if (g.load.active())
@@ -3323,9 +3527,10 @@ void print_status()
 	else if (mgr().is_client())
 	{
 		::Msg("[coop]   my proxy (host numbering) %u, swap %s", g.my_proxy, g.swap_done ? "done" : "pending");
-		::Msg("[coop]   transition: %s%s, %u vote(s) sent, held at the edge %u time(s)",
+		::Msg("[coop]   transition: %s%s%s, %u vote(s) sent, held at the edge %u time(s), %u route(s) known",
 		    g.view.state == transition::State::Idle ? "nobody waits" : "the host's board is on",
-		    g.want ? ", I am ready" : "", g.votes_sent, g.holds_applied);
+		    g.want ? ", I am ready" : "", g.consent ? " (I go with the group)" : "", g.votes_sent, g.holds_applied,
+		    u32(g.routes.all().size()));
 		if (g.char_step != State::CharStep::None)
 			::Msg("[coop]   new character: %s", g.char_step == State::CharStep::Sent ? "chosen, waiting for the world"
 			                                                                       : "choosing (window)");

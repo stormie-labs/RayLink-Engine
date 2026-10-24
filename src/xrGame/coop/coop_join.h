@@ -91,8 +91,10 @@ u32 world_generation();
 bool accept_transition();
 
 // --- the waiting point of a level change (protocol 10; rule and messages in xrCoop/coop_transition.h) ---
-// Until the split levels (F3a) the whole group changes level together: a player who stands in the zone of an exit is
-// ready for it, the group goes when every player in the world is (5 s countdown), the host may go at once. Both roles run
+// Until the split levels (F3a) the whole group changes level together: a player who stands in the zone of an exit (or in a
+// route restrictor that leads into it, coop.transition_route) is ready for it, one who is not at the exit may hold a key to
+// come along from where he is, the group goes on the moment every player in the world is ready (no countdown; the screens
+// darken, the load follows a second later; owner 2026-10-24). Both roles run
 // it from frame(); the placard reads coop.transition() (scripts\coop_hud_transition.script). F3a T8: the host player votes
 // and reads the board over the local link like a client (TransitionVote / TransitionState); the group's move is one
 // simultaneous load (LoadWait / LoadReady: every client in the world loads the transition's save with the host, the loading
@@ -106,13 +108,15 @@ bool transition_owns_exit(bool exit_enabled);
 // yes); false = the stock change goes on (no players besides the host, or the board's own change). `P` is read, not
 // consumed.
 bool host_gate_level_change(NET_Packet& P);
-// Console coop_transition_go (host): the key held at an exit: the group goes now. coop_transition_cancel (any player):
-// the key held while ready: withdraw (no claim until he leaves the zone); a guide trip: not confirmed. coop_transition_confirm
-// (client): yes to the host's guide trip.
-bool transition_go_now();
+// Console coop_transition_consent (any player who is NOT at the exit the board waits at, 2026-10-24): the key held: he goes
+// with the group from where he is (no distance) until he holds it again. coop_transition_cancel (any player): the key held
+// while ready: withdraw (at an exit: no claim until he leaves the zone; coming along: not any more); a guide trip: not
+// confirmed. coop_transition_confirm (client): yes to the host's guide trip. The host's "go now" key is gone (the chat's
+// /go, accept_transition, stays).
+bool transition_consent();
 bool transition_cancel();
 bool transition_confirm();
-// coop.transition() for Lua (coop_script.cpp register_raw).
+// coop.transition() and coop.transition_route() for Lua (coop_script.cpp register_raw).
 void register_lua(lua_State* L);
 // Host, F3 Task 10: player `peer` goes through the join again in the world the host serves now: SessionReset {why,
 // epoch} to him alone, with the epoch he is in already (his session and the host's take it as it is), his entry

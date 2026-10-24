@@ -98,7 +98,7 @@ enum class Msg : uint16_t
 	JoinComplete = 0x0103, // host -> client: catch-up done, live sync on
 	SessionReset = 0x0104, // host -> clients: world replaced (host load): str reason, u32 new world epoch; rejoin
 	LevelChange = 0x0105, // host -> clients: group transition, rejoin after
-	TransitionVote = 0x0106, // client -> host: u8 op (ready / cancel), u16 level changer (host numbering), coop_transition.h VoteMsg
+	TransitionVote = 0x0106, // client -> host: u8 op (ready / cancel / consent / route), u16 level changer (host numbering), [u16 route], coop_transition.h VoteMsg
 	AvatarList = 0x0107, // host -> clients: AvatarListMsg, who plays each player character in the world (R3 В3)
 	CharOffer = 0x0108, // host -> client: CharOfferMsg, his key has no character here: choose one (protocol 8)
 	CharChoice = 0x0109, // client -> host: CharChoiceMsg, faction and bought gear; the host answers with the world
