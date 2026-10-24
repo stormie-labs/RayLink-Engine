@@ -7,6 +7,9 @@
 // #include "../../../../xrEngine/CameraBase.h"
 //#include "../../../ActorCondition.h"
 #include "../../../HudManager.h"
+#include "../../../level.h"
+#include "../../../coop/coop_ai.h" // Anomaly Coop (audit A5): is_remote_player
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5): the grip on a remote player's machine
 
 #define TEMPLATE_SPECIALIZATION template <\
 	typename _Object\
@@ -24,7 +27,11 @@ void CStateBloodsuckerVampireExecuteAbstract::initialize()
 {
 	inherited::initialize();
 
-	object->CControlledActor::install();
+	// Anomaly Coop (audit A5): on a remote player's character the grip plays on his machine (coop_vampire)
+	const CEntityAlive* enemy = object->EnemyMan.get_enemy();
+	m_coop_target = enemy && coop::npc_ai::is_remote_player(enemy) ? enemy->ID() : u16(-1);
+	if (m_coop_target == u16(-1))
+		object->CControlledActor::install();
 
 	look_head();
 
@@ -36,6 +43,15 @@ void CStateBloodsuckerVampireExecuteAbstract::initialize()
 	object->m_hits_before_vampire = 0;
 	object->m_sufficient_hits_before_vampire_random = -1 + (rand() % 3);
 
+	m_effector_activated = false;
+	if (m_coop_target != u16(-1))
+	{
+		coop::monster_fx::host_hold(m_coop_target, object->ID());
+		coop::monster_fx::host_send(enemy, object, coop::monster_fx::kBloodsuckerVampire, 0, 0.f);
+		m_effector_activated = true; // his machine starts it when his view has turned
+		return;
+	}
+
 	HUD().SetRenderable(false);
 	NET_Packet P;
 	Actor()->u_EventGen(P, GEG_PLAYER_WEAPON_HIDE_STATE, Actor()->ID());
@@ -44,8 +60,6 @@ void CStateBloodsuckerVampireExecuteAbstract::initialize()
 	Actor()->u_EventSend(P);
 
 	Actor()->set_inventory_disabled(true);
-
-	m_effector_activated = false;
 }
 
 TEMPLATE_SPECIALIZATION
@@ -127,6 +141,17 @@ void CStateBloodsuckerVampireExecuteAbstract::show_hud()
 TEMPLATE_SPECIALIZATION
 void CStateBloodsuckerVampireExecuteAbstract::cleanup()
 {
+	if (m_coop_target != u16(-1)) // Anomaly Coop (audit A5): the remote player's machine lets its actor go
+	{
+		coop::monster_fx::host_send(Level().Objects.net_Find(m_coop_target), object,
+		                            coop::monster_fx::kBloodsuckerVampire, 1, 0.f);
+		coop::monster_fx::host_unhold(m_coop_target, object->ID());
+		m_coop_target = u16(-1);
+		if (object->com_man().ta_is_active())
+			object->com_man().ta_deactivate();
+		return;
+	}
+
 	Actor()->set_inventory_disabled(false);
 
 	if (object->com_man().ta_is_active())
@@ -179,6 +204,10 @@ bool CStateBloodsuckerVampireExecuteAbstract::check_start_conditions()
 
 	if (!object->WantVampire())
 		return false;
+
+	// Anomaly Coop (audit A5): a remote player's character too, unless another monster holds him already
+	if (coop::npc_ai::is_remote_player(enemy))
+		return !coop::monster_fx::host_held(enemy->ID());
 
 	// является ли враг актером
 	if (!smart_cast<CActor const*>(enemy))

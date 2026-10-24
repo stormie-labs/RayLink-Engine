@@ -39,6 +39,7 @@
 
 #include "controller_psy_hit.h"
 #include "../monster_cover_manager.h"
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
 //#include "controller_psy_aura.h"
 
 #ifdef _DEBUG
@@ -379,6 +380,8 @@ void CController::play_control_sound_start()
 
 void CController::play_control_sound_hit()
 {
+	if (!EnemyMan.get_enemy())
+		return; // Anomaly Coop: a puppet plays it for our actor (control_fx_on_actor)
 	Fvector pos = EnemyMan.get_enemy()->Position();
 	pos.y += 1.5f;
 
@@ -425,8 +428,17 @@ void CController::control_hit()
 
 	// start postprocess
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(EnemyMan.get_enemy()));
-	if (!pA) return;
+	if (!pA)
+	{
+		// Anomaly Coop (audit A5): a remote player's character took the psy hit above (PlayerHit); his machine shakes
+		coop::monster_fx::host_send(EnemyMan.get_enemy(), this, coop::monster_fx::kControllerControl, 0, 0.f);
+		return;
+	}
+	control_fx_on_actor();
+}
 
+void CController::control_fx_on_actor()
+{
 	Actor()->Cameras().AddCamEffector(xr_new<CMonsterEffectorHit>(m_control_effector.ce_time,
 	                                                              m_control_effector.ce_amplitude,
 	                                                              m_control_effector.ce_period_number,
@@ -435,7 +447,8 @@ void CController::control_hit()
 	                                                          m_control_effector.time_attack,
 	                                                          m_control_effector.time_release));
 
-	play_control_sound_hit();
+	if (control_hit_sound._feedback()) control_hit_sound.stop();
+	control_hit_sound.play_at_pos(Actor(), Fvector(Actor()->Position()).add(Fvector().set(0.f, 1.5f, 0.f)));
 	/*
 		active_control_fx			= true;
 		time_control_hit_started	= Device.dwTimeGlobal;
@@ -447,6 +460,7 @@ void CController::control_hit()
 void CController::UpdateCL()
 {
 	inherited::UpdateCL();
+	m_psy_hit->coop_update(); // Anomaly Coop (audit A5): a client's tube whose end never came
 
 	if (m_sndShockEffector)
 	{
@@ -519,6 +533,7 @@ void CController::Die(CObject* who)
 
 void CController::net_Destroy()
 {
+	m_psy_hit->coop_abort(); // Anomaly Coop (audit A5): a puppet that leaves mid-tube lets our actor go
 	inherited::net_Destroy();
 
 	FreeFromControl();
@@ -552,8 +567,14 @@ void CController::OnFreedFromControl(const CEntity* entity)
 void CController::draw_fire_particles()
 {
 	if (!EnemyMan.get_enemy()) return;
-	CEntityAlive* enemy = const_cast<CEntityAlive*>(EnemyMan.get_enemy());
 	if (!EnemyMan.see_enemy_now()) return;
+	draw_fire_particles_to(EnemyMan.get_enemy());
+}
+
+void CController::draw_fire_particles_to(const CEntityAlive* target)
+{
+	CEntityAlive* enemy = const_cast<CEntityAlive*>(target);
+	if (!enemy) return;
 
 	// вычислить позицию и направленность партикла
 	Fvector my_head_pos;
@@ -573,7 +594,8 @@ void CController::draw_fire_particles()
 	/*if (Random.randI(100) > 30)*/
 	{
 		//		Hit_Psy						(enemy, m_tube_damage / 2.f);
-		play_control_sound_hit();
+		if (control_hit_sound._feedback()) control_hit_sound.stop(); // as play_control_sound_hit, at the target
+		control_hit_sound.play_at_pos(enemy, Fvector(enemy->Position()).add(Fvector().set(0.f, 1.5f, 0.f)));
 	}
 
 	//m_sound_hit_fx.set_volume(10.0f);
@@ -749,19 +771,26 @@ void CController::set_mental_state(EMentalState state)
 void CController::HitEntity(const CEntity* pEntity, float fDamage, float impulse, Fvector& dir,
                             ALife::EHitType hit_type, bool draw_hit_marks)
 {
-	if (pEntity == Actor() && !GodMode())
-	{
-		Actor()->conditions().PowerHit(m_stamina_hit, false);
-		if (Actor()->conditions().GetPower() < m_stamina_hit)
-		{
-			if (!Actor()->inventory().Action((u16)kDROP, CMD_STOP))
-			{
-				Actor()->g_PerformDrop();
-			}
-		}
-	}
+	if (pEntity == Actor())
+		stamina_hit_actor();
+	else // Anomaly Coop (audit A5): a remote player's machine drains its own actor
+		coop::monster_fx::host_send(pEntity, this, coop::monster_fx::kControllerStamina, 0, 0.f);
 
 	inherited::HitEntity(pEntity, fDamage, impulse, dir, hit_type, draw_hit_marks);
+}
+
+void CController::stamina_hit_actor()
+{
+	if (GodMode())
+		return;
+	Actor()->conditions().PowerHit(m_stamina_hit, false);
+	if (Actor()->conditions().GetPower() < m_stamina_hit)
+	{
+		if (!Actor()->inventory().Action((u16)kDROP, CMD_STOP))
+		{
+			Actor()->g_PerformDrop();
+		}
+	}
 }
 
 bool CController::tube_ready() const

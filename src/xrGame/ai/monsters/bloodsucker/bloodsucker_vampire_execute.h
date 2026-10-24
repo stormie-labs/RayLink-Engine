@@ -19,8 +19,11 @@ class CStateBloodsuckerVampireExecute : public CState<_Object>
 
 	bool m_effector_activated;
 
+	// Anomaly Coop (audit A5): the remote player's character the grip is on; -1: the actor (stock)
+	u16 m_coop_target;
+
 public:
-	CStateBloodsuckerVampireExecute(_Object* obj) : inherited(obj)
+	CStateBloodsuckerVampireExecute(_Object* obj) : inherited(obj), m_coop_target(u16(-1))
 	{
 	}
 

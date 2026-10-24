@@ -7,6 +7,8 @@
 #include "control_animation_base.h"
 #include "../../Inventory.h"
 #include "../../Weapon.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop (audit A5): players, their view
+#include "../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5): the effect on a remote player's machine
 
 namespace detail
 {
@@ -167,7 +169,28 @@ void anti_aim_ability::start_camera_effector()
 {
 	VERIFY(!m_effector_id);
 	VERIFY(m_effectors.size());
-	pcstr const effector_name = m_effectors[rand() % m_effectors.size()].c_str();
+	u32 const index = rand() % m_effectors.size();
+	CEntityAlive const* who = aim_target();
+	if (who && who != Actor())
+	{
+		// Anomaly Coop (audit A5): a remote player aims at us - his machine shakes his aim and takes the blow
+		m_effector_id = Actor() ? Actor()->Cameras().RequestCamEffectorId() : 1; // "started"; nothing to remove here
+		m_camera_effector_end_tick = m_animation_end_tick;
+		coop::monster_fx::host_send(who, m_object, coop::monster_fx::kAntiAim, u8(index), 0.f);
+		return;
+	}
+
+	m_camera_effector_end_tick = play_effector_on_actor(index);
+
+	if (m_callback)
+	{
+		m_callback();
+	}
+}
+
+TTime anti_aim_ability::play_effector_on_actor(u32 index)
+{
+	pcstr const effector_name = m_effectors[index].c_str();
 
 	m_effector_id = Actor()->Cameras().RequestCamEffectorId();
 
@@ -183,11 +206,20 @@ void anti_aim_ability::start_camera_effector()
 	LPCSTR fn = pSettings->r_string(effector_name, "cam_eff_name");
 	cam_eff->Start(fn);
 
-	m_camera_effector_end_tick = Device.dwTimeGlobal + (TTime)(cam_eff->GetAnimatorLength() * 1000);
-	m_camera_effector_end_tick = _max(m_camera_effector_end_tick, m_animation_end_tick);
+	TTime const end_tick = Device.dwTimeGlobal + (TTime)(cam_eff->GetAnimatorLength() * 1000);
 
 	Actor()->Cameras().AddCamEffector(cam_eff);
+	return _max(end_tick, m_animation_end_tick);
+}
 
+void anti_aim_ability::coop_play(u8 index)
+{
+	if (index >= m_effectors.size() || !Actor() || !Actor()->g_Alive())
+		return;
+	// the animator effector ends by itself (not cyclic); the next one replaces nothing of ours
+	const u32 id = m_effector_id;
+	play_effector_on_actor(index);
+	m_effector_id = id; // this puppet's own ability state stays as it was (it never runs here)
 	if (m_callback)
 	{
 		m_callback();
@@ -235,18 +267,23 @@ float anti_aim_ability::calculate_angle() const
 {
 	float const opposite_angle_return_value = M_PI;
 
-	if (!m_object->EnemyMan.see_enemy_now(Actor()))
+	CEntityAlive const* who = aim_target(); // Anomaly Coop (audit A5): the actor or a remote player's character
+	if (!who || !m_object->EnemyMan.see_enemy_now(who))
 	{
 		return opposite_angle_return_value;
 	}
 
-	Fvector const self_dir = Actor()->Cameras().Direction();
+	Fvector self_dir;
+	if (!coop::npc_ai::player_view_dir(who, self_dir))
+	{
+		return opposite_angle_return_value;
+	}
 
 	Fvector monster_center;
 	m_object->Center(monster_center);
 	Fvector monster_head = get_head_position(m_object);
 
-	Fvector const actor_head = get_head_position(Actor());
+	Fvector const actor_head = get_head_position(const_cast<CEntityAlive*>(who));
 	Fvector const to_monster_center = monster_center - actor_head;
 	Fvector const to_monster_head = monster_head - actor_head;
 	float const max_deviation = angle_between_vectors(to_monster_center, to_monster_head);
@@ -260,16 +297,28 @@ float anti_aim_ability::calculate_angle() const
 
 extern CActor* g_actor;
 
+CEntityAlive const* anti_aim_ability::aim_target() const
+{
+	CEntityAlive const* enemy = m_object->EnemyMan.get_enemy();
+	if (!enemy)
+		return nullptr;
+	if (enemy == Actor() || coop::npc_ai::is_remote_player(enemy))
+		return enemy;
+	return nullptr;
+}
+
 bool anti_aim_ability::check_update_condition() const
 {
-	if (!m_object->g_Alive() || !g_actor || !Actor()->g_Alive())
+	if (!m_object->g_Alive())
 		return false;
 
-	CEntityAlive const* enemy = m_object->EnemyMan.get_enemy();
-	if (enemy != Actor())
+	// Anomaly Coop (audit A5): the enemy is a player - this machine's actor or a remote player's character
+	CEntityAlive const* who = aim_target();
+	if (!who || !who->g_Alive())
 		return false;
 
-	if (!smart_cast<CWeapon*>(Actor()->inventory().ActiveItem()))
+	CInventoryOwner const* owner = smart_cast<CInventoryOwner const*>(who);
+	if (!owner || !smart_cast<CWeapon*>(owner->inventory().ActiveItem()))
 		return false;
 
 	return true;

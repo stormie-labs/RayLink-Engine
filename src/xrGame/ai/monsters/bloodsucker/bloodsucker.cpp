@@ -24,6 +24,7 @@
 
 #include "../../../PHDestroyable.h"
 #include "../../../CharacterPhysicsSupport.h"
+#include "../../../HudManager.h" // Anomaly Coop (audit A5): the vampire's grip hides the HUD
 
 #ifdef DEBUG
 #	include <dinput.h>
@@ -621,6 +622,7 @@ void CAI_Bloodsucker::UpdateCL()
 {
 	update_invisibility();
 	inherited::UpdateCL();
+	coop_vampire_update(); // Anomaly Coop (audit A5)
 	CControlledActor::frame_update();
 	character_physics_support()->movement()->CollisionEnable(!is_collision_off());
 
@@ -819,6 +821,80 @@ void CAI_Bloodsucker::predator_freeze()
 void CAI_Bloodsucker::predator_unfreeze()
 {
 	control().animation().unfreeze();
+}
+
+namespace
+{
+// Anomaly Coop (audit A5): a grip whose letting go never came frees the actor by itself (the hold is 4 s, the
+// approach and the last blow a few more)
+constexpr u32 kCoopVampireMaxMs = 12000;
+} // namespace
+
+void CAI_Bloodsucker::coop_vampire(u8 phase)
+{
+	if (phase != 0)
+	{
+		coop_vampire_release();
+		return;
+	}
+	CActor* actor = Actor();
+	if (!actor || !actor->g_Alive() || m_coop_vampire || actor->input_external_handler_installed())
+		return; // another monster holds our actor
+	m_coop_vampire = true;
+	m_coop_vampire_effector = false;
+	m_coop_vampire_deadline = Device.dwTimeGlobal + kCoopVampireMaxMs;
+	CControlledActor::install();
+	HUD().SetRenderable(false);
+	actor->SetWeaponHideState(INV_STATE_BLOCK_ALL, true);
+	actor->set_inventory_disabled(true);
+}
+
+void CAI_Bloodsucker::coop_vampire_release()
+{
+	if (!m_coop_vampire)
+		return;
+	m_coop_vampire = false;
+	if (CActor* actor = Actor())
+	{
+		actor->set_inventory_disabled(false);
+		actor->SetWeaponHideState(INV_STATE_BLOCK_ALL, false);
+	}
+	if (CControlledActor::is_controlling())
+		CControlledActor::release();
+	HUD().SetRenderable(true);
+}
+
+void CAI_Bloodsucker::coop_vampire_update()
+{
+	if (!m_coop_vampire)
+		return;
+	if (!g_Alive() || Device.dwTimeGlobal > m_coop_vampire_deadline)
+	{
+		coop_vampire_release();
+		return;
+	}
+	// look at its head, as the host's state does for the actor (look_head)
+	if (IKinematics* k = smart_cast<IKinematics*>(Visual()))
+	{
+		const u16 head = k->LL_BoneID("bip01_head");
+		if (head != BI_NONE)
+		{
+			Fmatrix global_transform;
+			global_transform.mul_43(XFORM(), k->LL_GetTransform(head));
+			CControlledActor::look_point(global_transform.c);
+		}
+	}
+	if (!m_coop_vampire_effector && !CControlledActor::is_turning())
+	{
+		ActivateVampireEffector();
+		m_coop_vampire_effector = true;
+	}
+}
+
+void CAI_Bloodsucker::net_Destroy()
+{
+	coop_vampire_release(); // Anomaly Coop (audit A5): a puppet that leaves mid-grip lets our actor go
+	inherited::net_Destroy();
 }
 
 void CAI_Bloodsucker::move_actor_cam(float angle)

@@ -10,6 +10,7 @@
 
 #include "Level.h"
 #include "Actor.h"
+#include "ActorEffector.h" // player_view_dir: the actor's camera
 #include "GameObject.h"
 #include "entity_alive.h"
 #include "CustomMonster.h"
@@ -377,6 +378,24 @@ u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearP
 			out[n++] = body;
 	}
 	return n;
+}
+
+bool player_view_dir(const CEntityAlive* player, Fvector& dir)
+{
+	if (!player)
+		return false;
+	if (player == g_actor)
+	{
+		dir = g_actor->Cameras().Direction();
+		return true;
+	}
+	if (!is_remote_player(player))
+		return false;
+	float yaw = 0.f, pitch = 0.f;
+	if (!players::avatar_view(player->ID(), yaw, pitch))
+		return false;
+	dir.setHP(yaw, -pitch);
+	return true;
 }
 
 bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster)

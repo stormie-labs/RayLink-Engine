@@ -17,6 +17,7 @@
 #include "psy_dog_state_manager.h"
 #include "../../../alife_object_registry.h"
 #include "../../../../xrServerEntities/xrserver_objects_alife_monsters.h"
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
 
 CPsyDog::CPsyDog()
 {
@@ -290,8 +291,16 @@ void CPsyDogPhantom::Think()
 	CParticlesPlayer::StartParticles(m_particles_appear, Fvector().set(0.0f, 0.1f, 0.0f), ID());
 
 	if (EnemyMan.get_enemy() != Actor())
+	{
+		// Anomaly Coop (audit A5): at a remote player - his machine shakes its actor
+		coop::monster_fx::host_send(EnemyMan.get_enemy(), this, coop::monster_fx::kPsyDogAppear, 0, 0.f);
 		return;
+	}
+	appear_fx_on_actor();
+}
 
+void CPsyDogPhantom::appear_fx_on_actor()
+{
 	Actor()->Cameras().AddCamEffector(xr_new<CMonsterEffectorHit>(m_appear_effector.ce_time,
 	                                                              m_appear_effector.ce_amplitude,
 	                                                              m_appear_effector.ce_period_number,

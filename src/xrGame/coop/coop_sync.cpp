@@ -255,6 +255,7 @@ void frame()
 	syncapi::frame(); // F2 T14
 	story::frame();
 	levels::frame(); // F3a: the registry and the map servers (T10, T9)
+	monster_fx::frame(up); // audit A5: abilities that came before their monster
 }
 
 void print_status()

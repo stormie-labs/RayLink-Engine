@@ -143,6 +143,8 @@ public:
 	virtual void CheckSpecParams(u32 spec_params);
 
 	void UpdateGraviObject();
+	// Anomaly Coop (audit A5): the host's wave at us, shown on this machine (a puppet deals no damage)
+	void coop_gravi_at_actor();
 
 	void StartGraviPrepare();
 	void StopGraviPrepare();

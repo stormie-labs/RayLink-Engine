@@ -14,6 +14,16 @@
 #include "../../../ActorCondition.h"
 #include "../../../HudManager.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_ai.h" // Anomaly Coop: is_remote_player
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop: the tube on a remote player's machine
+
+namespace
+{
+// Anomaly Coop (audit A5), client: the controller whose tube holds our actor now (one at a time, as the stock
+// camera effector check makes it on the host)
+CControllerPsyHit* g_coop_tube = nullptr;
+constexpr u32 kCoopTubeSlackMs = 5000; // a stage's end that never came: the actor is freed this much later
+} // namespace
 
 void CControllerPsyHit::load(LPCSTR section)
 {
@@ -59,16 +69,20 @@ bool CControllerPsyHit::check_start_conditions()
 	if (m_man->is_captured_pure())
 		return false;
 
-	if (Actor()->Cameras().GetCamEffector(eCEControllerPsyHit))
+	const CEntityAlive* who = pick_target(); // Anomaly Coop (audit A5): a remote player's character too
+	if (!who)
 		return false;
 
-	if (!see_enemy())
+	if (who == Actor() ? !!Actor()->Cameras().GetCamEffector(eCEControllerPsyHit) : coop::monster_fx::host_held(who->ID()))
+		return false;
+
+	if (!m_object->EnemyMan.see_enemy_now(who))
 		return false;
 
 	if (!tube_ready())
 		return false;
 
-	if (m_object->Position().distance_to(Actor()->Position()) < m_min_tube_dist)
+	if (m_object->Position().distance_to(who->Position()) < m_min_tube_dist)
 		return false;
 
 	return true;
@@ -82,14 +96,15 @@ void CControllerPsyHit::activate()
 	m_man->path_stop(this);
 	m_man->move_stop(this);
 
-	//////////////////////////////////////////////////////////////////////////
-	// set direction
-	SControlDirectionData* ctrl_dir = (SControlDirectionData*)m_man->data(this, ControlCom::eControlDir);
-	VERIFY(ctrl_dir);
-	ctrl_dir->heading.target_speed = 3.f;
-	ctrl_dir->heading.target_angle = m_man->direction().angle_to_target(Actor()->Position());
+	const CEntityAlive* who = pick_target();
+	m_coop_target = who && who != Actor() ? who->ID() : u16(-1); // Anomaly Coop (audit A5)
+	turn_to(who);
+	if (remote_target())
+	{
+		coop::monster_fx::host_hold(m_coop_target, m_object->ID());
+		coop::monster_fx::host_send(who, m_object, coop::monster_fx::kControllerTube, coopPrepare, 0.f);
+	}
 
-	//////////////////////////////////////////////////////////////////////////
 	m_current_index = 0;
 	play_anim();
 
@@ -114,6 +129,13 @@ void CControllerPsyHit::deactivate()
 	}
 
 	set_sound_state(eNone);
+
+	if (remote_target()) // Anomaly Coop (audit A5): the player's machine lets its actor go
+	{
+		coop::monster_fx::host_send(target(), m_object, coop::monster_fx::kControllerTube, coopCancel, 0.f);
+		coop::monster_fx::host_unhold(m_coop_target, m_object->ID());
+		m_coop_target = u16(-1);
+	}
 }
 
 void CControllerPsyHit::on_event(ControlCom::EEventType type, ControlCom::IEventData* data)
@@ -180,9 +202,34 @@ namespace detail
 
 extern CActor* g_actor;
 
-bool CControllerPsyHit::see_enemy()
+const CEntityAlive* CControllerPsyHit::pick_target() const
 {
-	return m_object->EnemyMan.see_enemy_now(Actor());
+	const CEntityAlive* enemy = m_object->EnemyMan.get_enemy();
+	if (enemy && coop::npc_ai::is_remote_player(enemy) && m_object->EnemyMan.see_enemy_now(enemy))
+		return enemy;
+	return Actor();
+}
+
+const CEntityAlive* CControllerPsyHit::target() const
+{
+	if (!remote_target())
+		return Actor();
+	return smart_cast<const CEntityAlive*>(Level().Objects.net_Find(m_coop_target));
+}
+
+void CControllerPsyHit::turn_to(const CEntityAlive* who)
+{
+	if (!who)
+		return;
+	SControlDirectionData* ctrl_dir = (SControlDirectionData*)m_man->data(this, ControlCom::eControlDir);
+	VERIFY(ctrl_dir);
+	ctrl_dir->heading.target_speed = 3.f;
+	ctrl_dir->heading.target_angle = m_man->direction().angle_to_target(who->Position());
+}
+
+#if 0 // the stock visibility test, kept for reference (Anomaly Coop: see_enemy_now(target()) is used)
+bool CControllerPsyHit_see_enemy()
+{
 	// 	using namespace detail;
 	// 	Fvector const self_head = get_head_position(m_object);
 	// 	Fvector actor_center;
@@ -200,6 +247,7 @@ bool CControllerPsyHit::see_enemy()
 	// 
 	// 	return false;
 }
+#endif
 
 bool CControllerPsyHit::check_conditions_final()
 {
@@ -212,16 +260,20 @@ bool CControllerPsyHit::check_conditions_final()
 	// 	if (m_object->EnemyMan.get_enemy() != Actor())	
 	// 		return false;
 
-	if (!m_object->EnemyMan.is_enemy(Actor()))
+	const CEntityAlive* who = target(); // Anomaly Coop (audit A5): the actor or a remote player's character
+	if (!who)
 		return false;
 
-	if (!Actor()->g_Alive())
+	if (!m_object->EnemyMan.is_enemy(who))
 		return false;
 
-	if (m_object->Position().distance_to_xz(Actor()->Position()) < m_min_tube_dist - 2)
+	if (!who->g_Alive())
 		return false;
 
-	return see_enemy();
+	if (m_object->Position().distance_to_xz(who->Position()) < m_min_tube_dist - 2)
+		return false;
+
+	return m_object->EnemyMan.see_enemy_now(who);
 }
 
 void CControllerPsyHit::death_glide_start()
@@ -232,6 +284,19 @@ void CControllerPsyHit::death_glide_start()
 		return;
 	}
 
+	const float motion_time = m_man->animation().motion_time(m_stage[1], m_object->Visual());
+	smart_cast<CController *>(m_object)->draw_fire_particles();
+	if (remote_target())
+		// Anomaly Coop (audit A5): the player's machine plays the pull on its actor
+		coop::monster_fx::host_send(target(), m_object, coop::monster_fx::kControllerTube, coopStart, motion_time);
+	else
+		glide_actor(motion_time);
+
+	turn_to(target());
+}
+
+void CControllerPsyHit::glide_actor(float motion_time)
+{
 	HUD().SetRenderable(false);
 
 	if (CController* controller = smart_cast<CController*>(m_object))
@@ -281,11 +346,7 @@ void CControllerPsyHit::death_glide_start()
 	float const dest_fov = 10.f;
 
 	Actor()->Cameras().AddCamEffector(xr_new<CControllerPsyHitCamEffector>(eCEControllerPsyHit, src_pos, target_pos,
-	                                                                       m_man->animation().motion_time(
-		                                                                       m_stage[1], m_object->Visual()),
-	                                                                       base_fov, dest_fov));
-
-	smart_cast<CController *>(m_object)->draw_fire_particles();
+	                                                                       motion_time, base_fov, dest_fov));
 
 	dir.sub(src_pos, target_pos);
 	dir.normalize();
@@ -303,21 +364,25 @@ void CControllerPsyHit::death_glide_start()
 	Actor()->u_EventSend(P);
 
 	m_blocked = true;
-
-	//////////////////////////////////////////////////////////////////////////
-	// set direction
-	SControlDirectionData* ctrl_dir = (SControlDirectionData*)m_man->data(this, ControlCom::eControlDir);
-	VERIFY(ctrl_dir);
-	ctrl_dir->heading.target_speed = 3.f;
-	ctrl_dir->heading.target_angle = m_man->direction().angle_to_target(Actor()->Position());
-
-	//////////////////////////////////////////////////////////////////////////
 }
 
 void CControllerPsyHit::death_glide_end()
 {
 	CController* monster = smart_cast<CController *>(m_object);
 	monster->draw_fire_particles();
+
+	if (remote_target())
+	{
+		// Anomaly Coop (audit A5): the character takes the psy hit here, its player gets it as PlayerHit; his machine
+		// plays the end of the tube on its actor
+		if (const CEntityAlive* who = target())
+		{
+			m_object->Hit_Psy(const_cast<CEntityAlive*>(who), monster->m_tube_damage);
+			coop::monster_fx::host_send(who, m_object, coop::monster_fx::kControllerTube, coopEnd, 0.f);
+		}
+		m_time_last_tube = Device.dwTimeGlobal;
+		return;
+	}
 
 	monster->m_sound_tube_hit_left.play_at_pos(Actor(), Fvector().set(-1.f, 0.f, 1.f), sm_2D);
 	monster->m_sound_tube_hit_right.play_at_pos(Actor(), Fvector().set(1.f, 0.f, 1.f), sm_2D);
@@ -342,6 +407,11 @@ void CControllerPsyHit::update_frame()
 void CControllerPsyHit::set_sound_state(ESoundState state)
 {
 	CController* monster = smart_cast<CController *>(m_object);
+	if (remote_target() && state != eNone) // Anomaly Coop (audit A5): the player's machine plays them
+	{
+		m_sound_state = state;
+		return;
+	}
 	if (state == ePrepare)
 	{
 		monster->m_sound_tube_prepare.play_at_pos(Actor(), Fvector().set(0.f, 0.f, 0.f), sm_2D);
@@ -377,10 +447,14 @@ void CControllerPsyHit::hit()
 
 	set_sound_state(eHit);
 	//m_object->Hit_Psy		(Actor(), monster->m_tube_damage);
+	if (remote_target()) // Anomaly Coop (audit A5)
+		coop::monster_fx::host_send(target(), m_object, coop::monster_fx::kControllerTube, coopHit, 0.f);
 }
 
 void CControllerPsyHit::stop()
 {
+	if (remote_target())
+		return; // Anomaly Coop (audit A5): the host's actor was never pulled
 	HUD().SetRenderable(true);
 
 	if (CController* controller = smart_cast<CController*>(m_object))
@@ -396,9 +470,93 @@ void CControllerPsyHit::stop()
 void CControllerPsyHit::on_death()
 {
 	if (!is_active())
+	{
+		coop_abort(); // Anomaly Coop (audit A5): a client's puppet died mid-tube
 		return;
+	}
 
 	stop();
 
 	m_man->deactivate(this);
+}
+
+// ---------------------------------------------------------------- Anomaly Coop (audit A5): client side
+
+void CControllerPsyHit::coop_play(u8 phase, float value)
+{
+	CController* monster = smart_cast<CController*>(m_object);
+	if (!monster || !Actor())
+		return;
+	if ((phase == coopPrepare || phase == coopStart) && !Actor()->g_Alive())
+		return;
+	if (g_coop_tube && g_coop_tube != this)
+		return; // another controller's tube holds our actor
+	if (phase != coopPrepare && phase != coopStart && !m_coop_playing)
+		return; // a tube we did not start (another one held us then)
+	switch (phase)
+	{
+	case coopPrepare:
+		if (Actor()->Cameras().GetCamEffector(eCEControllerPsyHit))
+			return;
+		g_coop_tube = this;
+		m_coop_playing = true;
+		m_coop_deadline = Device.dwTimeGlobal + 15000;
+		set_sound_state(ePrepare);
+		break;
+	case coopStart:
+		if (!m_coop_playing && Actor()->Cameras().GetCamEffector(eCEControllerPsyHit))
+			return;
+		g_coop_tube = this;
+		m_coop_playing = true;
+		m_coop_deadline = Device.dwTimeGlobal + iFloor(_max(value, 0.f) * 1000.f) + kCoopTubeSlackMs;
+		monster->draw_fire_particles_to(Actor());
+		glide_actor(value);
+		break;
+	case coopHit:
+		set_sound_state(eHit);
+		break;
+	case coopEnd:
+		monster->draw_fire_particles_to(Actor());
+		monster->m_sound_tube_hit_left.play_at_pos(Actor(), Fvector().set(-1.f, 0.f, 1.f), sm_2D);
+		monster->m_sound_tube_hit_right.play_at_pos(Actor(), Fvector().set(1.f, 0.f, 1.f), sm_2D);
+		stop(); // the damage comes from the host as PlayerHit
+		m_coop_deadline = Device.dwTimeGlobal + kCoopTubeSlackMs; // the cancel follows with the last animation
+		break;
+	default:
+		coop_abort();
+		break;
+	}
+}
+
+void CControllerPsyHit::coop_abort()
+{
+	if (remote_target()) // host: the controller leaves mid-tube; the player's machine lets its actor go
+	{
+		coop::monster_fx::host_send(target(), m_object, coop::monster_fx::kControllerTube, coopCancel, 0.f);
+		coop::monster_fx::host_unhold(m_coop_target, m_object->ID());
+		m_coop_target = u16(-1);
+	}
+	if (!m_coop_playing)
+		return;
+	m_coop_playing = false;
+	if (g_coop_tube == this)
+		g_coop_tube = nullptr;
+	if (m_blocked && Actor())
+	{
+		NET_Packet P;
+		Actor()->u_EventGen(P, GEG_PLAYER_WEAPON_HIDE_STATE, Actor()->ID());
+		P.w_u16(INV_STATE_BLOCK_ALL);
+		P.w_u8(u8(false));
+		Actor()->u_EventSend(P);
+	}
+	m_blocked = false;
+	set_sound_state(eNone);
+	if (Actor())
+		stop();
+}
+
+void CControllerPsyHit::coop_update()
+{
+	if (m_coop_playing && Device.dwTimeGlobal > m_coop_deadline)
+		coop_abort();
 }

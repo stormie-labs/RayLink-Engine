@@ -96,6 +96,7 @@ public:
 	virtual void Die(CObject* who);
 
 	void destroy_from_parent();
+	void appear_fx_on_actor(); // Anomaly Coop (audit A5): the leap's shake, on the machine of the player it is at
 private:
 	void destroy_me();
 	void try_to_register_to_parent();

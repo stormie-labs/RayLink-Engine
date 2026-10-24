@@ -409,6 +409,18 @@ void CBurer::UpdateGraviObject()
 	else ::Sound->play_at_pos(sound_gravi_wave, 0, snd_pos);
 }
 
+void CBurer::coop_gravi_at_actor()
+{
+	if (!Actor())
+		return;
+	Fvector from_pos = Position();
+	from_pos.y += 0.5f;
+	Fvector target_pos = Actor()->Position();
+	target_pos.y += 0.5f;
+	m_gravi_object.activate(Actor(), from_pos, target_pos);
+	sound().play(eMonsterSoundGraviAttack);
+}
+
 void CBurer::UpdateCL()
 {
 	inherited::UpdateCL();

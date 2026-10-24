@@ -45,6 +45,19 @@ public:
 	// Utils
 	//--------------------------------------------------------------------
 	void move_actor_cam(float angle);
+
+	// Anomaly Coop (audit A5): the host's vampire grip on this machine's actor (phase 0 grabs, 1 lets go)
+	void coop_vampire(u8 phase);
+	void coop_vampire_release();
+	virtual void net_Destroy();
+
+private:
+	bool m_coop_vampire = false;
+	bool m_coop_vampire_effector = false;
+	u32 m_coop_vampire_deadline = 0;
+	void coop_vampire_update();
+
+public:
 	bool is_collision_off();
 	void set_collision_off(bool b_collision);
 

@@ -78,6 +78,9 @@ u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearP
 // Does `player` (this machine's actor or a remote player's character) see `monster` now? The actor: its visual memory;
 // a remote player: his reported view and the line of sight (player_sees).
 bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster);
+// Audit A5: where `player` looks - this machine's actor: its camera; a remote player's character: the view his
+// machine reports. False for anything else or a view never reported.
+bool player_view_dir(const CEntityAlive* player, Fvector& dir);
 void viewers_clear();
 // Console: coop_viewer_range (m, 0 = viewers off), coop_viewer_frame_radius (m, 0 = scale only). Host settings.
 void register_console();

@@ -116,6 +116,9 @@ public:
 	void play_control_sound_hit();
 
 	void control_hit();
+	// Anomaly Coop (audit A5): what control_hit and a melee blow do to the actor, on the machine of the player hit
+	void control_fx_on_actor();
+	void stamina_hit_actor();
 
 	void psy_fire();
 	bool can_psy_fire();
@@ -140,6 +143,7 @@ public:
 public:
 
 	void draw_fire_particles();
+	void draw_fire_particles_to(const CEntityAlive* enemy); // Anomaly Coop: toward a given target
 
 	void test_covers();
 
