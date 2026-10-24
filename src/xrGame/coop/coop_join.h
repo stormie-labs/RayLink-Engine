@@ -52,6 +52,9 @@ namespace join
 enum BlobKind : u32
 {
 	BlobWorldSave = 1,
+	// F3a T8: the shared save of a group transition (the same layout as BlobWorldSave), sent with LoadWait Prepared to every
+	// moving client before the host's own reload: everybody loads it at once (levels::wire kBlobLevelState is 3).
+	BlobPreparedSave = 2,
 };
 
 // F3a T4: the world server's handlers (the joins, choices and votes of the players; the session's rate limits) and
@@ -90,7 +93,10 @@ bool accept_transition();
 // --- the waiting point of a level change (protocol 10; rule and messages in xrCoop/coop_transition.h) ---
 // Until the split levels (F3a) the whole group changes level together: a player who stands in the zone of an exit is
 // ready for it, the group goes when every player in the world is (5 s countdown), the host may go at once. Both roles run
-// it from frame(); the placard reads coop.transition() (scripts\coop_hud_transition.script).
+// it from frame(); the placard reads coop.transition() (scripts\coop_hud_transition.script). F3a T8: the host player votes
+// and reads the board over the local link like a client (TransitionVote / TransitionState); the group's move is one
+// simultaneous load (LoadWait / LoadReady: every client in the world loads the transition's save with the host, the loading
+// screens come off together, hold_loading_screen below).
 // Hook of CLevelChanger (the stock "go?" dialog and the silent change of its zone): true = the group waits here, the
 // stock reaction stays off. False for a disabled exit (its own message stays), outside a session and for a host nobody
 // has joined.
@@ -158,4 +164,11 @@ bool client_loading_world();
 // thread.
 bool world_is_mirror();
 } // namespace join
+
+// F3a T8, engine hook (CGamePersistent::game_loaded): the loading screen of a simultaneous group load stays up. A player
+// whose world of the transition is loaded waits on it until the world server says Enter (every mover is ready, or a minute
+// after the server's world came up), then all screens come off together; "Waiting for: <nicks>" is its header line. Never
+// outside a session; a held screen lets go by itself kLoadWaitMs + 30 s after the server's world was up (xrCoop/coop_transition.h
+// LoadScreen). Main thread.
+bool hold_loading_screen();
 } // namespace coop

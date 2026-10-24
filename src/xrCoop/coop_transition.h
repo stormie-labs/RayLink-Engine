@@ -29,6 +29,17 @@
 // Wire (protocol 10): TransitionVote = u8 op + u16 level changer (host numbering; kNoChanger = no exit, a "ready" without
 // one confirms the guide trip); TransitionState (host -> all) = StateMsg below, at most every kStateEveryMs while the board
 // is not idle, plus once when it goes idle.
+//
+// F3a T8 (docs/plans/2026-10-24-f3a-split-levels.md §1.2, §1.5, §1.10):
+//  - the host player is a client of his own world server over the local link: he is peer 0 of the server's players(), a
+//    member like any other, and his claim comes as a TransitionVote that goes through the same rule as a remote client's
+//    (apply_vote); his placard reads the TransitionState of the link;
+//  - the together entry of split levels: a member who stands on the level the exit leads to is not waited for (on_target),
+//    one on another map says yes from there with the exit's id and no distance (other_map), and his row says so;
+//  - the simultaneous load of a group transition: on "go" the world server writes the shared save of the transition, gives
+//    it the next world epoch and sends every moving client LoadWait {Prepared} and the save BEFORE its own reload; all load
+//    at once, each loading screen stays (LoadScreen) until the server says Enter (PreparedLoad over levels::LoadBarrier):
+//    everybody is ready, or kLoadWaitMs after the server's world came up for those who are; a laggard enters alone.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -38,8 +49,10 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "coop_load_barrier.h" // F3a T3: levels::LoadBarrier, kLoadWaitMs
 #include "coop_protocol.h" // Writer, Reader, Msg, kMaxPlayers
 
 namespace coop
@@ -80,20 +93,26 @@ enum class Mark : uint8_t
 	Elsewhere = 4, // ready for another exit
 };
 
-// A player as the host sees him this tick.
+// A player as the host sees him this tick (one per entry of the world server's players(): the host player is peer 0).
 struct Member
 {
-	uint32_t id = 0; // peer id, the host is 0
+	uint32_t id = 0; // peer id, the host player is 0
 	bool in_world = true; // connected and has finished loading (join::host_player_in_world)
 	bool alive = true; // survival::Life::Alive
-	bool remote = true; // a client: his claim lapses without a refresh (the host's own never does)
+	bool remote = true; // a client: his claim lapses without a refresh (the host player's, over the local link, never does)
+	bool on_target = false; // F3a §1.10: he stands on the level the exit leads to: neither waited for nor listed
+	bool other_map = false; // F3a §1.10: he is on another map: his yes is a remote one (no distance), his row says so
 };
+
+// The high bit of a row's mark byte on the wire: the row's player is on another map (F3a; the layout stays 7 bytes a row).
+constexpr uint8_t kRowOtherMap = 0x80;
 
 struct Row
 {
 	uint32_t id = 0;
 	Mark mark = Mark::Away;
 	uint16_t dist_m = kUnknownDist; // metres to the leading exit, as the host sees him
+	bool other_map = false; // F3a: on another map (Member::other_map)
 };
 
 struct Status
@@ -180,10 +199,12 @@ public:
 		for (auto it = m_claims.begin(); it != m_claims.end();)
 		{
 			const Member* m = member_of(it->first);
-			bool drop = !m || !m->in_world || !m->alive;
+			// F3a: one who stands on the level the exit leads to does not go
+			bool drop = !m || !m->in_world || !m->alive || m->on_target;
 			if (!drop && m->remote && now > it->second.seen && now - it->second.seen > kClaimLapseMs)
 				drop = true;
-			if (!drop && !is_guide(it->second.goal) && dist)
+			// F3a: a yes from another map is not near the exit at all: no distance drops it
+			if (!drop && !m->other_map && !is_guide(it->second.goal) && dist)
 			{
 				const float d = dist(it->first, it->second.goal);
 				if (d >= 0.f && d > kLeaveM)
@@ -241,8 +262,11 @@ public:
 		uint32_t blockers = 0, loaders = 0;
 		for (const Member& m : sorted)
 		{
+			if (m.on_target)
+				continue; // F3a: already where the exit leads: neither waited for nor listed
 			Row r;
 			r.id = m.id;
+			r.other_map = m.other_map;
 			const auto c = m_claims.find(m.id);
 			if (c != m_claims.end())
 			{
@@ -261,7 +285,7 @@ public:
 				r.mark = Mark::Away;
 				++blockers;
 			}
-			if (m.in_world && dist)
+			if (m.in_world && !m.other_map && dist)
 			{
 				const float d = dist(m.id, lead);
 				if (d >= 0.f)
@@ -381,10 +405,63 @@ struct VoteMsg
 	}
 };
 
+// F3a T8: what the world server knows of the sender of a TransitionVote when it takes it (coop_join.cpp reads it from its
+// world). The same for every sender, the host player (peer 0, over the local link) included.
+struct VoteFacts
+{
+	bool in_world = false; // his character is in the world the server serves now
+	bool exit_known = false; // the exit he names is a level changer of the server's level
+	float dist = -1.f; // metres from his character to that exit, < 0 unknown
+	bool other_map = false; // he is on another map (the together entry of split levels): a yes from there, no distance
+	bool guide_running = false; // a guide trip runs and its starter still says yes
+};
+
+// What a vote did to the board (the server logs the refusals).
+enum class Verdict : uint8_t
+{
+	Claimed, // he is ready now (a new claim, or one for another exit)
+	Refreshed, // the same claim again: it keeps its age
+	Released, // a cancel took his claim
+	Nothing, // a cancel of one who had no claim
+	NotInWorld, // a ready from one who is not in the world
+	NoExit, // a ready at an exit the server's level does not have
+	TooFar, // a ready from further than kReachM of the exit, or from an unknown distance, on the exit's map
+	NoGuide, // a yes to a guide trip that does not run
+};
+
+// The server's rule for a TransitionVote of player `from` (VoteMsg read and checked by the caller).
+inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteFacts& f, uint64_t now)
+{
+	if (v.op == VoteCancel)
+		return b.release(from) ? Verdict::Released : Verdict::Nothing;
+	if (!f.in_world)
+		return Verdict::NotInWorld;
+	uint32_t goal = kGuideGoal;
+	if (v.changer == kNoChanger)
+	{
+		if (!f.guide_running)
+			return Verdict::NoGuide;
+	}
+	else
+	{
+		if (!f.exit_known)
+			return Verdict::NoExit;
+		// T12 review (Ruling 18): on the exit's map only within kReachM of it (an unknown distance is no claim); F3a: a yes
+		// from another map is the together entry's remote one, no distance
+		if (!f.other_map && !(f.dist >= 0.f && f.dist <= kReachM))
+			return Verdict::TooFar;
+		goal = goal_of_exit(v.changer);
+	}
+	uint32_t before = 0;
+	const bool again = b.claimed(from, &before) && before == goal;
+	b.claim(from, goal, now);
+	return again ? Verdict::Refreshed : Verdict::Claimed;
+}
+
 // Host -> all (Msg::TransitionState): the board as every machine's placard shows it. `level` is the stock name of the level
 // the leading exit leads to ("l01_escape"; the Lua side translates it), empty when the exit has none (read: unknown).
 //   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms, u32 load_ms,
-//   u8 n, n x { u32 player, u8 mark, u16 dist_m }
+//   u8 n, n x { u32 player, u8 mark (| kRowOtherMap: on another map, F3a), u16 dist_m }
 struct StateMsg
 {
 	State state = State::Idle;
@@ -410,7 +487,7 @@ struct StateMsg
 		for (size_t i = 0; i < n; ++i)
 		{
 			w.u32(rows[i].id);
-			w.u8(uint8_t(rows[i].mark));
+			w.u8(uint8_t(uint8_t(rows[i].mark) | (rows[i].other_map ? kRowOtherMap : 0u)));
 			w.u16(rows[i].dist_m);
 		}
 	}
@@ -433,11 +510,13 @@ struct StateMsg
 		{
 			Row row;
 			row.id = r.u32();
-			const uint8_t m = r.u8();
+			const uint8_t byte = r.u8();
 			row.dist_m = r.u16();
+			const uint8_t m = uint8_t(byte & ~kRowOtherMap);
 			if (!r.ok() || m > uint8_t(Mark::Elsewhere))
 				return false;
 			row.mark = Mark(m);
+			row.other_map = (byte & kRowOtherMap) != 0;
 			rows.push_back(row);
 		}
 		return r.ok();
@@ -535,6 +614,244 @@ struct Intent
 	}
 	void sent(uint64_t now) { last = now; }
 	void reset() { last = 0; }
+};
+
+// ---------------------------------------------------------------- F3a T8: the simultaneous load of a group transition
+
+static_assert(kLoadWaitMs == levels::kLoadWaitMs, "the board's loaders' minute and the load barrier's are the same minute");
+constexpr uint32_t kLoadReadyRepeatMs = 3000; // a player on a held screen says LoadReady again this often (a hole may eat it)
+constexpr uint32_t kLoadAloneGraceMs = 30000; // after the server's minute, this long more before a held screen lets go alone
+constexpr uint32_t kLoadBlobStallMs = 30000; // the server's world is up and the save has not moved this long: it is lost
+
+// The world server's side (coop_join.cpp): the movers of one transition and the barrier of their loading screens. The
+// barrier (levels::LoadBarrier) is started at the "go" so that a LoadReady of the new epoch is counted whenever it comes
+// (it waits in the server's world gate until the server's world is up, coop_world_gate.h LoadReady = Hold); its minute is
+// started again when the server's world is up, with the readiness kept: nobody can enter a world before it exists, and the
+// host's own load does not eat the others' minute. The host player (peer 0, kHostPeer) is a mover: his readiness is the
+// server's world (world_up). Enter goes to every mover who is ready once the barrier opens; a laggard enters alone when he is.
+class PreparedLoad
+{
+public:
+	// The "go": a transition to world epoch `epoch` for `movers` (the host player 0 among them: his process reloads).
+	// Replaces the load that was.
+	void start(uint32_t epoch, std::vector<uint32_t> movers, uint64_t now)
+	{
+		m_active = true;
+		m_epoch = epoch;
+		m_world_up = false;
+		m_movers.clear();
+		for (uint32_t p : movers)
+			if (std::find(m_movers.begin(), m_movers.end(), p) == m_movers.end())
+				m_movers.push_back(p);
+		m_entered.clear();
+		m_barrier.start(epoch, m_movers, false, now);
+	}
+	// LoadReady {epoch} from `peer`: true if it made him ready now.
+	bool ready(uint32_t peer, uint32_t epoch)
+	{
+		if (!m_active || epoch != m_epoch || !is_mover(peer) || m_barrier.is_ready(peer))
+			return false;
+		m_barrier.ready(peer, epoch);
+		return m_barrier.is_ready(peer);
+	}
+	// The server's world is up (and with it the host player): the minute starts now.
+	void world_up(uint64_t now)
+	{
+		if (!m_active || m_world_up)
+			return;
+		std::vector<uint32_t> were_ready;
+		for (uint32_t p : m_movers)
+			if (m_barrier.is_ready(p))
+				were_ready.push_back(p);
+		m_barrier.start(m_epoch, m_movers, false, now);
+		for (uint32_t p : were_ready)
+			m_barrier.ready(p, m_epoch);
+		m_barrier.world_up(m_epoch); // the host player (levels::LoadBarrier's host_peer 0)
+		m_world_up = true;
+	}
+	// A mover left the session, or asked for the world the usual way: nobody waits for him.
+	void drop(uint32_t peer)
+	{
+		m_movers.erase(std::remove(m_movers.begin(), m_movers.end(), peer), m_movers.end());
+		m_entered.erase(std::remove(m_entered.begin(), m_entered.end(), peer), m_entered.end());
+		m_barrier.drop(peer);
+	}
+	// The movers who leave their screen now (LoadWait Enter): ready, not entered yet, the barrier open. Marks them entered.
+	std::vector<uint32_t> take_entering(uint64_t now)
+	{
+		std::vector<uint32_t> out;
+		if (!m_active || !m_world_up || !m_barrier.enter(now))
+			return out;
+		for (uint32_t p : m_movers)
+			if (m_barrier.is_ready(p) && !entered(p))
+			{
+				m_entered.push_back(p);
+				out.push_back(p);
+			}
+		return out;
+	}
+	// Every mover entered (or was dropped).
+	bool finished() const
+	{
+		if (!m_active || !m_world_up)
+			return false;
+		for (uint32_t p : m_movers)
+			if (!entered(p))
+				return false;
+		return true;
+	}
+	// LoadWait rows: every mover, ready or not, in the order of start().
+	std::vector<std::pair<uint32_t, bool>> rows() const
+	{
+		std::vector<std::pair<uint32_t, bool>> out;
+		for (uint32_t p : m_movers)
+			out.emplace_back(p, m_barrier.is_ready(p));
+		return out;
+	}
+	void clear()
+	{
+		m_active = false;
+		m_world_up = false;
+		m_movers.clear();
+		m_entered.clear();
+		m_barrier.clear();
+	}
+
+	bool active() const { return m_active; }
+	uint32_t epoch() const { return m_epoch; }
+	bool world_is_up() const { return m_active && m_world_up; }
+	bool is_mover(uint32_t peer) const
+	{
+		return m_active && std::find(m_movers.begin(), m_movers.end(), peer) != m_movers.end();
+	}
+	bool entered(uint32_t peer) const { return std::find(m_entered.begin(), m_entered.end(), peer) != m_entered.end(); }
+	bool is_ready(uint32_t peer) const { return m_active && m_barrier.is_ready(peer); }
+	const std::vector<uint32_t>& movers() const { return m_movers; }
+
+private:
+	bool m_active = false;
+	bool m_world_up = false;
+	uint32_t m_epoch = 0;
+	std::vector<uint32_t> m_movers;
+	std::vector<uint32_t> m_entered;
+	levels::LoadBarrier m_barrier{0}; // the host player is peer 0 (kHostPeer)
+};
+
+// A player's loading screen of a simultaneous load (a remote client, or the host player in the host's process).
+enum class Load : uint8_t
+{
+	None, // no simultaneous load
+	Waiting, // a remote client: LoadWait Prepared came, its save is on the way (the old world is still on the screen)
+	Loading, // the world of the transition loads under the screen (the host player: from his own process's reload on)
+	Holding, // the world is up, LoadReady said: the screen stays until Enter
+	Entering, // Enter came: leave the screen (a client goes live) as soon as the world is up
+};
+
+struct LoadScreen
+{
+	Load stage = Load::None;
+	uint32_t epoch = 0;
+	bool local = false; // the host player: his own world is the server's
+	uint64_t since = 0; // LoadWait Prepared
+	uint64_t progress_at = 0; // the last piece of the save (Waiting)
+	uint64_t up_at = 0; // the world came up under the screen
+	uint64_t said_at = 0; // the last LoadReady
+	uint64_t host_up_at = 0; // the first word from the server after its world came up (LoadWait Waiting / Enter), 0 none
+	std::vector<uint32_t> waiting_for; // who the server still waits for (its last LoadWait), the line on the screen
+
+	// LoadWait Prepared {e}. `download`: a remote client, the save comes as a blob (Waiting); the host player's process loads
+	// the world itself (Loading). False: refused (not newer than the transition that runs).
+	bool prepared(uint32_t e, bool download, uint64_t now)
+	{
+		if (stage != Load::None && e <= epoch)
+			return false;
+		*this = LoadScreen();
+		stage = download ? Load::Waiting : Load::Loading;
+		epoch = e;
+		local = !download;
+		since = progress_at = now;
+		return true;
+	}
+	void progress(uint64_t now)
+	{
+		if (stage == Load::Waiting)
+			progress_at = now;
+	}
+	// The save came and its load is issued (Waiting -> Loading).
+	bool loading()
+	{
+		if (stage != Load::Waiting)
+			return false;
+		stage = Load::Loading;
+		return true;
+	}
+	// The world is up under the screen: true once (Loading -> Holding) = say LoadReady.
+	bool world_up(uint64_t now)
+	{
+		if (stage != Load::Loading)
+			return false;
+		stage = Load::Holding;
+		up_at = said_at = now;
+		return true;
+	}
+	// Holding: true = say LoadReady again (every kLoadReadyRepeatMs).
+	bool repeat(uint64_t now)
+	{
+		if (stage != Load::Holding || now < said_at + kLoadReadyRepeatMs)
+			return false;
+		said_at = now;
+		return true;
+	}
+	// LoadWait Waiting {e}: the server's world is up; who is ready.
+	void waiting(uint32_t e, const std::vector<std::pair<uint32_t, bool>>& rows, uint64_t now)
+	{
+		if (stage == Load::None || e != epoch)
+			return;
+		if (host_up_at == 0)
+			host_up_at = now;
+		waiting_for.clear();
+		for (const auto& row : rows)
+			if (!row.second)
+				waiting_for.push_back(row.first);
+	}
+	// LoadWait Enter {e}: true if the screen goes now (or as soon as the world is up).
+	bool enter(uint32_t e, uint64_t now)
+	{
+		if (e != epoch || (stage != Load::Loading && stage != Load::Holding))
+			return false;
+		if (host_up_at == 0)
+			host_up_at = now;
+		stage = Load::Entering;
+		waiting_for.clear();
+		return true;
+	}
+	// LoadWait Cancel {e}: the load is off, nothing is held.
+	bool cancel(uint32_t e)
+	{
+		if (stage == Load::None || e != epoch)
+			return false;
+		reset();
+		return true;
+	}
+	// Holding, and no Enter kLoadWaitMs + kLoadAloneGraceMs after the server's world was seen up: enter alone. Never before
+	// the server's world is up (a client must not play in a world the host is not in yet); the host player's own world is it.
+	bool alone(uint64_t now) const
+	{
+		if (stage != Load::Holding)
+			return false;
+		const uint64_t base = host_up_at != 0 ? host_up_at : (local ? up_at : 0);
+		return base != 0 && now >= base + kLoadWaitMs + kLoadAloneGraceMs;
+	}
+	// Waiting, the server's world is up and the save has not moved for kLoadBlobStallMs: it is lost (ask for the world).
+	bool stalled(uint64_t now) const
+	{
+		if (stage != Load::Waiting || host_up_at == 0)
+			return false;
+		return now >= std::max(progress_at, host_up_at) + kLoadBlobStallMs;
+	}
+	// The loading screen stays (CGamePersistent::game_loaded, coop::hold_loading_screen).
+	bool holds() const { return stage == Load::Loading || stage == Load::Holding; }
+	void reset() { *this = LoadScreen(); }
 };
 } // namespace transition
 } // namespace coop

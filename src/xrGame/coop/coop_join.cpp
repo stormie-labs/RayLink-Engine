@@ -16,6 +16,7 @@
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_shapes.h"
 #include "xrCoop/coop_death_rules.h" // Ruling F3-9: retired keys, new_key_charge
+#include "xrCoop/coop_levels_wire.h" // F3a T8: LoadWait, LoadReady
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_link_hold.h"
 #include "xrCoop/coop_newchar.h"
@@ -23,6 +24,8 @@
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/CameraBase.h" // transition: the view of a player put back at the edge
+#include "../../xrEngine/x_ray.h" // F3a T8: pApp->ls_header, the line of a held loading screen
+#include "string_table.h" // F3a T8: st_coop_load_*
 #include "ai_space.h"
 #include "script_engine.h"
 #include "level_graph.h"
@@ -90,6 +93,9 @@ struct HostPeer
 	u16 proxy = kNoId;
 	bool loading = false; // world sent, waiting for WorldLoaded
 	u64 sent_at = 0;
+	// F3a T8: a mover of the simultaneous load: he loads the transition's save with the host (no SessionReset, no
+	// JoinRequest); his WorldLoaded after LoadWait Enter ends his join. Cleared when it ends or he asks for the world.
+	bool prepared = false;
 };
 
 struct State
@@ -149,10 +155,28 @@ struct State
 		Fvector angles = {0.f, 0.f, 0.f};
 		std::string level;
 	} guide;
-	// both: the host's board as this machine's placard shows it (the host's own board on the host)
+	// host: the board's last message (coop_status); F3a T8: the host player's placard reads his own copy (view) from the link
+	transition::StateMsg board_view;
+	// both: the world server's board as this player's placard shows it (the host player: what the link brought him)
 	transition::StateMsg view;
 	u64 view_at = 0;
-	u32 view_bad = 0; // client: unreadable TransitionState
+	u32 view_bad = 0; // unreadable TransitionState
+	// F3a T8, host: the simultaneous load of the group's transition (xrCoop/coop_transition.h PreparedLoad, plan §1.5)
+	transition::PreparedLoad load;
+	u16 load_level = levels::wire::kNoLevel; // the game graph level it goes to
+	bool load_world_pending = false; // the next world created is the transition's: on_world_created keeps its epoch
+	bool load_pumping = false; // host_prepare is handing the saves to the network: a new join waits
+	u64 load_go_at = 0; // when the group went (the clock of the log lines)
+	u64 load_up_at = 0; // when the server's world came up
+	u64 load_sent_at = 0; // LoadWait Waiting: the last one
+	u32 load_sent_sig = 0; // ... what it said
+	u32 loads_ignored = 0; // LoadReady of no load of ours (the first few logged)
+	// F3a T8, a player (a remote client, or the host player in the host's process): his screen of that load
+	transition::LoadScreen screen;
+	u16 screen_level = levels::wire::kNoLevel;
+	bool screen_line = false; // the "Waiting for" line is on the loading screen; screen_line_was is the header it covers
+	std::string screen_line_was;
+	u32 load_waits_bad = 0; // unreadable LoadWait
 	// both: this player. `want` is what he does (stands in an exit's zone, or said yes to a guide trip).
 	bool want = false;
 	u32 want_goal = 0;
@@ -206,6 +230,7 @@ constexpr float kVoteReachM = transition::kReachM;
 constexpr u64 kAfterReleaseMs = 4000;
 
 void transition_world_replaced(); // below, with the waiting point of a level change
+void load_screen_off(); // F3a T8: below, with the simultaneous load
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
 u32 g_mirror_generation = 0; // B2: g_world_generation of the world loaded from a host's save (0: none), outlives State
@@ -1034,7 +1059,9 @@ void host_join_request(PeerId from, const PeerInfo& peer)
 {
 	const PeerInfo* p = &peer;
 	// Review of the live fixes: a join during the host's own load waits like a Later until the host plays normally.
-	if (host_precaching())
+	// F3a T8: so does one that comes while the host hands a transition's saves to the network (the world is leaving: a
+	// save of it now would be of the old level; he gets the SessionReset of the new one like everybody who is not a mover).
+	if (g.load_pumping || host_precaching())
 	{
 		if (std::find(g.precache_wait.begin(), g.precache_wait.end(), from) == g.precache_wait.end())
 			g.precache_wait.push_back(from);
@@ -1061,10 +1088,14 @@ void host_join_request(PeerId from, const PeerInfo& peer)
 	}
 }
 
+void host_load_forget(PeerId peer, const char* why); // F3a T8, below with the simultaneous load
+
 void host_on_join_request(PeerId from, Reader&)
 {
 	if (!mgr().is_host())
 		return; // F0 final review: the session drops it on a client already (msg_sender); handlers check it too
+	// F3a T8: a mover of the simultaneous load whose save got lost asks for the world the usual way: he is no mover any more
+	host_load_forget(from, "he asks for the world");
 	if (const PeerInfo* p = mgr().session().peer(from))
 		host_join_request(from, *p);
 }
@@ -1100,16 +1131,27 @@ void host_on_world_loaded(PeerId from, Reader&)
 	// was admitted again, with a new CharOffer, every 5 s.
 	const bool world_sent = it != g.peers.end() && it->second.loading && it->second.proxy != kNoId &&
 	    !g.choosers.in_choice(from);
-	if (!world_sent || !g.gate.loaded(from))
+	// F3a T8: a mover of the simultaneous load had no JoinRequest (the gate knows no join of his): his WorldLoaded comes
+	// after LoadWait Enter (or after his screen let go alone), in the world served now (the session dropped one of another
+	// epoch, and the world gate one made while the world was not up: WorldLoaded = Drop).
+	const bool prepared = world_sent && it->second.prepared && g.world_seen == g_world_generation && !g.reset_pending;
+	if (!world_sent || !(prepared || g.gate.loaded(from)))
 	{
 		if (++g.loaded_ignored <= kRefusalsLogged)
 			::Msg("! [coop] #%u says it loaded the world, but no world is being sent to it: ignored", from);
 		return;
 	}
 	it->second.loading = false;
+	it->second.prepared = false;
 	const PeerInfo* p = mgr().session().peer(from);
-	::Msg("[coop] '%s' is in the world (load took %.1f s)", p ? p->nick.c_str() : "?",
-	    float(mgr().now_ms() - it->second.sent_at) / 1000.f);
+	if (prepared && g.load.is_mover(from) && !g.load.entered(from))
+	{
+		// his screen let go alone (no Enter reached him): he is in, the load does not wait for him any more
+		::Msg("[coop] load: '%s' entered without the host's Enter (his screen let go alone)", p ? p->nick.c_str() : "?");
+		g.load.drop(from);
+	}
+	::Msg("[coop] '%s' is in the world (load took %.1f s%s)", p ? p->nick.c_str() : "?",
+	    float(mgr().now_ms() - it->second.sent_at) / 1000.f, prepared ? ", a simultaneous load" : "");
 	bring_online(it->second.proxy); // W9: his character was kept out of the world while he was away or loading
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
@@ -1149,6 +1191,7 @@ void client_on_session_reset(PeerId from, Reader& r)
 	g.load_issued = false;
 	g.swap_done = false;
 	transition_world_replaced(); // the host's board of the old world
+	load_screen_off(); // F3a T8: a simultaneous load of ours is over, this join is the usual one
 	// protocol 8: an offer of the old world is void; the window stays open until the host offers again (join_offer)
 	g.char_step = State::CharStep::None;
 	sync::reset();
@@ -1561,12 +1604,511 @@ std::string goal_level_name(u32 goal)
 	return lc ? level_name_of(lc->m_tNextGraphID) : std::string();
 }
 
+// ---------------------------------------------------------------- F3a T8: the simultaneous load of a group transition
+// Plan §1.5, xrCoop/coop_transition.h (PreparedLoad, LoadScreen). On "go" the host's own level change writes the shared
+// save of the transition (CALifeUpdateManager::change_level, coop_auto_N) with every moving client's character already on
+// the new level (host_place_movers). The world server gives it the next world epoch and sends every mover LoadWait
+// {Prepared} and that save as a blob BEFORE its own reload (the engine reconnects a frame or two later), and hands the
+// saves to the network first (host_pump_saves): the session tops a peer's Bulk lane up to 512 KB only from update(), which
+// a level load does not call. Everybody loads the same save at once; a mover's screen stays (hold_loading_screen) until
+// LoadWait {Enter}; his WorldLoaded after it ends his join as every join ends (host_end_join, JoinComplete). No SessionReset
+// and no JoinRequest for a mover: the world is already his. Whoever is not in the world at the go (loading, choosing a
+// character) rejoins after the host's load as before. The log lines "[coop] load:" carry the times of each step.
+
+constexpr u64 kPreparedPumpMs = 8000; // the longest the host's reload waits for the saves to be handed to the network
+constexpr u64 kFreshSaveSlackMs = 2000; // the file time of the level change's save may lag the clock this much (FAT)
+
+// Where the group arrives: the point the actor's level change puts him at.
+struct Arrival
+{
+	GameGraph::_GRAPH_ID graph = GameGraph::_GRAPH_ID(-1);
+	u32 node = u32(-1);
+	Fvector position = {0.f, 0.f, 0.f};
+};
+
+// A client who goes with the group, and where his character stood (put back if the level change wrote nothing).
+struct Mover
+{
+	PeerId peer = kInvalidPeer;
+	u16 proxy = kNoId;
+	GameGraph::_GRAPH_ID graph = 0;
+	u32 node = 0;
+	Fvector position = {0.f, 0.f, 0.f};
+};
+
+std::string nick_of_peer(PeerId id)
+{
+	for (const PeerInfo& p : mgr().session().players())
+		if (p.id == id)
+			return p.nick;
+	string32 n;
+	xr_sprintf(n, "#%u", id);
+	return n;
+}
+
+u16 level_id_of(GameGraph::_GRAPH_ID gv)
+{
+	if (!ai().get_game_graph() || !ai().game_graph().valid_vertex_id(gv))
+		return levels::wire::kNoLevel;
+	return u16(ai().game_graph().vertex(gv)->level_id());
+}
+
+// The stock name of game graph level `id` ("l01_escape"), empty if this machine's graph has no such level.
+std::string level_name_by_id(u16 id)
+{
+	if (id == levels::wire::kNoLevel || !ai().get_game_graph())
+		return std::string();
+	const GameGraph::LEVEL_MAP& all = ai().game_graph().header().levels();
+	const auto it = all.find(GameGraph::_LEVEL_ID(id));
+	return it == all.end() ? std::string() : std::string(it->second.name().c_str());
+}
+
+// The clients who go with the group: in the world, their character known and free (one that sits in something, or a
+// player still loading or choosing, rejoins after the host's load as before).
+xr_vector<Mover> host_pick_movers()
+{
+	xr_vector<Mover> out;
+	if (!ai().get_alife())
+		return out;
+	for (const PeerInfo& p : mgr().session().peers())
+	{
+		const auto it = g.peers.find(p.id);
+		if (p.state != PeerState::Joined || it == g.peers.end() || it->second.loading || it->second.proxy == kNoId ||
+		    sync::host_peer_joining(p.id) || g.choosers.in_choice(p.id))
+			continue;
+		const CSE_ALifeDynamicObject* e = ai().alife().objects().object(it->second.proxy, true);
+		if (!e || e->ID_Parent != kNoId)
+			continue;
+		Mover m;
+		m.peer = p.id;
+		m.proxy = e->ID;
+		m.graph = e->m_tGraphID;
+		m.node = e->m_tNodeID;
+		m.position = e->o_Position;
+		out.push_back(m);
+	}
+	return out;
+}
+
+// The movers' characters go where the group arrives (around the actor's point, as bring_proxy_to_level puts a late one),
+// so the level change's save has them on the new level. teleport_object takes one that is online offline: the old world
+// goes within a frame or two, and its player's world is frozen from his LoadWait on.
+void host_place_movers(const xr_vector<Mover>& movers, const Arrival& at)
+{
+	static const float kAround[][2] = {
+	    {1.5f, 0.f}, {0.f, 1.5f}, {-1.5f, 0.f}, {0.f, -1.5f}, {1.5f, 1.5f}, {-1.5f, -1.5f}, {1.5f, -1.5f}};
+	constexpr size_t kPlaces = sizeof(kAround) / sizeof(kAround[0]);
+	size_t i = 0;
+	for (const Mover& m : movers)
+	{
+		Fvector pos = at.position;
+		pos.x += kAround[i % kPlaces][0];
+		pos.z += kAround[i % kPlaces][1];
+		++i;
+		alife_rw().teleport_object(m.proxy, at.graph, at.node, pos);
+	}
+}
+
+// The level change wrote no save: the movers' characters go back where they stood, into the world again.
+void host_unplace_movers(const xr_vector<Mover>& movers)
+{
+	for (const Mover& m : movers)
+	{
+		if (!ai().alife().objects().object(m.proxy, true))
+			continue;
+		alife_rw().teleport_object(m.proxy, m.graph, m.node, m.position);
+		bring_online(m.proxy);
+	}
+}
+
+// The save of the level change that just ran: its name (what the new level loads, the server's command line up to the
+// first '/') and whether its file was written since `before` (else the level change wrote nothing, its stock refusal).
+bool level_change_save(const FILETIME& before, std::string& name)
+{
+	name.clear();
+	const shared_str* line = ai().get_alife() ? ai().alife().server_command_line() : nullptr;
+	if (!line || !line->size())
+		return false;
+	const char* text = line->c_str();
+	const char* slash = strchr(text, '/');
+	name.assign(text, slash ? size_t(slash - text) : size_t(xr_strlen(text)));
+	if (name.empty())
+		return false;
+	string_path scop;
+	save_path(scop, name.c_str(), ".scop");
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExA(scop, GetFileExInfoStandard, &fa))
+		return false;
+	ULARGE_INTEGER wrote, since;
+	wrote.LowPart = fa.ftLastWriteTime.dwLowDateTime;
+	wrote.HighPart = fa.ftLastWriteTime.dwHighDateTime;
+	since.LowPart = before.dwLowDateTime;
+	since.HighPart = before.dwHighDateTime;
+	return wrote.QuadPart + kFreshSaveSlackMs * 10000ull >= since.QuadPart; // FILETIME: 100 ns
+}
+
+// A prepared world for the player whose character is `proxy`: the layout of a join's world save (client_load_world). Its
+// list of online objects is the host's actor alone (on the client he is the host's avatar and gets no EntitySwitch ever,
+// host_collect_online): the host's new world brings its objects online after this save, and those switches reach the mover
+// with the catch-up of his join (queued from the host's world change on, flushed by host_end_join).
+std::vector<u8> prepared_blob(u16 proxy, const std::vector<u8>& engine_part, const std::vector<u8>& script_part)
+{
+	Writer w(engine_part.size() + script_part.size() + 32);
+	w.u16(proxy);
+	w.u32(1);
+	w.u16(0);
+	w.u32((u32)engine_part.size());
+	w.bytes(engine_part.data(), engine_part.size());
+	w.u32((u32)script_part.size());
+	if (!script_part.empty())
+		w.bytes(script_part.data(), script_part.size());
+	return std::vector<u8>(w.data().begin(), w.data().end());
+}
+
+levels::wire::LoadWaitMsg load_wait_msg(u8 state, u32 epoch)
+{
+	levels::wire::LoadWaitMsg m;
+	m.state = state;
+	m.epoch = epoch;
+	m.level = g.load_level;
+	if (state == levels::wire::LoadWaitMsg::Waiting || state == levels::wire::LoadWaitMsg::Enter)
+		for (const auto& row : g.load.rows())
+		{
+			if (m.rows.size() >= kMaxPlayers)
+				break;
+			levels::wire::LoadWaitMsg::Row r;
+			r.peer = row.first;
+			r.ready = row.second ? 1 : 0;
+			m.rows.push_back(r);
+		}
+	return m;
+}
+
+// To a remote mover, or to the host player over the local link (peer 0).
+void host_load_send(PeerId to, const levels::wire::LoadWaitMsg& m)
+{
+	Writer w(16 + 5 * m.rows.size());
+	if (m.write(w)) // false only for more rows than players: never (load_wait_msg)
+		mgr().session().send(to, Lane::Reliable, Msg::LoadWait, w);
+}
+
+// The prepared saves go to the network before the host's reload: the session's update() hands a peer's blob to ENet
+// 512 KB at a time and a level load calls no update() for tens of seconds (only the keep-alive thread runs ENet then),
+// so the host pumps the session here until every save is handed over, kPreparedPumpMs at most; what is left then goes
+// after the host's load. The players' requests made meanwhile are of the old epoch (dropped by the session); a new join
+// waits (load_pumping, host_join_request).
+void host_pump_saves(u32 blobs, u64 bytes)
+{
+	Session& s = mgr().session();
+	const uint64_t ends = s.stats(u16(Msg::BlobEnd)).sent_count + blobs;
+	const uint64_t chunk_bytes = s.stats(u16(Msg::BlobChunk)).sent_bytes + bytes;
+	const u64 start = mgr().now_ms();
+	bool handed = false;
+	g.load_pumping = true;
+	while (mgr().now_ms() - start < kPreparedPumpMs)
+	{
+		s.update(mgr().now_ms());
+		if (s.stats(u16(Msg::BlobEnd)).sent_count >= ends && s.stats(u16(Msg::BlobChunk)).sent_bytes >= chunk_bytes)
+		{
+			handed = true;
+			break;
+		}
+		Sleep(1);
+	}
+	g.load_pumping = false;
+	::Msg("[coop] load: %u save(s), %u KB, %s the network in %u ms%s", blobs, u32(bytes / 1024),
+	    handed ? "handed to" : "partly handed to", u32(mgr().now_ms() - start),
+	    handed ? " (the last 512 KB of each leave during the host's load)" : ", the rest follows when the host's world is up");
+}
+
+// The "go" of a group with movers, right after the host's level change (host_release). See the section's header.
+void host_prepare(const xr_vector<Mover>& movers, u16 level, const FILETIME& before, u64 save_ms)
+{
+	std::string name;
+	if (!level_change_save(before, name))
+	{
+		::Msg("! [coop] load: the level change wrote no save (%s): no simultaneous load, the players rejoin the usual way",
+		    name.empty() ? "no name" : name.c_str());
+		host_unplace_movers(movers);
+		return;
+	}
+	string_path scop, scoc;
+	save_path(scop, name.c_str(), ".scop");
+	save_path(scoc, name.c_str(), ".scoc");
+	std::vector<u8> engine_part, script_part;
+	if (!read_file(scop, engine_part) || engine_part.empty())
+	{
+		// the characters are on the new level in that save already: their usual rejoin finds them there
+		::Msg("! [coop] load: cannot read the save of the level change (%s): the players rejoin the usual way", scop);
+		return;
+	}
+	read_file(scoc, script_part); // absent if Anomaly's script storage is disabled
+	Session& s = mgr().session();
+	const u64 now = mgr().now_ms();
+	const u32 epoch = g.epoch + 1;
+	levels::wire::LoadWaitMsg prepared;
+	prepared.state = levels::wire::LoadWaitMsg::Prepared;
+	prepared.epoch = epoch;
+	prepared.level = level;
+	// 1. LoadWait Prepared to every mover while his session is still in this epoch (nothing goes to a client of another)
+	for (const Mover& m : movers)
+		host_load_send(m.peer, prepared);
+	// 2. the world epoch of the transition, now: the host's process keeps it for its new world (on_world_created)
+	g.epoch = epoch;
+	s.set_world_epoch(epoch);
+	g.load_world_pending = true;
+	// 3. the movers' joins (their world traffic waits for their WorldLoaded) and their saves, queued after the epoch moved
+	//    (a blob carries the epoch it was queued in; one queued before would be cancelled by the move)
+	for (auto& it : g.peers)
+		it.second.prepared = false; // a mover of an earlier load who is not in yet rejoins the usual way
+	std::vector<uint32_t> ids{kHostPeer};
+	u64 bytes = 0;
+	std::string names;
+	for (const Mover& m : movers)
+	{
+		HostPeer& hp = g.peers[m.peer];
+		hp.prepared = true;
+		hp.loading = true;
+		hp.sent_at = 0; // the join's time limit starts when the host's world is up (host_watch_world)
+		sync::host_begin_join(m.peer);
+		std::vector<u8> blob = prepared_blob(m.proxy, engine_part, script_part);
+		bytes += blob.size();
+		s.send_blob(m.peer, BlobPreparedSave, std::move(blob));
+		ids.push_back(m.peer);
+		names += names.empty() ? "" : ", ";
+		names += nick_of_peer(m.peer);
+	}
+	g.load_level = level;
+	g.load.start(epoch, ids, now);
+	g.load_go_at = now;
+	g.load_up_at = 0;
+	g.load_sent_at = 0;
+	g.load_sent_sig = 0;
+	// 4. the host player over the local link, after the epoch moved (a link packet of an older epoch is dropped at the pump)
+	host_load_send(kHostPeer, prepared);
+	::Msg("[coop] load: the transition's save '%s' was written in %u ms (%u + %u bytes); epoch %u to '%s': %s load it "
+	      "with the host",
+	    name.c_str(), u32(save_ms), u32(engine_part.size()), u32(script_part.size()), epoch,
+	    level_name_by_id(level).c_str(), names.c_str());
+	// 5. the saves to the network before the reload
+	host_pump_saves(u32(movers.size()), bytes);
+}
+
+// A mover is no mover any more (he left, asks for the world the usual way, joins again).
+void host_load_forget(PeerId peer, const char* why)
+{
+	const auto it = g.peers.find(peer);
+	const bool was = (it != g.peers.end() && it->second.prepared) || g.load.is_mover(peer);
+	if (it != g.peers.end())
+		it->second.prepared = false;
+	if (g.load.is_mover(peer))
+		g.load.drop(peer);
+	if (was)
+		::Msg("[coop] load: '%s' is no mover of the simultaneous load any more (%s)", nick_of_peer(peer).c_str(), why);
+}
+
+// Another world than the transition's came (a load meanwhile): its movers rejoin the usual way, the host player's screen
+// does not wait for it (his link takes this message: it is pushed in the epoch that is current now).
+void host_load_void(const char* why)
+{
+	if (!g.load.active())
+		return;
+	::Msg("! [coop] load: the simultaneous load of epoch %u is off (%s): its players rejoin the usual way", g.load.epoch(),
+	    why);
+	host_load_send(kHostPeer, load_wait_msg(levels::wire::LoadWaitMsg::Cancel, g.load.epoch()));
+	g.load.clear();
+	g.load_world_pending = false;
+	for (auto& it : g.peers)
+		it.second.prepared = false;
+}
+
+// Host, every frame: the barrier of the load. Enter to whoever may leave his screen now, Waiting (who is ready) to the
+// others on a change and every kStateEveryMs, the end of the load when everybody is in.
+void host_load_step(u64 now)
+{
+	if (!g.load.active() || !g.load.world_is_up())
+		return;
+	const std::vector<uint32_t> entering = g.load.take_entering(now);
+	if (!entering.empty())
+	{
+		const levels::wire::LoadWaitMsg enter = load_wait_msg(levels::wire::LoadWaitMsg::Enter, g.load.epoch());
+		std::string names;
+		for (uint32_t peer : entering)
+		{
+			host_load_send(peer, enter);
+			names += names.empty() ? "" : ", ";
+			names += nick_of_peer(peer);
+		}
+		::Msg("[coop] load: Enter for %s: %.1f s after the go, %.1f s after the host's world came up", names.c_str(),
+		    float(now - g.load_go_at) / 1000.f, float(now - g.load_up_at) / 1000.f);
+	}
+	if (g.load.finished())
+	{
+		::Msg("[coop] load: done, every player is in (%.1f s after the go)", float(now - g.load_go_at) / 1000.f);
+		g.load.clear();
+		return;
+	}
+	u32 sig = 17u;
+	for (const auto& row : g.load.rows())
+		sig = sig * 31u + row.first * 2u + (row.second ? 1u : 0u);
+	const bool changed = sig != g.load_sent_sig;
+	if (now - g.load_sent_at < (changed ? 100u : u64(transition::kStateEveryMs)))
+		return;
+	g.load_sent_sig = sig;
+	g.load_sent_at = now;
+	const levels::wire::LoadWaitMsg waiting = load_wait_msg(levels::wire::LoadWaitMsg::Waiting, g.load.epoch());
+	for (uint32_t peer : g.load.movers())
+		if (!g.load.entered(peer))
+			host_load_send(peer, waiting);
+}
+
+// --- a player's side: his loading screen (a remote client, or the host player in the host's process)
+
+// The header line of the loading screen while it is held: "Waiting for: <nicks>" (pApp->ls_header, put back after).
+void load_screen_line(bool on)
+{
+	if (!pApp)
+		return;
+	if (!on)
+	{
+		if (g.screen_line)
+			xr_strcpy(pApp->ls_header, g.screen_line_was.c_str());
+		g.screen_line = false;
+		return;
+	}
+	if (!g.screen_line)
+	{
+		g.screen_line_was = pApp->ls_header;
+		g.screen_line = true;
+	}
+	// before the world server's word that its world is up, it is the host the screen waits for
+	std::vector<uint32_t> who = g.screen.waiting_for;
+	if (who.empty() && g.screen.host_up_at == 0)
+		who.push_back(kHostPeer);
+	std::string text;
+	if (who.empty())
+		text = CStringTable().translate("st_coop_load_all").c_str();
+	else
+	{
+		text = CStringTable().translate("st_coop_load_wait").c_str();
+		for (size_t i = 0; i < who.size(); ++i)
+		{
+			text += i ? ", " : " ";
+			text += nick_of_peer(who[i]);
+		}
+	}
+	if (xr_strcmp(pApp->ls_header, text.c_str()))
+		xr_strcpy(pApp->ls_header, text.c_str());
+}
+
+void load_screen_off()
+{
+	g.screen.reset();
+	load_screen_line(false);
+}
+
+void send_load_ready()
+{
+	levels::wire::LoadReadyMsg m;
+	m.epoch = g.screen.epoch;
+	Writer w(4);
+	m.write(w);
+	net::client_send(Msg::LoadReady, w); // the host player's over the local link
+}
+
+// Client: in the host's world: tell the host (its catch-up follows, host_end_join).
+void client_go_live()
+{
+	mgr().set_phase(Phase::Live);
+	mgr().session().send(kHostPeer, Lane::Reliable, Msg::WorldLoaded, Writer());
+	sync::on_client_live();
+}
+
+// A player, every frame: LoadReady when his world of the transition is up (and again while the screen is held), leave
+// the screen at Enter (a client goes live), let go alone if no Enter comes, ask for the world the usual way if the save
+// got lost, and the line on the screen.
+void player_load_step(u64 now)
+{
+	if (g.screen.stage == transition::Load::None)
+	{
+		load_screen_line(false);
+		return;
+	}
+	const bool mirror = mgr().is_client();
+	// a client: loaded and its roles swapped, as for its WorldLoaded; the host player: his process's world
+	const bool up = world_up() && !Device.dwPrecacheFrame &&
+	    (!mirror || (mgr().phase() == Phase::LoadingWorld && g.swap_done));
+	if (up && g.screen.world_up(now))
+	{
+		send_load_ready();
+		::Msg("[coop] load: my world is up %.1f s after the go, waiting for the others", float(now - g.screen.since) / 1000.f);
+	}
+	else if (g.screen.repeat(now))
+		send_load_ready();
+	if (g.screen.alone(now))
+	{
+		::Msg("! [coop] load: no Enter from the host %u s after its world came up: entering alone",
+		    u32((transition::kLoadWaitMs + transition::kLoadAloneGraceMs) / 1000));
+		g.screen.enter(g.screen.epoch, now);
+	}
+	if (g.screen.stage == transition::Load::Entering && (up || !mirror))
+	{
+		::Msg("[coop] load: in, %.1f s after the go (%.1f s on the held screen)", float(now - g.screen.since) / 1000.f,
+		    g.screen.up_at ? float(now - g.screen.up_at) / 1000.f : 0.f);
+		load_screen_off();
+		if (mirror)
+			client_go_live();
+		return;
+	}
+	if (mirror && g.screen.stalled(now))
+	{
+		::Msg("! [coop] load: the host's save stopped coming %u s ago: asking for the world the usual way",
+		    u32(transition::kLoadBlobStallMs / 1000));
+		load_screen_off();
+		mgr().session().send(kHostPeer, Lane::Reliable, Msg::JoinRequest, Writer());
+		return;
+	}
+	load_screen_line(g.screen.holds());
+}
+
+// Client: LoadWait Prepared: the group moves, the save of the transition follows as a blob. As a SessionReset, but the
+// world comes by itself: no JoinRequest.
+void client_prepared(const levels::wire::LoadWaitMsg& m, u64 now)
+{
+	if (!mgr().is_live_client())
+	{
+		::Msg("! [coop] load: the host prepares a world while this player is not in its world (%s): ignored",
+		    phase_name(mgr().phase()));
+		return;
+	}
+	if (m.epoch <= mgr().session().world_epoch() || !g.screen.prepared(m.epoch, true, now))
+	{
+		::Msg("! [coop] load: a prepared world of epoch %u, this player is in epoch %u: ignored", m.epoch,
+		    mgr().session().world_epoch());
+		return;
+	}
+	g.screen_level = m.level;
+	::Msg("[coop] load: the group moves to '%s' (epoch %u): the host's save comes now, everybody loads it at once",
+	    level_name_by_id(m.level).c_str(), m.epoch);
+	g.my_proxy = kNoId;
+	g.load_issued = false;
+	g.swap_done = false;
+	transition_world_replaced(); // the host's board of the old world
+	g.char_step = State::CharStep::None;
+	sync::reset();
+	g.receive_started = now; // the join time limit starts again
+	mgr().set_phase(Phase::ReceivingWorld);
+	// R2 I1: the host is in the new epoch already (it moved right after this message); the save carries it
+	mgr().session().set_world_epoch(m.epoch);
+}
+
 // Host: the level change of `goal`, the one the stock exit sends (R2 I3: built from the host's own entity, or from what
 // the host's game asked for in a guide trip). The gate lets it by (g.releasing).
 bool host_release(u32 goal)
 {
 	NET_Packet P;
 	P.w_begin(M_CHANGE_LEVEL);
+	Arrival at; // F3a T8: where the movers' characters go in the transition's save
 	if (transition::is_guide(goal))
 	{
 		if (!g.guide.set)
@@ -1578,6 +2120,9 @@ bool host_release(u32 goal)
 		P.w(&g.guide.node, sizeof(g.guide.node));
 		P.w_vec3(g.guide.position);
 		P.w_vec3(g.guide.angles);
+		at.graph = g.guide.graph;
+		at.node = g.guide.node;
+		at.position = g.guide.position;
 		::Msg("[coop] moving the group to '%s' (guide trip)", g.guide.level.c_str());
 	}
 	else
@@ -1592,13 +2137,29 @@ bool host_release(u32 goal)
 		P.w(&lc->m_dwNextNodeID, sizeof(lc->m_dwNextNodeID));
 		P.w_vec3(lc->m_tNextPosition);
 		P.w_vec3(lc->m_tAngles);
+		at.graph = lc->m_tNextGraphID;
+		at.node = lc->m_dwNextNodeID;
+		at.position = lc->m_tNextPosition;
 		::Msg("[coop] moving the group to '%s' (level exit %u)", level_name_of(lc->m_tNextGraphID).c_str(), goal);
 	}
+	// F3a T8: the clients in the world load the transition's save with the host (host_prepare); the others rejoin after
+	const xr_vector<Mover> movers = host_has_company() ? host_pick_movers() : xr_vector<Mover>();
+	if (!movers.empty())
+		host_place_movers(movers, at);
+	FILETIME before;
+	GetSystemTimeAsFileTime(&before);
+	const u64 save_from = mgr().now_ms();
 	g.releasing = true;
-	Level().Send(P, net_flags(TRUE)); // the host's own level change; clients follow via SessionReset
+	Level().Send(P, net_flags(TRUE)); // the host's own level change: its save is written here, the reload comes a frame later
 	g.releasing = false;
+	const u64 save_ms = mgr().now_ms() - save_from;
 	g.guide.set = false;
 	g.released_at = mgr().now_ms();
+	if (!movers.empty())
+	{
+		host_prepare(movers, level_id_of(at.graph), before, save_ms);
+		g.released_at = mgr().now_ms(); // the old world's last frames are after the saves went out (host_pump_saves)
+	}
 	return true;
 }
 
@@ -1616,13 +2177,12 @@ u32 board_signature(const transition::Status& st)
 	return sig;
 }
 
-// Host: this machine's placard takes the board at once; the clients get it on a change (at most every 100 ms) and every
-// kStateEveryMs while the board is not idle, and once when it goes idle.
+// Host: every player gets the board on a change (at most every 100 ms) and every kStateEveryMs while it is not idle, and
+// once when it goes idle. F3a T8: the host player too, over the local link: his placard reads what the link brings him.
 void host_board_send(const transition::Status& st, u64 now)
 {
 	const bool idle = st.state == transition::State::Idle;
-	g.view = transition::state_message(st, idle ? std::string() : goal_level_name(st.goal));
-	g.view_at = now;
+	g.board_view = transition::state_message(st, idle ? std::string() : goal_level_name(st.goal));
 	const u32 sig = board_signature(st);
 	if (idle)
 	{
@@ -1638,9 +2198,10 @@ void host_board_send(const transition::Status& st, u64 now)
 	g.board_sent_idle = idle;
 	g.board_sent_sig = sig;
 	g.board_sent_at = now;
-	Writer w(48 + 8 * g.view.rows.size());
-	g.view.write(w);
-	mgr().session().broadcast(Lane::Reliable, Msg::TransitionState, w); // not queued: a loading client ignores it
+	Writer w(48 + 8 * g.board_view.rows.size());
+	g.board_view.write(w);
+	// not queued: a loading client ignores it; the host player gets it over the local link (Session::broadcast)
+	mgr().session().broadcast(Lane::Reliable, Msg::TransitionState, w);
 }
 
 // Host, ten times a second: the players as the board sees them, the board's verdict, the group's move.
@@ -1654,32 +2215,36 @@ void host_board_step(u64 now)
 	if (!g_pGameLevel || !ai().get_alife() || g.world_seen != g_world_generation)
 		return; // no world (a level change, a load): nothing to run, the board was cleared with the old world
 	const bool company = host_has_company();
-	if (!company && g.board.empty() && g.view.state == transition::State::Idle)
+	if (!company && g.board.empty() && g.board_view.state == transition::State::Idle)
 		return;
 	if (!company)
 	{
 		g.board.clear(); // the others left: the host's changes are the stock ones again
 		g.guide.set = false;
 	}
+	// F3a T8: the members are the server's players(): the host player is peer 0 among them (over the local link), not a
+	// member added apart; below the protocol his character is this process's actor.
 	std::vector<transition::Member> members;
-	{
-		transition::Member h;
-		h.id = 0;
-		h.remote = false;
-		CActor* a = g_actor ? Actor() : nullptr;
-		h.in_world = a != nullptr;
-		h.alive = a && a->g_Alive() && survival::life_of(0) == survival::Life::Alive;
-		members.push_back(h);
-	}
-	for (const PeerInfo& p : mgr().session().peers())
+	for (const PeerInfo& p : mgr().session().players())
 	{
 		if (p.state != PeerState::Joined)
 			continue;
 		transition::Member m;
 		m.id = p.id;
-		const u16 proxy = proxy_of_peer(p.id);
-		m.in_world = !sync::host_peer_joining(p.id) && host_player_in_world(proxy);
-		m.alive = !m.in_world || survival::life_of(proxy) == survival::Life::Alive;
+		if (p.local)
+		{
+			m.remote = false; // the local link loses nothing: his claim needs no refresh to live
+			CActor* a = g_actor ? Actor() : nullptr;
+			m.in_world = a != nullptr;
+			m.alive = a && a->g_Alive() && survival::life_of(0) == survival::Life::Alive;
+		}
+		else
+		{
+			const u16 proxy = proxy_of_peer(p.id);
+			m.in_world = !sync::host_peer_joining(p.id) && host_player_in_world(proxy);
+			m.alive = !m.in_world || survival::life_of(proxy) == survival::Life::Alive;
+		}
+		// on_target / other_map stay off: one map for everybody until split levels run (F3a T10 sets them by coop_levels)
 		members.push_back(m);
 	}
 	const transition::DistFn dist = [](u32 id, u32 goal) -> float
@@ -1727,34 +2292,19 @@ void transition_step(u64 now)
 	g.zone_changer = touched;
 	bool want = g.zone_in && touched != g.withdrawn_from;
 	u32 goal = want ? transition::goal_of_exit(touched) : 0;
-	if (mgr().is_client())
+	// A yes to the guide trip on the board (a client's confirm; the host player's game asked for the trip, host_gate_level_change)
+	// holds while the board shows that trip; the board's message clears it when the trip is over (client_on_transition_state).
+	if (g.guide_yes && g.view.state != transition::State::Idle && g.view.kind == 1)
 	{
-		if (g.guide_yes && g.view.state != transition::State::Idle && g.view.kind == 1)
-		{
-			want = true;
-			goal = transition::kGuideGoal;
-		}
-		else
-			g.guide_yes = false;
+		want = true;
+		goal = transition::kGuideGoal;
 	}
 	if (want && !g.want)
 		g.held_note = false;
 	g.want = want;
 	g.want_goal = goal;
-	if (mgr().is_host())
-	{
-		// His own claim goes to the board; the claim of a guide trip is the board's own business (host_gate_level_change)
-		uint32_t claimed_goal = 0;
-		if (g.released_at != 0 && now - g.released_at < kAfterReleaseMs)
-		{
-			// the group is on its way, the old world is about to go: no new claim in it
-		}
-		else if (want)
-			g.board.claim(0, goal, now);
-		else if (g.board.claimed(0, &claimed_goal) && !transition::is_guide(claimed_goal))
-			g.board.release(0);
-	}
-	else
+	// F3a T8: every player says it with TransitionVote, the host player too: net::client_send puts his on the local link and
+	// the world server takes it as anybody's (host_on_transition_vote, from = 0). His placard's view comes back the same way.
 	{
 		const u32 self = mgr().self();
 		bool view_ready = false;
@@ -1822,6 +2372,7 @@ void transition_world_replaced()
 	g.board_lead_known = false;
 	g.board_sent_idle = true;
 	g.view = transition::StateMsg();
+	g.board_view = transition::StateMsg();
 	g.want = false;
 	g.zone_in = false;
 	g.zone_changer = kNoId;
@@ -1867,7 +2418,8 @@ void set_lua_bool(lua_State* L, const char* key, bool v)
 // coop.transition() -> nil | table, the board as this player's placard shows it (scripts/coop_hud_transition.script):
 //   state "waiting" | "counting", kind "exit" | "guide", level (stock name, "l01_escape"), changer (exit id, host numbering),
 //   ready, total, countdown_ms (left, counting), load_ms (left of the loaders' minute, 0 = none),
-//   rows = { {peer, mark "ready"|"away"|"loading"|"down"|"elsewhere", dist (m, to the exit; left out if unknown)}, ... },
+//   rows = { {peer, mark "ready"|"away"|"loading"|"down"|"elsewhere", dist (m, to the exit; left out if unknown),
+//            other (true: on another map, F3a; left out otherwise)}, ... },
 //   me = { peer, host, in_zone (I stand in an exit's zone), ready (the board has me ready), dist (m to the exit),
 //          confirm (a guide trip I can say yes to) },
 //   pos = {x, y, z} of the exit on this machine (left out for a guide trip).
@@ -1876,7 +2428,7 @@ int l_transition(lua_State* L)
 {
 	const u64 now = mgr().now_ms();
 	const transition::StateMsg& v = g.view;
-	const bool fresh = mgr().is_host() || now - g.view_at <= 3000;
+	const bool fresh = now - g.view_at <= 3000; // F3a T8: the host player's view comes over the link like anybody's
 	if (!mgr().active() || !group_waits_here() || v.state == transition::State::Idle || !fresh)
 	{
 		lua_pushnil(L);
@@ -1904,6 +2456,8 @@ int l_transition(lua_State* L)
 		set_lua_string(L, "mark", mark_name(r.mark));
 		if (r.dist_m != transition::kUnknownDist)
 			set_lua_number(L, "dist", lua_Number(r.dist_m));
+		if (r.other_map)
+			set_lua_bool(L, "other", true); // F3a: on another map (the together entry of split levels)
 		lua_rawseti(L, -2, ++index);
 		me_ready = me_ready || (r.id == self && r.mark == transition::Mark::Ready);
 	}
@@ -1930,7 +2484,25 @@ int l_transition(lua_State* L)
 
 } // namespace
 
-// Host: a client's TransitionVote. Ready at an exit (checked: an exit of this level, the player is in the world and within
+namespace
+{
+// The character of player `id` in the world served now, nullptr if he is not in it. F3a T8: the host player's (peer 0, over
+// the local link) is the actor of this process; a client's is his proxy once his join is done.
+CObject* player_body(PeerId id)
+{
+	if (!g_pGameLevel || !ai().get_alife() || g.world_seen != g_world_generation)
+		return nullptr;
+	if (id == kHostPeer)
+		return g_actor ? Actor() : nullptr;
+	const u16 proxy = proxy_of_peer(id);
+	if (sync::host_peer_joining(id) || !host_player_in_world(proxy))
+		return nullptr;
+	return Level().Objects.net_Find(proxy);
+}
+} // namespace
+
+// Host: a player's TransitionVote, the host player's over the local link included (F3a T8: one rule for all,
+// transition::apply_vote). Ready at an exit (checked: an exit of this level, the player is in the world and within
 // kVoteReachM of it), Ready without an exit (a yes to the host's guide trip), Cancel.
 void host_on_transition_vote(PeerId from, Reader& r)
 {
@@ -1943,71 +2515,73 @@ void host_on_transition_vote(PeerId from, Reader& r)
 			::Msg("! [coop] a malformed TransitionVote from #%u: ignored", from);
 		return;
 	}
-	const PeerInfo* p = mgr().session().peer(from);
-	const char* nick = p ? p->nick.c_str() : "?";
-	if (v.op == transition::VoteCancel)
-	{
-		if (g.board.release(from))
-		{
-			g.board_ticked = 0; // the board runs on the next frame
-			::Msg("[coop] transition: '%s' is not ready any more", nick);
-		}
-		return;
-	}
-	if (!g_pGameLevel || !ai().get_alife())
-		return;
-	// T12 review (Ruling 18): only a player who is in the world claims, and only at that exit.
-	const u16 proxy = proxy_of_peer(from);
-	const bool in_world = !sync::host_peer_joining(from) && host_player_in_world(proxy);
-	CObject* body = in_world ? Level().Objects.net_Find(proxy) : nullptr;
-	if (!body)
-	{
-		if (++g.votes_refused <= kRefusalsLogged)
-			::Msg("! [coop] '%s' says he is ready at level exit %u but is not in the world: ignored", nick, v.changer);
-		return;
-	}
+	const std::string nick = nick_of_peer(from);
 	const u64 now = mgr().now_ms();
-	if (v.changer == transition::kNoChanger)
+	transition::VoteFacts f;
+	if (v.op == transition::VoteReady)
 	{
-		uint32_t goal = 0;
-		if (!g.guide.set || !g.board.claimed(0, &goal) || !transition::is_guide(goal))
-		{
-			if (++g.votes_refused <= kRefusalsLogged)
-				::Msg("! [coop] '%s' says yes to a guide trip but there is none: ignored", nick);
+		if (!g_pGameLevel || !ai().get_alife())
 			return;
+		if (g.released_at != 0 && now - g.released_at < kAfterReleaseMs)
+			return; // the group is on its way, the old world is about to go: no new claim in it
+		// T12 review (Ruling 18): only a player who is in the world claims, and only at that exit (R2 I3: a level changer of
+		// the host's own level)
+		const CObject* body = player_body(from);
+		f.in_world = body != nullptr;
+		if (v.changer != transition::kNoChanger)
+		{
+			const CSE_ALifeLevelChanger* lc = level_changer_here(v.changer);
+			f.exit_known = lc != nullptr;
+			if (lc && body)
+				f.dist = distance_to_exit(*lc, body->Position());
 		}
-		g.board.claim(from, transition::kGuideGoal, now);
+		uint32_t starter = 0;
+		f.guide_running = g.guide.set && g.board.claimed(0, &starter) && transition::is_guide(starter);
+		// f.other_map stays off: one map for everybody until split levels run (F3a T10)
+	}
+	switch (transition::apply_vote(g.board, from, v, f, now))
+	{
+	case transition::Verdict::Released:
+		g.board_ticked = 0; // the board runs on the next frame
+		::Msg("[coop] transition: '%s' is not ready any more", nick.c_str());
+		break;
+	case transition::Verdict::Nothing:
+		break;
+	case transition::Verdict::Claimed:
 		g.board_ticked = 0;
-		return;
-	}
-	// R2 I3: the client names a level exit; the host goes only through a level changer of its own level.
-	const CSE_ALifeLevelChanger* lc = level_changer_here(v.changer);
-	if (!lc)
-	{
+		if (v.changer != transition::kNoChanger)
+			::Msg("[coop] transition: '%s' is ready at level exit %u (%.1f m)", nick.c_str(), v.changer, f.dist);
+		break;
+	case transition::Verdict::Refreshed:
+		g.board_ticked = 0;
+		break;
+	case transition::Verdict::NotInWorld:
 		if (++g.votes_refused <= kRefusalsLogged)
-			::Msg("! [coop] '%s' says he is ready at object %u, which is no level exit here: ignored", nick, v.changer);
-		return;
-	}
-	const float away = distance_to_exit(*lc, body->Position());
-	if (!(away <= kVoteReachM))
-	{
+			::Msg("! [coop] '%s' says he is ready at level exit %u but is not in the world: ignored", nick.c_str(),
+			    v.changer);
+		break;
+	case transition::Verdict::NoExit:
 		if (++g.votes_refused <= kRefusalsLogged)
-			::Msg("! [coop] '%s' says he is ready at level exit %u from %.1f m away (at most %.0f m): ignored", nick,
-			    v.changer, away, kVoteReachM);
-		return;
+			::Msg("! [coop] '%s' says he is ready at object %u, which is no level exit here: ignored", nick.c_str(),
+			    v.changer);
+		break;
+	case transition::Verdict::TooFar:
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' says he is ready at level exit %u from %.1f m away (at most %.0f m): ignored", nick.c_str(),
+			    v.changer, f.dist, kVoteReachM);
+		break;
+	case transition::Verdict::NoGuide:
+		if (++g.votes_refused <= kRefusalsLogged)
+			::Msg("! [coop] '%s' says yes to a guide trip but there is none: ignored", nick.c_str());
+		break;
 	}
-	uint32_t before = 0;
-	const bool was = g.board.claimed(from, &before) && before == transition::goal_of_exit(v.changer);
-	g.board.claim(from, transition::goal_of_exit(v.changer), now);
-	g.board_ticked = 0;
-	if (!was)
-		::Msg("[coop] transition: '%s' is ready at level exit %u (%.1f m)", nick, v.changer, away);
 }
 
-// Client: the host's board. The placard reads it (coop.transition()).
+// A player: the world server's board. The placard reads it (coop.transition()). F3a T8: a remote client gets it from his
+// session, the host player from the local link.
 void client_on_transition_state(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !mgr().active())
 		return;
 	transition::StateMsg m;
 	if (!m.read(r))
@@ -2022,6 +2596,77 @@ void client_on_transition_state(PeerId from, Reader& r)
 		g.guide_yes = false;
 }
 
+// F3a T8, host: a player's loading screen of the simultaneous load is up (the host player's over the local link; his
+// readiness is the server's world as well, host_watch_world). It waits in the world gate while the server's world is not
+// up (coop_world_gate.h LoadReady = Hold) and runs when it is, in the same epoch.
+void host_on_load_ready(PeerId from, Reader& r)
+{
+	if (!mgr().is_host())
+		return;
+	levels::wire::LoadReadyMsg m;
+	if (!m.read(r))
+	{
+		if (++g.loads_ignored <= kRefusalsLogged)
+			::Msg("! [coop] load: a malformed LoadReady from #%u: ignored", from);
+		return;
+	}
+	if (!g.load.active() || m.epoch != g.load.epoch() || !g.load.is_mover(from))
+		return; // a repeat after his Enter, or of a load that is over: nothing to do
+	if (g.load.ready(from, m.epoch))
+		::Msg("[coop] load: '%s' is ready, %.1f s after the go", nick_of_peer(from).c_str(),
+		    float(mgr().now_ms() - g.load_go_at) / 1000.f);
+}
+
+// F3a T8, a player: the world server's word on the simultaneous load (a remote client from his session, the host player
+// from the local link).
+void client_on_load_wait(PeerId from, Reader& r)
+{
+	if (from != kHostPeer || !mgr().active())
+		return;
+	levels::wire::LoadWaitMsg m;
+	if (!m.read(r))
+	{
+		if (++g.load_waits_bad <= kRefusalsLogged)
+			::Msg("! [coop] load: an unreadable LoadWait from the host: ignored");
+		return;
+	}
+	const u64 now = mgr().now_ms();
+	switch (m.state)
+	{
+	case levels::wire::LoadWaitMsg::Prepared:
+		if (mgr().is_client())
+			client_prepared(m, now); // the save follows: this machine loads it
+		else if (g.screen.prepared(m.epoch, false, now)) // the host player: his process reloads by itself
+		{
+			g.screen_level = m.level;
+			::Msg("[coop] load: the group moves to '%s' (epoch %u): this screen waits for the others too",
+			    level_name_by_id(m.level).c_str(), m.epoch);
+		}
+		return;
+	case levels::wire::LoadWaitMsg::Waiting:
+	{
+		std::vector<std::pair<uint32_t, bool>> rows;
+		for (const levels::wire::LoadWaitMsg::Row& row : m.rows)
+			rows.emplace_back(row.peer, row.ready != 0);
+		g.screen.waiting(m.epoch, rows, now);
+		return;
+	}
+	case levels::wire::LoadWaitMsg::Enter:
+		if (g.screen.enter(m.epoch, now))
+			::Msg("[coop] load: Enter from the host, %.1f s after the go", float(now - g.screen.since) / 1000.f);
+		return;
+	case levels::wire::LoadWaitMsg::Cancel:
+		if (g.screen.cancel(m.epoch))
+		{
+			load_screen_line(false);
+			::Msg("[coop] load: the host called the simultaneous load of epoch %u off", m.epoch);
+		}
+		return;
+	default:
+		return;
+	}
+}
+
 // F3a T4: the one handler table split in two (Manager::install_handlers), registrations only
 void install_server(Session& s)
 {
@@ -2031,6 +2676,7 @@ void install_server(Session& s)
 	s.on(Msg::JoinRequest, &host_on_join_request);
 	s.on(Msg::CharChoice, &host_on_char_choice); // protocol 8
 	s.on(Msg::WorldLoaded, &host_on_world_loaded);
+	s.on(Msg::LoadReady, &host_on_load_ready); // F3a T8
 }
 
 void install_client(Endpoint& e)
@@ -2040,6 +2686,7 @@ void install_client(Endpoint& e)
 	e.on(Msg::JoinComplete, &client_on_join_complete);
 	e.on(Msg::SessionReset, &client_on_session_reset);
 	e.on(Msg::AvatarList, &client_on_avatar_list); // R3 В3
+	e.on(Msg::LoadWait, &client_on_load_wait); // F3a T8
 }
 
 bool host_can_start()
@@ -2075,8 +2722,13 @@ void on_world_created()
 	// is dropped from now on, and nothing of the new world goes to a client before its SessionReset.
 	if (mgr().is_host())
 	{
-		++g.epoch;
-		mgr().session().set_world_epoch(g.epoch);
+		if (g.load_world_pending)
+			g.load_world_pending = false; // F3a T8: the transition's world: its epoch was given at the go (host_prepare)
+		else
+		{
+			++g.epoch;
+			mgr().session().set_world_epoch(g.epoch);
+		}
 	}
 }
 
@@ -2118,12 +2770,7 @@ bool transition_cancel()
 	g.guide_yes = false;
 	if (g.zone_in)
 		g.withdrawn_from = g.zone_changer; // no claim until he leaves this zone
-	if (mgr().is_host())
-	{
-		g.board.release(0);
-		g.board_ticked = 0;
-	}
-	g.intent.reset(); // the cancel goes out at the next frame
+	g.intent.reset(); // the cancel goes out at the next frame (F3a T8: the host player's over the local link too)
 	return true;
 }
 
@@ -2172,6 +2819,7 @@ bool host_gate_level_change(NET_Packet& P)
 	g.guide.set = true;
 	g.board.start_guide(0, now);
 	g.board_ticked = 0;
+	g.guide_yes = true; // F3a T8: the host player asked for it: his votes over the local link keep his yes (transition_step)
 	::Msg("[coop] transition: the host's game asks to go to '%s' (a guide trip): the group waits for everybody's yes",
 	    g.guide.level.c_str());
 	return true;
@@ -2202,6 +2850,7 @@ bool host_rejoin_peer(PeerId peer, const char* why)
 	auto it = g.peers.find(peer);
 	if (it == g.peers.end())
 		return false; // no join of his reached this world: there is nothing to do again
+	host_load_forget(peer, "he joins again"); // F3a T8
 	g.gate.forget(peer);
 	g.precache_wait.erase(std::remove(g.precache_wait.begin(), g.precache_wait.end(), peer), g.precache_wait.end());
 	g.choosers.forget(peer);
@@ -2271,6 +2920,7 @@ void on_peer_left(PeerId id)
 	g.choosers.forget(id); // protocol 8: he left while choosing his character
 	g.board.forget(id); // nobody of his stands at an exit any more
 	g.board_ticked = 0;
+	host_load_forget(id, "he left"); // F3a T8: the simultaneous load does not wait for him
 	auto it = g.peers.find(id);
 	if (it == g.peers.end())
 		return;
@@ -2315,6 +2965,7 @@ bool is_proxy(u16 id)
 void on_welcome(const WelcomeMsg&)
 {
 	transition_world_replaced(); // a new session: no board of an earlier one
+	load_screen_off(); // F3a T8: nor a loading screen of an earlier one
 	g.my_proxy = kNoId;
 	g.load_issued = false;
 	g.char_step = State::CharStep::None;
@@ -2346,6 +2997,7 @@ void on_session_lost(const char*)
 	xr_vector<u16> proxies;
 	for (const auto& it : g.peers)
 		proxies.push_back(it.second.proxy);
+	load_screen_line(false); // F3a T8: a held loading screen's line goes with the session
 	g = State();
 	for (u16 proxy : proxies)
 		take_offline(proxy);
@@ -2353,9 +3005,11 @@ void on_session_lost(const char*)
 
 void on_blob_progress(PeerId, u32, u32 kind, u64 done, u64 total)
 {
-	if (kind != BlobWorldSave)
+	if (kind != BlobWorldSave && kind != BlobPreparedSave)
 		return;
 	const u64 now = mgr().now_ms();
+	if (kind == BlobPreparedSave)
+		g.screen.progress(now); // F3a T8: the save of the transition still comes
 	if (now - g.last_progress_log < 500 && done != total)
 		return;
 	g.last_progress_log = now;
@@ -2364,7 +3018,24 @@ void on_blob_progress(PeerId, u32, u32 kind, u64 done, u64 total)
 
 void on_blob_complete(PeerId from, u32, u32 kind, std::vector<u8>& data)
 {
-	if (kind != BlobWorldSave || from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !mgr().is_client())
+		return;
+	if (kind == BlobPreparedSave)
+	{
+		// F3a T8: the save of the simultaneous load (LoadWait Prepared came first; the session dropped one of another epoch)
+		if (g.screen.stage != transition::Load::Waiting || mgr().phase() != Phase::ReceivingWorld || g.load_issued)
+		{
+			::Msg("! [coop] load: the save of a transition arrived while none was awaited (%s): ignored",
+			    phase_name(mgr().phase()));
+			return;
+		}
+		g.screen.loading();
+		::Msg("[coop] load: the save came %.1f s after the go (%u KB), loading it",
+		    float(mgr().now_ms() - g.screen.since) / 1000.f, u32(data.size() / 1024));
+		client_load_world(data);
+		return;
+	}
+	if (kind != BlobWorldSave)
 		return;
 	// R2 I1: only the world we asked for and are waiting for (the session already dropped saves of another epoch).
 	if (mgr().phase() != Phase::ReceivingWorld || g.load_issued)
@@ -2392,8 +3063,25 @@ void host_watch_world()
 		g.choosers.world_replaced(); // protocol 8: a player choosing is asked again after his SessionReset
 		transition_world_replaced(); // a wait at an exit of the old world means nothing here
 		g.reset_pending = true;
+		// F3a T8: the world of a simultaneous load (the epoch given at the go, kept by on_world_created) keeps its movers;
+		// any other world (a load meanwhile) calls that load off
+		const bool prepared_world = g.load.active() && g.load.epoch() == g.epoch;
+		if (g.load.active() && !prepared_world)
+			host_load_void("another world was loaded");
 		for (auto& it : g.peers)
 		{
+			if (prepared_world && it.second.prepared)
+			{
+				// He loads this very save: his character has the same id here. What the old world left queued for him is
+				// older than his save; what this one does from now on waits for his WorldLoaded (host_end_join flushes it):
+				// the objects this world brings online after the save are among it.
+				it.second.loading = true;
+				it.second.sent_at = 0;
+				net::host_drop(it.first);
+				sync::host_begin_join(it.first);
+				continue;
+			}
+			it.second.prepared = false;
 			it.second.loading = true;
 			it.second.sent_at = 0; // review R2 C1: the join timer restarts at SessionReset, not at the first join
 			it.second.proxy = kNoId; // an id of the old world: set again by their JoinRequest
@@ -2412,14 +3100,32 @@ void host_watch_world()
 	w.str("the host loaded a save or changed level");
 	w.u32(g.epoch); // R2 I1: the client's session tells it back before its JoinRequest
 	const u64 now = mgr().now_ms();
+	u32 resets = 0, movers = 0;
 	for (const PeerInfo& p : mgr().session().peers())
 	{
-		mgr().session().send(p.id, Lane::Reliable, Msg::SessionReset, w);
 		auto it = g.peers.find(p.id);
+		if (it != g.peers.end() && it->second.prepared)
+		{
+			// F3a T8: no SessionReset for a mover: his world is this one already (the transition's save)
+			world::host_mark_proxy(it->second.proxy, p.id);
+			syncapi::host_send_full(p.id); // his coop.sync copy, as at a join (LoadWait Prepared reset his)
+			it->second.sent_at = now; // his load into this world is what the join's time limit measures
+			++movers;
+			continue;
+		}
+		mgr().session().send(p.id, Lane::Reliable, Msg::SessionReset, w);
 		if (it != g.peers.end())
 			it->second.sent_at = now; // the rejoin into the new world is what the timeout measures
+		++resets;
 	}
-	::Msg("[coop] world replaced (epoch %u): %u player(s) rejoin", g.epoch, (u32)mgr().session().peers().size());
+	if (g.load.active())
+	{
+		g.load.world_up(now); // the host player is ready with it; the others' minute starts now
+		g.load_up_at = now;
+		::Msg("[coop] load: the host's world is up %.1f s after the go; %u player(s) loaded it with the host",
+		    float(now - g.load_go_at) / 1000.f, movers);
+	}
+	::Msg("[coop] world replaced (epoch %u): %u player(s) rejoin", g.epoch, resets);
 }
 
 constexpr u64 kJoinTimeoutMs = 5 * 60 * 1000; // R-2.3: a join is limited in time
@@ -2455,8 +3161,10 @@ void frame()
 	if (mgr().is_host())
 	{
 		host_watch_world();
-		transition_step(mgr().now_ms()); // the host's own zone, his hold at the edge, the placard's numbers
+		transition_step(mgr().now_ms()); // the host player's zone and vote, his hold at the edge, the placard's numbers
+		player_load_step(mgr().now_ms()); // F3a T8: the host player's loading screen
 		host_board_step(mgr().now_ms());
+		host_load_step(mgr().now_ms()); // F3a T8: the barrier of a simultaneous load
 		host_watch_joins();
 		host_due_joins();
 		return;
@@ -2477,14 +3185,15 @@ void frame()
 		return; // the window is gone (stopped above)
 	if (mgr().is_live_client())
 		transition_step(mgr().now_ms()); // his zone, his hold at the edge of the level, the placard's numbers
-	if (mgr().phase() != Phase::LoadingWorld || !g.swap_done)
+	player_load_step(mgr().now_ms()); // F3a T8: LoadReady, the held screen, Enter (live comes with it)
+	if (!mgr().active() || mgr().phase() != Phase::LoadingWorld || !g.swap_done)
 		return;
 	// Level is up and the local actor exists: tell the host.
 	if (!g_pGameLevel || !Level().game || !g_actor || Device.dwPrecacheFrame)
 		return;
-	mgr().set_phase(Phase::Live);
-	mgr().session().send(kHostPeer, Lane::Reliable, Msg::WorldLoaded, Writer());
-	sync::on_client_live();
+	if (g.screen.stage != transition::Load::None)
+		return; // F3a T8: a simultaneous load: this player goes live with the host's Enter (player_load_step)
+	client_go_live();
 }
 
 void print_status()
@@ -2503,13 +3212,26 @@ void print_status()
 		::Msg("[coop]   new characters before the world (protocol 8): %u made, %u choosing now, %u choice(s) refused, "
 		      "%u ignored",
 		    g.characters_made, u32(g.choosers.count()), g.choices_refused, g.choices_ignored);
-		if (g.view.state != transition::State::Idle)
-			::Msg("[coop]   transition: %s at %s (exit %u), %u of %u ready%s", g.view.state == transition::State::Counting ? "counting down" : "waiting",
-			    g.view.level.c_str(), u32(g.view.changer), u32(g.view.ready), u32(g.view.total),
-			    g.view.kind == 1 ? " (a guide trip)" : "");
+		const transition::StateMsg& b = g.board_view;
+		if (b.state != transition::State::Idle)
+			::Msg("[coop]   transition: %s at %s (exit %u), %u of %u ready%s", b.state == transition::State::Counting ? "counting down" : "waiting",
+			    b.level.c_str(), u32(b.changer), u32(b.ready), u32(b.total), b.kind == 1 ? " (a guide trip)" : "");
+		// F3a T8: the simultaneous load of the group's transition
+		if (g.load.active())
+		{
+			std::string rows;
+			for (const auto& row : g.load.rows())
+			{
+				rows += rows.empty() ? "" : ", ";
+				rows += nick_of_peer(row.first) + (g.load.entered(row.first) ? " in" : (row.second ? " ready" : " loading"));
+			}
+			::Msg("[coop]   load: epoch %u to '%s', %s, %.1f s since the go: %s", g.load.epoch(),
+			    level_name_by_id(g.load_level).c_str(), g.load.world_is_up() ? "the host's world is up" : "the host is loading",
+			    float(mgr().now_ms() - g.load_go_at) / 1000.f, rows.c_str());
+		}
 		for (const auto& it : g.peers)
-			::Msg("[coop]   peer #%u proxy %u%s%s", it.first, it.second.proxy, it.second.loading ? " (loading)" : "",
-			    g.gate.waiting(it.first) ? " (join waits for its turn)" : "");
+			::Msg("[coop]   peer #%u proxy %u%s%s%s", it.first, it.second.proxy, it.second.loading ? " (loading)" : "",
+			    it.second.prepared ? " (simultaneous load)" : "", g.gate.waiting(it.first) ? " (join waits for its turn)" : "");
 	}
 	else if (mgr().is_client())
 	{
@@ -2520,6 +3242,13 @@ void print_status()
 		if (g.char_step != State::CharStep::None)
 			::Msg("[coop]   new character: %s", g.char_step == State::CharStep::Sent ? "chosen, waiting for the world"
 			                                                                       : "choosing (window)");
+	}
+	// F3a T8: this player's screen of a simultaneous load (a client, or the host player)
+	if (mgr().active() && g.screen.stage != transition::Load::None)
+	{
+		static const char* const kStage[] = {"none", "the save comes", "loading", "held, waiting for the others", "entering"};
+		::Msg("[coop]   load screen: epoch %u to '%s', %s, %u still waited for", g.screen.epoch,
+		    level_name_by_id(g.screen_level).c_str(), kStage[size_t(g.screen.stage)], u32(g.screen.waiting_for.size()));
 	}
 }
 
@@ -2607,4 +3336,6 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	world::client_mark_host_avatar(g.my_proxy);
 }
 } // namespace join
+
+bool hold_loading_screen() { return mgr().active() && join::g.screen.holds(); }
 } // namespace coop

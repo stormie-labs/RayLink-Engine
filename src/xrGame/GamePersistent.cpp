@@ -1,6 +1,7 @@
 #include "pch_script.h"
 #include "gamepersistent.h"
 #include "coop/coop_manager.h"
+#include "coop/coop_join.h" // Anomaly Coop F3a: hold_loading_screen
 #include "../xrEngine/fmesh.h"
 #include "../xrEngine/xr_ioconsole.h"
 #include "../xrEngine/gamemtllib.h"
@@ -569,6 +570,7 @@ namespace crash_saving {
 
 void CGamePersistent::game_loaded()
 {
+	if (coop::hold_loading_screen()) return; // Anomaly Coop F3a: a group's loading screens come off together (LoadWait Enter)
 	if (Device.dwPrecacheFrame <= 2)
 	{
 		if (g_pGameLevel &&
