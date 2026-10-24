@@ -39,6 +39,7 @@
 #include "xrServer_Objects_ALife_Items.h"
 #include "../xrServerEntities/xrMessages.h"
 
+#include <atomic>
 #include <cmath>
 #include <set>
 #include <string>
@@ -228,7 +229,6 @@ void load_settings()
 		v.combat_radius = read_radius("combat_radius", v.combat_radius);
 		v.tent_rest_radius = read_radius("tent_rest_radius", v.tent_rest_radius);
 		v.tent_claim_radius = read_radius("tent_claim_radius", v.tent_claim_radius);
-		v.tent_claim_ms = read_period("tent_claim_ms", v.tent_claim_ms, checkpoint::kMinClaimMs); // R1 M-11
 		if (pSettings->line_exist(kSection, "tent_sections"))
 		{
 			LPCSTR list = pSettings->r_string(kSection, "tent_sections");
@@ -271,9 +271,9 @@ void load_settings()
 	read_item_lists();
 
 	::Msg("[coop] checkpoint sources: campfire %.1f m / %u ms, fight %.1f m, tents %u section(s) (rest %.1f m, claim "
-	      "%.1f m / %u ms), a client gets [%s] / [%s] for %u / %u item kind(s), %u rest zone name(s)",
+	      "%.1f m), a player gets [%s] / [%s] for %u / %u item kind(s), %u rest zone name(s)",
 	    v.campfire_radius, v.campfire_dwell_ms, v.combat_radius, u32(v.tent_sections.size()), v.tent_rest_radius,
-	    v.tent_claim_radius, v.tent_claim_ms, v.tent_section.c_str(), v.sleepbag_section.c_str(),
+	    v.tent_claim_radius, v.tent_section.c_str(), v.sleepbag_section.c_str(),
 	    u32(g_set.tent_items.size()), u32(g_set.sleepbag_items.size()), u32(g_set.rest_names.size()));
 }
 
@@ -327,12 +327,13 @@ struct Client
 	bool sent_any = false;
 	u64 last_ms = 0;
 	// F3a T7: the host player's claim waits here for the main thread's frame (Lua may claim from the game thread; the
-	// internal channel is the main thread's), then goes over the link like a client's (player_frame)
-	bool queued = false;
+	// internal channel is the main thread's), then goes over the link like a client's (player_frame). R1: written before
+	// g_claim_queued says it is there.
 	ClaimWhat queued_what = ClaimWhat::Tent;
 	float queued_pos[3] = {0, 0, 0};
 };
 Client g_client;
+std::atomic<bool> g_claim_queued{false}; // F3a T7 R1: set after the claim's data (release), taken by player_frame (acquire)
 
 constexpr size_t kRefusals = size_t(Refusal::Failed) + 1;
 
@@ -829,9 +830,10 @@ void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& p
 }
 
 // Ruling F3-8: a player packs up his own tent or sleeping bag at the spot: the host releases it and gives back the very
-// item it took for it; the checkpoint on it rolls back as with stock. F3a T7: the host player's too. A tent of his that
-// the stock put up before (his claim named it: owner kHostOwner, no item on the mark) gives back the stock item of its
-// kind, as the stock tent bag and compression bag do.
+// item it took for it; the checkpoint on it rolls back as with stock. F3a T7: the host player's too. R1: which tents are
+// his is checkpoint::may_pack - for the host player also every tent nobody owns (the stock put those up for him, in
+// single player or before a claim named them: no mark, or a mark without an item); such a tent gives back the stock
+// item of its kind, as the stock tent bag and compression bag do.
 void pack_for(u16 character, const Fvector& pos)
 {
 	const std::string key = key_of(character);
@@ -841,7 +843,7 @@ void pack_for(u16 character, const Fvector& pos)
 	double best = double(g_set.v.tent_claim_radius) * double(g_set.v.tent_claim_radius);
 	for (u16 id : g.book.known())
 	{
-		if (g.book.owner_of(id) != key)
+		if (!checkpoint::may_pack(key, g.book.owner_of(id)))
 			continue;
 		const CGameObject* t = object_here(id);
 		if (!t)
@@ -859,13 +861,13 @@ void pack_for(u16 character, const Fvector& pos)
 		return refuse(character, ClaimWhat::Pack, Refusal::Far); // none of his within reach of the spot
 	checkpoint::TentMark mark;
 	const bool marked = read_mark(tent, mark);
-	if (marked && mark.item.empty() && key == checkpoint::kHostOwner)
+	if (key == checkpoint::kHostOwner && (!marked || mark.item.empty()))
 	{
 		const CGameObject* t = object_here(tent);
 		const bool bag = t && what_of(t->cNameSect()) == u8(ClaimWhat::Sleepbag);
 		mark.item = bag ? g_set.sleepbag_items.front() : g_set.tent_items.front(); // read_item_lists: never empty
 	}
-	if (!marked || mark.item.empty() || !give_item(mark.item, character))
+	if (mark.item.empty() || !give_item(mark.item, character))
 	{
 		::Msg("! [coop] checkpoint sources: tent %u of character %u not packed up: %s", tent, character,
 		    mark.item.empty() ? "nothing to give back for it" : "the item could not be given");
@@ -948,9 +950,8 @@ void host_frame(u64 now_ms)
 
 void player_frame()
 {
-	if (!g_client.queued)
+	if (!g_claim_queued.exchange(false, std::memory_order_acquire))
 		return;
-	g_client.queued = false;
 	if (!mgr().is_host())
 		return; // the session ended or turned: the claim has nobody to go to
 	Writer w;
@@ -962,6 +963,7 @@ void reset()
 {
 	g = State();
 	g_set = Settings(); // read again at the next session (a mod pack may have changed the ltx)
+	g_claim_queued.store(false, std::memory_order_relaxed);
 	g_client = Client();
 	g_stat = Stats();
 }
@@ -971,11 +973,10 @@ void print_status()
 	if (mgr().is_host())
 	{
 		const checkpoint::SourceSettings& v = settings();
-		::Msg("[coop]   checkpoint sources: campfire %.1f m / %u ms, fight %.1f m, tent rest %.1f m, claim %.1f m / %u "
-		      "ms, %u tent section(s), clients get [%s] / [%s], %u rest name(s)",
+		::Msg("[coop]   checkpoint sources: campfire %.1f m / %u ms, fight %.1f m, tent rest %.1f m, claim %.1f m, %u "
+		      "tent section(s), players get [%s] / [%s], %u rest name(s)",
 		    v.campfire_radius, v.campfire_dwell_ms, v.combat_radius, v.tent_rest_radius, v.tent_claim_radius,
-		    v.tent_claim_ms, u32(v.tent_sections.size()), v.tent_section.c_str(), v.sleepbag_section.c_str(),
-		    u32(g_set.rest_names.size()));
+		    u32(v.tent_sections.size()), v.tent_section.c_str(), v.sleepbag_section.c_str(), u32(g_set.rest_names.size()));
 		::Msg("[coop]   checkpoint sources: world %s (epoch %u), %u campfire(s), %u tent(s) here, %u known, %u "
 		      "owned, %u mod source(s), %u rest zone(s), %u player(s) timed",
 		    g.world ? "served" : "none", g.epoch, u32(g.campfires.size()), u32(g.tents.size()), u32(g.book.tents()),
@@ -1155,11 +1156,12 @@ bool claim_tent(ClaimWhat what, const Fvector& pos)
 	to_array(pos, p);
 	if (mgr().is_host())
 	{
-		// F3a T7: the host player claims like a client, over the internal channel from the next frame (player_frame)
-		g_client.queued = true;
+		// F3a T7: the host player claims like a client, over the internal channel from the next frame (player_frame).
+		// R1: the data first, then the flag.
 		g_client.queued_what = what;
 		for (int i = 0; i < 3; ++i)
 			g_client.queued_pos[i] = p[i];
+		g_claim_queued.store(true, std::memory_order_release);
 	}
 	else
 	{

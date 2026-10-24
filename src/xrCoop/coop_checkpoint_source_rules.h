@@ -2,7 +2,7 @@
 // settings of mod_system_coop_checkpoints.ltx and their bounds, the CheckpointClaim message, the nearest source a
 // player stands at, the objects mods declare as camps, the mark a tent carries in its custom data (whose it is and
 // the item it was made from), the item a tent is paid with, the sections behind the ids of sources and the book of
-// tents (who owns which one, and the claims that wait for a tent). The engine side is
+// tents (who owns which one, who may pack which one up). The engine side is
 // xrGame/coop/coop_checkpoint_sources.cpp.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
@@ -31,7 +31,7 @@ constexpr float kMaxSourceRadius = 500.0f;
 // A period of a source: 0..kMaxSourcePeriodMs (10 minutes).
 constexpr uint32_t kMaxSourcePeriodMs = 600000;
 // R1 M-11: a claim waits at least this long — the host's scan runs once a second and the stock tent animation takes
-// 4 s, so a shorter wait never finds the tent.
+// 4 s, so a shorter wait never finds the tent. F3a T7 R1: LEGACY with tent_claim_ms (no claim waits any more).
 constexpr uint32_t kMinClaimMs = 5000;
 // tent_sections keeps at most this many names; a name is 1..64 characters of [A-Za-z0-9_].
 constexpr size_t kMaxTentSections = 16;
@@ -47,7 +47,9 @@ struct SourceSettings
 	std::string sleepbag_section = "ph_sleepbag";
 	float tent_rest_radius = 2.0f; // the own tent this close is a rest place
 	float tent_claim_radius = 4.0f; // a claimed spot: this close to the player, the tent this close to the spot
-	uint32_t tent_claim_ms = 15000; // a claim waits this long; the tent appeared at most this long before it
+	// LEGACY (F3a T7 R1): the host's own claim waited this long for the tent the stock put up. Every player's tent is put
+	// up by the host at once now (coop_checkpoint_sources place_for): neither read from the ltx nor used.
+	uint32_t tent_claim_ms = 15000;
 	std::string cover_list = "misc\\surge_manager.ltx"; // its [list]: the stock surge covers (rest places too)
 	// R1 I-1: its [tent_i_bag_sections] and [sleeping_bag_sections] (the stock TentBagSections / SleepBagSections):
 	// the items a client pays for a tent / a sleeping bag with.
@@ -56,7 +58,7 @@ struct SourceSettings
 
 inline bool radius_ok(float r) { return std::isfinite(r) && r > 0.0f && r <= kMaxSourceRadius; }
 inline bool period_ok(double ms) { return std::isfinite(ms) && ms >= 0.0 && ms <= double(kMaxSourcePeriodMs); }
-// tent_claim_ms: a whole number of ms in kMinClaimMs..kMaxSourcePeriodMs.
+// tent_claim_ms (LEGACY, see there): a whole number of ms in kMinClaimMs..kMaxSourcePeriodMs.
 inline bool claim_period_ok(double ms)
 {
 	return period_ok(ms) && ms >= double(kMinClaimMs) && ms == std::floor(ms);
@@ -144,8 +146,8 @@ private:
 
 // R1 I-2: whose a tent is and what it was made from lives on the tent itself, so it outlasts a load and a level change:
 // section [coop_tent] of its custom data, `owner` = the player key digest of the owner (ledger::character_key) or
-// kHostOwner, `item` = the item section the host took for it (given back when it is packed up; none for the host's own
-// tents, which the stock item_tent puts up and packs).
+// kHostOwner, `item` = the item section the host took for it (given back when it is packed up; none on the host's own
+// tents the stock item_tent put up before F3a T7 - they give back the stock item of their kind).
 constexpr const char* kTentIniSection = "coop_tent";
 constexpr const char* kTentIniOwner = "owner";
 constexpr const char* kTentIniItem = "item";
@@ -166,6 +168,15 @@ void tent_mark_to_ini(std::string& text, const TentMark& m);
 // The mark of a tent; false if it has no owner (or a malformed one). A malformed item reads as none.
 bool tent_mark_from_ini(const std::string& text, TentMark& out);
 
+// F3a T7 R1: may the player whose owner key is `key` pack up a tent whose owner (the book's, from its mark) is `owner`
+// (empty: nobody's)? His own tent, always. A tent nobody owns only the host player (kHostOwner): the stock put every
+// unmarked tent up for the host (in single player, or before a claim named it) - a client's tent always carries his mark
+// (Ruling F3-6). Another player's tent, never.
+inline bool may_pack(const std::string& key, const std::string& owner)
+{
+	return owner_key_ok(key) && (owner == key || (owner.empty() && key == kHostOwner));
+}
+
 // ---------------------------------------------------------------- the item a tent is paid with (R1 I-1)
 
 struct ItemSeen
@@ -180,7 +191,6 @@ uint16_t pick_item(const std::vector<ItemSeen>& items, const std::vector<std::st
 // ---------------------------------------------------------------- tents
 
 constexpr size_t kMaxTents = 1024; // tents (and their owners) the host keeps track of; more are not kept
-constexpr size_t kMaxClaims = 64; // claims waiting for a tent, one per character
 
 struct TentSeen
 {
@@ -189,28 +199,13 @@ struct TentSeen
 	uint8_t what = 0; // ClaimWhat of its section (tent_section / sleepbag_section); 0: another tent section, either
 };
 
-struct TentMatch
-{
-	uint16_t character = 0xffff;
-	uint16_t tent = kNoSource;
-	ClaimWhat what = ClaimWhat::Tent;
-};
-
-// A claim that ended without a tent.
-struct ClaimEnd
-{
-	uint16_t character = 0xffff;
-	ClaimWhat what = ClaimWhat::Tent;
-};
-
-// What the host knows of the tents of a world: when each one appeared on the level, whose it is (by owner key: the
-// engine fills it from the tents' marks), and the claims ("I put up a tent here") that wait for one. A claim is closed
-// by the nearest tent of its kind within reach of the claimed spot that nobody owns and that appeared at most
-// `fresh_ms` before the claim (or after it); tents that stood when the world was served are never new.
+// What the host knows of the tents of a world: when each one appeared on the level and whose it is (by owner key: the
+// engine fills it from the tents' marks). F3a T7 R1: the claims that waited for a tent the stock put up (the host's own,
+// before F3a T7) are gone - the host puts every player's tent up at once.
 class TentBook
 {
 public:
-	// A newly served world: tents, owners and claims are forgotten, and every tent the next observe() sees is old.
+	// A newly served world: tents and owners are forgotten, and every tent the next observe() sees is old.
 	void new_world();
 	// The tents of tent_sections now on the level. A tent not known yet appeared at `now_ms` (old on the first call
 	// after new_world()). False if some were not kept (kMaxTents).
@@ -223,23 +218,10 @@ public:
 	size_t owned_by(const std::string& key) const;
 	// R1 I-2: one more tent for this key keeps it within `max` (tents and sleeping bags together).
 	bool may_place(const std::string& key, size_t max) const;
-	// A claim of `character` (owner key `key`) for a tent of `what` at `pos`, open for `ttl_ms`; a newer one of the
-	// same character replaces his older one. False for a key that is not owner_key_ok, Pack, a position that is not one, or
-	// when kMaxClaims other characters have one.
-	bool claim(uint16_t character, const std::string& key, ClaimWhat what, const float pos[3], uint64_t now_ms,
-		uint32_t ttl_ms);
-	bool has_claim(uint16_t character) const;
-	// Closes the claims these tents answer, oldest claim first (see the class); the tent becomes the claimant's.
-	std::vector<TentMatch> match(const std::vector<TentSeen>& tents, float radius, uint32_t fresh_ms);
-	// Drops the claims whose time is up.
-	std::vector<ClaimEnd> expire(uint64_t now_ms);
-	// Drops the claims of characters not in `present` (their players left the world).
-	std::vector<ClaimEnd> keep_claims_of(const std::set<uint16_t>& present);
 	// Every tent known (for the check that it still exists).
 	std::vector<uint16_t> known() const;
 	size_t tents() const { return m_tents.size(); }
 	size_t owners() const { return m_owner.size(); }
-	size_t claims() const { return m_claims.size(); }
 
 private:
 	struct Tent
@@ -247,18 +229,8 @@ private:
 		uint64_t first_seen = 0;
 		bool old = false; // stood when the world was served
 	};
-	struct Claim
-	{
-		uint16_t character = 0xffff;
-		std::string key;
-		ClaimWhat what = ClaimWhat::Tent;
-		float pos[3] = {0, 0, 0};
-		uint64_t at = 0;
-		uint64_t deadline = 0;
-	};
 	std::map<uint16_t, Tent> m_tents;
 	std::map<uint16_t, std::string> m_owner; // tent -> owner key
-	std::vector<Claim> m_claims; // in the order they came
 	bool m_first = true; // the next observe() is the first of this world
 };
 
@@ -447,7 +419,6 @@ inline void TentBook::new_world()
 {
 	m_tents.clear();
 	m_owner.clear();
-	m_claims.clear();
 	m_first = true;
 }
 
@@ -512,118 +483,6 @@ inline size_t TentBook::owned_by(const std::string& key) const
 inline bool TentBook::may_place(const std::string& key, size_t max) const
 {
 	return owner_key_ok(key) && owned_by(key) < max;
-}
-
-inline bool TentBook::claim(uint16_t character, const std::string& key, ClaimWhat what, const float pos[3],
-	uint64_t now_ms, uint32_t ttl_ms)
-{
-	if (!owner_key_ok(key) || what == ClaimWhat::Pack || !detail::pos_ok(pos))
-		return false;
-	bool had = false;
-	for (auto it = m_claims.begin(); it != m_claims.end(); ++it)
-		if (it->character == character)
-		{
-			m_claims.erase(it); // the newer claim goes to the end: claims stay in the order they came
-			had = true;
-			break;
-		}
-	if (!had && m_claims.size() >= kMaxClaims)
-		return false;
-	Claim c;
-	c.character = character;
-	c.key = key;
-	c.what = what;
-	for (int i = 0; i < 3; ++i)
-		c.pos[i] = pos[i];
-	c.at = now_ms;
-	c.deadline = now_ms + ttl_ms;
-	m_claims.push_back(c);
-	return true;
-}
-
-inline bool TentBook::has_claim(uint16_t character) const
-{
-	for (const Claim& c : m_claims)
-		if (c.character == character)
-			return true;
-	return false;
-}
-
-inline std::vector<TentMatch> TentBook::match(const std::vector<TentSeen>& tents, float radius, uint32_t fresh_ms)
-{
-	std::vector<TentMatch> out;
-	if (!radius_ok(radius))
-		return out;
-	const double r2 = double(radius) * double(radius);
-	for (auto c = m_claims.begin(); c != m_claims.end();)
-	{
-		const TentSeen* best = nullptr;
-		double best_d2 = 0.0;
-		for (const TentSeen& t : tents)
-		{
-			const auto it = m_tents.find(t.id);
-			if (it == m_tents.end() || it->second.old || m_owner.count(t.id))
-				continue; // not observed, stood when the world was served, or somebody's
-			if (t.what != 0 && t.what != static_cast<uint8_t>(c->what))
-				continue; // a sleeping bag is no answer to a tent claim, and the other way round
-			if (it->second.first_seen + fresh_ms < c->at)
-				continue; // put up too long before the claim
-			const double d2 = detail::dist2(t.pos, c->pos);
-			if (!(d2 <= r2))
-				continue;
-			if (!best || d2 < best_d2 || (d2 == best_d2 && t.id < best->id))
-			{
-				best = &t;
-				best_d2 = d2;
-			}
-		}
-		if (best && set_owner(best->id, c->key))
-		{
-			TentMatch m;
-			m.character = c->character;
-			m.tent = best->id;
-			m.what = c->what;
-			out.push_back(m);
-			c = m_claims.erase(c);
-		}
-		else
-			++c;
-	}
-	return out;
-}
-
-inline std::vector<ClaimEnd> TentBook::expire(uint64_t now_ms)
-{
-	std::vector<ClaimEnd> out;
-	for (auto c = m_claims.begin(); c != m_claims.end();)
-		if (now_ms >= c->deadline)
-		{
-			ClaimEnd e;
-			e.character = c->character;
-			e.what = c->what;
-			out.push_back(e);
-			c = m_claims.erase(c);
-		}
-		else
-			++c;
-	return out;
-}
-
-inline std::vector<ClaimEnd> TentBook::keep_claims_of(const std::set<uint16_t>& present)
-{
-	std::vector<ClaimEnd> out;
-	for (auto c = m_claims.begin(); c != m_claims.end();)
-		if (!present.count(c->character))
-		{
-			ClaimEnd e;
-			e.character = c->character;
-			e.what = c->what;
-			out.push_back(e);
-			c = m_claims.erase(c);
-		}
-		else
-			++c;
-	return out;
 }
 
 inline std::vector<uint16_t> TentBook::known() const

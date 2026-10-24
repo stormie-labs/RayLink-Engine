@@ -64,8 +64,8 @@ constexpr RateRule kClientRateRules[] = {
 	// world save. One per 2 s after a burst; a choice nobody asked for is ignored anyway (coop_join, newchar::Choosers).
 	{Msg::CharChoice, 4, 2000},
 	// F3: one per tent the player places (the stock use of a sleeping bag, an animation, then picking the tent up again
-	// before the next one); the host keeps each claim open 15 s (tent_claim_ms) to find the tent. One per 2 s after a
-	// burst.
+	// before the next one); the host answers each claim at once - it puts the tent up or packs it up (F3a T7: the host
+	// player's too, no claim waits for a tent any more). One per 2 s after a burst.
 	{Msg::CheckpointClaim, 4, 2000},
 	// F3: the player lies down at his rest spot or gets up (the doze window, any time); the plan's host limit is one
 	// per second. 4 covers a quick lie down / get up / lie down.

@@ -29,6 +29,7 @@
 #include "alife_time_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -53,16 +54,26 @@ constexpr size_t kRefusals = size_t(Refusal::Camp) + 1;
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
 
 // This machine's own word (lie down / get up). Lua may call coop.rest from anywhere, so the word is only recorded
-// here; frame() handles it (host) or sends it (client). The newest word wins: a lie-down and a get-up before the next
-// frame (or before the pacer lets one out) are a get-up. A word of an older world is dropped.
+// here; frame() sends it to the world server (F3a T7: the host player's over the internal channel). The newest word
+// wins: a lie-down and a get-up before the next frame (or before the pacer lets one out) are a get-up. A word of an
+// older world is dropped.
+// F3a T7 R1: the word is written first and g_pending_on says it is there after it (release / acquire): say() may run on
+// the game thread, player_frame on the main thread.
 struct Pending
 {
-	bool on = false;
 	Request rq;
 	u32 world = 0; // join::world_generation() when it was said
 	bool held = false; // client: the pacer held it back (counted once)
 };
 Pending g_pending;
+std::atomic<bool> g_pending_on{false};
+
+void drop_pending()
+{
+	g_pending_on.store(false, std::memory_order_relaxed);
+	g_pending = Pending();
+}
+
 limits::Pacer g_pacer; // client: RestRequest below the host's rate rule
 
 struct Host
@@ -421,8 +432,8 @@ void client_sync_world()
 		return;
 	g_mirror = Mirror();
 	g_mirror.world = gen;
-	if (g_pending.on && g_pending.world != gen)
-		g_pending = Pending();
+	if (g_pending_on.load(std::memory_order_acquire) && g_pending.world != gen)
+		drop_pending();
 }
 
 const Entry* mirror_find(u16 local_id)
@@ -491,14 +502,14 @@ bool player_live() { return mgr().is_host() || mgr().is_live_client(); }
 void player_frame()
 {
 	client_sync_world();
-	if (g_pending.on && player_live())
+	if (g_pending_on.load(std::memory_order_acquire) && player_live())
 	{
 		if (g_pacer.take(Msg::RestRequest, mgr().now_ms()))
 		{
 			Writer w;
 			write_request(w, g_pending.rq);
 			net::client_send(Msg::RestRequest, w);
-			g_pending = Pending();
+			drop_pending();
 			++g_stat.asked;
 		}
 		else if (!g_pending.held)
@@ -518,12 +529,12 @@ bool say(Op op, int hours, bool forced)
 	if (!mgr().is_host() && !mgr().is_live_client())
 		return false;
 	Pending p;
-	p.on = true;
 	p.rq.op = op;
 	p.rq.hours = op == Op::LieDown ? clamp_hours(hours) : u8(0);
 	p.rq.forced = op == Op::LieDown && forced;
 	p.world = join::world_generation();
-	g_pending = p;
+	g_pending = p; // the word first (R1), then the flag
+	g_pending_on.store(true, std::memory_order_release);
 	return true;
 }
 
@@ -688,7 +699,7 @@ void reset()
 	// and outside a session nothing is delivered): Lua reads state_of, which is "awake" now.
 	g_host = Host();
 	g_mirror = Mirror();
-	g_pending = Pending();
+	drop_pending();
 	g_pacer.reset();
 	g_told.clear();
 	g_stat = Stats();

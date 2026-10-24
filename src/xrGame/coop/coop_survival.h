@@ -141,8 +141,9 @@ xr_string nick_of(u16 host_id);
 // answer to a character goes to his peer (net::host_send: peer 0 over the link).
 u16 character_of_peer(PeerId peer); // 0xffff: no character of his in this world
 PeerId peer_of_character(u16 character); // kInvalidPeer: nobody plays it now
-// The player of `character` is in the served world: the host player while the host's level and actor are up, a client once
-// he has loaded it (join::host_player_in_world).
+// The player of `character` is in the served world: the host player while the host's level and actor are up and the
+// world is served (R1: not in the frame a world was created in, as join::host_player_in_world keeps it for a client), a
+// client once he has loaded it (join::host_player_in_world).
 bool player_in_world(u16 character);
 
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)

@@ -534,6 +534,48 @@ inline NewCharVerdict on_new_character(const Tracker& t, bool retiring)
 	return t.hardcore_out ? NewCharVerdict::Start : NewCharVerdict::NotOut;
 }
 
+// F3a T7 R1: the fall a new-life order names: none (the tracker's "no death decided", never an owner's counter), so a
+// standing or dead owner never takes it (take_respawn) - a repeat that comes after he stood up moves nobody.
+constexpr uint16_t kNewLifeSeq = 0xffff;
+
+// F3a T7 R1: what an owner takes from a Respawn order (Msg::PlayerRevive OpRespawn, coop_survival apply_respawn).
+enum class RespawnTake : uint8_t
+{
+	Stale, // nothing: an older fall, or a life no respawn is for
+	Respawn, // back at his checkpoint (a Dead owner after the evacuation, an Alive one owed a respawn)
+	NewLife // his new character after a hardcore run (the host player's; a client's comes by a new join)
+};
+
+// Dead or Alive: a respawn when the order names his fall (`my_seq`, never kNewLifeSeq). Spectating: the only Respawn a
+// spectator is ever sent is his new life (Ruling F3-7: out of the run nobody is respawned), so the fall it names is not
+// compared - the world's records start over with a world and may not know his. Wounded or Respawning: stale.
+inline RespawnTake take_respawn(uint8_t life, uint16_t my_seq, uint16_t order_seq)
+{
+	if (life == kLifeSpectating)
+		return RespawnTake::NewLife;
+	if ((life == kLifeDead || life == kLifeAlive) && order_seq == my_seq && order_seq != kNewLifeSeq)
+		return RespawnTake::Respawn;
+	return RespawnTake::Stale;
+}
+
+// F3a T7 R1: the world's last order of the host player's new life (kept with his record of this world: a new world
+// starts it over).
+struct NewLife
+{
+	bool sent = false;
+	uint64_t at = 0; // host clock of the last order
+};
+
+// The world gave the host player his new life (not out of the run, no retirement under way) but he reports `life`
+// Spectating: the order did not reach him (refused, or dropped with a world). It goes again: at once when this record
+// of him has none, else at most every `retry_ms` (a report that crossed the order on its way must not double it).
+inline bool new_life_lost(uint8_t life, bool out, bool retiring, const NewLife& last, uint64_t now_ms, uint32_t retry_ms)
+{
+	if (life != kLifeSpectating || out || retiring)
+		return false;
+	return !last.sent || now_ms >= last.at + retry_ms;
+}
+
 // Review R2 of T9: a retiring character keeps his key and his player until his stash has his things. A pending stash
 // knows its owner by the key when both sides have one, else by the player who plays him (same_owner,
 // coop_death_items.h). Taking the key off, or sending his player away to make the new character (host_rejoin_peer: the

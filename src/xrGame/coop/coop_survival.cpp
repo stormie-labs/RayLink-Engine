@@ -273,7 +273,7 @@ struct HostRec
 	xr_vector<u16> worn;
 	u16 ordered_seq = death::kNoSeq; // a respawn order for this fall is out (cleared by any report but Alive, and by a leave)
 	bool debt = false; // the respawn debt as last read / written (coop_status only: the world keeps the real one)
-	u16 reported_seq = death::kNoSeq; // F3a T7: the fall of his last report (the order of his new character names it)
+	death::NewLife new_life; // F3a T7 R1: the last order of the host player's new life in this world (host_on_state's watch)
 };
 xr_map<u16, HostRec> g_host;
 // F3 Task 10: characters out of a hardcore run that retire, their things on the way into a stash (death::retire_step).
@@ -292,6 +292,10 @@ bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebod
 u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
 u64 g_last_guard = 0;
+// F3a T7 R1, host: join::world_generation() as of the last frame of this module (after join::frame served it). A world
+// created since then is not served yet - the same guard join::host_player_in_world keeps for a client (its world_seen,
+// set by host_watch_world): player_in_world(0) waits for it as well.
+u32 g_world_served = 0;
 
 // Lying poses (hold_pose): avatars by local id, and my own actor.
 struct Pose
@@ -879,12 +883,16 @@ void apply_evacuate(u16 seq, u32 delay_ms)
 // when the death was decided.
 // F3a T7: a Spectating owner gets it only as his new character after a hardcore run (Ruling F3-7: out of the run he is
 // never respawned): the host player's, whose actor stays in the world (host_order_new_life; a client's new character
-// comes by a new join instead). Nothing of the death is charged then (no wear, no coop_respawned).
+// comes by a new join instead). Nothing of the death is charged then (no wear, no coop_respawned). R1: he takes it
+// whatever fall it names, and only he does (death::take_respawn).
 void apply_respawn(u16 seq, const Fvector& pos, checkpoint::Kind kind)
 {
 	CActor* a = local_actor();
-	const bool fresh = g_me.life == Life::Spectating;
-	if (!a || (g_me.life != Life::Dead && g_me.life != Life::Alive && !fresh) || seq != g_me.seq)
+	// F3a T7 R1 (death::take_respawn): a spectator takes it whatever fall it names - the world's records start over with a
+	// world and may not know his; the new-life order names none (death::kNewLifeSeq), so a standing owner never takes it.
+	const death::RespawnTake take = death::take_respawn(u8(g_me.life), g_me.seq, seq);
+	const bool fresh = take == death::RespawnTake::NewLife;
+	if (!a || take == death::RespawnTake::Stale)
 	{
 		++g_stat.stale_orders;
 		return;
@@ -1276,10 +1284,11 @@ death::Action host_on_died(u16 id, u16 seq)
 // the report (death::debt_after_report) and is kept in the world, and so is "out of a hardcore run" (F3 Task 10); an
 // Alive report is answered by death::on_alive_report: a respawn owed after a leave or a world change (Review Focus 1 /
 // 2), a hardcore spectator sent back to watching (Ruling F3-7) until he starts a new character.
+bool host_send_new_life(u16 character);
+
 void host_on_state(u16 id, Life life, u16 seq)
 {
 	HostRec& h = g_host[id];
-	h.reported_seq = seq;
 	if (life != Life::Wounded)
 		h.hold.close(); // nobody holds him any more (stood up, or bled out)
 	// F3 Task 10 (T8 review): the world's word on "out" first; a death of an out character then costs nothing again
@@ -1296,6 +1305,19 @@ void host_on_state(u16 id, Life life, u16 seq)
 	if (life != Life::Alive)
 	{
 		h.ordered_seq = death::kNoSeq; // a new fall, or the order arrived (Respawning)
+		// F3a T7 R1: the host player's new life was ordered (not out of the run, no retirement under way) and he still
+		// reports Spectating: the order did not reach him (refused, or dropped with a world). Nothing else would heal it
+		// (his NewCharacter is refused now: "not out"): it goes again (death::new_life_lost: at once in a new record of
+		// him, else every kNewCharRetryMs; it names no fall, so it cannot move him once he stands).
+		if (id == 0 &&
+		    death::new_life_lost(u8(life), h.tracker.hardcore_out, g_retire.find(id) != g_retire.end(), h.new_life, now(),
+		        kNewCharRetryMs))
+		{
+			::Msg("! [coop] %s still watches though his new character was ordered: the order goes again",
+			    nick_of(id).c_str());
+			if (!host_send_new_life(id))
+				::Msg("! [coop] the new character of %s waits: his actor is not here", nick_of(id).c_str());
+		}
 		return;
 	}
 	h.revive_pending_until = 0;
@@ -1504,19 +1526,46 @@ Fvector host_new_place(const Fvector& stands, const char*& where, checkpoint::Ki
 	return pos;
 }
 
-// Step 4 for the host player's character (0), his things in the stash now (host_retire_frame). His actor stays in the
-// world (a client's new character comes by a new join instead), so the world starts it over: not out, no death decided,
-// nothing owed, 0 RU (money::host_set: his balance goes to him over the internal channel), and orders his owner, over the
-// internal channel like any order (F3a T7), to stand up at his arrival point as a fresh one: a Respawn to his spectating
-// owner (apply_respawn, finish_new_life). The world's Lua (coop_menu_char) offers him faction and kit:
-// coop_host_new_character() (menu.char_offer to peer 0). False when his actor is not here.
-bool host_order_new_life(u16 character)
+// F3a T7 R1: the order of the host player's new life - a Respawn to his owner at his arrival point (host_new_place) that
+// names no fall (death::kNewLifeSeq: only a spectating owner takes it, apply_respawn / finish_new_life), over the
+// internal channel like any order. Recorded for the watch in host_on_state (HostRec::new_life). False when his actor is
+// not here.
+bool host_send_new_life(u16 character)
 {
 	CGameObject* body = object_here(character);
 	if (!body)
 		return false;
+	const char* where = "";
+	checkpoint::Kind kind = checkpoint::Kind::None;
+	Fvector pos = host_new_place(body->Position(), where, kind);
+	pos.y += kRespawnLift;
+	Writer w(24);
+	w.u8(OpRespawn);
+	w.u16(character);
+	w.u16(death::kNewLifeSeq);
+	const float p[3] = {pos.x, pos.y, pos.z};
+	w.vec3(p);
+	w.u8(u8(kind));
+	host_send_order(character, w);
 	HostRec& h = g_host[character];
-	const u16 seq = h.reported_seq; // the fall he is out at: the order must name it
+	h.new_life.sent = true;
+	h.new_life.at = now();
+	::Msg("[coop] %s: his new character stands up at %s (%.1f, %.1f, %.1f)", nick_of(character).c_str(), where, pos.x,
+	    pos.y, pos.z);
+	return true;
+}
+
+// Step 4 for the host player's character (0), his things in the stash now (host_retire_frame). His actor stays in the
+// world (a client's new character comes by a new join instead), so the world starts it over: not out, no death decided,
+// nothing owed, 0 RU (money::host_set: his balance goes to him over the internal channel), and orders his owner, over the
+// internal channel like any order (F3a T7), to stand up at his arrival point as a fresh one (host_send_new_life). The
+// world's Lua (coop_menu_char) offers him faction and kit: coop_host_new_character() (menu.char_offer to peer 0). False
+// when his actor is not here (nothing changed: he stays out and may ask again).
+bool host_order_new_life(u16 character)
+{
+	if (!object_here(character))
+		return false;
+	HostRec& h = g_host[character];
 	h.tracker = death::Tracker(); // a new character: not out, no death decided, nothing owed
 	h.ordered_seq = death::kNoSeq;
 	h.has_worn = false;
@@ -1524,22 +1573,10 @@ bool host_order_new_life(u16 character)
 	h.debt = false;
 	flag_write(character, kOutKey, false); // before his Alive report: it reads the world's word (learn_out)
 	flag_write(character, kDebtKey, false);
-	const char* where = "";
-	checkpoint::Kind kind = checkpoint::Kind::None;
-	Fvector pos = host_new_place(body->Position(), where, kind);
-	pos.y += kRespawnLift;
 	if (!money::host_set(peer_of_character(character), 0, "new character"))
 		::Msg("! [coop] new character of %s: his money is not set to 0 (no balance to write)", nick_of(character).c_str());
-	Writer w(24);
-	w.u8(OpRespawn);
-	w.u16(character);
-	w.u16(seq);
-	const float p[3] = {pos.x, pos.y, pos.z};
-	w.vec3(p);
-	w.u8(u8(kind));
-	host_send_order(character, w);
-	::Msg("[coop] %s starts a new character at %s (%.1f, %.1f, %.1f), fall #%u", nick_of(character).c_str(), where, pos.x,
-	    pos.y, pos.z, seq);
+	::Msg("[coop] %s starts a new character", nick_of(character).c_str());
+	host_send_new_life(character);
 	// Ruling F3-10: kit 1 only with coop_hardcore_new_kit on; else he starts with nothing (the window offers a faction only)
 	script::queue_callback("coop_host_new_character", {script::cb_int(death::host_new_kit() ? 1 : 0)});
 	return true;
@@ -2595,7 +2632,7 @@ bool player_in_world(u16 character)
 	if (!mgr().is_host() || character == 0xffff)
 		return false;
 	if (character == 0)
-		return mgr().session().local() && g_pGameLevel && local_actor();
+		return mgr().session().local() && g_pGameLevel && local_actor() && g_world_served == join::world_generation();
 	return join::host_player_in_world(character);
 }
 
@@ -2731,6 +2768,7 @@ void reset()
 	g_rules = console_rules();
 	g_world_rules = g_rules;
 	g_epoch = 0xffffffff;
+	g_world_served = 0;
 	g_last_roster = g_last_guard = 0;
 	g_feed.clear();
 	g_guard_logged.clear();
@@ -2738,6 +2776,8 @@ void reset()
 
 void frame()
 {
+	// R1: join::frame runs before this one in Manager::frame and serves the world it finds (host_watch_world)
+	g_world_served = mgr().is_host() && g_pGameLevel ? join::world_generation() : 0;
 	if (!g_pGameLevel || !live())
 	{
 		if (g_me.actor || !g_players.empty() || !g_host.empty())
