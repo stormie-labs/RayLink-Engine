@@ -26,6 +26,7 @@
 #include "../../xrEngine/CameraBase.h" // transition: the view of a player put back at the edge
 #include "../../xrEngine/x_ray.h" // F3a T8: pApp->ls_header, the line of a held loading screen
 #include "string_table.h" // F3a T8: st_coop_load_*
+#include "../../xrEngine/xr_input.h" // F3a T8 R1: pInput, the held screen takes no input
 #include "ai_space.h"
 #include "script_engine.h"
 #include "level_graph.h"
@@ -47,6 +48,7 @@
 #include <cstdio>
 
 extern string_path g_last_saved_game;
+extern bool g_bDisableAllInput; // Level_input.cpp: the level takes no input (level.disable_input)
 extern xr_vector<CLevelChanger*> g_lchangers; // level_changer.cpp: the exits of the level that are online
 
 int g_coop_max_new_characters = int(coop::limits::kNewCharactersDefault);
@@ -175,6 +177,9 @@ struct State
 	transition::LoadScreen screen;
 	u16 screen_level = levels::wire::kNoLevel;
 	bool screen_line = false; // the "Waiting for" line is on the loading screen; screen_line_was is the header it covers
+	bool screen_input_off = false; // R1 1: the held screen took the level's input; screen_input_was is what it was before
+	bool screen_input_was = false;
+	u64 load_pumped_at = 0; // R1 5, host: the go's saves went to the network (the reload watchdog counts from here)
 	std::string screen_line_was;
 	u32 load_waits_bad = 0; // unreadable LoadWait
 	// both: this player. `want` is what he does (stands in an exit's zone, or said yes to a guide trip).
@@ -1797,21 +1802,42 @@ void host_load_send(PeerId to, const levels::wire::LoadWaitMsg& m)
 // so the host pumps the session here until every save is handed over, kPreparedPumpMs at most; what is left then goes
 // after the host's load. The players' requests made meanwhile are of the old epoch (dropped by the session); a new join
 // waits (load_pumping, host_join_request).
-void host_pump_saves(u32 blobs, u64 bytes)
+// R1 3: when is every mover's save handed over? The session tells no peer's outgoing progress, only what it sent of each
+// message type. After the go's epoch move only the movers' saves stream: every other blob was cut by the move and ends with
+// no chunk more, and no new one starts while load_pumping holds the joins. So the data of the BlobChunks sent since the pump
+// began reaching the movers' total means each mover's save is out (none sends more than its own size; transition::
+// saves_handed), whatever another peer's cut blob does. The BlobEnd of a save may wait for room in its lane (512 KB alive)
+// after its last chunk, and a cut blob's BlobEnd counts in the same total: the pump goes on while fewer than `blobs` BlobEnds
+// went out, and a settle time of two round trips of the slowest mover after both hold, for a lagging one to follow.
+void host_pump_saves(const xr_vector<PeerId>& movers, u32 blobs, u64 bytes)
 {
 	Session& s = mgr().session();
-	const uint64_t ends = s.stats(u16(Msg::BlobEnd)).sent_count + blobs;
-	const uint64_t chunk_bytes = s.stats(u16(Msg::BlobChunk)).sent_bytes + bytes;
+	const uint64_t chunk_bytes0 = s.stats(u16(Msg::BlobChunk)).sent_bytes;
+	const uint64_t chunks0 = s.stats(u16(Msg::BlobChunk)).sent_count;
+	const uint64_t ends0 = s.stats(u16(Msg::BlobEnd)).sent_count;
+	u32 rtt = 0;
+	for (const PeerInfo& p : s.peers())
+		if (std::find(movers.begin(), movers.end(), p.id) != movers.end())
+			rtt = _max(rtt, p.rtt_ms);
+	const u64 settle = _min<u64>(1000, 2 * u64(rtt) + 100);
 	const u64 start = mgr().now_ms();
+	u64 out_at = 0;
 	bool handed = false;
 	g.load_pumping = true;
 	while (mgr().now_ms() - start < kPreparedPumpMs)
 	{
 		s.update(mgr().now_ms());
-		if (s.stats(u16(Msg::BlobEnd)).sent_count >= ends && s.stats(u16(Msg::BlobChunk)).sent_bytes >= chunk_bytes)
+		const MsgStats& chunk = s.stats(u16(Msg::BlobChunk));
+		const bool data = transition::saves_handed(chunk.sent_bytes - chunk_bytes0, chunk.sent_count - chunks0, bytes);
+		if (data && s.stats(u16(Msg::BlobEnd)).sent_count >= ends0 + blobs)
 		{
-			handed = true;
-			break;
+			if (out_at == 0)
+				out_at = mgr().now_ms();
+			if (mgr().now_ms() - out_at >= settle)
+			{
+				handed = true;
+				break;
+			}
 		}
 		Sleep(1);
 	}
@@ -1891,7 +1917,11 @@ void host_prepare(const xr_vector<Mover>& movers, u16 level, const FILETIME& bef
 	    name.c_str(), u32(save_ms), u32(engine_part.size()), u32(script_part.size()), epoch,
 	    level_name_by_id(level).c_str(), names.c_str());
 	// 5. the saves to the network before the reload
-	host_pump_saves(u32(movers.size()), bytes);
+	xr_vector<PeerId> mover_ids;
+	for (const Mover& m : movers)
+		mover_ids.push_back(m.peer);
+	host_pump_saves(mover_ids, u32(movers.size()), bytes);
+	g.load_pumped_at = mgr().now_ms(); // R1 5: the reload comes a frame or two from now (host_load_watch)
 }
 
 // A mover is no mover any more (he left, asks for the world the usual way, joins again).
@@ -1918,8 +1948,36 @@ void host_load_void(const char* why)
 	host_load_send(kHostPeer, load_wait_msg(levels::wire::LoadWaitMsg::Cancel, g.load.epoch()));
 	g.load.clear();
 	g.load_world_pending = false;
+	g.load_pumped_at = 0;
 	for (auto& it : g.peers)
 		it.second.prepared = false;
+}
+
+// R1 5, host, every frame: the reload follows the go within a frame or two (MakeReconnect is a deferred engine event), and a
+// level load runs no frames; frames that still run kReloadWatchMs after the go's saves went out mean the reload is not
+// coming. The prepared load is called off (so no later world is taken for the transition's), and everybody rejoins this
+// world as after a world change (host_rejoin_peer one by one would miss a player of the old epoch, who must hear the new
+// one): the epoch moved at the go, the movers' characters were put on the other level in this world (their JoinRequest
+// brings them back, bring_proxy_to_level).
+void host_load_watch(u64 now)
+{
+	if (!transition::reload_overdue(g.load_world_pending, g.load_pumped_at, now))
+		return;
+	::Msg("! [coop] load: no reload followed the go in %u s: the simultaneous load is off, everybody rejoins this world",
+	    u32(transition::kReloadWatchMs / 1000));
+	host_load_void("no reload followed the go");
+	g.gate.world_replaced();
+	g.precache_wait.clear();
+	g.choosers.world_replaced();
+	transition_world_replaced();
+	for (auto& it : g.peers)
+	{
+		it.second.loading = true;
+		it.second.sent_at = 0;
+		it.second.proxy = kNoId; // set again by their JoinRequest (the character by key)
+		sync::host_begin_join(it.first);
+	}
+	g.reset_pending = true; // host_watch_world sends the SessionReset of the epoch the go gave
 }
 
 // Host, every frame: the barrier of the load. Enter to whoever may leave his screen now, Waiting (who is ready) to the
@@ -2001,10 +2059,30 @@ void load_screen_line(bool on)
 		xr_strcpy(pApp->ls_header, text.c_str());
 }
 
+// R1 1: while the screen is held the level takes no input (the stock "press any key" grabs it and pauses; a session never
+// pauses): the actor stands where he arrived. The keys held at that moment are let go (as level.disable_input does), and the
+// flag a script had set is given back after (Esc still opens the main menu: CLevel::IR_OnKeyboardPress).
+void load_screen_input(bool held)
+{
+	if (held == g.screen_input_off)
+		return;
+	if (held)
+	{
+		g.screen_input_was = g_bDisableAllInput;
+		if (pInput)
+			pInput->DeactivateSoft();
+		g_bDisableAllInput = true;
+	}
+	else
+		g_bDisableAllInput = g.screen_input_was;
+	g.screen_input_off = held;
+}
+
 void load_screen_off()
 {
 	g.screen.reset();
 	load_screen_line(false);
+	load_screen_input(false);
 }
 
 void send_load_ready()
@@ -2032,14 +2110,18 @@ void player_load_step(u64 now)
 	if (g.screen.stage == transition::Load::None)
 	{
 		load_screen_line(false);
+		load_screen_input(false);
 		return;
 	}
 	const bool mirror = mgr().is_client();
-	// a client: loaded and its roles swapped, as for its WorldLoaded; the host player: his process's world
+	// a client: loaded and its roles swapped, as for its WorldLoaded; the host player: his process's world. R1 4: in a
+	// world created after the Prepared (LoadScreen::world_up checks the generation)
 	const bool up = world_up() && !Device.dwPrecacheFrame &&
 	    (!mirror || (mgr().phase() == Phase::LoadingWorld && g.swap_done));
-	if (up && g.screen.world_up(now))
+	if (up && g.screen.world_up(now, g_world_generation))
 	{
+		if (mirror)
+			g.receive_started = now; // R1 2: the join's time limit measured his download and load; the held screen starts it again
 		send_load_ready();
 		::Msg("[coop] load: my world is up %.1f s after the go, waiting for the others", float(now - g.screen.since) / 1000.f);
 	}
@@ -2069,6 +2151,7 @@ void player_load_step(u64 now)
 		return;
 	}
 	load_screen_line(g.screen.holds());
+	load_screen_input(g.screen.holds());
 }
 
 // Client: LoadWait Prepared: the group moves, the save of the transition follows as a blob. As a SessionReset, but the
@@ -2081,7 +2164,7 @@ void client_prepared(const levels::wire::LoadWaitMsg& m, u64 now)
 		    phase_name(mgr().phase()));
 		return;
 	}
-	if (m.epoch <= mgr().session().world_epoch() || !g.screen.prepared(m.epoch, true, now))
+	if (m.epoch <= mgr().session().world_epoch() || !g.screen.prepared(m.epoch, true, now, g_world_generation))
 	{
 		::Msg("! [coop] load: a prepared world of epoch %u, this player is in epoch %u: ignored", m.epoch,
 		    mgr().session().world_epoch());
@@ -2636,7 +2719,7 @@ void client_on_load_wait(PeerId from, Reader& r)
 	case levels::wire::LoadWaitMsg::Prepared:
 		if (mgr().is_client())
 			client_prepared(m, now); // the save follows: this machine loads it
-		else if (g.screen.prepared(m.epoch, false, now)) // the host player: his process reloads by itself
+		else if (g.screen.prepared(m.epoch, false, now, g_world_generation)) // the host player: his process reloads by itself
 		{
 			g.screen_level = m.level;
 			::Msg("[coop] load: the group moves to '%s' (epoch %u): this screen waits for the others too",
@@ -2998,6 +3081,7 @@ void on_session_lost(const char*)
 	for (const auto& it : g.peers)
 		proxies.push_back(it.second.proxy);
 	load_screen_line(false); // F3a T8: a held loading screen's line goes with the session
+	load_screen_input(false); // R1 1: and its hold of the level's input
 	g = State();
 	for (u16 proxy : proxies)
 		take_offline(proxy);
@@ -3161,6 +3245,7 @@ void frame()
 	if (mgr().is_host())
 	{
 		host_watch_world();
+		host_load_watch(mgr().now_ms()); // F3a T8 R1: a go whose reload never came
 		transition_step(mgr().now_ms()); // the host player's zone and vote, his hold at the edge, the placard's numbers
 		player_load_step(mgr().now_ms()); // F3a T8: the host player's loading screen
 		host_board_step(mgr().now_ms());

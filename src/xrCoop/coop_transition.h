@@ -622,6 +622,24 @@ static_assert(kLoadWaitMs == levels::kLoadWaitMs, "the board's loaders' minute a
 constexpr uint32_t kLoadReadyRepeatMs = 3000; // a player on a held screen says LoadReady again this often (a hole may eat it)
 constexpr uint32_t kLoadAloneGraceMs = 30000; // after the server's minute, this long more before a held screen lets go alone
 constexpr uint32_t kLoadBlobStallMs = 30000; // the server's world is up and the save has not moved this long: it is lost
+constexpr uint64_t kBlobChunkHeader = 6; // R1 3: a BlobChunk as the session counts it: u16 type, u32 blob id, then data
+constexpr uint64_t kReloadWatchMs = 10000; // R1 5: frames this long after the go's pump and no reload: none is coming
+
+// R1 3: the movers' saves are handed to the network: since the pump began the session sent `chunks` BlobChunk messages of
+// `chunk_bytes` in all (headers included), and only the movers' saves stream then (data_total = their sizes together).
+// A save can send no more than its own size, so the data reaching their total means every one of them is handed over.
+inline bool saves_handed(uint64_t chunk_bytes, uint64_t chunks, uint64_t data_total)
+{
+	const uint64_t headers = chunks * kBlobChunkHeader;
+	return chunk_bytes >= headers && chunk_bytes - headers >= data_total;
+}
+
+// R1 5: a prepared load whose reload has not come: `pending` (the next world is the transition's), `since` (the pump
+// ended, 0 not yet).
+inline bool reload_overdue(bool pending, uint64_t since, uint64_t now)
+{
+	return pending && since != 0 && now >= since + kReloadWatchMs;
+}
 
 // The world server's side (coop_join.cpp): the movers of one transition and the barrier of their loading screens. The
 // barrier (levels::LoadBarrier) is started at the "go" so that a LoadReady of the new epoch is counted whenever it comes
@@ -758,10 +776,11 @@ struct LoadScreen
 	uint64_t said_at = 0; // the last LoadReady
 	uint64_t host_up_at = 0; // the first word from the server after its world came up (LoadWait Waiting / Enter), 0 none
 	std::vector<uint32_t> waiting_for; // who the server still waits for (its last LoadWait), the line on the screen
+	uint32_t world = 0; // R1 4: this machine's world generation at Prepared (join::world_generation)
 
 	// LoadWait Prepared {e}. `download`: a remote client, the save comes as a blob (Waiting); the host player's process loads
 	// the world itself (Loading). False: refused (not newer than the transition that runs).
-	bool prepared(uint32_t e, bool download, uint64_t now)
+	bool prepared(uint32_t e, bool download, uint64_t now, uint32_t world_now)
 	{
 		if (stage != Load::None && e <= epoch)
 			return false;
@@ -770,6 +789,7 @@ struct LoadScreen
 		epoch = e;
 		local = !download;
 		since = progress_at = now;
+		world = world_now;
 		return true;
 	}
 	void progress(uint64_t now)
@@ -786,9 +806,11 @@ struct LoadScreen
 		return true;
 	}
 	// The world is up under the screen: true once (Loading -> Holding) = say LoadReady.
-	bool world_up(uint64_t now)
+	// R1 4: only a world created after the Prepared counts (`world_now` is this machine's world generation): the host
+	// player's process runs the old level for a frame or two after the go.
+	bool world_up(uint64_t now, uint32_t world_now)
 	{
-		if (stage != Load::Loading)
+		if (stage != Load::Loading || world_now == world)
 			return false;
 		stage = Load::Holding;
 		up_at = said_at = now;
