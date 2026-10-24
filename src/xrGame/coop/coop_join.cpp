@@ -3031,9 +3031,18 @@ bool transition_consent()
 {
 	// 2026-10-24: one who is NOT at the exit the board waits at goes with the group from where he is (no distance); at the
 	// exit there is nothing to hold (he withdraws by stepping out)
-	if (!group_waits_here() || g.zone_in || g.view.state != transition::State::Waiting || g.view.kind != 0 ||
-	    g.view.changer == transition::kNoChanger)
+	// Live 2026-10-24 (build 15): "it is pressed once, I cannot hold it" - a refusal says why (it said nothing)
+	const char* why = !group_waits_here()                          ? "nobody waits here (no session / not live)"
+	    : g.zone_in                                              ? "you stand in an exit's zone yourself"
+	    : g.view.state != transition::State::Waiting             ? "the board does not wait (idle or going)"
+	    : g.view.kind != 0                                       ? "the board is a guide trip"
+	    : g.view.changer == transition::kNoChanger              ? "the board names no exit"
+	                                                             : nullptr;
+	if (why)
+	{
+		::Msg("! [coop] transition: 'go with the group' refused: %s", why);
 		return false;
+	}
 	g.consent = true;
 	g.consent_goal = u32(g.view.changer);
 	g.intent.reset(); // it goes out at the next frame (the host player's over the local link too)
