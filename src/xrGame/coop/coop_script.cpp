@@ -635,7 +635,8 @@ bool arg_id(lua_State* L, int idx, lua_Number& out)
 	return out >= 0 && out <= lua_Number(0xffffffffu);
 }
 
-// coop.players() -> { {id=, nick=, avatar_id= (local numbering, nil if unknown), rtt=, is_self=}, ... }
+// coop.players() -> { {id=, nick=, avatar_id= (local numbering, nil if unknown), rtt=, loss= (0..1, the transport's
+// smoothed packet loss; 0 for ourselves), is_self=}, ... } (loss: scripts\coop_hud_netgraph)
 int l_players(lua_State* L)
 {
 	lua_newtable(L);
@@ -643,7 +644,7 @@ int l_players(lua_State* L)
 		return 1;
 	const PeerId self = mgr().self();
 	int index = 0;
-	auto push_entry = [L, &index, self](PeerId id, const char* nick, u16 avatar, u32 rtt)
+	auto push_entry = [L, &index, self](PeerId id, const char* nick, u16 avatar, u32 rtt, float loss)
 	{
 		lua_newtable(L);
 		lua_pushnumber(L, lua_Number(id));
@@ -657,17 +658,19 @@ int l_players(lua_State* L)
 		}
 		lua_pushnumber(L, lua_Number(rtt));
 		lua_setfield(L, -2, "rtt");
+		lua_pushnumber(L, lua_Number(loss));
+		lua_setfield(L, -2, "loss");
 		lua_pushboolean(L, id == self);
 		lua_setfield(L, -2, "is_self");
 		lua_rawseti(L, -2, ++index);
 	};
 	if (self != kInvalidPeer)
-		push_entry(self, mgr().nick(), 0, 0); // our own actor is always id 0 here
+		push_entry(self, mgr().nick(), 0, 0, 0.f); // our own actor is always id 0 here
 	for (const PeerInfo& p : mgr().session().peers())
 	{
 		if (p.id == self)
 			continue;
-		push_entry(p.id, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms);
+		push_entry(p.id, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms, p.packet_loss);
 	}
 	return 1;
 }
