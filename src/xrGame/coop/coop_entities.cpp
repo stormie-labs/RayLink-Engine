@@ -20,6 +20,7 @@
 #include "Inventory.h"
 #include "Torch.h"
 #include "Weapon.h"
+#include "sight_manager.h"
 #include "inventory_item.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
@@ -234,7 +235,32 @@ u8 creature_flags(CGameObject* obj, u16& held)
 			if (w->strapped_mode())
 				flags |= CreatureStrapped;
 	}
+	if (stalker->sight().enabled())
+		for (const Fmatrix* m : {&stalker->sight().current_spine_rotation(), &stalker->sight().current_shoulder_rotation(),
+			     &stalker->sight().current_head_rotation()})
+			if (!m->i.similar(Fidentity.i, EPS_L) || !m->j.similar(Fidentity.j, EPS_L) || !m->k.similar(Fidentity.k, EPS_L))
+			{
+				flags |= CreatureAims;
+				break;
+			}
 	return flags;
+}
+
+// Live 2026-10-24 (owner): "the NPC does not point its gun and walks oddly sideways in front of the client". A stalker
+// aims by turning spine, shoulder and head bones (CSightManager::compute_aiming -> the animation's bone callbacks); a
+// puppet runs no sight update, so its torso stayed square with its legs. The host's final rotations ride along.
+void write_aim(Writer& w, CAI_Stalker& stalker)
+{
+	for (const Fmatrix* m : {&stalker.sight().current_spine_rotation(), &stalker.sight().current_shoulder_rotation(),
+		     &stalker.sight().current_head_rotation()})
+	{
+		Fquaternion q;
+		q.set(*m);
+		w.u16(u16(pack_unit(q.x)));
+		w.u16(u16(pack_unit(q.y)));
+		w.u16(u16(pack_unit(q.z)));
+		w.u16(u16(pack_unit(q.w)));
+	}
 }
 
 // Client: any torch the puppet has, attached first (an item the host keeps detached is still lit by Switch).
@@ -333,6 +359,8 @@ void host_send_snapshots()
 		}
 		if (flags & CreatureHolds)
 			w.u16(held);
+		if (flags & CreatureAims)
+			write_aim(w, *obj->cast_stalker());
 		if (++in_packet >= 255 || w.size() >= kSnapshotBudget)
 			flush();
 	}
@@ -353,6 +381,7 @@ struct MirrorSample
 	AnimState anims;
 	u8 flags = 0; // CreatureFlags (W5 C2.6)
 	u16 held = kNoId; // local id of the item in hands (CreatureHolds)
+	Fquaternion aim[3]; // spine, shoulder, head bone rotations (CreatureAims; identity without it)
 };
 struct MirrorTrack
 {
@@ -826,6 +855,17 @@ void client_on_snapshot(PeerId, Reader& r)
 		}
 		if (s.flags & CreatureHolds)
 			s.held = join::to_local(r.u16());
+		for (Fquaternion& q : s.aim)
+		{
+			q.identity();
+			if (s.flags & CreatureAims)
+			{
+				q.x = unpack_unit(s16(r.u16()));
+				q.y = unpack_unit(s16(r.u16()));
+				q.z = unpack_unit(s16(r.u16()));
+				q.w = unpack_unit(s16(r.u16()));
+			}
+		}
 		if (!r.ok() || id == 0)
 			break;
 		MirrorTrack& t = g_tracks[id];
@@ -888,6 +928,8 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 		out = k < 0.5f ? a : b;
 		out.pos.lerp(a.pos, b.pos, k);
 		out.yaw = angle_lerp(a.yaw, b.yaw, k);
+		for (int i = 0; i < 3; ++i)
+			out.aim[i].slerp(a.aim[i], b.aim[i], clampr(k, 0.f, 1.f));
 		return true;
 	}
 	out = t.samples.back();
@@ -1124,6 +1166,13 @@ bool drive_mirror(CGameObject* obj)
 	xform.c.set(s.pos);
 	obj->XFORM().set(xform);
 	remote::set_health(obj, s.health); // WP1: snapshot health (never kills, see remote::on_host_death)
+	if (CAI_Stalker* stalker = obj->cast_stalker())
+	{
+		Fmatrix bones[3];
+		for (int i = 0; i < 3; ++i)
+			bones[i].rotation(s.aim[i]);
+		stalker->sight().coop_set_rotations(bones[0], bones[1], bones[2]);
+	}
 
 	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
 	MirrorTrack& track = it->second;

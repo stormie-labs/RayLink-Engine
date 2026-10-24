@@ -124,6 +124,9 @@ public:
 	IC Fmatrix const& current_spine_rotation() const;
 	IC Fmatrix const& current_shoulder_rotation() const;
 	IC Fmatrix const& current_head_rotation() const;
+	// Anomaly Coop: a puppet (remote stalker) runs no sight update (CAI_Stalker::UpdateCL); its bone callbacks show the
+	// host's final rotations, set here from the snapshot.
+	void coop_set_rotations(Fmatrix const& spine, Fmatrix const& shoulder, Fmatrix const& head);
 
 public:
 	IC void bone_aiming();

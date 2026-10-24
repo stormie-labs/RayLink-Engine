@@ -917,6 +917,13 @@ void CSightManager::adjust_orientation()
 	head.target = head.current;
 }
 
+void CSightManager::coop_set_rotations(Fmatrix const& spine, Fmatrix const& shoulder, Fmatrix const& head)
+{
+	m_current.m_spine.m_rotation = spine;
+	m_current.m_shoulder.m_rotation = shoulder;
+	m_current.m_head.m_rotation = head;
+}
+
 void CSightManager::enable(bool const value)
 {
 	if (value == m_enabled)

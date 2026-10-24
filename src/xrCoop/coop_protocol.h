@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -55,7 +56,9 @@ namespace coop
 //    (T10), TransitionState + `u8 flags` (T8), WeatherSync + `u8 weather_set` (T15).
 // 12 (live 2026-10-24: a client never saw an NPC raise its weapon): EntitySnapshot carries a stalker's item in hands,
 //    CreatureHolds (+ CreatureStrapped) and a u16 id after the anims.
-constexpr uint32_t kProtocolVersion = 12;
+// 13 (live 2026-10-24: "the NPC does not point its gun and walks oddly sideways in front of the client"): EntitySnapshot
+//    carries a stalker's aim, CreatureAims and 3 quaternions (spine, shoulder, head bone rotations) after the item id.
+constexpr uint32_t kProtocolVersion = 13;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -466,6 +469,7 @@ enum CreatureFlags : uint8_t
 	CreatureTorchLit = 1, // the creature's head torch is on
 	CreatureHolds = 2, // a stalker's active item: its u16 id follows the anims (protocol 12)
 	CreatureStrapped = 4, // that item is a weapon carried on the back, not in the hands
+	CreatureAims = 8, // the stalker turns spine, shoulder and head to its aim: 3 quaternions follow (protocol 13)
 };
 constexpr uint8_t pack_anim_byte(uint8_t anim_count, uint8_t creature_flags)
 {
@@ -473,4 +477,18 @@ constexpr uint8_t pack_anim_byte(uint8_t anim_count, uint8_t creature_flags)
 }
 constexpr uint8_t anim_count_of(uint8_t packed) { return uint8_t(packed & 0x0F); }
 constexpr uint8_t creature_flags_of(uint8_t packed) { return uint8_t(packed >> 4); }
+
+// A unit-range float (a quaternion component) as int16: x 32767, clamped, rounded to the nearest.
+inline int16_t pack_unit(float v)
+{
+	const float c = v > 1.f ? 1.f : (v < -1.f ? -1.f : v);
+	const float s = c * 32767.f;
+	return int16_t(s >= 0.f ? s + 0.5f : s - 0.5f);
+}
+inline float unpack_unit(int16_t v)
+{
+	const float f = float(v) / 32767.f;
+	return f < -1.f ? -1.f : f;
+}
+constexpr size_t kSnapshotAimBytes = 3 * 4 * sizeof(int16_t); // spine, shoulder, head: x, y, z, w
 } // namespace coop
