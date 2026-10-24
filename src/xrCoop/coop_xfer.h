@@ -17,7 +17,7 @@
 //                          declines it the same way: AbortAck = "I do not hold (id, g) and never will"
 // Stream within ownership: Snapshot {g, seq|state} ->  Snapshot {g, seq} (the ack; seq 0 from the world = "send me
 //                          your state", a resync)
-// Healing:                 Drop {g}: let go of every incarnation of the id up to g
+// Healing:                 Drop {g}: let go of every incarnation of the id up to g (a spawn not answered yet: Drop {0} only)
 // Both sides repeat until the answer (kRetryFirstMs doubling to kRetryMaxMs); every answer is idempotent. A grant
 // nobody commits for kGrantTimeoutMs is aborted.
 //
@@ -43,16 +43,23 @@
 //      {g}, the map server does not confirm the abort of the gen it is destroying.
 //   R6 the journal (Granting, Aborting, Releasing) stays within kJournalMaxEntries and kJournalMaxBytes of text: a
 //      transfer that does not fit is not started (no Grant, no Ack) - the map server repeats until it fits.
-//   R7 a map server is known to the ledger by a peer register_server gives each connection: never reused (the next
-//      one is kept in the journal across loads), so nothing of an earlier connection can pass for a later one's. The
-//      ledger hears only registered peers that are not lost. server_lost means gone: its process is dead or its
+//   R7 a map server is known to the ledger by a peer register_server gives each connection: never reused in one
+//      process, so nothing of an earlier connection can pass for a later one's. The journal keeps the counter as of
+//      the SAVE only - not enough for a load inside the running process: the live ledger has registered peers after the
+//      save, and a packet of such a connection still on its way (a SpawnPrepare of a peer the new ledger hands out
+//      again) would register an object for a server that does not have it (review round 3, H5). HARD REQUIREMENT for
+//      the engine (T11): at every load that keeps the process alive, the ledger that replaces the live one gets its
+//      counter - new.set_peer_floor(live.next_peer()), after resolve_after_load, before the first register_server.
+//      (After a restart of the host's process nothing is in flight, and the journal's counter is enough.) The ledger
+//      hears only registered peers that are not lost. server_lost means gone: its process is dead or its
 //      connection closed for good and its Holder is never used again. Its objects go back to the world at once (a
 //      prepared release completed, a grant or an abort to it resolved as if acknowledged); the Drops it returns are
 //      best effort; its late messages are ignored.
 //   R8 after a load (resolve_after_load) every map server is gone: Releasing - completed with the journal's state;
 //      Granting/Aborting - rolled back; an object owned by a map server - back to the world at its last confirmed
 //      state. A Releasing entry whose object the save lacks is recreated from its state; a Granting entry whose
-//      object the save lacks is a violation (nothing to roll back to).
+//      object the save lacks is a violation (nothing to roll back to). The new ledger takes the live one's peer
+//      counter (set_peer_floor, R7); packets of the old connections may still be on their way and are not heard.
 //   R9 audit() takes a report that is current: everything the map server sent before it was handled before it (one
 //      ordered channel). Transfers in flight are never judged. A Lost heal takes the object back two-phase - Aborting
 //      under a new gen, Abort repeated until the map server's AbortAck - so the world writes it again only once the map
@@ -61,7 +68,14 @@
 //   R10 a late ReleaseCommit of a release the world finished before the object's current transfer gets Done again;
 //      nothing is applied twice. Every record, a remade one too, starts with a fresh gen, so this always holds.
 //   R11 a Destroy the world does not take (a late copy, an incarnation not given to that map server, an aborted
-//      grant) gets Drop: the object is gone there already, the map server only stops asking.
+//      grant) gets Drop: the object is gone there already, the map server only stops asking. A Destroy {0} it does
+//      not take gets Done {0} instead, never Drop {0}: Drop {0} is the refusal of a spawn (review round 3, path c);
+//      only a Destroying {0} takes a Done {0}.
+//   R12 a spawn not answered yet (Spawning, gen 0) lets go of only what is about that spawn: a Drop {0} (the world's
+//      refusal), an Abort {x} above everything barred for the id (a heal's reclaim - a fresh gen). Anything else is a
+//      late packet of an earlier life of the id and leaves the spawn alone: a late copy of an Abort already answered
+//      (x at or below the declined gen), a Drop {x != 0} (the answer to a destroy of an earlier life), a Done. Without
+//      this a fresh, unregistered spawn is lost (review round 3, H4 and paths a-c).
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
@@ -162,6 +176,13 @@ public:
 		m_live.insert(p);
 		return p;
 	}
+	// The peer register_server hands out next: a ledger that is replaced by a load hands its counter on (set_peer_floor).
+	Peer next_peer() const { return m_next_peer; }
+	// R7, a hard requirement of every load that keeps the process alive: load_journal brings back the counter of the SAVE,
+	// but the live ledger has registered peers after it, and a packet of such a connection still on its way must not pass
+	// for a new connection's (review round 3, H5). The engine (T11) reads next_peer() of the live ledger before it is
+	// replaced and gives it to the new one here, anywhere before the first register_server. Never lowers the counter.
+	void set_peer_floor(Peer floor) { m_next_peer = std::max(m_next_peer, floor); }
 
 	// An object of the world (start, load, the world's own spawn). Creates it owned by the world; an existing one keeps
 	// its owner and takes the state only when the world writes it. Clears a tombstone of the id.
@@ -817,7 +838,15 @@ private:
 		}
 		// Not a destroy the world can take (a late copy, an incarnation it does not give this map server, an aborted
 		// grant): the object is gone there already, so the map server only has to stop asking. Nothing changes here.
-		out.push_back(detail::packet(Op::Drop, id, p.key.gen, kWorld, p.from));
+		// A Destroy {0} gets Done {0}, never Drop {0}: Drop {0} is the refusal of a spawn, and a later spawn of the same id
+		// would take this late answer for its own refusal and let go of the object (review round 3, path c). Done {0}
+		// ends only a map server's Destroying {0}; Spawning, Held and Committing ignore it, and so does a Destroying
+		// {g != 0}: a Done under a fresh gen (the reviewer's first form) would have ended the destroy of a LATER
+		// incarnation whose own Destroy {g} is still on its way, and the world would keep the object (round 3, own find).
+		if (p.key.gen == 0)
+			out.push_back(detail::packet(Op::Done, id, 0, kWorld, p.from));
+		else
+			out.push_back(detail::packet(Op::Drop, id, p.key.gen, kWorld, p.from));
 	}
 
 	void on_snapshot(const Packet& p, std::vector<Packet>& out)

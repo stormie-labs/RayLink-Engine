@@ -417,6 +417,8 @@ private:
 				bury(id, x);
 				m_objs.erase(it);
 			}
+			else if (x == 0 && o.gen == 0)
+				m_objs.erase(it); // the world could not take its Destroy {0} (R11): it only has to stop asking
 			return {};
 		default:
 			return {};
@@ -524,7 +526,10 @@ private:
 			// An Abort with a gen while spawning: the world registered this spawn and takes it back (a heal - the
 			// spawn's gen is below any gen of an abort sent after it). Let go, like any incarnation up to x (review
 			// round 2, item 3). Gen 0 refuses a request for an id the world never knew: nothing to let go.
-			if (x != 0)
+			// Only an Abort above everything barred here is a heal's: its gen is fresh, above any gen this map server
+			// finished or declined, while a late copy of an Abort about an earlier life of the id is at or below the gen
+			// it was declined under, and must leave a spawn of this life alone (review round 3, H4).
+			if (x != 0 && x > barred(id))
 			{
 				m_events.push_back(Event{Event::Kind::Remove, id, {}});
 				m_objs.erase(it);
@@ -544,6 +549,11 @@ private:
 		if (it == m_objs.end())
 			return;
 		Obj& o = it->second;
+		// A spawn not answered yet (gen 0) obeys one Drop only: {0}, the world's refusal of its SpawnPrepare. A Drop {x}
+		// is about incarnations up to x - the late answer to a destroy of an earlier life of the id says nothing about
+		// this spawn, whatever x is (review round 3, path b).
+		if (o.st == St::Spawning && x != 0)
+			return;
 		const bool writes = o.st == St::Held || o.st == St::Releasing || o.st == St::Spawning;
 		if ((writes || o.st == St::Destroying) && o.gen <= x)
 		{
