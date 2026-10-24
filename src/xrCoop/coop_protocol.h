@@ -194,6 +194,9 @@ enum class Msg : uint16_t
 	RestSleep = 0x01C4, // host -> every sleeper: u8 hours (F3 T11)
 	DeathMarker = 0x01C5, // host -> all: u16 character, u16 marker object, u8 drop mode
 	NewCharacter = 0x01C6, // client -> host: hardcore, the dead player starts a new character
+	// Audit A5 (2026-10-24): a monster's special ability hits a remote player: the host decides, the player's machine plays
+	// it on its own actor (camera / PP effectors, impulse, psy damage). u16 monster (host id), u8 kind, u8 phase, f32 value.
+	MonsterEffect = 0x01C7, // host -> the targeted player
 
 	// F3a split levels (0x01D0-0x01DF; docs/plans/2026-10-24-f3a-split-levels.md §2.1; layouts: xrCoop/coop_levels_wire.h,
 	// scopes: coop_scope.h). "World server" is the host's process, "map server" a background process of the host's PC

@@ -28,6 +28,7 @@
 #include "coop_router.h" // F2 T10
 #include "coop_callgate.h" // F2 T12
 #include "coop_levels.h" // F3a
+#include "coop_monster_fx.h" // audit A5
 
 #include "Level.h"
 #include "Actor.h"
@@ -81,6 +82,7 @@ void install_server(Session& s)
 	items::install_server(s);
 	objects::install_server(s);
 	levels::install_server(s); // F3a
+	monster_fx::install_server(s); // audit A5
 }
 
 void install_client(Endpoint& e)
@@ -105,6 +107,7 @@ void install_client(Endpoint& e)
 	items::install_client(e);
 	objects::install_client(e);
 	levels::install_client(e); // F3a
+	monster_fx::install_client(e); // audit A5
 }
 
 void on_session_started()
@@ -280,6 +283,7 @@ void print_status()
 	presence::print_status();
 	items::print_status();
 	objects::print_status();
+	monster_fx::print_status(); // audit A5
 }
 
 void dump_state(LPCSTR args)

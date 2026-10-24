@@ -120,6 +120,7 @@ inline Need need_of(Msg type)
 	case Msg::ZoneState: // the host sends the zones again when a client is live (host_on_peer_ready)
 	case Msg::MoneyBalance: // the host sends the balance again when its player is live (host_on_peer_in_world)
 	case Msg::DeathMarker:
+	case Msg::MonsterEffect: // audit A5: an effect of a moment, on a monster of a world that is up
 	case Msg::LevelXferDown: // F3a: the world server repeats it until it is acknowledged
 	case Msg::LevelBrain: // 1 Hz, the next one replaces it
 	case Msg::LevelHash: // every 10 s

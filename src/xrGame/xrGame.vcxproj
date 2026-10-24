@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_monster_fx.h" />
     <ClInclude Include="coop\coop_levels.h" />
     <ClInclude Include="coop\coop_game_settings.h" />
     <ClInclude Include="coop\coop_callgate.h" />
@@ -2112,6 +2113,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_monster_fx.cpp" />
     <ClCompile Include="coop\coop_trunk.cpp" />
     <ClCompile Include="coop\coop_mapserver.cpp" />
     <ClCompile Include="coop\coop_levels_xfer.cpp" />

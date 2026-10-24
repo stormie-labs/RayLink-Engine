@@ -113,6 +113,7 @@ const char* msg_name(Msg type)
 	case Msg::RestSleep: return "RestSleep";
 	case Msg::DeathMarker: return "DeathMarker";
 	case Msg::NewCharacter: return "NewCharacter";
+	case Msg::MonsterEffect: return "MonsterEffect";
 
 	case Msg::LevelMap: return "LevelMap";
 	case Msg::LevelMove: return "LevelMove";
@@ -195,6 +196,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::RestState: // F3: the host decides the shared sleep
 	case Msg::RestSleep:
 	case Msg::DeathMarker: // F3: the host moves a dead player's things
+	case Msg::MonsterEffect: // audit A5: the host's monsters decide their abilities
 	case Msg::LevelMap: // F3a: the world server's table of the levels
 	case Msg::LevelMoveResult:
 	case Msg::LevelFlush: // F3a: orders and halves of the world server toward a map server

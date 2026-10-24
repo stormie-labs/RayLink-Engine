@@ -2502,6 +2502,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_monster_fx.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_levels.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7490,6 +7493,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_monster_fx.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_trunk.cpp">
       <Filter>Coop</Filter>
     </ClCompile>

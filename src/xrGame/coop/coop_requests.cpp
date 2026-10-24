@@ -2895,6 +2895,12 @@ void host_on_launch(PeerId from, Reader& r)
 }
 } // namespace
 
+void local_actor_hit(const SHit& hit, CObject* who, CObject* weapon)
+{
+	if (mgr().is_client())
+		apply_to_actor(hit, who, weapon);
+}
+
 // ---------------------------------------------------------------- API
 
 const char* reason_name(Reason r)

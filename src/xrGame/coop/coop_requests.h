@@ -174,5 +174,8 @@ bool host_explode_as(u16 explosive, u16 initiator);
 // Lua: coop.explode_as(explosive_id, initiator_id) -> bool, host numbering. A raw C function for
 // coop::script::register_raw (coop_script.cpp); coop_npc_world.script calls it when present.
 int lua_explode_as(lua_State* L);
+// Client: damage for this machine's actor, authorised as a PlayerHit is (armour, artefacts, callbacks, HUD marks).
+// Audit A5: what a host monster's ability does to us (coop_monster_fx.cpp), played here on the host's word.
+void local_actor_hit(const SHit& hit, CObject* who, CObject* weapon);
 } // namespace requests
 } // namespace coop

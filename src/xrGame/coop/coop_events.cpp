@@ -12,6 +12,7 @@
 #include "coop_dialog.h"
 #include "coop_story.h"
 #include "coop_callgate.h" // F2 T12
+#include "coop_monster_fx.h" // audit A5
 #include "xrCoop/coop_rules.h"
 
 #include "Level.h"
@@ -79,7 +80,7 @@ struct Counters
 {
 	// client router
 	u64 spawns_forwarded = 0, spawns_refused = 0, destroys_forwarded = 0, destroys_blocked = 0;
-	u64 moves_forwarded = 0, moves_blocked = 0, hits_forwarded = 0, hits_blocked = 0, actor_hits_blocked = 0;
+	u64 moves_forwarded = 0, moves_blocked = 0, hits_forwarded = 0, hits_blocked = 0, actor_hits_blocked = 0, ability_hits = 0;
 	u64 deaths_blocked = 0, other_blocked = 0, level_changes = 0, saves_blocked = 0, vehicles_blocked = 0;
 	u64 launches_forwarded = 0, launches_dropped = 0; // W3a: own rockets (ReqLaunch / old drop fallback)
 	u64 echo_dropped = 0; // R4 4: spawns and world-object requests not made from reactions to the host's story
@@ -280,6 +281,13 @@ bool on_hit(NET_Packet& P, u16 dest, u16 type)
 		// Falls, anomalies, radiation, our own explosions: local. A hit from a host-driven
 		// creature or another player's avatar arrives from the host as PlayerHit instead.
 		CGameObject* who = find_go(hit.whoID);
+		if (monster_fx::client_playing())
+		{
+			// Audit A5: a host monster's ability the host sent us plays here (a giant's kick): its strike lands now,
+			// authorised, instead of coming back through the local server where the hook would refuse it
+			requests::local_actor_hit(hit, who, find_go(hit.weaponID));
+			return swallow(g_c.ability_hits);
+		}
 		if (who && who->ID() != kActor && sync::is_remote_driven(who))
 			return swallow(g_c.hits_blocked);
 		return false;
@@ -1018,10 +1026,10 @@ void print_status()
 	      "launches of other players copied / %llu missed",
 	    g_c.launches_forwarded, g_c.launches_dropped, g_c.launches_applied, g_c.launches_missed);
 	::Msg("[coop]   router: spawns %llu fwd / %llu refused, destroys %llu fwd / %llu blocked, moves %llu fwd / %llu "
-	      "blocked, hits %llu fwd / %llu blocked (+%llu direct on actor), deaths blocked %llu, other blocked %llu, "
+	      "blocked, hits %llu fwd / %llu blocked (+%llu direct on actor, %llu monster ability strikes taken), deaths blocked %llu, other blocked %llu, "
 	      "level exits %llu, save/load blocked %llu, vehicles refused %llu",
 	    g_c.spawns_forwarded, g_c.spawns_refused, g_c.destroys_forwarded, g_c.destroys_blocked, g_c.moves_forwarded,
-	    g_c.moves_blocked, g_c.hits_forwarded, g_c.hits_blocked, g_c.actor_hits_blocked, g_c.deaths_blocked,
+	    g_c.moves_blocked, g_c.hits_forwarded, g_c.hits_blocked, g_c.actor_hits_blocked, g_c.ability_hits, g_c.deaths_blocked,
 	    g_c.other_blocked, g_c.level_changes, g_c.saves_blocked, g_c.vehicles_blocked);
 	::Msg("[coop]   events in: parents %llu applied / %llu failed / %llu timed out (%u pending), deaths %llu (%u "
 	      "pending), local %llu spawns / %llu destroys / %llu errors",
@@ -1047,8 +1055,8 @@ bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 	if (coop::hold_loading_screen()) return true; // F3a T8 R1: nobody is hurt behind a held loading screen (a session never pauses)
 	if (mgr().is_host())
 		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
-	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying())
-		return false;
+	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying() || monster_fx::client_playing())
+		return false; // audit A5: a host monster's ability played here on the host's word hurts us directly
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
 	if (!who || who == actor || !sync::is_remote_driven(who))
 		return false;

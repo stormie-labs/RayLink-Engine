@@ -169,6 +169,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::IdLease:
 	case Msg::IdLeaseAck:
 	case Msg::DeathMarker:
+	case Msg::MonsterEffect: // audit A5: the authority of the monster's level decides
 	// a client asks for an entity it misses: the authority of its level answers with the spawn
 	case Msg::StateDumpRequest:
 	case Msg::StateDump: out = Scope::Map; return true;

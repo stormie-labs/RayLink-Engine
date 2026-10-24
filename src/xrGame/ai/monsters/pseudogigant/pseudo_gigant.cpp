@@ -20,6 +20,8 @@
 #include "script_hit.h"
 #include "pch_script.h"
 #include "../../script_game_object.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop: is_remote_player
+#include "../../coop/coop_monster_fx.h" // Anomaly Coop: the kick on a remote player's machine
 
 // demonized: Flag for damaging NPCs and other objects by the stomp attack
 BOOL pseudogiantCanDamageObjects = 1;
@@ -372,15 +374,30 @@ void CPseudoGigant::on_threaten_execute()
 	// играть партиклы
 	PlayParticles(m_kick_particles, pos, Direction());
 
-	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(EnemyMan.get_enemy()));
-	if (!pA) return;
-	if ((pA->MovingState() & ACTOR_DEFS::mcJump) != 0) return;
-    if (pseudogiantDodgeWhileFalling && (pA->MovingState() & ACTOR_DEFS::mcFall) != 0) return;
+	const CEntityAlive* enemy = EnemyMan.get_enemy();
+	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(enemy));
+	if (!pA && !(enemy && coop::npc_ai::is_remote_player(enemy)))
+		return;
 
-	float dist_to_enemy = pA->Position().distance_to(Position());
+	float dist_to_enemy = enemy->Position().distance_to(Position());
 	float hit_value;
 	hit_value = m_kick_damage - m_kick_damage * dist_to_enemy / m_threaten_dist_max;
 	clamp(hit_value, 0.f, 1.f);
+
+	if (!pA)
+	{
+		// Anomaly Coop (audit A5, 2026-10-24): a remote player's character - his machine plays the kick on its actor
+		// (camera, slow-down, the strike), kick_actor there
+		coop::monster_fx::host_send(enemy, this, coop::monster_fx::kGiantKick, 0, hit_value);
+		return;
+	}
+	kick_actor(pA, hit_value);
+}
+
+void CPseudoGigant::kick_actor(CActor* pA, float hit_value)
+{
+	if ((pA->MovingState() & ACTOR_DEFS::mcJump) != 0) return;
+    if (pseudogiantDodgeWhileFalling && (pA->MovingState() & ACTOR_DEFS::mcFall) != 0) return;
 
 	// запустить эффектор
 	Actor()->Cameras().AddCamEffector(xr_new<CMonsterEffectorHit>(m_threaten_effector.ce_time,
