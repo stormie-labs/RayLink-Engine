@@ -213,6 +213,9 @@ bool intercept_actor_kill(CEntity* victim, u16 killer_id);
 // CActor::ActorUse (lead hook) before talking to the person we look at. True = consumed (revive hold
 // started on a wounded player, or refused with a hint).
 bool on_use_person(CInventoryOwner* person);
+// CActor::ActorUse after on_use_person (live 2026-10-25): a wounded teammate in reach and in front of the camera, when the
+// crosshair is on something else (a corpse, an item beside him). True = consumed as on_use_person.
+bool on_use_nearby();
 // players::drive_avatar (lead hook): a wounded / dead player's avatar plays a lying pose instead of the
 // owner's motions. True = pose handled, skip the snapshot motions.
 bool avatar_pose_override(CAI_Stalker* avatar);

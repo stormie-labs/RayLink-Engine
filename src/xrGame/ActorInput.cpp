@@ -539,6 +539,8 @@ void CActor::ActorUse()
 
 	if (m_pPersonWeLookingAt && coop::survival::on_use_person(m_pPersonWeLookingAt)) // Anomaly Coop: revive a wounded teammate
 		return;
+	if (coop::survival::on_use_nearby()) // Anomaly Coop: ... in front of me, the crosshair on a corpse or an item beside him
+		return;
 
 	if (!psActorFlags.test(AF_MULTI_ITEM_PICKUP))
 		m_bPickupMode = true;

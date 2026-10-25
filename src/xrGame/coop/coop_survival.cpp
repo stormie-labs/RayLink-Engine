@@ -2972,6 +2972,36 @@ bool on_use_person(CInventoryOwner* person)
 	return true;
 }
 
+bool on_use_nearby()
+{
+	if (!live())
+		return false;
+	CActor* a = local_actor();
+	if (!a || is_down(g_me.life))
+		return false;
+	static_assert(revive::kPickRange == kReviveRange, "the pick reaches as far as the hold keeps going");
+	xr_vector<PlayerRef> players;
+	collect_players(players, false);
+	std::vector<revive::ReviveCandidate> candidates;
+	for (const PlayerRef& p : players)
+	{
+		CGameObject* o = object_here(p.local_id);
+		if (!o || o == a)
+			continue;
+		const Fvector& pos = o->Position();
+		candidates.push_back({p.local_id, {pos.x, pos.y, pos.z}, life_by_host_id(p.host_id) == Life::Wounded});
+	}
+	const Fvector& eye = Device.vCameraPosition;
+	const Fvector& dir = Device.vCameraDirection;
+	const Fvector& feet = a->Position();
+	const u16 target = revive::pick_revive_target({eye.x, eye.y, eye.z}, {dir.x, dir.y, dir.z}, {feet.x, feet.y, feet.z},
+	    candidates);
+	if (target == revive::kNoTarget)
+		return false;
+	CInventoryOwner* person = smart_cast<CInventoryOwner*>(object_here(target));
+	return person && on_use_person(person);
+}
+
 bool avatar_pose_override(CAI_Stalker* avatar)
 {
 	if (!avatar || !live())

@@ -24,7 +24,9 @@
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "coop_protocol.h" // Writer, Reader
 
@@ -420,5 +422,54 @@ private:
 	bool m_active = false, m_announced = false, m_ever = false;
 	uint64_t m_last = 0;
 };
+// ---------------------------------------------------------------- the target of F
+// Live 2026-10-25 (owner): "sometimes you cannot revive an ally when a corpse or something else clickable lies next to
+// him". F revived only what the crosshair hit (CActor::ActorUse, 2 m ray); a corpse or an item nearer along the ray took
+// the F (loot). A wounded teammate in reach and in front of the camera wins over them.
+struct Vec3
+{
+	float x = 0.f, y = 0.f, z = 0.f;
+};
+struct ReviveCandidate
+{
+	uint16_t id;
+	Vec3 pos; // where he lies (the object's position: the ground under him)
+	bool wounded;
+};
+constexpr uint16_t kNoTarget = 0xffff;
+constexpr float kPickRange = 2.5f; // reach from my feet (= kReviveRange, coop_survival.cpp: the hold needs the same)
+constexpr float kPickCone = 0.70710678f; // cos 45 degrees: in front of the camera
+constexpr float kBodyLift = 0.3f; // a lying body: aim a little above the ground under him
+
+// The wounded teammate F revives: in reach of `feet`, within the cone around `view` from `eye`, the nearest to the middle
+// of the view; kNoTarget if none.
+inline uint16_t pick_revive_target(const Vec3& eye, const Vec3& view, const Vec3& feet,
+	const std::vector<ReviveCandidate>& candidates)
+{
+	const float vl = std::sqrt(view.x * view.x + view.y * view.y + view.z * view.z);
+	if (!(vl > 0.f))
+		return kNoTarget;
+	uint16_t best = kNoTarget;
+	float best_cos = kPickCone;
+	for (const ReviveCandidate& c : candidates)
+	{
+		if (!c.wounded)
+			continue;
+		const float fx = c.pos.x - feet.x, fy = c.pos.y - feet.y, fz = c.pos.z - feet.z;
+		if (fx * fx + fy * fy + fz * fz > kPickRange * kPickRange)
+			continue;
+		const float tx = c.pos.x - eye.x, ty = c.pos.y + kBodyLift - eye.y, tz = c.pos.z - eye.z;
+		const float tl = std::sqrt(tx * tx + ty * ty + tz * tz);
+		if (!(tl > 0.f))
+			continue;
+		const float cosv = (tx * view.x + ty * view.y + tz * view.z) / (tl * vl);
+		if (cosv > best_cos)
+		{
+			best_cos = cosv;
+			best = c.id;
+		}
+	}
+	return best;
+}
 } // namespace revive
 } // namespace coop
