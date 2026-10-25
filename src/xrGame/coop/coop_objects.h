@@ -47,6 +47,7 @@
 #pragma once
 
 class CGameObject;
+class CUsableScriptObject;
 class CCustomZone;
 class CMissile;
 class CBlend;
@@ -81,6 +82,9 @@ void physic_anim(CGameObject* obj, CBlend* blend); // CPhysicObject::UpdateCL: a
 // CUsableScriptObject::use (hook requested from the lead): true = a client use of a physic object was sent
 // to the host; the caller returns true without running the use callback.
 bool client_intercept_use(CGameObject* obj, CGameObject* who);
+// Client: the "Sleep" tip on a sleeping bag (its ph_idle logic runs on the host only); called by CActor's pick when the
+// usable object it looks at has no tip.
+void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj);
 // CHelicopter::UpdateCL (hook requested from the lead): true = placed from host poses, skip own movement.
 bool client_drive_pose(CGameObject* obj);
 

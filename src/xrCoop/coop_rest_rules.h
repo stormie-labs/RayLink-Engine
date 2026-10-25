@@ -21,6 +21,9 @@ namespace coop
 {
 namespace rest
 {
+constexpr uint16_t kNoBag = 0xffff; // a rest that is not on a sleeping bag (a rest zone, a campfire, a faint)
+constexpr uint16_t kNoId = 0xffff; // nobody
+
 enum class State : uint8_t
 {
 	Awake = 0,
@@ -126,9 +129,10 @@ enum class Refusal : uint8_t
 	Combat = 2, // in a fight
 	Dead = 3, // not alive (wounded, dead, respawning)
 	Busy = 4, // the group sleeps now, or the host cannot take it
-	Camp = 5 // T11 review M2: the checkpoint could not be set where he lies (checkpoints::host_set refused it)
+	Camp = 5, // T11 review M2: the checkpoint could not be set where he lies (checkpoints::host_set refused it)
+	Occupied = 6 // owner 2026-10-25: another player rests on this sleeping bag (protocol 14)
 };
-inline bool refusal_ok(uint8_t v) { return v <= uint8_t(Refusal::Camp); }
+inline bool refusal_ok(uint8_t v) { return v <= uint8_t(Refusal::Occupied); }
 
 inline const char* refusal_name(Refusal r)
 {
@@ -139,6 +143,7 @@ inline const char* refusal_name(Refusal r)
 	case Refusal::Dead: return "dead";
 	case Refusal::Busy: return "busy";
 	case Refusal::Camp: return "camp";
+	case Refusal::Occupied: return "occupied";
 	case Refusal::None:
 	default: return "none";
 	}
@@ -149,7 +154,7 @@ inline const char* refusal_name(Refusal r)
 inline Refusal refusal_from_name(const char* s)
 {
 	if (s)
-		for (const Refusal r : {Refusal::Place, Refusal::Combat, Refusal::Dead, Refusal::Busy, Refusal::Camp})
+		for (const Refusal r : {Refusal::Place, Refusal::Combat, Refusal::Dead, Refusal::Busy, Refusal::Camp, Refusal::Occupied})
 		{
 			const char* n = refusal_name(r);
 			size_t i = 0;
@@ -195,8 +200,8 @@ inline Refusal check_lie_down(bool alive, bool group_sleeping, bool forced, bool
 
 // ---------------------------------------------------------------- messages
 
-// RestRequest, client -> host: u8 op, u8 hours, u8 forced (0 / 1), nothing after. The host clamps the hours; a get-up
-// carries 0, 0.
+// RestRequest, client -> host: u8 op, u8 hours, u8 forced (0 / 1), u16 bag (protocol 14: the host id of the sleeping bag
+// he lies on, kNoBag if none), nothing after. The host clamps the hours; a get-up carries 0, 0, kNoBag.
 enum class Op : uint8_t
 {
 	LieDown = 1,
@@ -207,6 +212,7 @@ struct Request
 	Op op = Op::GetUp;
 	uint8_t hours = 0;
 	bool forced = false;
+	uint16_t bag = kNoBag;
 };
 
 inline void write_request(Writer& w, const Request& r)
@@ -214,6 +220,7 @@ inline void write_request(Writer& w, const Request& r)
 	w.u8(uint8_t(r.op));
 	w.u8(r.hours);
 	w.u8(r.forced ? 1 : 0);
+	w.u16(r.bag);
 }
 
 inline bool read_request(Reader& rd, Request& out)
@@ -221,11 +228,13 @@ inline bool read_request(Reader& rd, Request& out)
 	const uint8_t op = rd.u8();
 	const uint8_t hours = rd.u8();
 	const uint8_t forced = rd.u8();
+	const uint16_t bag = rd.u16();
 	if (!rd.ok() || rd.remaining() != 0 || (op != uint8_t(Op::LieDown) && op != uint8_t(Op::GetUp)) || forced > 1)
 		return false;
 	out.op = static_cast<Op>(op);
 	out.hours = hours;
 	out.forced = forced != 0;
+	out.bag = bag;
 	return true;
 }
 
@@ -346,7 +355,8 @@ public:
 	// he is in a fight now (only a forced rest starts in one). A fight that begins later ends the rest (tick). Lying
 	// down again takes the new wish. False while the shared sleep runs, or when the book holds kMaxPlayers rests already
 	// and he is not one of them.
-	bool lie_down(uint16_t id, int hours, bool forced, bool in_combat)
+	// `bag`: the sleeping bag he lies on (kNoBag: none); one rest per bag (bag_taker, checked by the engine before).
+	bool lie_down(uint16_t id, int hours, bool forced, bool in_combat, uint16_t bag = kNoBag)
 	{
 		if (m_sleep)
 			return false;
@@ -358,8 +368,21 @@ public:
 		r.hours = clamp_hours(hours);
 		r.forced = forced;
 		r.fighting = in_combat;
+		r.bag = bag;
 		m_rest[id] = r;
 		return true;
+	}
+
+	// Who else rests (or sleeps) on this sleeping bag: kNoId if nobody but `except` (his own new wish takes the bag again).
+	// A rest without a bag (kNoBag) takes no place from anybody.
+	uint16_t bag_taker(uint16_t bag, uint16_t except) const
+	{
+		if (bag == kNoBag)
+			return kNoId;
+		for (const auto& kv : m_rest)
+			if (kv.first != except && kv.second.bag == bag)
+				return kv.first;
+		return kNoId;
 	}
 
 	// He is awake (his own word, or the host ends his rest). True if he was not.
@@ -565,6 +588,7 @@ private:
 		uint8_t hours = 1;
 		bool forced = false;
 		bool fighting = false; // in a fight at the last tick (or when he lay down)
+		uint16_t bag = kNoBag; // the sleeping bag he lies on
 	};
 
 	static const Seen* find(const std::vector<Seen>& sorted, uint16_t id)

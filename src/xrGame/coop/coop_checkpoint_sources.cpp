@@ -1142,6 +1142,12 @@ u16 host_tent_owner(u16 tent)
 
 // ---------------------------------------------------------------- any machine
 
+bool is_sleeping_bag(const shared_str& section)
+{
+	settings(); // a client reads the section names too
+	return what_of(section) == u8(ClaimWhat::Sleepbag);
+}
+
 bool claim_tent(ClaimWhat what, const Fvector& pos)
 {
 	if (!(mgr().is_host() || mgr().is_live_client()) || !pos_ok(pos))

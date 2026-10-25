@@ -10,6 +10,7 @@
 #include "coop_events.h"
 #include "coop_alife.h"
 #include "coop_story.h"
+#include "coop_checkpoint_sources.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 
@@ -170,7 +171,7 @@ struct Counters
 	    throws_malformed = 0, consume_forced = 0; // R3 В7
 	// client
 	u64 samples_in = 0, rests_in = 0, poses_applied = 0, rests_applied = 0, mismatch = 0, zones_applied = 0,
-	    explode_applied = 0, explode_fallback = 0, destroyed_applied = 0, broken_applied = 0, uses_sent = 0,
+	    explode_applied = 0, explode_fallback = 0, destroyed_applied = 0, broken_applied = 0, uses_sent = 0, sleeping_bags_used = 0,
 	    pushes_sent = 0, throws_sent = 0, activations_sent = 0, forced_online = 0, explode_blocked = 0,
 	    switches_blocked = 0;
 	u64 dropped_before_live = 0; // R2 I2: EntityState / ZoneState that came before we were live
@@ -2064,8 +2065,9 @@ void print_status()
 		    g_c.zones_applied, (u32)g_zone_pending.size(), g_c.explode_applied, g_c.explode_fallback,
 		    g_c.destroyed_applied, g_c.broken_applied, g_c.explode_blocked, g_c.switches_blocked);
 		::Msg("[coop]   objects req: %llu uses (%llu dropped as story echo), %llu pushes, %llu throws, "
-		    "%llu artefact activations sent",
-		    g_c.uses_sent, g_c.uses_echo_dropped, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent);
+		    "%llu artefact activations sent; %llu sleeping bags used here",
+		    g_c.uses_sent, g_c.uses_echo_dropped, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent,
+		    g_c.sleeping_bags_used);
 		::Msg("[coop]   objects in: %llu state / zone messages dropped before live (R2 I2)", g_c.dropped_before_live);
 	}
 }
@@ -2138,6 +2140,20 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 		return false;
 	if (who->ID() != kActor || !smart_cast<CPhysicObject*>(obj) || obj->H_Parent())
 		return false;
+	// Live 2026-10-25: a client could not sleep on a sleeping bag ("F does not press"). The stock sleep is the user's own
+	// window (item_tent physic_object_on_use_callback -> ui_sleep_dialog.sleep_bag), which a Use sent to the host never
+	// opens here. A sleeping bag's use stays on this machine: Lua opens the window, the host decides the sleep (coop_rest:
+	// the place, one sleeper per bag).
+	if (checkpoints::sources::is_sleeping_bag(obj->cNameSect()))
+	{
+		::luabind::functor<void> use_bag;
+		if (ai().script_engine().functor("coop_rest.use_sleep_place", use_bag))
+		{
+			use_bag(obj->lua_game_object());
+			++g_c.sleeping_bags_used;
+		}
+		return true;
+	}
 	// the host runs the same story reaction on its side: a second Use from us would toggle the object twice
 	if (rules::client_echo(story::applying(), false, false) == rules::Echo::Drop)
 	{
@@ -2153,6 +2169,14 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 		++g_c.uses_sent;
 	}
 	return true;
+}
+
+void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj)
+{
+	if (!usable || !obj || !mgr().is_client() || usable->tip_text())
+		return;
+	if (checkpoints::sources::is_sleeping_bag(obj->cNameSect()))
+		usable->set_tip_text("st_sleep"); // the stock ph_sleepbag.ltx tip
 }
 
 bool client_drive_pose(CGameObject* obj)

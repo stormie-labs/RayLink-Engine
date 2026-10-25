@@ -273,6 +273,11 @@ void host_request(u16 character, const Request& rq)
 	Refusal why = check_lie_down(alive, g_host.group.sleeping(), rq.forced, fight, place != Place::None);
 	if (why == Refusal::None && !g_host.group.may_lie_down(character))
 		why = Refusal::Busy; // asked before the camp is set: a camp never comes without the rest
+	// Owner 2026-10-25: one sleeping bag, one sleeper ("this sleeping bag is taken"). The host's book is the only judge, so
+	// two players pressing at once still get one bag: the second word is refused here.
+	const u16 bag = rq.forced ? kNoBag : rq.bag;
+	if (why == Refusal::None && g_host.group.bag_taker(bag, character) != rest::kNoId)
+		why = Refusal::Occupied;
 	if (why != Refusal::None)
 		return refuse(character, why);
 	// T11 review M2: a rest that is not a faint always comes with his camp there (CHECKPOINTS_DEATH §4.1). A camp the
@@ -283,10 +288,11 @@ void host_request(u16 character, const Request& rq)
 			return refuse(character, Refusal::Camp);
 		++g_stat.camps;
 	}
-	g_host.group.lie_down(character, int(rq.hours), rq.forced, fight); // may_lie_down said it takes him
+	g_host.group.lie_down(character, int(rq.hours), rq.forced, fight, bag); // may_lie_down said it takes him
 	if (log_allowed(g_stat.lie_downs))
-		::Msg("[coop] rest: character %u rests %u h (%s%s)", character, u32(g_host.group.hours_of(character)),
-		    rq.forced ? "passed out" : checkpoints::sources::place_name(place), fight ? ", in a fight" : "");
+		::Msg("[coop] rest: character %u rests %u h (%s%s%s)", character, u32(g_host.group.hours_of(character)),
+		    rq.forced ? "passed out" : checkpoints::sources::place_name(place), fight ? ", in a fight" : "",
+		    bag != kNoBag ? ", on a sleeping bag" : "");
 }
 
 // The hours skipped as stock change_game_time does (level_script.cpp): the environment's clock and ALife's.
@@ -524,7 +530,7 @@ void player_frame()
 
 // ---------------------------------------------------------------- this machine's word
 
-bool say(Op op, int hours, bool forced)
+bool say(Op op, int hours, bool forced, u16 bag = kNoBag)
 {
 	if (!mgr().is_host() && !mgr().is_live_client())
 		return false;
@@ -532,6 +538,7 @@ bool say(Op op, int hours, bool forced)
 	p.rq.op = op;
 	p.rq.hours = op == Op::LieDown ? clamp_hours(hours) : u8(0);
 	p.rq.forced = op == Op::LieDown && forced;
+	p.rq.bag = op == Op::LieDown && !forced ? bag : kNoBag;
 	p.world = join::world_generation();
 	g_pending = p; // the word first (R1), then the flag
 	g_pending_on.store(true, std::memory_order_release);
@@ -584,7 +591,7 @@ bool arg_id(lua_State* L, int idx, u16& out)
 	return true;
 }
 
-// coop.rest.lie_down(hours [, forced]) -> bool
+// coop.rest.lie_down(hours [, forced [, bag]]) -> bool; bag: the local id of the sleeping bag he lies on (protocol 14)
 int l_lie_down(lua_State* L)
 {
 	bool ok = lua_type(L, 1) == LUA_TNUMBER;
@@ -594,7 +601,14 @@ int l_lie_down(lua_State* L)
 	ok = ok && (t == LUA_TNONE || t == LUA_TNIL || t == LUA_TBOOLEAN);
 	const bool forced = t == LUA_TBOOLEAN && lua_toboolean(L, 2) != 0;
 	const int hours = h < 0.0 ? 0 : (h > 24.0 ? 24 : int(h)); // clamp_hours makes 0 an hour
-	lua_pushboolean(L, ok && say(Op::LieDown, hours, forced) ? 1 : 0);
+	u16 bag = kNoBag;
+	if (lua_type(L, 3) == LUA_TNUMBER)
+	{
+		const double b = double(lua_tonumber(L, 3));
+		if (std::isfinite(b) && b >= 0.0 && b < double(kNoBag))
+			bag = join::to_host(u16(b));
+	}
+	lua_pushboolean(L, ok && say(Op::LieDown, hours, forced, bag) ? 1 : 0);
 	return 1;
 }
 

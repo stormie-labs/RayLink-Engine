@@ -8,6 +8,7 @@
 #include "alife_space.h"
 #include "hit.h"
 #include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_objects.h" // Anomaly Coop: client_usable_tip
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -2027,6 +2028,7 @@ void CActor::shedule_Update(u32 DT)
 
 		if (GameID() == eGameIDSingle)
 		{
+			coop::objects::client_usable_tip(m_pUsableObject, game_object); // Anomaly Coop: a client's sleeping bag
 			if (m_pUsableObject && m_pUsableObject->tip_text())
 			{
 				m_sDefaultObjAction = CStringTable().translate(m_pUsableObject->tip_text());

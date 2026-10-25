@@ -98,6 +98,8 @@ void host_claim_tent(u16 character, checkpoint::ClaimWhat what, const Fvector& p
 u16 host_tent_owner(u16 tent);
 // Any machine: coop.checkpoint.claim_tent. True if the claim was handed to the host.
 bool claim_tent(checkpoint::ClaimWhat what, const Fvector& pos);
+// Any machine: an object of this section is a sleeping bag a player sleeps on (sleepbag_section; live 2026-10-25).
+bool is_sleeping_bag(const shared_str& section);
 } // namespace sources
 } // namespace checkpoints
 } // namespace coop

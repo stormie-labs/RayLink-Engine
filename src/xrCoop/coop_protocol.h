@@ -58,7 +58,9 @@ namespace coop
 //    CreatureHolds (+ CreatureStrapped) and a u16 id after the anims.
 // 13 (live 2026-10-24: "the NPC does not point its gun and walks oddly sideways in front of the client"): EntitySnapshot
 //    carries a stalker's aim, CreatureAims and 3 quaternions (spine, shoulder, head bone rotations) after the item id.
-constexpr uint32_t kProtocolVersion = 13;
+// 14 (owner 2026-10-25: one sleeping bag, one sleeper): RestRequest ends with `u16 bag` (coop_rest_rules.h), refusal 6
+//    "occupied".
+constexpr uint32_t kProtocolVersion = 14;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
