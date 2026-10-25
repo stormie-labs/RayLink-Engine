@@ -1148,6 +1148,12 @@ bool is_sleeping_bag(const shared_str& section)
 	return what_of(section) == u8(ClaimWhat::Sleepbag);
 }
 
+bool is_tent(const shared_str& section)
+{
+	settings();
+	return what_of(section) == u8(ClaimWhat::Tent);
+}
+
 bool claim_tent(ClaimWhat what, const Fvector& pos)
 {
 	if (!(mgr().is_host() || mgr().is_live_client()) || !pos_ok(pos))

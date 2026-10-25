@@ -100,6 +100,8 @@ u16 host_tent_owner(u16 tent);
 bool claim_tent(checkpoint::ClaimWhat what, const Fvector& pos);
 // Any machine: an object of this section is a sleeping bag a player sleeps on (sleepbag_section; live 2026-10-25).
 bool is_sleeping_bag(const shared_str& section);
+// Any machine: an object of this section is a tent players put up (tent_section).
+bool is_tent(const shared_str& section);
 } // namespace sources
 } // namespace checkpoints
 } // namespace coop
