@@ -431,6 +431,17 @@ bool save(Reason why)
 		::Msg("! [coop] autosave (%s) skipped: the host's level cannot be saved now", reason_name(why));
 		return false;
 	}
+	// Live 2026-10-25 (owner: "loaded the game from the moment I quit dead: a black screen"). A down host is alive for the
+	// engine with 1% health; a save then (the end of the session when he quits dead, or a timed one past its postpone)
+	// loads him dying: no health, no limbs, the screen black. No save of any reason while the host's character is down:
+	// the last good one stays.
+	if (survival::life_of(0) != survival::Life::Alive)
+	{
+		++g_stat.skipped;
+		::Msg("! [coop] autosave (%s) skipped: the host's character is down (%s), the last save stays", reason_name(why),
+		    survival::life_name(survival::life_of(0)));
+		return false;
+	}
 	const u64 started = mgr().now_ms();
 	if (!begin_temp())
 	{
