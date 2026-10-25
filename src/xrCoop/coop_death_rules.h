@@ -417,6 +417,15 @@ inline BodyPose body_pose(uint8_t life)
 	return BodyPose::Standing; // alive, or a number no Life has
 }
 
+// Live 2026-10-25 (owner): "when somebody dies for good while lying there is no animation of his death". The dead pose is
+// a looping wounded idle (stalkers have no death motions, they fall as ragdolls): a dead body breathed like a wounded one.
+// It makes its last move and lies still kDeathStillMs after the death (a clock that went back: still at once).
+constexpr uint64_t kDeathStillMs = 1000;
+inline bool body_still(BodyPose pose, uint64_t died_ms, uint64_t now_ms)
+{
+	return pose == BodyPose::Dead && (now_ms < died_ms || now_ms - died_ms >= kDeathStillMs);
+}
+
 // The own camera does not turn with the mouse (and the body with it): dead, out of the run, being respawned. A wounded
 // player looks around. Fire / Aim still switch the watched teammate (they are keys, not the mouse).
 inline bool look_locked(uint8_t life)

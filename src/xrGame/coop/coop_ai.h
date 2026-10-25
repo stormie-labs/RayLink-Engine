@@ -36,6 +36,10 @@ namespace npc_ai
 bool is_player(const CObject* obj);
 // A player character that is not this machine's actor, while a session runs (on the host: a client's proxy).
 bool is_remote_player(const CObject* obj);
+// Live 2026-10-25 (owner): "when somebody died, why do NPCs go on shooting the corpse". A player who is down stays alive for
+// the engine (he can be revived); one dead for good, out of the run or being respawned is no enemy (CEnemyManager::useful).
+// A wounded one still is: an enemy may finish him.
+bool player_out_of_fight(const CObject* obj);
 
 // Host, main thread, every frame of a driven player proxy (remote::apply): refreshes its light estimate
 // (twice a second) and its view direction.

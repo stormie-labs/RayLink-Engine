@@ -79,6 +79,8 @@ bool CEnemyManager::useful(const CEntityAlive* entity_alive) const
 	PROF_EVENT("CEnemyManager::useful");
 	if (!entity_alive->g_Alive())
 		return (false);
+	if (coop::npc_ai::player_out_of_fight(entity_alive)) // Anomaly Coop: a dead player's body is no enemy
+		return (false);
 
 	if ((entity_alive->SpatialComponent->spatial.type & STYPE_VISIBLEFORAI) != STYPE_VISIBLEFORAI)
 		return (false);

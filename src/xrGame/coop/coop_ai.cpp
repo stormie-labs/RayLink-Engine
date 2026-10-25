@@ -140,6 +140,14 @@ const Proxy* fresh_record(u16 id)
 }
 } // namespace
 
+bool player_out_of_fight(const CObject* obj)
+{
+	if (!obj || !mgr().active() || !is_player(obj))
+		return false;
+	const survival::Life l = survival::life_of(obj->ID());
+	return l == survival::Life::Dead || l == survival::Life::Spectating || l == survival::Life::Respawning;
+}
+
 bool is_player(const CObject* obj)
 {
 	if (!obj)

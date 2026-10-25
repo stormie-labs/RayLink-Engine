@@ -21,6 +21,8 @@
 #include "Torch.h"
 #include "Weapon.h"
 #include "sight_manager.h"
+#include "object_handler_planner.h"
+#include "object_handler_space.h"
 #include "inventory_item.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
@@ -304,8 +306,15 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 			return false; // not in its inventory here yet
 	}
 	ClientApply scope; // local inventory moves of the puppet pass the client router
-	stalker->CObjectHandler::set_goal(
-		(flags & CreatureStrapped) ? MonsterSpace::eObjectActionStrapped : MonsterSpace::eObjectActionIdle, item);
+	const bool strapped = (flags & CreatureStrapped) != 0;
+	stalker->CObjectHandler::set_goal(strapped ? MonsterSpace::eObjectActionStrapped : MonsterSpace::eObjectActionIdle, item);
+	// Live 2026-10-25 (build 21): "an NPC at a campfire drinks beer with his gun in the same hand". The weapon goes on the
+	// back only when the torso animation of strapping ends (CObjectActionStrapping::on_animation_end sets
+	// eWorldPropertyStrapped, which CObjectHandler::weapon_bones reads); a puppet plays the host's motions, so that end
+	// never comes and the weapon stayed in the right hand. The host's word sets the planner's world state itself.
+	CPropertyStorage& world = stalker->CObjectHandler::planner().m_storage;
+	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped, strapped);
+	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped2Idle, false);
 	return done;
 }
 

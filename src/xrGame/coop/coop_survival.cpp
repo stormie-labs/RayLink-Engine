@@ -305,6 +305,7 @@ struct Pose
 	bool missing = false; // the visual has none of the candidate motions
 	const IKinematicsAnimated* visual = nullptr; // the visual `motion` was looked up in (compared, never called)
 	bool logged = false; // a missing pose was told (once, until the character stands up)
+	u64 since = 0; // when this pose began (a dead body lies still after its last move)
 };
 xr_map<u16, Pose> g_poses;
 // Build 10: my own actor's pose (own_pose_frame). While it holds, g_pose_actor names that actor: its own motions are off
@@ -2284,6 +2285,7 @@ bool hold_pose(Pose& p, IKinematicsAnimated* ka, Life life, const char* who, u16
 		p.visual = ka;
 		p.motion = find_pose(ka, pose_life);
 		p.missing = !p.motion.valid();
+		p.since = now();
 		if (p.missing && !p.logged)
 		{
 			p.logged = true;
@@ -2295,6 +2297,12 @@ bool hold_pose(Pose& p, IKinematicsAnimated* ka, Life life, const char* who, u16
 		return false;
 	if (!blend_playing(ka, p.motion))
 		ka->PlayCycle(p.motion, TRUE);
+	if (death::body_still(want, p.since, now())) // the last move is over: the dead body does not breathe
+		for (u32 part = 0; part < 4; ++part)
+			for (u32 i = 0, n = ka->LL_PartBlendsCount(part); i < n; ++i)
+				if (CBlend* b = ka->LL_PartBlend(part, i))
+					if (b->motionID == p.motion)
+						b->speed = 0.f;
 	return true;
 }
 
