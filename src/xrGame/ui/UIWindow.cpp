@@ -1,0 +1,882 @@
+#include "stdafx.h"
+#include "UIWindow.h"
+#include "../UICursor.h"
+#include "../MainMenu.h"
+
+#include "../Include/xrRender/DebugRender.h"
+#include "../Include/xrRender/UIRender.h"
+#include "../UIGameCustom.h"
+#include "../ui/UIDialogWnd.h"
+//#include "UIHelper.h"
+//#include "UIHint.h"
+//#include "../ScriptXMLInit.h"
+
+
+poolSS<_12b, 128> ui_allocator;
+
+// #define LOG_ALL_WNDS
+#ifdef LOG_ALL_WNDS
+	int ListWndCount = 0;
+	struct DBGList{
+		int				num;
+		bool			closed;
+	};
+	xr_vector<DBGList>	dbg_list_wnds;
+	void dump_list_wnd(){
+		Msg("------Total  wnds %d",dbg_list_wnds.size());
+		xr_vector<DBGList>::iterator _it = dbg_list_wnds.begin();
+		for(;_it!=dbg_list_wnds.end();++_it)
+			if(!(*_it).closed)
+				Msg("--leak detected ---- wnd = %d",(*_it).num);
+	}
+#else
+void dump_list_wnd()
+{
+}
+#endif
+
+xr_vector<Frect> g_wnds_rects;
+BOOL g_show_wnd_rect2 = FALSE;
+
+void clean_wnd_rects()
+{
+#ifdef DEBUG
+	DRender->DestroyDebugShader(IDebugRender::dbgShaderWindow);
+#endif // DEBUG
+}
+
+void add_rect_to_draw(Frect r)
+{
+	g_wnds_rects.push_back(r);
+}
+
+void draw_rect(Frect& r, u32 color)
+{
+#ifdef DEBUG
+
+	DRender->SetDebugShader(IDebugRender::dbgShaderWindow);
+
+//.	UIRender->StartLineStrip	(5);
+	UIRender->StartPrimitive	(5, IUIRender::ptLineStrip, UI().m_currentPointType);
+
+	UIRender->PushPoint(r.lt.x, r.lt.y, 0, color, 0,0);
+	UIRender->PushPoint(r.rb.x, r.lt.y, 0, color, 0,0);
+	UIRender->PushPoint(r.rb.x, r.rb.y, 0, color, 0,0);
+	UIRender->PushPoint(r.lt.x, r.rb.y, 0, color, 0,0);
+	UIRender->PushPoint(r.lt.x, r.lt.y, 0, color, 0,0);
+
+//.	UIRender->FlushLineStrip();
+	UIRender->FlushPrimitive();
+	
+#endif // DEBUG
+}
+
+void draw_wnds_rects()
+{
+	if (0 == g_wnds_rects.size()) return;
+
+	xr_vector<Frect>::iterator it = g_wnds_rects.begin();
+	xr_vector<Frect>::iterator it_e = g_wnds_rects.end();
+
+	for (; it != it_e; ++it)
+	{
+		Frect& r = *it;
+		UI().ClientToScreenScaled(r.lt, r.lt.x, r.lt.y);
+		UI().ClientToScreenScaled(r.rb, r.rb.x, r.rb.y);
+		draw_rect(r, color_rgba(255, 0, 0, 255));
+	};
+
+	g_wnds_rects.clear();
+}
+
+void CUIWindow::SetPPMode()
+{
+	m_bPP = true;
+	MainMenu()->RegisterPPDraw(this);
+	Show(false);
+};
+
+void CUIWindow::ResetPPMode()
+{
+	if (GetPPMode())
+	{
+		MainMenu()->UnregisterPPDraw(this);
+		m_bPP = false;
+	}
+}
+
+// Windows that have taken the mouse, oldest first; the top one receives all mouse input. Nesting is
+// a transient grab (a scrollbar drag) on top of a lasting one (an open popup), so a release restores
+// the previous holder instead of leaving nobody in charge.
+static xr_vector<CUIWindow*> s_capture_stack;
+
+static void erase_capture(CUIWindow* w)
+{
+	auto it = std::find(s_capture_stack.begin(), s_capture_stack.end(), w);
+	if (it != s_capture_stack.end())
+		s_capture_stack.erase(it);
+}
+
+static bool capture_inside(CUIWindow* c, CUIWindow* w)
+{
+	for (CUIWindow* p = c; p; p = p->GetParent())
+		if (p == w)
+			return true;
+	return false;
+}
+
+static void erase_capture_subtree(CUIWindow* w)
+{
+	s_capture_stack.erase(
+		std::remove_if(s_capture_stack.begin(), s_capture_stack.end(),
+		               [w](CUIWindow* c) { return capture_inside(c, w); }),
+		s_capture_stack.end());
+}
+
+CUIWindow::CUIWindow()
+	: m_pParentWnd(NULL),
+	  m_pMessageTarget(NULL),
+	  m_pKeyboardCapturer(NULL),
+	  m_bAutoDelete(false),
+	  //m_pHint(NULL),
+	  m_bCursorOverWindow(false),
+	  m_bPP(false),
+	  m_dwFocusReceiveTime(0),
+	  //dwHintDelay(1000),
+	  //bShowHint(false),
+	  //m_sHint(""),
+	  m_bCustomDraw(false)
+{
+	Show(true);
+	Enable(true);
+#ifdef LOG_ALL_WNDS
+	ListWndCount++;
+	m_dbg_id = ListWndCount;
+	dbg_list_wnds.push_back(DBGList());
+	dbg_list_wnds.back().num		= m_dbg_id;
+	dbg_list_wnds.back().closed		= false;
+#endif
+}
+
+CUIWindow::~CUIWindow()
+{
+	VERIFY(!(GetParent()&&IsAutoDelete()));
+
+	erase_capture_subtree(this);
+
+	//if (m_pHint)
+	//	xr_delete(m_pHint);
+
+    if (CurrentGameUI())
+    {
+        CurrentGameUI()->RemoveDialogToRender(this);
+    }
+
+	CUIWindow* parent = GetParent();
+	bool ad = IsAutoDelete();
+	if (parent && !ad)
+		parent->CUIWindow::DetachChild(this);
+
+	if (!m_ChildWndList.empty()) {
+		DetachAll();
+	}
+
+	if (GetPPMode())
+		MainMenu()->UnregisterPPDraw(this);
+
+    CollectGarbage();
+
+#ifdef LOG_ALL_WNDS
+	xr_vector<DBGList>::iterator _it = dbg_list_wnds.begin();
+	bool bOK = false;
+	for(;_it!=dbg_list_wnds.end();++_it){
+		if( (*_it).num==m_dbg_id && !(*_it).closed){
+			bOK = true;
+			(*_it).closed = true;
+			dbg_list_wnds.erase(_it);
+			break;
+		}
+		if( (*_it).num==m_dbg_id && (*_it).closed){
+			Msg("--CUIWindow [%d] already deleted", m_dbg_id);
+			bOK = true;
+		}
+	}
+	if(!bOK)
+		Msg("CUIWindow::~CUIWindow.[%d] cannot find window in list", m_dbg_id);
+#endif
+}
+
+
+void CUIWindow::Draw()
+{
+	PROF_EVENT("CUIWindow::Draw");
+	xrCriticalSectionGuard guard(csUi);
+	for (CUIWindow* W : m_ChildWndList)
+	{
+		if (!W)		continue;
+		if (!W->IsShown())		continue;
+		if (W->GetCustomDraw())	continue;
+		W->Draw();
+	}
+#ifdef DEBUG
+	if (g_show_wnd_rect2) {
+		Frect r;
+		GetAbsoluteRect(r);
+		add_rect_to_draw(r);
+	}
+#endif
+}
+
+void CUIWindow::Draw(float x, float y)
+{
+	PROF_EVENT("CUIWindow::Draw");
+	SetWndPos(Fvector2().set(x, y));
+	Draw();
+}
+
+void CUIWindow::Update()
+{
+	PROF_EVENT("CUIWindow::Update");
+	CUIDialogWnd* TIR = CurrentGameUI() ? CurrentGameUI()->TopInputReceiver() : nullptr;
+
+	if (GetUICursor().IsVisible() || (TIR && !TIR->NeedCursor()))
+	{
+		bool cursor_on_window;
+
+		Fvector2 temp = GetUICursor().GetCursorPosition();
+		Frect r;
+		GetAbsoluteRect(r);
+		cursor_on_window = !!r.in(temp) && HitClipPass(temp);
+		// RECEIVE and LOST focus
+		if (m_bCursorOverWindow != cursor_on_window)
+		{
+			if (cursor_on_window)
+				OnFocusReceive();
+			else
+				OnFocusLost();
+		}
+	}
+
+    {
+        xrCriticalSectionGuard guard(csUi);
+        for (WINDOW_LIST_it it = m_ChildWndList.begin(); m_ChildWndList.end() != it; ++it)
+        {
+            if (!(*it)->IsShown()) continue;
+            (*it)->Update();
+        }
+    }
+
+    CollectGarbage();
+}
+
+void CUIWindow::CollectGarbage()
+{
+    if (m_ChildWndToDelete.empty())
+        return;
+
+    WINDOW_LIST temp;
+    temp.swap(m_ChildWndToDelete);
+    for (CUIWindow* pChild : temp)
+    {
+        if (pChild)
+            xr_delete(pChild);
+    }
+}
+
+void CUIWindow::AttachChild(CUIWindow* pChild)
+{
+	R_ASSERT(pChild);
+	if (!pChild) return;
+
+	// Ncenka: Print in console instead of crash
+	if (IsChild(pChild)) {
+		Msg("!CUIWindow::AttachChild, %s child element is already attached to %s", pChild->WindowName_script(), WindowName_script());
+		return;
+	}
+
+	pChild->SetParent(this);
+
+	xrCriticalSectionGuard guard(csUi);
+	m_ChildWndList.push_back(pChild);
+}
+
+void CUIWindow::DetachChild(CUIWindow* pChild)
+{
+	R_ASSERT(pChild);
+	if (NULL == pChild)
+		return;
+
+	erase_capture_subtree(pChild);
+
+	{
+		xrCriticalSectionGuard guard(csUi);
+
+		//.	SafeRemoveChild			(pChild);
+		WINDOW_LIST_it it = std::find(m_ChildWndList.begin(), m_ChildWndList.end(), pChild);
+		R_ASSERT(it != m_ChildWndList.end());
+		m_ChildWndList.erase(it);
+	}
+
+	pChild->SetParent(NULL);
+
+    if (pChild->IsAutoDelete())
+        if (std::find(m_ChildWndToDelete.begin(), m_ChildWndToDelete.end(), pChild) == m_ChildWndToDelete.end())
+            m_ChildWndToDelete.push_back(pChild);
+}
+
+void CUIWindow::DetachAll()
+{
+	xrCriticalSectionGuard guard(csUi);
+
+	while (!m_ChildWndList.empty())
+	{
+		DetachChild(m_ChildWndList.back());
+	}
+}
+
+void CUIWindow::GetAbsoluteRect(Frect& r)
+{
+	if (GetParent() == NULL)
+	{
+		GetWndRect(r);
+		return;
+	}
+	GetParent()->GetAbsoluteRect(r);
+
+	Frect rr;
+	GetWndRect(rr);
+	r.left += rr.left;
+	r.top += rr.top;
+	r.right = r.left + GetWidth();
+	r.bottom = r.top + GetHeight();
+}
+
+//реакция на мышь
+//координаты курсора всегда, кроме начального вызова 
+//задаются относительно текущего окна
+
+#define DOUBLE_CLICK_TIME 250
+
+bool CUIWindow::OnMouseAction(float x, float y, EUIMessages mouse_action)
+{
+	Frect wndRect = GetWndRect();
+
+	cursor_pos.x = x;
+	cursor_pos.y = y;
+
+
+	if (WINDOW_LBUTTON_DOWN == mouse_action)
+	{
+		static u32 _last_db_click_frame = 0;
+		u32 dwCurTime = Device.dwTimeContinual;
+
+		if ((_last_db_click_frame != Device.dwFrame) && (dwCurTime - m_dwLastClickTime < DOUBLE_CLICK_TIME))
+		{
+			mouse_action = WINDOW_LBUTTON_DB_CLICK;
+			_last_db_click_frame = Device.dwFrame;
+		}
+
+		m_dwLastClickTime = dwCurTime;
+	}
+
+	if (GetParent() == NULL)
+	{
+		// the window that captured the mouse gets every message, wherever the cursor is
+		CUIWindow* cap = MouseCapturer();
+		if (cap && cap != this)
+		{
+			CUIWindow* cap_root = cap;
+			while (cap_root->GetParent())
+				cap_root = cap_root->GetParent();
+
+			if (cap_root == this || cap_root == cap) // our tree, or an unattached capturer
+			{
+				Frect cap_rect;
+				cap->GetAbsoluteRect(cap_rect);
+				Fvector2 cur = GetUICursor().GetCursorPosition();
+				cap->OnMouseAction(cur.x - cap_rect.left, cur.y - cap_rect.top, mouse_action);
+				return true;
+			}
+		}
+
+		if (!wndRect.in(cursor_pos))
+			return false;
+		//получить координаты относительно окна
+		cursor_pos.x -= wndRect.left;
+		cursor_pos.y -= wndRect.top;
+	}
+
+	// handle any action
+	switch (mouse_action)
+	{
+	case WINDOW_MOUSE_MOVE:
+		OnMouseMove();
+		break;
+	case WINDOW_MOUSE_WHEEL_DOWN:
+		OnMouseScroll(WINDOW_MOUSE_WHEEL_DOWN);
+		break;
+	case WINDOW_MOUSE_WHEEL_UP:
+		OnMouseScroll(WINDOW_MOUSE_WHEEL_UP);
+		break;
+	case WINDOW_LBUTTON_DOWN:
+		if (OnMouseDown(MOUSE_1)) return true;
+		break;
+	case WINDOW_RBUTTON_DOWN:
+		if (OnMouseDown(MOUSE_2)) return true;
+		break;
+	case WINDOW_CBUTTON_DOWN:
+		if (OnMouseDown(MOUSE_3)) return true;
+		break;
+	case WINDOW_LBUTTON_DB_CLICK:
+		if (OnDbClick()) return true;
+		break;
+	default:
+		break;
+	}
+
+	//Проверка на попадание мыши в окно,
+	//происходит в обратном порядке, чем рисование окон
+	//(последние в списке имеют высший приоритет)
+	xrCriticalSectionGuard guard(csUi);
+	WINDOW_LIST::reverse_iterator it = m_ChildWndList.rbegin();
+
+	for (; it != m_ChildWndList.rend(); ++it)
+	{
+		CUIWindow* w = (*it);
+		Frect wndRect = w->GetWndRect();
+		if (wndRect.in(cursor_pos) && w->HitClipPass(GetUICursor().GetCursorPosition()))
+		{
+			if (w->IsEnabled())
+			{
+				if (w->OnMouseAction(cursor_pos.x - w->GetWndRect().left,
+					cursor_pos.y - w->GetWndRect().top, mouse_action))
+					return true;
+			}
+		}
+		else if (w->IsEnabled() && w->CursorOverWindow())
+		{
+			if (w->OnMouseAction(cursor_pos.x - w->GetWndRect().left,
+				cursor_pos.y - w->GetWndRect().top, mouse_action))
+				return true;
+		}
+	}
+
+
+	return false;
+}
+
+
+void CUIWindow::OnMouseMove()
+{
+}
+
+void CUIWindow::OnMouseScroll(float iDirection)
+{
+}
+
+bool CUIWindow::OnDbClick()
+{
+	if (GetMessageTarget())
+		GetMessageTarget()->SendMessage(this, WINDOW_LBUTTON_DB_CLICK);
+	return false;
+}
+
+bool CUIWindow::OnMouseDown(int mouse_btn)
+{
+	return false;
+}
+
+void CUIWindow::OnMouseUp(int mouse_btn)
+{
+}
+
+void CUIWindow::OnFocusReceive()
+{
+	m_dwFocusReceiveTime = Device.dwTimeGlobal;
+	m_bCursorOverWindow = true;
+
+	if (GetMessageTarget())
+		GetMessageTarget()->SendMessage(this, WINDOW_FOCUS_RECEIVED, NULL);
+
+	//if (m_pHint)
+	//	bShowHint = true;
+}
+
+void CUIWindow::OnFocusLost()
+{
+	m_dwFocusReceiveTime = 0;
+	m_bCursorOverWindow = false;
+
+	if (GetMessageTarget())
+		GetMessageTarget()->SendMessage(this, WINDOW_FOCUS_LOST, NULL);
+
+	//bShowHint = false;
+}
+
+
+//Сообщение, посылаемое дочерним окном,
+//о том, что окно хочет захватить мышь,
+//все сообщения от нее будут направляться только
+//ему в независимости от того где мышь
+void CUIWindow::SetCapture(CUIWindow* pChildWindow, bool capture_status)
+{
+	if (capture_status)
+	{
+		if (!pChildWindow)
+			return;
+
+		//оповестить дочернее окно о потере фокуса мыши
+		if (!s_capture_stack.empty() && s_capture_stack.back() != pChildWindow)
+			s_capture_stack.back()->SendMessage(this, WINDOW_MOUSE_CAPTURE_LOST);
+
+		erase_capture(pChildWindow); // re-capture moves it to the top rather than stacking twice
+		s_capture_stack.push_back(pChildWindow);
+	}
+	else
+	{
+		erase_capture(pChildWindow);
+	}
+}
+
+CUIWindow* CUIWindow::MouseCapturer()
+{
+	return s_capture_stack.empty() ? NULL : s_capture_stack.back();
+}
+
+void CUIWindow::ReleaseMouseCapture()
+{
+	erase_capture_subtree(this);
+}
+
+
+//реакция на клавиатуру
+bool CUIWindow::OnKeyboardAction(int dik, EUIMessages keyboard_action)
+{
+	bool result;
+
+	//если есть дочернее окно,захватившее клавиатуру, то
+	//сообщение направляем ему сразу
+	if (NULL != m_pKeyboardCapturer)
+	{
+		result = m_pKeyboardCapturer->OnKeyboardAction(dik, keyboard_action);
+
+		if (result) return true;
+	}
+
+	xrCriticalSectionGuard guard(csUi);
+	WINDOW_LIST::reverse_iterator it = m_ChildWndList.rbegin();
+
+	for (; it != m_ChildWndList.rend(); ++it)
+	{
+		if ((*it)->IsEnabled())
+		{
+			result = (*it)->OnKeyboardAction(dik, keyboard_action);
+
+			if (result) return true;
+		}
+	}
+	return false;
+}
+
+bool CUIWindow::OnKeyboardHold(int dik)
+{
+	bool result;
+
+	if (NULL != m_pKeyboardCapturer)
+	{
+		result = m_pKeyboardCapturer->OnKeyboardHold(dik);
+
+		if (result) return true;
+	}
+
+	xrCriticalSectionGuard guard(csUi);
+	WINDOW_LIST::reverse_iterator it = m_ChildWndList.rbegin();
+
+	for (; it != m_ChildWndList.rend(); ++it)
+	{
+		if ((*it)->IsEnabled())
+		{
+			result = (*it)->OnKeyboardHold(dik);
+
+			if (result) return true;
+		}
+	}
+
+	return false;
+}
+
+void CUIWindow::SetKeyboardCapture(CUIWindow* pChildWindow, bool capture_status)
+{
+	if (NULL != GetParent())
+		GetParent()->SetKeyboardCapture(this, capture_status);
+
+	if (capture_status)
+	{
+		//оповестить дочернее окно о потере фокуса клавиатуры
+		if (NULL != m_pKeyboardCapturer)
+			m_pKeyboardCapturer->SendMessage(this, WINDOW_KEYBOARD_CAPTURE_LOST);
+
+		m_pKeyboardCapturer = pChildWindow;
+	}
+	else
+		m_pKeyboardCapturer = NULL;
+}
+
+
+//обработка сообщений 
+void CUIWindow::SendMessage(CUIWindow* pWnd, s16 msg, void* pData)
+{
+	xrCriticalSectionGuard guard(csUi);
+	//оповестить дочерние окна
+	for (WINDOW_LIST_it it = m_ChildWndList.begin(); m_ChildWndList.end() != it; ++it)
+	{
+		if ((*it)->IsEnabled())
+			(*it)->SendMessage(pWnd, msg, pData);
+	}
+}
+
+CUIWindow* CUIWindow::GetCurrentMouseHandler()
+{
+	return GetTop()->GetChildMouseHandler();
+}
+
+CUIWindow* CUIWindow::GetChildMouseHandler()
+{
+	xrCriticalSectionGuard guard(csUi);
+	CUIWindow* pWndResult;
+	WINDOW_LIST::reverse_iterator it = m_ChildWndList.rbegin();
+
+	for (; it != m_ChildWndList.rend(); ++it)
+	{
+		Frect wndRect = (*it)->GetWndRect();
+		// very strange code.... i can't understand difference between
+		// first and second condition. I Got It from OnMouseAction() method;
+		if (wndRect.in(cursor_pos))
+		{
+			if ((*it)->IsEnabled())
+			{
+				return pWndResult = (*it)->GetChildMouseHandler();
+			}
+		}
+		else if ((*it)->IsEnabled() && (*it)->CursorOverWindow())
+		{
+			return pWndResult = (*it)->GetChildMouseHandler();
+		}
+	}
+
+	return this;
+}
+
+//для перевода окна и потомков в исходное состояние
+void CUIWindow::Reset()
+{
+}
+
+void CUIWindow::ResetAll()
+{
+	xrCriticalSectionGuard guard(csUi);
+	for (WINDOW_LIST_it it = m_ChildWndList.begin(); m_ChildWndList.end() != it; ++it)
+	{
+		(*it)->Reset();
+	}
+}
+
+CUIWindow* CUIWindow::GetMessageTarget()
+{
+	return m_pMessageTarget ? m_pMessageTarget : GetParent();
+}
+
+bool CUIWindow::IsChild(CUIWindow* pPossibleChild) const
+{
+	xrCriticalSectionGuard guard(const_cast<xrCriticalSection&>(csUi));
+	WINDOW_LIST::const_iterator it = std::find(m_ChildWndList.begin(), m_ChildWndList.end(), pPossibleChild);
+	return it != m_ChildWndList.end();
+}
+
+
+CUIWindow* CUIWindow::FindChild(const LPCSTR name)
+{
+	if (WindowName() == name)
+		return this;
+
+	xrCriticalSectionGuard guard(csUi);
+	WINDOW_LIST::const_iterator it = m_ChildWndList.begin();
+	WINDOW_LIST::const_iterator it_e = m_ChildWndList.end();
+	for (; it != it_e; ++it)
+	{
+		CUIWindow* pRes = (*it)->FindChild(name);
+		if (pRes != NULL)
+			return pRes;
+	}
+	return NULL;
+}
+
+void CUIWindow::SetParent(CUIWindow* pNewParent)
+{
+	// Ncenka: Print in console instead of crash
+	if (m_pParentWnd && m_pParentWnd->IsChild(this)) {
+		Msg("!CUIWindow::SetParent, %s element is already attached to %s", WindowName_script(), m_pParentWnd->WindowName_script());
+		return;
+	}
+
+	m_pParentWnd = pNewParent;
+}
+
+void CUIWindow::ShowChildren(bool show)
+{
+	xrCriticalSectionGuard guard(csUi);
+	for (WINDOW_LIST_it it = m_ChildWndList.begin(); m_ChildWndList.end() != it; ++it)
+		(*it)->Show(show);
+}
+
+static bool is_in(Frect const& a, Frect const& b) //b in a
+{
+	return (a.x1 < b.x1) && (a.x2 > b.x2) && (a.y1 < b.y1) && (a.y2 > b.y2);
+}
+
+
+
+bool fit_in_rect(CUIWindow* w, Frect const& vis_rect, float border, float dx16pos) //this = hint wnd
+{
+	float const cursor_height = 43.0f;
+	Fvector2 cursor_pos = GetUICursor().GetCursorPosition();
+	if (UI().is_widescreen())
+	{
+		cursor_pos.x -= dx16pos;
+	}
+
+	if (!vis_rect.in(cursor_pos))
+	{
+		return false;
+	}
+
+	Frect rect;
+	rect.set(-border, -border, w->GetWidth() - 2.0f * border, w->GetHeight() - 2.0f * border);
+	rect.add(cursor_pos.x, cursor_pos.y);
+
+	rect.sub(0.0f, rect.height() - border);
+	if (!is_in(vis_rect, rect)) { rect.sub(rect.width() - border, 0.0f); }
+	if (!is_in(vis_rect, rect)) { rect.add(0.0f, rect.height() - border); }
+	if (!is_in(vis_rect, rect)) { rect.add(rect.width() - border, cursor_height); }
+
+	float yn = rect.top - vis_rect.height() + rect.height() - border + cursor_height;
+	if (!is_in(vis_rect, rect)) { rect.sub(0.0f, yn); }
+	if (!is_in(vis_rect, rect)) { rect.sub(rect.width() - border, 0.0f); }
+
+	w->SetWndPos(rect.lt);
+	return true;
+}
+
+bool fit_in_rect2(CUIWindow* w, Frect const& vis_rect, float border, float dx16pos) //this = hint wnd
+{
+	float const cursor_size = 21.0f;
+	Fvector2 cursor_pos = GetUICursor().GetCursorPosition();
+	if (UI().is_widescreen())
+	{
+		cursor_pos.x -= dx16pos;
+	}
+
+	if (!vis_rect.in(cursor_pos))
+	{
+		return false;
+	}
+
+	Frect rect;
+	rect.set(-border, -border, w->GetWidth() - 2.0f * border, w->GetHeight() - 2.0f * border);
+
+	float const cursor_x_in_vis_rect = cursor_pos.x - vis_rect.x1;
+	bool const cursor_is_left_of_center = cursor_x_in_vis_rect < (vis_rect.width() / 2) - cursor_size;
+	if (cursor_is_left_of_center)
+	{
+		// show hint window to the right of the cursor
+		rect.add(cursor_pos.x + cursor_size, 0.0f);
+	}
+	else
+	{
+		// show hint window to the left of the cursor
+		rect.add(cursor_pos.x - w->GetWidth() - border, 0.0f);
+	}
+
+	float const cursor_y_in_vis_rect = cursor_pos.y - vis_rect.y1;
+	bool const cursor_is_top_of_center = cursor_y_in_vis_rect < (vis_rect.height() / 2) - cursor_size;
+	if (cursor_is_top_of_center)
+	{
+		// show hint window under the cursor
+		rect.add(0.0f, cursor_pos.y + cursor_size);
+	}
+	else
+	{
+		// show hint window over the cursor
+		rect.add(0.0f, cursor_pos.y - w->GetHeight() - border);
+	}
+
+	if (rect.top < vis_rect.top)
+	{
+		// hint window sticks out of parent at the top, correct that by moving it down
+		float const y_correction = vis_rect.top - rect.top;
+		rect.add(0.0f, y_correction);
+	}
+
+	if (rect.bottom > vis_rect.bottom)
+	{
+		// hint window sticks out of parent at the bottom, correct that by moving it up
+		float const y_correction = vis_rect.bottom - rect.bottom;
+		rect.add(0.0f, y_correction);
+	}
+	// TODO: #1 if hint window taller than parent, consider increasing width by const step and the looping the logic until hint_window_width >= vis_rect.width
+	// TODO: #2 correct horizontally (only important if first todo implemented)
+
+	w->SetWndPos(rect.lt);
+	return true;
+}
+
+/*
+void CUIWindow::DisableHint()
+{
+	bShowHint = false;
+}
+
+void CUIWindow::EnableHint()
+{
+	bShowHint = true;
+}
+
+u32 CUIWindow::GetHintDelay()
+{
+	return dwHintDelay;
+}
+
+void CUIWindow::SetHintDelay(u32 val)
+{
+	dwHintDelay = val;
+}
+
+void CUIWindow::DrawHintWnd()
+{
+	if (m_pHint && bShowHint)
+	{
+		Frect r;
+		GetAbsoluteRect(r);
+		Fvector2 pos = UI().GetUICursor().GetCursorPosition();
+		if (r.in(pos))
+			m_pHint->Draw();
+	}
+}
+
+void CUIWindow::RemoveHint()
+{
+	if (m_pHint)
+		xr_delete(m_pHint);
+	m_pHint = NULL;
+}
+
+void CUIWindow::SetHintText(LPCSTR text)	
+{ 
+	m_sHint = text;
+}
+
+LPCSTR CUIWindow::GetHintText()
+{ 
+	return m_sHint;
+}
+*/

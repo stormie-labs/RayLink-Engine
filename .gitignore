@@ -1,0 +1,40 @@
+# exclude all dot files except .gitignore
+.*
+!.gitignore
+!.gitattributes
+
+# exclude binaries and temporary files
+_build/
+/src/*.tss
+/**/x64/
+**/.vs/
+*.pdb
+*.ilk
+*.user
+*.VC.db
+*.VC.opendb
+lua51.dll
+lua51.exp
+lua51.lib
+luajit.exe
+
+# luajit generated files
+src/3rd party/luajit-2/src/lj_bcdef.h
+src/3rd party/luajit-2/src/lj_ffdef.h
+src/3rd party/luajit-2/src/lj_folddef.h
+src/3rd party/luajit-2/src/lj_libdef.h
+src/3rd party/luajit-2/src/lj_recdef.h
+src/3rd party/luajit-2/src/host/buildvm_arch.h
+src/3rd party/luajit-2/src/jit/vmdef.lua
+src/3rd party/luajit-2/src/intermediate/
+src/3rd party/luajit-2/src/*.obj
+src/3rd party/luajit-2/src/*.pdb
+src/3rd party/luajit-2/src/host/*.exe
+
+# compressor runtime artifacts
+compressor/engine.log
+compressor/mod/
+
+# emacs temp file
+\#*\#
+*~

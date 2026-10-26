@@ -1,0 +1,96 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{3f1d5a7e-6c0b-4e55-9a2d-0b6c2f7d1a01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{3f1d5a7e-6c0b-4e55-9a2d-0b6c2f7d1a02}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="3rd party\enet">
+      <UniqueIdentifier>{3f1d5a7e-6c0b-4e55-9a2d-0b6c2f7d1a03}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="3rd party\enet\include">
+      <UniqueIdentifier>{3f1d5a7e-6c0b-4e55-9a2d-0b6c2f7d1a04}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="coop_protocol.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="coop_session.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="coop_transport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="coop_wire.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\callbacks.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\compress.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\host.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\list.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\packet.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\peer.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\protocol.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+    <ClCompile Include="..\3rd party\enet\win32.c">
+      <Filter>3rd party\enet</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="coop_protocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="coop_session.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="coop_transport.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="coop_wire.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\callbacks.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\enet.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\list.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\protocol.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\time.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\types.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\unix.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\utility.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\3rd party\enet\include\enet\win32.h">
+      <Filter>3rd party\enet\include</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

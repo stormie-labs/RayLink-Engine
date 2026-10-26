@@ -1,0 +1,214 @@
+#ifndef LAYERS_XRRENDER_LIGHT_H_INCLUDED
+#define LAYERS_XRRENDER_LIGHT_H_INCLUDED
+
+#include "../../xrcdb/ispatial.h"
+
+//#include "../../xrEngine/xr_object.h"
+
+#if (RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+#	include "light_package.h"
+#	include "light_GI.h"
+#include "../xrRender/r__dsgraph_manager.h"
+#endif //(RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+
+extern Fvector4 ps_ssfx_volumetric;
+class CObject;
+
+class light :
+	public IRender_Light
+{
+public:
+	struct
+	{
+		u32 type : 4;
+		u32 bStatic : 1;
+		u32 bActive : 1;
+		u32 bShadow : 1;
+		u32 bVolumetric:1;
+		u32 bHudMode: 1;
+		u32 bOccq:       1;
+	} flags;
+
+	Fvector position;
+	Fvector direction;
+	Fvector right;
+	float range;
+	float cone;
+	Fcolor color;
+
+	CObject *ignore_object, *decor_object[6];
+
+	vis_data hom;
+	u32 frame_render;
+	light* m_parent;
+	u8 m_moving_frames;
+
+	int omnipart_num;
+	int sss_id;
+	int sss_refresh;
+    int sss_remove_latency;
+	s8 sss_priority;
+	bool sss_is_playerlight;
+    xr_delegate<void(light*)> sss_on_light_destroy;
+
+	light* omipart_parent;
+	float distance;
+	float distance_lpos;
+
+#if RENDER!=R_R1 && !XRCPU_PIPE_EXPORTS
+	FixedSet<IRender_Sector*> m_sectors;
+#endif	//	RENDER!=R_R1
+
+	float m_volumetric_quality;
+	float m_volumetric_intensity;
+	float m_volumetric_distance;
+
+#ifndef XRCPU_PIPE_EXPORTS
+#ifndef _EDITOR
+	CDSGraphManager GMLight = CDSGraphManager(u32(0),
+#if RENDER==R_R1
+		u32(STYPE_RENDERABLE),
+#else
+		u32(STYPE_RENDERABLE + STYPE_RENDERABLESHADOW),
+#endif
+		{ true,false,false,false,true,false,false });
+#endif
+#endif
+
+	float virtual_size;
+
+#if (RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+	float			falloff;			// precalc to make light equal to zero at light range
+	float	        attenuation0;		// Constant attenuation		
+	float	        attenuation1;		// Linear attenuation		
+	float	        attenuation2;		// Quadratic attenuation	
+
+	light*						omnipart	[6]	;
+	xr_vector<light_indirect>	indirect		;
+	u32							indirect_photons;
+
+	ref_shader		s_spot;
+	ref_shader		s_point;
+	ref_shader		s_volumetric;
+
+#if (RENDER==R_R3) || (RENDER==R_R4)
+	ref_shader		s_spot_msaa[8];
+	ref_shader		s_point_msaa[8];
+	ref_shader		s_volumetric_msaa[8];
+#endif	//	(RENDER==R_R3) || (RENDER==R_R4)
+
+	u32				m_xform_frame, m_parent_p_frame, m_parent_u_frame;
+	Fmatrix			m_xform;
+
+	struct _vis		{
+		u32			frame2test;		// frame the test is sheduled to
+		ID3DQuery*	Q;
+		bool		visible;		// visible/invisible
+		bool		pending;		// test is still pending
+		u16			smap_ID;
+		float		distance;
+	}				vis;
+
+	union			_xform	{
+		struct		_D		{
+			Fmatrix						combine	;
+			s32							minX,maxX	;
+			s32							minY,maxY	;
+			BOOL						transluent	;
+		}	D;
+		struct		_P		{
+			Fmatrix						world		;
+			Fmatrix						view		;
+			Fmatrix						project		;
+			Fmatrix						combine		;
+		}	P;
+		struct		_S		{
+			Fmatrix						view		;
+			Fmatrix						project		;
+			Fmatrix						combine		;
+			u32							size		;
+			u32							posX		;
+			u32							posY		;
+			BOOL						transluent	;
+			CFrustum					frustum;
+		}	S;
+	}	X;
+#endif	//	(RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+
+public:
+	virtual void set_type(LT type) { flags.type = type; }
+	virtual LT get_type() { return (LT)flags.type; }
+	virtual void set_active(bool b);
+	virtual bool get_active() { return flags.bActive; }
+
+#if RENDER!=R_R1 && !XRCPU_PIPE_EXPORTS
+	void get_sectors();
+	bool has_light_visible_from_sectors(CDSGraphManager& DM);
+	bool has_outdoor_light();
+	xrCriticalSection sectors_lc;
+#endif	//	RENDER!=R_R1
+
+	virtual void set_shadow(bool b);
+	virtual void set_volumetric(bool b)
+	{
+		if (ps_ssfx_volumetric.x > 0)
+			b = true;
+
+		flags.bVolumetric = b;
+	}
+
+	virtual void set_volumetric_quality(float fValue) { m_volumetric_quality = fValue; }
+	virtual void set_volumetric_intensity(float fValue) { m_volumetric_intensity = ps_ssfx_volumetric.y; }
+	virtual void set_volumetric_distance(float fValue) { m_volumetric_distance = 1.0f; }
+
+	virtual void set_position(const Fvector& P, const float eps = EPS);
+	virtual void set_rotation(const Fvector& D, const Fvector& R, const float eps = EPS);
+	virtual void set_cone(float angle);
+	virtual void set_range(float R);
+
+	virtual void set_virtual_size(float R)
+	{ 
+		virtual_size = R; 
+	};
+
+	virtual void set_color(const Fcolor& C) { color.set(C); }
+	virtual void set_color(float r, float g, float b) { color.set(r, g, b, 1); }
+	virtual void set_texture(LPCSTR name);
+	virtual void set_hud_mode(bool b) { flags.bHudMode = b; }
+	virtual bool get_hud_mode() { return flags.bHudMode; };
+
+	virtual void set_occq_mode(bool b) { flags.bOccq = b; }
+	virtual bool get_occq_mode() { return flags.bOccq; }
+
+	virtual void set_ignore_object(CObject* O) { ignore_object = O; };
+	virtual CObject* get_ignore_object() { return ignore_object; };
+
+	virtual void set_decor_object(CObject* O, int index = 0) { decor_object[index] = O; };
+	virtual CObject* get_decor_object(int index = 0) { return decor_object[index]; };
+
+	virtual void set_is_playerlight(bool b) { sss_is_playerlight = b; };
+
+	virtual void spatial_move();
+	virtual Fvector spatial_sector_point();
+
+	virtual IRender_Light* dcast_Light() { return this; }
+
+	virtual vis_data& get_homdata();
+#if (RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+	void			gi_generate				();
+	void			xform_calc				();
+	void			vis_prepare				();
+	void			vis_update				();
+	void			export_					();
+	void			set_attenuation_params	(float a0, float a1, float a2, float fo);
+	void			optimize_smap_size		();
+#endif // (RENDER==R_R2) || (RENDER==R_R3) || (RENDER==R_R4)
+
+	float get_LOD();
+
+	light();
+	virtual ~light();
+	virtual void destroy(bool deffered = true);
+};
+
+#endif // #define LAYERS_XRRENDER_LIGHT_H_INCLUDED
