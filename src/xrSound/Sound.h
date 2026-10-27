@@ -333,6 +333,8 @@ public:
 	virtual void stop(BOOL bDeffered) = 0;
 	virtual const CSound_params* get_params() = 0;
 	virtual u32 play_time() = 0;
+	// Initial offset only, before the first sound update (co-op late join). Existing sounds start at zero.
+	virtual void set_start_position(float seconds) = 0;
 };
 
 /// definition (Sound Stream Interface)

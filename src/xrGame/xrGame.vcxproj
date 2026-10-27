@@ -2150,6 +2150,7 @@
     <ClCompile Include="coop\coop_entities.cpp" />
     <ClCompile Include="coop\coop_sync.cpp" />
     <ClCompile Include="coop\coop_players.cpp" />
+    <ClCompile Include="coop\coop_instrument.cpp" />
     <ClCompile Include="coop\coop_world.cpp" />
     <ClCompile Include="coop\coop_join.cpp" />
     <ClCompile Include="coop\coop_console.cpp" />

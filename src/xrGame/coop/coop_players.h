@@ -2,6 +2,7 @@
 #pragma once
 
 #include "xrCoop/coop_session.h"
+#include "xrCoop/coop_instrument.h"
 
 struct SInvItemPlace;
 class CSE_Abstract;
@@ -23,6 +24,7 @@ struct State
 	u32 legs = 0, torso = 0, head = 0; // MotionID values on the character visual
 	u8 active_slot = 0;
 	u16 active_item = 0xffff; // item id in host numbering
+	instrument::State instrument;
 
 	void write(Writer& w) const;
 	bool read(Reader& r);

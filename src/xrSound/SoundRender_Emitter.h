@@ -9,6 +9,7 @@
 class CSoundRender_Emitter : public CSound_emitter
 {
 	float starting_delay;
+	float starting_offset = 0.f;
 public:
 	enum State
 	{
@@ -126,6 +127,11 @@ public:
 	void pause(BOOL bVal, int id);
 
 	virtual u32 play_time();
+	virtual void set_start_position(float seconds) override
+	{
+		if (m_current_state == stStarting && _valid(seconds))
+			starting_offset = clampr(seconds, 0.f, _max(0.f, get_length_sec() - .001f));
+	}
 
 	CSoundRender_Emitter();
 	~CSoundRender_Emitter();

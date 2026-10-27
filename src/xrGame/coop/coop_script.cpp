@@ -10,6 +10,7 @@
 #include "coop_story.h"
 #include "coop_survival.h"
 #include "coop_players.h" // players::avatar_safemode (coop_equip.cpp)
+#include "coop_instrument.h"
 #include "coop_dialog.h" // W11: dialog::host_talk_holder
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
 #include "coop_money.h" // F2 T1: money::register_lua
@@ -1557,6 +1558,7 @@ void register_raw(lua_State* L)
 		{"bleed_left", &l_bleed_left},
 		{"revive_progress", &l_revive_progress}, // HUD v2 part 2: the revive / give-up holds for scripts\coop_hud_revive
 		{"player_safemode", &l_player_safemode},
+		{"instrument", &players::lua_instrument},
 		{"talk_holder", &l_talk_holder}, // W11
 		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)
 		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter

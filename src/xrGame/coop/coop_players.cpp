@@ -6,6 +6,7 @@
 #include "coop_survival.h"
 #include "coop_entities.h"
 #include "coop_sound.h"
+#include "coop_instrument.h"
 #include "xrCoop/coop_validate.h"
 
 #include "Level.h"
@@ -123,6 +124,7 @@ bool capture(State& s)
 	s.active_slot = u8(actor->inventory().GetActiveSlot());
 	PIItem active = actor->inventory().ActiveItem();
 	s.active_item = active ? join::to_host(active->object_id()) : 0xffff;
+	s.instrument = capture_instrument();
 	return true;
 }
 
@@ -136,6 +138,10 @@ void host_on_player_state(PeerId from, Reader& r)
 	const u16 proxy = join::proxy_of_peer(from);
 	if (proxy == 0xffff)
 		return;
+	// Identity comes from the authenticated peer. Movement/life interrupt even a dishonest instrument intent.
+	if (!instrument::stationary(s.mstate, s.vel.x, s.vel.y, s.vel.z,
+	        survival::life_of(proxy) == survival::Life::Alive))
+		s.instrument = instrument::State();
 	push_sample(proxy, s);
 
 	Writer w(64);
@@ -174,6 +180,8 @@ bool interpolate(Track& t, u64 render_time, State& out)
 	if (t.samples.size() == 1 || render_time <= t.samples.front().local_time)
 	{
 		out = t.samples.front().s;
+		if (render_time > t.samples.front().local_time)
+			instrument::advance(out.instrument, u32(_min<u64>(render_time - t.samples.front().local_time, kStreamGapMs)));
 		return true;
 	}
 	for (size_t i = 1; i < t.samples.size(); ++i)
@@ -185,6 +193,7 @@ bool interpolate(Track& t, u64 render_time, State& out)
 		const float span = float(b.local_time - a.local_time);
 		const float k = span > 0.f ? float(render_time - a.local_time) / span : 1.f;
 		out = k < 0.5f ? a.s : b.s; // discrete fields from the nearer sample
+		out.instrument = instrument::interpolate(a.s.instrument, b.s.instrument, k);
 		out.pos.lerp(a.s.pos, b.s.pos, k);
 		out.vel.lerp(a.s.vel, b.s.vel, k);
 		out.body_yaw = angle_lerp(a.s.body_yaw, b.s.body_yaw, k);
@@ -196,6 +205,7 @@ bool interpolate(Track& t, u64 render_time, State& out)
 	out = t.samples.back().s;
 	const float ahead = float(_min<u64>(render_time - t.samples.back().local_time, 200)) / 1000.f;
 	out.pos.mad(out.vel, ahead);
+	instrument::advance(out.instrument, u32(_min<u64>(render_time - t.samples.back().local_time, kStreamGapMs)));
 	return true;
 }
 } // namespace
@@ -216,6 +226,7 @@ void State::write(Writer& w) const
 	w.u32(head);
 	w.u8(active_slot);
 	w.u16(active_item);
+	instrument.write(w);
 }
 
 bool State::read(Reader& r)
@@ -235,6 +246,8 @@ bool State::read(Reader& r)
 	head = r.u32();
 	active_slot = r.u8();
 	active_item = r.u16();
+	if (!instrument.read(r) || r.remaining() != 0)
+		return refuse_state("malformed instrument state");
 	// R3 K1: finite numbers, a sane speed, a position inside the level's box grown by kLevelMargin.
 	// Ruling 14: each refusal says why (counter + first log lines); the checks themselves are unchanged.
 	if (!r.ok())
@@ -271,6 +284,7 @@ void install_client(Endpoint& e)
 
 void reset()
 {
+	instrument_reset();
 	g_tracks.clear();
 	g_last_send = 0;
 	equip_reset();
@@ -280,7 +294,10 @@ void on_peer_left(PeerId id)
 {
 	const u16 avatar = mgr().is_host() ? join::proxy_of_peer(id) : world::avatar_of(id);
 	if (avatar != 0xffff)
+	{
+		instrument_forget(avatar);
 		g_tracks.erase(avatar);
+	}
 }
 
 void frame()
@@ -288,6 +305,7 @@ void frame()
 	const bool live = mgr().is_host() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;
+	instrument_frame();
 	equip_frame();
 	const u64 now = mgr().now_ms();
 	if (now - g_last_send < kSendIntervalMs)
@@ -332,7 +350,18 @@ bool drive_avatar(CAI_Stalker* avatar)
 		sound::on_avatar_move(avatar, mstate_before, s.mstate); // W5 C2.2: jumps and landings
 	if (survival::avatar_pose_override(avatar)) // WP8: wounded / dead pose
 	{
+		instrument_forget(avatar->ID());
 		t.applied_legs = t.applied_torso = t.applied_head = 0; // replay the owner's motions after standing up
+		return true;
+	}
+	// Stale streams never leave a musician frozen or a song playing indefinitely.
+	instrument::State intent = s.instrument;
+	if (mgr().now_ms() - t.last_rx > kStreamGapMs ||
+	    !instrument::stationary(s.mstate, s.vel.x, s.vel.y, s.vel.z, avatar->g_Alive()))
+		intent = instrument::State();
+	if (instrument_pose(avatar, intent))
+	{
+		t.applied_legs = t.applied_torso = t.applied_head = 0xffff;
 		return true;
 	}
 
@@ -342,7 +371,7 @@ bool drive_avatar(CAI_Stalker* avatar)
 	{
 		auto play = [ka](u32 value, u32& applied)
 		{
-			if (!value || value == applied)
+			if (!instrument::motion_present(value) || value == applied)
 				return;
 			if (!entities::motion_valid(ka, value)) // the avatar's visual may not be the owner's yet
 				return; // R3 В4: `applied` keeps only what was really played, so the motion is retried later

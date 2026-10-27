@@ -23,6 +23,7 @@
 #include "WeaponKnife.h"
 #include "Pda.h"
 #include "coop/coop_survival.h" // Anomaly Coop
+#include "coop/coop_instrument.h"
 
 static const float y_spin0_factor = 0.0f;
 static const float y_spin1_factor = 0.4f;
@@ -355,6 +356,7 @@ void CActor::ResetAnimationCache()
 
 void CActor::g_SetAnimation(u32 mstate_rl)
 {
+	if (coop::players::own_instrument_held(this)) return; // Anomaly Coop: original NPC instrument sequence
 	if (coop::survival::own_pose_held(this)) // Anomaly Coop (build 10): a lying pose of the co-op holds, not our motions
 		return;
 	if (!g_Alive())

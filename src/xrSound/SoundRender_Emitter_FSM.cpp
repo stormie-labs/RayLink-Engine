@@ -125,8 +125,8 @@ void CSoundRender_Emitter::update(float dt)
 		break;
 	case stStarting:
 		if (iPaused) break;
-		fTimeStarted = fTime;
-		fTimeToStop = fTime + (get_length_sec() / psSpeedOfSound); 
+		fTimeStarted = fTime - starting_offset;
+		fTimeToStop = fTime + ((get_length_sec() - starting_offset) / psSpeedOfSound);
 		fTimeToPropagade = fTime;
 		fade_volume = 1.f;
 		occluder_volume = SoundRender->get_occlusion(p_source.position, .2f, occluder);
@@ -136,7 +136,7 @@ void CSoundRender_Emitter::update(float dt)
 		if (update_culling(dt))
 		{
 			m_current_state = stPlaying;
-			set_cursor(0);
+			set_cursor(calc_cursor(fTimeStarted, fTime, get_length_sec(), source()->m_wformat));
 			SoundRender->i_start(this);
 		}
 		else

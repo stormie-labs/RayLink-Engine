@@ -8,6 +8,7 @@
 void CSoundRender_Emitter::start(ref_sound* _owner, BOOL _loop, float delay)
 {
 	starting_delay = delay;
+	starting_offset = 0.f;
 
 	VERIFY(_owner);
 	owner_data = _owner->_p;

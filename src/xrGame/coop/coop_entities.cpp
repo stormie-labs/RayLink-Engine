@@ -1,5 +1,7 @@
 #include "stdafx.h"
 #include "coop_entities.h"
+#include "coop_instrument.h"
+#include "attachable_item.h"
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
@@ -171,7 +173,7 @@ void host_process_events()
 // Generic animation state: per bone partition the newest blend's motion and phase.
 struct AnimState
 {
-	u32 motion[kMaxPartitions] = {};
+	u32 motion[kMaxPartitions] = {instrument::kNoMotion, instrument::kNoMotion, instrument::kNoMotion, instrument::kNoMotion};
 	u16 time_ms[kMaxPartitions] = {};
 	u8 count = 0;
 };
@@ -189,10 +191,12 @@ void capture_anims(CGameObject* obj, AnimState& a)
 		for (u32 i = 0; i < n; ++i)
 		{
 			CBlend* b = ka->LL_PartBlend(part, i);
-			if (b && (!best || b->blendAmount >= best->blendAmount))
+			if (b && instrument::prefer_blend(b->blend_state()!=CBlend::eFREE_SLOT,
+			        b->blend_state()==CBlend::eFalloff, b->blendAmount,
+			        best!=nullptr, best && best->blend_state()==CBlend::eFalloff, best ? best->blendAmount : 0.f))
 				best = b;
 		}
-		a.motion[part] = best ? best->motionID.val : 0;
+		a.motion[part] = best ? best->motionID.val : instrument::kNoMotion;
 		a.time_ms[part] = best ? u16(_min(best->timeCurrent, 65.f) * 1000.f) : 0;
 		a.count = u8(part + 1);
 	}
@@ -201,6 +205,19 @@ void capture_anims(CGameObject* obj, AnimState& a)
 bool is_creature(CGameObject* obj)
 {
 	return remote::is_puppet_type(obj); // stalkers, monsters, traders (WP1)
+}
+
+u8 npc_instrument(CGameObject* obj)
+{
+	CInventoryOwner* owner=obj->cast_inventory_owner();
+	if (!owner) return 0;
+	for (CAttachableItem* a:owner->attached_objects())
+		if (a && a->enabled())
+		{
+			if (a->item().object().cNameSect()=="guitar_a") return 1;
+			if (a->item().object().cNameSect()=="harmonica_a") return 2;
+		}
+	return 0;
 }
 
 // W5 C2.6: the head torch of an NPC is switched by the host's Lua (sr_light spawns/releases it, story effects
@@ -370,6 +387,7 @@ void host_send_snapshots()
 			w.u16(held);
 		if (flags & CreatureAims)
 			write_aim(w, *obj->cast_stalker());
+		w.u8(npc_instrument(obj));
 		if (++in_packet >= 255 || w.size() >= kSnapshotBudget)
 			flush();
 	}
@@ -390,6 +408,7 @@ struct MirrorSample
 	AnimState anims;
 	u8 flags = 0; // CreatureFlags (W5 C2.6)
 	u16 held = kNoId; // local id of the item in hands (CreatureHolds)
+	u8 instrument_kind = 0;
 	Fquaternion aim[3]; // spine, shoulder, head bone rotations (CreatureAims; identity without it)
 };
 struct MirrorTrack
@@ -855,7 +874,8 @@ void client_on_snapshot(PeerId, Reader& r)
 		s.yaw = r.angle16();
 		s.health = float(r.u8()) / 255.f;
 		const u8 packed = r.u8();
-		s.anims.count = _min<u8>(anim_count_of(packed), u8(kMaxPartitions));
+		s.anims.count = anim_count_of(packed);
+		if (s.anims.count > kMaxPartitions) return;
 		s.flags = creature_flags_of(packed);
 		for (u8 k = 0; k < s.anims.count; ++k)
 		{
@@ -875,7 +895,8 @@ void client_on_snapshot(PeerId, Reader& r)
 				q.w = unpack_unit(s16(r.u16()));
 			}
 		}
-		if (!r.ok() || id == 0)
+		s.instrument_kind = r.u8();
+		if (!r.ok() || id == 0 || s.instrument_kind > 2)
 			break;
 		MirrorTrack& t = g_tracks[id];
 		if (t.have_offset && s32(remote_time - t.last_remote) <= 0)
@@ -1151,7 +1172,7 @@ bool intercept_local_spawn(CSE_Abstract* entity)
 
 bool motion_valid(IKinematicsAnimated* ka, u32 motion)
 {
-	if (!ka || !motion)
+	if (!ka || !instrument::motion_present(motion))
 		return false;
 	MotionID m;
 	m.val = motion;
@@ -1184,6 +1205,7 @@ bool drive_mirror(CGameObject* obj)
 	}
 
 	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
+	players::instrument_npc_attachment(obj, s.instrument_kind);
 	MirrorTrack& track = it->second;
 	const u8 want = track.samples.back().flags;
 	const u16 want_held = track.samples.back().held;
@@ -1208,15 +1230,25 @@ bool drive_mirror(CGameObject* obj)
 		for (u8 part = 0; part < s.anims.count; ++part)
 		{
 			const u32 value = s.anims.motion[part];
-			if (!value || value == it->second.applied[part])
+			if (!instrument::motion_present(value))
 				continue;
 			if (!motion_valid(ka, value))
 				continue;
 			MotionID m;
 			m.val = value;
-			if (CBlend* b = ka->LL_PlayCycle(u16(part), m, TRUE, nullptr, nullptr))
-				b->timeCurrent = float(s.anims.time_ms[part]) / 1000.f;
-			it->second.applied[part] = value;
+			CBlend* playing = nullptr;
+			for (u32 i=0,n=ka->LL_PartBlendsCount(part); i<n; ++i)
+			{
+				CBlend* b=ka->LL_PartBlend(part,i);
+				if (b && b->motionID==m && b->blend_state()==CBlend::eAccrue) { playing=b; break; }
+			}
+			if (!playing) playing=ka->LL_PlayCycle(u16(part),m,TRUE,nullptr,nullptr);
+			if (playing)
+			{
+				const float phase=clampr(float(s.anims.time_ms[part])/1000.f,0.f,_max(0.f,playing->timeTotal-.001f));
+				if (instrument::phase_needs_sync(phase,playing->timeCurrent)) playing->timeCurrent=phase;
+				it->second.applied[part]=value;
+			}
 		}
 	}
 	return true;

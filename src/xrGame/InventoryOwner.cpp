@@ -1,5 +1,6 @@
 #include "pch_script.h"
 #include "InventoryOwner.h"
+#include "coop/coop_instrument.h" // Anomaly Coop: render-only instrument prop
 #include "entity_alive.h"
 #include "pda.h"
 #include "actor.h"
@@ -328,6 +329,7 @@ bool CInventoryOwner::IsTrading()
 //==============
 void CInventoryOwner::renderable_Render		(IDSGraphManager* DM)
 {
+	if (CGameObject* obj = cast_game_object()) coop::players::instrument_render(obj, DM);
 	if (inventory().ActiveItem())
 		inventory().ActiveItem()->renderable_Render(DM);
 
