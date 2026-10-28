@@ -9,6 +9,14 @@ namespace coop { namespace instrument {
 constexpr uint32_t kMaxSongMs = 600000;
 constexpr uint32_t kTransitionMs = 15000;
 constexpr uint32_t kNoMotion = 0xffff;
+template <class FileSystem, class Path>
+bool resource_exists(FileSystem& fs, Path& path, const char* alias, const char* name, const char* extension)
+{
+    // The four-argument overload concatenates the extension and cannot accept nullptr.
+    if (extension)
+        return fs.exist(path, alias, name, extension);
+    return fs.exist(path, alias, name);
+}
 struct State
 {
     uint8_t kind = 0, phase = 0, track = 0; // kind 1 guitar/2 harmonica; phase 1 enter/2 play/3 leave

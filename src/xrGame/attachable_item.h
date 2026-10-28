@@ -46,6 +46,8 @@ public:
 	IC u16 bone_id() const;
 	IC void set_bone_id(u16 bone_id);
 	IC const Fmatrix& offset() const;
+	// Anomaly Coop: validated host attachment pose; caller disables the item before changing it.
+	void coop_set_attach_position(LPCSTR bone, const Fmatrix& offset) { m_bone_name = bone; m_offset = offset; }
 	IC bool enabled() const;
 	virtual void enable(bool value);
 protected:

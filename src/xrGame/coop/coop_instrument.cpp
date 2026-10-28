@@ -37,7 +37,7 @@ struct Presentation
     u32 song_serial = 0;
     u8 song_track = 0, song_kind = 0;
     IRenderVisual* prop = nullptr;
-    u8 prop_kind = 0, npc_kind = 0;
+    u8 prop_kind = 0;
     bool show_prop = false, missing_logged = false;
 };
 // Heap-owned: release sound/render resources while the world still exists, never at process-static teardown.
@@ -79,7 +79,7 @@ const char* section(u8 kind) { return kind == 1 ? "guitar_a" : "harmonica_a"; }
 bool resource(const char* alias, const char* name, const char* ext)
 {
     string_path path;
-    return FS.exist(path, alias, name, ext);
+    return instrument::resource_exists(FS, path, alias, name, ext);
 }
 // Safely resolve the full ORIGINAL sequence on this visual. A missing sequence leaves normal animation running.
 bool pose_motion(IKinematicsAnimated* ka, const instrument::State& s, MotionID& motion, float& phase, bool& prop)
@@ -291,31 +291,13 @@ void instrument_reset()
     for (auto& it:g_present) dispose(it.second);
     g_present.clear();
 }
-void instrument_npc_attachment(CGameObject* obj, u8 kind)
-{
-    auto it=g_present.find(obj->ID());
-    if (!kind && it==g_present.end()) return;
-    Presentation& p=view(obj); p.npc_kind=kind; p.show_prop=kind!=0;
-    if (CInventoryOwner* owner=obj->cast_inventory_owner())
-        for (PIItem item:owner->inventory().m_all)
-        {
-            const bool guitar=item->object().cNameSect()=="guitar_a", harmonica=item->object().cNameSect()=="harmonica_a";
-            if (!guitar && !harmonica) continue;
-            if (CAttachableItem* a=smart_cast<CAttachableItem*>(item))
-            {
-                const bool on=kind==(guitar ? 1 : 2);
-                if (a->enabled()!=on) a->enable(on);
-                if (on) p.show_prop=false; // the real attachment is present: no second model
-            }
-        }
-}
 void instrument_render(CGameObject* obj, IDSGraphManager* DM)
 {
     auto it=g_present.find(obj->ID());
     if (it==g_present.end() || it->second->owner!=obj || !alive(obj)) return;
     Presentation& p=*it->second;
     if (!p.show_prop) return;
-    const u8 kind=p.npc_kind ? p.npc_kind : p.state.kind;
+    const u8 kind=p.state.kind;
     if (!kind) return;
     IKinematics* k=obj->Visual() ? obj->Visual()->dcast_PKinematics() : nullptr;
     const char* sect=section(kind);

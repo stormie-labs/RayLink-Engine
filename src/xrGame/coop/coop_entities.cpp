@@ -11,6 +11,7 @@
 #include "coop_requests.h"
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_mirror.h" // B2
+#include "xrCoop/coop_attachments.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -68,6 +69,7 @@ struct HostEvent
 xr_vector<HostEvent> g_host_events;
 u64 g_last_snapshot = 0;
 u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_sent = 0, g_snapshots_sent = 0;
+u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
 
 void write_packet(Writer& w, const NET_Packet& p)
 {
@@ -207,17 +209,31 @@ bool is_creature(CGameObject* obj)
 	return remote::is_puppet_type(obj); // stalkers, monsters, traders (WP1)
 }
 
-u8 npc_instrument(CGameObject* obj)
+// Ambient scripts run only on the host. Replicate their real attachments, not a list of known prop sections.
+attachments::State capture_attachments(CGameObject* obj)
 {
-	CInventoryOwner* owner=obj->cast_inventory_owner();
-	if (!owner) return 0;
-	for (CAttachableItem* a:owner->attached_objects())
-		if (a && a->enabled())
+	attachments::State state;
+	CInventoryOwner* owner = obj->cast_inventory_owner();
+	if (!owner) return state;
+	for (CAttachableItem* a : owner->attached_objects())
+		if (a && a->enabled() && !smart_cast<CTorch*>(&a->item()))
 		{
-			if (a->item().object().cNameSect()=="guitar_a") return 1;
-			if (a->item().object().cNameSect()=="harmonica_a") return 2;
+			attachments::Item item;
+			item.id = a->item().object().ID();
+			item.bone = a->bone_name().c_str();
+			a->offset().getHPB(item.angles[0], item.angles[1], item.angles[2]);
+			item.position[0] = a->offset().c.x;
+			item.position[1] = a->offset().c.y;
+			item.position[2] = a->offset().c.z;
+			if (!item.valid() || state.items.size() == attachments::kMaxItems)
+			{
+				// A partial list must not be mistaken for a command to detach the remaining items.
+				state.items.clear(); state.complete = false; ++g_attachment_incomplete;
+				return state;
+			}
+			state.items.push_back(item);
 		}
-	return 0;
+	return state;
 }
 
 // W5 C2.6: the head torch of an NPC is switched by the host's Lua (sr_light spawns/releases it, story effects
@@ -335,6 +351,53 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 	return done;
 }
 
+bool apply_attachments(CGameObject* obj, const attachments::State& state)
+{
+	CInventoryOwner* owner = obj->cast_inventory_owner();
+	if (!state.complete) return false;
+	if (!owner) return state.items.empty();
+	IKinematics* k = obj->Visual() ? obj->Visual()->dcast_PKinematics() : nullptr;
+	if (!k) return false;
+	// Copy IDs before enable(false) mutates the owner's attachment list. Torches retain their separate light path.
+	std::vector<uint16_t> enabled;
+	for (CAttachableItem* a : owner->attached_objects())
+		if (a && !smart_cast<CTorch*>(&a->item())) enabled.push_back(a->item().object().ID());
+	ClientApply scope;
+	return attachments::reconcile(state, enabled,
+		[&](uint16_t id) {
+			CObject* o = Level().Objects.net_Find(id);
+			CInventoryItem* item = o && o->H_Parent() == obj ? smart_cast<CInventoryItem*>(o) : nullptr;
+			if (CAttachableItem* a = item ? smart_cast<CAttachableItem*>(item) : nullptr)
+			{
+				a->enable(false);
+				if (owner->attached(item)) owner->detach(item);
+			}
+		},
+		[&](const attachments::Item& wanted) {
+			CObject* o = Level().Objects.net_Find(wanted.id);
+			CInventoryItem* item = o && !o->getDestroy() && o->H_Parent() == obj ? smart_cast<CInventoryItem*>(o) : nullptr;
+			CAttachableItem* a = item ? smart_cast<CAttachableItem*>(item) : nullptr;
+			if (!a || smart_cast<CTorch*>(item) || item->m_pInventory != &owner->inventory()) return false;
+			const u16 bone = k->LL_BoneID(wanted.bone.c_str());
+			if (bone == BI_NONE) return false;
+			Fmatrix offset;
+			offset.setHPB(wanted.angles[0], wanted.angles[1], wanted.angles[2]);
+			offset.c.set(wanted.position[0], wanted.position[1], wanted.position[2]);
+			const Fmatrix& old = a->offset();
+			const bool same_pose = a->bone_name() == wanted.bone.c_str() && old.i.similar(offset.i) &&
+				old.j.similar(offset.j) && old.k.similar(offset.k) && old.c.similar(offset.c);
+			if (!same_pose || !owner->attached(item))
+			{
+				a->enable(false);
+				if (owner->attached(item)) owner->detach(item);
+				a->coop_set_attach_position(wanted.bone.c_str(), offset);
+				a->enable(true);
+			}
+			a->set_bone_id(bone); // a changed NPC visual may have different numeric bone IDs
+			return owner->attached(item);
+		});
+}
+
 void host_send_snapshots()
 {
 	const u64 now = mgr().now_ms();
@@ -368,26 +431,29 @@ void host_send_snapshots()
 		obj->XFORM().getHPB(h, p, b);
 		const Fvector& pos = obj->Position();
 
-		w.u16(obj->ID());
+		Writer entry(128);
+		entry.u16(obj->ID());
 		float v[3] = {pos.x, pos.y, pos.z};
-		w.vec3(v);
-		w.angle16(angle_normalize(h));
-		w.u8(u8(clampr(alive ? alive->GetfHealth() : 1.f, 0.f, 1.f) * 255.f));
+		entry.vec3(v);
+		entry.angle16(angle_normalize(h));
+		entry.u8(u8(clampr(alive ? alive->GetfHealth() : 1.f, 0.f, 1.f) * 255.f));
 		AnimState a;
 		capture_anims(obj, a);
 		u16 held;
 		const u8 flags = creature_flags(obj, held);
-		w.u8(pack_anim_byte(a.count, flags)); // W5 C2.6: creature flags in the high nibble
+		entry.u8(pack_anim_byte(a.count, flags)); // W5 C2.6: creature flags in the high nibble
 		for (u8 k = 0; k < a.count; ++k)
 		{
-			w.u32(a.motion[k]);
-			w.u16(a.time_ms[k]);
+			entry.u32(a.motion[k]);
+			entry.u16(a.time_ms[k]);
 		}
 		if (flags & CreatureHolds)
-			w.u16(held);
+			entry.u16(held);
 		if (flags & CreatureAims)
-			write_aim(w, *obj->cast_stalker());
-		w.u8(npc_instrument(obj));
+			write_aim(entry, *obj->cast_stalker());
+		capture_attachments(obj).write(entry);
+		if (in_packet && w.size() + entry.size() > kSnapshotBudget) flush();
+		w.bytes(entry.ptr(), entry.size());
 		if (++in_packet >= 255 || w.size() >= kSnapshotBudget)
 			flush();
 	}
@@ -408,7 +474,7 @@ struct MirrorSample
 	AnimState anims;
 	u8 flags = 0; // CreatureFlags (W5 C2.6)
 	u16 held = kNoId; // local id of the item in hands (CreatureHolds)
-	u8 instrument_kind = 0;
+	attachments::State attachments;
 	Fquaternion aim[3]; // spine, shoulder, head bone rotations (CreatureAims; identity without it)
 };
 struct MirrorTrack
@@ -422,6 +488,9 @@ struct MirrorTrack
 	u16 held_shown = kNoId; // the item it holds
 	u64 flags_retry = 0; // a failed apply (torch not here yet) is tried again from this time
 	u64 flags_check = 0; // and the shown state is re-checked from time to time (local engine paths may switch it)
+	attachments::State attachments_shown;
+	bool attachments_pending = true;
+	u64 attachments_retry = 0, attachments_check = 0;
 };
 xr_map<u16, MirrorTrack> g_tracks;
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
@@ -895,9 +964,9 @@ void client_on_snapshot(PeerId, Reader& r)
 				q.w = unpack_unit(s16(r.u16()));
 			}
 		}
-		s.instrument_kind = r.u8();
-		if (!r.ok() || id == 0 || s.instrument_kind > 2)
+		if (!s.attachments.read(r) || id == 0)
 			break;
+		for (auto& item : s.attachments.items) item.id = join::to_local(item.id);
 		MirrorTrack& t = g_tracks[id];
 		if (t.have_offset && s32(remote_time - t.last_remote) <= 0)
 			continue; // latest wins
@@ -1205,11 +1274,25 @@ bool drive_mirror(CGameObject* obj)
 	}
 
 	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
-	players::instrument_npc_attachment(obj, s.instrument_kind);
 	MirrorTrack& track = it->second;
+	const u64 now = mgr().now_ms();
+	if (((track.attachments_pending || !(s.attachments == track.attachments_shown)) && now >= track.attachments_retry)
+		|| now >= track.attachments_check)
+	{
+		track.attachments_check = now + 2000;
+		if (apply_attachments(obj, s.attachments))
+		{
+			track.attachments_pending = false;
+			track.attachments_shown = s.attachments; track.attachments_retry = 0; ++g_attachment_applies;
+		}
+		else
+		{
+			track.attachments_pending = true;
+			track.attachments_retry = now + 100; ++g_attachment_retries;
+		}
+	}
 	const u8 want = track.samples.back().flags;
 	const u16 want_held = track.samples.back().held;
-	const u64 now = mgr().now_ms();
 	if (((want != track.flags_shown || want_held != track.held_shown) && now >= track.flags_retry)
 		|| now >= track.flags_check)
 	{
@@ -1274,6 +1357,8 @@ void frame()
 
 void print_status()
 {
+	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
+		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
 	if (mgr().is_host())
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);

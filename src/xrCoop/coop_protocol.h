@@ -62,7 +62,7 @@ namespace coop
 //    "occupied".
 // 15: bounded instrument state at the end of PlayerState; EntitySnapshot ends each creature with u8 instrument kind.
 //     Animation absence uses MotionID::invalidate (0xffff); (slot 0,index 0) is a valid motion.
-constexpr uint32_t kProtocolVersion = 15;
+constexpr uint32_t kProtocolVersion = 16;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 

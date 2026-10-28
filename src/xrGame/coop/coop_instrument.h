@@ -13,6 +13,4 @@ void instrument_frame();
 void instrument_reset();
 void instrument_forget(u16 id);
 void instrument_render(CGameObject* obj, IDSGraphManager* DM);
-// NPC attachments are independent of player instrument intent and use the host's bounded kind only.
-void instrument_npc_attachment(CGameObject* obj, u8 kind);
 } }
