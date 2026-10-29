@@ -50,6 +50,11 @@ bool suspend_binder(CScriptBinder* binder);
 // then Die(): ragdoll, corpse, death callbacks; the inventory stays. Repeats are ignored.
 void on_host_death(CGameObject* obj, u16 killer_local_id);
 
+// CAI_Stalker::Die hook, before the ragdoll is built (a client, host NPCs only). A puppet runs no death planner, so
+// nothing empties its hands: the item it holds goes into the corpse's inventory, where the host keeps it (GAMMA keeps
+// guns on bodies). A host that drops it instead sends EntityParent, which takes it out of the inventory again.
+void on_puppet_die(CGameObject* obj);
+
 // Health from a snapshot (0..1) for a living puppet. Never kills: values <= 0 keep it barely
 // alive until on_host_death arrives.
 void set_health(CGameObject* obj, float health);

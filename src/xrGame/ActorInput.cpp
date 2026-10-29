@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "coop/coop_survival.h"
+#include "coop/coop_world.h" // Anomaly Coop
 #include <dinput.h>
 #include "Actor.h"
 #include "Torch.h"
@@ -548,6 +549,11 @@ void CActor::ActorUse()
 	if (character_physics_support()->movement()->PHCapture())
 		character_physics_support()->movement()->PHReleaseObject();
 
+	// Anomaly Coop (owner, live 2026-10-29): F does nothing else to another player's character for now - no use callback
+	// (the stalker binder's use_callback: xr_meet's voice on use, trade_manager, npc_on_use mods), no talk, no search.
+	// Reviving a wounded teammate (the two hooks above) is the only thing it does to him.
+	if (coop::world::is_player_character(m_pObjectWeLookingAt))
+		return;
 
 	if (m_pUsableObject && NULL == m_pObjectWeLookingAt->cast_inventory_item())
 	{

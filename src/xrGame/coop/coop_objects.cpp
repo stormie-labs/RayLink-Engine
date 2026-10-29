@@ -673,6 +673,13 @@ bool apply_poses(CGameObject* go, const xr_vector<Pose>& poses, bool moving)
 		st.enabled = true; // keeps the collision space current; a still body falls asleep by itself
 		sync->set_State(st);
 	}
+	// CPHElement::set_LinearVel / set_AngularVel skip fixed elements: what contacts and joints push into a 1e8 kg body
+	// would stay and grow frame after frame (contact effects scale with sqrt(mass), the body drifts once the poses stop).
+	// FixBody zeroes it again (live 2026-10-29: a dead NPC's gun in the ground "screamed").
+	for (u16 i = 0; i < n; ++i)
+		if (CPhysicsElement* e = shell->get_ElementByStoreOrder(i))
+			if (e->isFixed())
+				e->Fix();
 	return true;
 }
 

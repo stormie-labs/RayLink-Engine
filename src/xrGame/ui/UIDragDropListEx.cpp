@@ -618,6 +618,13 @@ CUICellItem* CUICellContainer::FindSimilar(CUICellItem* itm)
 #else
 		CUICellItem* i = (CUICellItem*)(*it);
 #endif
+		if (i == itm)
+			continue;
+		// Anomaly Coop: the cheap section/condition compare first; the ini lookups below ran for every pair of cells,
+		// O(n^2) per list fill of a large trader stock.
+		if (!i->EqualTo(itm))
+			continue;
+
 		//Alundaio: Don't stack equipped items
 		PIItem iitem = (PIItem)i->m_pData;
 		if (iitem && iitem->m_pInventory)
@@ -631,11 +638,7 @@ CUICellItem* CUICellContainer::FindSimilar(CUICellItem* itm)
 		}
 		//-Alundaio
 
-		if (i == itm)
-			continue;
-
-		if (i->EqualTo(itm))
-			return i;
+		return i;
 	}
 	return NULL;
 }

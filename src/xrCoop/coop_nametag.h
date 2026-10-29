@@ -277,5 +277,40 @@ inline bool set_param(Params& p, const char* key, float v)
 	}
 	return false;
 }
+
+// Owner 2026-10-29 (build 29): "remove the random names on each other". A player's character carries his nick as its
+// character name (coop_equip.cpp apply_name: CInventoryOwner::ChangeName and the server entity's display copy), the
+// text of this tag, instead of the random stalker name of the avatar profile. ChangeName passes it through
+// TranslateName, which splits a "name:lname_x" pair at ':' and asserts on any other count of parts, so ':' goes; '%'
+// goes too (the UI reads "%c[...]" as a colour). At most n - 1 bytes and the terminator, never a cut UTF-8 sequence.
+// Returns the length; 0 (nothing left, or no room): the caller keeps the name the character has.
+constexpr size_t kMaxCharacterName = 64; // a nick is at most 48 bytes (coop_session.cpp sanitize_nick)
+
+inline size_t character_name(char* out, size_t n, const char* nick)
+{
+	if (!out || n == 0)
+		return 0;
+	const unsigned char* p = reinterpret_cast<const unsigned char*>(nick ? nick : "");
+	size_t len = 0;
+	while (*p)
+	{
+		if (*p == ':' || *p == '%')
+		{
+			++p;
+			continue;
+		}
+		const size_t seq = *p >= 0xF0 ? 4 : *p >= 0xE0 ? 3 : *p >= 0xC0 ? 2 : 1;
+		size_t have = 1;
+		while (have < seq && (p[have] & 0xC0) == 0x80)
+			++have;
+		if (len + have >= n)
+			break;
+		std::memcpy(out + len, p, have);
+		len += have;
+		p += have;
+	}
+	out[len] = 0;
+	return len;
+}
 } // namespace nametag
 } // namespace coop

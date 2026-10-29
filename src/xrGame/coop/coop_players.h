@@ -65,5 +65,8 @@ bool avatar_view(u16 avatar_id, float& yaw, float& pitch);
 // coop_equip.cpp: safe mode (weapon lowered) of the player whose avatar is `avatar_id`, as last reported in
 // PlayerEquip; false if not known.
 bool avatar_safemode(u16 avatar_id, bool& lowered);
+// coop_equip.cpp: the player's head torch is on, as last reported in PlayerEquip. The torch items of an avatar stay dark
+// (coop_equip draws the head torch itself): the AI's light estimate of a player's character reads this.
+bool avatar_headlamp(u16 avatar_id);
 } // namespace players
 } // namespace coop

@@ -189,15 +189,18 @@ void capture_anims(CGameObject* obj, AnimState& a)
 	for (u32 part = 0; part < kMaxPartitions; ++part)
 	{
 		const u32 n = ka->LL_PartBlendsCount(part);
-		CBlend* best = nullptr;
-		for (u32 i = 0; i < n; ++i)
-		{
-			CBlend* b = ka->LL_PartBlend(part, i);
-			if (b && instrument::prefer_blend(b->blend_state()!=CBlend::eFREE_SLOT,
-			        b->blend_state()==CBlend::eFalloff, b->blendAmount,
-			        best!=nullptr, best && best->blend_state()==CBlend::eFalloff, best ? best->blendAmount : 0.f))
-				best = b;
-		}
+		const u32 pick = instrument::pick_mirror_blend(n, [&](u32 i) {
+			instrument::BlendView v;
+			if (const CBlend* b = ka->LL_PartBlend(part, i))
+			{
+				v.live = b->blend_state() != CBlend::eFREE_SLOT;
+				v.fading = b->blend_state() == CBlend::eFalloff;
+				v.weight = b->blendAmount;
+				v.channel = b->channel;
+			}
+			return v;
+		});
+		const CBlend* best = pick < n ? ka->LL_PartBlend(part, pick) : nullptr;
 		a.motion[part] = best ? best->motionID.val : instrument::kNoMotion;
 		a.time_ms[part] = best ? u16(_min(best->timeCurrent, 65.f) * 1000.f) : 0;
 		a.count = u8(part + 1);
@@ -1323,7 +1326,7 @@ bool drive_mirror(CGameObject* obj)
 			for (u32 i=0,n=ka->LL_PartBlendsCount(part); i<n; ++i)
 			{
 				CBlend* b=ka->LL_PartBlend(part,i);
-				if (b && b->motionID==m && b->blend_state()==CBlend::eAccrue) { playing=b; break; }
+				if (b && instrument::mirrored_channel(b->channel) && b->motionID==m && b->blend_state()==CBlend::eAccrue) { playing=b; break; }
 			}
 			if (!playing) playing=ka->LL_PlayCycle(u16(part),m,TRUE,nullptr,nullptr);
 			if (playing)

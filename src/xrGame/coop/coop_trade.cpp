@@ -49,7 +49,6 @@ constexpr u16 kNoId = 0xffff;
 constexpr u16 kMaxDealItems = 1024;
 constexpr u64 kMoveCheckMs = 2500; // container move not applied after this -> rebuild the window
 constexpr u64 kRefreshMinMs = 150; // at most one list rebuild per this period (take-all bursts)
-constexpr u64 kSettleMs = 1500; // after a successful deal, one consistency rebuild
 constexpr u64 kPendingWarnMs = 15000; // client: a deal without answer is logged
 constexpr s64 kMaxMoney = 0xffffffffll;
 constexpr u8 kDealDonate = 1;
@@ -687,14 +686,26 @@ void client_on_result(Reader& r)
 			// with the item prices this window showed.
 			const u64 deadline = now_ms() + kCallbackWaitMs;
 			const u16 trader_local = join::to_local(trader_host);
+			// The window shows the deal already (client_transfer moved the cells), and the stock trader-inventory watch
+			// (CUIActorMenu::Update) refills the trader's list when the items leave him: the lists are rebuilt again only
+			// if an item has not arrived where the deal put it (refresh_actor_menu, kMoveCheckMs). The unconditional
+			// settle rebuild of both lists was a second hitch after every purchase (live 2026-10-29, G.A.M.M.A.).
 			for (const DealItem& di : deal.sell)
+			{
 				g_callbacks.push_back({di.id, trader_local, true, di.price, deadline});
+				on_container_move(kNoId, trader_local, di.id);
+			}
 			for (const DealItem& di : deal.buy)
+			{
 				g_callbacks.push_back({di.id, a->ID(), false, di.price, deadline});
+				on_container_move(kNoId, a->ID(), di.id);
+			}
 		}
 		else
+		{
 			::Msg("! [coop] trade #%u accepted while there is no actor here", seq);
-		request_rebuild(now_ms() + kSettleMs);
+			request_rebuild(now_ms());
+		}
 	}
 	else
 	{

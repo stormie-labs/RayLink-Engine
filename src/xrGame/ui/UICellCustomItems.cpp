@@ -78,8 +78,17 @@ CUIInventoryCellItem::CUIInventoryCellItem(CInventoryItem* itm)
 	LPCSTR condbar = READ_IF_EXISTS(pSettings, r_string, itm->m_section_id, "condition_bar", NULL);
 	if (condbar)
 	{
-		CUIXml uiXml;
-		uiXml.Load(CONFIG_PATH, UI_PATH, "actor_menu_item.xml");
+		// Anomaly Coop: parsed once, as CUICellItem::init already does with the same file. A load per cell read the file
+		// and ran it through the script XML hook (G.A.M.M.A.'s DXML re-parses it in Lua) for every item of every list fill
+		// ([identity_immunities] gives nearly every item a condition_bar): a hitch on each trade window rebuild (live
+		// 2026-10-29, buying at a trader).
+		static CUIXml uiXml;
+		static bool isXmlReady = false;
+		if (!isXmlReady)
+		{
+			uiXml.Load(CONFIG_PATH, UI_PATH, "actor_menu_item.xml");
+			isXmlReady = true;
+		}
 		CUIXmlInit::InitProgressBar(uiXml, condbar, 0, m_pConditionState);
 	}
 }

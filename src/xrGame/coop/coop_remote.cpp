@@ -18,6 +18,7 @@
 #include "ai/monsters/basemonster/base_monster.h"
 #include "ai/trader/ai_trader.h"
 #include "InventoryOwner.h"
+#include "Inventory.h"
 #include "step_manager.h"
 #include "script_binder.h"
 #include "PhysicsShellHolder.h"
@@ -54,7 +55,7 @@ struct Puppet
 	const CBlend* legs_blend = nullptr;
 };
 xr_map<u16, Puppet> g_puppets;
-u64 g_made_remote = 0, g_made_local = 0, g_deaths = 0, g_driven = 0;
+u64 g_made_remote = 0, g_made_local = 0, g_deaths = 0, g_driven = 0, g_holstered = 0;
 
 // W9: nobody talks to a player's character, on any machine: talk off means no "talk" use tip (CActor looks at
 // IsTalkEnabled), OfferTalk refuses, Lua is_talk_enabled() is false. Its Lua binder update is suspended (no
@@ -320,6 +321,27 @@ void on_host_death(CGameObject* obj, u16 killer_local_id)
 	++g_deaths;
 }
 
+// Live 2026-10-29 (build 29, owner's screenshot): on the client a dead NPC kept its gun in its hand; the gun went into
+// the ground and "screamed". Stock empties a dead stalker's hands in its death planner (CStalkerActionDead drops the
+// held item), which a puppet never runs (Remote: no Think), and its snapshots stop at death. A host drop comes as
+// EntityParent; GAMMA's keep_guns_on_bodies keeps the gun with GE_TRADE_SELL + GE_TRADE_BUY in one frame, which
+// events::host_flush relays as nothing ("back where it was"). So the gun stayed on the hand bone and its collision
+// went into the hand element of the ragdoll (AddActiveWeaponCollision), a fixed 1e8 kg body the host's poses place:
+// pushed into the terrain, it made contact sounds every step. The item goes into the corpse's inventory before the
+// ragdoll is built; a drop from the host takes it out of there.
+void on_puppet_die(CGameObject* obj)
+{
+	if (!obj || !mgr().is_client() || world::is_player_proxy(obj->ID()) || !is_remote_creature(obj))
+		return;
+	CInventoryOwner* owner = obj->cast_inventory_owner();
+	PIItem item = owner ? owner->inventory().ActiveItem() : nullptr;
+	if (!item)
+		return;
+	entities::ClientApply scope; // the host's word applied here: its weapon state events stay local
+	if (owner->inventory().Ruck(item))
+		++g_holstered;
+}
+
 void set_health(CGameObject* obj, float health)
 {
 	if (!is_remote_creature(obj))
@@ -332,8 +354,9 @@ void set_health(CGameObject* obj, float health)
 
 void print_status()
 {
-	::Msg("[coop]   puppets: %u now, %llu made remote, %llu made local, %llu driven updates, %llu host deaths applied",
-	    (u32)g_puppets.size(), g_made_remote, g_made_local, g_driven, g_deaths);
+	::Msg("[coop]   puppets: %u now, %llu made remote, %llu made local, %llu driven updates, %llu host deaths applied, "
+	    "%llu held items put away at death",
+	    (u32)g_puppets.size(), g_made_remote, g_made_local, g_driven, g_deaths, g_holstered);
 	npc_ai::print_status();
 }
 } // namespace remote

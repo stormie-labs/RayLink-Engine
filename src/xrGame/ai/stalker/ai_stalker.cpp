@@ -605,6 +605,8 @@ void CAI_Stalker::reload(LPCSTR section)
 
 void CAI_Stalker::Die(CObject* who)
 {
+	coop::remote::on_puppet_die(this); // Anomaly Coop: a puppet's hands are emptied before its ragdoll is built
+
 	movement().on_death();
 
 	notify_on_wounded_or_killed(who);

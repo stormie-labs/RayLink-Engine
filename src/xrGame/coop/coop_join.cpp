@@ -21,6 +21,7 @@
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_link_hold.h"
 #include "xrCoop/coop_newchar.h"
+#include "xrCoop/coop_nametag.h" // live b29: player names in the stored field
 #include "xrCoop/coop_transition.h" // protocol 10: the waiting point of a level change
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -455,6 +456,20 @@ struct StartPoint
 	std::string where; // "start:<location>" / "camp:<smart>" (the log)
 };
 
+// A player character's name lives in m_character_name_str, the field saves and spawn packets carry: every STATE_Read (a
+// save, the copy each game object spawns from, a mirrored EntitySpawn) rebuilds m_character_name from it, so a name put
+// into m_character_name alone turns back into the stock name of the avatar's profile (sim_default_stalker_0,
+// GENERATE_NAME: live b29 "Borka Mason"). nametag::character_name keeps it readable by TranslateName, the same text
+// coop_equip.cpp apply_name shows; nothing left of the nick keeps the name the character has.
+void set_player_name(CSE_ALifeTraderAbstract& who, const std::string& nick)
+{
+	char name[nametag::kMaxCharacterName];
+	if (!nametag::character_name(name, sizeof(name), nick.c_str()))
+		return;
+	who.m_character_name_str = name;
+	who.m_character_name = TranslateName(who.m_character_name_str.c_str());
+}
+
 CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_digest, const StartPoint& at)
 {
 	CSE_ALifeCreatureActor* actor = ai().alife().graph().actor();
@@ -483,7 +498,7 @@ CSE_ALifeHumanStalker* create_proxy(const PeerInfo& p, const std::string& key_di
 	string512 ini;
 	xr_sprintf(ini, "[coop]\nkey = %s\nnick = %s\n", key_digest.c_str(), p.nick.c_str()); // R1 I1: the digest
 	proxy->m_ini_string = ini;
-	proxy->m_character_name = p.nick.c_str();
+	set_player_name(*proxy, p.nick);
 	::Msg("[coop] new character for '%s': proxy id %u at [%.1f %.1f %.1f] (%s)", p.nick.c_str(), proxy->ID, pos.x, pos.y,
 	    pos.z, at.set ? at.where.c_str() : "next to the host");
 	return proxy;
@@ -995,6 +1010,7 @@ bool host_send_save(PeerId from, const PeerInfo& p_ref, CSE_ALifeHumanStalker& p
 	CSE_ALifeHumanStalker* proxy = &proxy_ref;
 	HostPeer& hp = g.peers[from];
 	hp.proxy = proxy->ID;
+	set_player_name(*proxy, p->nick); // a returning character of an older save still has the stock name; nicks change
 	hp.loading = true; // W9: not in the world before WorldLoaded: the save he gets has his character offline
 	world::host_mark_proxy(proxy->ID, from);
 
@@ -3673,6 +3689,7 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	swap_values(actor->CSE_ALifeTraderAbstract::m_rank, proxy->CSE_ALifeTraderAbstract::m_rank);
 	swap_values(actor->m_reputation, proxy->m_reputation);
 	swap_values(actor->m_character_name, proxy->m_character_name);
+	swap_values(actor->m_character_name_str, proxy->m_character_name_str); // what the spawns rebuild the name above from
 	// The proxy is an NPC of community X; a player character uses actor_X (game_relations.ltx has
 	// both, relations and scripts tell them apart).
 	if (actor->m_community_index != NO_COMMUNITY_INDEX)

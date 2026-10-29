@@ -3,6 +3,8 @@
 // PlayerEquip (reliable, on change + every 5 s): the owner's visual, item in hands, torch.
 //   Applied to the player's avatar everywhere; on the host the proxy keeps the visual in its
 //   server entity, so the character looks right after a save/load (P4).
+//   A PDA in hands is drawn as an attachment of the avatar (show_pda, live 2026-10-29).
+//   With each one the character takes its player's nick as its name (apply_name, live 2026-10-29).
 //   W5 tail: handheld flashlight on + its light section (drawn here by our own lights, see HandLight)
 //   and safe mode (weapon lowered, coop.player_safemode).
 // PlayerVitals (reliable, every 2 s, client -> host): health, satiety, radiation, psy, power,
@@ -21,7 +23,9 @@
 #include "coop_entities.h"
 #include "coop_net.h"
 #include "coop_alife.h"
+#include "coop_survival.h"
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_nametag.h"
 #include "xrCoop/coop_gear.h"
 #include "xrCoop/coop_checkpoint_rules.h"
 
@@ -194,6 +198,65 @@ bool capture_equip(Equip& e)
 	return true;
 }
 
+// Owner, live 2026-10-29 (build 29): "the PDA in the hands for others". The object handler plans only for weapons and
+// missiles (object_handler_planner.cpp add_item): a goal on any other item (a PDA, an artefact) names a world property
+// it has no evaluator for, whose lookup (problem_solver_inline.h evaluator) reads past its table in Release. Such an
+// item leaves the avatar's hands empty for the planner (apply_equip); a PDA is drawn the way stock stalkers draw one in
+// scenes, as an attachment at its own attach_bone_name / offsets (bip01_l_hand, device_pda in items_devices.ltx). The
+// engine attaches only the sections the avatar's section lists (attachment_owner.cpp can_attach): mod_system_coop.ltx
+// adds the PDAs to the attachable_items of [coop_player_avatar]. enable() only adds the item to what the body draws:
+// it stays where it is in the inventory and stays its owner's. Player characters only, never an NPC.
+u64 g_pda_refused = 0;
+
+void show_pda(CAI_Stalker* av, PIItem held)
+{
+	CInventoryOwner* owner = av->cast_inventory_owner();
+	if (!owner || !world::is_player_character(av))
+		return;
+	IKinematics* k = av->Visual() ? av->Visual()->dcast_PKinematics() : nullptr;
+	for (PIItem item : av->inventory().m_all)
+	{
+		if (!item || !item->cast_pda())
+			continue;
+		const bool want = item == held && k && k->LL_BoneID(item->bone_name()) != BI_NONE;
+		if (want == (item->enabled() && owner->attached(item)))
+			continue;
+		item->enable(false); // also hides one the inventory detached (OnItemRuck) but left enabled
+		if (owner->attached(item))
+			owner->detach(item);
+		if (!want)
+			continue;
+		item->enable(true);
+		if (owner->attached(item))
+			continue;
+		item->enable(false); // a section this avatar may not attach (attachable_items): it stays put away
+		if (++g_pda_refused <= 10)
+			::Msg("! [coop] avatar %u cannot hold the PDA [%s] in its hand (not in [coop_player_avatar] attachable_items?)",
+			    av->ID(), item->object().cNameSect().c_str());
+	}
+}
+
+// Owner, live 2026-10-29 (build 29): "remove the random names on each other". A player's character is a stalker of the
+// avatar profile, so its server entity got a random stalker name at spawn (specific_character, GENERATE_NAME_), saved
+// and sent as its name string; the nick create_proxy (coop_join.cpp) puts in the display copy is gone after a load and
+// on the other machines. The crosshair readout (HUDRecon.cpp), Lua character_name() (GAMMA's Faction ID HUD, HUD
+// marks, kill news, the loot window) and the server entity's name (PDA rankings, character info) showed it to the
+// other players. The character carries its player's nick instead, the text of the tag over its head. On each machine,
+// again with every PlayerEquip: nothing new on the wire, a nick learned late is there within 5 s.
+void apply_name(u16 avatar_id, CAI_Stalker* av)
+{
+	const xr_string nick = survival::nick_of(join::to_host(avatar_id));
+	char name[nametag::kMaxCharacterName];
+	if (nick == "?" || !nametag::character_name(name, sizeof(name), nick.c_str()))
+		return; // not known here yet (a client has the nicks from the host's roster): the next PlayerEquip
+	if (xr_strcmp(av->Name(), name))
+		av->ChangeName(name); // the game object, and its own saved name string (no ':' for TranslateName to split)
+	CSE_ALifeTraderAbstract* t =
+	    ai().get_alife() ? smart_cast<CSE_ALifeTraderAbstract*>(ai().alife().objects().object(avatar_id, true)) : nullptr;
+	if (t && xr_strcmp(t->m_character_name.c_str(), av->Name()))
+		t->m_character_name = av->Name(); // the server entity's display copy; its saved name string is left as it is
+}
+
 // Returns false if the avatar is not online yet (keep it pending).
 bool apply_equip(u16 avatar_id, const Equip& e)
 {
@@ -219,13 +282,23 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 		if (o && o->H_Parent() == av)
 			in_hands = smart_cast<CGameObject*>(o);
 	}
-	av->CObjectHandler::set_goal(MonsterSpace::eObjectActionIdle, in_hands);
+	PIItem held = in_hands ? in_hands->cast_inventory_item() : nullptr;
+	const bool planned = held && (held->cast_weapon() || held->cast_missile()); // see show_pda
+	av->CObjectHandler::set_goal(MonsterSpace::eObjectActionIdle, planned ? in_hands : nullptr);
+	show_pda(av, held);
 
+	// Live 2026-10-29 (b29): the head torch of another player shone at the ground "who knows where", and a lamp given from
+	// one player to the other kept shining from where its old holder wore it. No torch item is ever attached to an
+	// avatar's head (GAMMA's device_torch_dummy / _nv_* are not in the stalker's attachable_items, and CAI_Stalker
+	// can_attach wants enable(true), which only sr_light gives an NPC), and in the backpack its CTorch::Update does not
+	// run: a lit one shone from wherever the item last was on this machine, every torch of the inventory at once. The
+	// items stay dark; the owner's head torch is drawn at the head, where the player looks (head lights below).
 	for (PIItem item : av->inventory().m_all)
 		if (CTorch* torch = smart_cast<CTorch*>(item))
-			if (torch->torch_active() != e.torch)
-				torch->Switch(e.torch);
+			if (torch->torch_active())
+				torch->Switch(false);
 
+	apply_name(avatar_id, av);
 	g_applied[avatar_id] = e;
 	return true;
 }
@@ -246,9 +319,14 @@ struct HandLight
 	u16 bone = BI_NONE;
 	bool placed = false;
 	bool dynamic = false; // spot and omni on (the avatar may use dynamic lights)
+	bool head = false; // the owner's head torch (PlayerEquip torch), not the handheld flashlight
+	Fvector offset{}; // in the bone's space: where the lamp sits on it
 };
 // Heap objects: a static map destroyed at process exit must not release render lights after the renderer.
 xr_map<u16, HandLight*> g_lights; // local avatar id -> its hand light
+xr_map<u16, HandLight*> g_head_lights; // local avatar id -> its head torch
+// Where a stalker wears device_torch on bip01_head (its attach_position_offset; GAMMA's headlamps inherit it).
+const Fvector kHeadLampOffset = {0.134f, -0.007f, 0.09f};
 u32 g_lights_world = 0; // join::world_generation() the lights were made in
 u64 g_lights_made = 0, g_lights_bad = 0;
 
@@ -265,6 +343,9 @@ void destroy_lights()
 	for (auto& it : g_lights)
 		destroy_light(it.second);
 	g_lights.clear();
+	for (auto& it : g_head_lights)
+		destroy_light(it.second);
+	g_head_lights.clear();
 }
 
 CAI_Stalker* avatar_here(u16 id)
@@ -328,7 +409,7 @@ void place_light(HandLight* l, CAI_Stalker* av)
 		l->bone = BI_NONE;
 		if (K)
 		{
-			l->bone = K->LL_BoneID("bip01_l_hand");
+			l->bone = K->LL_BoneID(l->head ? "bip01_head" : "bip01_l_hand");
 			if (l->bone == BI_NONE)
 				l->bone = K->LL_BoneID("bip01_head");
 		}
@@ -340,12 +421,12 @@ void place_light(HandLight* l, CAI_Stalker* av)
 		K->CalculateBones(FALSE); // once per frame at most
 		Fmatrix M;
 		M.mul_43(X, K->LL_GetTransform(l->bone));
-		pos = M.c;
+		M.transform_tiny(pos, l->offset); // a hand light: the bone itself; a head torch: the lamp on the head
 	}
 	else
 	{
 		pos = X.c;
-		pos.y += 1.2f;
+		pos.y += l->head ? 1.7f : 1.2f;
 	}
 	Fvector dir = X.k, right = X.i; // model facing (drive_avatar sets it from the owner's body yaw)
 	float view_yaw = 0.f, view_pitch = 0.f;
@@ -397,7 +478,26 @@ void place_light(HandLight* l, CAI_Stalker* av)
 	l->glow->set_color(f);
 }
 
-// Every frame (main thread): lights follow the avatars, appear and go with the owners' flashlights.
+// The head torch of a player: the light section of the torch its avatar carries (GAMMA's headlamps and the stock
+// device_torch: torch_definition), placed like a stalker's attached device_torch, aimed by place_light.
+HandLight* make_head_light(CAI_Stalker* av)
+{
+	LPCSTR light = "torch_definition";
+	for (PIItem item : av->inventory().m_all)
+		if (smart_cast<CTorch*>(item))
+		{
+			light = READ_IF_EXISTS(pSettings, r_string, item->object().cNameSect().c_str(), "light_section", "torch_definition");
+			break;
+		}
+	if (!light || !pSettings->section_exist(light))
+		return nullptr;
+	HandLight* l = make_light(light);
+	l->head = true;
+	l->offset = kHeadLampOffset;
+	return l;
+}
+
+// Every frame (main thread): lights follow the avatars, appear and go with the owners' flashlights and head torches.
 void hand_light_frame()
 {
 	const u32 world = join::world_generation();
@@ -414,6 +514,17 @@ void hand_light_frame()
 		{
 			destroy_light(it->second);
 			it = g_lights.erase(it);
+		}
+		else
+			++it;
+	}
+	for (auto it = g_head_lights.begin(); it != g_head_lights.end();)
+	{
+		const auto e = g_applied.find(it->first);
+		if (!avatar_here(it->first) || e == g_applied.end() || !e->second.torch)
+		{
+			destroy_light(it->second);
+			it = g_head_lights.erase(it);
 		}
 		else
 			++it;
@@ -437,6 +548,23 @@ void hand_light_frame()
 				continue;
 			}
 			l = g_lights.emplace(it.first, make_light(it.second.light_section)).first;
+		}
+		place_light(l->second, av);
+	}
+	for (const auto& it : g_applied)
+	{
+		if (!it.second.torch)
+			continue;
+		CAI_Stalker* av = avatar_here(it.first);
+		if (!av)
+			continue;
+		auto l = g_head_lights.find(it.first);
+		if (l == g_head_lights.end())
+		{
+			HandLight* made = make_head_light(av);
+			if (!made)
+				continue;
+			l = g_head_lights.emplace(it.first, made).first;
 		}
 		place_light(l->second, av);
 	}
@@ -786,6 +914,12 @@ bool avatar_safemode(u16 avatar_id, bool& lowered)
 	return true;
 }
 
+bool avatar_headlamp(u16 avatar_id)
+{
+	auto it = g_applied.find(avatar_id);
+	return it != g_applied.end() && it->second.torch;
+}
+
 void equip_reset()
 {
 	destroy_lights();
@@ -859,13 +993,16 @@ void equip_resend()
 
 void equip_print_status()
 {
-	::Msg("[coop]   equipment: %llu out, %llu in, %u pending, %llu visuals refused; vitals: %llu out, %llu in",
-	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_visual_bad, g_vitals_out, g_vitals_in);
+	::Msg("[coop]   equipment: %llu out, %llu in, %u pending, %llu visuals refused, %llu PDAs not held (attachable_items); "
+	      "vitals: %llu out, %llu in",
+	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_visual_bad, g_pda_refused, g_vitals_out, g_vitals_in);
 	::Msg("[coop]   equipment layout: %llu out, %llu in, %llu malformed; last placed on a rejoin: slots %u, belt %u, "
 	      "backpack %u, %u left to the engine",
 	      g_gear_out, g_gear_in, g_gear_bad, g_gear_placed[1], g_gear_placed[2], g_gear_placed[3], g_gear_placed[0]);
-	::Msg("[coop]   hand lights: %u on, %llu made, %llu unknown sections | my flashlight %s, safe mode %s",
-	      (u32)g_lights.size(), g_lights_made, g_lights_bad, g_last_sent.hand_light ? g_last_sent.light_section.c_str() : "off",
+	::Msg("[coop]   hand lights: %u on, head torches: %u on, %llu made, %llu unknown sections | my flashlight %s, "
+	      "head torch %s, safe mode %s",
+	      (u32)g_lights.size(), (u32)g_head_lights.size(), g_lights_made, g_lights_bad,
+	      g_last_sent.hand_light ? g_last_sent.light_section.c_str() : "off", g_last_sent.torch ? "on" : "off",
 	      g_last_sent.safemode ? "on" : "off");
 }
 } // namespace players

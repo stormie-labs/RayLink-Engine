@@ -81,5 +81,30 @@ inline bool prefer_blend(bool live, bool fading, float weight, bool best_live, b
 {
     return live && (!best_live || (best_fading && !fading) || (fading == best_fading && weight >= best_weight));
 }
+// Live b29 (2026-10-29): client NPC puppets flashed a T-pose in fights. A stalker's hit flinch (character_hit_animations.cpp)
+// plays hit_downl/r, hitback17... on channels 2 and 3 with weight = hit power (1..3), and those channels ADD key deltas
+// over the motion's first frame (Animation.cpp: {lerp, add}); the motions themselves are authored on the bind pose. The
+// host picked the heavier/later flinch, the client replayed it as a channel-0 cycle: the bind pose. Only channel 0 is a pose.
+constexpr uint8_t kMirrorChannel = 0;
+inline bool mirrored_channel(uint8_t channel) { return channel == kMirrorChannel; }
+struct BlendView { bool live = false, fading = false; float weight = 0.f; uint8_t channel = 0; };
+// Host capture: the blend of one bone partition the mirror replays (index), or n when there is none.
+template <class View>
+uint32_t pick_mirror_blend(uint32_t n, View view)
+{
+    uint32_t best = n;
+    BlendView b;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const BlendView c = view(i);
+        if (mirrored_channel(c.channel) &&
+            prefer_blend(c.live, c.fading, c.weight, best != n, best != n && b.fading, best != n ? b.weight : 0.f))
+        {
+            best = i;
+            b = c;
+        }
+    }
+    return best;
+}
 inline bool phase_needs_sync(float host, float local) { return std::fabs(host-local) > .25f; }
 } }

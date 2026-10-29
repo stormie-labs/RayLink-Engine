@@ -92,7 +92,7 @@ float max3(const Fvector& v) { return _max(v.x, _max(v.y, v.z)); }
 // sun if the sun ray is free + own headlamp. Point lights of the level (fires, lamps) are left out.
 float estimate_light(CGameObject* obj, Proxy& p)
 {
-	p.headlamp = false;
+	p.headlamp = players::avatar_headlamp(obj->ID()); // a player's character: its torch items stay dark (coop_equip.cpp)
 	if (CInventoryOwner* io = obj->cast_inventory_owner())
 	{
 		for (PIItem item : io->inventory().m_all)

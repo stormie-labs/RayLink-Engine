@@ -37,6 +37,10 @@
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 #include "ui/UIInventoryUtilities.h"
+#include "ai_space.h"
+#include "InventoryOwner.h"
+#include "string_table.h"
+#include "xrServer_Objects_ALife_Monsters.h"
 
 namespace coop
 {
@@ -313,6 +317,21 @@ void dump_state(LPCSTR args)
 		const Fvector& p = go->Position();
 		::Msg("[coop-dump] %5u %-32s parent %5u pos [%8.2f %8.2f %8.2f]", host_id, go->cName().c_str(),
 		    go->H_Parent() ? join::to_host(go->H_Parent()->ID()) : 0xffff, p.x, p.y, p.z);
+		CInventoryOwner* owner = one ? smart_cast<CInventoryOwner*>(go) : nullptr;
+		if (owner)
+		{
+			// NPC names (2026-10-30): the shown name, the entity's display and stored name, its character and visual,
+			// the language that translated it - the same line from the host and a client tells which one differs
+			CSE_ALifeTraderAbstract* tr = ai().get_alife()
+			    ? smart_cast<CSE_ALifeTraderAbstract*>(ai().alife().objects().object(go->ID(), true))
+			    : nullptr;
+			const STRING_TABLE_DATA* st = CStringTable::getPData();
+			auto text = [](const shared_str& v) { return v.size() ? v.c_str() : ""; };
+			::Msg("[coop-dump]       name '%s' | entity '%s' stored '%s' character [%s] profile [%s] | visual [%s] | lang %s",
+			    owner->Name(), tr ? tr->m_character_name.c_str() : "-", tr ? tr->m_character_name_str.c_str() : "-",
+			    tr ? text(tr->m_SpecificCharacter) : "-", tr ? text(tr->m_sCharacterProfile) : "-",
+			    text(go->cNameVisual()), st ? text(st->m_sLanguage) : "?");
+		}
 	}
 	::Msg("[coop-dump] %u online objects (ids in host numbering)", count);
 }
