@@ -314,6 +314,7 @@ xr_token dead_body_collision_tokens[] =
 
 void register_mp_console_commands();
 #include "coop/coop_manager.h"
+#include "coop/coop_join.h" // Anomaly Coop: save ownership includes mirror teardown
 #include "coop/coop_worldstate.h" // Anomaly Coop: time_factor gating
 //-----------------------------------------------------------
 
@@ -1091,7 +1092,7 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
-		if (coop::mgr().is_client()) // Anomaly Coop: only the host saves the shared world (R-9.2)
+		if (!coop::join::may_save_world()) // Anomaly Coop: includes mirror teardown after disconnect (R-9.2)
 			{ Msg("! [coop] saving is disabled on a co-op client, the host saves the world"); return; }
 #if 0
 		if (!Level().autosave_manager().ready_for_autosave()) {

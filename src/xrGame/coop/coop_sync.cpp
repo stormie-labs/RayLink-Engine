@@ -52,6 +52,7 @@ xr_set<PeerId> g_joining;
 // F3a T4: what the old install(Session&) set up besides the handlers, once per process, in its order
 void init()
 {
+	join::prepare_client_cache();
 	story::init();
 	requests::init();
 	money::init(); // F2 T1

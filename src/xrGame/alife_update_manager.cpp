@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_join.h" // Anomaly Coop: the private join cache is not the player's last save
 #include "coop/coop_sync.h"
 #include "coop/coop_checkpoints.h" // F3: arrival checkpoints on a level change
 #include "coop/coop_autosave.h" // F3: the host's autosave name on a level change
@@ -316,7 +317,8 @@ void CALifeUpdateManager::load(LPCSTR game_name, bool no_assert, bool new_only)
 	size_t									memory_usage = Memory.mem_usage();
 #endif
 
-	xr_strcpy(g_last_saved_game, game_name);
+	if (!coop::join::is_client_cache_save(game_name))
+		xr_strcpy(g_last_saved_game, game_name);
 
 	if (new_only || !CALifeStorageManager::load(game_name))
 	{

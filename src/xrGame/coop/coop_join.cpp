@@ -15,6 +15,7 @@
 #include "coop_survival.h" // transition wait: who is alive
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_shapes.h"
+#include "xrCoop/coop_save_policy.h"
 #include "xrCoop/coop_death_rules.h" // Ruling F3-9: retired keys, new_key_charge
 #include "xrCoop/coop_levels_wire.h" // F3a T8: LoadWait, LoadReady
 #include "xrCoop/coop_limits.h"
@@ -88,7 +89,7 @@ namespace join
 namespace
 {
 constexpr LPCSTR kProxySection = "coop_player_avatar";
-constexpr LPCSTR kClientSaveName = "coop_session";
+constexpr LPCSTR kClientSaveName = save_policy::kClientStem;
 constexpr u16 kNoId = 0xffff;
 
 struct HostPeer
@@ -1434,18 +1435,31 @@ void client_load_world(std::vector<u8>& data)
 	}
 
 	string_path scop, scoc;
-	save_path(scop, kClientSaveName, ".scop");
-	save_path(scoc, kClientSaveName, ".scoc");
+	client_cache_path(scop, ".scop");
+	client_cache_path(scoc, ".scoc");
+	on_blocking_work();
+	if (script_size && !write_file(scoc, script_part, script_size))
+	{
+		::Msg("! [coop] cannot write client script cache %s", scoc);
+		mgr().stop("cannot write the world script cache");
+		return;
+	}
+	if (!script_size && !DeleteFileA(scoc))
+	{
+		const DWORD error = GetLastError();
+		if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+		{
+			::Msg("! [coop] cannot remove stale script cache %s (%lu)", scoc, error);
+			mgr().stop("cannot reset the world script cache");
+			return;
+		}
+	}
 	if (!write_file(scop, engine_part, engine_size))
 	{
 		::Msg("! [coop] cannot write %s", scop);
 		mgr().stop("cannot write the world save");
 		return;
 	}
-	if (script_size)
-		write_file(scoc, script_part, script_size);
-	else
-		FS.file_delete(scoc);
 
 	g.my_proxy = proxy;
 	entities::client_set_initial_online(online); // needs my_proxy for the id mapping
@@ -3267,6 +3281,72 @@ void on_welcome(const WelcomeMsg&)
 u16 my_proxy() { return g.my_proxy; }
 
 bool client_loading_world() { return mgr().phase() == Phase::LoadingWorld; }
+
+bool is_client_cache_save(LPCSTR name)
+{
+	return name && save_policy::is_client_cache(name);
+}
+
+void client_cache_path(string_path& out, LPCSTR extension)
+{
+	string_path relative;
+	xr_sprintf(relative, "%s%s", save_policy::kCacheFile, extension);
+	FS.update_path(out, "$app_data_root$", relative);
+}
+
+void prepare_client_cache()
+{
+	// The old reserved join snapshot lived among campaign saves. Archive it without deleting or replacing any file.
+	const LPCSTR extensions[] = {".scop", ".scoc", ".dds"};
+	string_path from[3], to[3];
+	bool found = false;
+	for (u32 i = 0; i < 3; ++i)
+	{
+		save_path(from[i], save_policy::kLegacyStem, extensions[i]);
+		const DWORD attr = GetFileAttributesA(from[i]);
+		found |= attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+	}
+	if (!found) return;
+	for (u32 slot = 0; slot < 100; ++slot)
+	{
+		bool free = true;
+		for (u32 i = 0; i < 3; ++i)
+		{
+			string_path relative;
+			xr_sprintf(relative, "raylink\\cache\\legacy_session_%u\\coop_session%s", slot, extensions[i]);
+			FS.update_path(to[i], "$app_data_root$", relative);
+			free &= GetFileAttributesA(to[i]) == INVALID_FILE_ATTRIBUTES;
+		}
+		if (!free) continue;
+		bool moved = false;
+		for (u32 i = 0; i < 3; ++i)
+		{
+			const DWORD attr = GetFileAttributesA(from[i]);
+			if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
+			VerifyPath(to[i]);
+			if (MoveFileExA(from[i], to[i], MOVEFILE_WRITE_THROUGH))
+			{
+				moved = true;
+				::Msg("[coop] archived legacy join cache: %s", to[i]);
+			}
+			else
+				::Msg("! [coop] cannot archive legacy join cache %s (%lu); file kept", from[i], GetLastError());
+		}
+		if (moved)
+		{
+			FS.get_path("$game_saves$")->m_Flags.set(FS_Path::flNeedRescan, TRUE);
+			FS.m_Flags.set(CLocatorAPI::flNeedCheck, TRUE);
+			FS.rescan_pathes();
+		}
+		return;
+	}
+	::Msg("! [coop] legacy join cache archive is full; files kept");
+}
+
+bool may_save_world()
+{
+	return save_policy::may_save_world(mgr().is_client(), world_is_mirror());
+}
 
 bool world_is_mirror()
 {

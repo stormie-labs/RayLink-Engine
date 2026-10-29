@@ -7,6 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include "coop/coop_join.h" // Anomaly Coop: received worlds use a private cache, outside campaign saves
 #include "saved_game_wrapper.h"
 #include "alife_time_manager.h"
 #include "alife_object_registry.h"
@@ -21,6 +22,11 @@ extern LPCSTR alife_section;
 
 LPCSTR CSavedGameWrapper::saved_game_full_name(LPCSTR saved_game_name, string_path& result)
 {
+	if (coop::join::is_client_cache_save(saved_game_name))
+	{
+		coop::join::client_cache_path(result, SAVE_EXTENSION);
+		return result;
+	}
 	string_path temp;
 	strconcat(sizeof(temp), temp, saved_game_name,SAVE_EXTENSION);
 	FS.update_path(result, "$game_saves$", temp);
@@ -29,6 +35,7 @@ LPCSTR CSavedGameWrapper::saved_game_full_name(LPCSTR saved_game_name, string_pa
 
 bool CSavedGameWrapper::saved_game_exist(LPCSTR saved_game_name)
 {
+	if (coop::join::is_client_cache_save(saved_game_name) && !coop::join::client_loading_world()) return false;
 	string_path file_name;
 	return (!!FS.exist(saved_game_full_name(saved_game_name, file_name)));
 }
@@ -49,6 +56,7 @@ bool CSavedGameWrapper::valid_saved_game(IReader& stream)
 
 bool CSavedGameWrapper::valid_saved_game(LPCSTR saved_game_name)
 {
+	if (coop::join::is_client_cache_save(saved_game_name) && !coop::join::client_loading_world()) return false;
 	string_path file_name;
 	if (!FS.exist(saved_game_full_name(saved_game_name, file_name)))
 		return (false);

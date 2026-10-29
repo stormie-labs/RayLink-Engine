@@ -47,6 +47,12 @@ CALifeStorageManager::~CALifeStorageManager()
 
 void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 {
+	// Anomaly Coop: the console is not the only caller; refuse before Lua, last-save state or disk writes.
+	if (!coop::join::may_save_world())
+	{
+		Msg("! [coop] only the host can save the shared world");
+		return;
+	}
 	PROF_EVENT();
 	coop::on_blocking_work(); // Anomaly Coop: writing a big save blocks the frame, keep the session link alive
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
@@ -172,6 +178,8 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 
 bool CALifeStorageManager::load(LPCSTR save_name_no_check)
 {
+	// Anomaly Coop: a received snapshot can only be loaded by the active join pipeline.
+	if (coop::join::is_client_cache_save(save_name_no_check) && !coop::join::client_loading_world()) return false;
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
 
 	string_path save_name;
@@ -193,9 +201,10 @@ bool CALifeStorageManager::load(LPCSTR save_name_no_check)
 		strconcat(sizeof(m_save_name), m_save_name, save_name, SAVE_EXTENSION);
 	}
 	string_path file_name;
-	FS.update_path(file_name, "$game_saves$", m_save_name);
+	CSavedGameWrapper::saved_game_full_name(save_name, file_name); // Anomaly Coop: also resolves the private join cache
 
-	xr_strcpy(g_last_saved_game, save_name);
+	if (!coop::join::is_client_cache_save(save_name))
+		xr_strcpy(g_last_saved_game, save_name);
 	xr_strcpy(g_bug_report_file, file_name);
 
 	IReader* stream;
