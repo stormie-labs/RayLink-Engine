@@ -276,6 +276,11 @@ using Manifest = std::vector<ManifestEntry>;
 // Order-independent fingerprint of a manifest (FNV-1a over sorted entries).
 uint64_t manifest_fingerprint(const Manifest& m);
 
+// A loose gamedata file (path relative to gamedata, any case, '\\' or '/') that only changes how the world looks:
+// everything under textures\. Left out of the manifest, so a texture pack or another version of one does not refuse
+// a join (live 2026-10-29: a GAMMA client was refused for textures).
+bool manifest_visual_only(const std::string& gamedata_rel);
+
 struct ManifestDiff
 {
 	std::vector<std::string> missing_here; // host has, we don't

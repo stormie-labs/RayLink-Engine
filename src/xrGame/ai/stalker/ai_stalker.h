@@ -370,6 +370,7 @@ private:
 	xr_vector<CTradeItem> m_temp_items;
 	u32 m_total_money;
 	bool m_sell_info_actuality;
+	u32 m_sell_info_frame; // Anomaly Coop: Device.dwFrame of m_temp_items (update_sell_info)
 	bool m_can_select_weapon;
 public:
 	bool can_select_weapon() { return m_can_select_weapon; };

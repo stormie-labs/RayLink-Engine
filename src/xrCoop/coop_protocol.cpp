@@ -2,6 +2,7 @@
 #include "coop_protocol.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -303,6 +304,18 @@ const char* reject_reason_name(RejectReason r)
 }
 
 // ---------------------------------------------------------------- manifest
+
+bool manifest_visual_only(const std::string& gamedata_rel)
+{
+	static const char kFolder[] = "textures";
+	const size_t n = sizeof(kFolder) - 1;
+	if (gamedata_rel.size() <= n + 1 || (gamedata_rel[n] != '\\' && gamedata_rel[n] != '/'))
+		return false;
+	for (size_t i = 0; i < n; ++i)
+		if (std::tolower(static_cast<unsigned char>(gamedata_rel[i])) != kFolder[i])
+			return false;
+	return true;
+}
 
 uint64_t manifest_fingerprint(const Manifest& m)
 {

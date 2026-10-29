@@ -11,6 +11,7 @@
 #include "coop_requests.h"
 #include "coop_script.h"
 #include "coop_money.h"
+#include "xrCoop/coop_talks.h" // R4 2: may_trade_with
 
 #include "Level.h"
 #include "Actor.h"
@@ -421,9 +422,12 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 		return NoTrader;
 	if (!smart_cast<CAI_Trader*>(trader) && !smart_cast<CAI_Stalker*>(trader))
 		return NoTrader; // CTrade (pricing below) knows traders and stalkers only
-	// R4 2: the counterparty is one the player trades with now: its trade flag is on (the stock talk window
-	// offers trade only then; wounded NPCs and meet logic turn it off) and it stands by the player's character.
-	if (!trader->IsTradeEnabled())
+	// R4 2: the counterparty is one the player trades with now (talks::may_trade_with): its stock trade flag is on, or,
+	// on Anomaly 1.5.3 where xr_meet keeps that flag off and trade opens from the dialog, the player talked to it; and it
+	// stands by the player's character.
+	const CAI_Stalker* stalker = smart_cast<const CAI_Stalker*>(trader);
+	if (!talks::may_trade_with(trader->IsTradeEnabled(),
+	        dialog::host_talked_recently(from, trader_id, u32(talks::kTradeAfterTalkMs)), stalker && stalker->wounded()))
 		return NoTrader;
 	if (!trader->NeedOsoznanieMode() && !within_reach(proxy, trader, kTradeReach))
 		return TooFar;

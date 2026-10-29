@@ -316,6 +316,8 @@ const Manifest& Manager::manifest()
 			continue;
 		if (is_runtime_written(f.name.c_str()))
 			continue; // per-player settings and caches the game rewrites while running: not content
+		if (manifest_visual_only(f.name.c_str()))
+			continue; // textures: how the world looks, not what the host and the clients simulate
 		ManifestEntry e;
 		e.path = xr_string("gamedata\\").append(f.name).c_str();
 		const long size = f.size;

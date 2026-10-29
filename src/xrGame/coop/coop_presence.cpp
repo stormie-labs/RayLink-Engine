@@ -9,6 +9,8 @@
 #include "coop_items.h"
 #include "coop_sound.h"
 #include "coop_requests.h"
+#include "coop_remote.h"
+#include "coop_world.h"
 #include "xrCoop/coop_nametag.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -41,6 +43,7 @@ constexpr u8 kMaxShotsPerEvent = 32;
 constexpr u32 kMaxBulletsPerEvent = 16;
 constexpr float kTagRange = 400.f;
 constexpr float kMuzzleSnap = 3.f; // use the avatar weapon's own fire point when it is this close
+constexpr float kNpcShotRange = 500.f; // host: an NPC's shot goes to the players this close to it
 
 enum Kind : u8
 {
@@ -187,6 +190,7 @@ struct Stats
 {
 	u64 shots_out = 0, reloads_out = 0, events_in = 0, shots_in = 0, reloads_in = 0, bullets = 0;
 	u64 no_avatar = 0, no_weapon = 0, sounds_missing = 0;
+	u64 npc_shots_out = 0, npc_shots_far = 0;
 } g_stat;
 
 bool live() { return mgr().is_host() || mgr().is_live_client(); }
@@ -342,11 +346,14 @@ void play(u16 avatar_id, const ShotEvent& e)
 		return;
 	}
 	const bool silenced = (e.flags & FlagSilenced) != 0;
-	play_weapon_sound(sect, silenced ? "snd_silncer_shot" : "snd_shoot", "snd_shoot", av, origin,
-	    SOUND_TYPE_WEAPON_SHOOTING);
+	// Live 2026-10-29 (b28): the weapon's own collection, as CWeaponMagazined::PlaySoundShot of a non-actor plays it.
+	// GAMMA's snd_shoot is mostly a layer section (snd_1_layer...), not a file, so reading the line as a file was silent
+	// ("avatar sound 'wpn_gsh18_snd_shoot' not found"); layers, variants and on_before_play_hud_sound now apply.
+	w->PlaySound(silenced ? "sndSilencerShot" : "sndShot", origin);
 	play_particles(sect, silenced ? "silencer_flame_particles" : "flame_particles", origin, e.dir);
 	play_particles(sect, silenced ? "silencer_smoke_particles" : "smoke_particles", origin, e.dir);
-	fire_bullets(av, w, e, origin);
+	if (world::is_player_character(av))
+		fire_bullets(av, w, e, origin); // an NPC's hits come from the host; no local bullets (bullet_on_impact mods)
 }
 
 // ---------------------------------------------------------------- network
@@ -392,6 +399,27 @@ void on_shot_msg(PeerId from, Reader& r)
 	play(avatar, e);
 }
 
+// Host: an NPC's shot (shooter = the NPC, host numbering) to every player within kNpcShotRange of the muzzle.
+void send_npc(const ShotEvent& e)
+{
+	Writer w(40);
+	e.write(w);
+	for (const PeerInfo& p : mgr().session().peers())
+	{
+		if (p.state != PeerState::Joined || sync::host_peer_joining(p.id))
+			continue;
+		const u16 proxy = join::proxy_of_peer(p.id);
+		CObject* o = proxy != 0xffff ? Level().Objects.net_Find(proxy) : nullptr;
+		if (!o || o->Position().distance_to(e.pos) > kNpcShotRange)
+		{
+			++g_stat.npc_shots_far;
+			continue;
+		}
+		net::host_send(p.id, Msg::PlayerShot, w, Lane::Unreliable);
+		g_stat.npc_shots_out += e.count;
+	}
+}
+
 void send_pending()
 {
 	xr_vector<ShotEvent> shots;
@@ -401,6 +429,11 @@ void send_pending()
 	}
 	for (ShotEvent& e : shots)
 	{
+		if (e.shooter != 0xffff)
+		{
+			send_npc(e);
+			continue;
+		}
 		send(e);
 		g_stat.shots_out += e.count;
 	}
@@ -606,9 +639,19 @@ void on_weapon_shot(CWeapon* w)
 	if (!w || !g_pGameLevel || !live())
 		return;
 	CObject* parent = w->H_Parent();
-	if (!parent || parent != Level().CurrentEntity())
-		return; // only the local actor's own weapon: avatars and NPCs are someone else's
-	ShotEvent e;
+	if (!parent)
+		return;
+	ShotEvent e; // shooter 0xffff: the local actor's own shot (send() fills it in)
+	if (parent != Level().CurrentEntity())
+	{
+		// Live 2026-10-29 (b28): "the client does not hear NPCs shoot". A puppet never fires (no brain, its object handler
+		// held at idle / strapped), so the host relays its own NPCs' shots. Avatars and proxies belong to their players.
+		CGameObject* npc = smart_cast<CGameObject*>(parent);
+		if (!mgr().is_host() || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
+		    world::is_player_character(npc))
+			return;
+		e.shooter = npc->ID();
+	}
 	e.weapon = join::to_host(w->ID());
 	if (CWeaponMagazinedWGrenade* gl = smart_cast<CWeaponMagazinedWGrenade*>(w))
 		if (gl->GetGrenadeLauncherMode())
@@ -689,6 +732,9 @@ void print_status()
 	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s (v2.1: %u drawn)",
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
 	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off", u32(g_tags.size()));
+	if (mgr().is_host())
+		::Msg("[coop]   presence: npc shots out %llu, npc shot events out of range %llu", g_stat.npc_shots_out,
+		    g_stat.npc_shots_far);
 	sound::print_status();
 }
 

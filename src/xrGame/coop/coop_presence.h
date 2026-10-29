@@ -5,6 +5,8 @@
 //   sent once per frame as PlayerShot. Everybody else plays it on the shooter's avatar: shot sound, flame
 //   and smoke particles at the third-person muzzle, and cosmetic bullets (tracers, impacts) that never
 //   deal damage (SendHit off). Damage is decided by the hit claims (WP2), not here.
+//   The host's NPCs too (live 2026-10-29: puppets never fire): their shots go as PlayerShot with shooter = the NPC to
+//   the players within 500 m; the clients play sound, flame and smoke on the puppet, no bullets.
 // Reload: the owner's active weapon entering the reload state goes out as PlayerShot kind Reload; the
 //   others play the weapon's reload sound at the avatar (the reload body motion comes with the owner's
 //   MotionIDs in PlayerState already).
@@ -37,7 +39,7 @@ void reset(); // session started / ended (drops cached sounds and cartridges)
 void print_status();
 void render_hud(); // HUDManager::RenderUI: name tags (positions prepared by frame())
 
-// Weapon fired (any game thread): records a shot of the local actor's weapon, frame() sends it.
+// Weapon fired (any game thread): records a shot of the local actor's weapon (host: of its NPCs too), frame() sends it.
 void on_weapon_shot(CWeapon* weapon);
 } // namespace presence
 } // namespace coop

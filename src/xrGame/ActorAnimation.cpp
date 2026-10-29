@@ -635,11 +635,13 @@ void CActor::g_SetAnimation(u32 mstate_rl)
 					{
 						switch (P->GetState())
 						{
-						case CPda::eIdle: M_torso = P->m_bZoomed ? TW->zoom : (moving_idx == STorsoWpn::eSprint ? ST->m_torso[0].moving[moving_idx] : ST->m_torso[4].moving[moving_idx]);
-							break;
-						case CPda::eShowing: M_torso = TW->draw;
-							break;
-						case CPda::eHiding: M_torso = TW->holster;
+						// Anomaly Coop (live 2026-10-29): device_pda shares animation_slot 13 with wpn_binoc, so the slot's zoom,
+						// draw and holster torsos are the binoculars' (zoom = binoculars at the eyes), and other players'
+						// avatars replay this MotionID. The PDA keeps its own hands pose, raised or not; binoculars (CWeapon)
+						// still use the slot.
+						case CPda::eIdle:
+						case CPda::eShowing:
+						case CPda::eHiding: M_torso = moving_idx == STorsoWpn::eSprint ? ST->m_torso[0].moving[moving_idx] : ST->m_torso[4].moving[moving_idx];
 							break;
 						default: M_torso = ST->m_torso[4].moving[moving_idx];
 							break;

@@ -86,6 +86,16 @@ inline bool talked_recently(uint16_t holding, const Recent& recent, uint16_t npc
 	return holding == npc || recent.within(npc, now, window_ms);
 }
 
+// R4 2 on Anomaly 1.5.3: the counterparty of a client's deal is one he trades with now. The stock trade flag says so for
+// an engine trade window; Anomaly opens trade from the dialog, and its meet logic turns that flag off on every update
+// (xr_meet.script), so there the player's talk with the NPC says so: held now, or ended no more than kTradeAfterTalkMs
+// ago (the dialog hands over to the trade window, which may stay open a while). A wounded NPC never trades.
+constexpr uint64_t kTradeAfterTalkMs = 600000;
+inline bool may_trade_with(bool trade_flag, bool talked_recently, bool wounded)
+{
+	return !wounded && (trade_flag || talked_recently);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // B8: DialogLockResult - the host's answer to a client's request for the talk lock (ids in host numbering).
 //   u16 npc, u8 result, and for NotWilling one more byte: the Reason. Results 0..4 are unchanged since protocol 8; an

@@ -165,6 +165,7 @@ void CAI_Stalker::reinit()
 	m_best_found_ammo = 0;
 	m_item_actuality = false;
 	m_sell_info_actuality = false;
+	m_sell_info_frame = u32(-1);
 
 	m_ce_close = xr_new<CCoverEvaluatorCloseToEnemy>(&movement().restrictions());
 	m_ce_far = xr_new<CCoverEvaluatorFarFromEnemy>(&movement().restrictions());
