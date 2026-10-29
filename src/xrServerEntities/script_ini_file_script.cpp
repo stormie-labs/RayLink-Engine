@@ -12,6 +12,7 @@
 #include "string_table.h"
 #include "script_engine.h"
 #include "ai_space.h"
+#include "../xrCore/raylink_version.h"
 
 using namespace luabind;
 
@@ -124,9 +125,22 @@ int get_modded_exes_version() {
 	return result;
 }
 
+// RayLink: the name of this exe build starts with the engine's ("RayLink Engine b28 (Modded Exes MT-TEST)"). The
+// modded exes flavour stays in it: scripts detect the MT variant by find("MT") (modded_exes_migration.script applies
+// the MT console defaults that way). The version number functions above stay as they are: mods compare
+// MODDED_EXES_VERSION to enable features.
 LPCSTR get_modded_exes_name() {
-	shared_str result = "Modded Exes MT-TEST";
-	return result.c_str();
+	return RAYLINK_ENGINE_VERSION " (Modded Exes MT-TEST)";
+}
+
+// RayLink: for scripts. raylink_engine_version() = "RayLink Engine b28" (or "RayLink Engine dev"),
+// raylink_engine_build() = "28" (or "dev" for a development build).
+LPCSTR raylink_engine_version() {
+	return RAYLINK_ENGINE_VERSION;
+}
+
+LPCSTR raylink_engine_build() {
+	return RAYLINK_BUILD > 0 ? RAYLINK_STRINGIZE(RAYLINK_BUILD) : "dev";
 }
 
 // demonized: get modded exes version
@@ -222,6 +236,10 @@ void CScriptIniFile::script_register(lua_State* L)
 		// demonized: get modded exes version
 		def("get_modded_exes_version", &get_modded_exes_version),
 		def("get_modded_exes_name", &get_modded_exes_name),
+
+		// RayLink: which engine runs the game
+		def("raylink_engine_version", &raylink_engine_version),
+		def("raylink_engine_build", &raylink_engine_build),
 
 		// demonized: get translation strings table
 		def("get_string_table", &get_string_table)

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "resource.h"
 #include "dedicated_server_only.h"
+#include "../xrCore/raylink_version.h" // the window title names the engine
 
 #ifdef INGAME_EDITOR
 # include "../include/editor/ide.hpp"
@@ -71,7 +72,7 @@ PROTECT_API void CRenderDevice::Initialize()
 
 		// Create the render window
 		m_hWnd = CreateWindowEx(WS_EX_TOPMOST,
-		                        wndclass, "S.T.A.L.K.E.R.: Anomaly", m_dwWindowStyle,
+		                        wndclass, "S.T.A.L.K.E.R.: Anomaly - " RAYLINK_ENGINE_VERSION, m_dwWindowStyle,
 		                        /*rc.left, rc.top, */CW_USEDEFAULT, CW_USEDEFAULT,
 		                        (rc.right - rc.left), (rc.bottom - rc.top), 0L,
 		                        0, hInstance, 0L);

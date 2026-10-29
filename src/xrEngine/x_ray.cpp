@@ -33,6 +33,7 @@
 #include "xrSash.h"
 #include "MonitorList.h"
 #include "renderdoc_integration.h"
+#include "../xrCore/raylink_version.h"
 
 extern "C" void XR_EARLY_INIT();
 
@@ -40,7 +41,7 @@ extern "C" void XR_EARLY_INIT();
 
 
 //---------------------------------------------------------------------
-#define XRAY_MONOLITH_VERSION "X-Ray Monolith v1.5.3"
+#define XRAY_MONOLITH_VERSION "X-Ray Monolith v1.5.3" // the engine RayLink is based on (credit in the log banner)
 ENGINE_API CInifile* pGameIni = NULL;
 BOOL g_bIntroFinished = FALSE;
 extern void Intro(void* fn);
@@ -1107,7 +1108,8 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	renderdoc_initialize();
 
 	InitSettings();
-	Msg(XRAY_MONOLITH_VERSION);
+	// RayLink: "RayLink Engine b28 - S.T.A.L.K.E.R. Anomaly 1.5.3 (based on X-Ray Monolith v1.5.3)"
+	Msg("%s - %s (based on %s)", RAYLINK_ENGINE_VERSION, RAYLINK_GAME_NAME, XRAY_MONOLITH_VERSION);
 
 	{
 		FS_FileSet fset;

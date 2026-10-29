@@ -3,6 +3,7 @@
 
 #include "xrdebug.h"
 #include "os_clipboard.h"
+#include "raylink_version.h" // the crash dialogs name the engine and its build
 
 #include <sal.h>
 #include <dxerr.h>
@@ -243,7 +244,7 @@ void xrDebug::do_exit(const std::string& message)
 	if (handler)
 		handler();
 	xrLogger::FlushLog();
-	MessageBox(NULL, message.c_str(), "Error", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
+	MessageBox(NULL, message.c_str(), RAYLINK_ENGINE_VERSION " - Error", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
 	TerminateProcess(GetCurrentProcess(), 1);
 }
 
@@ -288,7 +289,7 @@ void xrDebug::backend(const char* expression, const char* description, const cha
 	MessageBox(
 		NULL,
 		assertion_info,
-		"Fatal Error",
+		RAYLINK_ENGINE_VERSION " - Fatal Error",
 		MB_OK | MB_ICONERROR | MB_SYSTEMMODAL
 	);
 
@@ -873,7 +874,7 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 	MessageBox(
 		GetTopWindow(NULL),
 		"Unhandled exception occured. See log for details",
-		"Fatal Error",
+		RAYLINK_ENGINE_VERSION " - Fatal Error",
 		MB_OK | MB_ICONERROR | MB_SYSTEMMODAL
 	);
 	//    TerminateProcess(GetCurrentProcess(), 1);

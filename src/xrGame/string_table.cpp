@@ -6,6 +6,7 @@
 #include "..\..\xrEngine\x_ray.h"
 #include "MainMenu.h"
 #include "UIGameCustom.h"
+#include "../xrCore/raylink_version.h"
 #include <regex>
 
 STRING_TABLE_DATA* CStringTable::pData = NULL;
@@ -86,6 +87,16 @@ void CStringTable::Init()
 #endif // #ifdef DEBUG
 	//---
 	ReparseKeyBindings();
+
+	// RayLink: the main menu's version line (ui_main_menu.script and the mods' copies of it show ui_st_game_version)
+	// names the engine after the game's own text: "S.T.A.L.K.E.R. G.A.M.M.A. 0.9.5 | RayLink Engine b28". Done once
+	// every file is loaded, so it holds whichever file defines the string last (G.A.M.M.A.'s text overhaul does).
+	STRING_TABLE_MAP_IT game_version = pData->m_StringTable.find("ui_st_game_version");
+	if (game_version != pData->m_StringTable.end())
+	{
+		LPCSTR game_line = game_version->second.c_str();
+		game_version->second = raylink::game_line_with_engine(game_line ? game_line : "", RAYLINK_ENGINE_VERSION).c_str();
+	}
 
 	//Discord
 	snprintf(discord_strings.mainmenu, 128, xr_ToUTF8(*CStringTable().translate("st_main_menu")));

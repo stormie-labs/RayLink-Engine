@@ -16,6 +16,7 @@
 #include "xr_object.h"
 #include "MonitorList.h"
 #include "renderdoc_integration.h"
+#include "../xrCore/raylink_version.h"
 
 xr_token* vid_quality_token = NULL;
 
@@ -81,6 +82,25 @@ public:
 		Console->Hide();
 		Engine.Event.Defer("KERNEL:disconnect");
 		Engine.Event.Defer("KERNEL:quit");
+	}
+};
+
+//-----------------------------------------------------------------------
+// RayLink: `version` prints which engine runs the game,
+// "RayLink Engine b28 - S.T.A.L.K.E.R. Anomaly 1.5.3 (fork of X-Ray Monolith)"
+class CCC_Version : public IConsole_Command
+{
+public:
+	CCC_Version(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; };
+
+	virtual void Execute(LPCSTR args)
+	{
+		Msg("%s - %s (fork of %s)", RAYLINK_ENGINE_VERSION, RAYLINK_GAME_NAME, RAYLINK_ENGINE_BASE);
+	}
+
+	virtual void Info(TInfo& I)
+	{
+		xr_strcpy(I, "engine name and build");
 	}
 };
 
@@ -1091,6 +1111,7 @@ void CCC_Register()
 {
 	// General
 	CMD1(CCC_Help, "help");
+	CMD1(CCC_Version, "version");
 	CMD1(CCC_Quit, "quit");
 	CMD1(CCC_Start, "start");
 	CMD1(CCC_Disconnect, "disconnect");

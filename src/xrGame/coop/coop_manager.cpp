@@ -7,6 +7,7 @@
 #include "coop_autosave.h" // F3
 #include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "xrCoop/coop_link_hold.h"
+#include "../../xrCore/raylink_version.h" // build_id names the engine build
 
 #include <atomic>
 #include <cstdio>
@@ -248,10 +249,11 @@ void Manager::set_phase(Phase p)
 
 const char* Manager::build_id()
 {
-	// Same exe on both sides is the supported setup; compile stamp + protocol identify it.
+	// Same exe on both sides is the supported setup; engine build + protocol + compile stamp identify it
+	// ("RayLink Engine b28 p16 Oct 29 2026 17:05:12": the build mismatch refusal shows both sides' ids).
 	static string128 id = "";
 	if (!id[0])
-		xr_sprintf(id, "anomaly-coop p%u %s %s", kProtocolVersion, __DATE__, __TIME__);
+		xr_sprintf(id, "%s p%u %s %s", RAYLINK_ENGINE_VERSION, kProtocolVersion, __DATE__, __TIME__);
 	return id;
 }
 

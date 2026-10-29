@@ -63,9 +63,9 @@ BEGIN
         BLOCK "000004b0"
         BEGIN
             VALUE "CompanyName", "Anomaly Team"
-            VALUE "FileDescription", "X-Ray Monolith Engine"
+            VALUE "FileDescription", "RayLink Engine (X-Ray Monolith fork)"
             VALUE "FileVersion", "1.0.5.6"
-            VALUE "InternalName", "Monolith Engine"
+            VALUE "InternalName", "RayLink Engine"
             VALUE "LegalCopyright", "Copyright 2009 GSC Game World, 2018-2024 Anomaly Team"
             VALUE "OriginalFilename", "Anomaly.exe"
             VALUE "ProductName", "S.T.A.L.K.E.R.: Anomaly"

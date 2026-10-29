@@ -96,6 +96,7 @@ Where the co-op code lives: `src/xrCoop` (network core, protocol, rules; no game
 
 | Problem | What to do |
 |---|---|
+| Which engine build do I run? | The main menu's version line ends with *RayLink Engine b&lt;N&gt;* (so do the window title and the first line of the log); the console command `version` prints it too. A local build without a number says *RayLink Engine dev*. |
 | *Access denied* while the launcher builds the stand | The game (or its second window, or a crashed process) still runs from the stand: close it. |
 | Refused at join: different build | Both press *Update the build* in the launcher. |
 | Refused at join: content differs | Different G.A.M.M.A. version or mod list: copy the host's setup, then *Build the stand* again. |

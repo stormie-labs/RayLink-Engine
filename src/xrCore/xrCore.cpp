@@ -6,6 +6,7 @@
 #include <mmsystem.h>
 #include <objbase.h>
 #include "xrCore.h"
+#include "raylink_version.h"
 
 #pragma comment(lib,"winmm.lib")
 
@@ -138,10 +139,11 @@ void xrCore::_initialize(LPCSTR _ApplicationName, xrLogger::LogCallback cb, BOOL
 #endif // _EDITOR
 		flags |= CLocatorAPI::flScanAppRoot;
 		FS._initialize(flags, 0, fs_fname);
+		// RayLink: the engine names itself first (raylink_version.h); the 'xrCore' build line below stays as log
+		// readers know it. "modded exes version" is the MODDED_EXES_VERSION mods compare (demonized: the build date).
+		Msg("%s (%s fork, modded exes version %s)\n", RAYLINK_ENGINE_VERSION, RAYLINK_ENGINE_BASE,
+		    get_modded_exes_version_string().c_str());
 		Msg("'%s' build %d, %s\n", "xrCore", build_id, build_date);
-
-		// demonized: Print modded exes version
-		Msg("%s version %s\n", get_modded_exes_name(), get_modded_exes_version_string().c_str());
 		Msg("Game started: %s\n", timeInDMYHMSMMM().c_str());
 		EFS._initialize();
 #ifdef DEBUG
