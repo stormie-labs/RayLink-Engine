@@ -158,6 +158,12 @@ bool CAttachmentOwner::can_attach(const CInventoryItem* inventory_item) const
 	return true;
 }
 
+// Anomaly Coop: whether this owner's attachable_items allow the section at all (can_attach also wants the item enabled).
+bool CAttachmentOwner::may_attach(const shared_str& section) const
+{
+	return m_attach_item_sections.end() != std::find(m_attach_item_sections.begin(), m_attach_item_sections.end(), section);
+}
+
 void CAttachmentOwner::reattach_items()
 {
 	CGameObject* game_object = smart_cast<CGameObject*>(this);

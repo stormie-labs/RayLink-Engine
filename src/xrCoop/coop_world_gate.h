@@ -137,6 +137,7 @@ inline Need need_of(Msg type)
 	case Msg::EntityParent:
 	case Msg::EntityDied:
 	case Msg::EntityLocal:
+	case Msg::EntityVisual:
 	case Msg::ItemState:
 	case Msg::ReqSpawn:
 	case Msg::ReqDestroy:

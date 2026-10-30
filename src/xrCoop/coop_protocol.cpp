@@ -84,6 +84,7 @@ const char* msg_name(Msg type)
 	case Msg::IdLeaseAck: return "IdLeaseAck";
 	case Msg::ItemState: return "ItemState";
 	case Msg::EntitySound: return "EntitySound";
+	case Msg::EntityVisual: return "EntityVisual";
 	case Msg::PlayerRules: return "PlayerRules";
 
 	case Msg::InfoPortion: return "InfoPortion";
@@ -179,6 +180,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::EntityState:
 	case Msg::EntityLocal:
 	case Msg::EntitySound:
+	case Msg::EntityVisual:
 	case Msg::ReqResult:
 	case Msg::TimeSync:
 	case Msg::WeatherSync:
@@ -651,5 +653,39 @@ bool NpcSound::read(Reader& r)
 		if (!std::isfinite(v) || std::fabs(v) > 1000.f)
 			return false;
 	return true;
+}
+
+// ---------------------------------------------------------------- protocol 17: a host creature's new visual
+
+bool EntityVisualMsg::valid() const
+{
+	if (visual.empty() || visual.size() > kMaxVisual)
+		return false;
+	if (visual[0] == '\\' || visual[0] == '/' || visual[0] == '.')
+		return false;
+	if (visual.find("..") != std::string::npos)
+		return false;
+	for (const char ch : visual)
+	{
+		const unsigned char c = static_cast<unsigned char>(ch);
+		const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+		    c == '\\' || c == '/' || c == ' ' || c == '.' || c == '-';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+void EntityVisualMsg::write(Writer& w) const
+{
+	w.u16(object);
+	w.str(visual);
+}
+
+bool EntityVisualMsg::read(Reader& r)
+{
+	object = r.u16();
+	visual = r.str();
+	return r.ok() && valid();
 }
 } // namespace coop

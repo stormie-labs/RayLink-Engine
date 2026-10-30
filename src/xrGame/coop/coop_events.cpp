@@ -19,6 +19,7 @@
 #include "Car.h"
 #include "Actor.h"
 #include "GameObject.h"
+#include "script_game_object.h"
 #include "entity_alive.h"
 #include "Hit.h"
 #include "eatable_item.h"
@@ -56,6 +57,7 @@ xr_vector<u16> g_local_destroyed;
 xr_set<u16> g_local_relayed; // non-ALife entities announced with EntityLocal
 xr_map<u16, u16> g_last_holder; // free item -> player character that dropped/threw it
 xr_map<u16, Fvector> g_drop_positions; // item -> exact drop position asked for (drop_item_and_teleport)
+xr_set<u16> g_visuals; // server entities that took a new visual since the last frame
 
 // ---------------------------------------------------------------- client state
 struct ParentTarget
@@ -87,10 +89,11 @@ struct Counters
 	// client apply
 	u64 parent_applied = 0, parent_failed = 0, parent_timeouts = 0, deaths_applied = 0, local_spawns = 0,
 	    local_destroys = 0, local_errors = 0, launches_applied = 0, launches_missed = 0;
+	u64 visuals_applied = 0, visuals_offline = 0; // EntityVisual on a game object / on an offline server entity
 	u64 dropped_before_live = 0; // R2 I2: world messages that came before we were live
 	// host relay
 	u64 parent_sent = 0, deaths_sent = 0, player_deaths = 0, local_spawn_sent = 0, local_destroy_sent = 0,
-	    launches_relayed = 0;
+	    launches_relayed = 0, visuals_sent = 0;
 } g_c;
 
 u32 g_log_count = 0;
@@ -719,6 +722,37 @@ void client_on_entity_died(PeerId, Reader& r)
 	client_step_deaths();
 }
 
+// Protocol 17: a host creature took a new visual. The motion ids of its snapshots belong to that model, so the puppet
+// changes the way the host's Lua changed it (GE_CHANGE_VISUAL to our server, ChangeVisual: bones, damage, animations).
+void client_on_entity_visual(PeerId, Reader& r)
+{
+	if (before_live(Msg::EntityVisual))
+		return;
+	EntityVisualMsg m;
+	if (!m.read(r))
+		return;
+	const u16 id = join::to_local(m.object);
+	if (id == kActor || id == kNoId)
+		return;
+	if (CGameObject* obj = find_go(id))
+	{
+		if (!remote::is_puppet_type(obj) || world::is_player_character(obj))
+			return; // players' characters change with PlayerEquip
+		entities::ClientApply scope;
+		obj->lua_game_object()->set_visual_name(m.visual.c_str(), false);
+		++g_c.visuals_applied;
+		return;
+	}
+	// Offline here: the server entity brings the new model to the game object when it comes online.
+	if (CSE_Abstract* e = find_entity(id))
+		if (CSE_Visual* visual = e->visual())
+			if (!world::is_player_character(e))
+			{
+				visual->set_visual(m.visual.c_str());
+				++g_c.visuals_offline;
+			}
+}
+
 // EntityLocal op 2 (W3a): the host launched a player's rocket. Our copy, still in that player's launcher
 // here, flies the same way through the engine's own launch event. It never detonates here: the host's
 // explosion (WP7) and its destroy (op 1) follow.
@@ -867,6 +901,24 @@ void host_discard()
 	g_drop_positions.clear();
 	g_deaths.clear();
 	g_local_destroyed.clear();
+	g_visuals.clear();
+}
+
+// Protocol 17: the model a host creature took (Lua set_visual_name); a player's character has its own (PlayerEquip).
+void host_send_visual(u16 id)
+{
+	CGameObject* obj = find_go(id);
+	if (!obj || !remote::is_puppet_type(obj) || world::is_player_character(obj))
+		return;
+	EntityVisualMsg m;
+	m.object = id;
+	m.visual = obj->cNameVisual().c_str();
+	if (!m.valid())
+		return;
+	Writer w(m.visual.size() + 8);
+	m.write(w);
+	net::host_broadcast(Msg::EntityVisual, w);
+	++g_c.visuals_sent;
 }
 
 void host_flush()
@@ -875,13 +927,17 @@ void host_flush()
 	xr_map<u16, Fvector> drops;
 	xr_vector<std::pair<u16, u16>> deaths;
 	xr_vector<u16> destroyed;
+	xr_set<u16> visuals;
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		changes.swap(g_parent_changes);
 		drops.swap(g_drop_positions);
 		deaths.swap(g_deaths);
 		destroyed.swap(g_local_destroyed);
+		visuals.swap(g_visuals);
 	}
+	for (u16 id : visuals)
+		host_send_visual(id); // the snapshots already carry the new model's motion ids (coop_entities)
 	for (const auto& c : changes)
 	{
 		CSE_Abstract* e = find_entity(c.first);
@@ -973,6 +1029,7 @@ void install_client(Endpoint& e)
 	e.on(Msg::EntityParent, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_parent(from, r); });
 	e.on(Msg::EntityDied, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_died(from, r); });
 	e.on(Msg::EntityLocal, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_local(from, r); });
+	e.on(Msg::EntityVisual, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_visual(from, r); });
 	e.on(Msg::PlayerDied, &on_player_died);
 }
 
@@ -985,6 +1042,7 @@ void reset()
 	g_local_relayed.clear();
 	g_last_holder.clear();
 	g_drop_positions.clear();
+	g_visuals.clear();
 	g_parent_targets.clear();
 	g_death_targets.clear();
 	g_log_count = 0;
@@ -1017,9 +1075,9 @@ void print_status()
 	if (mgr().is_host())
 	{
 		::Msg("[coop]   events out: %llu parent changes, %llu deaths, %llu player deaths, local %llu spawns / %llu "
-		      "destroys (%u relayed alive), %llu player rocket launches",
+		      "destroys (%u relayed alive), %llu player rocket launches, %llu creature visuals",
 		    g_c.parent_sent, g_c.deaths_sent, g_c.player_deaths, g_c.local_spawn_sent, g_c.local_destroy_sent,
-		    (u32)g_local_relayed.size(), g_c.launches_relayed);
+		    (u32)g_local_relayed.size(), g_c.launches_relayed, g_c.visuals_sent);
 		return;
 	}
 	::Msg("[coop]   rockets: %llu own launches sent to the host (%llu dropped without a rocket object), %llu "
@@ -1032,9 +1090,10 @@ void print_status()
 	    g_c.moves_blocked, g_c.hits_forwarded, g_c.hits_blocked, g_c.actor_hits_blocked, g_c.ability_hits, g_c.deaths_blocked,
 	    g_c.other_blocked, g_c.level_changes, g_c.saves_blocked, g_c.vehicles_blocked);
 	::Msg("[coop]   events in: parents %llu applied / %llu failed / %llu timed out (%u pending), deaths %llu (%u "
-	      "pending), local %llu spawns / %llu destroys / %llu errors",
+	      "pending), local %llu spawns / %llu destroys / %llu errors, creature visuals %llu online / %llu offline",
 	    g_c.parent_applied, g_c.parent_failed, g_c.parent_timeouts, (u32)g_parent_targets.size(), g_c.deaths_applied,
-	    (u32)g_death_targets.size(), g_c.local_spawns, g_c.local_destroys, g_c.local_errors);
+	    (u32)g_death_targets.size(), g_c.local_spawns, g_c.local_destroys, g_c.local_errors, g_c.visuals_applied,
+	    g_c.visuals_offline);
 	::Msg("[coop]   echo dropped: %llu spawns / world-object requests made in reaction to the host's story (R4 4); "
 	      "%llu world messages (parents, deaths, local entities) dropped before live (R2 I2)",
 	    g_c.echo_dropped, g_c.dropped_before_live);
@@ -1089,6 +1148,14 @@ void host_on_death(u16 victim, u16 killer)
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_deaths.emplace_back(victim, killer);
+}
+
+void host_on_visual(u16 id)
+{
+	if (!mgr().is_host() || id == kActor)
+		return;
+	xrCriticalSectionGuard guard(g_lock);
+	g_visuals.insert(id);
 }
 
 void host_on_destroy(const CSE_Abstract* entity)

@@ -180,6 +180,7 @@ void xrServer::Process_event(NET_Packet& P, ClientID sender)
 			string256 tmp;
 			P.r_stringZ(tmp);
 			visual->set_visual(tmp);
+			coop::events::host_on_visual(receiver->ID); // Anomaly Coop: a creature's new model -> clients
 		}
 		break;
 	case GE_DIE:

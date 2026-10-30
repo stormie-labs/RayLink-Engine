@@ -62,7 +62,9 @@ namespace coop
 //    "occupied".
 // 15: bounded instrument state at the end of PlayerState; EntitySnapshot ends each creature with u8 instrument kind.
 //     Animation absence uses MotionID::invalidate (0xffff); (slot 0,index 0) is a valid motion.
-constexpr uint32_t kProtocolVersion = 16;
+// 17 (2026-10-30): EntityVisual 0x012D (host -> all): a host creature took a new visual (GE_CHANGE_VISUAL); the motion ids
+//     of the snapshots belong to the host's model, a puppet that kept the old one played other motions.
+constexpr uint32_t kProtocolVersion = 17;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -142,6 +144,7 @@ enum class Msg : uint16_t
 	EntityLocal = 0x012A, // non-ALife child entity (fake missile, rocket): spawn/destroy with a fixed id
 	ItemState = 0x012B, // owned item state (ammo, condition, addons, upgrades, uses) and unload ammo spawn (WP9)
 	EntitySound = 0x012C, // host -> one client, unreliable: sounds of NPCs/monsters within its hearing range (W5 C2)
+	EntityVisual = 0x012D, // host -> all: EntityVisualMsg, a host creature's new visual (protocol 17)
 
 	// requests (client -> host) and results
 	ReqSpawn = 0x0140, // section, parent, position; host spawns with its id
@@ -470,6 +473,23 @@ struct NpcSound
 // A relative sound file name a client may open: 1..kMaxPath chars of [a-z0-9_ .-] and '\\', no "..", does not
 // start with a separator, no drive or alias ('$', ':').
 bool sound_path_valid(const std::string& path);
+
+// Msg::EntityVisual: a host creature took a new visual (Lua set_visual_name: disguises, mods that dress NPCs).
+// Wire: u16 object (host numbering), str visual (a model name as in the spawn data, under $game_meshes$).
+struct EntityVisualMsg
+{
+	static constexpr size_t kMaxVisual = 200;
+
+	uint16_t object = 0xFFFF;
+	std::string visual;
+
+	// 1..kMaxVisual chars of [A-Za-z0-9_ .-] and path separators, no "..", does not start with a separator or a dot, no
+	// drive or alias (':', '$'): a relative name a client may load.
+	bool valid() const;
+	void write(Writer& w) const;
+	// False on overrun or a name that is not valid().
+	bool read(Reader& r);
+};
 
 // EntitySnapshot: the byte that holds the animation partition count (0..15) carries creature flags in its high
 // nibble since protocol 3.

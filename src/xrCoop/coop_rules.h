@@ -60,6 +60,7 @@ inline bool live_only(Msg type)
 	case Msg::EntityParent:
 	case Msg::EntityState:
 	case Msg::EntityLocal:
+	case Msg::EntityVisual:
 	case Msg::ItemState:
 	case Msg::ZoneState:
 		return true;

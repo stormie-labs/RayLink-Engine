@@ -146,6 +146,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::EntityState:
 	case Msg::EntityLocal:
 	case Msg::EntitySound:
+	case Msg::EntityVisual:
 	case Msg::ItemState:
 	case Msg::ReqSpawn:
 	case Msg::ReqDestroy:

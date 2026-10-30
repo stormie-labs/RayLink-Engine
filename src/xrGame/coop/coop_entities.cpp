@@ -301,7 +301,8 @@ void write_aim(Writer& w, CAI_Stalker& stalker)
 	}
 }
 
-// Client: any torch the puppet has, attached first (an item the host keeps detached is still lit by Switch).
+// Client: the torch the host wears on the puppet's head, attached first, else one of the sections the puppet may wear
+// (sr_light's device_torch). The host's flag comes from an attached torch only; a lamp in the backpack stays dark.
 CTorch* puppet_torch(CGameObject* obj)
 {
 	if (CTorch* t = attached_torch(obj))
@@ -311,7 +312,8 @@ CTorch* puppet_torch(CGameObject* obj)
 		return nullptr;
 	for (PIItem item : owner->inventory().m_all)
 		if (CTorch* t = item ? smart_cast<CTorch*>(item) : nullptr)
-			return t;
+			if (owner->may_attach(t->cNameSect()))
+				return t;
 	return nullptr;
 }
 
@@ -326,8 +328,18 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 	const bool lit = (flags & CreatureTorchLit) != 0;
 	if (CTorch* t = puppet_torch(obj))
 	{
-		if (t->torch_active() != lit)
-			t->Switch(lit);
+		// Found 2026-10-30 with the avatar headlamp (b29): the host's Lua wears a lit torch (enable_attachable_item ->
+		// CObjectHandler::attach); a puppet runs no binder, so its torch stayed in the backpack, where it gets no head
+		// transform, and lit there it shone from wherever the item last was. It is worn here as on the host.
+		if (lit != stalker->attached(t))
+			t->enable(lit); // on: the head bone carries it, CObjectHandler::attach lights it; off: detach puts it out
+		const bool worn = stalker->attached(t);
+		if (lit && !worn)
+			t->enable(false); // refused (CAI_Stalker::can_attach: a dead puppet): clean again for the next try
+		if (t->torch_active() != (lit && worn))
+			t->Switch(lit && worn);
+		if (lit && !worn && stalker->g_Alive())
+			done = false;
 	}
 	else if (lit)
 		done = false;

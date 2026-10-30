@@ -6,7 +6,8 @@
 // Code that applies host commands opens entities::ClientApply; its events pass unchanged.
 //
 // Host relay: the host server reports ownership changes, deaths and destroyed non-ALife
-// children; frame() broadcasts them (EntityParent, EntityDied, PlayerDied, EntityLocal).
+// children and new creature models; frame() broadcasts them (EntityParent, EntityDied, PlayerDied, EntityLocal,
+// EntityVisual).
 // Clients apply them with the same ids through the normal engine event chain.
 //
 // Wire layouts (ids in host numbering):
@@ -14,6 +15,7 @@
 //                 (flags 1: an exact drop position, e.g. drop_item_and_teleport; else the holder's)
 //   EntityDied    u16 victim, u16 killer
 //   PlayerDied    u16 character (host actor 0 or a proxy), u16 killer
+//   EntityVisual  EntityVisualMsg: u16 creature, str visual (protocol 17)
 //   EntityLocal   u8 op (0 spawn, 1 destroy, 2 launch), u16 id; spawn: u16 parent, u16 size, M_SPAWN bytes;
 //                 launch (W3a, id = rocket): u16 launcher, vec3 pos, vec3 dir, vec3 vel, vec3 angular_vel
 //                 (a rocket the host launched for a player: the other clients fly their copy the same way)
@@ -52,6 +54,8 @@ bool client_refuse_vehicle(CGameObject* holder);
 void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent);
 void host_on_death(u16 victim, u16 killer);
 void host_on_destroy(const CSE_Abstract* entity);
+// GE_CHANGE_VISUAL reached the server entity `id`: a creature's new model goes to the clients (EntityVisual).
+void host_on_visual(u16 id);
 // A ReqSpawn produced an entity ALife does not register (child of an item: fake missile,
 // rocket). Clients get it through EntityLocal with the same id.
 void host_relay_local_spawn(CSE_Abstract* entity);
