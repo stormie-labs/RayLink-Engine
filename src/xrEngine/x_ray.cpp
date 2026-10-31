@@ -968,6 +968,51 @@ ENGINE_API bool g_dedicated_server = false;
 
 #endif // DEDICATED_SERVER
 
+// Anomaly Coop: the launcher's Steam mode names its steam_api64.dll in RAYLINK_STEAM_API and puts SteamAppId and SteamGameId in
+// the environment. Steam's overlay hooks the renderer only when Steam is up before the first D3D device, and that is all this
+// process wants of Steam: the lobby and the tunnel live in the launcher's helper process.
+static DWORD WINAPI coop_steam_pump(LPVOID run_callbacks)
+{
+	for (;;)
+	{
+		reinterpret_cast<void(__cdecl*)()>(run_callbacks)();
+		Sleep(100);
+	}
+}
+
+static void coop_steam_overlay_start()
+{
+	wchar_t path[1024];
+	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_API", path, 1024);
+	if (length == 0 || length >= 1024)
+		return;
+	HMODULE api = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+	if (!api)
+	{
+		Msg("! [coop] Steam overlay: cannot load the library (%u)", GetLastError());
+		return;
+	}
+	typedef int(__cdecl * init_flat)(char*);
+	const init_flat init = reinterpret_cast<init_flat>(GetProcAddress(api, "SteamAPI_InitFlat"));
+	const FARPROC run_callbacks = GetProcAddress(api, "SteamAPI_RunCallbacks");
+	if (!init || !run_callbacks)
+	{
+		Msg("! [coop] Steam overlay: this library has no flat API");
+		return;
+	}
+	char error[1024] = {};
+	const int result = init(error);
+	if (result != 0)
+	{
+		Msg("! [coop] Steam overlay: Steam refused (%d): %s", result, error);
+		return;
+	}
+	Msg("[coop] Steam overlay: on");
+	HANDLE pump = CreateThread(NULL, 0, coop_steam_pump, reinterpret_cast<LPVOID>(run_callbacks), 0, NULL);
+	if (pump)
+		CloseHandle(pump);
+}
+
 int APIENTRY WinMain_impl(HINSTANCE hInstance,
                           HINSTANCE hPrevInstance,
                           char* lpCmdLine,
@@ -1106,6 +1151,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	compute_build_id();
 	Core._initialize("xray", NULL, TRUE, fsgame[0] ? fsgame : NULL);
 	renderdoc_initialize();
+	coop_steam_overlay_start();
 
 	InitSettings();
 	// RayLink: "RayLink Engine b28 - S.T.A.L.K.E.R. Anomaly 1.5.3 (based on X-Ray Monolith v1.5.3)"

@@ -160,6 +160,7 @@ public:
 	                       Fvector& dir,
 	                       ALife::EHitType hit_type = ALife::eHitTypeWound,
 	                       bool draw_hit_marks = true);
+	void melee_fx_on_actor(float fDamage, const Fvector& hit_dir, Fvector& dir); // Anomaly Coop (audit F2)
 
 	virtual void HitEntityInJump(const CEntity* pEntity)
 	{

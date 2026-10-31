@@ -55,6 +55,7 @@
 #include "debug_text_tree.h"
 #endif
 #include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_ai.h" // Anomaly Coop: nearest_player
 
 #pragma warning (disable:4355)
 #pragma warning (push)
@@ -607,7 +608,7 @@ void CBaseMonster::set_state_sound(u32 type, bool once)
 			case MonsterSound::eMonsterSoundIdle:
 				// check distance to actor
 
-				if (Actor()->Position().distance_to(Position()) > db().m_fDistantIdleSndRange)
+				if (!coop::npc_ai::nearest_player(Position(), db().m_fDistantIdleSndRange)) // Anomaly Coop (audit F11): any player
 				{
 					delay = u32(float(db().m_dwDistantIdleSndDelay) * _sqrt(float(objects_count)));
 					type = MonsterSound::eMonsterSoundIdleDistant;

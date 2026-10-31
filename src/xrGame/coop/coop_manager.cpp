@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "xrCoop/coop_silence_pause.h"
+#include "xrCoop/coop_steam_join.h"
 
 string64 g_coop_nick = "";
 
@@ -115,7 +116,35 @@ struct AutoStart
 	u64 next_status = 0;
 	u32 shots_every_s = 0;
 	u64 next_shot = 0;
+	u64 next_steam_join = 0;
 } g_auto;
+
+constexpr u32 kSteamJoinPollMs = 500;
+
+// The launcher's Steam mode: an invite accepted while the game runs leaves the tunnel's address in the file
+// RAYLINK_STEAM_JOIN names. False: nothing there.
+bool steam_join_waits(u16& port)
+{
+	wchar_t path[1024];
+	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_JOIN", path, 1024);
+	if (length == 0 || length >= 1024)
+		return false;
+	FILE* file = _wfopen(path, L"rb");
+	if (!file)
+		return false;
+	char text[32] = {};
+	fread(text, 1, sizeof(text) - 1, file);
+	fclose(file);
+	_wremove(path);
+	u16 tunnel = 0;
+	if (!steam_join::parse_tunnel(text, tunnel))
+	{
+		::Msg("! [coop] Steam invite: not an address");
+		return false;
+	}
+	port = tunnel;
+	return true;
+}
 
 u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
 {
@@ -487,6 +516,7 @@ bool Manager::start_client(const char* address, u16 port)
 
 void Manager::stop(const char* reason)
 {
+	g_auto.connect.clear(); // leaving is meant: autostart does not go back
 	if (!active())
 		return;
 	autosave::host_on_session_end(); // F3: the host's last world save of the session, while the level still runs
@@ -544,6 +574,28 @@ void Manager::autostart()
 	}
 	const u64 now = now_ms();
 	const bool level_ready = g_pGameLevel && g_actor && !Device.dwPrecacheFrame && ai().get_alife();
+
+	u16 steam_port = 0;
+	if (now >= g_auto.next_steam_join)
+	{
+		g_auto.next_steam_join = now + kSteamJoinPollMs;
+		if (steam_join_waits(steam_port))
+		{
+			string64 address;
+			xr_sprintf(address, "%s:%u", steam_join::kLoopback, u32(steam_port));
+			if (!active() || g_auto.connect != address) // the same invite again, while in that game, changes nothing
+			{
+				::Msg("[coop] Steam invite accepted: joining the host through the tunnel");
+				if (active())
+					stop("joined a friend through a Steam invite");
+				g_auto.host = false;
+				g_auto.connect = address;
+				g_auto.connect_tries = 0;
+				g_auto.next_connect = 0;
+				g_auto.welcomed = false;
+			}
+		}
+	}
 
 	if (g_auto.host && !g_auto.host_done && !active() && level_ready)
 	{
@@ -703,6 +755,38 @@ void on_blocking_work()
 	Manager& m = Manager::get();
 	if (m.active() && link_hold::may_arm(g_crashed.load()))
 		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread; refused after a crash
+}
+
+bool steam_invite_ready()
+{
+	wchar_t lobby[32];
+	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_LOBBY", lobby, 32);
+	HMODULE api = GetModuleHandleW(L"steam_api64.dll");
+	if (length == 0 || length >= 32 || !api)
+		return false;
+	typedef void*(__cdecl * friends_of_steam)();
+	const friends_of_steam friends = reinterpret_cast<friends_of_steam>(GetProcAddress(api, "SteamAPI_SteamFriends_v018"));
+	return friends && friends();
+}
+
+bool steam_invite_window()
+{
+	wchar_t lobby[32];
+	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_LOBBY", lobby, 32);
+	HMODULE api = GetModuleHandleW(L"steam_api64.dll");
+	if (length == 0 || length >= 32 || !api)
+		return false;
+	typedef void*(__cdecl * friends_of_steam)();
+	typedef void(__cdecl * invite_dialog)(void*, unsigned long long);
+	const friends_of_steam friends = reinterpret_cast<friends_of_steam>(GetProcAddress(api, "SteamAPI_SteamFriends_v018"));
+	const invite_dialog dialog = reinterpret_cast<invite_dialog>(GetProcAddress(api, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog"));
+	if (!friends || !dialog)
+		return false;
+	void* steam_friends = friends(); // null when Steam refused this process (x_ray.cpp)
+	if (!steam_friends)
+		return false;
+	dialog(steam_friends, _wcstoui64(lobby, nullptr, 10));
+	return true;
 }
 
 bool skip_keypress_on_load()

@@ -26,6 +26,7 @@
 #include "../../../ActorEffector.h"
 #include "../../../../xrEngine/CameraBase.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F2)
 
 void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr user_data, const Fvector& Position,
                                   float power)
@@ -114,105 +115,115 @@ void CBaseMonster::HitEntity(const CEntity* pEntity, float fDamage, float impuls
 		HS.Write_Packet(l_P);
 		u_EventSend(l_P);
 
-		if (pEntityNC == Actor() && draw_hit_marks)
+		if (draw_hit_marks)
 		{
-			START_PROFILE("BaseMonster/Animation/HitEntity")
-				;
-
-				StaticDrawableWrapper* s = CurrentGameUI()->AddCustomStatic("monster_claws", false);
-
-				float h1, p1;
-				Device.vCameraDirection.getHP(h1, p1);
-				Fvector hd = hit_dir;
-				hd.mul(-1);
-				float d = -h1 + hd.getH();
-				s->wnd()->SetHeading(d);
-				Fvector2 wnd_pos = s->wnd()->GetWndPos();
-				wnd_pos.y += 400.0f * _cos(d);
-				wnd_pos.x += 500.0f * _sin(d);
-				s->wnd()->SetWndPos(wnd_pos);
-
-			STOP_PROFILE;
-
-			//SetAttackEffector			();
-
-			float time_to_lock = fDamage * MAX_LOCK_TIME;
-			clamp(time_to_lock, 0.f, MAX_LOCK_TIME);
-            // verdatim: damage stagger time factor
-            time_to_lock *= Actor()->DamageStaggerTimeFactor;
-			Actor()->lock_accel_for(int(time_to_lock * 1000));
-
-			//////////////////////////////////////////////////////////////////////////
-			//
-			//////////////////////////////////////////////////////////////////////////
-
-			CEffectorCam* ce = Actor()->Cameras().GetCamEffector((ECamEffectorType)effBigMonsterHit);
-			if (!ce)
-			{
-				const shared_str& eff_sect = pSettings->r_string(cNameSect(), "actor_hit_effect");
-				if (eff_sect.c_str())
-				{
-					int id = -1;
-					Fvector cam_pos, cam_dir, cam_norm;
-					Actor()->cam_Active()->Get(cam_pos, cam_dir, cam_norm);
-					cam_dir.normalize_safe();
-					dir.normalize_safe();
-
-					float ang_diff = angle_difference(cam_dir.getH(), dir.getH());
-					Fvector cp;
-					cp.crossproduct(cam_dir, dir);
-					bool bUp = (cp.y > 0.0f);
-
-					Fvector cross;
-					cross.crossproduct(cam_dir, dir);
-					VERIFY(ang_diff>=0.0f && ang_diff<=PI);
-
-					float _s1 = PI_DIV_8;
-					float _s2 = _s1 + PI_DIV_4;
-					float _s3 = _s2 + PI_DIV_4;
-					float _s4 = _s3 + PI_DIV_4;
-
-					if (ang_diff <= _s1)
-					{
-						id = 2;
-					}
-					else
-					{
-						if (ang_diff > _s1 && ang_diff <= _s2)
-						{
-							id = (bUp) ? 5 : 7;
-						}
-						else if (ang_diff > _s2 && ang_diff <= _s3)
-						{
-							id = (bUp) ? 3 : 1;
-						}
-						else if (ang_diff > _s3 && ang_diff <= _s4)
-						{
-							id = (bUp) ? 4 : 6;
-						}
-						else if (ang_diff > _s4)
-						{
-							id = 0;
-						}
-						else
-						{
-							VERIFY(0);
-						}
-					}
-
-					string64 sect_name;
-
-					xr_sprintf(sect_name, "%s_%d", eff_sect.c_str(), id);
-					AddEffector(Actor(), effBigMonsterHit, sect_name, fDamage);
-				}
-			}
-			//////////////////////////////////////////////////////////////////////////
+			if (pEntityNC == Actor())
+				melee_fx_on_actor(fDamage, hit_dir, dir);
+			else // Anomaly Coop (audit F2): a client took the damage only, and walked out of a melee that pins the host
+				coop::monster_fx::host_send(pEntity, this, coop::monster_fx::kMeleeHit, 0, fDamage);
 		}
 
 		Morale.on_attack_success();
 
 		m_time_last_attack_success = Device.dwTimeGlobal;
 	}
+}
+
+// Claw marks, the stagger and the camera shove of a blow that landed on this machine's actor. Anomaly Coop (audit F2): on a
+// client the monster is a puppet and this comes from the host (monster_fx::kMeleeHit).
+void CBaseMonster::melee_fx_on_actor(float fDamage, const Fvector& hit_dir, Fvector& dir)
+{
+	START_PROFILE("BaseMonster/Animation/HitEntity")
+		;
+
+		StaticDrawableWrapper* s = CurrentGameUI()->AddCustomStatic("monster_claws", false);
+
+		float h1, p1;
+		Device.vCameraDirection.getHP(h1, p1);
+		Fvector hd = hit_dir;
+		hd.mul(-1);
+		float d = -h1 + hd.getH();
+		s->wnd()->SetHeading(d);
+		Fvector2 wnd_pos = s->wnd()->GetWndPos();
+		wnd_pos.y += 400.0f * _cos(d);
+		wnd_pos.x += 500.0f * _sin(d);
+		s->wnd()->SetWndPos(wnd_pos);
+
+	STOP_PROFILE;
+
+	//SetAttackEffector			();
+
+	float time_to_lock = fDamage * MAX_LOCK_TIME;
+	clamp(time_to_lock, 0.f, MAX_LOCK_TIME);
+            // verdatim: damage stagger time factor
+            time_to_lock *= Actor()->DamageStaggerTimeFactor;
+	Actor()->lock_accel_for(int(time_to_lock * 1000));
+
+	//////////////////////////////////////////////////////////////////////////
+	//
+	//////////////////////////////////////////////////////////////////////////
+
+	CEffectorCam* ce = Actor()->Cameras().GetCamEffector((ECamEffectorType)effBigMonsterHit);
+	if (!ce)
+	{
+		const shared_str& eff_sect = pSettings->r_string(cNameSect(), "actor_hit_effect");
+		if (eff_sect.c_str())
+		{
+			int id = -1;
+			Fvector cam_pos, cam_dir, cam_norm;
+			Actor()->cam_Active()->Get(cam_pos, cam_dir, cam_norm);
+			cam_dir.normalize_safe();
+			dir.normalize_safe();
+
+			float ang_diff = angle_difference(cam_dir.getH(), dir.getH());
+			Fvector cp;
+			cp.crossproduct(cam_dir, dir);
+			bool bUp = (cp.y > 0.0f);
+
+			Fvector cross;
+			cross.crossproduct(cam_dir, dir);
+			VERIFY(ang_diff>=0.0f && ang_diff<=PI);
+
+			float _s1 = PI_DIV_8;
+			float _s2 = _s1 + PI_DIV_4;
+			float _s3 = _s2 + PI_DIV_4;
+			float _s4 = _s3 + PI_DIV_4;
+
+			if (ang_diff <= _s1)
+			{
+				id = 2;
+			}
+			else
+			{
+				if (ang_diff > _s1 && ang_diff <= _s2)
+				{
+					id = (bUp) ? 5 : 7;
+				}
+				else if (ang_diff > _s2 && ang_diff <= _s3)
+				{
+					id = (bUp) ? 3 : 1;
+				}
+				else if (ang_diff > _s3 && ang_diff <= _s4)
+				{
+					id = (bUp) ? 4 : 6;
+				}
+				else if (ang_diff > _s4)
+				{
+					id = 0;
+				}
+				else
+				{
+					VERIFY(0);
+				}
+			}
+
+			string64 sect_name;
+
+			xr_sprintf(sect_name, "%s_%d", eff_sect.c_str(), id);
+			AddEffector(Actor(), effBigMonsterHit, sect_name, fDamage);
+		}
+	}
+	//////////////////////////////////////////////////////////////////////////
 }
 
 

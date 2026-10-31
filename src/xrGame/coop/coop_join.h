@@ -103,6 +103,9 @@ bool accept_transition();
 // stock reaction stays off. False for a disabled exit (its own message stays), outside a session and for a host nobody
 // has joined.
 bool transition_owns_exit(bool exit_enabled);
+// A host alone in his session: the exit takes him at once, the stock "go?" dialog stays off too. False for a disabled exit
+// (its own message stays) and outside a session.
+bool exit_without_dialog(bool exit_enabled);
 // Hook of game_sv_Single::change_level, the one place every level change of the host goes through (the zone, the
 // dialog, jump_to_level of a guide): true = held, the group waits (a guide trip, which has no exit, needs everybody's
 // yes); false = the stock change goes on (no players besides the host, or the board's own change). `P` is read, not

@@ -23,11 +23,13 @@ namespace coop
 namespace death
 {
 // checkpoint: a death costs items and money, the player comes back at their camp. hardcore: a death ends the run, the
-// player watches the others.
+// player watches the others. rollback: a death takes the whole group back to the last save of the game, nothing is lost,
+// and saves work as in the single player game.
 enum class Mode : uint8_t
 {
 	Checkpoint = 0,
-	Hardcore = 1
+	Hardcore = 1,
+	Rollback = 2
 };
 
 // What happens to the lost items. Drop: the share goes into a bag (a coop_death_stash) at the body, Ruling L-1; loose
@@ -120,7 +122,7 @@ struct Rules
 		n.wear_pct = r.u8();
 		n.rank_pct = r.u8();
 		n.share_pct = r.u8();
-		if (!r.ok() || m > static_cast<uint8_t>(Mode::Hardcore) || d > static_cast<uint8_t>(Drop::Keep))
+		if (!r.ok() || m > static_cast<uint8_t>(Mode::Rollback) || d > static_cast<uint8_t>(Drop::Keep))
 			return false;
 		if (!std::isfinite(n.revive_health))
 			return false;
@@ -317,7 +319,8 @@ enum class Action : uint8_t
 {
 	None,
 	LossesAndEvacuate, // take the items, start the T countdown
-	Spectate           // hardcore: the player is out
+	Spectate,          // hardcore: the player is out
+	Rollback           // the group goes back to the last save
 };
 
 // A player's death (sequence number `seq`) was seen. Only the first report of each death does anything.
@@ -333,10 +336,27 @@ inline Action on_died(Tracker& t, uint16_t seq, uint64_t now_ms, const Rules& r)
 		t.respawn_at = 0;
 		return Action::Spectate;
 	}
+	if (r.mode == Mode::Rollback)
+	{
+		t.respawn_at = 0;
+		return Action::Rollback;
+	}
 	t.respawn_at = now_ms + r.delay_ms;
 	if (t.respawn_at == 0) // 0 means "not waiting"
 		t.respawn_at = 1;
 	return Action::LossesAndEvacuate;
+}
+
+// The group could not go back (no save of this game, a damaged one): the death `seq` goes the checkpoint way. False when
+// that is not the death decided last, or it is decided another way already.
+inline bool rollback_refused(Tracker& t, uint16_t seq, uint64_t now_ms, const Rules& r)
+{
+	if (seq != t.decided_seq || t.hardcore_out || t.respawn_at != 0)
+		return false;
+	t.respawn_at = now_ms + r.delay_ms;
+	if (t.respawn_at == 0) // 0 means "not waiting"
+		t.respawn_at = 1;
+	return true;
 }
 
 // The evacuation time is over: true once.

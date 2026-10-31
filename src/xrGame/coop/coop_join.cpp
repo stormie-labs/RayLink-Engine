@@ -3105,6 +3105,11 @@ bool transition_owns_exit(bool exit_enabled)
 	return exit_enabled && group_waits_here();
 }
 
+bool exit_without_dialog(bool exit_enabled)
+{
+	return exit_enabled && mgr().active() && mgr().is_host() && !group_waits_here();
+}
+
 bool host_gate_level_change(NET_Packet& P)
 {
 	if (!mgr().is_host() || g.releasing || !host_has_company() || !ai().get_alife())

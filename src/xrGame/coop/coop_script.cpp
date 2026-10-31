@@ -1378,6 +1378,44 @@ int l_life_of(lua_State* L)
 	return 1;
 }
 
+// coop.rollback_failed(character, seq): the host found no save to go back to, that death goes the checkpoint way
+int l_rollback_failed(lua_State* L)
+{
+	u16 id = 0;
+	u16 seq = 0;
+	if (arg_local_id(L, 1, id) && arg_local_id(L, 2, seq))
+		survival::rollback_failed(id, seq);
+	return 0;
+}
+
+// coop.steam_invite_ready() -> true when the launcher's Steam mode started this game with a lobby
+int l_steam_invite_ready(lua_State* L)
+{
+	lua_pushboolean(L, steam_invite_ready() ? 1 : 0);
+	return 1;
+}
+
+// coop.steam_invite() -> bool: Steam's "invite a friend" window over the game
+int l_steam_invite(lua_State* L)
+{
+	lua_pushboolean(L, steam_invite_window() ? 1 : 0);
+	return 1;
+}
+
+// coop.rollback_pending() -> true while the group waits for the host's load
+int l_rollback_pending(lua_State* L)
+{
+	lua_pushboolean(L, survival::rollback_pending() ? 1 : 0);
+	return 1;
+}
+
+// coop.saves_open() -> true in a session of the rollback death mode: saves work as in the single player game
+int l_saves_open(lua_State* L)
+{
+	lua_pushboolean(L, survival::saves_open() ? 1 : 0);
+	return 1;
+}
+
 // coop.bleed_left(local_id) -> milliseconds of bleed-out left (0 unless wounded), nil without a session
 int l_bleed_left(lua_State* L)
 {
@@ -1555,6 +1593,11 @@ void register_raw(lua_State* L)
 		{"story_hold_infos", &l_story_hold_infos},
 		{"story_local_task", &l_story_local_task},
 		{"life_of", &l_life_of},
+		{"steam_invite_ready", &l_steam_invite_ready},
+		{"steam_invite", &l_steam_invite},
+		{"rollback_failed", &l_rollback_failed},
+		{"rollback_pending", &l_rollback_pending},
+		{"saves_open", &l_saves_open},
 		{"bleed_left", &l_bleed_left},
 		{"revive_progress", &l_revive_progress}, // HUD v2 part 2: the revive / give-up holds for scripts\coop_hud_revive
 		{"player_safemode", &l_player_safemode},

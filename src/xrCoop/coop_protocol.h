@@ -492,7 +492,7 @@ struct EntityVisualMsg
 };
 
 // EntitySnapshot: the byte that holds the animation partition count (0..15) carries creature flags in its high
-// nibble since protocol 3.
+// nibble since protocol 3. A monster has no torch or strap: it uses those two bits for its look (coop_enemy_rules.h).
 enum CreatureFlags : uint8_t
 {
 	CreatureTorchLit = 1, // the creature's head torch is on

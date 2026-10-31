@@ -8,6 +8,7 @@
 #include "coop_survival.h"
 #include "xrCoop/coop_viewers.h"
 #include "xrCoop/coop_death_rules.h" // out_of_fight, monster_leaves
+#include "xrCoop/coop_enemy_rules.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -45,8 +46,8 @@ constexpr float kSunRange = 500.f; // as CROS_impl::calc_sun_value
 constexpr float kSkyRange = 50.f; // as CROS_impl::calc_sky_hemi_value
 constexpr float kSkyScale = 0.08f; // r2_dhemi_sky_scale default: the sky adds little to the average
 constexpr float kHeadlampLum = 1.f; // the own headlamp a few cm away saturates CROS_impl's light sum
-constexpr float kViewCos = 0.57f; // half view cone of a player ~55 degrees (screen plus a little side vision)
-constexpr float kAwareDistance = 2.f; // that close a player notices an NPC whatever he looks at
+using enemy_rules::kViewCos;
+using enemy_rules::kAwareDistance;
 constexpr float kHeadHeight = 1.5f; // look-at target on this machine's actor (stock uses its camera)
 
 struct Proxy
@@ -58,6 +59,7 @@ struct Proxy
 	bool headlamp = false;
 	Fvector view{};
 	bool view_valid = false;
+	u32 reload_ms = 0; // audit F3c: Device.dwTimeGlobal of the last reload this player reported
 };
 
 xr_map<u16, Proxy> g_proxies; // host: client proxies driven recently, by local id
@@ -420,8 +422,52 @@ bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster)
 		return false;
 	if (player == g_actor)
 		return g_actor->memory().visual().visible_now(monster);
-	bool sees = false;
-	return player_sees(player, monster, sees) && sees;
+	if (!is_remote_player(player) || !player->g_Alive() || !monster->g_Alive())
+		return false;
+	// Audit F1 (2026-10-31): never the monster's memory. This test is what alerts a monster that sees nothing (asleep, its
+	// back turned), so through player_sees it was dead for a client: the host woke a pack by standing in view, a client not.
+	++g_stat.sees_asked;
+	Fvector from = player->Position();
+	from.y += kHeadHeight;
+	Fvector at;
+	monster->Center(at);
+	Fvector dir;
+	dir.sub(at, from);
+	const float range = dir.magnitude();
+	if (range > EPS_L)
+		dir.div(range);
+	const Proxy* p = fresh_record(player->ID());
+	const bool view_known = p && p->view_valid;
+	if (!enemy_rules::player_notices(range, view_known, view_known ? dir.dotproduct(p->view) : 0.f, true))
+		return false; // the ray only for what is in view
+	if (range > EPS_L && Level().ObjectSpace.RayTest(from, dir, range, collide::rqtStatic, nullptr, nullptr))
+		return false;
+	++g_stat.sees_yes;
+	return true;
+}
+
+void on_player_reload(u16 player)
+{
+	if (mgr().is_host())
+		g_proxies[player].reload_ms = Device.dwTimeGlobal;
+}
+
+bool player_reloading(const CEntityAlive* player)
+{
+	if (!player || !is_remote_player(player))
+		return false;
+	const auto it = g_proxies.find(player->ID());
+	return it != g_proxies.end() && enemy_rules::reload_shown(Device.dwTimeGlobal, it->second.reload_ms);
+}
+
+bool player_jumping(const CObject* player)
+{
+	if (!player)
+		return false;
+	if (player == g_actor)
+		return g_actor->is_jump();
+	using namespace ACTOR_DEFS;
+	return is_remote_player(player) && (players::avatar_mstate(player->ID()) & (mcJump | mcFall | mcLanding | mcLanding2)) != 0;
 }
 
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist)

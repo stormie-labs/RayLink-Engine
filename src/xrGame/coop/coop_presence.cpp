@@ -11,6 +11,7 @@
 #include "coop_requests.h"
 #include "coop_remote.h"
 #include "coop_world.h"
+#include "coop_ai.h"
 #include "xrCoop/coop_nametag.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -328,6 +329,7 @@ void play(u16 avatar_id, const ShotEvent& e)
 	{
 		play_weapon_sound(sect, "snd_reload", nullptr, av, body, SOUND_TYPE_WEAPON_RECHARGING);
 		++g_stat.reloads_in;
+		npc_ai::on_player_reload(avatar_id); // audit F3c: a burer's shield drops for it
 		return;
 	}
 

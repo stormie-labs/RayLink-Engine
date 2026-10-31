@@ -11,6 +11,7 @@
 #include "../ai_monster_effector.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
 #include "../../../coop/coop_ai.h" // Anomaly Coop: player_down
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F5c)
 
 CPolterFlame::CPolterFlame(CPoltergeist* polter) : inherited(polter)
 {
@@ -91,6 +92,21 @@ void CPolterFlame::create_flame(const CObject* target_object)
 	Fvector position;
 	if (!get_valid_flame_position(target_object, position)) return;
 
+	Fvector target_point = get_head_position(const_cast<CObject*>(target_object));
+	Fvector target_dir;
+	target_dir.sub(target_point, position);
+	target_dir.normalize();
+
+	start_flame(target_object, position, target_dir);
+
+	m_time_flame_started = time();
+
+	// Anomaly Coop (audit F5c): the particles were host-only, a client burned from nothing
+	coop::monster_fx::host_flame(m_object, position, target_dir);
+}
+
+void CPolterFlame::start_flame(const CObject* target_object, const Fvector& position, const Fvector& dir)
+{
 	SFlameElement* element = xr_new<SFlameElement>();
 
 	element->position = position;
@@ -100,15 +116,24 @@ void CPolterFlame::create_flame(const CObject* target_object)
 	element->sound.play_at_pos(m_object, element->position);
 	element->particles_object = 0;
 	element->time_last_hit = 0;
-
-	Fvector target_point = get_head_position(const_cast<CObject*>(target_object));
-	element->target_dir.sub(target_point, element->position);
-	element->target_dir.normalize();
+	element->target_dir = dir;
 
 	m_flames.push_back(element);
 	select_state(element, ePrepare);
+}
 
-	m_time_flame_started = time();
+// Anomaly Coop (audit F5c): the flame the host lit. update_schedule takes it through its stages by the same times; a
+// puppet deals no damage, so it needs no target.
+void CPolterFlame::coop_play(const Fvector& position, const Fvector& dir)
+{
+	if (coop::remote::is_remote_creature(m_object))
+		start_flame(nullptr, position, dir);
+}
+
+void CPoltergeist::coop_flame(const Fvector& position, const Fvector& dir)
+{
+	if (m_flame)
+		static_cast<CPolterFlame*>(m_flame)->coop_play(position, dir);
 }
 
 void CPolterFlame::select_state(SFlameElement* elem, EFlameState state)

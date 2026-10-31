@@ -6,6 +6,7 @@
 #include "../../../../xrPhysics/icolisiondamageinfo.h"
 #include "inventory_item.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F4)
 
 CPolterTele::CPolterTele(CPoltergeist* polter) : inherited(polter), m_pmt_object_collision_damage(0.5f)
 {
@@ -338,6 +339,7 @@ void CPolterTele::tele_fire_objects()
             const float fire_time = hobj->Position().distance_to(enemy_pos) / m_pmt_fly_velocity;
 			hobj->set_collision_hit_callback(xr_new<SCollisionHitCallback>(m_object, m_pmt_object_collision_damage));
 			m_object->CTelekinesis::fire_t(hobj, enemy_pos, fire_time);
+			coop::monster_fx::host_throw(hobj, m_object, m_pmt_object_collision_damage); // Anomaly Coop (audit F4)
 			return;
 		}
 	}

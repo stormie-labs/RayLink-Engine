@@ -18,6 +18,9 @@
 #include "../../../alife_object_registry.h"
 #include "../../../../xrServerEntities/xrserver_objects_alife_monsters.h"
 #include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
+#include "../../../coop/coop_ai.h" // Anomaly Coop: is_player
+#include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "xrCoop/coop_enemy_rules.h" // Anomaly Coop
 
 CPsyDog::CPsyDog()
 {
@@ -314,7 +317,10 @@ void CPsyDogPhantom::appear_fx_on_actor()
 void CPsyDogPhantom::Hit(SHit* pHDS)
 {
 	if (is_wait_to_destroy_object()) return;
-	if ((pHDS->who == EnemyMan.get_enemy()) && (pHDS->who != 0)) destroy_me();
+	// Anomaly Coop (audit F10): any player's shot dispels it: a second player could not, only its own target
+	if (coop::enemy_rules::phantom_dispelled(pHDS->who != 0, pHDS->who == EnemyMan.get_enemy(),
+	                                         coop::npc_ai::is_player(pHDS->who), coop::remote::is_remote_creature(this)))
+		destroy_me();
 }
 
 void CPsyDogPhantom::net_Destroy()

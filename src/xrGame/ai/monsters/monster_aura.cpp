@@ -3,6 +3,7 @@
 #include "basemonster/base_monster.h"
 #include "../../Actor.h"
 #include "../../ActorEffector.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop: player_down
 
 //#include "../../HudSound.h"
 
@@ -137,7 +138,8 @@ bool monster_aura::check_work_condition() const
 
 	return m_enabled &&
 		Actor() &&
-		Actor()->g_Alive();
+		Actor()->g_Alive() &&
+		!coop::npc_ai::player_down(Actor()); // Anomaly Coop (audit F9)
 }
 
 void monster_aura::remove_pp_effector()

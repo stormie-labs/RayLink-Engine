@@ -128,7 +128,7 @@ void CLevelChanger::feel_touch_new(CObject* tpObject)
 	if (coop::join::transition_owns_exit(m_b_enabled))
 		return; // Anomaly Coop: in a session the group waits at the exit (join::frame): no dialog, no change of our own
 
-	if (m_bSilentMode)
+	if (m_bSilentMode || coop::join::exit_without_dialog(m_b_enabled))
 	{
 		NET_Packet p;
 		p.w_begin(M_CHANGE_LEVEL);
@@ -137,6 +137,7 @@ void CLevelChanger::feel_touch_new(CObject* tpObject)
 		p.w_vec3(m_position);
 		p.w_vec3(m_angles);
 		Level().Send(p, net_flags(TRUE));
+		m_entrance_time = Device.fTimeGlobal;
 		return;
 	}
 	Fvector p, r;
@@ -200,6 +201,18 @@ void CLevelChanger::update_actor_invitation()
 
 		if (m_entrance_time + 5.0f < Device.fTimeGlobal)
 		{
+			if (coop::join::exit_without_dialog(m_b_enabled)) // Anomaly Coop: the last friend left while he stood here
+			{
+				NET_Packet packet;
+				packet.w_begin(M_CHANGE_LEVEL);
+				packet.w(&m_game_vertex_id, sizeof(m_game_vertex_id));
+				packet.w(&m_level_vertex_id, sizeof(m_level_vertex_id));
+				packet.w_vec3(m_position);
+				packet.w_vec3(m_angles);
+				Level().Send(packet, net_flags(TRUE));
+				m_entrance_time = Device.fTimeGlobal;
+				continue;
+			}
 			CUIGameSP* pGameSP = smart_cast<CUIGameSP*>(CurrentGameUI());
 			Fvector p, r;
 			bool b = get_reject_pos(p, r);

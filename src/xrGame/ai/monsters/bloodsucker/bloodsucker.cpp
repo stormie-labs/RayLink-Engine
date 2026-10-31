@@ -12,6 +12,7 @@
 #include "../monster_velocity_space.h"
 #include "../../../gamepersistent.h"
 #include "../../../game_object_space.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 #include "../control_animation_base.h"
 #include "../control_movement_base.h"
@@ -653,6 +654,8 @@ void CAI_Bloodsucker::shedule_Update(u32 dt)
 void CAI_Bloodsucker::Die(CObject* who)
 {
 	inherited::Die(who);
+	if (coop::remote::is_remote_creature(this))
+		force_visibility_state(unset); // Anomaly Coop (audit F5b): the look the host sent ends with the monster
 	stop_invisible_predator();
 }
 

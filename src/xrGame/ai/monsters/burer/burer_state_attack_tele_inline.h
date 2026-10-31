@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../level.h"
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F4)
 
 #define GOOD_DISTANCE_FOR_TELE	15.f
 #define MAX_TIME_CHECK_FAILURE	6000
@@ -292,6 +293,7 @@ void CStateBurerAttackTele<Object>::FireAllToEnemy()
         SCollisionHitCallback* const hit_callback = is_actor ? xr_new<SCollisionHitCallback>(object) : nullptr;
         cur_object->set_collision_hit_callback(hit_callback);
 		object->CTelekinesis::fire_t(cur_object, enemy_pos, fire_time);
+		coop::monster_fx::host_throw(cur_object, object); // Anomaly Coop (audit F4)
 
 		u32 const new_num_objects = object->CTelekinesis::get_objects_count();
 		if (new_num_objects < prev_num_objects)
@@ -365,6 +367,7 @@ void CStateBurerAttackTele<Object>::ExecuteTeleFire()
     SCollisionHitCallback* const hit_callback = enemy->cast_actor() ? xr_new<SCollisionHitCallback>(object) : nullptr;
     selected_object->set_collision_hit_callback(hit_callback);
 	object->CTelekinesis::fire_t(selected_object, enemy_pos, fire_time);
+	coop::monster_fx::host_throw(selected_object, object); // Anomaly Coop (audit F4)
 
 	object->StopTeleObjectParticle(selected_object);
 	object->sound().play(CBurer::eMonsterSoundTeleAttack);

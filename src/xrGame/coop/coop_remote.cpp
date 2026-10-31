@@ -17,6 +17,9 @@
 #include "ai/stalker/ai_stalker.h"
 #include "stalker_movement_manager_smart_cover.h"
 #include "ai/monsters/basemonster/base_monster.h"
+#include "ai/monsters/bloodsucker/bloodsucker.h"
+#include "ai/monsters/poltergeist/poltergeist.h"
+#include "ai/monsters/pseudodog/psy_dog.h"
 #include "ai/trader/ai_trader.h"
 #include "InventoryOwner.h"
 #include "Inventory.h"
@@ -116,10 +119,18 @@ void restart_net_state(CCustomMonster* m)
 	m->NET_Last = n;
 }
 
+// Audit F5a, F5d (2026-10-31): the monsters that spawn out of sight: a poltergeist (for life), a psy dog's phantom (until its
+// leap). A client saw a floating body the host cannot see. What follows comes from the host (MonsterLook in the snapshots).
+bool spawns_hidden(CGameObject* obj)
+{
+	CPoltergeist* polter = smart_cast<CPoltergeist*>(obj);
+	return (polter && polter->g_Alive() && polter->is_hidden()) || smart_cast<CPsyDogPhantom*>(obj);
+}
+
 void make_remote(CGameObject* obj)
 {
 	obj->setLocal(FALSE);
-	if (!obj->getVisible())
+	if (!obj->getVisible() && !spawns_hidden(obj))
 		obj->setVisible(TRUE); // a Remote CEntity is invisible by default
 	if (!obj->getEnabled())
 		obj->setEnabled(TRUE);
@@ -140,6 +151,8 @@ void make_local(CGameObject* obj)
 		alive->conditions().SetCanBeHarmedState(true);
 	if (CCustomMonster* m = obj->cast_custom_monster())
 		restart_net_state(m);
+	if (CAI_Bloodsucker* sucker = smart_cast<CAI_Bloodsucker*>(obj))
+		sucker->force_visibility_state(CAI_Bloodsucker::unset); // audit F5b: its own AI decides again
 	g_puppets.erase(obj->ID());
 	++g_made_local;
 }

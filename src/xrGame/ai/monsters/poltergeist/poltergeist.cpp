@@ -9,6 +9,7 @@
 #include "../../../detail_path_manager.h"
 #include "../monster_velocity_space.h"
 #include "../../../coop/coop_ai.h" // Anomaly Coop: nearest_player, is_player
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 #include "../../../level.h"
 #include "../../../level_debug.h"
 #include "../control_animation_base.h"
@@ -426,6 +427,8 @@ void CPoltergeist::Die(CObject* who)
 		if (state_invisible)
 		{
 			setVisible(true);
+			if (coop::remote::is_remote_creature(this))
+				m_current_position = Position(); // Anomaly Coop (audit F5a): a puppet never moved it, it is the spawn point
 
 			if (PPhysicsShell())
 			{

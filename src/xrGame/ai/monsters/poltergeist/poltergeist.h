@@ -81,6 +81,7 @@ public:
 	virtual char* get_monster_class_name() { return "poltergeist"; }
 
 	bool detected_enemy();
+	void coop_flame(const Fvector& position, const Fvector& dir); // Anomaly Coop (audit F5c): the host's flame on a puppet
 	float get_fly_around_distance() const { return m_fly_around_distance; }
 	float get_fly_around_change_direction_time() const { return m_fly_around_change_direction_time; }
 
@@ -273,11 +274,13 @@ public:
 	virtual void update_schedule();
 	virtual void on_destroy();
 	virtual void on_die();
+	void coop_play(const Fvector& position, const Fvector& dir); // Anomaly Coop (audit F5c)
 
 private:
 	void select_state(SFlameElement* elem, EFlameState state);
 	bool get_valid_flame_position(const CObject* target_object, Fvector& res_pos);
 	void create_flame(const CObject* target_object);
+	void start_flame(const CObject* target_object, const Fvector& position, const Fvector& dir);
 };
 
 

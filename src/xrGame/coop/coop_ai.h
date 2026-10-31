@@ -83,8 +83,14 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
 constexpr u32 kMaxNearPlayers = 8;
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers]);
 // Does `player` (this machine's actor or a remote player's character) see `monster` now? The actor: its visual memory;
-// a remote player: his reported view and the line of sight (player_sees).
+// a remote player: his reported view and a static ray from his head (audit F1). Unlike player_sees it does not ask what
+// `monster` sees: CMonsterEnemyMemory asks this to alert a monster that sees nothing.
 bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster);
+// Audit F3c: a remote player's character reported the start of a reload (coop_presence); player_reloading: a moment ago.
+void on_player_reload(u16 player);
+bool player_reloading(const CEntityAlive* player);
+// Audit F3d: `player` is in a jump - this machine's actor, or a remote player by the move state his machine reports.
+bool player_jumping(const CObject* player);
 // Audit A5: where `player` looks - this machine's actor: its camera; a remote player's character: the view his
 // machine reports. False for anything else or a view never reported.
 bool player_view_dir(const CEntityAlive* player, Fvector& dir);

@@ -12,6 +12,7 @@
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
+#include "xrCoop/coop_enemy_rules.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -19,6 +20,7 @@
 #include "coop_alife.h"
 #include "ai/stalker/ai_stalker.h"
 #include "ai/monsters/basemonster/base_monster.h"
+#include "ai/monsters/bloodsucker/bloodsucker.h"
 #include "InventoryOwner.h"
 #include "Inventory.h"
 #include "Torch.h"
@@ -252,6 +254,36 @@ CTorch* attached_torch(CGameObject* obj)
 	return nullptr;
 }
 
+// Audit F5b, F5d (2026-10-31): what only a monster's AI on the host knows about its look. A puppet finds no enemy, so its
+// update_invisibility always landed on full visibility: a client never saw a bloodsucker or a psysucker cloak. A psy dog's
+// phantom shows itself at its leap.
+enemy_rules::MonsterLook monster_look(CGameObject* obj)
+{
+	using enemy_rules::MonsterLook;
+	if (!obj->getVisible())
+		return MonsterLook::Hidden;
+	if (const CAI_Bloodsucker* sucker = smart_cast<const CAI_Bloodsucker*>(obj))
+	{
+		const CAI_Bloodsucker::visibility_t state = sucker->get_visibility_state();
+		if (state == CAI_Bloodsucker::no_visibility)
+			return MonsterLook::CloakFull;
+		if (state == CAI_Bloodsucker::partial_visibility)
+			return MonsterLook::CloakPartial;
+	}
+	return MonsterLook::Shown;
+}
+
+void apply_monster_look(CGameObject* obj, enemy_rules::MonsterLook look)
+{
+	using enemy_rules::MonsterLook;
+	const bool hidden = look == MonsterLook::Hidden;
+	if (!!obj->getVisible() == hidden)
+		obj->setVisible(hidden ? FALSE : TRUE);
+	if (CAI_Bloodsucker* sucker = smart_cast<CAI_Bloodsucker*>(obj))
+		sucker->force_visibility_state(look == MonsterLook::CloakFull ? CAI_Bloodsucker::no_visibility :
+		    look == MonsterLook::CloakPartial ? CAI_Bloodsucker::partial_visibility : CAI_Bloodsucker::full_visibility);
+}
+
 // Live 2026-10-24 (owner): "on the client you do not see an NPC raise its weapon at whoever aimed at it". A puppet runs
 // no object handler of its own: its torso plays the host's aim, but its hands stayed empty. The item in hands rides in
 // the snapshot (`held`, the host id, when CreatureHolds is set).
@@ -261,7 +293,7 @@ u8 creature_flags(CGameObject* obj, u16& held)
 	held = kNoId;
 	CAI_Stalker* stalker = obj->cast_stalker();
 	if (!stalker)
-		return flags;
+		return obj->cast_base_monster() ? enemy_rules::look_flags(monster_look(obj)) : flags;
 	if (CTorch* t = attached_torch(obj))
 		if (t->torch_active())
 			flags |= CreatureTorchLit;
@@ -323,7 +355,11 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 {
 	CAI_Stalker* stalker = obj->cast_stalker();
 	if (!stalker)
+	{
+		if (obj->cast_base_monster())
+			apply_monster_look(obj, enemy_rules::look_of(flags));
 		return true;
+	}
 	bool done = true;
 	const bool lit = (flags & CreatureTorchLit) != 0;
 	if (CTorch* t = puppet_torch(obj))

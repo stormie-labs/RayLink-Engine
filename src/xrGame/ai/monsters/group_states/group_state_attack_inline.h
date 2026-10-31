@@ -12,6 +12,7 @@
 #include "group_state_attack_run.h"
 #include "../../../entity_alive.h"
 #include "../../../actor.h"
+#include "../../../coop/coop_ai.h" // Anomaly Coop: is_player
 
 #define TEMPLATE_SPECIALIZATION template <\
 	typename _Object\
@@ -110,7 +111,7 @@ void CStateGroupAttackAbstract::execute()
 	bool can_attack_on_move = object->can_attack_on_move();
 	CEntityAlive* enemy = const_cast<CEntityAlive*>(object->EnemyMan.get_enemy());
 
-	bool const enemy_is_actor = !!smart_cast<CActor*>(enemy);
+	bool const enemy_is_actor = coop::npc_ai::is_player(enemy); // Anomaly Coop (audit F3b): the lair warns every player alike
 
 	const Fvector3 enemy_pos = enemy->Position();
 

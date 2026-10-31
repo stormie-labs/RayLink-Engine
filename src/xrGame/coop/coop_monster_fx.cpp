@@ -7,8 +7,14 @@
 #include "coop_join.h"
 #include "coop_ai.h"
 #include "xrCoop/coop_local_link.h"
+#include "xrCoop/coop_enemy_rules.h"
 #include "Level.h"
 #include "Actor.h"
+#include "Hit.h"
+#include "PhysicsShellHolder.h"
+#include "../xrphysics/PhysicsShell.h"
+#include "../xrServerEntities/xrMessages.h"
+#include "../Include/xrRender/Kinematics.h"
 #include "ai/monsters/basemonster/base_monster.h"
 #include "ai/monsters/pseudogigant/pseudo_gigant.h"
 #include "ai/monsters/controller/controller.h"
@@ -17,6 +23,7 @@
 #include "ai/monsters/anti_aim_ability.h"
 #include "ai/monsters/bloodsucker/bloodsucker.h"
 #include "ai/monsters/pseudodog/psy_dog.h"
+#include "ai/monsters/poltergeist/poltergeist.h"
 
 namespace coop
 {
@@ -24,7 +31,7 @@ namespace monster_fx
 {
 namespace
 {
-u64 g_sent = 0, g_played = 0, g_dropped = 0, g_late = 0;
+u64 g_sent = 0, g_played = 0, g_dropped = 0, g_late = 0, g_thrown_hits = 0;
 constexpr u32 kPendingMs = 1500;
 constexpr size_t kMaxPending = 32;
 
@@ -42,9 +49,23 @@ struct Pending
 	u8 phase;
 	float value;
 	u32 until;
+	Fvector at, dir; // kPolterFlame
 };
 xr_vector<Pending> g_pending;
 bool g_playing = false;
+
+// Audit F4: an object a monster threw, followed until it hits a remote player or its flight ends.
+struct Throw
+{
+	u16 object, monster;
+	float power, mass;
+	Fvector last; // where it was at last_ms
+	u32 last_ms, until;
+};
+constexpr size_t kMaxThrows = 32;
+xrCriticalSection g_thrown_lock; // AI think, which throws, may run on the game thread
+xr_vector<Throw> g_thrown; // under the lock, frame() takes them
+xr_vector<Throw> g_flights;
 
 struct Playing
 {
@@ -53,7 +74,7 @@ struct Playing
 };
 
 // This machine's actor takes what the host decided for it.
-void play(CBaseMonster* monster, u8 kind, u8 phase, float value)
+void play(CBaseMonster* monster, u8 kind, u8 phase, float value, const Fvector& at, const Fvector& dir)
 {
 	CActor* actor = g_actor;
 	if (!actor || actor->getDestroy())
@@ -140,6 +161,27 @@ void play(CBaseMonster* monster, u8 kind, u8 phase, float value)
 			return;
 		}
 		break;
+	case kMeleeHit:
+		if (!alive)
+			break;
+		{
+			// rebuilt here: the blow's own direction stays on the host
+			Fvector to_actor;
+			to_actor.sub(actor->Position(), monster->Position());
+			to_actor.normalize_safe();
+			Fvector shove = to_actor;
+			monster->melee_fx_on_actor(value, to_actor, shove);
+		}
+		++g_played;
+		return;
+	case kPolterFlame:
+		if (CPoltergeist* polter = smart_cast<CPoltergeist*>(monster))
+		{
+			polter->coop_flame(at, dir);
+			++g_played;
+			return;
+		}
+		break;
 	default: break;
 	}
 	(void)phase;
@@ -152,6 +194,15 @@ void client_on_effect(PeerId, Reader& r)
 	const u8 kind = r.u8();
 	const u8 phase = r.u8();
 	const float value = r.f32();
+	Fvector at{}, dir{};
+	if (kind == kPolterFlame)
+	{
+		float v[3] = {};
+		r.vec3(v);
+		at.set(v[0], v[1], v[2]);
+		r.vec3(v);
+		dir.set(v[0], v[1], v[2]);
+	}
 	if (!r.ok() || !mgr().is_live_client() || !g_pGameLevel || kind >= kKinds)
 	{
 		++g_dropped;
@@ -162,12 +213,114 @@ void client_on_effect(PeerId, Reader& r)
 	{
 		// a monster spawned this instant (a psy dog's phantom) may come after its effect: it waits a moment
 		if (g_pending.size() < kMaxPending)
-			g_pending.push_back({id, kind, phase, value, Device.dwTimeGlobal + kPendingMs});
+			g_pending.push_back({id, kind, phase, value, Device.dwTimeGlobal + kPendingMs, at, dir});
 		else
 			++g_dropped;
 		return;
 	}
-	play(monster, kind, phase, value);
+	play(monster, kind, phase, value, at, dir);
+}
+
+enemy_rules::Point point_of(const Fvector& v)
+{
+	return enemy_rules::Point{v.x, v.y, v.z};
+}
+
+// What the stock collision would have dealt a character of the player's kind (the actor's section) at `speed`.
+float throw_power(const Throw& t, float speed)
+{
+	const float contact = enemy_rules::contact_speed(speed, t.mass, pSettings->r_float("actor", "ph_mass"));
+	return enemy_rules::thrown_power(contact, pSettings->r_float("actor", "ph_crash_speed_min"),
+	    pSettings->r_float("actor", "ph_crash_speed_max"), t.power);
+}
+
+// As the monster's own blow (HitEntity): named after a creature the hit goes to the player as PlayerHit.
+void hit_player(CGameObject* monster, CEntityAlive* player, const Fvector& dir, float power)
+{
+	NET_Packet P;
+	SHit hit;
+	hit.GenHeader(GE_HIT, player->ID());
+	hit.whoID = monster->ID();
+	hit.weaponID = monster->ID();
+	hit.dir = dir;
+	hit.power = power;
+	IKinematics* k = smart_cast<IKinematics*>(player->Visual());
+	hit.boneID = k ? k->LL_GetBoneRoot() : u16(BI_NONE);
+	hit.p_in_bone_space = Fvector().set(0.f, 0.f, 0.f);
+	hit.impulse = 0.f;
+	hit.hit_type = ALife::eHitTypeStrike;
+	hit.Write_Packet(P);
+	monster->u_EventSend(P);
+	++g_thrown_hits;
+}
+
+// True: the flight is over. One step of the object against every remote player: at tens of m/s it covers a metre and more
+// between two samples, and its Position() moves only when it is updated (far from the host: not every frame).
+bool flight_over(Throw& t, u32 now)
+{
+	if (now > t.until)
+		return true;
+	CGameObject* object = smart_cast<CGameObject*>(Level().Objects.net_Find(t.object));
+	CGameObject* monster = smart_cast<CGameObject*>(Level().Objects.net_Find(t.monster));
+	if (!object || !monster || object->getDestroy() || monster->getDestroy())
+		return true;
+	const Fvector pos = object->Position();
+	if (now == t.last_ms || pos.similar(t.last))
+		return false;
+	const float step = pos.distance_to(t.last);
+	const float speed = step / (float(now - t.last_ms) * 0.001f);
+	CEntityAlive* near_players[npc_ai::kMaxNearPlayers];
+	const u32 count = npc_ai::players_near(pos, step + enemy_rules::kThrowReach + enemy_rules::kThrowBodyHeight, near_players);
+	for (u32 i = 0; i < count; ++i)
+	{
+		CEntityAlive* player = near_players[i];
+		if (!npc_ai::is_remote_player(player))
+			continue; // the host's actor takes the stock contact
+		Fvector chest = player->Position();
+		chest.y += enemy_rules::kThrowBodyHeight;
+		const enemy_rules::Point closest = enemy_rules::closest_on_segment(point_of(t.last), point_of(pos), point_of(chest));
+		if (enemy_rules::distance(closest, point_of(chest)) > enemy_rules::kThrowReach)
+			continue;
+		const float power = throw_power(t, speed);
+		if (power <= 0.f)
+			continue;
+		Fvector from, dir;
+		from.set(closest.x, closest.y, closest.z);
+		dir.sub(chest, from);
+		const float range = dir.magnitude();
+		if (range > EPS_L)
+		{
+			dir.div(range);
+			if (Level().ObjectSpace.RayTest(from, dir, range, collide::rqtStatic, nullptr, nullptr))
+				continue; // it flew by behind a wall
+		}
+		else
+			dir.set(0.f, 0.f, 1.f);
+		hit_player(monster, player, dir, power);
+		return true;
+	}
+	t.last = pos;
+	t.last_ms = now;
+	return false;
+}
+
+void host_flights(bool world_up)
+{
+	{
+		xrCriticalSectionGuard guard(&g_thrown_lock);
+		g_flights.insert(g_flights.end(), g_thrown.begin(), g_thrown.end());
+		g_thrown.clear();
+	}
+	if (g_flights.empty())
+		return;
+	if (!world_up || !mgr().is_host())
+	{
+		g_flights.clear();
+		return;
+	}
+	const u32 now = Device.dwTimeGlobal;
+	g_flights.erase(std::remove_if(g_flights.begin(), g_flights.end(), [now](Throw& t) { return flight_over(t, now); }),
+	    g_flights.end());
 }
 } // namespace
 
@@ -206,6 +359,7 @@ bool host_held(u16 target)
 
 void frame(bool world_up)
 {
+	host_flights(world_up);
 	if (g_pending.empty())
 		return;
 	if (!world_up || !mgr().is_live_client())
@@ -223,7 +377,7 @@ void frame(bool world_up)
 		{
 			g_pending.erase(g_pending.begin() + i);
 			++g_late;
-			play(monster, p.kind, p.phase, p.value);
+			play(monster, p.kind, p.phase, p.value, p.at, p.dir);
 			continue;
 		}
 		if (now > p.until)
@@ -253,6 +407,39 @@ bool host_send(const CObject* target, const CObject* monster, u8 kind, u8 phase,
 	return true;
 }
 
+void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir)
+{
+	if (!monster || !mgr().is_host())
+		return;
+	Writer w(36);
+	w.u16(monster->ID());
+	w.u8(kPolterFlame);
+	w.u8(0);
+	w.f32(0.f);
+	const float position[3] = {at.x, at.y, at.z}, direction[3] = {dir.x, dir.y, dir.z};
+	w.vec3(position);
+	w.vec3(direction);
+	net::host_broadcast(Msg::MonsterEffect, w, Lane::Unreliable); // a picture of a moment: no queue for a client that loads
+	++g_sent;
+}
+
+void host_throw(CPhysicsShellHolder* object, const CObject* monster, float power)
+{
+	if (!object || !monster || !object->PPhysicsShell() || !mgr().is_host())
+		return;
+	Throw t;
+	t.object = object->ID();
+	t.monster = monster->ID();
+	t.power = power;
+	t.mass = object->PPhysicsShell()->getMass();
+	t.last = object->Position();
+	t.last_ms = Device.dwTimeGlobal;
+	t.until = t.last_ms + enemy_rules::kThrowFlightMs;
+	xrCriticalSectionGuard guard(&g_thrown_lock);
+	if (g_thrown.size() < kMaxThrows)
+		g_thrown.push_back(t);
+}
+
 void install_server(Session&) {}
 
 void install_client(Endpoint& e)
@@ -263,8 +450,8 @@ void install_client(Endpoint& e)
 void print_status()
 {
 	::Msg("[coop]   monster abilities on remote players: %llu sent, %llu played here (%llu after their monster came), "
-	      "%llu dropped, %u waiting; %u players held",
-	    g_sent, g_played, g_late, g_dropped, (u32)g_pending.size(), (u32)g_holds.size());
+	      "%llu dropped, %u waiting; %u players held; thrown objects: %u flying, %llu hit",
+	    g_sent, g_played, g_late, g_dropped, (u32)g_pending.size(), (u32)g_holds.size(), (u32)g_flights.size(), g_thrown_hits);
 }
 } // namespace monster_fx
 } // namespace coop

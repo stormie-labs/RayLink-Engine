@@ -145,6 +145,9 @@ void on_blocking_work();
 // Engine hook: skip the "press any key" screen after a level load (a joining client, or an
 // instance started with -coop_host / -coop_connect for automated tests).
 bool skip_keypress_on_load();
+// The launcher's Steam mode started this game with a lobby: Steam's "invite a friend" window can open over the game.
+bool steam_invite_ready();
+bool steam_invite_window();
 } // namespace coop
 
 // Player nick shown to others (console var coop_nick, saved in user.ltx).

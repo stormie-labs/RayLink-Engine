@@ -22,6 +22,7 @@
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIStatic.h"
 #include "coop/coop_survival.h" // Anomaly Coop
+#include "coop/coop_ai.h" // Anomaly Coop: player_down
 
 #define MAX_SATIETY					1.0f
 #define START_SATIETY				0.5f
@@ -383,7 +384,8 @@ void CActorCondition::AffectDamage_InjuriousMaterialAndMonstersInfluence()
 	// Add Radiation and Psy Level from Monsters
 	CPda* const pda = m_object->GetPDA();
 
-	if (m_object && m_object->g_Alive())
+	// Anomaly Coop (audit F9): an aura leaves a player who is down, as the monsters do: each of its hits shortened his bleed-out
+	if (m_object && m_object->g_Alive() && !coop::npc_ai::player_down(m_object))
 	{
 		typedef xr_vector<CObject*> monsters;
 

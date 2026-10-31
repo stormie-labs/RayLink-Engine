@@ -14,16 +14,20 @@
 #include "../saved_game_wrapper.h"
 #include "../login_manager.h"
 #include "MainMenu.h"
+#include "../coop/coop_survival.h"
 #include "../coop/coop_manager.h" // Anomaly Coop
 
 extern string_path g_last_saved_game;
 
 // Anomaly Coop (F3): in a co-op session nobody saves or loads from the menu, the host included (the host restores
-// from the emergency autosaves in the co-op window). The buttons of the save/load entries are not created.
+// from the emergency autosaves in the co-op window). The buttons of the save/load entries are not created. In the
+// rollback death mode the host has them as in the stock game.
 // The names are the same in stock Anomaly and in GAMMA (ui_mm_main_16.xml, MCM copy).
 static bool coop_hidden_menu_button(LPCSTR name)
 {
 	if (!name || !coop::mgr().active())
+		return false;
+	if (coop::mgr().is_host() && coop::survival::saves_open())
 		return false;
 	return !xr_strcmp(name, "btn_save") || !xr_strcmp(name, "btn_load") || !xr_strcmp(name, "btn_lastsave");
 }

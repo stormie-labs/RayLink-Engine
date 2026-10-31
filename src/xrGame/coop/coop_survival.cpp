@@ -6,6 +6,7 @@
 #include "coop_world.h"
 #include "coop_net.h"
 #include "coop_script.h"
+#include "coop_autosave.h"
 #include "coop_death.h"
 #include "coop_checkpoints.h"
 #include "coop_money.h"
@@ -73,6 +74,7 @@ constexpr u32 kRespawnRetryMs = 2000; // host: no body to respawn right now (not
 constexpr float kRespawnLift = 0.2f; // a respawn point is on the ground: appear this much above it
 constexpr u32 kStaleRemoteMs = 15000; // client: forget players the host stopped reporting
 constexpr u32 kGuardMs = 1000;
+constexpr u32 kRollbackDelayMs = 5000; // rollback mode: everybody reads who died, then the host loads
 constexpr float kCamDrop = 1.1f; // eye height drop while lying
 constexpr float kOverheadHeight = 6.f; // evacuated with nobody alive: camera this high above the body
 constexpr float kOverheadTurn = 0.08f; // ... turning this many radians a second
@@ -148,6 +150,7 @@ float g_cv_death_share = death::kShareDefaultPct; // build 10: the loss shares o
 xr_token g_death_mode_tokens[] = {
 	{"checkpoint", int(death::Mode::Checkpoint)},
 	{"hardcore", int(death::Mode::Hardcore)},
+	{"rollback", int(death::Mode::Rollback)},
 	{"respawn", int(death::Mode::Checkpoint)},
 	{"respawn_keep", int(death::Mode::Checkpoint)},
 	{nullptr, 0},
@@ -161,7 +164,10 @@ xr_token g_death_drop_tokens[] = {
 	{nullptr, 0},
 };
 
-const char* mode_name(death::Mode m) { return m == death::Mode::Hardcore ? "hardcore" : "checkpoint"; }
+const char* mode_name(death::Mode m)
+{
+	return m == death::Mode::Hardcore ? "hardcore" : m == death::Mode::Rollback ? "rollback" : "checkpoint";
+}
 
 u8 console_pct(float v) { return u8(iFloor(clampr(v, 0.f, 100.f) + 0.5f)); }
 
@@ -177,7 +183,7 @@ u8 console_share(float v)
 death::Rules console_rules()
 {
 	death::Rules r;
-	r.mode = g_cv_death_mode == u32(death::Mode::Hardcore) ? death::Mode::Hardcore : death::Mode::Checkpoint;
+	r.mode = death::Mode(_min(g_cv_death_mode, u32(death::Mode::Rollback)));
 	r.drop = death::Drop(_min(g_cv_death_drop, u32(death::Drop::Keep)));
 	r.bleedout_ms = u32(g_cv_bleedout_s * 1000.f);
 	r.revive_health = g_cv_revive_health;
@@ -289,6 +295,7 @@ struct Retirement
 };
 xr_map<u16, Retirement> g_retire;
 bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
+u64 g_rollback_at = 0; // rollback mode: when the host goes back to the last save, 0 = not on the way
 u32 g_epoch = 0xffffffff;
 u64 g_last_roster = 0;
 u64 g_last_guard = 0;
@@ -1220,6 +1227,8 @@ void flag_write(u16 character, const char* key, bool on)
 // until somebody stands up again (host_on_state Alive).
 void host_check_wipe()
 {
+	if (g_world_rules.mode == death::Mode::Rollback)
+		return; // the group is on its way back, nothing to stay and watch
 	std::vector<u8> lives;
 	lives.push_back(u8(g_me.life));
 	for (const auto& it : g_players)
@@ -1261,10 +1270,21 @@ bool host_order_respawn(u16 id, u16 seq)
 	return true;
 }
 
-// The host's answer to a death (death::Tracker: once per death). Checkpoint: the items (coop_death, by
-// coop_death_drop) and the money go now, the owner is evacuated for coop_respawn_delay, host_frame respawns him.
-// Hardcore: he is out and watches. The host player (character 0) takes the same path: his orders go to him over the
-// internal channel (F3a T7).
+// Checkpoint death: the items (coop_death, by coop_death_drop) and the money go now, the owner is evacuated for
+// coop_respawn_delay, host_frame respawns him.
+void host_take_losses_and_evacuate(u16 id, u16 seq)
+{
+	const u32 items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
+	const u32 money = death::host_take_money(id, g_world_rules.money_pct);
+	::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(), seq,
+	    items, death::drop_name(g_world_rules.drop), u32(g_world_rules.share_pct), money, g_world_rules.delay_ms / 1000);
+	host_order_evacuate(id, seq, g_world_rules.delay_ms);
+}
+
+// The host's answer to a death (death::Tracker: once per death). Checkpoint: host_take_losses_and_evacuate. Hardcore: he
+// is out and watches. Rollback: nothing is taken, the group goes back to the last save after kRollbackDelayMs, the delay
+// counted here because the script's time events may stand while the host is dead. The host player (character 0) takes
+// the same path: his orders go to him over the internal channel (F3a T7).
 death::Action host_on_died(u16 id, u16 seq)
 {
 	HostRec& h = g_host[id];
@@ -1273,19 +1293,33 @@ death::Action host_on_died(u16 id, u16 seq)
 	{
 	case death::Action::None: return a; // decided already (state repeats are normal)
 	case death::Action::Spectate: host_order_spectate(id, seq); break;
-	case death::Action::LossesAndEvacuate:
+	case death::Action::LossesAndEvacuate: host_take_losses_and_evacuate(id, seq); break;
+	case death::Action::Rollback:
+		::Msg("[coop] death of %s (fall #%u): the group goes back to the last save in %u s", nick_of(id).c_str(), seq,
+		    kRollbackDelayMs / 1000);
 	{
-		const u32 items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
-		const u32 money = death::host_take_money(id, g_world_rules.money_pct);
-		::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(),
-		    seq, items, death::drop_name(g_world_rules.drop), u32(g_world_rules.share_pct), money,
-		    g_world_rules.delay_ms / 1000);
-		host_order_evacuate(id, seq, g_world_rules.delay_ms);
+		const bool first = g_rollback_at == 0;
+		if (first)
+			g_rollback_at = now() + kRollbackDelayMs;
+		script::queue_callback("coop_group_rollback",
+		    {script::cb_int(id), script::cb_int(seq), script::cb_str(nick_of(id).c_str()), script::cb_int(kRollbackDelayMs / 1000),
+		        script::cb_int(first ? 1 : 0)});
 		break;
 	}
 	}
 	host_check_wipe();
 	return a;
+}
+
+// coop.rollback_failed: no save to go back to, the death goes the checkpoint way.
+void host_rollback_failed(u16 id, u16 seq)
+{
+	HostRec& h = g_host[id];
+	if (!death::rollback_refused(h.tracker, seq, now(), g_world_rules))
+		return;
+	host_take_losses_and_evacuate(id, seq);
+	flag_write(id, kDebtKey, true);
+	h.debt = true;
 }
 
 // Every life report of a character's owner (the host player's too, over the internal channel). The respawn debt follows
@@ -1769,6 +1803,17 @@ void host_frame(u64 t)
 			::Msg("[coop] a new world: %u retirement(s) of the old one dropped", u32(g_retire.size()));
 		g_retire.clear();
 		g_wipe_fired = false;
+		g_rollback_at = 0;
+	}
+
+	if (g_rollback_at)
+	{
+		autosave::suspend(true); // a save of the dead would bring the death back
+		if (t >= g_rollback_at)
+		{
+			g_rollback_at = 0;
+			script::queue_callback("coop_group_rollback_go", {});
+		}
 	}
 
 	const death::Rules r = console_rules();
@@ -2493,6 +2538,7 @@ void leave_session()
 	g_host.clear(); // the respawn debts stay in the world (custom data), not here
 	g_retire.clear(); // a stash still waiting is released empty (death::reset); the character stays out
 	g_wipe_fired = false;
+	g_rollback_at = 0;
 	g_rules_from_host = false;
 	g_hud.clear();
 }
@@ -3051,5 +3097,15 @@ bool own_pose_held(const CActor* actor) { return actor && g_pose_actor.load() ==
 bool look_locked() { return live() && g_me.actor && death::look_locked(u8(g_me.life)); }
 
 const death::Rules& rules() { return mgr().is_host() ? g_world_rules : g_rules; }
+
+void rollback_failed(u16 character, u16 seq)
+{
+	if (mgr().is_host())
+		host_rollback_failed(character, seq);
+}
+
+bool saves_open() { return mgr().active() && rules().mode == death::Mode::Rollback; }
+
+bool rollback_pending() { return g_rollback_at != 0; }
 } // namespace survival
 } // namespace coop

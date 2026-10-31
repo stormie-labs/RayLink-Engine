@@ -195,6 +195,11 @@ struct ReviveProgress
 };
 // False: nothing to show (no session, or neither reviving nor wounded).
 bool revive_progress(ReviveProgress& out);
+// Rollback death mode. rollback_failed (host, Lua): no save to go back to, the death `seq` of `character` goes the
+// checkpoint way. saves_open: saves work as in the single player game in this session, the host's to make and load.
+void rollback_failed(u16 character, u16 seq);
+bool saves_open();
+bool rollback_pending(); // host: the group waits for the load
 // Host (Ruling F3-4): what the owner of `character` had in his slots and on his belt when he reported his death `seq`,
 // host numbering, sorted, each id once and carried by the character when the report came (at most 40). False when
 // no report of that death brought the list (the host's own actor: its slots and belt are seen directly).
