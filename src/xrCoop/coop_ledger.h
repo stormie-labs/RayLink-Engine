@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -198,6 +199,8 @@ struct Pending
 {
 	uint32_t seq;
 	int32_t delta;
+	Cause cause = Cause::Script; // what a change the host never saw goes out with again (take_skipped)
+	uint32_t ref = 0;
 };
 
 // Sequence numbers compare as serial numbers (as every coop seq): `a` is newer than `b`.
@@ -216,6 +219,16 @@ inline uint32_t client_view(uint32_t host_balance, uint32_t acked_seq, const std
 	v -= int64_t(std::min<uint64_t>(held, uint64_t(INT64_MAX) / 2)); // at most 64 x u32 in practice
 	const int64_t hi = std::max<int64_t>(int64_t(max_money), int64_t(host_balance));
 	return uint32_t(std::min<int64_t>(std::max<int64_t>(v, 0), hi));
+}
+
+// Client, a Gap note: takes the changes the host never saw out of `pending` (they go out again as new ones).
+inline std::vector<Pending> take_skipped(std::vector<Pending>& pending, uint32_t first, uint32_t count)
+{
+	std::vector<Pending> out;
+	const auto skipped = [&](const Pending& p) { return uint32_t(p.seq - first) < count; };
+	std::copy_if(pending.begin(), pending.end(), std::back_inserter(out), skipped);
+	pending.erase(std::remove_if(pending.begin(), pending.end(), skipped), pending.end());
+	return out;
 }
 
 // Drops the changes an answer with `acked_seq` covers (the host has applied or refused them).
@@ -245,17 +258,41 @@ enum class NoteKind : uint8_t
 	None = 0, // only a balance
 	Received = 1, // another player gave this one `amount` RU (`peer` is the giver)
 	Refused = 2, // the host refused a change of his (`cause`, `verdict`, `amount`; a transfer: `peer` is the receiver)
+	Gap = 3, // parity audit D11: the host never saw `amount` of his changes from seq `peer` on: he sends them again
 };
-constexpr uint8_t kNoteKindCount = 3;
+constexpr uint8_t kNoteKindCount = 4;
 
 struct MoneyNote
 {
 	NoteKind kind = NoteKind::None;
 	Cause cause = Cause::Script; // Refused: the cause of the change
 	Verdict verdict = Verdict::Applied; // Refused: why
-	uint32_t peer = 0; // Received: the giver; Refused with Cause::Transfer: the receiver; else 0
-	int32_t amount = 0; // Received: RU credited; Refused: the change asked for (negative: a spend or a transfer)
+	uint32_t peer = 0; // Received: the giver; Refused with Cause::Transfer: the receiver; Gap: the first seq; else 0
+	int32_t amount = 0; // Received: RU credited; Refused: the change asked for (negative: a spend or a transfer); Gap: seqs
 };
+
+// Parity audit D11: a ReqMoney over the host's rate row (Session::limit_rate) is dropped before its handler, with no
+// answer. The next one to pass set `acked` past it, the client forgot it as answered and the change was gone. `seq` came
+// after `acked`: how many seqs between them the host never saw. The first request of a connection has nothing to compare
+// with, and a hole wider than kMaxGap is no lost burst: the changes of a world that was replaced went with it.
+constexpr uint32_t kMaxGap = 1024;
+
+inline uint32_t seq_gap(uint32_t acked, uint32_t seq)
+{
+	if (!acked || int32_t(seq - acked) <= 1)
+		return 0;
+	const uint32_t skipped = seq - acked - 1;
+	return skipped > kMaxGap ? 0 : skipped;
+}
+
+inline MoneyNote note_gap(uint32_t first, uint32_t count)
+{
+	MoneyNote n;
+	n.kind = NoteKind::Gap;
+	n.peer = first;
+	n.amount = int32_t(count);
+	return n;
+}
 
 // The note of a transfer for its receiver. A credit past what a note holds is cut, never wrapped.
 inline MoneyNote note_received(uint32_t giver, uint32_t credit)

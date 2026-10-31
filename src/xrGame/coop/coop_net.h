@@ -36,6 +36,7 @@ void host_drop(PeerId to);
 // Host: the queue of a loading client hit its cap (the client is stuck): it must be kicked.
 bool host_queue_overflow(PeerId to);
 void reset();
+void print_status(); // D16: the join queues
 
 // True if this machine is in a live session (host, or client in the world).
 inline bool live() { return mgr().is_host() || mgr().is_live_client(); }

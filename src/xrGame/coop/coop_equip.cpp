@@ -565,6 +565,8 @@ void hand_light_frame()
 			if (!made)
 				continue;
 			l = g_head_lights.emplace(it.first, made).first;
+			::Msg("[coop] the head light of avatar %u is drawn here, %.1f m from the camera", it.first,
+			      av->Position().distance_to(Device.vCameraPosition));
 		}
 		place_light(l->second, av);
 	}
@@ -983,6 +985,30 @@ void equip_frame()
 	}
 
 	hand_light_frame();
+}
+
+// Live 2026-10-31, still open: a head torch switched on and handed straight to the other player lit up "from the back of his
+// body". Reading the code finds nothing that lights it on either machine: OnH_B_Independent puts it out, the binder lights only
+// what its own actor has in the slot, apply_equip keeps an avatar's dark, the head light goes with the owner's PlayerEquip. So
+// the game says it: every switch of a player's torch on this machine, with where the item is, up to kTorchLines in a session.
+void on_torch_switch(const CTorch& torch, bool on)
+{
+	constexpr u32 kTorchLines = 200;
+	static u32 lines = 0;
+	if (!g_pGameLevel || !mgr().active() || lines >= kTorchLines)
+		return;
+	const CObject* parent = torch.H_Parent();
+	const CGameObject* holder = smart_cast<const CGameObject*>(parent);
+	const bool mine = parent && parent == Level().CurrentEntity();
+	if (holder && !mine && !world::is_player_character(holder))
+		return; // an NPC's lamp at dusk
+	++lines;
+	const CInventoryOwner* owner = smart_cast<const CInventoryOwner*>(parent);
+	const Fvector& at = torch.Position();
+	::Msg("[coop] torch %u [%s] %s on this machine: %s (holder %u), place %u, slot %u, worn %d, at %.1f %.1f %.1f, %.1f m from the camera",
+	      torch.ID(), torch.cNameSect().c_str(), on ? "on" : "off", mine ? "on me" : holder ? "on an avatar" : "on nobody",
+	      holder ? u32(holder->ID()) : 0xffffu, u32(torch.CurrPlace()), u32(torch.CurrSlot()), owner && owner->attached(&torch) ? 1 : 0,
+	      at.x, at.y, at.z, at.distance_to(Device.vCameraPosition));
 }
 
 void equip_resend()

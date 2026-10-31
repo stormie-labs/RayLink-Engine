@@ -25,6 +25,8 @@
 #include "ai/monsters/pseudodog/psy_dog.h"
 #include "ai/monsters/poltergeist/poltergeist.h"
 
+void SetActorVisibility(u16 who, float value);
+
 namespace coop
 {
 namespace monster_fx
@@ -66,6 +68,13 @@ constexpr size_t kMaxThrows = 32;
 xrCriticalSection g_thrown_lock; // AI think, which throws, may run on the game thread
 xr_vector<Throw> g_thrown; // under the lock, frame() takes them
 xr_vector<Throw> g_flights;
+
+// Audit F11: the strongest NPC about to notice each remote player, since the last look.
+constexpr u16 kSeenSource = 0xfffe; // the key of the host's word in the actor's table of who notices it: no object has it
+xrCriticalSection g_seen_lock; // vision runs in AI think, frame() takes them
+float g_seen_top[kMaxPlayers] = {};
+float g_seen_sent[kMaxPlayers] = {};
+u32 g_seen_next = 0;
 
 struct Playing
 {
@@ -182,10 +191,54 @@ void play(CBaseMonster* monster, u8 kind, u8 phase, float value, const Fvector& 
 			return;
 		}
 		break;
+	case kBurerGraviPrepare:
+		if (CBurer* burer = smart_cast<CBurer*>(monster))
+		{
+			burer->coop_gravi_prepare(phase != 0);
+			++g_played;
+			return;
+		}
+		break;
+	case kBurerTeleGlow:
+		if (CBurer* burer = smart_cast<CBurer*>(monster))
+		{
+			if (CGameObject* held = smart_cast<CGameObject*>(Level().Objects.net_Find(join::to_local(u16(value)))))
+			{
+				if (phase)
+					burer->StartTeleObjectParticle(held);
+				else
+					burer->StopTeleObjectParticle(held);
+				++g_played;
+				return;
+			}
+		}
+		break;
+	case kGiantDust:
+		if (CPseudoGigant* giant = smart_cast<CPseudoGigant*>(monster))
+		{
+			giant->coop_dust(at, dir);
+			++g_played;
+			return;
+		}
+		break;
+	case kPhantomAppear:
+		if (CPsyDogPhantom* phantom = smart_cast<CPsyDogPhantom*>(monster))
+		{
+			phantom->coop_appear();
+			++g_played;
+			return;
+		}
+		break;
 	default: break;
 	}
 	(void)phase;
 	++g_dropped;
+}
+
+// The kinds sent with a place: vec3 position and vec3 direction after the value.
+bool has_place(u8 kind)
+{
+	return kind == kPolterFlame || kind == kGiantDust;
 }
 
 void client_on_effect(PeerId, Reader& r)
@@ -195,7 +248,7 @@ void client_on_effect(PeerId, Reader& r)
 	const u8 phase = r.u8();
 	const float value = r.f32();
 	Fvector at{}, dir{};
-	if (kind == kPolterFlame)
+	if (has_place(kind))
 	{
 		float v[3] = {};
 		r.vec3(v);
@@ -206,6 +259,12 @@ void client_on_effect(PeerId, Reader& r)
 	if (!r.ok() || !mgr().is_live_client() || !g_pGameLevel || kind >= kKinds)
 	{
 		++g_dropped;
+		return;
+	}
+	if (kind == kActorSeen)
+	{
+		SetActorVisibility(kSeenSource, value);
+		++g_played;
 		return;
 	}
 	CBaseMonster* monster = smart_cast<CBaseMonster*>(Level().Objects.net_Find(id));
@@ -304,6 +363,39 @@ bool flight_over(Throw& t, u32 now)
 	return false;
 }
 
+// Audit F11: twice a second at most, what the NPCs of the last moment make of each remote player.
+void host_seen_frame(bool world_up)
+{
+	const u32 now = Device.dwTimeGlobal;
+	if (now < g_seen_next)
+		return;
+	g_seen_next = now + enemy_rules::kSeenEachMs;
+	float top[kMaxPlayers];
+	{
+		xrCriticalSectionGuard guard(&g_seen_lock);
+		std::copy(std::begin(g_seen_top), std::end(g_seen_top), top);
+		std::fill(std::begin(g_seen_top), std::end(g_seen_top), 0.f);
+	}
+	if (!world_up || !mgr().is_host())
+	{
+		std::fill(std::begin(g_seen_sent), std::end(g_seen_sent), 0.f);
+		return;
+	}
+	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
+	{
+		if (!enemy_rules::seen_worth_sending(g_seen_sent[peer], top[peer]))
+			continue;
+		g_seen_sent[peer] = top[peer];
+		Writer w(12);
+		w.u16(u16(-1));
+		w.u8(kActorSeen);
+		w.u8(0);
+		w.f32(top[peer]);
+		net::host_send(peer, Msg::MonsterEffect, w);
+		++g_sent;
+	}
+}
+
 void host_flights(bool world_up)
 {
 	{
@@ -360,6 +452,7 @@ bool host_held(u16 target)
 void frame(bool world_up)
 {
 	host_flights(world_up);
+	host_seen_frame(world_up);
 	if (g_pending.empty())
 		return;
 	if (!world_up || !mgr().is_live_client())
@@ -409,11 +502,29 @@ bool host_send(const CObject* target, const CObject* monster, u8 kind, u8 phase,
 
 void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir)
 {
+	host_shown_at(monster, kPolterFlame, at, dir);
+}
+
+void host_shown(const CObject* monster, u8 kind, u8 phase, float value)
+{
+	if (!monster || !mgr().is_host())
+		return;
+	Writer w(12);
+	w.u16(monster->ID());
+	w.u8(kind);
+	w.u8(phase);
+	w.f32(value);
+	net::host_broadcast(Msg::MonsterEffect, w);
+	++g_sent;
+}
+
+void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fvector& dir)
+{
 	if (!monster || !mgr().is_host())
 		return;
 	Writer w(36);
 	w.u16(monster->ID());
-	w.u8(kPolterFlame);
+	w.u8(kind);
 	w.u8(0);
 	w.f32(0.f);
 	const float position[3] = {at.x, at.y, at.z}, direction[3] = {dir.x, dir.y, dir.z};
@@ -421,6 +532,18 @@ void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir)
 	w.vec3(direction);
 	net::host_broadcast(Msg::MonsterEffect, w, Lane::Unreliable); // a picture of a moment: no queue for a client that loads
 	++g_sent;
+}
+
+void host_seen(const CCustomMonster* observer, const CObject* player, float value)
+{
+	if (!mgr().is_host() || !npc_ai::is_remote_player(player))
+		return;
+	const CEntityAlive* body = smart_cast<const CEntityAlive*>(player);
+	const PeerId peer = world::avatar_peer(player->ID());
+	if (!body || peer >= kMaxPlayers || !observer->is_relation_enemy(body))
+		return;
+	xrCriticalSectionGuard guard(&g_seen_lock);
+	g_seen_top[peer] = std::max(g_seen_top[peer], value);
 }
 
 void host_throw(CPhysicsShellHolder* object, const CObject* monster, float power)

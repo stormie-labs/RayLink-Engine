@@ -2550,6 +2550,9 @@
     <ClInclude Include="coop\coop_presence.h">
       <Filter>Coop</Filter>
     </ClInclude>
+    <ClInclude Include="coop\coop_lamps.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_survival.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7554,6 +7557,9 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_presence.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_lamps.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_survival.cpp">

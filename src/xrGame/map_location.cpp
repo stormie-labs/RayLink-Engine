@@ -23,6 +23,7 @@
 #include "level_changer.h"
 #include "actor_memory.h"
 #include "visual_memory_manager.h"
+#include "coop/coop_join.h"
 #include "location_manager.h"
 #include "gametask.h"
 #include "gametaskmanager.h"
@@ -346,6 +347,10 @@ bool CMapLocation::Update() //returns actual
 			return m_cached.m_Actuality;
 		}
 	}
+
+	// Anomaly Coop: on a client a task's spot can arrive before the copy of an entity the host has just spawned
+	if (!m_owner_se_object && coop::join::world_is_mirror() && ai().get_alife())
+		m_owner_se_object = ai().alife().objects().object(m_objectID, true);
 
 	CObject* pObject = Level().Objects.net_Find(m_objectID);
 

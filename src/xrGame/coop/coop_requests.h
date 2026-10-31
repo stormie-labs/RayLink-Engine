@@ -81,6 +81,7 @@ enum class Reason : u8
 	FriendlyFire,
 	Engine, // the engine refused the change
 	Queued, // F2 T12b round 2: not an answer - a leased create waits in the host's budget queue (accepted = false)
+	Busy, // parity audit D12: the host is loading a world: nothing happened
 	Count
 };
 const char* reason_name(Reason r);
@@ -150,6 +151,8 @@ int lua_lease_ids(lua_State* L);
 // is not answered yet, or a clone of ours replaces it (round 1, review C1). A clone of it is refused then (nil);
 // coop_mods_guard.script refuses the scope swap before the mod's own creates and tells the player.
 int lua_lease_waiting(lua_State* L);
+// True while item `id` (local numbering) waits for the host: the roster does not call it extra.
+bool client_lease_waiting(u16 id);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
 // set_switch_online/offline; W3a; F2 T12 round 1: set_interactive, the restrictions). A wrapper over the call gate
 // (F2 T12): name is the kCalls name ("alife:kill_entity"), target the object id (0xffff = none; else it must exist in

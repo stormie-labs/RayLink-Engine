@@ -17,6 +17,7 @@
 
 #include "actor.h"
 #include "huditem.h"
+#include "xrCoop/coop_silence_pause.h"
 #include "UIGameCustom.h"
 #include "UI/UIDialogWnd.h"
 #include "../xrEngine/xr_input.h"
@@ -212,7 +213,8 @@ void CLevel::IR_OnKeyboardPress(int key)
         if (Device.editor())	return;
 #endif // INGAME_EDITOR
 
-		if (!g_block_pause && (IsGameTypeSingle() || IsDemoPlay()))
+		// Anomaly Coop (audit H4): the toggle below goes by the device's word, which never turns where the clock cannot stop
+		if (!g_block_pause && (IsGameTypeSingle() || IsDemoPlay()) && coop::pause_key_acts(g_pGamePersistent->CanBePaused()))
 		{
 #ifdef DEBUG
             if(psActorFlags.test(AF_NO_CLIP))

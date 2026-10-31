@@ -5,6 +5,8 @@
 #include "../../../xrEngine/motion.h"
 #include "../Include/xrRender/RenderVisual.h"
 #include "../Include/xrRender/KinematicsAnimated.h"
+#include "../../coop/coop_ai.h" // Anomaly Coop: phantom_target
+#include "../../coop/coop_manager.h" // Anomaly Coop
 
 CPhantom::CPhantom()
 {
@@ -79,18 +81,22 @@ BOOL CPhantom::net_Spawn(CSE_Abstract* DC)
 	// inherited
 	if (!inherited::net_Spawn(DC)) return FALSE;
 
-	m_enemy = Level().CurrentEntity();
-	VERIFY(m_enemy);
+	// Anomaly Coop (audit F10): the nearest player. CurrentEntity sent the host's copy after the host from anywhere: a
+	// phantom spawned by a client's fight flew on to him and stayed a body on the client's screen meanwhile.
+	m_enemy = coop::npc_ai::phantom_target(Position());
 
 	// default init 
 	m_fly_particles = 0;
 	SetfHealth(0.001f);
 
 	// orientate to enemy
-	XFORM().k.sub(m_enemy->Position(), Position()).normalize();
-	XFORM().j.set(0, 1, 0);
-	XFORM().i.crossproduct(XFORM().j, XFORM().k);
-	XFORM().k.getHP(vHP.x, vHP.y);
+	if (m_enemy) // Anomaly Coop: a client's copy may come before its actor
+	{
+		XFORM().k.sub(m_enemy->Position(), Position()).normalize();
+		XFORM().j.set(0, 1, 0);
+		XFORM().i.crossproduct(XFORM().j, XFORM().k);
+		XFORM().k.getHP(vHP.x, vHP.y);
+	}
 
 	// set animation
 	IKinematicsAnimated* K = smart_cast<IKinematicsAnimated*>(Visual());
@@ -120,6 +126,14 @@ void CPhantom::net_Destroy()
 	SStateData& sdata = m_state_data[stFly];
 	sdata.sound.stop();
 	Particles::Details::Destroy(m_fly_particles);
+}
+
+// Anomaly Coop (audit F10): a player's character can go while a phantom flies at it (the player left)
+void CPhantom::net_Relcase(CObject* O)
+{
+	inherited::net_Relcase(O);
+	if (m_enemy == O)
+		m_enemy = NULL; // the next update takes this machine's entity, as the stock does with none
 }
 
 //---------------------------------------------------------------------
@@ -234,7 +248,7 @@ void CPhantom::OnIdleState()
 void CPhantom::OnFlyState()
 {
 	UpdateFlyMedia();
-	if (g_Alive())
+	if (g_Alive() && m_enemy)
 	{
 		Fvector vE, vP;
 		m_enemy->Center(vE);
@@ -260,6 +274,8 @@ void CPhantom::UpdateFlyMedia()
 {
 	if (!m_enemy)
 		m_enemy = Level().CurrentEntity();
+	if (!m_enemy)
+		return; // Anomaly Coop: a client's copy before its actor is here
 
 	UpdatePosition(m_enemy->Position());
 	Fmatrix xform = XFORM_center();
@@ -345,6 +361,9 @@ void CPhantom::UpdatePosition(const Fvector& tgt_pos)
 
 void CPhantom::PsyHit(const CObject* object, float value)
 {
+	if (coop::mgr().is_client())
+		return; // Anomaly Coop (audit F10): the host's copy strikes, and the target gets it as PlayerHit. Not twice.
+
 	NET_Packet P;
 	SHit HS;
 	HS.GenHeader(GE_HIT, object->ID()); //				//	u_EventGen		(P,GE_HIT, object->ID());				

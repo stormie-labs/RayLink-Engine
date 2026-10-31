@@ -466,6 +466,14 @@ inline bool monster_leaves(uint8_t life)
 	return life == kLifeWounded || out_of_fight(life);
 }
 
+// The enemy filter of one creature (CEnemyManager::useful): does it leave this player alone? A monster always leaves a
+// wounded one; a stalker finishes him unless the host switched "stalkers finish a downed player" off
+// (coop_finish_downed 0, on by default: the stock behaviour of a stalker with a wounded enemy).
+inline bool enemy_leaves(uint8_t life, bool stalker, bool finish_downed)
+{
+	return (stalker && finish_downed) ? out_of_fight(life) : monster_leaves(life);
+}
+
 // The respawn a character is owed in his world (fix round 1, M-1 and M-3). The engine keeps it with the character (his
 // custom data), so a save written while he is dead or evacuated carries it to the world loaded from that save (a level
 // change, an autosave restore), and a new game or another save does not have it. Set when the host decides a checkpoint

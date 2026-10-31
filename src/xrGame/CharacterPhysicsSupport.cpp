@@ -38,6 +38,7 @@
 #include "stalker_movement_manager_smart_cover.h"
 
 #include "../build_config_defines.h"
+#include "coop/coop_presence.h"
 
 //const float default_hinge_friction = 5.f;//gray_wolf comment
 #ifdef DEBUG
@@ -522,6 +523,12 @@ void CCharacterPhysicsSupport::KillHit(SHit& H)
 
 const u32 hit_valide_time = 1000;
 
+void CCharacterPhysicsSupport::coop_flinch(const Fvector& dir, const Fvector& bone_pos, u16 bone)
+{
+	if (m_flags.test(fl_use_hit_anims) && Type() == etStalker && !m_flags.test(fl_death_anim_on))
+		m_hit_animations.PlayHitMotion(dir, bone_pos, bone, m_EntityAlife);
+}
+
 void CCharacterPhysicsSupport::in_Hit(SHit& H, bool is_killing)
 {
 	m_sv_hit = H;
@@ -551,6 +558,8 @@ void CCharacterPhysicsSupport::in_Hit(SHit& H, bool is_killing)
 		//&& Type() == etStalker
 	{
 		m_hit_animations.PlayHitMotion(H.direction(), H.bone_space_position(), H.bone(), m_EntityAlife);
+		// Anomaly Coop (audit F7): additive, so not in the mirrored animations: a puppet plays its own
+		coop::presence::on_flinch(&m_EntityAlife, H.direction(), H.bone_space_position(), H.bone());
 	}
 
 	if (!(m_pPhysicsShell && m_pPhysicsShell->isActive()))

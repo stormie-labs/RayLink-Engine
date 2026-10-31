@@ -27,6 +27,7 @@
 #include "../../../../xrEngine/CameraBase.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
 #include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F2)
+#include "../../../coop/coop_presence.h" // Anomaly Coop (audit F7)
 
 void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr user_data, const Fvector& Position,
                                   float power)
@@ -274,6 +275,7 @@ void CBaseMonster::HitSignal(float amount, Fvector& vLocalDir, CObject* who, s16
 	else if ((yaw >= 5 * PI_DIV_4) && (yaw <= 7 * PI_DIV_4)) hit_side = eSideRight;
 
 	anim().FX_Play(hit_side, 1.0f);
+	coop::presence::on_monster_flinch(this, u8(hit_side)); // Anomaly Coop (audit F7)
 
 	HitMemory.add_hit(who, hit_side);
 

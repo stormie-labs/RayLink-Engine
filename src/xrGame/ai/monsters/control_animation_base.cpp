@@ -372,6 +372,7 @@ void CControlAnimationBase::FX_Play(EHitSide side, float amount)
 
 	SAnimItem* anim_it = m_anim_storage[cur_anim_info().get_motion()];
 	VERIFY(anim_it);
+	if (!anim_it) return; // Anomaly Coop (audit F7): a puppet's "current motion" is its idle, not what the host plays
 
 	clamp(amount, 0.f, 1.f);
 

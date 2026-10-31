@@ -1397,6 +1397,16 @@ bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 	if (host_drops_requests_of(from))
 	{
 		++g_h.dropped_joining; // its ids belong to a world that was replaced (load, level change)
+		// D12: an answer, or the client waits out kResultTimeoutMs before it shows the truth again. A joining player
+		// dropped his requests with his world: this answer would only follow him into the new one.
+		if (has_seq && type != Msg::ReqItemEvent && !sync::host_peer_joining(from)) // host_on_item_event answers its own
+		{
+			q.from = from;
+			q.type = type;
+			q.seq = r.u32();
+			if (r.ok())
+				reply(q, Reason::Busy, kNoId);
+		}
 		return false;
 	}
 	q.from = from;
@@ -2921,6 +2931,7 @@ const char* reason_name(Reason r)
 	case Reason::FriendlyFire: return "friendly fire is off";
 	case Reason::Engine: return "engine refused";
 	case Reason::Queued: return "waits for the cost budget";
+	case Reason::Busy: return "the host is loading a world";
 	default: return "?";
 	}
 }
@@ -3023,6 +3034,7 @@ void frame()
 
 void register_console()
 {
+	CMD4(CCC_Integer, "coop_reconcile", &entities::reconcile_switch(), 0, 1); // the roster's digests and repairs (parity audit D1)
 	CMD4(CCC_Integer, "coop_client_hit_perks", &g_coop_client_hit_perks, 0, 1);
 }
 
@@ -3520,6 +3532,8 @@ bool keep_released(CSE_Abstract* entity)
 	g_quarantine.keep(entity, mgr().now_ms(), join::world_generation());
 	return true;
 }
+
+bool client_lease_waiting(u16 id) { return lease_waiting(id); }
 
 int lua_lease_waiting(lua_State* L)
 {

@@ -28,6 +28,7 @@
 #include "memory_manager.h"
 #include "ai/monsters/basemonster/base_monster.h"
 #include "coop/coop_ai.h" // Anomaly Coop
+#include "coop/coop_monster_fx.h" // Anomaly Coop
 
 float g_ai_vision_speed_boost = 1.0f;
 
@@ -812,6 +813,12 @@ void CVisualMemoryManager::update(float time_delta)
 			else
 				SetActorVisibility(m_object->ID(), 0.f);
 		}
+
+		// Anomaly Coop (audit F11): the same for a remote player, whose machine has no vision to ask: the host tells it
+		if (m_object)
+			for (const CNotYetVisibleObject& seen : m_not_yet_visible_objects)
+				coop::monster_fx::host_seen(m_object, seen.m_object,
+				                            clampr(seen.m_value / visibility_threshold(), 0.f, 1.f));
 
 	STOP_PROFILE
 }

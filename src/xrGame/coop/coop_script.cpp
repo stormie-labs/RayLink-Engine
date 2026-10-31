@@ -43,7 +43,8 @@ namespace
 constexpr size_t kMaxName = 64; // event name: printable ASCII, no spaces
 constexpr size_t kMaxPayload = 16 * 1024;
 constexpr size_t kMaxOutbox = 512; // events queued by Lua, sent in frame()
-constexpr size_t kMaxInbox = 512; // events waiting for Lua (P6)
+constexpr size_t kMaxInbox = 4096; // events waiting for Lua (P6): a level's load fills them, 512 lost the oldest
+constexpr size_t kMaxInboxBytes = 4 * 1024 * 1024; // and their payloads (16 KB each at the most)
 constexpr size_t kMaxChat = 64;
 constexpr u32 kDeliverPerFrame = 64;
 constexpr u64 kStaleMs = 120000; // an event older than this is not delivered any more
@@ -89,7 +90,7 @@ struct EngineEvent
 	std::string name; // Callback
 	std::vector<CallbackArg> args; // Callback, at most kMaxCallbackArgs
 };
-constexpr size_t kMaxEngineEvents = 64;
+constexpr size_t kMaxEngineEvents = 1024; // parity audit D10: only a dropped checkpoint is read again by Lua
 // send_script_callback reserves 16 Lua stack slots: traceback, SendScriptCallback, the name, then the arguments.
 static_assert(kMaxCallbackArgs + 3 <= 16, "queue_callback arguments must fit the stack send_script_callback checks");
 
@@ -159,6 +160,9 @@ MenuMemo g_menu;
 Stats g_stats;
 std::deque<Outgoing> g_outbox;
 std::deque<Incoming> g_inbox;
+size_t g_inbox_bytes = 0;
+u64 g_lua_back_ms = 0; // the last frame Lua was not ready (a load)
+u32 g_lost_events = 0; // dropped since Lua was last told (coop_events_lost)
 std::deque<ChatLine> g_chat;
 std::deque<EngineEvent> g_engine;
 Rejection g_reject;
@@ -331,10 +335,13 @@ bool send_script_callback(const char* name, PushArgs push_args)
 
 void deliver_later(PeerId from, std::string&& name, std::string&& payload)
 {
-	if (g_inbox.size() >= kMaxInbox)
+	g_inbox_bytes += name.size() + payload.size();
+	while (!g_inbox.empty() && (g_inbox.size() >= kMaxInbox || g_inbox_bytes > kMaxInboxBytes))
 	{
+		g_inbox_bytes -= g_inbox.front().name.size() + g_inbox.front().payload.size();
 		g_inbox.pop_front();
 		++g_stats.drop_overflow;
+		++g_lost_events;
 		if (log_allowed(g_stats.drop_overflow))
 			::Msg("! [coop] script event queue full, oldest event dropped");
 	}
@@ -484,9 +491,11 @@ void deliver_inbox()
 	{
 		Incoming e = std::move(g_inbox.front());
 		g_inbox.pop_front();
-		if (now - e.t_ms > kStaleMs)
+		g_inbox_bytes -= e.name.size() + e.payload.size();
+		if (limits::event_stale(now, e.t_ms, g_lua_back_ms, kStaleMs))
 		{
 			++g_stats.drop_stale;
+			++g_lost_events;
 			if (log_allowed(g_stats.drop_stale))
 				::Msg("! [coop] script event '%s' from #%u is too old, dropped", e.name.c_str(), e.from);
 			continue;
@@ -536,6 +545,7 @@ void push_engine_event(EngineEvent&& e)
 		const char* what = old.kind == EngineEvent::Callback ? old.name.c_str() :
 			old.kind < EngineEvent::Callback ? kEventNames[old.kind] : "?";
 		++g_stats.engine_dropped;
+		++g_lost_events;
 		if (log_allowed(g_stats.engine_dropped))
 			::Msg("! [coop] engine event queue full (%u): '%s' dropped", u32(kMaxEngineEvents), what);
 		g_engine.pop_front();
@@ -552,9 +562,10 @@ void deliver_engine()
 	{
 		EngineEvent e = std::move(g_engine.front());
 		g_engine.pop_front();
-		if (now - e.t_ms > kStaleMs)
+		if (limits::event_stale(now, e.t_ms, g_lua_back_ms, kStaleMs))
 		{
 			++g_stats.engine_dropped;
+			++g_lost_events;
 			continue;
 		}
 		bool ok = false;
@@ -610,6 +621,21 @@ void deliver_engine()
 		if (ok)
 			++g_stats.engine_delivered;
 	}
+}
+
+// Parity audit D10: what a queue dropped is not sent again. The ones that fell through are told in one number when the
+// queues have run dry, so a script with a resync of its own (coop_tasks) asks for it: coop_events_lost(count).
+void deliver_lost()
+{
+	if (!g_lost_events || !g_inbox.empty() || !g_engine.empty())
+		return;
+	const u32 lost = g_lost_events;
+	g_lost_events = 0;
+	send_script_callback("coop_events_lost", [lost](lua_State* L)
+	{
+		lua_pushnumber(L, lua_Number(lost));
+		return 1;
+	});
 }
 
 // --- the `coop` namespace ---------------------------------------------------------------------
@@ -1666,6 +1692,8 @@ void reset()
 {
 	g_outbox.clear();
 	g_inbox.clear();
+	g_inbox_bytes = 0;
+	g_lost_events = 0;
 	g_chat.clear();
 	g_engine.clear();
 	g_stats = Stats();
@@ -1682,10 +1710,14 @@ void frame()
 	}
 	flush_outbox();
 	if (!lua_ready())
+	{
+		g_lua_back_ms = mgr().now_ms();
 		return;
+	}
 	deliver_chat();
 	deliver_inbox();
 	deliver_engine();
+	deliver_lost();
 }
 
 void on_transition_vote(const char* nick)
@@ -1824,6 +1856,20 @@ void on_session_end(const char* reason)
 	if (!by_user && g_menu.rejected_ms && mgr().now_ms() - g_menu.rejected_ms < kRejectShadowMs)
 		return;
 	menu_error(by_user ? "left" : "lost", reason && *reason ? reason : "the session ended", by_user);
+}
+
+void parity_command(const char* tag)
+{
+	if (!lua_ready())
+	{
+		::Msg("[coop-parity] not in a co-op world");
+		return;
+	}
+	call_module("coop_parity", "command", [tag](lua_State* L)
+	{
+		lua_pushstring(L, tag ? tag : "");
+		return 1;
+	});
 }
 
 void print_status()

@@ -116,5 +116,15 @@ inline bool phantom_dispelled(bool has_author, bool author_is_its_enemy, bool au
 {
 	return !puppet && has_author && (author_is_its_enemy || author_is_player);
 }
+
+// F11: a client's stealth indicator. Vision runs on the host, so the host sends how close the NPCs are to noticing him: the
+// strongest of them, twice a second at most, when it moved or nobody is noticing him any more.
+constexpr uint32_t kSeenEachMs = 500;
+constexpr float kSeenStep = 0.03f;
+
+inline bool seen_worth_sending(float sent, float now)
+{
+	return now == 0.f ? sent != 0.f : std::fabs(now - sent) >= kSeenStep;
+}
 } // namespace enemy_rules
 } // namespace coop

@@ -148,6 +148,8 @@ public:
 
 	void StartGraviPrepare();
 	void StopGraviPrepare();
+	// Anomaly Coop (audit F11): the host's word that a wave gathers on this machine's actor, or no more
+	void coop_gravi_prepare(bool on);
 
 	void StartTeleObjectParticle(CGameObject* pO);
 	void StopTeleObjectParticle(CGameObject* pO);
@@ -170,6 +172,9 @@ public:
 
 private:
 	bool m_force_gravi_attack;
+
+	u16 m_coop_prepare_target = u16(-1); // Anomaly Coop (audit F11): host: the remote player the wave gathers on
+	bool m_coop_prepare_shown = false; // client: it gathers on this machine's actor
 
 	void xr_stdcall StaminaHit();
 

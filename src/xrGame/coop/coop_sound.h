@@ -6,11 +6,14 @@
 //   - CSoundPlayer::play (stalker AI voices, Lua npc:play_sound themes, monster sounds): follows the bone, keeps
 //     the synchro mask so a newer line of the same creature cuts an older one, as on the host;
 //   - CScriptSound play / play_at_pos / play_no_feedback on a creature (Lua sound_object): played once where it
-//     started (3D only, never 2D or looped sounds).
+//     started (3D only, never 2D or looped sounds);
+//   - the abilities that play a ref_sound of their own (audit M2: a burer's wave, telekinesis, a giant's threat and stomp),
+//     from one line at each site: played once where they started.
 // Player characters (the host's actor, client proxies, avatars) are never relayed. On a client, CSoundPlayer::play
 // on a host-driven creature is muted (the host is authoritative for creature sounds, no doubles from local paths
 // such as Die() or Lua relays); avatars keep their own sounds.
-// Wire: Msg::EntitySound, Lane::Unreliable, host -> one client: u8 count, count x NpcSound (xrCoop/coop_protocol.h).
+// Wire: Msg::EntitySound, host -> one client: u8 count, count x NpcSound (xrCoop/coop_protocol.h). Lane::Unreliable, a long
+// line and a creature's last sound Lane::Reliable while a small bucket per client holds (audit M5, xrCoop/coop_relay_rules.h).
 // Limits: per client a token bucket (30/s, burst 40), the sound's max distance (default coop_npc_sound_dist, cap
 // 300 m) from the client's character, one entry per object+file within 150 ms; on a client at most 48 relayed
 // sounds play at once, 4 per creature.
@@ -58,6 +61,9 @@ void on_player_sound(CObject* owner, ref_sound& sound, u16 bone, u32 synchro_mas
 // CScriptSound play paths after the sound started. Host: records a 3D, non-looped sound on a creature.
 // `at` = nullptr: at the object's position.
 void on_script_sound(CObject* owner, ref_sound& sound, const Fvector* at, u32 flags, float delay, float volume);
+// An ability of `owner` played `sound` at `at`, on neither path above. Host: as a script sound. `skip`: a player's character
+// whose own machine plays it (the target of a burer's wave).
+void on_ability_sound(CObject* owner, ref_sound& sound, const Fvector& at, const CObject* skip = nullptr);
 // CStepManager::update: the material pair for the current step. Puppet stalkers and avatars get the ground under
 // their feet from a ray; everything else keeps `engine_pair`.
 SGameMtlPair* step_pair(CEntityAlive* creature, SGameMtlPair* engine_pair);

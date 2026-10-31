@@ -64,7 +64,7 @@ namespace coop
 //     Animation absence uses MotionID::invalidate (0xffff); (slot 0,index 0) is a valid motion.
 // 17 (2026-10-30): EntityVisual 0x012D (host -> all): a host creature took a new visual (GE_CHANGE_VISUAL); the motion ids
 //     of the snapshots belong to the host's model, a puppet that kept the old one played other motions.
-constexpr uint32_t kProtocolVersion = 17;
+constexpr uint32_t kProtocolVersion = 18;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -121,7 +121,7 @@ enum class Msg : uint16_t
 	                       // (u8 1, varu n, n x {u16 item, u16 tag, u8 place<<6|slot}, xrCoop/coop_gear.h)
 	PlayerEquip = 0x0112, // visual, active slot item, torch, NVG, helmet
 	PlayerAnim = 0x0113, // motion ids by partition
-	PlayerShot = 0x0114, // shot event: weapon, origin, direction
+	PlayerShot = 0x0114, // shot event: weapon, origin, direction; what a host creature or machine does: coop_presence.h
 	PlayerGrenade = 0x0115,
 	PlayerHit = 0x0116, // host -> owner: damage dealt to that player's character
 	PlayerWounded = 0x0117, // owner -> host -> all: life state (alive / wounded / dead / spectating), coop_survival
@@ -143,7 +143,7 @@ enum class Msg : uint16_t
 	EntityState = 0x0129, // generic CSE state update (doors, physics, zones)
 	EntityLocal = 0x012A, // non-ALife child entity (fake missile, rocket): spawn/destroy with a fixed id
 	ItemState = 0x012B, // owned item state (ammo, condition, addons, upgrades, uses) and unload ammo spawn (WP9)
-	EntitySound = 0x012C, // host -> one client, unreliable: sounds of NPCs/monsters within its hearing range (W5 C2)
+	EntitySound = 0x012C, // host -> one client: sounds of NPCs/monsters within its hearing range (W5 C2), a long line reliable
 	EntityVisual = 0x012D, // host -> all: EntityVisualMsg, a host creature's new visual (protocol 17)
 
 	// requests (client -> host) and results
@@ -232,8 +232,18 @@ enum class Msg : uint16_t
 
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
-	StateDumpRequest = 0x01B0,
+	StateDumpRequest = 0x01B0, // client -> host: u16 id[, u8 what]: an entity it misses, a repair (coop_reconcile.h Repair)
 	StateDump = 0x01B1,
+
+	// a client catches up by itself (coop_reconcile.h, parity audit 2026-10-31 D1, F1-F3, F5)
+	EntityHash = 0x0130, // host -> clients: the digest of one bucket of the roster of entities, a round every 10 s
+	EntityRoster = 0x0131, // host -> the client that asked: the rows of a bucket
+	EntityResync = 0x0132, // client -> host: u8 bucket: my digest of it differs, send its rows
+	EntityTraits = 0x0133, // host -> the client that asked: an NPC's community, rank and reputation
+	EntitySquad = 0x0134, // host -> the client that asked: a squad's members
+
+	// hanging lamps: the host's word on the lamps that changed (parity audit W2, xrCoop/coop_relay_rules.h)
+	LampState = 0x0138, // host -> clients: varu n, n x {u16 lamp, u8 LampBits}
 };
 
 // Human-readable name for logs and stats ("Hello", "PlayerState", ...).

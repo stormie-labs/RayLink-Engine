@@ -92,7 +92,8 @@ void host_send_balance(PeerId peer);
 // GE_MONEY of the local actor (any thread). Skipped while host commands are applied (entities::client_applying).
 void client_on_actor_money(u32 money);
 // Main thread: sends the queued changes now.
-void client_flush();
+// paced: the frame's flush, within the host's rate limit. false: everything now, before a deal the host checks against it.
+void client_flush(bool paced = false);
 // While alive, decreases of the actor's money are added up here and not sent: the request they belong to carries
 // the sum (F2 T5: an upgrade paid by one request, items::UpgradePurchase). Main thread; scopes nest (the innermost one
 // counts).

@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "MainMenu.h"
 #include "coop/coop_manager.h"
+#include "xrCoop/coop_ui_rules.h" // Anomaly Coop
+#include "UIGameCustom.h" // Anomaly Coop
 #include "UI/UIDialogWnd.h"
 #include "ui/UIMessageBoxEx.h"
 #include "../xrEngine/xr_IOConsole.h"
@@ -239,7 +241,8 @@ void CMainMenu::Activate(bool bActivate)
         else
             Console->Execute("stat_memory");
 
-		Device.seqRender.Add(this, 4); // 1-console 2-cursor 3-tutorial
+		// 1-console 2-cursor 3-tutorial. Anomaly Coop: over a loading screen a group holds (xrCoop/coop_ui_rules.h)
+		Device.seqRender.Add(this, coop::ui_rules::menu_render_priority(load_screen_renderer.IsActive()));
 
 	}
 	else
@@ -285,7 +288,9 @@ void CMainMenu::Activate(bool bActivate)
 			bShowPauseString = m_Flags.test(flRestorePauseStr);
 		}
 
-		if (m_Flags.test(flRestoreCursor))
+		// Anomaly Coop: for a dialog that wants it. A load closes the menu too, and the level it was shown for is gone by then
+		const CUIDialogWnd* top = g_pGameLevel && CurrentGameUI() ? CurrentGameUI()->TopInputReceiver() : nullptr;
+		if (coop::ui_rules::cursor_back_after_menu(!!m_Flags.test(flRestoreCursor), top && top->NeedCursor()))
 			GetUICursor().Show();
 
 		Device.Pause(FALSE, TRUE, TRUE, "mm_deactivate2");

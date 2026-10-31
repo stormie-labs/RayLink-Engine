@@ -174,6 +174,18 @@ void CPsyDog::Think()
 }
 
 
+// Anomaly Coop (audit F11): Think never runs on a puppet, and the aura is a look on this machine's actor
+void CPsyDog::UpdateCL()
+{
+	inherited::UpdateCL();
+	const u32 now = Device.dwTimeGlobal;
+	if (now >= m_coop_aura_next && g_Alive() && coop::remote::is_remote_creature(this))
+	{
+		m_coop_aura_next = now + 250;
+		m_aura->update_schedule();
+	}
+}
+
 void CPsyDog::net_Destroy()
 {
 	m_aura->on_death();
@@ -291,7 +303,8 @@ void CPsyDogPhantom::Think()
 	setVisible(TRUE);
 	setEnabled(TRUE);
 
-	CParticlesPlayer::StartParticles(m_particles_appear, Fvector().set(0.0f, 0.1f, 0.0f), ID());
+	coop_appear();
+	coop::monster_fx::host_shown(this, coop::monster_fx::kPhantomAppear); // Anomaly Coop (audit F11)
 
 	if (EnemyMan.get_enemy() != Actor())
 	{
@@ -300,6 +313,11 @@ void CPsyDogPhantom::Think()
 		return;
 	}
 	appear_fx_on_actor();
+}
+
+void CPsyDogPhantom::coop_appear()
+{
+	CParticlesPlayer::StartParticles(m_particles_appear, Fvector().set(0.0f, 0.1f, 0.0f), ID());
 }
 
 void CPsyDogPhantom::appear_fx_on_actor()

@@ -23,6 +23,8 @@
 #include "coop/coop_manager.h" // Anomaly Coop
 #include "coop/coop_autosave.h" // Anomaly Coop
 #include "coop/coop_game_settings.h" // Anomaly Coop
+#include "UICursor.h" // Anomaly Coop
+#include "xrCoop/coop_ui_rules.h" // Anomaly Coop
 
 #include "../xrphysics/physicscommon.h"
 extern ENGINE_API bool g_dedicated_server;
@@ -136,6 +138,10 @@ void CLevel::net_Stop()
 		CurrentGameUI()->HideShownDialogs();
 		CurrentGameUI()->GetPdaMenu().Reset();
 	}
+	// Anomaly Coop: a PDA or a script's window open at the go dies with the level without closing, and its cursor stayed over
+	// the next level, a free system cursor with it (live 2026-10-31; a group moves whatever a player has open)
+	if (!coop::ui_rules::cursor_outlives_level(MainMenu()->IsActive()))
+		GetUICursor().Hide();
 
 	if (g_tutorial && !g_tutorial->Persistent())
 		g_tutorial->Stop();

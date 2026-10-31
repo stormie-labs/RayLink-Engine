@@ -206,6 +206,20 @@ public:
 	void MGunUpdateFire();
 	virtual void OnShot();
 
+	// Anomaly Coop (audits H2, W8): the host flies and shoots, a client copies what is seen and heard of it (coop_presence.h)
+	void coop_shot(const Fvector& pos, const Fvector& dir, bool bullets);
+	void coop_rocket(const Fvector& pos);
+	void coop_blast();
+	void coop_state(u8 flags, float health);
+	u8 coop_flags();
+
+private:
+	void coop_update_weapons();
+	u32 m_coop_aim_until;
+	bool m_coop_engine_on;
+
+public:
+
 	void UpdateMGunDir();
 	void UpdateWeapons();
 

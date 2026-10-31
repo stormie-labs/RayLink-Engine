@@ -43,6 +43,7 @@ namespace
 constexpr u16 kNoId = 0xffff;
 constexpr u16 kActor = 0; // the local actor on every machine (the join swap keeps it at 0)
 constexpr u32 kPendingTimeoutMs = 15000;
+constexpr u32 kExtendMs = 30000; // D5: a holder change that timed out waits this much more, after asking again
 constexpr u32 kDumpAfterMs = 1000;
 constexpr u32 kLogBurst = 20;
 
@@ -68,6 +69,7 @@ struct ParentTarget
 	bool exact_pos = false; // the drop position was chosen (script teleport), not "at the hand"
 	u64 since = 0;
 	bool dump_asked = false;
+	bool extended = false; // D5: item and holder were asked for again after the first timeout
 };
 xr_map<u16, ParentTarget> g_parent_targets; // item (local id) -> where the host says it is
 
@@ -77,6 +79,7 @@ struct DeathPending
 	u64 since = 0;
 };
 xr_map<u16, DeathPending> g_death_targets;
+xr_set<u16> g_death_asked; // D2: asked for again once each: the answer brings a new EntityDied, the roster does the rest
 
 struct Counters
 {
@@ -87,7 +90,7 @@ struct Counters
 	u64 launches_forwarded = 0, launches_dropped = 0; // W3a: own rockets (ReqLaunch / old drop fallback)
 	u64 echo_dropped = 0; // R4 4: spawns and world-object requests not made from reactions to the host's story
 	// client apply
-	u64 parent_applied = 0, parent_failed = 0, parent_timeouts = 0, deaths_applied = 0, local_spawns = 0,
+	u64 parent_applied = 0, parent_failed = 0, parent_timeouts = 0, deaths_applied = 0, deaths_expired = 0, local_spawns = 0,
 	    local_destroys = 0, local_errors = 0, launches_applied = 0, launches_missed = 0;
 	u64 visuals_applied = 0, visuals_offline = 0; // EntityVisual on a game object / on an offline server entity
 	u64 dropped_before_live = 0; // R2 I2: world messages that came before we were live
@@ -630,8 +633,25 @@ void client_step_parents()
 				net::client_send(Msg::StateDumpRequest, w); // P3: find it first (host resends it)
 				t.dump_asked = true;
 			}
-			if (now - t.since <= kPendingTimeoutMs)
+			if (now - t.since <= (t.extended ? kExtendMs : kPendingTimeoutMs))
 			{
+				++it;
+				continue;
+			}
+			if (!t.extended)
+			{
+				// D5: the item or its holder is not where it should be here. Both are asked for (the answer is a no-op for
+				// what is fine), and the host's word gets another chance before the roster has to find it.
+				t.extended = true;
+				t.since = now;
+				for (const u16 id : {item, t.parent})
+				{
+					if (id == kNoId)
+						continue;
+					Writer w(4);
+					w.u16(join::to_host(id));
+					net::client_send(Msg::StateDumpRequest, w);
+				}
 				++it;
 				continue;
 			}
@@ -677,8 +697,22 @@ void client_step_deaths()
 	const u64 now = mgr().now_ms();
 	for (auto it = g_death_targets.begin(); it != g_death_targets.end();)
 	{
-		if (step_death(it->first, it->second) || now - it->second.since > kPendingTimeoutMs)
+		if (step_death(it->first, it->second))
 			it = g_death_targets.erase(it);
+		else if (now - it->second.since > kPendingTimeoutMs)
+		{
+			// D2: the only word of this death, and its object never came: a living puppet would stand over a corpse. The
+			// host is asked for the creature (the answer tells its death too); the roster sees what is still wrong.
+			++g_c.deaths_expired;
+			if (g_death_asked.insert(it->first).second)
+			{
+				::Msg("! [coop] death of %u came before its object and waited in vain: asked again", join::to_host(it->first));
+				Writer w(4);
+				w.u16(join::to_host(it->first));
+				net::client_send(Msg::StateDumpRequest, w);
+			}
+			it = g_death_targets.erase(it);
+		}
 		else
 			++it;
 	}
@@ -1045,6 +1079,7 @@ void reset()
 	g_visuals.clear();
 	g_parent_targets.clear();
 	g_death_targets.clear();
+	g_death_asked.clear();
 	g_log_count = 0;
 	g_vehicle_note = false;
 }
@@ -1090,9 +1125,9 @@ void print_status()
 	    g_c.moves_blocked, g_c.hits_forwarded, g_c.hits_blocked, g_c.actor_hits_blocked, g_c.ability_hits, g_c.deaths_blocked,
 	    g_c.other_blocked, g_c.level_changes, g_c.saves_blocked, g_c.vehicles_blocked);
 	::Msg("[coop]   events in: parents %llu applied / %llu failed / %llu timed out (%u pending), deaths %llu (%u "
-	      "pending), local %llu spawns / %llu destroys / %llu errors, creature visuals %llu online / %llu offline",
+	      "pending, %llu expired), local %llu spawns / %llu destroys / %llu errors, creature visuals %llu online / %llu offline",
 	    g_c.parent_applied, g_c.parent_failed, g_c.parent_timeouts, (u32)g_parent_targets.size(), g_c.deaths_applied,
-	    (u32)g_death_targets.size(), g_c.local_spawns, g_c.local_destroys, g_c.local_errors, g_c.visuals_applied,
+	    (u32)g_death_targets.size(), g_c.deaths_expired, g_c.local_spawns, g_c.local_destroys, g_c.local_errors, g_c.visuals_applied,
 	    g_c.visuals_offline);
 	::Msg("[coop]   echo dropped: %llu spawns / world-object requests made in reaction to the host's story (R4 4); "
 	      "%llu world messages (parents, deaths, local entities) dropped before live (R2 I2)",
@@ -1149,6 +1184,37 @@ void host_on_death(u16 victim, u16 killer)
 	xrCriticalSectionGuard guard(g_lock);
 	g_deaths.emplace_back(victim, killer);
 }
+
+void host_send_parent(PeerId to, CSE_Abstract* e)
+{
+	if (!e)
+		return;
+	const CSE_ALifeObject* ao = smart_cast<const CSE_ALifeObject*>(e);
+	Writer w(24);
+	w.u16(e->ID);
+	w.u16(e->ID_Parent); // read and ignored: the holder before the change means nothing in a repair
+	w.u16(e->ID_Parent);
+	w.boolean(ao ? ao->m_bOnline : true);
+	put_vec(w, e->o_Position);
+	w.u8(e->ID_Parent == kNoId ? 1 : 0); // free: at this position, not at the hand of the holder it has on the client
+	net::host_send(to, Msg::EntityParent, w);
+}
+
+void host_send_death(PeerId to, CSE_Abstract* e)
+{
+	CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(e);
+	if (!c)
+		return;
+	CEntityAlive* body = smart_cast<CEntityAlive*>(find_go(e->ID));
+	if (body ? !!body->g_Alive() : c->g_Alive())
+		return;
+	Writer w(8);
+	w.u16(e->ID);
+	w.u16(c->get_killer_id());
+	net::host_send(to, Msg::EntityDied, w);
+}
+
+bool client_parent_pending(u16 item) { return g_parent_targets.count(item) != 0; }
 
 void host_on_visual(u16 id)
 {

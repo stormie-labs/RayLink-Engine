@@ -1,6 +1,7 @@
 #include "pch_script.h"
 #include "helicopter.h"
 #include "coop/coop_objects.h"
+#include "coop/coop_presence.h"
 #include "xrserver_objects_alife.h"
 #include "../xrphysics/PhysicsShell.h"
 #include "level.h"
@@ -44,6 +45,8 @@ void CHelicopter::init()
 	m_cur_rot.set(0.0f, 0.0f);
 	m_tgt_rot.set(0.0f, 0.0f);
 	m_bind_rot.set(0.0f, 0.0f);
+	m_coop_aim_until = 0;
+	m_coop_engine_on = false;
 
 	m_allow_fire = FALSE;
 	m_use_rocket_on_attack = TRUE;
@@ -394,10 +397,14 @@ void CHelicopter::UpdateCL()
 {
 	inherited::UpdateCL();
 	CExplosive::UpdateCL();
+	coop::presence::on_heli_state(this, coop_flags(), GetfHealth()); // Anomaly Coop: the host's scripts run the machine
 	if (state() != CHelicopter::eDead && coop::objects::client_drive_pose(this)) // Anomaly Coop: the host flies and shoots
 	{
 		if (PPhysicsShell())
 			PPhysicsShell()->SetTransform(XFORM(), mh_unspecified);
+		if (m_engineSound._feedback()) // audit H2: the rotor flies with it
+			m_engineSound.set_position(XFORM().c);
+		coop_update_weapons();
 		UpdateHeliParticles();
 		smart_cast<IKinematics*>(Visual())->CalculateBones();
 		return;

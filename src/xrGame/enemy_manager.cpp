@@ -79,8 +79,9 @@ bool CEnemyManager::useful(const CEntityAlive* entity_alive) const
 	PROF_EVENT("CEnemyManager::useful");
 	if (!entity_alive->g_Alive())
 		return (false);
-	// Anomaly Coop: a dead player's body is no enemy, and a monster leaves one who is down as well
-	if (m_stalker ? coop::npc_ai::player_out_of_fight(entity_alive) : coop::npc_ai::player_down(entity_alive))
+	// Anomaly Coop: a dead player's body is no enemy, and a monster leaves one who is down as well; a stalker only when the
+	// game rule coop_finish_downed is off
+	if (coop::npc_ai::player_out_for(entity_alive, m_stalker != nullptr))
 		return (false);
 
 	if ((entity_alive->SpatialComponent->spatial.type & STYPE_VISIBLEFORAI) != STYPE_VISIBLEFORAI)

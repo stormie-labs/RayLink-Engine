@@ -4,6 +4,7 @@
 
 #include "gamefont.h"
 #include "fDemoRecord.h"
+#include "IGame_Persistent.h"
 #include "xr_ioconsole.h"
 #include "xr_input.h"
 #include "xr_object.h"
@@ -513,7 +514,7 @@ void CDemoRecord::IR_OnMouseWheel(int direction)
 void CDemoRecord::IR_OnKeyboardPress(int dik)
 {
 	if (isInputBlocked) {
-		if (dik == DIK_PAUSE)
+		if (dik == DIK_PAUSE && g_pGamePersistent->CanBePaused()) // Anomaly Coop (audit H4): as Level_input.cpp's key
 			Device.Pause(!Device.Paused(), TRUE, TRUE, "demo_record");
 		if (dik == DIK_GRAVE)
 			Console->Show();
@@ -578,7 +579,7 @@ void CDemoRecord::IR_OnKeyboardPress(int dik)
 		//#endif // #ifndef MASTER_GOLD
 		//-Alundaio
 
-		if (dik == DIK_PAUSE)
+		if (dik == DIK_PAUSE && g_pGamePersistent->CanBePaused()) // Anomaly Coop (audit H4)
 			Device.Pause(!Device.Paused(), TRUE, TRUE, "demo_record");
 
 		if (Device.imgui_shown()) return;

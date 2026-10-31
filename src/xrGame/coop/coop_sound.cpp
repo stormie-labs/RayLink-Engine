@@ -9,6 +9,7 @@
 #include "coop_sync.h"
 #include "coop_remote.h"
 #include "coop_players.h"
+#include "xrCoop/coop_relay_rules.h"
 
 #include "../xrEngine/XR_IOConsole.h"
 #include "../xrEngine/xr_ioc_cmd.h"
@@ -57,6 +58,8 @@ struct Outgoing
 	NpcSound s;
 	Fvector pos{};
 	float radius = 100.f;
+	bool matters = false; // audit M5: a lost one has no repeat
+	u16 skip = kNoId; // the player's character whose own machine plays this one
 };
 xrCriticalSection g_out_lock; // the hooks may run on the game thread
 xr_vector<Outgoing> g_out;
@@ -74,6 +77,7 @@ struct Bucket
 {
 	float tokens = kBurst;
 	u64 last = 0;
+	relay::Bucket firm; // what goes on the reliable lane
 };
 xr_map<PeerId, Bucket> g_buckets;
 
@@ -129,7 +133,7 @@ xr_map<u16, Ground> g_ground;
 struct Stats
 {
 	// host
-	u64 recorded = 0, deduped = 0, queue_full = 0, sent = 0, packets = 0, too_far = 0, rate_dropped = 0;
+	u64 recorded = 0, deduped = 0, queue_full = 0, sent = 0, packets = 0, too_far = 0, rate_dropped = 0, firm = 0;
 	// client
 	u64 received = 0, played = 0, malformed = 0, no_object = 0, missing_files = 0, cut = 0, muted_local = 0;
 	// footsteps and Lua
@@ -190,7 +194,15 @@ LPCSTR relay_path(const ref_sound& snd)
 	return name && name[0] ? name : nullptr;
 }
 
-void record(CGameObject* go, NpcSound& s, float radius)
+// A long line, a dying creature's last sound: a lost one is not covered by what follows (audit M5).
+bool matters(const ref_sound& snd, CGameObject* go)
+{
+	const CSound_source* src = snd._handle();
+	CEntityAlive* alive = go->cast_entity_alive();
+	return relay::sound_matters(src ? src->length_sec() : 0.f, alive && !alive->g_Alive());
+}
+
+void record(CGameObject* go, NpcSound& s, float radius, bool firm, u16 skip = kNoId)
 {
 	if (!sound_path_valid(s.path))
 		return; // level sounds or odd names: the client could not open them anyway
@@ -213,6 +225,8 @@ void record(CGameObject* go, NpcSound& s, float radius)
 	o.s = std::move(s);
 	o.pos = go->Position();
 	o.radius = radius;
+	o.matters = firm;
+	o.skip = skip;
 	g_out.push_back(std::move(o));
 	++g_st.recorded;
 }
@@ -226,6 +240,7 @@ void host_frame()
 	{
 		PeerId id;
 		Fvector pos;
+		u16 proxy;
 	};
 	xr_vector<Target> targets;
 	if (g_pGameLevel)
@@ -237,7 +252,7 @@ void host_frame()
 			const u16 proxy = join::proxy_of_peer(p.id);
 			CObject* o = proxy != kNoId ? Level().Objects.net_Find(proxy) : nullptr;
 			if (o)
-				targets.push_back({p.id, o->Position()});
+				targets.push_back({p.id, o->Position(), proxy});
 		}
 	}
 	g_have_clients = !targets.empty() && g_npc_sounds;
@@ -254,22 +269,24 @@ void host_frame()
 		Bucket& b = g_buckets[t.id];
 		b.tokens = _min(kBurst, b.tokens + float(now - b.last) * kRatePerSec / 1000.f);
 		b.last = now;
-		Writer body(256);
-		u8 count = 0;
-		auto flush = [&]()
+		Writer bodies[2] = {Writer(256), Writer(64)}; // unreliable, reliable
+		u8 counts[2] = {};
+		auto flush = [&](u32 lane)
 		{
-			if (!count)
+			if (!counts[lane])
 				return;
-			Writer m(body.size() + 1);
-			m.u8(count);
-			m.bytes(body.ptr(), body.size());
-			net::host_send(t.id, Msg::EntitySound, m, Lane::Unreliable);
+			Writer m(bodies[lane].size() + 1);
+			m.u8(counts[lane]);
+			m.bytes(bodies[lane].ptr(), bodies[lane].size());
+			net::host_send(t.id, Msg::EntitySound, m, lane ? Lane::Reliable : Lane::Unreliable);
 			++g_st.packets;
-			body.clear();
-			count = 0;
+			bodies[lane].clear();
+			counts[lane] = 0;
 		};
 		for (const Outgoing& o : out)
 		{
+			if (o.skip == t.proxy)
+				continue;
 			if (o.pos.distance_to(t.pos) > o.radius)
 			{
 				++g_st.too_far;
@@ -281,12 +298,15 @@ void host_frame()
 				continue;
 			}
 			b.tokens -= 1.f;
-			o.s.write(body);
+			const u32 lane = o.matters && b.firm.take(now, relay::kFirmSoundsPerSec, relay::kFirmSoundsBurst) ? 1 : 0;
+			o.s.write(bodies[lane]);
 			++g_st.sent;
-			if (++count >= kMaxPerPacket)
-				flush();
+			g_st.firm += lane;
+			if (++counts[lane] >= kMaxPerPacket)
+				flush(lane);
 		}
-		flush();
+		flush(0);
+		flush(1);
 	}
 }
 
@@ -717,9 +737,9 @@ void register_console()
 void print_status()
 {
 	if (mgr().is_host())
-		::Msg("[coop]   npc sounds out (%s): %llu recorded, %llu deduped, %llu queue full; %llu sent in %llu packets, "
-		      "%llu out of range, %llu over the rate",
-		    g_npc_sounds ? "on" : "off", g_st.recorded, g_st.deduped, g_st.queue_full, g_st.sent, g_st.packets,
+		::Msg("[coop]   npc sounds out (%s): %llu recorded, %llu deduped, %llu queue full; %llu sent (%llu reliable) in %llu "
+		      "packets, %llu out of range, %llu over the rate",
+		    g_npc_sounds ? "on" : "off", g_st.recorded, g_st.deduped, g_st.queue_full, g_st.sent, g_st.firm, g_st.packets,
 		    g_st.too_far, g_st.rate_dropped);
 	else
 		::Msg("[coop]   npc sounds in (%s): %llu received, %llu played, %u playing, %llu cut, %llu no object, %llu "
@@ -769,7 +789,7 @@ void on_player_sound(CObject* owner, ref_sound& snd, u16 bone, u32 synchro_mask,
 	}
 	const u32 now = Device.dwTimeGlobal;
 	s.delay_ms = start_time > now ? u16(_min<u32>(start_time - now, 0xffff)) : u16(0);
-	record(go, s, radius_of(snd));
+	record(go, s, radius_of(snd), matters(snd, go));
 }
 
 void on_script_sound(CObject* owner, ref_sound& snd, const Fvector* at, u32 flags, float delay, float volume)
@@ -803,7 +823,29 @@ void on_script_sound(CObject* owner, ref_sound& snd, const Fvector* at, u32 flag
 		s.volume = u8(iFloor(clampr(volume, 0.f, 2.55f) * 100.f + 0.5f));
 	}
 	s.delay_ms = _valid(delay) && delay > 0.f ? u16(iFloor(_min(delay, 65.f) * 1000.f)) : u16(0);
-	record(go, s, radius_of(snd));
+	record(go, s, radius_of(snd), matters(snd, go));
+}
+
+void on_ability_sound(CObject* owner, ref_sound& snd, const Fvector& at, const CObject* skip)
+{
+	if (!host_recording())
+		return;
+	CGameObject* go = relay_source(owner);
+	LPCSTR path = go ? relay_path(snd) : nullptr;
+	if (!path || !_valid(at))
+		return;
+	Fvector off;
+	off.sub(at, go->Position());
+	if (off.magnitude() > 1000.f)
+		return;
+	NpcSound s;
+	s.object = go->ID();
+	s.path = path;
+	s.flags = NpcSound::Offset;
+	s.offset[0] = off.x;
+	s.offset[1] = off.y;
+	s.offset[2] = off.z;
+	record(go, s, radius_of(snd), matters(snd, go), skip ? skip->ID() : kNoId);
 }
 
 SGameMtlPair* step_pair(CEntityAlive* creature, SGameMtlPair* engine_pair)

@@ -115,7 +115,13 @@ inline Need need_of(Msg type)
 	case Msg::EntitySnapshot: // unreliable lane
 	case Msg::EntityAnim:
 	case Msg::EntityHealth:
-	case Msg::EntitySound: // unreliable lane
+	case Msg::EntitySound: // a moment of sound, on either lane
+	case Msg::LampState: // the host sends its word again when a client is in the world (coop_lamps.cpp)
+	case Msg::EntityHash: // the next round brings it again, and a world that is back is compared then
+	case Msg::EntityRoster: // answers of a bucket that the next round asks for again
+	case Msg::EntityResync:
+	case Msg::EntityTraits:
+	case Msg::EntitySquad:
 	case Msg::EntityState: // samples and rests repeat, destroyed / broken / explosions are stale visuals
 	case Msg::ZoneState: // the host sends the zones again when a client is live (host_on_peer_ready)
 	case Msg::MoneyBalance: // the host sends the balance again when its player is live (host_on_peer_in_world)

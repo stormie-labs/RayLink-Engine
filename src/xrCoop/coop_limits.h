@@ -5,6 +5,7 @@
 // the life states and the chat (a core message, taken by Session::handle_chat) did too, and the story outbox of a client
 // (Outbox) merges relations and keeps them in a lane of their own. Still without a row: the join lifecycle, TimeRequest,
 // the dialog choice, PlayerAnim / PlayerGrenade (no handler) and the blobs (their own limits).
+// Parity audit D11: ReqMoney is a Pacer's message now (coop_money.cpp client_flush).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -36,6 +37,9 @@ constexpr RateRule kClientRateRules[] = {
 	// R2 I4: a client asks for an entity it misses (P3); a modified one could ask for the whole world in a loop, each
 	// answer a full spawn packet. 20 per second after a burst.
 	{Msg::StateDumpRequest, 64, 50},
+	// Parity audit D1: the rows of a bucket whose digest differs twice in a row (coop_reconcile.h), each a few KB. A client
+	// that missed a stretch of the world differs in every bucket: one round in a row, then 4 a second.
+	{Msg::EntityResync, 32, 250},
 	// T12 review (Ruling 18): an honest client votes when it touches a level exit. Protocol 10 (the waiting point of a
 	// level change): ready when he steps into the zone, cancel when he steps out, "still here" every kClaimRefreshMs, and the
 	// client asks again only when the host's board does not show what he did (transition::Intent, paced by Pacer: 2 in a row,
@@ -233,6 +237,14 @@ struct Pace
 inline Pace client_pace(const RateRule& r)
 {
 	return {r.burst / 2 ? r.burst / 2 : 1, r.refill_ms + (r.refill_ms / 4 ? r.refill_ms / 4 : 1)};
+}
+
+// Parity audit D10: a Lua event that waited longer than `max_ms` for Lua is stale, but a client that has no Lua (it loads)
+// is not late: its clock starts when Lua is back. lua_back_ms: the last moment Lua was not ready.
+inline bool event_stale(uint64_t now_ms, uint64_t queued_ms, uint64_t lua_back_ms, uint64_t max_ms)
+{
+	const uint64_t from = queued_ms > lua_back_ms ? queued_ms : lua_back_ms;
+	return now_ms > from && now_ms - from > max_ms;
 }
 
 // A token bucket per message type, as the host's (Session::limit_rate) at client_pace. One per client machine.

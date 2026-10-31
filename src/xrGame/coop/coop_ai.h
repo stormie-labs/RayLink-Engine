@@ -43,6 +43,9 @@ bool player_out_of_fight(const CObject* obj);
 // Live 2026-10-30 (owner): "monsters keep at you after you go down". For a monster a wounded player is out too: it leaves
 // him and turns to whoever is standing (death::monster_leaves; CEnemyManager::useful, CMonsterEnemyManager, the poltergeist).
 bool player_down(const CObject* obj);
+// What CEnemyManager::useful asks: is this player no enemy for a creature of that kind? A monster leaves one who is down (as
+// player_down); a stalker finishes him unless the host switched the game rule coop_finish_downed off (then as a monster).
+bool player_out_for(const CObject* obj, bool stalker);
 
 // Host, main thread, every frame of a driven player proxy (remote::apply): refreshes its light estimate
 // (twice a second) and its view direction.
@@ -79,6 +82,9 @@ void viewers_frame();
 // the character of a player who is in the world and not down (player_down); nullptr when none. Engine code that only knew
 // Actor() (the poltergeist's senses) asks this.
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
+// Audit F10: who a phantom born at `pos` flies at: the nearest player who is on his feet, of all the players, this machine's
+// view of it. A phantom has no snapshot, every machine's copy picks by itself. Stock (no session, nobody): this machine's entity.
+CObject* phantom_target(const Fvector& pos);
 // Audit A6: every such player within `max_dist` of `pos` (this machine's actor first); returns how many were written.
 constexpr u32 kMaxNearPlayers = 8;
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers]);

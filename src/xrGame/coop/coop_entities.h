@@ -24,6 +24,11 @@ void reset();
 void frame();
 void print_status();
 void on_peer_left(PeerId id);
+// The roster (xrCoop/coop_reconcile.h, parity audit D1): after events::frame, so that a digest counts what this frame's
+// flush told the clients. Host: a bucket's digest, the rosters asked for; client: the repairs that wait for their rate.
+void reconcile_frame();
+// Console coop_reconcile: 0 stops digests and repairs (a live session that wants the old behaviour).
+int& reconcile_switch();
 
 // --- host ---
 void host_begin_join(PeerId id); // start queueing reliable world changes for a loading peer

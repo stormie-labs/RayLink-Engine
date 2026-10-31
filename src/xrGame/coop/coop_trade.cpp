@@ -11,6 +11,7 @@
 #include "coop_requests.h"
 #include "coop_script.h"
 #include "coop_money.h"
+#include "coop_items.h"
 #include "xrCoop/coop_talks.h" // R4 2: may_trade_with
 
 #include "Level.h"
@@ -572,6 +573,22 @@ void host_on_deal(PeerId from, Reader& r)
 		++g_host_rejected;
 }
 
+// A view a player may really have open: a box, a dead body, or the trader he holds the talk lock of. A living character's
+// items and an id out of thin air are nobody's business.
+bool may_see_contents(PeerId from, u8 kind, u16 id)
+{
+	CObject* o = find_object(id);
+	if (kind == ContBox)
+		return o && smart_cast<CInventoryBox*>(o) != nullptr;
+	if (kind == ContCorpse)
+	{
+		CInventoryOwner* owner = o ? smart_cast<CInventoryOwner*>(o) : nullptr;
+		return owner && !alive(owner);
+	}
+	return kind == ContTrader &&
+	    (dialog::host_lock_of(from) == id || dialog::host_talked_recently(from, id, u32(talks::kTradeAfterTalkMs)));
+}
+
 void host_on_container(PeerId from, Reader& r)
 {
 	const bool open = r.u8() != 0;
@@ -584,9 +601,13 @@ void host_on_container(PeerId from, Reader& r)
 		g_open.erase(from);
 		return;
 	}
+	const auto was = g_open.find(from);
+	const bool same_view = was != g_open.end() && was->second.kind == kind && was->second.id == id;
 	OpenView& v = g_open[from];
 	v.kind = kind;
 	v.id = id;
+	if (!same_view && !sync::host_peer_joining(from) && may_see_contents(from, kind, id))
+		items::host_send_contents(from, id); // F1: what his copy of it shows may be the spawn values
 	if (kind == ContBox || kind == ContCorpse)
 	{
 		// Host Lua (W5, e.g. loot addons): SendScriptCallback("coop_on_container_opened", peer, id).
@@ -1052,6 +1073,12 @@ bool refresh_actor_menu(CUIActorMenu& menu)
 		menu.SelectInventoryTab(tab); // public: refilters the actor bag and the container/trader lists
 	}
 	return rebuild || labels;
+}
+
+void client_on_item_state(u16 holder)
+{
+	if (g_view.shown && g_view.id == holder)
+		request_rebuild(now_ms() + kRefreshMinMs); // a window's contents come in a burst
 }
 
 void on_container_move(u16 from_id, u16 to_id, u16 item_id)

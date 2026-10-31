@@ -12,6 +12,7 @@
 #include "coop_script.h"
 #include "coop_world.h"
 #include "xrCoop/coop_ledger.h"
+#include "xrCoop/coop_limits.h"
 
 #include <cmath>
 #include <vector>
@@ -184,6 +185,7 @@ ledger::HostBook g_book;
 struct HostCounters
 {
 	u64 changes = 0, malformed = 0, no_character = 0, stale = 0, dropped_joining = 0, bad_receiver = 0;
+	u64 gaps = 0; // parity audit D11: requests that showed seqs never seen here
 	u64 notes_sent = 0; // F2 T6b: answers that carried a refusal, gifts told to the receiver
 	u64 verdicts[kVerdictCount] = {};
 	u64 gain_script = 0, gain_dialog = 0; // RU
@@ -380,6 +382,12 @@ void host_on_req(PeerId from, Reader& r)
 	ledger::Receiver to;
 	if (q.cause == Cause::Transfer)
 		to = receiver_of(PeerId(q.ref));
+	// D11: told first, with an `acked` that still stands before the hole: the client must not take them as answered.
+	if (const u32 skipped = ledger::seq_gap(g_book.acked(from), q.seq))
+	{
+		++g_h.gaps;
+		send_balance(from, balance, ledger::note_gap(g_book.acked(from) + 1, skipped));
+	}
 	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's (F2-1).
 	const bool talking = dialog::host_lock_of(from) != kNoId;
 	const ledger::Decision d =
@@ -438,7 +446,9 @@ struct ClientCounters
 	u64 sent = 0, balances = 0, set_by_host = 0, scoped = 0, gives = 0, malformed = 0;
 	u64 holds = 0, unclaimed = 0; // F2 T5
 	u64 gifts = 0, refusals = 0, refusals_muted = 0; // F2 T6b: notes told to the player (gifts, refusals), and the muted
+	u64 resent = 0; // parity audit D11: changes the host never saw, sent again
 } g_c;
+limits::Pacer g_cl_pacer; // D11: over the host's rate a ReqMoney is lost with no answer
 
 // Under g_cl_lock.
 void queue_change(s64 delta, Cause cause, PeerId ref)
@@ -447,7 +457,7 @@ void queue_change(s64 delta, Cause cause, PeerId ref)
 	const s32 d = s32(delta > lim ? lim : (delta < -lim ? -lim : delta)); // out of range: refused, then corrected
 	const ledger::MoneyReq q{++g_cl_seq, d, cause, ref};
 	g_cl.outbox.push_back(q);
-	g_cl.pending.push_back({q.seq, q.delta});
+	g_cl.pending.push_back({q.seq, q.delta, q.cause, q.ref});
 }
 
 // Under g_cl_lock. F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a
@@ -483,6 +493,16 @@ void client_on_balance(PeerId from, Reader& r)
 		if (log_allowed())
 			::Msg("! [coop] malformed MoneyBalance from the host: is its build of the game different from ours?");
 		return;
+	}
+	if (m.note.kind == ledger::NoteKind::Gap)
+	{
+		xrCriticalSectionGuard guard(g_cl_lock);
+		for (const ledger::Pending& p : ledger::take_skipped(g_cl.pending, m.note.peer, u32(_max(m.note.amount, 0))))
+		{
+			queue_change(p.delta, p.cause, p.ref);
+			++g_c.resent;
+		}
+		return; // its balance and `acked` say nothing new
 	}
 	if (mgr().is_host())
 	{
@@ -762,7 +782,7 @@ void on_session_started()
 void frame()
 {
 	if (mgr().is_live_client() || mgr().is_host()) // F3a T7: the host player's transfers go out too
-		client_flush();
+		client_flush(true);
 }
 
 void on_peer_left(PeerId id) { g_book.peer_left(id); } // the character keeps its allowances
@@ -806,6 +826,7 @@ void print_status()
 		    g_h.verdicts[u32(Verdict::Malformed)] + g_h.malformed,
 		    g_h.bad_receiver, g_h.stale, g_h.no_character, g_h.dropped_joining, g_h.gain_script, g_h.gain_dialog,
 		    g_h.grants, g_h.trades, g_h.capped, g_h.transfers, g_h.joins, g_h.notes_sent);
+		::Msg("[coop]   money: %llu requests showed seqs never seen here (D11, the client sends those again)", g_h.gaps);
 		::Msg("[coop]   money settings: gains %u in a row + %u per minute, dialogs %u in a row + %u per minute, max %u, "
 		      "upgrades from %.2f x cost, upgrades without a mechanic %s, transfers between players %s (at most %llu RU "
 		      "each, %u in a row + %u per minute)",
@@ -935,14 +956,19 @@ void client_on_actor_money(u32 money)
 	queue_change(delta, dialog::client_partner() != kNoId ? Cause::Dialog : Cause::Script, 0);
 }
 
-void client_flush()
+void client_flush(bool paced)
 {
 	if (!mgr().is_live_client() && !mgr().is_host())
 		return;
 	xr_vector<ledger::MoneyReq> out;
 	{
 		xrCriticalSectionGuard guard(g_cl_lock);
-		out.swap(g_cl.outbox);
+		const u64 now = mgr().now_ms();
+		size_t n = paced ? 0 : g_cl.outbox.size();
+		while (paced && n < g_cl.outbox.size() && g_cl_pacer.take(Msg::ReqMoney, now))
+			++n;
+		out.assign(g_cl.outbox.begin(), g_cl.outbox.begin() + n);
+		g_cl.outbox.erase(g_cl.outbox.begin(), g_cl.outbox.begin() + n);
 	}
 	for (const ledger::MoneyReq& q : out)
 	{

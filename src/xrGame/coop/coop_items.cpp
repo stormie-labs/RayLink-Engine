@@ -5,6 +5,7 @@
 #include "coop_join.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
+#include "coop_trade.h"
 
 #include <algorithm>
 #include <mutex>
@@ -136,6 +137,7 @@ struct Stats
 	u64 upgrades_dropped = 0; // R3 В6: unknown / out-of-order / clashing upgrades never reach a loading install
 	u64 dropped_before_live = 0; // R2 I2: client, ItemState that came before we were live
 	u64 upgrades_sold = 0; // F2 T5 fix round 1: host, sold upgrades installed on its copy and sent to the others
+	u64 world_states = 0; // parity audit F1: host, states of world items a client asked for or opened
 };
 Stats g_stats;
 
@@ -581,13 +583,15 @@ void log_diverged(u16 id, const char* section, u32 mask, const ItemData& cur, co
 
 // ---------------------------------------------------------------- capture
 
-void capture_object(CInventoryItem* item, ItemData& d)
+// `upgrades`: false for a digest, which does not read them (the list is copied for every item of a bucket otherwise).
+void capture_object(CInventoryItem* item, ItemData& d, bool upgrades = true)
 {
 	d = ItemData();
 	d.has_cond = true;
 	d.cond = quant(item->GetCondition());
-	d.has_upgrades = true;
-	d.upgrades = item->get_upgrades();
+	d.has_upgrades = upgrades;
+	if (upgrades)
+		d.upgrades = item->get_upgrades();
 
 	if (CWeaponAmmo* box = smart_cast<CWeaponAmmo*>(item))
 	{
@@ -637,7 +641,7 @@ void capture_object(CInventoryItem* item, ItemData& d)
 
 // Fallback when the item has no game object here. The launcher magazine and portions live only
 // in the game object's save data, so they are left out.
-bool capture_entity(CSE_Abstract* e, ItemData& d)
+bool capture_entity(CSE_Abstract* e, ItemData& d, bool upgrades = true)
 {
 	d = ItemData();
 	CSE_ALifeInventoryItem* ii = smart_cast<CSE_ALifeInventoryItem*>(e);
@@ -645,8 +649,9 @@ bool capture_entity(CSE_Abstract* e, ItemData& d)
 		return false;
 	d.has_cond = true;
 	d.cond = quant(ii->m_fCondition);
-	d.has_upgrades = true;
-	d.upgrades = ii->m_upgrades;
+	d.has_upgrades = upgrades;
+	if (upgrades)
+		d.upgrades = ii->m_upgrades;
 	if (CSE_ALifeItemAmmo* a = smart_cast<CSE_ALifeItemAmmo*>(e))
 	{
 		d.has_box = true;
@@ -1011,6 +1016,7 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 		apply_object(item, d, false);
 	apply_entity(e, d, false);
 	++g_stats.applied;
+	trade::client_on_item_state(entity_root(e)); // F1: the bars and prices of an open window
 	return true;
 }
 
@@ -1783,6 +1789,8 @@ void print_status()
 		      "(owners' upgrade lists are never taken, F2 T5)",
 		    (u32)g_owned.size(), stuck, s.relayed, s.pushed, s.enforced, s.boxes_released, s.spawns_ok,
 		    s.spawn_rounds, s.spawns_repeat, s.upgrades_sold);
+		::Msg("[coop]   items host: %llu states of world items sent to a client that differed or opened them (F1)",
+		    s.world_states);
 		::Msg("[coop]   items refused: malformed %llu, no character %llu, missing %llu, section %llu, "
 		      "not owner %llu, moved %llu, insane %llu",
 		    s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4], s.rejected[5],
@@ -1943,6 +1951,44 @@ AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& up
 		why = verdict_name(v);
 		return AddedUpgrade::Refused;
 	}
+}
+
+u32 state_digest(CSE_Abstract* e, bool with_uses)
+{
+	ItemData d;
+	if (CInventoryItem* item = find_item(e->ID))
+		capture_object(item, d, false);
+	else if (!capture_entity(e, d, false))
+		return 0;
+	return itemtags::state_digest(d, with_uses);
+}
+
+void host_send_state(PeerId to, u16 id)
+{
+	CSE_Abstract* e = find_entity(id);
+	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
+		return;
+	CInventoryItem* item = find_item(id);
+	ItemData d;
+	if (item)
+		capture_object(item, d);
+	else if (!capture_entity(e, d))
+		return;
+	Blob blob;
+	write_data(d, blob);
+	Writer w(blob.size() + 48);
+	write_state(w, id, e->s_name.c_str(), 0, blob);
+	net::host_send(to, Msg::ItemState, w);
+	++g_stats.world_states;
+}
+
+void host_send_contents(PeerId to, u16 holder)
+{
+	CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(holder, true) : nullptr;
+	if (!e)
+		return;
+	for (u16 id : e->children)
+		host_send_state(to, id);
 }
 
 void host_upgrade_sold(u16 id, PeerId owner)

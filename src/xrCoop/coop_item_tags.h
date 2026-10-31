@@ -82,5 +82,24 @@ std::uint32_t diverged(const D& cur, const D& owner, SameUpgrades&& same_upgrade
 		m |= Uses;
 	return m;
 }
+
+// Parity audit F1: the digest of the state of an item nobody alive holds, as the host and a client each see it
+// (coop_reconcile.h). Condition in steps of 1/1024: a step apart is a change, a float's last bits are not. The upgrades
+// are the host's and a mechanic's business (they go out with ItemState when sold). `with_uses`: portions live in the
+// game object only, so they count when the item is online at both ends.
+// D is an item state with the fields has_X / X of ItemData (coop_items.cpp).
+template <class D>
+std::uint32_t state_digest(const D& d, bool with_uses)
+{
+	std::uint32_t h = 2166136261u;
+	const auto mix = [&h](std::uint32_t v) { h = (h ^ v) * 16777619u; };
+	mix(d.has_cond ? (std::uint32_t(d.cond) + 32u) >> 6 : 0xFFFFu);
+	mix(d.has_box ? d.box : 0xFFFFu);
+	mix(d.has_addons ? d.addons : 0xFFFFu);
+	mix(d.has_main ? (std::uint32_t(d.main_count) << 8) | d.main_type : 0xFFFFFFFFu);
+	if (with_uses)
+		mix(d.has_uses ? d.uses : 0xFFFFu);
+	return h | 1u; // never 0: a row without a state
+}
 } // namespace itemtags
 } // namespace coop

@@ -69,6 +69,8 @@ void reset();
 void frame();
 // coop_status section: counters, queues, then coop_main.print_status() (domains, emission mirror).
 void print_status();
+// The console command coop_parity [tag]: scripts\coop_parity.script (host: every machine dumps, client: refuses).
+void parity_command(const char* tag);
 // A chat line from another player arrived: shown in the HUD by coop_main.on_chat(nick, text).
 void on_chat(const char* nick, const char* text);
 // Client: the host refused the handshake. Keeps the reason, the host's text and the mod-list diff; a frame

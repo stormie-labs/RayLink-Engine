@@ -137,6 +137,7 @@ public:
 	void ForceTransform(const Fmatrix& m);
 	void set_use_hit_anims(bool v) { m_flags.set(fl_use_hit_anims, (BOOL)v); }
 	bool is_hit_anim_playing() const { return m_hit_animations.is_hit_anim_playing(); }
+	void coop_flinch(const Fvector& dir, const Fvector& bone_pos, u16 bone); // Anomaly Coop (audit F7): the host's hit on a puppet
 	//////////////////base hierarchi methods///////////////////////////////////////////////////
 	void CreateCharacterSafe();
 	void CreateCharacter();

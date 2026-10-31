@@ -6,6 +6,7 @@
 #include "../../../actor_memory.h"
 #include "../../../visual_memory_manager.h"
 #include "../../../level.h"
+#include "../../../coop/coop_remote.h" // Anomaly Coop
 
 CPPEffectorPsyDogAura::CPPEffectorPsyDogAura(const SPPInfo& ppi, u32 time_to_fade)
 	: inherited(ppi)
@@ -65,6 +66,21 @@ void CPsyDogAura::update_schedule()
 	if (!m_object->g_Alive())
 		return;
 
+	// Anomaly Coop (audit F11): a puppet runs this for its machine's actor (CPsyDog::UpdateCL). The one reinit saw may be
+	// gone, or not here yet: a client's monsters can come first.
+	const bool puppet = coop::remote::is_remote_creature(m_object);
+	if (puppet)
+	{
+		CActor* actor = smart_cast<CActor*>(Level().CurrentEntity());
+		if (actor != m_actor)
+		{
+			m_actor = actor;
+			m_effector = 0; // went with its actor's cameras
+		}
+	}
+	if (!m_actor)
+		return;
+
 	m_time_phantom_saw_actor = 0;
 
 	// check memory of actor and check memory of phantoms
@@ -102,6 +118,11 @@ void CPsyDogAura::update_schedule()
 		if (m_time_phantom_saw_actor == time())
 			break;
 	}
+
+	// Anomaly Coop (audit F11): a puppet's phantoms have no AI to ask. A phantom only lives while its dog fights somebody
+	// here, so one that exists counts as having seen this player; close_to_actor still decides.
+	if (puppet && !m_object->m_storage.empty())
+		m_time_phantom_saw_actor = time();
 
 	bool const close_to_actor = m_actor ? m_object->Position().distance_to(m_actor->Position()) < 30 : false;
 	bool const need_be_active = ((m_time_actor_saw_phantom + 2000 > time()) ||

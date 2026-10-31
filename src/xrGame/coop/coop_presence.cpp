@@ -12,7 +12,9 @@
 #include "coop_remote.h"
 #include "coop_world.h"
 #include "coop_ai.h"
+#include "coop_lamps.h"
 #include "xrCoop/coop_nametag.h"
+#include "xrCoop/coop_relay_rules.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -27,6 +29,11 @@
 #include "Weapon.h"
 #include "WeaponAmmo.h"
 #include "WeaponMagazinedWGrenade.h"
+#include "HudItem.h"
+#include "helicopter.h"
+#include "CharacterPhysicsSupport.h"
+#include "ai/monsters/basemonster/base_monster.h"
+#include "ai/monsters/control_animation_base.h"
 #include "ParticlesObject.h"
 #include "GamePersistent.h"
 #include "ui_base.h"
@@ -44,18 +51,27 @@ constexpr u8 kMaxShotsPerEvent = 32;
 constexpr u32 kMaxBulletsPerEvent = 16;
 constexpr float kTagRange = 400.f;
 constexpr float kMuzzleSnap = 3.f; // use the avatar weapon's own fire point when it is this close
-constexpr float kNpcShotRange = 500.f; // host: an NPC's shot goes to the players this close to it
+constexpr u32 kMaxHeardShooters = 512; // host: the last shot of this many shooters is remembered
 
 enum Kind : u8
 {
 	KindShot = 0,
 	KindReload = 1,
 	KindLauncher = 2,
+	// host -> clients only (audits 2026-10-31): the rest of what its creatures and machines do
+	KindNpcSound = 3, // a weapon sound other than the shot: ammo = relay::weapon_sound_index
+	KindFlinch = 4, // a hit's flinch. A stalker: ammo = bone, pos = in the bone's space, dir = the hit's. A monster: ammo = EHitSide
+	KindHeliGun = 5,
+	KindHeliRocket = 6,
+	KindHeliState = 7, // flags = relay::HeliFlags, ammo = relay::heli_health_byte
+	KindHeliBlast = 8,
+	KindCount
 };
 
 enum Flags : u8
 {
 	FlagSilenced = 1,
+	FlagBullets = 2, // host -> client: an NPC's or a helicopter's shot shows its bullets on this client
 };
 
 struct ShotEvent
@@ -68,6 +84,7 @@ struct ShotEvent
 	u8 flags = 0;
 	Fvector pos{};
 	Fvector dir{};
+	Fvector at{}; // host, not on the wire: where in the world, for the range to each client
 
 	void write(Writer& w) const
 	{
@@ -93,7 +110,7 @@ struct ShotEvent
 		float p[3], d[3];
 		r.vec3(p);
 		r.vec3(d);
-		if (!r.ok() || kind > KindLauncher)
+		if (!r.ok() || kind >= KindCount)
 			return false;
 		pos.set(p[0], p[1], p[2]);
 		dir.set(d[0], d[1], d[2]);
@@ -191,8 +208,19 @@ struct Stats
 {
 	u64 shots_out = 0, reloads_out = 0, events_in = 0, shots_in = 0, reloads_in = 0, bullets = 0;
 	u64 no_avatar = 0, no_weapon = 0, sounds_missing = 0;
-	u64 npc_shots_out = 0, npc_shots_far = 0;
+	u64 npc_shots_out = 0, npc_shots_far = 0, npc_bullets_out = 0, firm_out = 0;
+	u64 npc_sounds_out = 0, npc_sounds_in = 0, flinches_out = 0, flinches_in = 0, heli_events_in = 0;
 } g_stat;
+
+// Host: each client's own budget, measured from its character (audit W3), and the last shot of each shooter (audit M5).
+struct ClientBudget
+{
+	relay::ShotBudget shots;
+	relay::Bucket flinches;
+};
+xr_map<PeerId, ClientBudget> g_budgets;
+xr_map<u16, u64> g_last_shot;
+xr_map<u16, relay::HeliReport> g_heli; // under g_lock
 
 bool live() { return mgr().is_host() || mgr().is_live_client(); }
 
@@ -354,11 +382,97 @@ void play(u16 avatar_id, const ShotEvent& e)
 	w->PlaySound(silenced ? "sndSilencerShot" : "sndShot", origin);
 	play_particles(sect, silenced ? "silencer_flame_particles" : "flame_particles", origin, e.dir);
 	play_particles(sect, silenced ? "silencer_smoke_particles" : "smoke_particles", origin, e.dir);
-	if (world::is_player_character(av))
-		fire_bullets(av, w, e, origin); // an NPC's hits come from the host; no local bullets (bullet_on_impact mods)
+	// An NPC's hits come from the host; its bullets here are the picture and the sound of the shot (audit W3, H3: whine, marks).
+	if (world::is_player_character(av) || (e.flags & FlagBullets))
+		fire_bullets(av, w, e, origin);
+}
+
+void play_flinch(CGameObject* go, const ShotEvent& e)
+{
+	CEntityAlive* alive = go->cast_entity_alive();
+	if (!alive || !alive->g_Alive() || !remote::is_remote_creature(go))
+		return;
+	if (CAI_Stalker* stalker = go->cast_stalker())
+	{
+		if (CCharacterPhysicsSupport* body = stalker->character_physics_support())
+			body->coop_flinch(e.dir, e.pos, e.ammo);
+	}
+	else if (CBaseMonster* monster = go->cast_base_monster())
+	{
+		if (e.ammo < eSideCount)
+			monster->anim().FX_Play(EHitSide(e.ammo), 1.f);
+	}
+	++g_stat.flinches_in;
+}
+
+// Client: what the host's creature or machine `id` did.
+void play_event(u16 id, const ShotEvent& e)
+{
+	CGameObject* go = object_here(id);
+	if (!go)
+	{
+		++g_stat.no_avatar;
+		return;
+	}
+	if (e.kind == KindNpcSound)
+	{
+		CHudItem* item = smart_cast<CHudItem*>(object_here(join::to_local(e.weapon)));
+		LPCSTR alias = relay::weapon_sound_alias(e.ammo);
+		if (!item || !alias)
+		{
+			++g_stat.no_weapon;
+			return;
+		}
+		Fvector body = go->Position();
+		body.y += 1.2f;
+		item->PlaySound(alias, body);
+		++g_stat.npc_sounds_in;
+		return;
+	}
+	if (e.kind == KindFlinch)
+	{
+		play_flinch(go, e);
+		return;
+	}
+	CHelicopter* heli = smart_cast<CHelicopter*>(go);
+	if (!heli)
+		return;
+	++g_stat.heli_events_in;
+	if (e.kind == KindHeliGun)
+		heli->coop_shot(e.pos, e.dir, (e.flags & FlagBullets) != 0);
+	else if (e.kind == KindHeliRocket)
+		heli->coop_rocket(e.pos);
+	else if (e.kind == KindHeliState)
+		heli->coop_state(e.flags, relay::heli_health(e.ammo));
+	else if (e.kind == KindHeliBlast)
+		heli->coop_blast();
 }
 
 // ---------------------------------------------------------------- network
+
+// Audit M5: a shot that opens a burst, a reload, a launcher: a lost one has nothing after it to cover the silence.
+bool firm(const ShotEvent& e, u16 shooter)
+{
+	if (e.kind != KindShot && e.kind != KindHeliGun)
+		return true;
+	if (g_last_shot.size() > kMaxHeardShooters)
+		g_last_shot.clear();
+	return relay::opens_burst(mgr().now_ms(), g_last_shot[shooter]);
+}
+
+// Host: to the players in the world. On the reliable lane the broadcast would queue for a client that loads, and a shot
+// is stale by the time it is in.
+void to_players(const Writer& w, Lane lane, PeerId except = kInvalidPeer)
+{
+	if (lane != Lane::Reliable)
+	{
+		net::host_broadcast(Msg::PlayerShot, w, lane, except);
+		return;
+	}
+	for (const PeerInfo& p : mgr().session().peers())
+		if (p.state == PeerState::Joined && p.id != except && !sync::host_peer_joining(p.id))
+			net::host_send(p.id, Msg::PlayerShot, w, lane);
+}
 
 void send(ShotEvent& e)
 {
@@ -367,10 +481,11 @@ void send(ShotEvent& e)
 		return;
 	Writer w(40);
 	e.write(w);
+	const Lane lane = firm(e, e.shooter) ? Lane::Reliable : Lane::Unreliable;
 	if (mgr().is_host())
-		net::host_broadcast(Msg::PlayerShot, w, Lane::Unreliable);
+		to_players(w, lane);
 	else
-		net::client_send(Msg::PlayerShot, w, Lane::Unreliable);
+		net::client_send(Msg::PlayerShot, w, lane);
 }
 
 void on_shot_msg(PeerId from, Reader& r)
@@ -383,12 +498,13 @@ void on_shot_msg(PeerId from, Reader& r)
 	if (mgr().is_host())
 	{
 		avatar = join::proxy_of_peer(from); // never trust the shooter a client claims
-		if (avatar == 0xffff || sync::host_peer_joining(from))
+		if (avatar == 0xffff || sync::host_peer_joining(from) || e.kind > KindLauncher)
 			return;
 		e.shooter = avatar;
+		e.flags &= FlagSilenced;
 		Writer w(40);
 		e.write(w);
-		net::host_broadcast(Msg::PlayerShot, w, Lane::Unreliable, from);
+		to_players(w, firm(e, avatar) ? Lane::Reliable : Lane::Unreliable, from);
 	}
 	else
 	{
@@ -397,28 +513,81 @@ void on_shot_msg(PeerId from, Reader& r)
 		avatar = join::to_local(e.shooter);
 		if (avatar == 0)
 			return; // our own shot echoed back
+		if (e.kind > KindLauncher)
+		{
+			play_event(avatar, e);
+			return;
+		}
 	}
 	play(avatar, e);
 }
 
-// Host: an NPC's shot (shooter = the NPC, host numbering) to every player within kNpcShotRange of the muzzle.
+relay::Vec vec_of(const Fvector& v) { return relay::Vec{v.x, v.y, v.z}; }
+
+// Host: an event of its NPC or machine (shooter, host numbering) to every player it concerns, as each one's distance and
+// budget allow (audits W3, W8, M5): a firefight at a distance is sound and flame, thinned; a fight around him brings its
+// bullets. The bullets take no bandwidth, one flag in the shot, but a client's frame: they stay limited as well.
 void send_npc(const ShotEvent& e)
 {
-	Writer w(40);
-	e.write(w);
+	const u64 now = mgr().now_ms();
+	const bool fire = e.kind == KindShot || e.kind == KindHeliGun;
+	const bool opens = fire && firm(e, e.shooter);
 	for (const PeerInfo& p : mgr().session().peers())
 	{
 		if (p.state != PeerState::Joined || sync::host_peer_joining(p.id))
 			continue;
 		const u16 proxy = join::proxy_of_peer(p.id);
 		CObject* o = proxy != 0xffff ? Level().Objects.net_Find(proxy) : nullptr;
-		if (!o || o->Position().distance_to(e.pos) > kNpcShotRange)
+		if (!o)
+			continue;
+		const Fvector& character = o->Position();
+		const float dist = character.distance_to(e.at);
+		ClientBudget& budget = g_budgets[p.id];
+		ShotEvent out = e;
+		Lane lane = Lane::Unreliable;
+		bool go = dist <= relay::kNpcShotRange;
+		if (fire)
+		{
+			const float line = relay::line_distance(vec_of(e.pos), vec_of(e.dir), relay::kNpcShotRange, vec_of(character));
+			const relay::ShotPlan plan = budget.shots.plan(now, dist, line, _max<u32>(e.count, 1), opens);
+			go = plan.send;
+			if (plan.bullets)
+			{
+				out.flags |= FlagBullets;
+				++g_stat.npc_bullets_out;
+			}
+			if (plan.firm)
+				lane = Lane::Reliable;
+		}
+		else if (e.kind == KindNpcSound)
+			go = dist <= relay::kWeaponSoundRange;
+		else if (e.kind == KindFlinch)
+			go = dist <= relay::kFlinchRange &&
+			    budget.flinches.take(now, relay::kFlinchesPerSec, relay::kFlinchesBurst);
+		else if (e.kind == KindHeliState)
+		{
+			go = true; // state, not a moment: a client farther off has the machine in its world too
+			if (e.flags & relay::HeliDead)
+				lane = Lane::Reliable; // it stops reporting after this one
+		}
+		else
+			lane = Lane::Reliable; // a launcher, a rocket, the blast: one each
+		if (!go)
 		{
 			++g_stat.npc_shots_far;
 			continue;
 		}
-		net::host_send(p.id, Msg::PlayerShot, w, Lane::Unreliable);
-		g_stat.npc_shots_out += e.count;
+		Writer w(40);
+		out.write(w);
+		net::host_send(p.id, Msg::PlayerShot, w, lane);
+		if (lane == Lane::Reliable)
+			++g_stat.firm_out;
+		if (fire)
+			g_stat.npc_shots_out += e.count;
+		else if (e.kind == KindNpcSound)
+			++g_stat.npc_sounds_out;
+		else if (e.kind == KindFlinch)
+			++g_stat.flinches_out;
 	}
 }
 
@@ -662,6 +831,7 @@ void on_weapon_shot(CWeapon* w)
 	e.flags = w->IsSilencerAttached() ? FlagSilenced : 0;
 	e.pos = w->get_LastFP();
 	e.dir = w->get_LastFD();
+	e.at = e.pos;
 	xrCriticalSectionGuard guard(&g_lock);
 	if (!g_pending.empty())
 	{
@@ -675,18 +845,125 @@ void on_weapon_shot(CWeapon* w)
 	g_pending.push_back(e);
 }
 
+namespace
+{
+bool host_records() { return g_pGameLevel && mgr().is_host(); }
+
+// A creature whose doings the clients are told: an NPC or a monster, never a player's character.
+bool host_creature(CGameObject* go)
+{
+	return go && go->ID() != 0 && remote::is_puppet_type(go) && !world::is_player_character(go);
+}
+
+void record(const ShotEvent& e)
+{
+	xrCriticalSectionGuard guard(&g_lock);
+	g_pending.push_back(e);
+}
+
+ShotEvent heli_event(CGameObject* heli, u8 kind, const Fvector& pos, const Fvector& dir)
+{
+	ShotEvent e;
+	e.shooter = e.weapon = heli->ID();
+	e.kind = kind;
+	e.pos = e.at = pos;
+	e.dir = dir;
+	return e;
+}
+} // namespace
+
+void on_item_sound(CGameObject* item, LPCSTR alias, const Fvector& pos)
+{
+	if (!host_records())
+		return;
+	const u8 index = relay::weapon_sound_index(alias);
+	CGameObject* holder = item && index != relay::kNoWeaponSound ? smart_cast<CGameObject*>(item->H_Parent()) : nullptr;
+	if (!host_creature(holder))
+		return;
+	ShotEvent e;
+	e.shooter = holder->ID();
+	e.weapon = item->ID();
+	e.kind = KindNpcSound;
+	e.ammo = index;
+	e.pos = e.at = pos;
+	e.dir.set(0.f, 0.f, 1.f);
+	record(e);
+}
+
+void on_flinch(CGameObject* creature, const Fvector& dir, const Fvector& bone_pos, u16 bone)
+{
+	if (!host_records() || !host_creature(creature) || bone >= 0xff || !_valid(dir) || dir.square_magnitude() < EPS_L ||
+	    !_valid(bone_pos))
+		return;
+	ShotEvent e;
+	e.shooter = e.weapon = creature->ID();
+	e.kind = KindFlinch;
+	e.ammo = u8(bone);
+	e.pos = bone_pos;
+	e.dir = dir;
+	e.at = creature->Position();
+	record(e);
+}
+
+void on_monster_flinch(CGameObject* monster, u8 side)
+{
+	if (!host_records() || !host_creature(monster))
+		return;
+	ShotEvent e;
+	e.shooter = e.weapon = monster->ID();
+	e.kind = KindFlinch;
+	e.ammo = side;
+	e.pos = e.at = monster->Position();
+	e.dir.set(0.f, 0.f, 1.f);
+	record(e);
+}
+
+void on_heli_shot(CGameObject* heli, const Fvector& pos, const Fvector& dir)
+{
+	if (host_records() && _valid(pos) && _valid(dir) && dir.square_magnitude() > EPS_L)
+		record(heli_event(heli, KindHeliGun, pos, dir));
+}
+
+void on_heli_rocket(CGameObject* heli, const Fvector& pos)
+{
+	if (host_records())
+		record(heli_event(heli, KindHeliRocket, pos, Fvector().set(0.f, 0.f, 1.f)));
+}
+
+void on_heli_blast(CGameObject* heli)
+{
+	if (host_records())
+		record(heli_event(heli, KindHeliBlast, heli->Position(), Fvector().set(0.f, 0.f, 1.f)));
+}
+
+void on_heli_state(CGameObject* heli, u8 flags, float health)
+{
+	if (!host_records())
+		return;
+	const u8 byte = relay::heli_health_byte(health);
+	const u64 now = mgr().now_ms();
+	ShotEvent e = heli_event(heli, KindHeliState, heli->Position(), Fvector().set(0.f, 0.f, 1.f));
+	e.flags = flags;
+	e.ammo = byte;
+	xrCriticalSectionGuard guard(&g_lock);
+	if (g_heli[heli->ID()].due(now, flags, byte))
+		g_pending.push_back(e);
+}
+
 void init() { items::set_weapon_fired_handler(&on_weapon_shot); }
 
 void install_server(Session& s)
 {
 	s.on(Msg::PlayerShot, &on_shot_msg);
 	sound::install_server(s); // W5 C2: NPC sounds and avatar steps ride on presence (no own line in coop_sync)
+	lamps::install_server(s);
 }
 
 void install_client(Endpoint& e)
 {
 	e.on(Msg::PlayerShot, &on_shot_msg);
 	sound::install_client(e);
+	lamps::install_client(e);
 }
 
 void register_console()
@@ -702,7 +979,10 @@ void reset()
 	{
 		xrCriticalSectionGuard guard(&g_lock);
 		g_pending.clear();
+		g_heli.clear();
 	}
+	g_budgets.clear();
+	g_last_shot.clear();
 	g_reload_weapon = 0xffff;
 	g_reload_state = 0;
 	g_tags.clear();
@@ -712,6 +992,7 @@ void reset()
 	xr_delete(g_tag_icons);
 	xr_delete(g_cache);
 	sound::reset();
+	lamps::reset();
 }
 
 void frame()
@@ -721,8 +1002,19 @@ void frame()
 	{
 		g_tags.clear();
 		g_sight.clear();
+		if (!world_up())
+		{
+			// what was recorded belongs to the world that is gone
+			lamps::world_down();
+			xrCriticalSectionGuard guard(&g_lock);
+			g_pending.clear();
+			g_heli.clear();
+		}
+		else
+			lamps::frame(); // a client entering: the host's word on the lamps may come before it is live
 		return;
 	}
+	lamps::frame();
 	send_pending();
 	poll_reload();
 	build_tags();
@@ -735,9 +1027,15 @@ void print_status()
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
 	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off", u32(g_tags.size()));
 	if (mgr().is_host())
-		::Msg("[coop]   presence: npc shots out %llu, npc shot events out of range %llu", g_stat.npc_shots_out,
-		    g_stat.npc_shots_far);
+		::Msg("[coop]   presence: npc shots out %llu (%llu with bullets), %llu events out of range or budget, %llu on the "
+		      "reliable lane; weapon sounds %llu, flinches %llu",
+		    g_stat.npc_shots_out, g_stat.npc_bullets_out, g_stat.npc_shots_far, g_stat.firm_out, g_stat.npc_sounds_out,
+		    g_stat.flinches_out);
+	else
+		::Msg("[coop]   presence: npc weapon sounds in %llu, flinches %llu, helicopter events %llu", g_stat.npc_sounds_in,
+		    g_stat.flinches_in, g_stat.heli_events_in);
 	sound::print_status();
+	lamps::print_status();
 }
 
 namespace

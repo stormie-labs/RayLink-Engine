@@ -25,6 +25,8 @@
 #include "../../../../xrCore/_vector3d_ext.h"
 #include "../control_direction_base.h"
 #include "../../script_game_object.h"
+#include "../../../coop/coop_sound.h" // Anomaly Coop (audit M2)
+#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F11)
 
 bool CBurer::can_scan = true;
 
@@ -55,6 +57,8 @@ void CBurer::reinit()
 
 void CBurer::net_Destroy()
 {
+	if (m_coop_prepare_shown)
+		coop_gravi_prepare(false); // Anomaly Coop (audit F11): the host's stop will not come for a burer that left
 	inherited::net_Destroy();
     CTelekinesis::remove_object_callbacks();
 	CTelekinesis::deactivate();
@@ -406,7 +410,12 @@ void CBurer::UpdateGraviObject()
 	{
 		sound_gravi_wave.set_position(snd_pos);
 	}
-	else ::Sound->play_at_pos(sound_gravi_wave, 0, snd_pos);
+	else
+	{
+		::Sound->play_at_pos(sound_gravi_wave, 0, snd_pos);
+		// Anomaly Coop (audit M2): the world hears it; the target's machine flies its own wave (monster_fx::kBurerGravi)
+		coop::sound::on_ability_sound(this, sound_gravi_wave, snd_pos, m_gravi_object.enemy);
+	}
 }
 
 void CBurer::coop_gravi_at_actor()
@@ -436,7 +445,13 @@ void CBurer::StartGraviPrepare()
 	if (!enemy) return;
 
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor*>(enemy));
-	if (!pA) return;
+	if (!pA)
+	{
+		// Anomaly Coop (audit F11): at a remote player the glow gathers on his machine
+		if (coop::monster_fx::host_send(enemy, this, coop::monster_fx::kBurerGraviPrepare, 1, 0.f))
+			m_coop_prepare_target = enemy->ID();
+		return;
+	}
 
 	pA->CParticlesPlayer::StartParticles(particle_gravi_prepare,
 	                                     Fvector().set(0.0f, 0.1f, 0.0f),
@@ -445,9 +460,26 @@ void CBurer::StartGraviPrepare()
 
 void CBurer::StopGraviPrepare()
 {
+	if (m_coop_prepare_target != u16(-1))
+	{
+		coop::monster_fx::host_send(Level().Objects.net_Find(m_coop_prepare_target), this,
+		                            coop::monster_fx::kBurerGraviPrepare, 0, 0.f);
+		m_coop_prepare_target = u16(-1);
+	}
 	CActor* pA = Actor();
 	if (!pA) return;
 	pA->CParticlesPlayer::StopParticles(particle_gravi_prepare, BI_NONE, true);
+}
+
+void CBurer::coop_gravi_prepare(bool on)
+{
+	CActor* pA = Actor();
+	if (!pA) return;
+	m_coop_prepare_shown = on;
+	if (on)
+		pA->CParticlesPlayer::StartParticles(particle_gravi_prepare, Fvector().set(0.0f, 0.1f, 0.0f), pA->ID());
+	else
+		pA->CParticlesPlayer::StopParticles(particle_gravi_prepare, BI_NONE, true);
 }
 
 void CBurer::StartTeleObjectParticle(CGameObject* pO)
@@ -457,6 +489,7 @@ void CBurer::StartTeleObjectParticle(CGameObject* pO)
 	PP->StartParticles(particle_tele_object,
 	                   Fvector().set(0.0f, 0.1f, 0.0f),
 	                   pO->ID());
+	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 1, float(pO->ID())); // Anomaly Coop (audit F11)
 }
 
 void CBurer::StopTeleObjectParticle(CGameObject* pO)
@@ -464,6 +497,7 @@ void CBurer::StopTeleObjectParticle(CGameObject* pO)
 	CParticlesPlayer* PP = smart_cast<CParticlesPlayer*>(pO);
 	if (!PP) return;
 	PP->StopParticles(particle_tele_object, BI_NONE, true);
+	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 0, float(pO->ID())); // Anomaly Coop (audit F11)
 }
 
 void CBurer::Hit(SHit* pHDS)

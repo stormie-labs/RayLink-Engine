@@ -22,6 +22,7 @@
 #include "../../script_game_object.h"
 #include "../../coop/coop_ai.h" // Anomaly Coop: is_remote_player
 #include "../../coop/coop_monster_fx.h" // Anomaly Coop: the kick on a remote player's machine
+#include "../../../coop/coop_sound.h" // Anomaly Coop (audit M2)
 
 // demonized: Flag for damaging NPCs and other objects by the stomp attack
 BOOL pseudogiantCanDamageObjects = 1;
@@ -272,6 +273,7 @@ void CPseudoGigant::on_activate_control(ControlCom::EControlType type)
 	if (type == ControlCom::eControlThreaten)
 	{
 		m_sound_start_threaten.play_at_pos(this, get_head_position(this));
+		coop::sound::on_ability_sound(this, m_sound_start_threaten, get_head_position(this)); // Anomaly Coop (audit M2)
 		m_time_next_threaten = time() + Random.randI(m_threaten_delay_min, m_threaten_delay_max);
 
 		// callback for start animation, will be triggered by everyone in radius
@@ -289,6 +291,11 @@ void CPseudoGigant::on_activate_control(ControlCom::EControlType type)
 			}
 		}
 	}
+}
+
+void CPseudoGigant::coop_dust(const Fvector& at, const Fvector& dir)
+{
+	PlayParticles(m_kick_particles, at, dir);
 }
 
 void CPseudoGigant::on_threaten_execute()
@@ -366,13 +373,15 @@ void CPseudoGigant::on_threaten_execute()
 	pos.set(Position());
 	pos.y += 0.1f;
 	m_sound_threaten_hit.play_at_pos(this, pos);
+	coop::sound::on_ability_sound(this, m_sound_threaten_hit, pos); // Anomaly Coop (audit M2)
 
 	// Interactive Grass FX
 	extern Fvector4 ps_ssfx_grass_interactive;
 	g_pGamePersistent->GrassBendersAddExplosion(ID(), pos, Fvector().set(0, -99, 0), 1.33f, 5.0f, ps_ssfx_grass_interactive.w, 20);
 
 	// играть партиклы
-	PlayParticles(m_kick_particles, pos, Direction());
+	coop_dust(pos, Direction());
+	coop::monster_fx::host_shown_at(this, coop::monster_fx::kGiantDust, pos, Direction()); // Anomaly Coop (audit F11)
 
 	const CEntityAlive* enemy = EnemyMan.get_enemy();
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(enemy));

@@ -247,6 +247,7 @@ void frame()
 		items::frame();
 	entities::frame();
 	events::frame(); // after entities: a spawn goes out before its parent change
+	entities::reconcile_frame(); // after events: a digest counts what this frame told the clients
 	if (up)
 		objects::frame();
 	requests::frame();
@@ -265,6 +266,7 @@ void frame()
 
 void print_status()
 {
+	net::print_status();
 	world::print_status();
 	players::print_status();
 	entities::print_status();

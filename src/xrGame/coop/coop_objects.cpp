@@ -70,6 +70,8 @@ constexpr u32 kScanIntervalMs = 500; // client: make new world bodies kinematic
 constexpr u32 kPushIntervalMs = 100;
 constexpr u32 kCleanupIntervalMs = 2000;
 constexpr u32 kTorridResendMs = 10000;
+constexpr u32 kRestRepeatMs = 10000; // D7: a rest pose is said again this long after it
+constexpr u8 kRestRepeats = 2; // and this many times: a client that met a hole has it within half a minute
 constexpr u32 kExplodeWaitMs = 300; // client: wait this long for the object before the fallback effect
 constexpr u32 kPendingStateTtlMs = 300000;
 constexpr u32 kThrowApplyTimeoutMs = 3000;
@@ -450,6 +452,8 @@ struct HostBody
 {
 	bool moving = false;
 	u64 last_move = 0;
+	u8 rest_repeats = 0; // D7: times its rest pose goes out again
+	u64 rest_again = 0;
 };
 xr_map<u16, HostBody> g_host_bodies; // bodies that moved since the level loaded
 struct HostPose
@@ -1738,6 +1742,18 @@ void host_flush_events()
 	}
 }
 
+void write_rest(Writer& w, CGameObject* go, const xr_vector<Pose>& poses)
+{
+	w.u16(go->ID());
+	w.u32(hash_str(go->cNameSect().c_str()));
+	w.u8(u8(poses.size()));
+	for (const Pose& p : poses)
+	{
+		put_vec(w, p.p);
+		put_quat(w, p.q);
+	}
+}
+
 void host_stream()
 {
 	const u64 now = now_ms();
@@ -1809,21 +1825,32 @@ void host_stream()
 		}
 		else if (it != g_host_bodies.end() && it->second.moving)
 		{
-			it->second.moving = false;
 			if (!capture(sh, poses))
-				continue;
+				continue; // D7: still "moving": the next pass tries again, or the rest would be lost for good
+			it->second.moving = false;
+			it->second.rest_repeats = kRestRepeats;
+			it->second.rest_again = now + kRestRepeatMs;
 			Writer w(16 + poses.size() * 20);
-			w.u16(go->ID());
-			w.u32(hash_str(go->cNameSect().c_str()));
-			w.u8(u8(poses.size()));
-			for (const Pose& p : poses)
-			{
-				put_vec(w, p.p);
-				put_quat(w, p.q);
-			}
+			write_rest(w, go, poses);
 			rests.add(w);
 			++g_c.rests_sent;
 		}
+	}
+	// D7: a Rest is one reliable message, and a client's world may not be up when it comes (the gate drops it there).
+	for (auto& it : g_host_bodies)
+	{
+		HostBody& hb = it.second;
+		if (!hb.rest_repeats || hb.moving || now < hb.rest_again)
+			continue;
+		--hb.rest_repeats;
+		hb.rest_again = now + kRestRepeatMs;
+		CGameObject* go = find_go(it.first);
+		if (!go || classify(go) != ObjKind::Body || !capture(go->cast_physics_shell_holder(), poses))
+			continue;
+		Writer w(16 + poses.size() * 20);
+		write_rest(w, go, poses);
+		rests.add(w);
+		++g_c.rests_sent;
 	}
 	samples.flush();
 	rests.flush();

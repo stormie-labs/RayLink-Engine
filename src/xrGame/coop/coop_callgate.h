@@ -21,6 +21,7 @@
 //                               psy_health, power, satiety, radiation, morale, bleeding, change_health, set_health_ex,
 //                               buy_supplies, destroy_object; round 2: change_psy_health, change_power, change_satiety,
 //                               change_radiation, change_morale
+//   HangingLamp.cpp             hanging_lamp:turn_on, turn_off (audit W2: the host's word comes as LampState, coop_lamps.h)
 // Every other export runs as in single player; its row only documents it until it gets a hook.
 //
 // Host, single player and a client before the host's world (its own world still runs while the host's downloads):

@@ -95,6 +95,13 @@ enum class AddedUpgrade : u8
 	Refused,
 };
 AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why);
+// Parity audit F1 (xrCoop/coop_reconcile.h): the digest of the item `e` as this machine sees it; `with_uses`: its top
+// holder is online, so the portions are in its game object at both ends.
+u32 state_digest(CSE_Abstract* e, bool with_uses);
+// Host: the host's state of world item `id`, or of everything `holder` holds, to one client: a repair, a loot or trade
+// window that opens (the client's copy keeps its spawn values, which GAMMA overwrites on the host right after).
+void host_send_state(PeerId to, u16 id);
+void host_send_contents(PeerId to, u16 holder);
 // Host (F2 T5 fix round 1): the host sold an upgrade of item `id` to player `owner` (ReqItemEvent accepted, the entity
 // holds it). The host's game object of the item takes the entity's list (a loading install: no event, no Lua price) and
 // the other players' copies get the host's state of it. The owner's own ItemState never adds an upgrade on the host.

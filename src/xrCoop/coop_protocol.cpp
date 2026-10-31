@@ -85,6 +85,12 @@ const char* msg_name(Msg type)
 	case Msg::ItemState: return "ItemState";
 	case Msg::EntitySound: return "EntitySound";
 	case Msg::EntityVisual: return "EntityVisual";
+	case Msg::LampState: return "LampState";
+	case Msg::EntityHash: return "EntityHash";
+	case Msg::EntityRoster: return "EntityRoster";
+	case Msg::EntityResync: return "EntityResync";
+	case Msg::EntityTraits: return "EntityTraits";
+	case Msg::EntitySquad: return "EntitySquad";
 	case Msg::PlayerRules: return "PlayerRules";
 
 	case Msg::InfoPortion: return "InfoPortion";
@@ -181,6 +187,11 @@ MsgSender msg_sender(Msg type)
 	case Msg::EntityLocal:
 	case Msg::EntitySound:
 	case Msg::EntityVisual:
+	case Msg::LampState:
+	case Msg::EntityHash:
+	case Msg::EntityRoster:
+	case Msg::EntityTraits:
+	case Msg::EntitySquad:
 	case Msg::ReqResult:
 	case Msg::TimeSync:
 	case Msg::WeatherSync:
@@ -239,6 +250,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::NewCharacter: // F3: hardcore, a dead player asks for a new character
 	case Msg::LevelMove: // F3a: a player asks to leave his level
 	case Msg::LoadReady: // F3a: a player's loading screen is up
+	case Msg::EntityResync: // a client's digest of a bucket differs
 	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
 
 	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender

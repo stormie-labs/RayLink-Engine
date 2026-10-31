@@ -97,6 +97,9 @@ void on_actor_menu_shown(CUIActorMenu& menu, bool shown);
 // container changed elsewhere, a trade answer arrived or a container move was not applied.
 // True: the caller refreshes prices, weights and money labels (UpdateItemsPlace).
 bool refresh_actor_menu(CUIActorMenu& menu);
+// Client: the host's state of a world item came (F1): a window open on `holder` (local numbering, the item's top holder)
+// shows its bars and prices again. Teammates' items change with every shot: the rest is no business of a window.
+void client_on_item_state(u16 holder);
 // move_item_from_to (container windows): the move is checked after a while; not applied -> rebuild.
 void on_container_move(u16 from_id, u16 to_id, u16 item_id);
 // CInventoryBox::net_Destroy, first line, on every machine and in single player (L-1 round 2). The actor menu keeps a

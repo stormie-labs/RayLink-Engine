@@ -104,6 +104,13 @@ void host_drop(PeerId to)
 
 bool host_queue_overflow(PeerId to) { return g_overflow.count(to) != 0; }
 
+void print_status()
+{
+	::Msg("[coop]   join queues: %llu changes queued in all, at most %u per peer", g_queued_total, u32(kMaxQueued));
+	for (const auto& it : g_queues)
+		::Msg("[coop]     #%u loads: %u queued%s", it.first, u32(it.second.size()), g_overflow.count(it.first) ? ", overflowed" : "");
+}
+
 void reset()
 {
 	g_queues.clear();

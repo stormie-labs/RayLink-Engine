@@ -188,6 +188,14 @@ public:
 	void Execute(LPCSTR args) override { sync::dump_state(args); }
 	void Info(TInfo& I) override { xr_strcpy(I, "write a comparable world-state snapshot to the log: coop_dump [object id]"); }
 };
+
+class CCC_CoopParity : public IConsole_Command
+{
+public:
+	CCC_CoopParity(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR args) override { script::parity_command(args); }
+	void Info(TInfo& I) override { xr_strcpy(I, "host: every machine writes its world to logs\\coop_parity_<tag>_<role>.tsv: coop_parity [tag]"); }
+};
 } // namespace
 
 void register_console_commands()
@@ -199,6 +207,7 @@ void register_console_commands()
 	CMD1(CCC_CoopChat, "coop_chat");
 	CMD1(CCC_CoopNetSim, "coop_netsim");
 	CMD1(CCC_CoopDump, "coop_dump");
+	CMD1(CCC_CoopParity, "coop_parity");
 	CMD1(CCC_CoopAcceptTransition, "coop_accept_transition");
 	CMD1(CCC_CoopTransitionConsent, "coop_transition_consent");
 	CMD1(CCC_CoopTransitionCancel, "coop_transition_cancel");

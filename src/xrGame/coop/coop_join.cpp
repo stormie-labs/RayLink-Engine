@@ -24,6 +24,7 @@
 #include "xrCoop/coop_newchar.h"
 #include "xrCoop/coop_nametag.h" // live b29: player names in the stored field
 #include "xrCoop/coop_transition.h" // protocol 10: the waiting point of a level change
+#include "xrCoop/coop_ui_rules.h" // the held screen's input
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/CameraBase.h" // transition: the view of a player put back at the edge
@@ -183,6 +184,7 @@ struct State
 	bool screen_line = false; // the "Waiting for" line is on the loading screen; screen_line_was is the header it covers
 	bool screen_input_off = false; // R1 1: the held screen took the level's input; screen_input_was is what it was before
 	bool screen_input_was = false;
+	u32 screen_input_world = 0; // g_world_generation when screen_input_was was read
 	u64 load_pumped_at = 0; // R1 5, host: the go's saves went to the network (the reload watchdog counts from here)
 	std::string screen_line_was;
 	u32 load_waits_bad = 0; // unreadable LoadWait
@@ -2157,21 +2159,29 @@ void load_screen_line(bool on)
 
 // R1 1: while the screen is held the level takes no input (the stock "press any key" grabs it and pauses; a session never
 // pauses): the actor stands where he arrived. The keys held at that moment are let go (as level.disable_input does), and the
-// flag a script had set is given back after (Esc still opens the main menu: CLevel::IR_OnKeyboardPress).
+// flag a script had set is given back after (Esc still opens the main menu: CLevel::IR_OnKeyboardPress). The screen takes
+// the input on the old level, in the frames after the go: a mod's animation with level.disable_input on was read here and came
+// back in the new world, where nothing clears it any more: Esc was the only key that worked, and every way back from the main
+// menu led to a game that did not answer. The new actor's net_spawn clears the flag under the screen, hence every frame.
 void load_screen_input(bool held)
 {
-	if (held == g.screen_input_off)
-		return;
 	if (held)
 	{
-		g.screen_input_was = g_bDisableAllInput;
-		if (pInput)
-			pInput->DeactivateSoft();
+		if (!g.screen_input_off)
+		{
+			g.screen_input_was = g_bDisableAllInput;
+			g.screen_input_world = g_world_generation;
+			if (pInput)
+				pInput->DeactivateSoft();
+			g.screen_input_off = true;
+		}
 		g_bDisableAllInput = true;
+		return;
 	}
-	else
-		g_bDisableAllInput = g.screen_input_was;
-	g.screen_input_off = held;
+	if (!g.screen_input_off)
+		return;
+	g_bDisableAllInput = ui_rules::input_off_after_hold(g.screen_input_was, g.screen_input_world, g_world_generation);
+	g.screen_input_off = false;
 }
 
 void load_screen_off()

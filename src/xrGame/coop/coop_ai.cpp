@@ -83,6 +83,10 @@ u32 g_lit_next = 0, g_lit_list_ms = 0;
 float g_viewer_range = viewers::kDefaultRange;
 float g_viewer_frame_radius = viewers::kDefaultFrameRadius;
 
+// Game rule coop_finish_downed (host setting, on by default): a stalker goes on shooting a player who is down. Off, he leaves
+// him like a monster does.
+int g_finish_downed = 1;
+
 struct Stats
 {
 	u64 light_estimates = 0, light_used = 0, sun_lit = 0, headlamps = 0, creature_estimates = 0, creature_used = 0;
@@ -155,6 +159,13 @@ bool player_down(const CObject* obj)
 	if (!obj || !mgr().active() || !is_player(obj))
 		return false;
 	return death::monster_leaves(u8(survival::life_of(obj->ID())));
+}
+
+bool player_out_for(const CObject* obj, bool stalker)
+{
+	if (!obj || !mgr().active() || !is_player(obj))
+		return false;
+	return death::enemy_leaves(u8(survival::life_of(obj->ID())), stalker, g_finish_downed != 0);
 }
 
 bool is_player(const CObject* obj)
@@ -398,6 +409,32 @@ u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearP
 	return n;
 }
 
+CObject* phantom_target(const Fvector& pos)
+{
+	if (!mgr().active())
+		return Level().CurrentEntity();
+	CObject* best = nearest_player(pos, flt_max);
+	if (mgr().is_client())
+	{
+		// nearest_player knows only this machine's actor here
+		float best_d = best ? best->Position().distance_to(pos) : flt_max;
+		for (u32 peer = 0; peer < kMaxPlayers; ++peer)
+		{
+			const u16 id = world::avatar_of(peer);
+			CEntityAlive* body = id == 0xffff ? nullptr : smart_cast<CEntityAlive*>(Level().Objects.net_Find(id));
+			if (!body || body == g_actor || body->getDestroy() || !body->g_Alive() || player_down(body))
+				continue;
+			const float d = body->Position().distance_to(pos);
+			if (d < best_d)
+			{
+				best = body;
+				best_d = d;
+			}
+		}
+	}
+	return best ? best : Level().CurrentEntity();
+}
+
 bool player_view_dir(const CEntityAlive* player, Fvector& dir)
 {
 	if (!player)
@@ -504,6 +541,7 @@ void register_console()
 {
 	CMD4(CCC_Float, "coop_viewer_range", &g_viewer_range, 0.f, viewers::kMaxRange); // host setting
 	CMD4(CCC_Float, "coop_viewer_frame_radius", &g_viewer_frame_radius, 0.f, viewers::kMaxFrameRadius); // host setting
+	CMD4(CCC_Integer, "coop_finish_downed", &g_finish_downed, 0, 1); // game rule (coop_game_schema c|coop_finish_downed)
 }
 
 void print_status()

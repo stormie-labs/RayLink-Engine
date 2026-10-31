@@ -6,6 +6,10 @@
 
 namespace coop
 {
+// The Pause key flips the device by its own word (Level_input.cpp). Where the clock cannot stop (a session, G18) that word
+// never turns, so every press would take the sound's pause and none give it back: the key does nothing there (audit H4).
+inline bool pause_key_acts(bool clock_can_stop) { return clock_can_stop; }
+
 struct SilencePause
 {
 	bool waiting = false;

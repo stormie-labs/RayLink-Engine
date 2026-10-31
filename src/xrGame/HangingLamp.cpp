@@ -12,6 +12,8 @@
 #include "game_object_space.h"
 #include "script_callback_ex.h"
 #include "script_game_object.h"
+#include "coop/coop_lamps.h"
+#include "coop/coop_callgate.h"
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
 //////////////////////////////////////////////////////////////////////
@@ -366,8 +368,12 @@ void CHangingLamp::ResetLanim()
 	if (light_ambient)
 		light_ambient->set_color(amb_clr);
 
-	isFlickering = false;
+	const bool was_on = IsOn(); // Anomaly Coop: a flicker's end lights the lamp on every machine by itself
+	isFlickering = true; // not a word of its own
 	TurnOn();
+	isFlickering = false;
+	if (!was_on)
+		coop::lamps::on_changed(this, true);
 }
 
 
@@ -376,6 +382,7 @@ void CHangingLamp::TurnOn()
 	if (!Alive())
 		return;
 
+	const bool was_on = IsOn(); // Anomaly Coop (audit W2)
 	Fvector p = XFORM().c;
 	light_render->set_position(p);
 	light_render->set_active(true);
@@ -436,6 +443,8 @@ void CHangingLamp::TurnOn()
 
 	processing_activate();
 	m_bState = 1;
+	if (!was_on && !isFlickering)
+		coop::lamps::on_changed(this); // Anomaly Coop (audit W2): a flicker is each machine's own
 }
 
 void CHangingLamp::TurnOff()
@@ -457,6 +466,19 @@ void CHangingLamp::TurnOff()
 	}
 	processing_deactivate();
 	m_bState = 0;
+	if (!isFlickering)
+		coop::lamps::on_changed(this); // Anomaly Coop (audit W2)
+}
+
+// Anomaly Coop (audit W2): the host's word (coop_lamps.cpp). A dead lamp stays dead here too: no flicker, no script lights it.
+void CHangingLamp::coop_set(bool on, bool dead)
+{
+	if (dead)
+		fHealth = 0.f;
+	if (on && !dead)
+		TurnOn();
+	else
+		TurnOff();
 }
 
 //void CHangingLamp::Hit(float P,Fvector &dir, CObject* who,s16 element,
@@ -479,7 +501,11 @@ void CHangingLamp::Hit(SHit* pHDS)
 	if (pHDS->boneID == light_bone)fHealth = 0.f;
 	else fHealth -= pHDS->damage() * 100.f;
 
-	if (bWasAlive && (!Alive())) TurnOff();
+	if (bWasAlive && (!Alive()))
+	{
+		TurnOff();
+		coop::lamps::on_changed(this); // Anomaly Coop (audit W2): dead, also when it was off already
+	}
 }
 
 static BONE_P_MAP bone_map = BONE_P_MAP();
@@ -553,6 +579,20 @@ BOOL CHangingLamp::UsedAI_Locations()
 	return (FALSE);
 }
 
+// Anomaly Coop (audit W2): a lamp of the world is the host's: a client's script does not switch its copy, the host's word
+// comes as LampState (coop_lamps.h).
+static void coop_script_turn_on(CHangingLamp* lamp)
+{
+	if (coop::callgate::client_gate("hanging_lamp:turn_on", lamp) != coop::calls::Gate::Refuse)
+		lamp->TurnOn();
+}
+
+static void coop_script_turn_off(CHangingLamp* lamp)
+{
+	if (coop::callgate::client_gate("hanging_lamp:turn_off", lamp) != coop::calls::Gate::Refuse)
+		lamp->TurnOff();
+}
+
 #pragma optimize("s",on)
 void CHangingLamp::script_register(lua_State* L)
 {
@@ -560,8 +600,8 @@ void CHangingLamp::script_register(lua_State* L)
 	[
 		::luabind::class_<CHangingLamp, CGameObject>("hanging_lamp")
 		.def(::luabind::constructor<>())
-		.def("turn_on", &CHangingLamp::TurnOn)
-		.def("turn_off", &CHangingLamp::TurnOff)
+		.def("turn_on", &coop_script_turn_on)
+		.def("turn_off", &coop_script_turn_off)
 		.def("set_color_animator", &CHangingLamp::SetLanim)
 		.def("reset_color_animator", &CHangingLamp::ResetLanim)
 		.def("is_on", &CHangingLamp::IsOn)

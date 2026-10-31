@@ -5,11 +5,13 @@
 // the slow-down, the damage: each machine hurts its own actor).
 //
 // Wire: MonsterEffect (host -> the targeted player) u16 monster (host numbering), u8 kind, u8 phase, f32 value. A flame
-// (kPolterFlame) goes to every client, with its vec3 position and vec3 direction after the value.
+// (kPolterFlame) goes to every client, with its vec3 position and vec3 direction after the value; so does what anybody near
+// can see of a monster (audit F11: kBurerTeleGlow, kGiantDust, kPhantomAppear; dust has a place too).
 #pragma once
 
 class CObject;
 class CBaseMonster;
+class CCustomMonster;
 class CPhysicsShellHolder;
 
 namespace coop
@@ -31,7 +33,12 @@ enum Kind : u8
 	kPsyDogAppear = 8, // a psy dog's phantom leaps out at the player: camera and post-process shake
 	kMeleeHit = 9, // a monster's blow landed (its damage comes as PlayerHit): value = its damage. Claw marks, stagger, shove
 	kPolterFlame = 10, // a fire poltergeist lit a flame (audit F5c): its particles and sound on every client
-	kKinds = 16,
+	kBurerGraviPrepare = 11, // a burer gathers a wave on the player (audit F11): phase 1 starts the glow on his actor, 0 stops it
+	kBurerTeleGlow = 12, // a burer holds an object (audit F11): phase 1 lights it, 0 puts it out, value = its id (host numbering)
+	kGiantDust = 13, // a pseudogiant's stomp raises dust (audit F11)
+	kPhantomAppear = 14, // a psy dog's phantom shows itself (audit F11): its particles
+	kActorSeen = 15, // how close NPCs are to noticing the player (audit F11): value 0..1, for his stealth indicator; no monster
+	kKinds = 32,
 };
 
 // Host: `kind` hits `target`. A remote player's character: sent to his machine, true. Anything else (this machine's actor,
@@ -39,6 +46,13 @@ enum Kind : u8
 bool host_send(const CObject* target, const CObject* monster, u8 kind, u8 phase, float value);
 // Host: `monster`, a fire poltergeist, lit a flame at `at`, burning along `dir`: every client plays it on the puppet.
 void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir);
+// Audit F11: host: what everybody near sees of `monster`, whoever it is after: every client plays `kind` on the puppet. A
+// start and its stop must both arrive, so this one is reliable; _at is a picture of a moment with a place, as a flame.
+void host_shown(const CObject* monster, u8 kind, u8 phase = 0, float value = 0.f);
+void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fvector& dir);
+// Audit F11: host, from an NPC's vision: `observer` has `value` (0..1) of what it takes to notice `player`. The strongest
+// of these goes to a remote player's machine, for his stealth indicator.
+void host_seen(const CCustomMonster* observer, const CObject* player, float value);
 
 // Audit F4 (2026-10-31): host: `monster` threw `object` with telekinesis. A player's proxy takes no collision damage (a
 // puppet skips the movement update that applies it), so its flight is followed and a remote player it passes gets the

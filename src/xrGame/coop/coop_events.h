@@ -54,6 +54,11 @@ bool client_refuse_vehicle(CGameObject* holder);
 void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent);
 void host_on_death(u16 victim, u16 killer);
 void host_on_destroy(const CSE_Abstract* entity);
+// The roster's repairs (xrCoop/coop_reconcile.h): the host's word on an entity, to one client. EntityDied only if it is dead.
+void host_send_parent(PeerId to, CSE_Abstract* e);
+void host_send_death(PeerId to, CSE_Abstract* e);
+// Client: the host's holder of `item` (local numbering) is being applied here.
+bool client_parent_pending(u16 item);
 // GE_CHANGE_VISUAL reached the server entity `id`: a creature's new model goes to the clients (EntityVisual).
 void host_on_visual(u16 id);
 // A ReqSpawn produced an entity ALife does not register (child of an item: fake missile,

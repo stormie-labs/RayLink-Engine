@@ -17,6 +17,7 @@
 #include "UIGameCustom.h"
 #include "CustomOutfit.h"
 #include "ActorHelmet.h"
+#include "coop/coop_players.h" // Anomaly Coop
 
 static const float TORCH_INERTION_CLAMP = PI_DIV_6;
 static const float TORCH_INERTION_SPEED_MAX = 7.5f;
@@ -149,6 +150,8 @@ void CTorch::Switch(bool light_on)
 		}
 	}
 
+	if (light_on != m_switched_on)
+		coop::players::on_torch_switch(*this, light_on); // Anomaly Coop: diagnostics
 	m_switched_on = light_on;
 	lightRenderState = light_on;
 	if (can_use_dynamic_lights())

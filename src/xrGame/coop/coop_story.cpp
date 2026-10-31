@@ -3,8 +3,10 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_alife.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_limits.h" // F2 T14 fix 1: limits::Pacer
+#include "xrCoop/coop_task_target.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -23,6 +25,8 @@
 #include "alife_registry_container.h"
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
+#include "alife_graph_registry.h"
+#include "game_graph.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "UIGameCustom.h"
 #include "ai_space.h"
@@ -45,9 +49,12 @@ constexpr u64 kHashIntervalMs = 10000;
 constexpr u64 kTaskScanIntervalMs = 200;
 constexpr u64 kReconcileIntervalMs = 200;
 constexpr u64 kProgressIntervalMs = 1000;
+constexpr u64 kProgressRefreshMs = 30000; // parity audit D9: rank and reputation are in no StoryHash domain
 constexpr u64 kRequestRetryMs = 3000;
 constexpr u64 kMapRetryMs = 5000;
 constexpr u64 kSpotPendingMs = 5000;
+constexpr u64 kTargetScanIntervalMs = 500;
+constexpr u32 kTargetsPerMessage = 256;
 constexpr size_t kMaxDeferred = 4096;
 
 // Story domains (StoryHash order, StoryResync mask).
@@ -72,6 +79,7 @@ enum : u8
 	TaskUpsert = 1, // host -> client: {task record}
 	TaskReqGive = 2, // client -> host: {str id, u16 giver, u32 time_to_complete, u32 timer_ttl, task record}
 	TaskReqState = 3, // client -> host: {str id, u64 receive_time, u8 state, u8 explicit}
+	TaskTargets = 4, // host -> client: {u16 n, n * {u16 id, vec3 pos, u32 level vertex, u16 game vertex}}
 
 	SpotAdd = 1, // both directions: {str type, u16 id, str hint, u8 serializable, u32 author}
 	SpotRemove = 2, // both: {str type, u16 id}
@@ -567,6 +575,143 @@ void host_scan_tasks()
 	}
 }
 
+// --- where the targets are (tasks audit C1) ---
+// A client's ALife does not run and offline entities are mirrored only when they spawn or switch. CMapLocation and the coop
+// compass read the client's copy of a target that is offline there, so the host keeps that copy where the target is.
+struct TargetPlace
+{
+	u16 id = kNoId; // host numbering
+	float pos[3] = {0, 0, 0};
+	u32 node = 0;
+	u16 game_vertex = 0xffff;
+};
+
+struct SentTarget
+{
+	task_target::Place place;
+	u64 at = 0;
+};
+xr_map<u16, SentTarget> g_target_sent; // host: last place sent per target
+u64 g_target_last_scan = 0;
+
+bool target_place(u16 local_id, TargetPlace& out)
+{
+	const CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(local_id, true) : nullptr;
+	if (!e)
+		return false;
+	const Fvector p = e->draw_level_position(); // a monster's offline path too, as the host's own map draws it
+	out.id = host_id_of(local_id);
+	out.pos[0] = p.x;
+	out.pos[1] = p.y;
+	out.pos[2] = p.z;
+	out.node = e->m_tNodeID;
+	out.game_vertex = e->m_tGraphID;
+	return true;
+}
+
+void write_targets(Writer& w, const TargetPlace* list, u32 n)
+{
+	w.u8(TaskTargets);
+	w.u16(u16(n));
+	for (u32 i = 0; i < n; ++i)
+	{
+		w.u16(list[i].id);
+		w.vec3(list[i].pos);
+		w.u32(list[i].node);
+		w.u16(list[i].game_vertex);
+	}
+}
+
+template <typename Send>
+void send_targets(const xr_vector<TargetPlace>& list, Send send)
+{
+	for (u32 at = 0; at < list.size(); at += kTargetsPerMessage)
+	{
+		Writer w(256);
+		write_targets(w, list.data() + at, _min<u32>(kTargetsPerMessage, u32(list.size()) - at));
+		send(w);
+		++g_stats.tasks_out;
+	}
+}
+
+// The targets of the running tasks (with a spot): all of them for a resync, else those that moved.
+xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next)
+{
+	xr_vector<TargetPlace> out;
+	const u64 now = mgr().now_ms();
+	xr_set<u16> seen;
+	for (const SGameTaskKey& k : tasks().GetGameTasks())
+	{
+		const CGameTask* t = k.game_task;
+		if (!t || is_local_task(k.task_id) || t->GetTaskState() != eTaskStateInProgress || !t->m_map_location.size() ||
+			t->m_map_object_id == kNoId || !seen.insert(t->m_map_object_id).second)
+			continue;
+		TargetPlace p;
+		if (!target_place(t->m_map_object_id, p))
+			continue;
+		task_target::Place place;
+		place.x = p.pos[0];
+		place.y = p.pos[1];
+		place.z = p.pos[2];
+		place.game_vertex = p.game_vertex;
+		const auto it = g_target_sent.find(p.id);
+		const SentTarget sent = it != g_target_sent.end() ? it->second : SentTarget();
+		if (all || task_target::due(sent.place, sent.at, place, now))
+		{
+			out.push_back(p);
+			if (next)
+				(*next)[p.id] = SentTarget{place, now};
+		}
+		else if (next)
+			(*next)[p.id] = sent;
+	}
+	return out;
+}
+
+void host_scan_targets()
+{
+	g_target_last_scan = mgr().now_ms();
+	if (!in_game())
+		return;
+	xr_map<u16, SentTarget> next;
+	const xr_vector<TargetPlace> moved = collect_targets(false, &next);
+	g_target_sent.swap(next); // a target nothing points at any more is forgotten
+	send_targets(moved, [](Writer& w) { net::host_broadcast(Msg::TaskUpdate, w); });
+}
+
+void send_targets_to(PeerId to)
+{
+	if (in_game())
+		send_targets(collect_targets(true, nullptr), [to](Writer& w) { net::host_send(to, Msg::TaskUpdate, w); });
+}
+
+void client_on_task_targets(Reader& r)
+{
+	const u16 n = r.u16();
+	for (u16 i = 0; i < n; ++i)
+	{
+		const u16 id = r.u16();
+		float p[3];
+		r.vec3(p);
+		const u32 node = r.u32();
+		const u16 game_vertex = r.u16();
+		if (!r.ok())
+			return;
+		if (!ai().get_alife())
+			continue;
+		CSE_ALifeDynamicObject* e = ai().alife().objects().object(local_id_of(id), true);
+		if (!e || e->m_bOnline)
+			continue; // online here: the spot follows the object itself
+		// as coop_entities place(): only what lives in the graph registry moves between its vertices
+		if (e->ID_Parent == kNoId && e->used_ai_locations() && e->m_tGraphID != game_vertex &&
+			ai().game_graph().valid_vertex_id(game_vertex) && ai().game_graph().valid_vertex_id(e->m_tGraphID))
+			alife_rw().graph().change(e, e->m_tGraphID, game_vertex);
+		e->o_Position.set(p[0], p[1], p[2]);
+		e->m_tNodeID = node;
+		e->m_tGraphID = game_vertex;
+	}
+}
+
 void send_task_to(PeerId to, const CGameTask* t)
 {
 	TaskRec r;
@@ -865,11 +1010,16 @@ void apply_record(TaskRec& rec, bool fresh)
 		t->m_map_object_id = obj;
 		if (rec.state == eTaskStateInProgress)
 		{
+			const shared_str active = g_active_task_id;
 			if (!m.GiveGameTaskToActor(t, 0, false, 0))
 			{
 				::Msg("! [coop] story: cannot add task '%s' from the host", cs(rec.id));
 				return;
 			}
+			// The engine makes every new task the active one. The active task is each player's own: another player's
+			// task leaves it alone (a task of his own that came through coop_tasks is made active there).
+			if (!own && rec.origin != mgr().self() && active.size() && m.HasGameTask(active, true))
+				g_active_task_id = active;
 		}
 		else
 		{
@@ -1895,6 +2045,7 @@ struct Progress
 	}
 };
 Progress g_own_sent; // last own progress sent
+u64 g_progress_refreshed = 0;
 u64 g_last_progress = 0;
 xr_map<PeerId, Progress> g_reported; // host: last values reported by each client
 
@@ -1959,8 +2110,9 @@ void progress_frame()
 		return;
 	g_last_progress = now;
 	const Progress mine = own_progress();
-	if (mine.valid && mine != g_own_sent)
+	if (mine.valid && (mine != g_own_sent || now - g_progress_refreshed >= kProgressRefreshMs))
 	{
+		g_progress_refreshed = now;
 		Writer w(16);
 		write_progress(w, host_id_of(0), mine);
 		send_out(Msg::Progress, w);
@@ -2023,7 +2175,10 @@ void host_send_full(PeerId to, u8 mask)
 	if (mask & DomInfos)
 		send_info_list(to);
 	if (mask & DomTasks)
+	{
 		send_task_list(to);
+		send_targets_to(to);
+	}
 	if (mask & DomRelations)
 		send_relation_list(to);
 	if (mask & DomSpots)
@@ -2271,9 +2426,14 @@ void handle_client(Msg type, Reader& r)
 	}
 	case Msg::TaskList: client_on_task_list(r); break;
 	case Msg::TaskUpdate:
-		if (r.u8() == TaskUpsert)
+	{
+		const u8 op = r.u8();
+		if (op == TaskUpsert)
 			client_on_task_upsert(r);
+		else if (op == TaskTargets)
+			client_on_task_targets(r);
 		break;
+	}
 	case Msg::MapSpot:
 	{
 		const u8 op = r.u8();
@@ -2497,6 +2657,8 @@ void reset()
 	g_host_level = nullptr;
 	g_host_epoch = 0;
 	g_host_last_scan = 0;
+	g_target_sent.clear();
+	g_target_last_scan = 0;
 	g_finisher.clear();
 	g_client_recs.clear();
 	g_known.clear();
@@ -2543,6 +2705,8 @@ void frame()
 		host_flush_rep_deltas();
 		if (mgr().now_ms() - g_host_last_scan >= kTaskScanIntervalMs)
 			host_scan_tasks();
+		if (mgr().now_ms() - g_target_last_scan >= kTargetScanIntervalMs)
+			host_scan_targets();
 		progress_frame();
 		host_hash_frame();
 		return;

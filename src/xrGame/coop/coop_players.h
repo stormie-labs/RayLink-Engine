@@ -7,6 +7,8 @@
 struct SInvItemPlace;
 class CSE_Abstract;
 
+class CTorch;
+
 namespace coop
 {
 namespace players
@@ -68,5 +70,7 @@ bool avatar_safemode(u16 avatar_id, bool& lowered);
 // coop_equip.cpp: the player's head torch is on, as last reported in PlayerEquip. The torch items of an avatar stay dark
 // (coop_equip draws the head torch itself): the AI's light estimate of a player's character reads this.
 bool avatar_headlamp(u16 avatar_id);
+// coop_equip.cpp: a torch of a player goes on or off on this machine (CTorch::Switch): one line in the log, no effect.
+void on_torch_switch(const CTorch& torch, bool on);
 } // namespace players
 } // namespace coop

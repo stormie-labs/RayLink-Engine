@@ -13,6 +13,10 @@
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
 #include "xrCoop/coop_enemy_rules.h"
+#include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_reconcile.h"
+#include "coop_events.h"
+#include "coop_items.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -99,6 +103,16 @@ void write_placement(Writer& w, const CSE_ALifeDynamicObject* e)
 	w.u16(e->m_tGraphID);
 }
 
+void write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Packet& update)
+{
+	w.u16(e->ID);
+	w.u16(e->ID_Parent);
+	w.boolean(e->m_bOnline);
+	write_placement(w, e);
+	write_packet(w, spawn);
+	write_packet(w, update);
+}
+
 void host_send_spawn(CSE_ALifeDynamicObject* e)
 {
 	NET_Packet spawn, update;
@@ -107,12 +121,7 @@ void host_send_spawn(CSE_ALifeDynamicObject* e)
 	e->UPDATE_Write(update);
 
 	Writer w(spawn.B.count + update.B.count + 32);
-	w.u16(e->ID);
-	w.u16(e->ID_Parent);
-	w.boolean(e->m_bOnline);
-	write_placement(w, e);
-	write_packet(w, spawn);
-	write_packet(w, update);
+	write_spawn(w, e, spawn, update);
 	net::host_broadcast(Msg::EntitySpawn, w);
 	++g_host_spawns;
 }
@@ -560,6 +569,247 @@ u32 g_mirror_log = 0, g_mirror_log_info = 0;
 bool log_allowed(u32& n) { return ++n <= 20 || (n % 100) == 0; }
 bool mirror_log_allowed() { return log_allowed(g_mirror_log); }
 
+// ---------------------------------------------------------------- the roster (xrCoop/coop_reconcile.h)
+
+int g_coop_reconcile = 1;
+struct RosterAsk
+{
+	PeerId peer = kInvalidPeer;
+	u8 bucket = 0;
+};
+xr_vector<RosterAsk> g_rc_asked; // host: rosters to send, after the frame's events
+u8 g_rc_bucket = 0; // host: the next digest
+u64 g_rc_last_step = 0, g_rc_last_roster = 0;
+reconcile::Watch g_rc_watch; // client
+reconcile::Queue g_rc_repairs; // client: asked for at the rate of StateDumpRequest
+reconcile::Retry g_id_retry; // client, D3: an EntitySpawn that found its id taken here
+limits::Pacer g_rc_pacer;
+u32 g_rc_log = 0;
+struct RosterStats
+{
+	u64 digests = 0, rosters = 0, rows = 0, repairs_in = 0, repairs_gone = 0; // host
+	u64 compared = 0, differed = 0, rosters_asked = 0, rosters_in = 0, repairs_asked = 0, retries = 0; // client
+	u64 kinds[7] = {}; // client: repairs asked by kind (bit of reconcile::Repair)
+	u64 traits_applied = 0, squad_members_out = 0, squad_members_in = 0, squad_waits = 0;
+} g_rc;
+
+// Client: asks the host about one entity (host numbering).
+void client_ask_entity(u16 id_host, u8 what)
+{
+	Writer w(4);
+	w.u16(id_host);
+	w.u8(what);
+	net::client_send(Msg::StateDumpRequest, w);
+}
+
+// As this machine sees it. An online creature's server entity lags behind its game object (a client's puppet is told of
+// its death, not its entity); the rest of the world keeps it in the entity.
+bool row_alive(CSE_ALifeDynamicObject* e)
+{
+	CSE_ALifeMonsterAbstract* m = e->cast_monster_abstract();
+	if (!m)
+		return true;
+	if (e->m_bOnline && g_pGameLevel)
+		if (CEntityAlive* a = smart_cast<CEntityAlive*>(Level().Objects.net_Find(e->ID)))
+			return !!a->g_Alive();
+	return m->g_Alive();
+}
+
+// True if a living creature or a player holds `e` in the end: such things change with every shot and hit, and their
+// state goes out when they are opened, taken or their holder dies. `root_online`: the top holder is online here.
+bool held_by_the_living(CSE_ALifeDynamicObject* e, bool& root_online)
+{
+	CSE_ALifeDynamicObject* root = e;
+	for (int depth = 0; root->ID_Parent != kNoId && depth < 8; ++depth)
+	{
+		CSE_ALifeDynamicObject* holder = ai().alife().objects().object(root->ID_Parent, true);
+		if (!holder)
+			break;
+		root = holder;
+	}
+	root_online = root->m_bOnline;
+	if (root == e)
+		return false;
+	if (root->ID == 0 || world::is_player_character(root))
+		return true;
+	if (root->cast_monster_abstract())
+		return row_alive(root);
+	return root->cast_trader_abstract() != nullptr; // a trader of its own class never dies
+}
+
+// The row of an entity, ids in host numbering. False: it is not on the roster: an object the game does not save (a
+// bolt, a body ALife is about to remove) is in no join save either, and a client that came later never had it.
+bool row_of(CSE_ALifeDynamicObject* e, reconcile::Row& r)
+{
+	if (!e->can_save() || e->redundant())
+		return false;
+	r = reconcile::Row();
+	r.id = join::to_host(e->ID);
+	if (r.id == 0 || e->ID == 0 || world::is_player_character(e))
+	{
+		r.online = true; // a player's character: its section, its place and its life are not the same at both ends
+		return true;
+	}
+	r.parent = e->ID_Parent == kNoId ? kNoId : join::to_host(e->ID_Parent);
+	CSE_ALifeOnlineOfflineGroup* group = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e);
+	// A squad from the wire stays offline here and its members switch one by one (apply_group_switch): its vote tells.
+	if (r.parent == kNoId)
+		r.online = group && mgr().is_client() ? g_online.count(e->ID) != 0 : !!e->m_bOnline;
+	r.alive = row_alive(e);
+	r.kind = reconcile::kind_of(e->s_name.c_str());
+	if (group)
+	{
+		std::vector<u16> members;
+		for (const auto& m : group->squad_members())
+			members.push_back(join::to_host(m.first));
+		r.state = reconcile::members_digest(members);
+	}
+	else if (CSE_ALifeTraderAbstract* t = e->cast_trader_abstract())
+		r.state = reconcile::traits_digest(s32(t->m_community_index), s32(t->m_rank), s32(t->m_reputation));
+	else if (e->cast_inventory_item())
+	{
+		bool root_online = false;
+		if (!held_by_the_living(e, root_online))
+			r.state = items::state_digest(e, root_online);
+	}
+	return true;
+}
+
+void collect_rows(u8 bucket, std::vector<reconcile::Row>& rows)
+{
+	rows.clear();
+	for (u32 id = bucket; id < kNoId; id += xfer::kBuckets)
+	{
+		CSE_ALifeDynamicObject* e = ai().alife().objects().object(join::to_local(u16(id)), true);
+		reconcile::Row r;
+		if (e && row_of(e, r))
+			rows.push_back(r);
+	}
+}
+
+bool peer_is_in_world(const PeerInfo& p) { return p.state == PeerState::Joined && !sync::host_peer_joining(p.id); }
+
+void host_send_roster(const RosterAsk& ask)
+{
+	std::vector<reconcile::Row> rows;
+	collect_rows(ask.bucket, rows);
+	Writer w(rows.size() * reconcile::kRowBytes + 8);
+	reconcile::write_roster(w, ask.bucket, rows);
+	net::host_send(ask.peer, Msg::EntityRoster, w);
+	++g_rc.rosters;
+	g_rc.rows += rows.size();
+}
+
+void host_reconcile()
+{
+	if (!world_up() || !g_coop_reconcile)
+		return;
+	const u64 now = mgr().now_ms();
+	if (!g_rc_asked.empty() && now - g_rc_last_roster >= reconcile::kRosterGapMs)
+	{
+		g_rc_last_roster = now;
+		host_send_roster(g_rc_asked.front());
+		g_rc_asked.erase(g_rc_asked.begin());
+	}
+	if (now - g_rc_last_step < reconcile::kStepMs)
+		return;
+	g_rc_last_step = now;
+	const auto& peers = mgr().session().peers();
+	if (std::none_of(peers.begin(), peers.end(), peer_is_in_world))
+		return; // nobody to compare with: no walk at all
+	const u8 bucket = g_rc_bucket;
+	g_rc_bucket = u8((g_rc_bucket + 1) % xfer::kBuckets);
+	std::vector<reconcile::Row> rows;
+	collect_rows(bucket, rows);
+	Writer w(8);
+	reconcile::write(w, reconcile::hash_bucket(bucket, rows));
+	for (const PeerInfo& p : peers)
+		if (peer_is_in_world(p))
+			net::host_send(p.id, Msg::EntityHash, w);
+	++g_rc.digests;
+}
+
+void host_on_resync(PeerId from, Reader& r)
+{
+	const u8 bucket = r.u8();
+	if (!mgr().is_host() || !r.ok() || bucket >= xfer::kBuckets)
+		return;
+	for (const RosterAsk& ask : g_rc_asked)
+		if (ask.peer == from && ask.bucket == bucket)
+			return;
+	g_rc_asked.push_back({from, bucket});
+}
+
+void client_on_hash(PeerId, Reader& r)
+{
+	reconcile::BucketHash host;
+	if (!reconcile::read(r, host) || !g_coop_reconcile || !world_up() || Device.dwPrecacheFrame)
+		return;
+	std::vector<reconcile::Row> rows;
+	collect_rows(host.bucket, rows);
+	const bool same = reconcile::hash_bucket(host.bucket, rows) == host;
+	++g_rc.compared;
+	g_rc.differed += same ? 0 : 1;
+	if (g_rc_watch.on_hash(host.bucket, same, mgr().now_ms()))
+	{
+		Writer w(2);
+		w.u8(host.bucket);
+		net::client_send(Msg::EntityResync, w);
+		++g_rc.rosters_asked;
+	}
+}
+
+void client_on_roster(PeerId, Reader& r)
+{
+	u8 bucket = 0;
+	std::vector<reconcile::Row> host, local;
+	if (!reconcile::read_roster(r, bucket, host) || !g_coop_reconcile || !world_up())
+		return;
+	++g_rc.rosters_in;
+	collect_rows(bucket, local);
+	const u64 now = mgr().now_ms();
+	for (const reconcile::Action& a : reconcile::diff(host, local))
+	{
+		const u16 id = join::to_local(a.id);
+		if ((a.what & (reconcile::Gone | reconcile::Replace)) && requests::client_lease_waiting(id))
+			continue; // our own create waits for the host
+		if ((a.what & reconcile::Parent) && events::client_parent_pending(id))
+			continue; // on its way
+		if (!g_rc_watch.allow(a.id, now))
+			continue;
+		const CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
+		// On the host's roster and here, but off ours: a squad emptied here is "redundant". Its spawn would change nothing.
+		const u8 what = (a.what & reconcile::Spawn) && e ? u8(reconcile::State | reconcile::Switch) : a.what;
+		g_rc_repairs.push(a.id, what);
+		if (log_allowed(g_rc_log))
+			::Msg("[coop] roster: %u [%s] differs from the host: repair 0x%02x", a.id, e ? e->s_name.c_str() : "not here",
+			    u32(what));
+	}
+}
+
+void client_reconcile()
+{
+	if (!g_coop_reconcile || !world_up())
+		return;
+	const u64 now = mgr().now_ms();
+	std::vector<u16> due;
+	g_id_retry.due(now, due);
+	for (u16 id : due)
+	{
+		client_ask_entity(id, reconcile::kAskMissing);
+		++g_rc.retries;
+	}
+	while (g_rc_repairs.size() && g_rc_pacer.take(Msg::StateDumpRequest, now))
+	{
+		reconcile::Action a;
+		g_rc_repairs.pop(a);
+		client_ask_entity(a.id, a.what);
+		++g_rc.repairs_asked;
+		for (u32 bit = 0; bit < 7; ++bit)
+			g_rc.kinds[bit] += (a.what >> bit) & 1;
+	}
+}
+
 struct ApplyGuard
 {
 	ApplyGuard() { ++g_applying; }
@@ -804,11 +1054,15 @@ void client_on_spawn(PeerId, Reader& r)
 	if (!read_packet(r, spawn) || !read_packet(r, update) || !ai().get_alife())
 		return;
 	if (ai().alife().objects().object(id, true))
+	{
+		g_id_retry.done(id_host);
 		return; // already have it (P6: repeat is harmless)
+	}
 	if (alife_rw().server().ID_to_entity(id))
 	{
 		// A local non-ALife object (EntityLocal, bolt...) holds the id: PerformIDgen would assert.
 		++g_missing;
+		g_id_retry.add(id_host, mgr().now_ms()); // D3: it goes in a moment, the entity is asked for again
 		::Msg("! [coop] id %u is taken here by a local object, mirrored entity skipped", id_host);
 		return;
 	}
@@ -817,6 +1071,7 @@ void client_on_spawn(PeerId, Reader& r)
 		// F2 T12b round 1 (R2 minor "ID already used"): our generator has it taken with no entity holding it (a leased id
 		// of ours, an entity between its steps): PerformIDgen below would assert
 		++g_missing;
+		g_id_retry.add(id_host, mgr().now_ms());
 		::Msg("! [coop] id %u is taken in our id generator, mirrored entity skipped", id_host);
 		return;
 	}
@@ -877,6 +1132,7 @@ void client_on_spawn(PeerId, Reader& r)
 		}
 	}
 	alife_rw().register_object(e, true);
+	g_id_retry.done(id_host);
 	// B2: a child follows its holder HERE; the host's flag of a child is its holder's state there (xrCoop/coop_mirror.h).
 	switch (mirror::placement(parent != kNoId, online, holder && holder->m_bOnline,
 	    holder && alife_rw().server().ID_to_entity(parent)))
@@ -1035,27 +1291,154 @@ void client_on_snapshot(PeerId, Reader& r)
 	}
 }
 
-// Host: a client asks for an entity it does not have.
+// F2: an NPC's community, rank and reputation changed by the host's Lua (stock scripts raise them with every kill).
+void client_on_traits(PeerId, Reader& r)
+{
+	reconcile::TraitsMsg m;
+	if (!reconcile::read(r, m) || !world_up())
+		return;
+	const u16 id = join::to_local(m.object);
+	CSE_ALifeDynamicObject* e = id ? ai().alife().objects().object(id, true) : nullptr;
+	CSE_ALifeTraderAbstract* t = e ? e->cast_trader_abstract() : nullptr;
+	if (!t || world::is_player_character(e))
+		return;
+	ApplyGuard guard;
+	CGameObject* go = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
+	if (CInventoryOwner* owner = go && !go->getDestroy() ? go->cast_inventory_owner() : nullptr)
+	{
+		owner->SetCommunity(m.community);
+		owner->SetRank(m.rank);
+		owner->SetReputation(m.reputation);
+	}
+	t->m_community_index = m.community;
+	t->m_rank = m.rank;
+	t->m_reputation = m.reputation;
+	++g_rc.traits_applied;
+}
+
+// F5: a squad's members changed after the join save. A squad from the wire only lists ids; one the engine bound holds
+// its members for real, and takes a new one the way the host did. A member that cannot be taken yet (not here, or online
+// on one side only: the roster repairs that first) waits for the next round.
+void client_on_squad(PeerId, Reader& r)
+{
+	reconcile::SquadMsg m;
+	if (!reconcile::read(r, m) || !world_up())
+		return;
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(join::to_local(m.squad), true);
+	CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e);
+	if (!g)
+		return;
+	ApplyGuard guard;
+	xr_set<u16> wanted;
+	for (u16 id : m.members)
+		wanted.insert(join::to_local(id));
+	// Before the list changes. An empty squad bound nobody: only ids, as a squad from the wire.
+	const bool bound = !g->squad_members().empty() && group_bound(*g);
+	xr_vector<u16> leaving;
+	for (const auto& member : g->squad_members())
+		if (!wanted.count(member.first))
+			leaving.push_back(member.first);
+	for (u16 id : leaving)
+	{
+		g->unregister_member(id);
+		++g_rc.squad_members_out;
+	}
+	for (u16 id : wanted)
+	{
+		if (g->squad_members().find(id) != g->squad_members().end())
+			continue;
+		CSE_ALifeMonsterAbstract* c = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(id, true));
+		if (!c || !c->g_Alive() || c->ID_Parent != kNoId || (bound && c->m_bOnline != g->m_bOnline))
+		{
+			++g_rc.squad_waits;
+			continue;
+		}
+		leave_group(c);
+		if (bound)
+			g->register_member(id);
+		else
+			const_cast<CSE_ALifeOnlineOfflineGroup::MEMBERS&>(g->squad_members())[id] = nullptr; // as its STATE_Read
+		++g_rc.squad_members_in;
+	}
+}
+
+// Host: a client asks about an entity. Without `what`: one of its handlers misses it; with it: a repair of the roster
+// (xrCoop/coop_reconcile.h). The answers are the host's usual world messages to that client alone, and each of them
+// changes nothing where it is already true.
 void host_on_entity_request(PeerId from, Reader& r)
 {
 	const u16 id = r.u16();
 	if (!r.ok() || !ai().get_alife()) // review R2 C2: no world between levels / in the main menu
 		return;
+	u8 what = r.remaining() ? r.u8() : reconcile::kAskMissing;
+	++g_rc.repairs_in;
+	const auto send_destroy = [&]()
+	{
+		Writer w(4);
+		w.u16(id);
+		net::host_send(from, Msg::EntityDestroy, w);
+		++g_rc.repairs_gone;
+	};
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	if (!e)
+	{
+		if (what & (reconcile::Gone | reconcile::Replace))
+			send_destroy();
 		return;
-	NET_Packet spawn, update;
-	e->Spawn_Write(spawn, FALSE);
-	update.w_begin(M_UPDATE);
-	e->UPDATE_Write(update);
-	Writer w(spawn.B.count + update.B.count + 32);
-	w.u16(e->ID);
-	w.u16(e->ID_Parent);
-	w.boolean(e->m_bOnline);
-	write_placement(w, e);
-	write_packet(w, spawn);
-	write_packet(w, update);
-	net::host_send(from, Msg::EntitySpawn, w);
+	}
+	if (id == 0 || world::is_player_character(e))
+		what &= reconcile::Spawn; // a player's character is nobody's to replace, and has no switches here
+	if (what & reconcile::Replace)
+		send_destroy();
+	if (what & (reconcile::Spawn | reconcile::Replace))
+	{
+		NET_Packet spawn, update;
+		e->Spawn_Write(spawn, FALSE);
+		update.w_begin(M_UPDATE);
+		e->UPDATE_Write(update);
+		Writer w(spawn.B.count + update.B.count + 32);
+		write_spawn(w, e, spawn, update);
+		net::host_send(from, Msg::EntitySpawn, w);
+	}
+	if ((what & reconcile::Switch) && e->ID_Parent == kNoId)
+	{
+		// A member goes with its squad: an EntitySwitch of its own tells a client that it left the squad (client_on_switch).
+		CSE_ALifeMonsterAbstract* m = e->cast_monster_abstract();
+		CSE_ALifeDynamicObject* squad = m && m->m_group_id != kNoId ? ai().alife().objects().object(m->m_group_id, true) : nullptr;
+		CSE_ALifeDynamicObject* who = squad ? squad : e;
+		Writer w(256);
+		write_switch(w, who, who->m_bOnline);
+		net::host_send(from, Msg::EntitySwitch, w);
+	}
+	if (what & reconcile::Parent)
+		events::host_send_parent(from, e);
+	if (what & reconcile::Died)
+		events::host_send_death(from, e);
+	if (!(what & reconcile::State))
+		return;
+	if (CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e))
+	{
+		reconcile::SquadMsg m;
+		m.squad = id;
+		for (const auto& member : g->squad_members())
+			m.members.push_back(member.first);
+		Writer w(m.members.size() * 2 + 8);
+		reconcile::write(w, m);
+		net::host_send(from, Msg::EntitySquad, w);
+	}
+	else if (CSE_ALifeTraderAbstract* t = e->cast_trader_abstract())
+	{
+		reconcile::TraitsMsg m;
+		m.object = id;
+		m.community = s32(t->m_community_index);
+		m.rank = s32(t->m_rank);
+		m.reputation = s32(t->m_reputation);
+		Writer w(16);
+		reconcile::write(w, m);
+		net::host_send(from, Msg::EntityTraits, w);
+	}
+	else
+		items::host_send_state(from, id);
 }
 
 bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
@@ -1092,6 +1475,7 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 void install_server(Session& s)
 {
 	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (mgr().is_host()) host_on_entity_request(from, r); });
+	s.on(Msg::EntityResync, &host_on_resync);
 }
 
 void install_client(Endpoint& e)
@@ -1103,6 +1487,10 @@ void install_client(Endpoint& e)
 	e.on(Msg::EntityDestroy, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_destroy(from, r); });
 	e.on(Msg::EntitySwitch, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_switch(from, r); });
 	e.on(Msg::EntitySnapshot, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_snapshot(from, r); });
+	e.on(Msg::EntityHash, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_hash(from, r); });
+	e.on(Msg::EntityRoster, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_roster(from, r); });
+	e.on(Msg::EntityTraits, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_traits(from, r); });
+	e.on(Msg::EntitySquad, [](PeerId from, Reader& r) { if (mgr().is_live_client()) client_on_squad(from, r); });
 }
 
 void reset()
@@ -1112,9 +1500,21 @@ void reset()
 	g_tracks.clear();
 	g_refetched.clear();
 	g_last_snapshot = 0;
+	g_rc_asked.clear();
+	g_rc_bucket = 0;
+	g_rc_last_step = g_rc_last_roster = 0;
+	g_rc_watch.reset();
+	g_rc_repairs.clear();
+	g_id_retry.clear();
+	g_rc_pacer.reset();
+	g_rc_log = 0;
 }
 
-void on_peer_left(PeerId) {}
+void on_peer_left(PeerId id)
+{
+	g_rc_asked.erase(std::remove_if(g_rc_asked.begin(), g_rc_asked.end(), [id](const RosterAsk& a) { return a.peer == id; }),
+	    g_rc_asked.end());
+}
 
 void host_begin_join(PeerId) {}
 void host_end_join(PeerId) {}
@@ -1202,7 +1602,23 @@ void client_on_holder_changed(u16 id, u16 new_parent, bool host_online)
 	}
 }
 
-void on_client_live() { g_tracks.clear(); }
+void on_client_live()
+{
+	g_tracks.clear();
+	g_rc_watch.reset();
+	g_rc_repairs.clear();
+	g_id_retry.clear();
+}
+
+void reconcile_frame()
+{
+	if (mgr().is_host())
+		host_reconcile();
+	else if (mgr().is_live_client())
+		client_reconcile();
+}
+
+int& reconcile_switch() { return g_coop_reconcile; }
 
 bool mirror_lost_child(CSE_Abstract* holder, u16 child)
 {
@@ -1411,10 +1827,24 @@ void print_status()
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
 	if (mgr().is_host())
+	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);
+		::Msg("[coop]   roster: %s, %llu digests, %llu rosters (%llu rows, %u waiting), %llu entity requests, %llu destroys "
+		      "of ids that are gone", g_coop_reconcile ? "on" : "off", g_rc.digests, g_rc.rosters, g_rc.rows,
+		    (u32)g_rc_asked.size(), g_rc.repairs_in, g_rc.repairs_gone);
+	}
 	else
 	{
+		::Msg("[coop]   roster: %s, %llu digests compared, %llu differed (%u buckets differ now, %llu healed), %llu rosters "
+		      "asked / %llu came, %llu repairs asked (spawn %llu, switch %llu, holder %llu, death %llu, state %llu, gone %llu, "
+		      "replace %llu), %u waiting (%llu refused), %u under way, %llu retries of a taken id (%u now)",
+		    g_coop_reconcile ? "on" : "off", g_rc.compared, g_rc.differed, g_rc_watch.watched(), g_rc_watch.healed(),
+		    g_rc.rosters_asked, g_rc.rosters_in, g_rc.repairs_asked, g_rc.kinds[0], g_rc.kinds[1], g_rc.kinds[2],
+		    g_rc.kinds[3], g_rc.kinds[4], g_rc.kinds[5], g_rc.kinds[6], (u32)g_rc_repairs.size(), g_rc_repairs.refused(),
+		    (u32)g_rc_watch.repairing(), g_rc.retries, (u32)g_id_retry.size());
+		::Msg("[coop]   roster applied: %llu traits, squad members %llu out / %llu in (%llu waited)", g_rc.traits_applied,
+		    g_rc.squad_members_out, g_rc.squad_members_in, g_rc.squad_waits);
 		::Msg("[coop]   world in: %u online, %u tracked, %llu spawns, %llu releases, %llu switches, %llu missing, "
 		    "local spawns %llu forwarded / %llu blocked",
 		    (u32)g_online.size(), (u32)g_tracks.size(), g_client_spawns, g_client_releases, g_client_switches,

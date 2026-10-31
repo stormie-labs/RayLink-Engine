@@ -57,6 +57,9 @@ public:
 	void TurnOff();
 	bool IsOn() { return m_bState; }
 	bool IsFlickering() { return isFlickering; }
+	// Anomaly Coop (audit W2): the host's word on this lamp (coop_lamps.h)
+	bool coop_dead() { return !Alive(); }
+	void coop_set(bool on, bool dead);
 	virtual void Load(LPCSTR section);
 	virtual BOOL net_Spawn(CSE_Abstract* DC);
 	virtual void net_Destroy();

@@ -4,6 +4,8 @@
 #include "xrMessages.h"
 #include "../Include/xrRender/Kinematics.h"
 #include "Level.h"
+#include "coop/coop_presence.h"
+#include "xrCoop/coop_relay_rules.h"
 
 void
 CHelicopter::BoneMGunCallbackX(CBoneInstance* B)
@@ -159,6 +161,53 @@ void CHelicopter::OnShot()
 	OnShellDrop(fire_pos, zero_vel);
 
 	m_layered_sounds.PlaySound("sndShoot", fire_pos, this, false);
+	coop::presence::on_heli_shot(this, fire_pos, fire_dir); // Anomaly Coop (audits H2, W8)
+}
+
+// Anomaly Coop (audits H2, W3, W8): the host's shot on a client's copy, the stock OnShot without its decisions. Its bullets
+// deal no damage: the host's did. The barrel follows the host's aim while it fires.
+void CHelicopter::coop_shot(const Fvector& pos, const Fvector& dir, bool bullets)
+{
+	m_enemy.destEnemyPos.mad(pos, dir, 100.f);
+	m_coop_aim_until = Device.dwTimeGlobal + coop::relay::kHeliAimMs;
+	UpdateMGunDir();
+	m_fire_pos = pos;
+	m_fire_dir = dir;
+	m_vCurrentShootDir = dir;
+	m_vCurrentShootPos = pos;
+	CShootingObject::FireStart();
+	if (bullets)
+		FireBullet(pos, dir, fireDispersionBase, m_CurrentAmmo, ID(), ID(), false, ::Random.randI(0, 30));
+	StartShotParticles();
+	if (m_bLightShotEnabled)
+		Light_Start();
+	StartFlameParticles();
+	StartSmokeParticles(pos, zero_vel);
+	OnShellDrop(pos, zero_vel);
+	m_layered_sounds.PlaySound("sndShoot", pos, this, false);
+}
+
+void CHelicopter::coop_rocket(const Fvector& pos)
+{
+	m_layered_sounds.PlaySound("sndRocket", pos, this, false);
+}
+
+// Anomaly Coop: UpdateWeapons of a client's copy: what it keeps up around the host's shots.
+void CHelicopter::coop_update_weapons()
+{
+	const bool firing = Device.dwTimeGlobal < m_coop_aim_until;
+	if (firing)
+		UpdateMGunDir();
+	else
+	{
+		m_tgt_rot.set(0.0f, 0.0f);
+		if (IsWorking())
+			MGunFireEnd();
+	}
+	angle_lerp(m_cur_rot.x, m_tgt_rot.x, PI, Device.fTimeDelta);
+	angle_lerp(m_cur_rot.y, m_tgt_rot.y, PI, Device.fTimeDelta);
+	CShootingObject::UpdateFlameParticles();
+	CShootingObject::UpdateLight();
 }
 
 void CHelicopter::MGunFireStart()
@@ -349,6 +398,7 @@ void CHelicopter::startRocket(u16 idx)
 		m_last_launched_rocket = idx;
 
 		m_layered_sounds.PlaySound("sndRocket", xform.c, this, false);
+		coop::presence::on_heli_rocket(this, xform.c); // Anomaly Coop (audit H2)
 	}
 }
 
