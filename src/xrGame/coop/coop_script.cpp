@@ -676,6 +676,29 @@ int l_players(lua_State* L)
 	return 1;
 }
 
+// coop.members() -> host: the players' characters of this world, also of players who left, the host's actor not among them:
+// { { id = character, peer = peer | nil, in_world = bool }, ... }
+int l_members(lua_State* L)
+{
+	lua_newtable(L);
+	int index = 0;
+	for (const join::Member& m : join::host_members())
+	{
+		lua_newtable(L);
+		lua_pushnumber(L, lua_Number(m.id));
+		lua_setfield(L, -2, "id");
+		if (m.peer != kInvalidPeer)
+		{
+			lua_pushnumber(L, lua_Number(m.peer));
+			lua_setfield(L, -2, "peer");
+		}
+		lua_pushboolean(L, m.in_world);
+		lua_setfield(L, -2, "in_world");
+		lua_rawseti(L, -2, ++index);
+	}
+	return 1;
+}
+
 // coop.avatar_of(peer) -> object id (local numbering) of that player's character here, or nil.
 int l_avatar_of(lua_State* L)
 {
@@ -1575,6 +1598,7 @@ void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
 		{"players", &l_players},
+		{"members", &l_members},
 		{"avatar_of", &l_avatar_of},
 		{"peer_of_avatar", &l_peer_of_avatar},
 		{"owners_known", &l_owners_known},

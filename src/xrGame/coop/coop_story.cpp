@@ -2451,8 +2451,9 @@ void register_commands()
 		return;
 	g_commands_registered = true;
 	CMD1(CCC_CoopTasksResync, "coop_tasks_resync");
-	// Host setting (R-7.6): 0 = task money to the finisher, 1 = split among online players.
-	CMD4(CCC_Integer, "coop_share_rewards", &g_coop_share_rewards, 0, 1);
+	// Host setting (R-7.6): 0 = task money to the finisher, 1 = split among online players, 2 = everyone who played
+	// shares it, 3 = everyone who played gets it in full (coop_reward_group.script).
+	CMD4(CCC_Integer, "coop_share_rewards", &g_coop_share_rewards, 0, 3);
 }
 
 const char* peer_name(PeerId id)

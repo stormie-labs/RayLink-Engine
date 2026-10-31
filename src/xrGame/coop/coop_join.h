@@ -76,6 +76,17 @@ bool is_proxy(u16 id);
 // his character in the world: an absent or still loading player's proxy stays offline (coop::switch_vote).
 bool host_player_in_world(u16 proxy_id);
 
+// Host: a player's character of this world, also of a player who left (it lives on in the save). `peer` is kInvalidPeer
+// when its player is not connected, in_world as host_player_in_world.
+struct Member
+{
+	u16 id = 0xffff;
+	PeerId peer = kInvalidPeer;
+	bool in_world = false;
+};
+// The characters still in play, the host's actor not among them: a retired one or one out of a hardcore run is not.
+std::vector<Member> host_members();
+
 // Host: increments when a load or level change replaces the served world (on_world_created), and so does the
 // session's world epoch: the session drops what peers made in an older world (R2 I1). Requests from peers that
 // rejoin the current world but have not loaded it yet must be ignored (see sync::host_peer_joining).

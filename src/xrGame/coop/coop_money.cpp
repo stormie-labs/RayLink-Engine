@@ -297,9 +297,8 @@ bool adjust(PeerId peer, s64 delta, const char* why, Source source,
 	u32 balance = 0;
 	if (holder == kNoId || !read_balance(holder, balance))
 		return false;
-	const s64 hi = _max(s64(policy().max_money), s64(balance));
 	const s64 want = s64(balance) + delta;
-	const u32 next = u32(want < 0 ? 0 : (want > hi ? hi : want));
+	const u32 next = ledger::capped_balance(balance, delta, policy().max_money);
 	if (source == Source::Grant)
 		++g_h.grants;
 	else if (source == Source::Trade)
@@ -649,6 +648,21 @@ int l_money_grant(lua_State* L)
 	return host_adjust(peer, amount, "grant") ? done(L) : refuse(L, "no character");
 }
 
+// coop.money_grant_to(character, amount) -> added | nil, why: host.
+int l_money_grant_to(lua_State* L)
+{
+	if (!mgr().is_host())
+		return refuse(L, "host only");
+	s64 character = 0, amount = 0;
+	if (!arg_int(L, 1, 1.0, double(kNoId - 1), character) || !arg_int(L, 2, 1.0, double(max_money()), amount))
+		return refuse(L, "bad arguments");
+	u32 added = 0;
+	if (!host_add_to_character(u16(character), u32(amount), "group reward", added))
+		return refuse(L, "no character");
+	lua_pushnumber(L, lua_Number(added));
+	return 1;
+}
+
 // coop.money_set(peer, amount) -> ok, why: host.
 int l_money_set(lua_State* L)
 {
@@ -847,6 +861,25 @@ bool host_adjust(PeerId peer, s64 delta, const char* why)
 	return adjust(peer, delta, why, trade ? Source::Trade : Source::Grant);
 }
 
+bool host_add_to_character(u16 character, u32 amount, const char* why, u32& added)
+{
+	added = 0;
+	if (!mgr().is_host() || !world::is_player_character(events::find_entity(character)))
+		return false;
+	u32 balance = 0;
+	if (!read_balance(character, balance))
+		return false;
+	const u32 next = ledger::capped_balance(balance, amount, policy().max_money);
+	added = next - balance;
+	for (const PeerInfo& p : mgr().session().peers())
+		if (join::proxy_of_peer(p.id) == character) // he is here (or loading the world): his balance is sent to him
+			return adjust(p.id, s64(amount), why, Source::Grant);
+	++g_h.grants;
+	if (next != balance)
+		write_balance(character, next);
+	return true;
+}
+
 bool host_set(PeerId peer, u32 amount, const char* why)
 {
 	if (!mgr().is_host())
@@ -960,6 +993,7 @@ void register_lua(lua_State* L)
 	static const luaL_Reg fns[] = {
 		{"money_give", &l_money_give},
 		{"money_grant", &l_money_grant},
+		{"money_grant_to", &l_money_grant_to},
 		{"money_set", &l_money_set},
 		{"money_set_rules", &l_money_set_rules},
 		{"money_of", &l_money_of},

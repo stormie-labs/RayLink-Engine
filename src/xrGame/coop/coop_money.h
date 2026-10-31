@@ -29,6 +29,8 @@
 //   money_give(peer, amount) -> ok, why    any machine: our money to another player (the host checks it, the answer comes
 //                                          later as a note)
 //   money_grant(peer, amount) -> ok, why   host: adds (or, negative, takes) money, never below 0
+//   money_grant_to(character, amount) -> added | nil, why  host: adds money to a player's character by id, also while
+//                                          its player is away (a group reward); `added` is what really came
 //   money_set(peer, amount) -> ok, why     host: sets the balance
 //   money_set_rules(enabled, max) -> ok, why  host: the transfer rules between players (F2 T6b); `max` per transfer
 //   money_of(peer) -> RU | nil             host
@@ -79,6 +81,9 @@ u32 host_balance(PeerId peer);
 bool host_adjust(PeerId peer, s64 delta, const char* why);
 // Sets the balance (up to max_money) and sends it to its player. False if he has no character.
 bool host_set(PeerId peer, u32 amount, const char* why);
+// Host: adds `amount` to a player's character, whether or not its player is here; `added` is what really came. False: not
+// a player's character.
+bool host_add_to_character(u16 character, u32 amount, const char* why, u32& added);
 // Sends `peer` his balance as it is (F2 T5: after the answer to an upgrade he paid for on his machine, which the host
 // refused or did not charge). Nothing if he has no character.
 void host_send_balance(PeerId peer);

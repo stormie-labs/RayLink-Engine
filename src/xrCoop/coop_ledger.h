@@ -397,6 +397,14 @@ inline bool read(Reader& r, MoneyBalanceMsg& m)
 	m.note.verdict = Verdict(verdict);
 	return true;
 }
+// A balance changed by `delta` within [0, max(max_money, balance)]: a balance over the limit is not cut, it only cannot grow.
+inline uint32_t capped_balance(uint32_t balance, int64_t delta, uint32_t max_money)
+{
+	const int64_t hi = int64_t(balance) > int64_t(max_money) ? int64_t(balance) : int64_t(max_money);
+	const int64_t want = int64_t(balance) + delta;
+	return uint32_t(want < 0 ? 0 : (want > hi ? hi : want));
+}
+
 // ---------------------------------------------------------------- host book
 
 // The key the host knows a character by: the digest on the "key" line of its custom data ([coop] key = <sha256 hex>),

@@ -145,6 +145,8 @@ PeerId peer_of_character(u16 character); // kInvalidPeer: nobody plays it now
 // world is served (R1: not in the frame a world was created in, as join::host_player_in_world keeps it for a client), a
 // client once he has loaded it (join::host_player_in_world).
 bool player_in_world(u16 character);
+// The world says `character` is out of a hardcore run ([coop_death] out = 1): he only watches, then starts anew.
+bool out_of_run(u16 character);
 
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)

@@ -2688,6 +2688,8 @@ PeerId peer_of_character(u16 character)
 	return join::peer_of_proxy(character);
 }
 
+bool out_of_run(u16 character) { return flag_read(character, kOutKey); }
+
 bool player_in_world(u16 character)
 {
 	if (!mgr().is_host() || character == 0xffff)

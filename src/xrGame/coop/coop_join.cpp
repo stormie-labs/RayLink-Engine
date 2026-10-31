@@ -17,6 +17,7 @@
 #include "xrCoop/coop_shapes.h"
 #include "xrCoop/coop_save_policy.h"
 #include "xrCoop/coop_death_rules.h" // Ruling F3-9: retired keys, new_key_charge
+#include "xrCoop/coop_ledger.h" // character_key
 #include "xrCoop/coop_levels_wire.h" // F3a T8: LoadWait, LoadReady
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_link_hold.h"
@@ -3195,6 +3196,29 @@ bool host_rejoin_peer(PeerId peer, const char* why)
 	::Msg("[coop] '%s' joins the world again (%s, epoch %u), his character %u is nobody's now", p ? p->nick.c_str() : "?",
 	    why && *why ? why : "-", g.epoch, u32(proxy));
 	return true;
+}
+
+std::vector<Member> host_members()
+{
+	std::vector<Member> out;
+	if (!mgr().is_host() || !ai().get_alife())
+		return out;
+	for (const auto& it : ai().alife().objects().objects())
+	{
+		const CSE_ALifeDynamicObject* e = it.second;
+		if (!e || !world::is_player_character(e) || !e->m_ini_string.size())
+			continue;
+		if (death::is_retired(e->m_ini_string.c_str()) || survival::out_of_run(e->ID))
+			continue;
+		Member m;
+		m.id = e->ID;
+		for (const PeerInfo& p : mgr().session().peers())
+			if (proxy_of_peer(p.id) == e->ID)
+				m.peer = p.id;
+		m.in_world = m.peer != kInvalidPeer && !sync::host_peer_joining(m.peer) && host_player_in_world(e->ID);
+		out.push_back(m);
+	}
+	return out;
 }
 
 void host_key_retired(const std::string& key_digest)
