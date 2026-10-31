@@ -167,7 +167,9 @@ bool CObjectHandler::goal_reached()
 void CObjectHandler::weapon_bones(int& b0, int& b1, int& b2) const
 {
 	CWeapon* weapon = smart_cast<CWeapon*>(inventory().ActiveItem());
-	if (!weapon || !planner().m_storage.property(ObjectHandlerSpace::eWorldPropertyStrapped))
+	// Anomaly Coop: the strapped state can outlive the weapon it was for, and a pistol has no strap bones: a null name reached
+	// LL_BoneID (host crash, live 2026-10-31). THROW3 below is empty in Release.
+	if (!weapon || !weapon->can_be_strapped() || !planner().m_storage.property(ObjectHandlerSpace::eWorldPropertyStrapped))
 	{
 		if (weapon)
 			weapon->strapped_mode(false);
@@ -206,7 +208,7 @@ void CObjectHandler::actualize_strap_mode(CWeapon* weapon) const
 {
 	VERIFY(weapon);
 
-	if (!planner().m_storage.property(ObjectHandlerSpace::eWorldPropertyStrapped))
+	if (!weapon->can_be_strapped() || !planner().m_storage.property(ObjectHandlerSpace::eWorldPropertyStrapped))
 	{
 		//		Msg						( "[%6d][%s] actualizing: weapon_strapped = false", Device.dwTimeGlobal, planner().object().cName().c_str() );
 		weapon->strapped_mode(false);
