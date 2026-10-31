@@ -317,6 +317,7 @@ bool g_my_twist_off = false;
 
 // Written by the condition hook (maybe on the GameThread worker), consumed by frame().
 std::atomic<u8> g_hook_life{u8(Life::Alive)};
+float g_hook_rad = 0.f; // the dose at the fall: main thread, as the hook
 std::atomic<const CActorCondition*> g_hook_owner{nullptr}; // condition of the actor that is down (a load makes a new one)
 std::atomic<bool> g_hook_fell{false};
 std::atomic<u32> g_hook_damage{0}; // milli-health lost while down
@@ -768,6 +769,8 @@ void host_order_evacuate(u16 target, u16 seq, u32 delay_ms)
 
 void enter_wounded(CActor* a, u64 t)
 {
+	if (a && g_hook_life.load() == u8(Life::Alive))
+		g_hook_rad = a->conditions().GetRadiation();
 	g_me.life = Life::Wounded;
 	g_hook_life.store(u8(Life::Wounded));
 	if (++g_me.seq == 0xffff) // 0xffff is death::Tracker's "no death decided"
@@ -789,6 +792,8 @@ void enter_wounded(CActor* a, u64 t)
 
 void enter_dead(CActor* a, u64 t)
 {
+	if (a && g_hook_life.load() == u8(Life::Alive))
+		g_hook_rad = a->conditions().GetRadiation();
 	g_me.life = Life::Dead;
 	g_hook_life.store(u8(Life::Dead));
 	g_me.since = t;
@@ -2646,6 +2651,11 @@ bool player_in_world(u16 character)
 	return join::host_player_in_world(character);
 }
 
+bool camera_left_body()
+{
+	return g_me.cam == 2 || g_me.cam == 3;
+}
+
 Life life_of(u16 local_id)
 {
 	if (local_id == 0)
@@ -2916,10 +2926,14 @@ void actor_condition_hook(CActorCondition& c)
 			g_hook_damage.fetch_add(u32(_min(kDownHealth - h, 100.f) * 1000.f + 0.5f)); // huge hits: no float->u32 overflow
 		if (h != kDownHealth)
 			c.SetHealth(kDownHealth);
+		// One who is down takes no more dose: the actor stays in the world, and zones and artefacts went on adding to it, up
+		// to a revive that kept it all (live 2026-10-31). A respawn clears it in stand_up.
+		c.SetRadiation(g_hook_rad);
 		return;
 	}
 	if (h <= 0.f)
 	{
+		g_hook_rad = c.GetRadiation();
 		c.SetHealth(kDownHealth);
 		g_hook_owner.store(&c);
 		g_hook_life.store(u8(Life::Wounded)); // pinned from now on; frame() completes the fall
@@ -2944,6 +2958,7 @@ bool intercept_actor_kill(CEntity* victim, u16 killer_id)
 		return false;
 	if (g_hook_life.load() == u8(Life::Alive) || g_hook_owner.load() != &a->conditions())
 	{
+		g_hook_rad = a->conditions().GetRadiation();
 		a->conditions().SetHealth(kDownHealth);
 		g_hook_owner.store(&a->conditions());
 		g_hook_life.store(u8(Life::Wounded));

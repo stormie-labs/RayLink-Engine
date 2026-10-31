@@ -6,6 +6,7 @@
 #include "coop_entities.h"
 #include "coop_players.h"
 #include "coop_ai.h"
+#include "xrCoop/coop_rules.h"
 
 #include "Level.h"
 #include "GameObject.h"
@@ -300,7 +301,11 @@ bool suspend_binder(CScriptBinder* binder)
 {
 	if (!binder || !mgr().active())
 		return false;
-	return is_remote_creature(smart_cast<CGameObject*>(binder));
+	CGameObject* obj = smart_cast<CGameObject*>(binder);
+	if (!is_remote_creature(obj))
+		return false;
+	CEntityAlive* body = obj->cast_entity_alive();
+	return !rules::puppet_binder_runs(obj->cast_base_monster() != nullptr, body && body->g_Alive());
 }
 
 void on_host_death(CGameObject* obj, u16 killer_local_id)

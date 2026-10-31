@@ -9,6 +9,7 @@
 #include "hit.h"
 #include "coop/coop_events.h" // Anomaly Coop
 #include "coop/coop_objects.h" // Anomaly Coop: client_usable_tip
+#include "coop/coop_survival.h" // Anomaly Coop: camera_left_body
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -2242,7 +2243,8 @@ bool canRenderLegs(CActor* actor, CHolderCustom* m_holder) noexcept
         && !m_holder
         && (legs_in_demo_record || pDemoRecords.empty())
         && showActorBody == 0
-        && !actor->m_FPCam;
+        && !actor->m_FPCam
+        && !coop::survival::camera_left_body(); // Anomaly Coop: the legs hang on the camera, it may watch a teammate
 };
 
 void CActor::renderable_Render(IDSGraphManager* DM)

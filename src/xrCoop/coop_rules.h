@@ -42,6 +42,14 @@ inline bool is_machine_info(const char* id)
 	return false;
 }
 
+// A client's creature is a puppet: the host runs its logic and its binder's update stays off here. A dead mutant is the
+// exception: the stock binder offers the skinning from that update (tip, use callback), and that is this player's knife
+// and this player's key. A dead stalker's update would start the NPC logic on a client: it stays off.
+inline bool puppet_binder_runs(bool is_mutant, bool alive)
+{
+	return is_mutant && !alive;
+}
+
 // R2 I2: a world message (host -> clients) that a client applies only in the Live phase. Before Live the client is in
 // its own world or loading the host's: such a message comes from the window between Welcome and JoinRequest, or from
 // a world it has left. It is dropped: what the host did before host_begin_join is in the save the client loads, what

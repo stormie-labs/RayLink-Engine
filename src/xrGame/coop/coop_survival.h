@@ -156,6 +156,8 @@ void render_hud(); // HUDManager::RenderUI (main thread, render phase): reads da
 
 // Life of the player whose character has `local_id` on this machine (0 = me). Alive if unknown.
 Life life_of(u16 local_id);
+// The camera shows a teammate or the body from above, not this actor's eyes. Main thread.
+bool camera_left_body();
 // The death rules in force here: the host's console on the host, the host's last PlayerRules on a client (the client's
 // own console until they come). Main thread.
 const death::Rules& rules();

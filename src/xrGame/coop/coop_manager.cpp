@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include "xrCoop/coop_silence_pause.h"
 
 string64 g_coop_nick = "";
 
@@ -583,16 +584,16 @@ void Manager::autostart()
 
 namespace
 {
-bool g_silence_paused = false;
+SilencePause g_silence;
 u32 g_silence_shown = ~0u;
 
 void host_silence_off()
 {
-	if (!g_silence_paused)
+	if (!g_silence.waiting)
 		return;
-	g_silence_paused = false;
+	const bool give_back = g_silence.end();
 	g_silence_shown = ~0u;
-	if (Device.Paused())
+	if (give_back)
 		Device.Pause(FALSE, TRUE, TRUE, "coop_host_silent");
 	::Msg("[coop] the host answers again: the game runs on");
 }
@@ -605,10 +606,9 @@ void host_silence_step()
 		host_silence_off();
 		return;
 	}
-	if (!g_silence_paused)
+	if (!g_silence.waiting)
 	{
-		g_silence_paused = true;
-		if (!Device.Paused())
+		if (g_silence.begin(Device.Paused()))
 			Device.Pause(TRUE, TRUE, TRUE, "coop_host_silent");
 		::Msg("! [coop] the host does not answer (%u ms): the game waits for it, out after %u s", silent,
 		    kHostSilenceLeaveMs / 1000);

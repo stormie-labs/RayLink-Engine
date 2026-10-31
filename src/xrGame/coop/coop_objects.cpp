@@ -28,6 +28,7 @@
 #include "BreakableObject.h"
 #include "CustomZone.h"
 #include "ZoneCampfire.h"
+#include "RadioactiveZone.h"
 #include "Artefact.h"
 #include "Missile.h"
 #include "Grenade.h"
@@ -941,6 +942,9 @@ void apply_zone(CCustomZone* zone, const ZoneEntry& e)
 	}
 	if (e.state >= u8(CCustomZone::eZoneStateMax))
 		return;
+	if (smart_cast<CRadioactiveZone*>(zone) && e.state != u8(CCustomZone::eZoneStateDisabled) &&
+		zone->ZoneState() != CCustomZone::eZoneStateDisabled)
+		return; // zone_switch_blocked: only the host's on and off
 	if (u8(zone->ZoneState()) == e.state)
 		return; // already there (bulk / phase resend): replaying would restart its particles and sounds
 	NET_Packet P;
@@ -2263,6 +2267,11 @@ bool host_destroys(CGameObject* obj) { return obj && mgr().is_client(); }
 bool zone_switch_blocked(CCustomZone* zone)
 {
 	if (!zone || !mgr().is_client() || g_zone_apply > 0)
+		return false;
+	// A radiation field hits only in the state a CActor wakes it to, and the host's copy does not feel a player's character
+	// (CRadioactiveZone::feel_touch_contact): a client got a dose only with the host in the same field (live 2026-10-31).
+	// Each machine's field runs for its own actor; apply_zone leaves it alone.
+	if (smart_cast<CRadioactiveZone*>(zone))
 		return false;
 	++g_c.switches_blocked;
 	return true;

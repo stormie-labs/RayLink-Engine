@@ -71,6 +71,7 @@ void CLevel::IR_OnMouseWheel(int direction)
 #endif
 	/* avo: end */
 
+	if (!CurrentGameUI()) return; // Anomaly Coop: see IR_OnMouseMove
 	if (CurrentGameUI()->IR_UIOnMouseWheel(direction)) return;
 	if (Device.Paused()
 #ifdef DEBUG
@@ -120,6 +121,8 @@ void CLevel::IR_OnMouseMove(int dx, int dy)
     /* avo: end */
 #endif // INPUT_CALLBACKS
 
+	// Anomaly Coop: a client's level takes the mouse while it loads, before the HUD exists (crash here, live 2026-10-31)
+	if (!CurrentGameUI()) return;
 	if (CurrentGameUI()->IR_UIOnMouseMove(dx, dy)) return;
 	if (Device.Paused() && !IsDemoPlay()
 #ifdef DEBUG
