@@ -67,7 +67,7 @@ public:
 	virtual void shedule_Update(u32 dt);
 
 	void set_actor_ignore(bool const actor_ignore) { m_actor_ignore = actor_ignore; }
-	bool get_actor_ignore() const { return m_actor_ignore; }
+	bool get_actor_ignore() const;
 
 	virtual void Die(CObject* who);
 

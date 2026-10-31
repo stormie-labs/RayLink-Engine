@@ -50,6 +50,9 @@ void UIRegistrator::script_register(lua_State* L)
 	[
 
 		class_<CGameFont>("CGameFont")
+		// the line (cell) height of the font in screen pixels, and the width of a one-line text in screen pixels
+		.def("GetHeight", &CGameFont::GetHeight)
+		.def("SizeOf", (float (CGameFont::*)(LPCSTR))&CGameFont::SizeOf_)
 		.enum_("EAligment")
 		[
 			value("alLeft", int(CGameFont::alLeft)),

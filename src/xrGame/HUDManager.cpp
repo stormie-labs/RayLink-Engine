@@ -96,6 +96,190 @@ CFontManager::~CFontManager()
 	FONTS_VEC_IT it_e = m_all_fonts.end();
 	for (; it != it_e; ++it)
 		xr_delete(**it);
+
+	// the registered fonts were deleted above through their `font` (m_all_fonts points into the entries)
+	for (SExtraFont* e : m_extra_fonts)
+		xr_delete(e);
+	m_extra_fonts.clear();
+}
+
+// ---------------------------------------------------------------- fonts by name, and the ones scripts register
+
+CFontManager::SExtraFont* CFontManager::FindExtra(LPCSTR name)
+{
+	if (!name)
+		return nullptr;
+	for (SExtraFont* e : m_extra_fonts)
+		if (0 == xr_strcmp(e->name.c_str(), name))
+			return e;
+	return nullptr;
+}
+
+CGameFont* CFontManager::FindByName(LPCSTR name)
+{
+	if (!name || !name[0])
+		return nullptr;
+
+	// the names XML has always known (CUIXmlInit::InitFont)
+	struct Stock
+	{
+		LPCSTR name;
+		CGameFont* CFontManager::*member;
+	};
+	static const Stock stock[] = {
+		{"graffiti19", &CFontManager::pFontGraffiti19Russian},
+		{"graffiti22", &CFontManager::pFontGraffiti22Russian},
+		{"graffiti32", &CFontManager::pFontGraffiti32Russian},
+		{"graffiti50", &CFontManager::pFontGraffiti50Russian},
+		{"arial_14", &CFontManager::pFontArial14},
+		{"medium", &CFontManager::pFontMedium},
+		{"small", &CFontManager::pFontStat},
+		{"letterica16", &CFontManager::pFontLetterica16Russian},
+		{"letterica18", &CFontManager::pFontLetterica18Russian},
+		{"letterica25", &CFontManager::pFontLetterica25},
+		{"di", &CFontManager::pFontDI},
+	};
+	for (const Stock& s : stock)
+		if (0 == xr_strcmp(s.name, name))
+			return this->*(s.member);
+
+	SExtraFont* e = FindExtra(name);
+	return e ? e->font : nullptr;
+}
+
+CGameFont* CFontManager::ExtraFallback(LPCSTR name)
+{
+	SExtraFont* e = FindExtra(name);
+	if (!e || e->font)
+		return nullptr;
+	if (!e->fallback_logged)
+	{
+		e->fallback_logged = true;
+		Msg("! [font] '%s' was registered but has no atlas: the stock letterica18 is used wherever XML names it", name);
+	}
+	return pFontLetterica18Russian;
+}
+
+// A name an XML attribute and a Lua call can carry around: letters, digits, '_', '-', '.', at most 63.
+static bool extra_font_name_ok(LPCSTR s)
+{
+	if (!s || !s[0] || xr_strlen(s) > 63)
+		return false;
+	for (; *s; ++s)
+	{
+		const char c = *s;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+			return false;
+	}
+	return true;
+}
+
+// A shader name: what the engine's shader lists hold ("font", "hud\\font"): letters, digits, '_', '\\', '/', at most 63.
+static bool extra_font_shader_ok(LPCSTR s)
+{
+	if (!s || !s[0] || xr_strlen(s) > 63)
+		return false;
+	for (; *s; ++s)
+	{
+		const char c = *s;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\\' || c == '/'))
+			return false;
+	}
+	return true;
+}
+
+bool CFontManager::RegisterFont(LPCSTR name, LPCSTR texture_base, LPCSTR shader, float target_height)
+{
+	if (!shader || !shader[0])
+		shader = "font";
+	if (!(target_height >= 1.f)) // 0, negative, NaN: the screen height
+		target_height = 0.f;
+	else if (target_height > 20000.f)
+		target_height = 20000.f;
+	if (!extra_font_name_ok(name))
+	{
+		Msg("! [font] RegisterFont: '%s' is not a font name (1..63 of A-Z a-z 0-9 _ - .)", name ? name : "(nil)");
+		return false;
+	}
+	if (!extra_font_shader_ok(shader))
+	{
+		Msg("! [font] RegisterFont '%s': '%s' is not a shader name", name, shader);
+		return false;
+	}
+	if (!texture_base || !texture_base[0])
+	{
+		Msg("! [font] RegisterFont '%s': no texture", name);
+		return false;
+	}
+	if (FindByName(name) && !FindExtra(name)) // a stock name: XML and every script rely on what it means
+	{
+		Msg("! [font] RegisterFont '%s': that is the name of a stock font", name);
+		return false;
+	}
+
+	SExtraFont* e = FindExtra(name);
+	if (e && e->font && 0 == xr_strcmp(e->texture.c_str(), texture_base) && 0 == xr_strcmp(e->shader.c_str(), shader) &&
+		e->target_height == target_height)
+		return true; // again, the same: nothing to do
+
+	string_path tex;
+	string256 why;
+	if (!ResolveFontFamily(texture_base, tex, why, target_height))
+	{
+		Msg("! [font] RegisterFont '%s': %s", name, why);
+		if (!e) // remembered: XML that names it falls back to a stock font instead of asserting
+		{
+			e = xr_new<SExtraFont>();
+			e->name = name;
+			e->texture = texture_base;
+			e->shader = shader;
+			e->target_height = target_height;
+			e->font = nullptr;
+			e->fallback_logged = false;
+			m_extra_fonts.push_back(e);
+		}
+		return false;
+	}
+
+	if (!e)
+	{
+		e = xr_new<SExtraFont>();
+		e->name = name;
+		e->font = nullptr;
+		e->fallback_logged = false;
+		m_extra_fonts.push_back(e);
+	}
+	e->texture = texture_base;
+	e->shader = shader;
+	e->target_height = target_height;
+	if (!e->font)
+	{
+		e->font = xr_new<CGameFont>(shader, tex, 0u);
+		m_all_fonts.push_back(&e->font);
+	}
+	else
+	{
+		e->font->Initialize(shader, tex); // in place: whoever holds the font sees the new atlas
+	}
+#ifdef DEBUG
+	e->font->m_font_name = name;
+#endif
+	return true;
+}
+
+void CFontManager::InitializeExtraFonts()
+{
+	for (SExtraFont* e : m_extra_fonts)
+	{
+		if (!e->font)
+			continue;
+		string_path tex;
+		string256 why;
+		if (ResolveFontFamily(e->texture.c_str(), tex, why, e->target_height))
+			e->font->Initialize(e->shader.c_str(), tex);
+		else
+			Msg("! [font] '%s': %s (the previous atlas stays)", e->name.c_str(), why);
+	}
 }
 
 void CFontManager::Render()
@@ -109,6 +293,7 @@ void CFontManager::Render()
 void CFontManager::OnDeviceReset()
 {
 	InitializeFonts();
+	InitializeExtraFonts();
 }
 
 //--------------------------------------------------------------------

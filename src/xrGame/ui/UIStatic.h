@@ -53,6 +53,10 @@ public:
 	CUIStaticItem* GetStaticItem() { return &m_UIStaticItem; }
 	void SetTextureRect_script(Frect* pr) { m_UIStaticItem.SetTextureRect(*pr); }
 	const Frect* GetTextureRect_script() { return &m_UIStaticItem.GetTextureRect(); }
+	// The size in pixels of the current texture: the texture rect when it is known (a texture of an atlas, or one that was drawn
+	// once), else the size in the header of its .dds file, so a script can place a picture before it is first drawn. (0, 0) when
+	// there is no texture or its size cannot be read.
+	Fvector2 GetTextureSize_script();
 
 	void SetHeadingPivot(const Fvector2& p, const Fvector2& offset, bool fixedLT)
 	{
@@ -168,6 +172,8 @@ public:
 	CGameFont* GetFont() { return TextItemControl().GetFont(); }
 	void SetTextColor(u32 color) { TextItemControl().SetTextColor(color); }
 	u32 GetTextColor() { return TextItemControl().GetTextColor(); }
+	void SetTextAlpha(u32 alpha) { TextItemControl().SetTextAlpha(alpha); }
+	u32 GetTextAlpha() { return TextItemControl().GetTextAlpha(); }
 	void SetTextComplexMode(bool mode = true) { TextItemControl().SetTextComplexMode(mode); }
 	void SetTextAlignment(ETextAlignment al) { TextItemControl().SetTextAlignment(al); }
 	void SetVTextAlignment(EVTextAlignment al) { TextItemControl().SetVTextAlignment(al); }

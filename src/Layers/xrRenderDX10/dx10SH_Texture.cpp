@@ -14,6 +14,7 @@
 #include "../xrRender/dxRenderDeviceRender.h"
 
 #include "StateManager/dx10ShaderResourceStateCache.h"
+#include "../../xrCoop/coop_guarded_call.h"
 
 #define		PRIORITY_HIGH	12
 #define		PRIORITY_NORMAL	8
@@ -177,7 +178,7 @@ void CTexture::apply_load(u32 dwStage)
             textures_load_tasks.run([self]()
             {
                 if (this_thread_id != GetCurrentThreadId()) { PROF_THREAD("X-Ray PPL Thread") }
-                self->Load();
+                self->LoadTask();
             });
         }
         // Bind nothing (or whatever is already there, e.g. mid-flight from an
@@ -698,6 +699,17 @@ void CTexture::Load()
 			CHK_DX(HW.pDevice->CreateShaderResourceView(pSurface, NULL, &m_pSRView));
 	}
 	PostLoad();
+	flags.bLoading = false;
+	flags.bLoaded = true;
+}
+
+void CTexture::LoadTask()
+{
+	char why[256] = "";
+	if (coop::guard::call([](void* self) { static_cast<CTexture*>(self)->Load(); }, this, why, sizeof(why)))
+		return;
+	// Same state as a file that is not there; every reader of the texture spins on bLoading otherwise.
+	Msg("! [texture] load of '%s' failed: %s", cName.c_str(), why);
 	flags.bLoading = false;
 	flags.bLoaded = true;
 }

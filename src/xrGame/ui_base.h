@@ -45,7 +45,39 @@ struct CFontManager : public pureDeviceReset
 	void InitializeFont(CGameFont*& F, LPCSTR section, u32 flags = 0);
 	LPCSTR GetFontTexName(LPCSTR section);
 
+	// Fonts a script adds at run time (RegisterFont). Each lives in an entry that never moves, because m_all_fonts keeps the
+	// address of its `font`: rendering, the device reset (a new height can mean another atlas) and the destruction go through
+	// that list like for the stock fonts. A name stays in the list even if its atlas was missing (font == nullptr): XML that
+	// names it then gets a stock font instead of an assert.
+	struct SExtraFont
+	{
+		shared_str name;
+		shared_str texture; // the family given to RegisterFont (see ResolveFontFamily)
+		shared_str shader;
+		float target_height; // px the tier is picked for (0 = the screen height, followed through device resets)
+		CGameFont* font;
+		bool fallback_logged;
+	};
+	xr_vector<SExtraFont*> m_extra_fonts;
+
+	// The font an XML `font="name"` / Lua GetFontByName(name) means: the stock names (graffiti19, letterica18, medium, small,
+	// di ...) first, then the registered ones. nullptr if there is none.
+	CGameFont* FindByName(LPCSTR name);
+	// Adds (or, for a name already registered, updates in place) a font whose atlas family `texture_base` is found by
+	// ResolveFontFamily. Idempotent; false (and a log line, never an assert) for a name that is not usable, a name of a stock
+	// font, a missing or broken atlas. `shader` null or empty = "font". `target_height` > 0 (px, may be fractional) picks the
+	// atlas tier for that height instead of the screen's (a UI laid out on a part of the screen); calling again with another
+	// value switches the tier in place. 0 (the default) = the screen height, followed when the device is reset.
+	bool RegisterFont(LPCSTR name, LPCSTR texture_base, LPCSTR shader, float target_height = 0.f);
+	// For XML: a name that was given to RegisterFont but has no font (its atlas is missing) -> the stock font to use instead
+	// (logged once per name); nullptr for any other name.
+	CGameFont* ExtraFallback(LPCSTR name);
+
 	virtual void OnDeviceReset();
+
+private:
+	SExtraFont* FindExtra(LPCSTR name);
+	void InitializeExtraFonts();
 };
 
 

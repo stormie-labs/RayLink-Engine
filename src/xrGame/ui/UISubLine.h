@@ -20,7 +20,8 @@ public:
 	CUISubLine& operator=(const CUISubLine& other);
 
 	const CUISubLine* Cut2Pos(int i);
-	void Draw(CGameFont* pFont, float x, float y) const;
+	// alpha: 0..255, multiplies the alpha of the colour (255 = as it is)
+	void Draw(CGameFont* pFont, float x, float y, u32 alpha = 255) const;
 
 	xr_string m_text;
 	u32 m_color;

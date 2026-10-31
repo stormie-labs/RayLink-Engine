@@ -377,7 +377,8 @@ void CControllerPsyHit::death_glide_end()
 		// plays the end of the tube on its actor
 		if (const CEntityAlive* who = target())
 		{
-			m_object->Hit_Psy(const_cast<CEntityAlive*>(who), monster->m_tube_damage);
+			if (!coop::npc_ai::player_down(who)) // something else put him down on the way: nothing more lands
+				m_object->Hit_Psy(const_cast<CEntityAlive*>(who), monster->m_tube_damage);
 			coop::monster_fx::host_send(who, m_object, coop::monster_fx::kControllerTube, coopEnd, 0.f);
 		}
 		m_time_last_tube = Device.dwTimeGlobal;
@@ -387,7 +388,8 @@ void CControllerPsyHit::death_glide_end()
 	monster->m_sound_tube_hit_left.play_at_pos(Actor(), Fvector().set(-1.f, 0.f, 1.f), sm_2D);
 	monster->m_sound_tube_hit_right.play_at_pos(Actor(), Fvector().set(1.f, 0.f, 1.f), sm_2D);
 
-	m_object->Hit_Psy(Actor(), monster->m_tube_damage);
+	if (!coop::npc_ai::player_down(Actor())) // Anomaly Coop
+		m_object->Hit_Psy(Actor(), monster->m_tube_damage);
 
 	m_time_last_tube = Device.dwTimeGlobal;
 	stop();

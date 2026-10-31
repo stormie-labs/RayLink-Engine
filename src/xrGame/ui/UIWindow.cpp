@@ -14,6 +14,9 @@
 
 poolSS<_12b, 128> ui_allocator;
 
+// How many windows have SetClipChildren(true): while there is none, the hover test never looks at the ancestors.
+static u32 s_clip_children_windows = 0;
+
 // #define LOG_ALL_WNDS
 #ifdef LOG_ALL_WNDS
 	int ListWndCount = 0;
@@ -145,7 +148,9 @@ CUIWindow::CUIWindow()
 	  //dwHintDelay(1000),
 	  //bShowHint(false),
 	  //m_sHint(""),
-	  m_bCustomDraw(false)
+	  m_bCustomDraw(false),
+	  m_bClipChildren(false),
+	  m_bFlushText(false)
 {
 	Show(true);
 	Enable(true);
@@ -162,6 +167,7 @@ CUIWindow::~CUIWindow()
 {
 	VERIFY(!(GetParent()&&IsAutoDelete()));
 
+	SetClipChildren(false);
 	erase_capture_subtree(this);
 
 	//if (m_pHint)
@@ -207,16 +213,70 @@ CUIWindow::~CUIWindow()
 }
 
 
+void CUIWindow::SetClipChildren(bool on)
+{
+	if (on == m_bClipChildren)
+		return;
+	m_bClipChildren = on;
+	if (on)
+		++s_clip_children_windows;
+	else if (s_clip_children_windows)
+		--s_clip_children_windows;
+}
+
+bool CUIWindow::ClippedOut(const Fvector2& abs_pos) const
+{
+	if (!s_clip_children_windows)
+		return false;
+	for (CUIWindow* p = m_pParentWnd; p; p = p->m_pParentWnd)
+	{
+		if (!p->m_bClipChildren)
+			continue;
+		Frect r;
+		p->GetAbsoluteRect(r);
+		if (!r.in(abs_pos.x, abs_pos.y))
+			return true;
+	}
+	return false;
+}
+
+void CUIWindow::DrawOrdered()
+{
+	if (!m_bFlushText)
+	{
+		Draw();
+		return;
+	}
+	UI().RenderFont();
+	Draw();
+	UI().RenderFont();
+}
+
 void CUIWindow::Draw()
 {
 	PROF_EVENT("CUIWindow::Draw");
 	xrCriticalSectionGuard guard(csUi);
+	const bool clip = m_bClipChildren;
+	if (clip)
+	{
+		Frect r;
+		GetAbsoluteRect(r);
+		// Text is only queued while windows draw and goes out in one batch afterwards, when the scissor is long gone: the
+		// text queued so far goes out now, before the scissor (it is not ours to clip), and ours under it, below.
+		UI().RenderFont();
+		UI().PushScissor(r);
+	}
 	for (CUIWindow* W : m_ChildWndList)
 	{
 		if (!W)		continue;
 		if (!W->IsShown())		continue;
 		if (W->GetCustomDraw())	continue;
-		W->Draw();
+		W->DrawOrdered();
+	}
+	if (clip)
+	{
+		UI().RenderFont();
+		UI().PopScissor();
 	}
 #ifdef DEBUG
 	if (g_show_wnd_rect2) {
@@ -246,7 +306,7 @@ void CUIWindow::Update()
 		Fvector2 temp = GetUICursor().GetCursorPosition();
 		Frect r;
 		GetAbsoluteRect(r);
-		cursor_on_window = !!r.in(temp) && HitClipPass(temp);
+		cursor_on_window = !!r.in(temp) && HitClipPass(temp) && !ClippedOut(temp);
 		// RECEIVE and LOST focus
 		if (m_bCursorOverWindow != cursor_on_window)
 		{

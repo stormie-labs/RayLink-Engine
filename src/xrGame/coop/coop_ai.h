@@ -40,6 +40,9 @@ bool is_remote_player(const CObject* obj);
 // the engine (he can be revived); one dead for good, out of the run or being respawned is no enemy (CEnemyManager::useful).
 // A wounded one still is: an enemy may finish him.
 bool player_out_of_fight(const CObject* obj);
+// Live 2026-10-30 (owner): "monsters keep at you after you go down". For a monster a wounded player is out too: it leaves
+// him and turns to whoever is standing (death::monster_leaves; CEnemyManager::useful, CMonsterEnemyManager, the poltergeist).
+bool player_down(const CObject* obj);
 
 // Host, main thread, every frame of a driven player proxy (remote::apply): refreshes its light estimate
 // (twice a second) and its view direction.
@@ -72,9 +75,9 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance);
 // parked), so the objects around them are updated as often as the ones around the host's camera. Anywhere else (a client,
 // no session, a world that is not up) it empties the list, which is the stock behaviour.
 void viewers_frame();
-// Audit A4 (2026-10-24): the nearest living player to `pos` within `max_dist` - this machine's actor or (host) the
-// character of a player who is in the world, alive or downed; nullptr when none. Engine code that only knew Actor()
-// (the poltergeist's senses) asks this.
+// Audit A4 (2026-10-24): the nearest player a monster can go for within `max_dist` of `pos` - this machine's actor or (host)
+// the character of a player who is in the world and not down (player_down); nullptr when none. Engine code that only knew
+// Actor() (the poltergeist's senses) asks this.
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
 // Audit A6: every such player within `max_dist` of `pos` (this machine's actor first); returns how many were written.
 constexpr u32 kMaxNearPlayers = 8;

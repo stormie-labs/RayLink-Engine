@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "GameFont.h"
+#include "font_family_rules.h"
 #ifndef _EDITOR
 #include "Render.h"
 #endif
@@ -157,6 +158,162 @@ ENGINE_API LPCSTR GetFontTextureName(LPCSTR section)
 
 	Msg("~[font] h=%u [%s] no usable rung, forcing %s", h, section, s_legacy_rungs[LEGACY_DEFAULT_IDX].key);
 	return pSettings->r_string(section, s_legacy_rungs[LEGACY_DEFAULT_IDX].key);
+}
+
+// ---------------------------------------------------------------- font families (fonts registered by scripts)
+
+// The .ini of the atlas `base` (language suffix applied, as CGameFont::Initialize does) can be read as a whole: a missing key
+// there is an R_ASSERT in Initialize, and a data error of a script's font must not take the game down.
+static bool font_ini_usable(LPCSTR base, string256& why)
+{
+	string_path resolved, buf, fn;
+	resolve_font_texture(base, resolved);
+	xr_strcpy(buf, sizeof(buf), resolved);
+	if (strext(buf))
+		*strext(buf) = 0;
+	if (!FS.exist(fn, "$game_textures$", buf, ".ini"))
+	{
+		xr_sprintf(why, "no %s.ini", buf);
+		return false;
+	}
+	string_path dds;
+	if (!FS.exist(dds, "$game_textures$", buf, ".dds"))
+	{
+		xr_sprintf(why, "no %s.dds", buf);
+		return false;
+	}
+
+	CInifile* ini = CInifile::Create(fn);
+	bool ok = true;
+	string64 key;
+	if (ini->section_exist("mb_symbol_coords"))
+	{
+		ok = ini->line_exist("mb_symbol_coords", "height");
+	}
+	else if (ini->section_exist("symbol_coords"))
+	{
+		ok = ini->line_exist("symbol_coords", "height");
+		for (u32 i = 0; ok && i < 0x100; ++i)
+		{
+			xr_sprintf(key, sizeof(key), "%03d", i);
+			ok = ini->line_exist("symbol_coords", key);
+		}
+	}
+	else if (ini->section_exist("char widths"))
+	{
+		ok = ini->line_exist("char widths", "height");
+		for (u32 i = 0; ok && i < 0x100; ++i)
+		{
+			xr_sprintf(key, sizeof(key), "%d", i);
+			ok = ini->line_exist("char widths", key);
+		}
+	}
+	else
+	{
+		ok = ini->section_exist("font_size") && ini->line_exist("font_size", "height") &&
+			ini->line_exist("font_size", "width") && ini->line_exist("font_size", "cpl");
+	}
+	CInifile::Destroy(ini);
+	if (!ok)
+		xr_sprintf(why, "%s.ini is not a complete font description", buf);
+	return ok;
+}
+
+ENGINE_API bool ResolveFontFamily(LPCSTR base, string_path& out_texture, string256& why, float target_height)
+{
+	why[0] = 0;
+	out_texture[0] = 0;
+	if (!base || !base[0])
+	{
+		xr_strcpy(why, sizeof(why), "empty texture name");
+		return false;
+	}
+
+	string_path family;
+	if (xr_strlen(base) >= sizeof(family))
+	{
+		xr_strcpy(why, sizeof(why), "texture name too long");
+		return false;
+	}
+	xr_strcpy(family, sizeof(family), base);
+	for (char* c = family; *c; ++c)
+		if (*c == '/')
+			*c = '\\';
+	if (strext(family)) // "ui\\x.dds" and "ui\\x" name the same family
+		*strext(family) = 0;
+	if (!family[0])
+	{
+		xr_strcpy(why, sizeof(why), "empty texture name");
+		return false;
+	}
+
+	// the directory (with its backslash) and the name of the family
+	string_path dir;
+	LPCSTR name = family;
+	dir[0] = 0;
+	if (LPCSTR slash = strrchr(family, '\\'))
+	{
+		name = slash + 1;
+		strncpy_s(dir, sizeof(dir), family, size_t(name - family));
+	}
+	if (!name[0])
+	{
+		xr_sprintf(why, "'%s' has no file name", base);
+		return false;
+	}
+
+	const float h = target_height > 0.f ? target_height : float(Device.dwHeight ? Device.dwHeight : 1);
+	LPCSTR lang = pSettings->r_string("string_table", "font_prefix");
+
+	string_path name_lc, lang_lc;
+	xr_strcpy(name_lc, sizeof(name_lc), name);
+	xr_strlwr(name_lc);
+	xr_strcpy(lang_lc, sizeof(lang_lc), lang ? lang : "");
+	xr_strlwr(lang_lc);
+
+	// the tiers: <name>_h<N><lang>.ini in the directory of the family
+	std::vector<uint32_t> authored;
+	if (xr_vector<LPSTR>* list = FS.file_list_open("$game_textures$", dir, FS_ListFiles | FS_RootOnly))
+	{
+		for (LPSTR file : *list)
+		{
+			string_path file_lc;
+			xr_strcpy(file_lc, sizeof(file_lc), file);
+			xr_strlwr(file_lc);
+			if (const uint32_t n = font_family::parse_tier_file(file_lc, name_lc, lang_lc))
+				authored.push_back(n);
+		}
+		FS.file_list_close(list);
+	}
+	const std::vector<uint32_t> tiers = font_family::by_preference(authored, h); // nearest first
+
+	string256 reason;
+	reason[0] = 0;
+	for (const uint32_t n : tiers)
+	{
+		string_path tier;
+		xr_sprintf(tier, sizeof(tier), "%s_h%u", family, n);
+		if (font_ini_usable(tier, reason))
+		{
+			xr_strcpy(out_texture, sizeof(out_texture), tier);
+			Msg("* [font] h=%.1f family %s -> %s (authored %u, %+.1f%%)", h, family, tier, n, 100.f * (float(n) / h - 1.f));
+			return true;
+		}
+		Msg("~[font] h=%.1f family %s: %s skipped (%s)", h, family, tier, reason);
+	}
+
+	if (font_ini_usable(family, reason))
+	{
+		xr_strcpy(out_texture, sizeof(out_texture), family);
+		Msg("* [font] h=%.1f family %s -> %s (one atlas for every height)", h, family, family);
+		return true;
+	}
+	if (tiers.empty())
+		xr_sprintf(why, "no atlas for '%s': %s (and no %s_h<N> files)", family, reason, family);
+	else
+		xr_sprintf(why, "no usable atlas for '%s': %u tiers were skipped (see the log), the single atlas: %s", family,
+		    u32(tiers.size()), reason);
+	return false;
 }
 
 CGameFont::CGameFont(LPCSTR section, u32 flags)

@@ -49,6 +49,10 @@ public:
 	                        const shared_str& shader_name = "hud\\default");
 	static void InitTexture(const shared_str& texture_name, const shared_str& shader_name, ui_shader& out_shader,
 	                        Frect& out_rect);
+	// The size in pixels of a texture file under $game_textures$ ("ui\\x", no extension), read from the header of its .dds without
+	// the renderer (a file texture has no size for the UI until it is first drawn). false (and 0, 0) when there is no such
+	// .dds. Cached by name.
+	static bool GetTextureFileSize(const shared_str& texture_name, Fvector2& out);
 	static float GetTextureHeight(const shared_str& texture_name);
 	static float GetTextureWidth(const shared_str& texture_name);
 	static Frect GetTextureRect(const shared_str& texture_name);

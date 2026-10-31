@@ -101,6 +101,35 @@ CGameFont* GetFontLetterica25()
 }
 
 
+// A font by the name XML gives it ("letterica18", "small" ...) or a script registered it with: nil when there is none.
+CGameFont* GetFontByName(LPCSTR name)
+{
+	if (g_dedicated_server || !GamePersistent().m_pUI_core)
+		return nullptr;
+	return mngr().FindByName(name);
+}
+
+// RegisterFont(name, texture_base[, shader[, target_height]]) -> bool: see CFontManager::RegisterFont
+bool RegisterFont4(LPCSTR name, LPCSTR texture_base, LPCSTR shader, float target_height)
+{
+	if (g_dedicated_server || !GamePersistent().m_pUI_core)
+	{
+		Msg("! [font] RegisterFont '%s': the UI is not up", name ? name : "(nil)");
+		return false;
+	}
+	return mngr().RegisterFont(name, texture_base, shader, target_height);
+}
+
+bool RegisterFont3(LPCSTR name, LPCSTR texture_base, LPCSTR shader)
+{
+	return RegisterFont4(name, texture_base, shader, 0.f);
+}
+
+bool RegisterFont2(LPCSTR name, LPCSTR texture_base)
+{
+	return RegisterFont4(name, texture_base, nullptr, 0.f);
+}
+
 int GetARGB(u16 a, u16 r, u16 g, u16 b)
 {
 	return color_argb(a, r, g, b);
@@ -195,6 +224,10 @@ void CUIWindow::script_register(lua_State* L)
 		def("GetFontGraffiti32Russian", &GetFontGraffiti32Russian),
 		def("GetFontGraffiti50Russian", &GetFontGraffiti50Russian),
 		def("GetFontLetterica25", &GetFontLetterica25),
+			def("GetFontByName", &GetFontByName),
+			def("RegisterFont", &RegisterFont2),
+			def("RegisterFont", &RegisterFont3),
+			def("RegisterFont", &RegisterFont4),
 		def("GetCursorPosition", &GetCursorPosition_script),
 		def("SetCursorPosition", &SetCursorPosition_script),
 		def("FitInRect", &fit_in_rect),
@@ -208,6 +241,10 @@ void CUIWindow::script_register(lua_State* L)
 		.def("SetAutoDelete", &CUIWindow::SetAutoDelete)
 		.def("IsAutoDelete", &CUIWindow::IsAutoDelete)
 
+		.def("SetFlushText", &CUIWindow::SetFlushText)
+		.def("IsFlushText", &CUIWindow::GetFlushText)
+		.def("SetClipChildren", &CUIWindow::SetClipChildren)
+		.def("IsClipChildren", &CUIWindow::GetClipChildren)
 		.def("IsCursorOverWindow", &CUIWindow::CursorOverWindow)
 		.def("FocusReceiveTime", &CUIWindow::FocusReceiveTime)
 		.def("GetAbsoluteRect", &CUIWindow::GetAbsoluteRect)
@@ -312,6 +349,13 @@ void CUIWindow::script_register(lua_State* L)
 			value("epi_new_network_game", CUIMMShniaga::epi_new_network_game)
 		]
 		.def("SetVisibleMagnifier", &CUIMMShniaga::SetVisibleMagnifier)
+		.def("GetPage", &CUIMMShniaga::GetPage)
+		.def("GetButtonCount", &CUIMMShniaga::GetButtonCount)
+		.def("GetButtonName", &CUIMMShniaga::GetButtonName)
+		.def("GetButtonCaption", &CUIMMShniaga::GetButtonCaption)
+		.def("PressButton", &CUIMMShniaga::PressButton)
+		.def("SetSilent", &CUIMMShniaga::SetSilent)
+		.def("IsSilent", &CUIMMShniaga::IsSilent)
 		.def("SetPage", &CUIMMShniaga::SetPage)
 		.def("ShowPage", &CUIMMShniaga::ShowPage),
 

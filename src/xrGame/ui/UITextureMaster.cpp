@@ -115,6 +115,41 @@ void CUITextureMaster::InitTexture(const shared_str& texture_name, CUIStaticItem
 		tc->CreateShader(texture_name.c_str(), shader_name.c_str());
 }
 
+bool CUITextureMaster::GetTextureFileSize(const shared_str& texture_name, Fvector2& out)
+{
+	static xr_map<shared_str, Fvector2> s_sizes; // (0, 0) = looked, no readable .dds
+	out.set(0.f, 0.f);
+	if (!texture_name.size())
+		return false;
+	auto it = s_sizes.find(texture_name);
+	if (it == s_sizes.end())
+	{
+		Fvector2 sz;
+		sz.set(0.f, 0.f);
+		string_path base, fn;
+		xr_strcpy(base, sizeof(base), texture_name.c_str());
+		if (strext(base))
+			*strext(base) = 0;
+		if (FS.exist(fn, "$game_textures$", base, ".dds"))
+		{
+			if (IReader* F = FS.r_open(fn))
+			{
+				u32 head[5] = {}; // 'DDS ', dwSize, dwFlags, dwHeight, dwWidth
+				if (F->length() >= int(sizeof(head)))
+				{
+					F->r(head, sizeof(head));
+					if (head[0] == 0x20534444 && head[3] > 0 && head[4] > 0 && head[3] <= 65536 && head[4] <= 65536)
+						sz.set(float(head[4]), float(head[3]));
+				}
+				FS.r_close(F);
+			}
+		}
+		it = s_sizes.insert(std::make_pair(texture_name, sz)).first;
+	}
+	out = it->second;
+	return it->second.x > 0.f && it->second.y > 0.f;
+}
+
 Frect CUITextureMaster::GetTextureRect(const shared_str& texture_name)
 {
 	TEX_INFO info = FindItem(texture_name);

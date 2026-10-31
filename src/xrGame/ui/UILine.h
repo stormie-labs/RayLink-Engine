@@ -55,7 +55,7 @@ public:
 	void Clear();
 	void ProcessNewLines();
 
-	void Draw(CGameFont* pFont, float x, float y) const;
+	void Draw(CGameFont* pFont, float x, float y, u32 alpha = 255) const;
 	bool IsEmpty() { return m_subLines.empty(); }
 
 	int GetSize();

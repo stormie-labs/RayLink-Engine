@@ -78,6 +78,17 @@ void CUIStatic::InitTextureEx(LPCSTR tex_name, LPCSTR sh_name)
 	m_TextureName = tex_name;
 }
 
+Fvector2 CUIStatic::GetTextureSize_script()
+{
+	Fvector2 sz;
+	sz.set(0.f, 0.f);
+	if (m_TextureName.size() && CUITextureMaster::GetTextureFileSize(shared_str(m_TextureName.c_str()), sz))
+		return sz;
+	// No such file: a region of an atlas, its rectangle is its size
+	const Frect& r = m_UIStaticItem.GetTextureRect();
+	return sz.set(r.width(), r.height());
+}
+
 void CUIStatic::Draw()
 {
 	PROF_EVENT("CUIStatic::Draw");

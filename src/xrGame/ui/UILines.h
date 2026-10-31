@@ -19,6 +19,10 @@ public:
 	//--
 	void SetTextColor(u32 color);
 	u32 GetTextColor() { return m_dwTextColor; }
+	// The alpha the whole text is drawn with, 0..255, on top of the alpha of its colours (255 = as they are). Applied when
+	// the text is drawn: no reparse, no layout, so it can change every frame (SetTextColor reparses a text in complex mode).
+	void SetTextAlpha(u32 alpha) { m_dwTextAlpha = alpha > 255 ? 255 : alpha; }
+	u32 GetTextAlpha() const { return m_dwTextAlpha; }
 	void SetFont(CGameFont* pFont);
 	CGameFont* GetFont() { return m_pFont; }
 	void SetTextAlignment(ETextAlignment al) { m_eTextAlign = al; }
@@ -67,6 +71,7 @@ protected:
 	ETextAlignment m_eTextAlign;
 	EVTextAlignment m_eVTextAlign;
 	u32 m_dwTextColor;
+	u32 m_dwTextAlpha;
 
 	CGameFont* m_pFont;
 

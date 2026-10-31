@@ -21,6 +21,7 @@ CUILines::CUILines()
 	m_eTextAlign = CGameFont::alLeft;
 	m_eVTextAlign = valTop;
 	m_dwTextColor = 0xffffffff;
+	m_dwTextAlpha = 255;
 	m_TextOffset.set(0.0f, 0.0f);
 	m_text = "";
 	m_wndSize.set(0.0f, 0.0f);
@@ -393,7 +394,8 @@ void CUILines::Draw(float x, float y)
 		return;
 
 	R_ASSERT(m_pFont);
-	m_pFont->SetColor(m_dwTextColor);
+	m_pFont->SetColor(m_dwTextAlpha >= 255 ? m_dwTextColor
+		                                   : subst_alpha(m_dwTextColor, (color_get_A(m_dwTextColor) * m_dwTextAlpha + 127) / 255));
 
 	if (!uFlags.is(flComplexMode))
 	{
@@ -445,7 +447,7 @@ void CUILines::Draw(float x, float y)
 		for (int i = 0; i < (int)size; i++)
 		{
 			pos.x = x + GetIndentByAlign();
-			m_lines[i].Draw(m_pFont, pos.x, pos.y);
+			m_lines[i].Draw(m_pFont, pos.x, pos.y, m_dwTextAlpha);
 			pos.y += height;
 		}
 	}

@@ -12,11 +12,24 @@
 // CALifeUpdateManager::change_level itself, to the same temporary name, and moved by level_change_commit().
 // After a save the oldest slot files beyond coop_autosave_count are deleted (slots_to_prune).
 //
+// One ring per game (menu Task 1): set_game(id) puts the ring in the namespace of a game, coop_auto_<id>_<N>; the ring, the
+// choice of the next slot, the pruning and the Restore list see that game's slots only. No game = the old shared
+// coop_auto_<N>, which are never touched while a game is set. coop_auto_tmp / coop_auto_bak stay shared.
+//
 // Console (host settings): coop_autosave_interval (minutes, 0 = off, default 10), coop_autosave_count (1..50, default
-// 10), coop_autosave_now. Lua: coop.autosave.suspend(on) for the Restore window.
+// 10), coop_autosave_now. Lua (table coop.autosave):
+//   suspend(on) -> bool            the Restore window holds / lets go the pause of the autosaves.
+//   set_game(id) -> bool           the ring belongs to game `id` ([0-9a-z-], 1..32); "" or nil = no game (the old ring). true =
+//                                  accepted; false = not a valid id (logged), the old shared ring is used. Idempotent, safe at
+//                                  any time (before a level exists, in a session, from a save callback).
+//   game() -> string               the game that is set ("" = none).
+//   slot_name(index[, id]) -> string | nil   "coop_auto_<id>_<index>" (id defaults to the game that is set).
+//   parse_slot(stem[, id]) -> number | nil   the slot number of a file name without extension in that ring, else nil.
 #pragma once
 
 #include "xrCoop/coop_autosave_rules.h"
+
+#include <string>
 
 struct lua_State;
 
@@ -35,6 +48,15 @@ void print_status(); // coop_status section (sync::print_status)
 void register_console(); // from coop::register_console_commands
 // Fills coop.autosave (suspend); called by coop_checkpoints_script_registrator once the `coop` table exists.
 void register_lua(lua_State* L);
+
+// The game whose ring the host's autosaves use ("" = the old shared one; Lua: coop.autosave.set_game). Returns false when
+// `id` is not a valid game id (then the old shared ring is used, and it is logged). Nothing to do with a session: it works
+// before a level exists and any number of times; the same game again changes nothing. A change of game drops what the
+// session learned about the old ring's slots (bad slots) and the autosave request / timer interval that waited for the old
+// one. A game is NOT dropped when a session starts or ends (the window sets it first): the same world hosted again keeps its
+// ring. A level change save already in progress finishes in the game it began in.
+bool set_game(const std::string& id);
+const std::string& game(); // the game that is set
 
 // Host in a session: write a save at the next safe frame (the host's character is up and awake, the level is not
 // coming up). A save that waits for that longer than 2 minutes is written anyway; a request that finds no way to save

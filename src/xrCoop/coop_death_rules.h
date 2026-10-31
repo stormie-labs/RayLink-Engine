@@ -433,6 +433,19 @@ inline bool look_locked(uint8_t life)
 	return life == kLifeDead || life == kLifeSpectating || life == kLifeRespawning;
 }
 
+// Live 2026-10-30 (owner): "monsters keep at you after you go down". Nobody hunts a player out of the run. A wounded one
+// bleeds out on his own and a teammate may still get him up: a stalker may finish him, a monster leaves him and turns to
+// whoever is standing.
+inline bool out_of_fight(uint8_t life)
+{
+	return life == kLifeDead || life == kLifeSpectating || life == kLifeRespawning;
+}
+
+inline bool monster_leaves(uint8_t life)
+{
+	return life == kLifeWounded || out_of_fight(life);
+}
+
 // The respawn a character is owed in his world (fix round 1, M-1 and M-3). The engine keeps it with the character (his
 // custom data), so a save written while he is dead or evacuated carries it to the world loaded from that save (a level
 // change, an autosave restore), and a new game or another save does not have it. Set when the host decides a checkpoint

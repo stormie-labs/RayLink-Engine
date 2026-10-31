@@ -145,14 +145,14 @@ void CUILine::ProcessNewLines()
 	setTextFromSublines();
 }
 
-void CUILine::Draw(CGameFont* pFont, float x, float y) const
+void CUILine::Draw(CGameFont* pFont, float x, float y, u32 alpha) const
 {
 	float length = 0;
 	int size = m_subLines.size();
 
 	for (int i = 0; i < size; i++)
 	{
-		m_subLines[i].Draw(pFont, x + length, y);
+		m_subLines[i].Draw(pFont, x + length, y, alpha);
 		float ll = pFont->SizeOf_(m_subLines[i].m_text.c_str()); //. all ok
 		UI().ClientToScreenScaledWidth(ll);
 		length += ll;

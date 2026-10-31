@@ -60,6 +60,7 @@
 #include "smart_cover_animation_selector.h"
 #include "../../coop/coop_remote.h" // Anomaly Coop
 #include "../../coop/coop_ai.h" // Anomaly Coop
+#include "../../coop/coop_join.h" // Anomaly Coop
 #include "smart_cover_animation_planner.h"
 #include "smart_cover_planner_target_selector.h"
 #include "../../../xrEngine/CameraBase.h"
@@ -831,6 +832,12 @@ BOOL CAI_Stalker::net_Spawn(CSE_Abstract* DC)
 
 void CAI_Stalker::net_Destroy()
 {
+	// Anomaly Coop: a mirror's level goes down with a puppet ahead of the torch it wears (apply_creature_flags), and
+	// CAttachmentOwner::net_Destroy asserts on what is still attached. The visual is needed here, so before inherited.
+	if (coop::join::world_is_mirror())
+		while (!attached_objects().empty())
+			CAttachmentOwner::detach(&attached_objects().back()->item());
+
 #ifdef HOLDERCUSTOM_NEW
 	detach_Holder();
 #endif

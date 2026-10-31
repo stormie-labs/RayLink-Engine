@@ -37,6 +37,19 @@ public:
 	}; //enum	enum_page_id
 	void SetPage(enum_page_id page_id, LPCSTR xml_file, LPCSTR xml_path);
 	void ShowPage(enum_page_id page_id);
+
+	// Script access to what the widget shows, so a script can draw its own look while the widget stays the source of truth for
+	// what the buttons are in the state the menu was opened in (the XML lists, with the buttons mods add there). The list is
+	// built when the widget is created, so it is valid as soon as it exists. Indexes are 0-based.
+	int GetPage() const { return int(m_page); } // enum_page_id of the list shown: 0 main, 1 new game, 2 network game
+	int GetButtonCount(); // buttons of the page that is shown
+	LPCSTR GetButtonName(int i); // the name a click is reported under (the callbacks of the script window are named by it); nil out of range
+	LPCSTR GetButtonCaption(int i); // the translated caption; nil out of range
+	bool PressButton(LPCSTR name); // what a click on that button of the shown page does (same SendMessage route); false when there is none
+	// Silent: the widget stays alive (its music keeps playing and looping, its lists keep being valid and PressButton works) but
+	// draws nothing, takes no mouse or key, does not react to the cursor and plays no wheel or click sound.
+	void SetSilent(bool on);
+	bool IsSilent() const { return m_silent; }
 protected:
 	typedef enum
 	{
@@ -50,6 +63,8 @@ protected:
 	void SelectBtn(CUIWindow* btn);
 	int BtnCount();
 	void OnBtnClick();
+	xr_vector<CUITextWnd*>* PageList(enum_page_id page); // nullptr for epi_none
+	void ApplyMagnifier();
 
 	void ProcessEvent(EVENT ev);
 
@@ -74,6 +89,9 @@ protected:
 	xr_vector<CUITextWnd*> m_buttons;
 	xr_vector<CUITextWnd*> m_buttons_new;
 	xr_vector<CUITextWnd*> m_buttons_new_network;
+
+	bool m_silent;
+	bool m_magnifier_visible;
 
 	int m_selected_btn;
 	enum_page_id m_page;

@@ -628,10 +628,12 @@ void hold_controls(CActor* a)
 	}
 	if (!g_me.inv_blocked)
 	{
-		g_me.inv_prev = a->inventory_disabled();
-		a->set_inventory_disabled(true);
+		// Fell in a grip (no input of ours: the grip holds the actor): the flag is the grip's and goes with it, not back after the revive
+		g_me.inv_prev = g_me.input_installed && a->inventory_disabled();
 		g_me.inv_blocked = true;
 	}
+	if (!a->inventory_disabled()) // the end of that grip took it off under us
+		a->set_inventory_disabled(true);
 	CActorCondition& c = a->conditions();
 	g_hook_owner.store(&c);
 	c.ClearWounds(); // the bleed-out timer is the bleeding: wounds would only shorten it twice

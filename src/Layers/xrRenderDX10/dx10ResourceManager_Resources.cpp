@@ -649,7 +649,7 @@ CTexture* CResourceManager::_CreateTexture(LPCSTR _Name)
 			textures_load_tasks.run([=]()
 			{
 				if (this_thread_id != GetCurrentThreadId()) { PROF_THREAD("X-Ray PPL Thread") }
-				T->Load();
+				T->LoadTask();
 			});
 		}
 		return T;

@@ -767,54 +767,18 @@ bool CUIXmlInit::InitFont(CUIXml& xml_doc, LPCSTR path, int index, u32& color, C
 	}
 	else
 	{
-		if (!xr_strcmp(font_name, GRAFFITI19_FONT_NAME))
+		// the stock names (graffiti19 .. di) and the fonts scripts registered (CFontManager::RegisterFont)
+		pFnt = UI().Font().FindByName(font_name);
+		if (!pFnt)
 		{
-			pFnt = UI().Font().pFontGraffiti19Russian;
-		}
-		else if (!xr_strcmp(font_name, GRAFFITI22_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontGraffiti22Russian;
-		}
-		else if (!xr_strcmp(font_name, GRAFFITI32_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontGraffiti32Russian;
-		}
-		else if (!xr_strcmp(font_name, GRAFFITI50_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontGraffiti50Russian;
-		}
-		else if (!xr_strcmp(font_name, "arial_14"))
-		{
-			pFnt = UI().Font().pFontArial14;
-		}
-		else if (!xr_strcmp(font_name, MEDIUM_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontMedium;
-		}
-		else if (!xr_strcmp(font_name, SMALL_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontStat;
-		}
-		else if (!xr_strcmp(font_name, LETTERICA16_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontLetterica16Russian;
-		}
-		else if (!xr_strcmp(font_name, LETTERICA18_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontLetterica18Russian;
-		}
-		else if (!xr_strcmp(font_name, LETTERICA25_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontLetterica25;
-		}
-		else if (!xr_strcmp(font_name, DI_FONT_NAME))
-		{
-			pFnt = UI().Font().pFontDI;
-		}
-		else
-		{
-			R_ASSERT3(0, "unknown font", font_name);
-			pFnt = NULL;
+			// a name that was registered but whose atlas is missing: a stock font and a log line, not a crash; a name nobody
+			// ever heard of stays the typo it is
+			pFnt = UI().Font().ExtraFallback(font_name);
+			if (!pFnt)
+			{
+				R_ASSERT3(0, "unknown font", font_name);
+				pFnt = NULL;
+			}
 		}
 	}
 	return true;

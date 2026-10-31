@@ -35,6 +35,9 @@ public:
 
 	void Preload();
 	void Load();
+#if defined(USE_DX10) || defined(USE_DX11)
+	void LoadTask(); // Load() for a task group nobody waits on: a failure ends here, not in the group
+#endif	//	USE_DX10
 	void PostLoad();
 	void Unload(void);
 	//	void								Apply			(u32 dwStage);

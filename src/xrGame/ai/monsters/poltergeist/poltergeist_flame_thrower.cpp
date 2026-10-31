@@ -10,6 +10,7 @@
 #include "../../../actorEffector.h"
 #include "../ai_monster_effector.h"
 #include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_ai.h" // Anomaly Coop: player_down
 
 CPolterFlame::CPolterFlame(CPoltergeist* polter) : inherited(polter)
 {
@@ -162,7 +163,8 @@ void CPolterFlame::update_schedule()
 			if (elem->time_started + m_time_fire_delay < time()) select_state(elem, eFire);
 			break;
 		case eFire:
-			if (elem->time_started + m_time_fire_play < time()) select_state(elem, eStop);
+			// Anomaly Coop: a flame already burning goes out on a player who is down, its hits skip HitEntity
+			if (elem->time_started + m_time_fire_play < time() || coop::npc_ai::player_down(elem->target_object)) select_state(elem, eStop);
 			else
 			{
 				// check if we need test hit to enemy

@@ -120,4 +120,16 @@ public:
 // Resolves which atlas key of `section` to load for the current Device.dwHeight.
 ENGINE_API LPCSTR GetFontTextureName(LPCSTR section);
 
+// The atlas of a font family that is not described by a config section (a font a script registers at run time).
+// `base` is a path under $game_textures$ without extension, e.g. "ui\\my_font". The family is the files
+//   <base>_h<N>.ini + .dds   an atlas authored for a screen N px high (the same idea as the texture_h<N> keys of a section)
+//   <base>.ini + .dds        one atlas for every height (used only when no <base>_h<N> is usable)
+// The one with the N nearest to Device.dwHeight on the log scale wins (a tie goes to the larger N), among those whose .ini
+// is a complete atlas description and whose .dds exists. The language suffix of the string table (font_prefix) is
+// honoured exactly as for the stock fonts. Never asserts: on false `why` says what is wrong and the log has the details;
+// on true `out_texture` is the family member to hand to CGameFont::Initialize (the language suffix is added there).
+// `target_height` > 0 (px, may be fractional) is the height to pick the tier for instead of Device.dwHeight: text that is
+// laid out for a smaller or larger area than the screen (a UI scaled to a part of it) asks for the tier of that area.
+ENGINE_API bool ResolveFontFamily(LPCSTR base, string_path& out_texture, string256& why, float target_height = 0.f);
+
 #endif // _XR_GAMEFONT_H_

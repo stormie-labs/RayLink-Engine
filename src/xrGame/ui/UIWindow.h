@@ -330,6 +330,25 @@ public:
 	IC bool GetCustomDraw() const { return m_bCustomDraw; }
 	IC void SetCustomDraw(bool b) { m_bCustomDraw = b; }
 
+	// The children of this window are drawn clipped to its rectangle (a scissor, UI().PushScissor, so nested clip windows and
+	// scroll views intersect correctly), and a child that is out of that rectangle is not under the cursor: its hover and
+	// IsCursorOverWindow stay false there. Text of the children is clipped too (the queued text is drawn under the scissor, the
+	// text queued before the window is drawn before it). Off by default, and no cost while it is off.
+	void SetClipChildren(bool on);
+	IC bool GetClipChildren() const { return m_bClipChildren; }
+
+	// Text is only queued while windows draw and goes out in one batch at the end of the frame, over every graphic of every
+	// window. A window that must cover text drawn by windows before it (a dialog over a page), or whose own text must not be
+	// covered by windows after it, asks for the queue to be flushed around it: the text queued so far is drawn before the window
+	// is, the text it queued (its own and its children's) right after it. Honoured where the window is drawn by its parent
+	// (DrawOrdered, used by the child loop of CUIWindow::Draw) or as a dialog of the holder; a window drawn by hand by some
+	// other container is drawn as usual. Off by default, and no cost while it is off.
+	void SetFlushText(bool on) { m_bFlushText = on; }
+	IC bool GetFlushText() const { return m_bFlushText; }
+	void DrawOrdered(); // Draw(), with the text queue flushed around it when SetFlushText is on
+	// True when some ancestor clips its children and `abs_pos` (UI coordinates) is outside that ancestor's rectangle.
+	bool ClippedOut(const Fvector2& abs_pos) const;
+
 	xrCriticalSection csUi;
 
 protected:
@@ -373,6 +392,8 @@ protected:
 	// Если курсор над окном
 	bool m_bCursorOverWindow;
 	bool m_bCustomDraw;
+	bool m_bClipChildren;
+	bool m_bFlushText;
 
 	xr_vector<Fvector2> m_hit_clip_poly;
 

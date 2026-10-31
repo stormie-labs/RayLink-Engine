@@ -12,6 +12,7 @@
 #include "Level.h"
 #include "Actor.h"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,10 @@ int g_count = 10; // coop_autosave_count: how many slots rotate
 
 Schedule g_schedule; // the timer
 Pause g_pause; // the Restore window is open (suspend)
-std::vector<uint32_t> g_bad_slots; // slots whose files could not be replaced: not tried again until the session ends
+// Whose slots the host rotates (set_game; "" = the old shared coop_auto_N) and, for that game, the slots whose files could
+// not be replaced: not tried again until the session ends or the game changes. The game is chosen by the Lua window before
+// a session exists and is NOT dropped at a session's start or end (reset): the same world hosted again keeps its ring.
+Ring g_ring;
 
 struct Pending
 {
@@ -64,7 +68,11 @@ struct Pending
 } g_pending;
 
 bool g_saving = false; // inside a save: nothing starts another
-uint32_t g_level_slot = 0; // the slot level_change_name took for the save of a level change in progress (0 = none)
+// The save of a level change in progress (between level_change_name and level_change_commit): the slot taken (0 = none) and
+// the game it belongs to. The game is kept with it: a set_game that comes in between (a Lua callback of the save itself) must
+// not send the world of this level change to another game's ring, nor orphan it in coop_auto_tmp.
+uint32_t g_level_slot = 0;
+std::string g_level_game;
 
 struct Stats
 {
@@ -153,41 +161,44 @@ void rescan_saves()
 	FS.rescan_pathes();
 }
 
-// The slots on disk: coop_auto_N.scop in the saves folder and when each was written.
-void list_slots(std::vector<SlotInfo>& out)
+// The slots of one game on disk: coop_auto_[<id>_]N.scop in the saves folder and when each was written. The files of other
+// games, the old coop_auto_N (when a game is given) and the shared temporary pair are not in it (slots_of_game).
+void list_slots(const std::string& game, std::vector<SlotInfo>& out)
 {
 	rescan_saves();
 	FS_FileSet files;
 	FS.file_list(files, "$game_saves$", FS_ListFiles | FS_RootOnly, "coop_auto_*" SAVE_EXTENSION);
+	std::vector<NamedFile> named;
 	for (const FS_File& f : files)
 	{
 		string_path stem;
 		xr_strcpy(stem, f.name.c_str());
 		if (char* dot = strext(stem))
 			*dot = 0;
-		uint32_t index = 0;
-		if (parse_slot(stem, index))
-			out.push_back({index, uint64_t(f.time_write)});
+		named.push_back({stem, uint64_t(f.time_write)});
 	}
+	const std::vector<SlotInfo> mine = slots_of_game(named, game);
+	out.insert(out.end(), mine.begin(), mine.end());
 }
 
-// The slot a save goes to: a free one, else the oldest, except those that failed before (review M2). 0 when every place
-// has failed.
-uint32_t pick_untried_slot()
+// The slot a save of `game` goes to: a free one, else the oldest, except those that failed before (review M2). 0 when every
+// place has failed.
+uint32_t pick_untried_slot(const std::string& game)
 {
 	std::vector<SlotInfo> slots;
-	list_slots(slots);
-	return next_slot_skipping(slots, uint32_t(g_count), g_bad_slots);
+	list_slots(game, slots);
+	return next_slot_skipping(slots, uint32_t(g_count), ring_bad(g_ring, game));
 }
 
-// The first slot to try for a new save. When every place has failed before, all are given another chance.
-uint32_t pick_slot()
+// The first slot to try for a new save of `game`. When every place has failed before, all are given another chance.
+uint32_t pick_slot(const std::string& game)
 {
-	uint32_t slot = pick_untried_slot();
+	uint32_t slot = pick_untried_slot(game);
 	if (!slot)
 	{
-		g_bad_slots.clear();
-		slot = pick_untried_slot();
+		if (g_ring.game == effective_game(game))
+			g_ring.bad_slots.clear();
+		slot = pick_untried_slot(game);
 	}
 	return slot;
 }
@@ -333,10 +344,10 @@ enum class Commit
 	NotMoved // the finished pair is in coop_auto_tmp, the slot could not take it
 };
 
-// coop_auto_tmp holds a finished save: moves it to coop_auto_<slot>.
-Commit commit_to(uint32_t slot)
+// coop_auto_tmp holds a finished save: moves it to the slot of `game`.
+Commit commit_to(const std::string& game, uint32_t slot)
 {
-	const std::string name = slot_name(slot);
+	const std::string name = slot_name(slot, game);
 	Pair from, to;
 	pair_paths(from, kTempStem);
 	pair_paths(to, name.c_str());
@@ -367,36 +378,36 @@ Commit commit_to(uint32_t slot)
 // The finished save goes to `first`; if its files cannot be replaced (read-only, held by another process), to the next
 // slot, a few times (review M2). Slots that failed are remembered for the session. Returns the slot, 0 when none took
 // it, with `result` saying whether the save is still in coop_auto_tmp.
-uint32_t commit_somewhere(uint32_t first, Commit& result)
+uint32_t commit_somewhere(const std::string& game, uint32_t first, Commit& result)
 {
 	uint32_t slot = first;
 	result = Commit::NotMoved;
 	for (u32 attempt = 0; attempt < kSlotTries && slot; ++attempt)
 	{
-		result = commit_to(slot);
+		result = commit_to(game, slot);
 		if (result == Commit::Done)
 			return slot;
 		if (result == Commit::NotWritten)
 			return 0;
 		++g_stat.slots_failed;
-		::Msg("! [coop] autosave: %s could not be replaced, %s", slot_name(slot).c_str(),
+		::Msg("! [coop] autosave: %s could not be replaced, %s", slot_name(slot, game).c_str(),
 		    attempt + 1 < kSlotTries ? "the next slot is tried" : "giving up");
-		if (std::find(g_bad_slots.begin(), g_bad_slots.end(), slot) == g_bad_slots.end())
-			g_bad_slots.push_back(slot);
-		slot = pick_untried_slot();
+		ring_mark_bad(g_ring, game, slot); // only if `game` is still the ring's game (see g_level_game)
+		slot = pick_untried_slot(game);
 	}
 	return 0;
 }
 
-// The host keeps coop_autosave_count slot files: after a save the oldest beyond that go (the rules: slots_to_prune). A
-// host that lowered the count drops the surplus with its next save.
-void prune_surplus(uint32_t written)
+// The host keeps coop_autosave_count slot files of the game: after a save the oldest beyond that go (the rules:
+// slots_to_prune). A host that lowered the count drops the surplus with its next save. Only the game's own files are
+// listed, so the old coop_auto_N and the slots of other games are never pruned, whatever their number.
+void prune_surplus(const std::string& game, uint32_t written)
 {
 	std::vector<SlotInfo> slots;
-	list_slots(slots); // with the new slot at its real time
+	list_slots(game, slots); // with the new slot at its real time
 	for (const uint32_t index : slots_to_prune(slots, uint32_t(g_count), written))
 	{
-		const std::string name = slot_name(index);
+		const std::string name = slot_name(index, game);
 		for (LPCSTR ext : {SAVE_EXTENSION, ".scoc", ".dds"})
 		{
 			string_path file;
@@ -448,10 +459,12 @@ bool save(Reason why)
 		++g_stat.failed;
 		return false;
 	}
-	const uint32_t first = pick_slot();
+	// The save belongs to the game that is set now, even if a Lua callback of the save itself sets another one meanwhile.
+	const std::string game = g_ring.game;
+	const uint32_t first = pick_slot(game);
 	send_save(kTempStem);
 	Commit result = Commit::NotMoved;
-	const uint32_t slot = commit_somewhere(first, result);
+	const uint32_t slot = commit_somewhere(game, first, result);
 	if (!slot)
 	{
 		++g_stat.failed;
@@ -459,10 +472,10 @@ bool save(Reason why)
 		    result == Commit::NotWritten ? "the world was not written" : "no slot took it");
 		return false;
 	}
-	const std::string name = slot_name(slot);
+	const std::string name = slot_name(slot, game);
 	note_saved(why, name);
 	::Msg("[coop] autosave %s (%s) written in %u ms", name.c_str(), reason_name(why), u32(mgr().now_ms() - started));
-	prune_surplus(slot);
+	prune_surplus(game, slot);
 	return true;
 }
 
@@ -522,6 +535,97 @@ int l_suspend(lua_State* L)
 	lua_pushboolean(L, 1);
 	return 1;
 }
+
+// coop.autosave.set_game(id) -> bool: the ring of the host's autosaves belongs to game `id` (see set_game).
+int l_set_game(lua_State* L)
+{
+	const int type = lua_type(L, 1);
+	if (type == LUA_TNONE || type == LUA_TNIL || (type == LUA_TSTRING && lua_objlen(L, 1) == 0))
+	{
+		lua_pushboolean(L, set_game(std::string()) ? 1 : 0); // on purpose: no game, the old shared ring
+		return 1;
+	}
+	if (type != LUA_TSTRING)
+	{
+		// Not an id: the same as an invalid one (set_game logs it). No implicit number -> string: send a numeric id as a string.
+		lua_pushboolean(L, set_game(std::string("<") + lua_typename(L, type) + ">") ? 1 : 0);
+		return 1;
+	}
+	size_t len = 0;
+	const char* s = lua_tolstring(L, 1, &len);
+	lua_pushboolean(L, set_game(std::string(s, len)) ? 1 : 0);
+	return 1;
+}
+
+// coop.autosave.game() -> string: the game whose ring is in use, "" = the old shared one.
+int l_game(lua_State* L)
+{
+	lua_pushstring(L, g_ring.game.c_str());
+	return 1;
+}
+
+// The game an optional argument names: absent or nil = the game that is set; a string = that namespace ("" = the old one,
+// a string that is not a valid id also reads as the old one, like everywhere). `ok` is false for any other type.
+std::string game_arg(lua_State* L, int idx, bool& ok)
+{
+	ok = true;
+	const int type = lua_type(L, idx);
+	if (type == LUA_TNONE || type == LUA_TNIL)
+		return g_ring.game;
+	if (type != LUA_TSTRING)
+	{
+		ok = false;
+		return std::string();
+	}
+	size_t len = 0;
+	const char* s = lua_tolstring(L, idx, &len);
+	return effective_game(std::string(s, len));
+}
+
+// coop.autosave.slot_name(index[, id]) -> string | nil: "coop_auto_<id>_<index>" ("coop_auto_<index>" in the old ring) for the
+// game that is set, or for `id`. nil for an index that is not 1..999999999.
+int l_slot_name(lua_State* L)
+{
+	bool ok = true;
+	const std::string game = game_arg(L, 2, ok);
+	if (!ok || lua_type(L, 1) != LUA_TNUMBER)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const lua_Number n = lua_tonumber(L, 1);
+	if (!(n >= 1 && n <= 999999999) || n != std::floor(n))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_pushstring(L, slot_name(uint32_t(n), game).c_str());
+	return 1;
+}
+
+// coop.autosave.parse_slot(stem[, id]) -> number | nil: the slot number of a save file name without extension in the ring
+// of the game that is set, or of `id`; nil when it is not a slot of that ring. The one rule the engine and Lua share (the
+// Restore list must not guess it with a Lua pattern: ids hold '-', which is magic there).
+int l_parse_slot(lua_State* L)
+{
+	bool ok = true;
+	const std::string game = game_arg(L, 2, ok);
+	uint32_t index = 0;
+	if (!ok || lua_type(L, 1) != LUA_TSTRING)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	size_t len = 0;
+	const char* s = lua_tolstring(L, 1, &len);
+	if (!parse_slot(std::string(s, len), index, game))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_pushnumber(L, lua_Number(index));
+	return 1;
+}
 } // namespace
 
 // ---------------------------------------------------------------- public
@@ -535,10 +639,13 @@ void reset()
 	g_schedule = Schedule();
 	g_schedule.last_ms = mgr().now_ms(); // the interval counts from the start of the session
 	g_pause = Pause(); // a pause is never carried over to another session
-	g_bad_slots.clear();
+	// The game stays (set_game is called by the window BEFORE the session starts, and this runs at its start): only what this
+	// session learned about the slots of the game is dropped.
+	g_ring.bad_slots.clear();
 	g_pending = Pending();
 	g_saving = false;
 	g_level_slot = 0;
+	g_level_game.clear();
 }
 
 void register_console()
@@ -561,8 +668,41 @@ void register_lua(lua_State* L)
 	lua_newtable(L);
 	lua_pushcfunction(L, &l_suspend);
 	lua_setfield(L, -2, "suspend");
-	lua_setfield(L, -2, "autosave"); // coop.autosave = { suspend = ... }
+	lua_pushcfunction(L, &l_set_game);
+	lua_setfield(L, -2, "set_game");
+	lua_pushcfunction(L, &l_game);
+	lua_setfield(L, -2, "game");
+	lua_pushcfunction(L, &l_slot_name);
+	lua_setfield(L, -2, "slot_name");
+	lua_pushcfunction(L, &l_parse_slot);
+	lua_setfield(L, -2, "parse_slot");
+	lua_setfield(L, -2, "autosave"); // coop.autosave = { suspend, set_game, game, slot_name, parse_slot }
 	lua_pop(L, 1); // coop
+}
+
+bool set_game(const std::string& id)
+{
+	const SetGameResult r = ring_set_game(g_ring, id);
+	if (!r.accepted)
+		::Msg("! [coop] autosave set_game: '%s' is not a game id (1..%u of a-z 0-9 '-'): the old shared ring coop_auto_N is used",
+		    id.substr(0, 64).c_str(), u32(kMaxGameIdLen));
+	if (r.changed)
+	{
+		// Another ring: what the old one learned (bad slots, dropped by ring_set_game) and what was asked of its world
+		// (a waiting save request, the interval of the timer) does not carry over. Nothing about the save of a level change in
+		// progress: it keeps the game it began in (g_level_game).
+		const u64 now = mgr().now_ms();
+		g_pending = Pending();
+		g_schedule.last_ms = now;
+		g_schedule.busy_since = 0;
+		::Msg("[coop] autosave: the ring is %s", g_ring.game.empty() ? "the shared coop_auto_N" : ("coop_auto_" + g_ring.game + "_N").c_str());
+	}
+	return r.accepted;
+}
+
+const std::string& game()
+{
+	return g_ring.game;
 }
 
 void suspend(bool on)
@@ -663,9 +803,10 @@ const char* level_change_name()
 	// this slot (or the next one if its files cannot be replaced); the new level is loaded from the slot.
 	if (!begin_temp())
 		return nullptr; // the stock name: the level change must go on
-	static string64 name;
-	g_level_slot = pick_slot();
-	xr_strcpy(name, slot_name(g_level_slot).c_str());
+	static string128 name;
+	g_level_game = g_ring.game; // the save belongs to this game from here to level_change_commit
+	g_level_slot = pick_slot(g_level_game);
+	xr_strcpy(name, slot_name(g_level_slot, g_level_game).c_str());
 	return name;
 }
 
@@ -674,11 +815,13 @@ const char* level_change_temp_name() { return g_level_slot ? kTempStem : nullptr
 const char* level_change_commit()
 {
 	const uint32_t first = g_level_slot;
+	const std::string game = g_level_game; // not the ring's game of now: see g_level_game
 	g_level_slot = 0;
+	g_level_game.clear();
 	if (!first)
 		return nullptr;
 	Commit result = Commit::NotMoved;
-	const uint32_t slot = commit_somewhere(first, result);
+	const uint32_t slot = commit_somewhere(game, first, result);
 	if (!slot)
 	{
 		++g_stat.failed;
@@ -691,12 +834,12 @@ const char* level_change_commit()
 		    reason_name(Reason::LevelChange), kTempStem);
 		return kTempStem;
 	}
-	static string64 name;
-	const std::string slot_text = slot_name(slot);
+	static string128 name;
+	const std::string slot_text = slot_name(slot, game);
 	xr_strcpy(name, slot_text.c_str());
 	note_saved(Reason::LevelChange, slot_text);
 	::Msg("[coop] autosave %s (%s)", name, reason_name(Reason::LevelChange));
-	prune_surplus(slot);
+	prune_surplus(game, slot);
 	return name;
 }
 
@@ -718,8 +861,9 @@ void host_on_level_exit()
 
 void print_status()
 {
-	::Msg("[coop]   autosave: %s, keeps %d, saved timer %llu, after sleep %llu, level change %llu, end %llu, manual %llu; "
+	::Msg("[coop]   autosave: ring %s, %s, keeps %d, saved timer %llu, after sleep %llu, level change %llu, end %llu, manual %llu; "
 	      "skipped %llu, failed %llu, slot moves failed %llu, dropped %llu%s%s",
+	    g_ring.game.empty() ? "coop_auto_N (shared)" : ("coop_auto_" + g_ring.game + "_N").c_str(),
 	    g_interval_min ? make_string("every %d min", g_interval_min).c_str() : "timer off", g_count,
 	    g_stat.saved[size_t(Reason::Timer)], g_stat.saved[size_t(Reason::Sleep)],
 	    g_stat.saved[size_t(Reason::LevelChange)], g_stat.saved[size_t(Reason::SessionEnd)],
@@ -729,11 +873,11 @@ void print_status()
 	if (g_last.at_ms)
 		::Msg("[coop]   autosave: last %s (%s) %llu s ago", g_last.name.c_str(), reason_name(g_last.why),
 		    (mgr().now_ms() - g_last.at_ms) / 1000);
-	if (!g_bad_slots.empty())
+	if (!g_ring.bad_slots.empty())
 	{
 		std::string bad;
-		for (const uint32_t s : g_bad_slots)
-			bad += (bad.empty() ? "" : ", ") + slot_name(s);
+		for (const uint32_t s : g_ring.bad_slots)
+			bad += (bad.empty() ? "" : ", ") + slot_name(s, g_ring.game);
 		::Msg("[coop]   autosave: slots that could not be replaced and are skipped: %s", bad.c_str());
 	}
 }

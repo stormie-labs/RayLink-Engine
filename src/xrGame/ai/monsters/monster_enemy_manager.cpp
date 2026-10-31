@@ -40,14 +40,15 @@ void CMonsterEnemyManager::init_external(CBaseMonster* M)
 
 void CMonsterEnemyManager::update()
 {
-	if (m_script_enemy && (m_script_enemy->getDestroy() || !m_script_enemy->g_Alive()))
+	// Anomaly Coop: a player who is down drops out like a dead one, he stays alive for the engine
+	if (m_script_enemy && (m_script_enemy->getDestroy() || !m_script_enemy->g_Alive() || coop::npc_ai::player_down(m_script_enemy)))
 	{
 		script_enemy();
 	}
 	if (forced)
 	{
 		// проверить валидность force-объекта
-		if (!enemy || enemy->getDestroy() || !enemy->g_Alive())
+		if (!enemy || enemy->getDestroy() || !enemy->g_Alive() || coop::npc_ai::player_down(enemy))
 		{
 			enemy = 0;
 			return;
@@ -295,7 +296,8 @@ bool CMonsterEnemyManager::is_faced(const CEntityAlive* object0, const CEntityAl
 
 bool CMonsterEnemyManager::is_enemy(const CEntityAlive* obj)
 {
-	return ((monster->g_Team() != obj->g_Team()) && monster->is_relation_enemy(obj) && obj->g_Alive());
+	return ((monster->g_Team() != obj->g_Team()) && monster->is_relation_enemy(obj) && obj->g_Alive() &&
+		!coop::npc_ai::player_down(obj));
 }
 
 const Fvector& CMonsterEnemyManager::get_enemy_position()

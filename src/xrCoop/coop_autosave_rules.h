@@ -1,6 +1,7 @@
 // Anomaly Coop — autosave rotation (F3, CHECKPOINTS_DEATH.md §7). The host writes emergency saves `coop_auto_1` ..
-// `coop_auto_N` in turn: a new level, after a shared sleep, on a timer and at the end of the session. These are the
-// rules only (names, which slot is next, when the timer is due); writing the files is the engine's job.
+// `coop_auto_N` in turn: a new level, after a shared sleep, on a timer and at the end of the session. With a game id the
+// ring is that game's own: `coop_auto_<id>_<N>`. These are the rules only (names, which slot is next, when the timer is
+// due); writing the files is the engine's job.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -13,25 +14,56 @@ namespace coop
 {
 namespace autosave
 {
-// "coop_auto_<index>", 1-based.
-inline std::string slot_name(uint32_t index)
+// One ring per game. A game id puts the slots of the host's ring in a namespace of their own, so two games on one machine do
+// not overwrite each other: "coop_auto_<id>_<index>". Without an id the ring is the old shared one, "coop_auto_<index>".
+// An id is 1..kMaxGameIdLen characters of lower case [0-9a-z-]. It never holds '_' (that is the separator between the id
+// and the number) or '.', '/', ':' (nothing that could leave the saves folder or end a name), so a name has exactly one
+// reading: the id is what stands between "coop_auto_" and the single "_" that precedes the digits.
+constexpr size_t kMaxGameIdLen = 32;
+
+inline bool valid_game_id(const std::string& id)
 {
-	return "coop_auto_" + std::to_string(index);
+	if (id.empty() || id.size() > kMaxGameIdLen)
+		return false;
+	for (const char c : id)
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || c == '-'))
+			return false;
+	return true;
 }
 
-// A save file name without extension: "coop_auto_7" -> 7. Only what slot_name makes is a slot: lower case, a plain
-// number from 1 (no sign, no leading zero, at most nine digits), nothing after it. `index` is left as it was on false.
-inline bool parse_slot(const std::string& file_stem, uint32_t& index)
+// The id a name is made with: `id` when it is valid, else none (""): an id that is not valid is no id. The engine checks the
+// id once, in set_game, and logs it; the name functions below are safe with any string all the same.
+inline const std::string& effective_game(const std::string& id)
 {
-	static const char kPrefix[] = "coop_auto_";
-	constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-	if (file_stem.size() <= kPrefixLen || file_stem.compare(0, kPrefixLen, kPrefix) != 0)
+	static const std::string none;
+	return valid_game_id(id) ? id : none;
+}
+
+// "coop_auto_<id>_<index>", or "coop_auto_<index>" without an id. Index is 1-based.
+inline std::string slot_name(uint32_t index, const std::string& game = std::string())
+{
+	const std::string& g = effective_game(game);
+	return g.empty() ? "coop_auto_" + std::to_string(index) : "coop_auto_" + g + "_" + std::to_string(index);
+}
+
+// A save file name without extension: "coop_auto_7" -> 7 in the old ring, "coop_auto_abc_7" -> 7 in the ring of game "abc".
+// Only what slot_name makes in THAT namespace is a slot: lower case, a plain number from 1 (no sign, no leading zero, at
+// most nine digits), nothing after it. The slots of another game, the files of the old ring (when a game is given) and
+// the game files (when none is) are not slots here, and neither are the shared coop_auto_tmp / coop_auto_bak (no "_<digits>"
+// after the prefix in any namespace; a game that is called "tmp" has coop_auto_tmp_<N>, a different name). The old rule
+// that rejects everything but digits after "coop_auto_" is what keeps "coop_auto_5_1" (game "5") out of the old ring.
+// `index` is left as it was on false.
+inline bool parse_slot(const std::string& file_stem, uint32_t& index, const std::string& game = std::string())
+{
+	const std::string& g = effective_game(game);
+	const std::string prefix = g.empty() ? std::string("coop_auto_") : "coop_auto_" + g + "_";
+	if (file_stem.size() <= prefix.size() || file_stem.compare(0, prefix.size(), prefix) != 0)
 		return false;
-	const size_t digits = file_stem.size() - kPrefixLen;
-	if (digits > 9 || file_stem[kPrefixLen] == '0')
+	const size_t digits = file_stem.size() - prefix.size();
+	if (digits > 9 || file_stem[prefix.size()] == '0')
 		return false;
 	uint32_t v = 0;
-	for (size_t i = kPrefixLen; i < file_stem.size(); ++i)
+	for (size_t i = prefix.size(); i < file_stem.size(); ++i)
 	{
 		const char c = file_stem[i];
 		if (c < '0' || c > '9')
@@ -42,12 +74,80 @@ inline bool parse_slot(const std::string& file_stem, uint32_t& index)
 	return true;
 }
 
+// A save file of the folder: its name without extension and when it was written.
+struct NamedFile
+{
+	std::string stem;
+	uint64_t file_time;
+};
+
 // A save that exists on disk: its slot and when it was written.
 struct SlotInfo
 {
 	uint32_t index;
 	uint64_t file_time;
 };
+
+// The slots of one game among the files of a folder: what the ring, next_slot, slots_to_prune and the Restore list see.
+// The files of other games, of the old ring (when a game is given), the shared temporary pair and everything else are left out.
+inline std::vector<SlotInfo> slots_of_game(const std::vector<NamedFile>& files, const std::string& game)
+{
+	std::vector<SlotInfo> slots;
+	for (const NamedFile& f : files)
+	{
+		uint32_t index = 0;
+		if (parse_slot(f.stem, index, game))
+			slots.push_back({index, f.file_time});
+	}
+	return slots;
+}
+
+// The ring the host rotates: whose slots, and what this session learned about them. A slot number means a file in ONE
+// game's namespace, so the memory of slots that could not be replaced (read-only, held by another process) belongs to the
+// game and goes when the game changes.
+struct Ring
+{
+	std::string game; // "" = the old shared ring
+	std::vector<uint32_t> bad_slots;
+};
+
+struct SetGameResult
+{
+	bool accepted; // false: the id was not valid and the ring is the old one
+	bool changed; // the ring is another one than before (the memory of bad slots was dropped)
+};
+
+// Sets the game of the ring. Safe at any time and as often as wanted: the same game again changes nothing and keeps the
+// memory; another game (or none) drops it. "" = no game, the old ring. An id that is not valid is no id (the old ring) and
+// is reported as not accepted.
+inline SetGameResult ring_set_game(Ring& r, const std::string& wanted)
+{
+	const bool accepted = wanted.empty() || valid_game_id(wanted);
+	const std::string now = accepted ? wanted : std::string();
+	const bool changed = now != r.game;
+	if (changed)
+	{
+		r.game = now;
+		r.bad_slots.clear();
+	}
+	return {accepted, changed};
+}
+
+// The bad slots of `game`: those of the ring when it is the ring's game, else none. A save that began in another game (the
+// game changed under it) neither reads nor writes the memory of this one.
+inline const std::vector<uint32_t>& ring_bad(const Ring& r, const std::string& game)
+{
+	static const std::vector<uint32_t> none;
+	return effective_game(game) == r.game ? r.bad_slots : none;
+}
+
+inline void ring_mark_bad(Ring& r, const std::string& game, uint32_t slot)
+{
+	if (slot < 1 || effective_game(game) != r.game)
+		return;
+	if (std::find(r.bad_slots.begin(), r.bad_slots.end(), slot) == r.bad_slots.end())
+		r.bad_slots.push_back(slot);
+}
 
 // The slot the next save goes to: the first free one of 1..count, and when all are taken the one with the oldest
 // file (the lowest index among equals). Files of slots above `count` (the host keeps fewer than before) are not

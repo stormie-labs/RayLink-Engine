@@ -152,6 +152,19 @@ void ui_core::AlignPixel(float& src_and_dest) const
 		src_and_dest = (float)iFloor(src_and_dest);
 }
 
+// A scissor rectangle of the UI (1024x768 units) in pixels. The one rounding for both Push and Pop: when a nested scissor is
+// popped the parent's rectangle is set again, and it must come out as it was when it was pushed (it was floored on the left
+// and top and rounded on the right and bottom; Pop used to floor all four and left the parent one pixel short).
+static Irect scissor_pixels(const ui_core& ui, const Frect& r)
+{
+	Irect o;
+	o.x1 = iFloor(ui.ClientToScreenScaledX(r.x1));
+	o.y1 = iFloor(ui.ClientToScreenScaledY(r.y1));
+	o.x2 = iFloor(ui.ClientToScreenScaledX(r.x2) + 0.5f);
+	o.y2 = iFloor(ui.ClientToScreenScaledY(r.y2) + 0.5f);
+	return o;
+}
+
 void ui_core::PushScissor(const Frect& r_tgt, bool overlapped)
 {
 	if (UI().m_currentPointType == IUIRender::pttLIT)
@@ -174,16 +187,7 @@ void ui_core::PushScissor(const Frect& r_tgt, bool overlapped)
 	}
 	m_Scissors.push(result);
 
-	result.lt.x = ClientToScreenScaledX(result.lt.x);
-	result.lt.y = ClientToScreenScaledY(result.lt.y);
-	result.rb.x = ClientToScreenScaledX(result.rb.x);
-	result.rb.y = ClientToScreenScaledY(result.rb.y);
-
-	Irect r;
-	r.x1 = iFloor(result.x1);
-	r.x2 = iFloor(result.x2 + 0.5f);
-	r.y1 = iFloor(result.y1);
-	r.y2 = iFloor(result.y2 + 0.5f);
+	Irect r = scissor_pixels(*this, result);
 	UIRender->SetScissor(&r);
 }
 
@@ -193,19 +197,15 @@ void ui_core::PopScissor()
 		return;
 
 	VERIFY(!m_Scissors.empty());
+	if (m_Scissors.empty()) // an unbalanced Pop (a script window torn down mid-draw) must not pop an empty stack
+		return;
 	m_Scissors.pop();
 
 	if (m_Scissors.empty())
 		UIRender->SetScissor(NULL);
 	else
 	{
-		const Frect& top = m_Scissors.top();
-		Irect tgt;
-		tgt.lt.x = iFloor(ClientToScreenScaledX(top.lt.x));
-		tgt.lt.y = iFloor(ClientToScreenScaledY(top.lt.y));
-		tgt.rb.x = iFloor(ClientToScreenScaledX(top.rb.x));
-		tgt.rb.y = iFloor(ClientToScreenScaledY(top.rb.y));
-
+		Irect tgt = scissor_pixels(*this, m_Scissors.top());
 		UIRender->SetScissor(&tgt);
 	}
 }

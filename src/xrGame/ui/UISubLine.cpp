@@ -96,8 +96,8 @@ const CUISubLine* CUISubLine::Cut2Pos(int i)
 	return m_pTempLine;
 }
 
-void CUISubLine::Draw(CGameFont* pFont, float x, float y) const
+void CUISubLine::Draw(CGameFont* pFont, float x, float y, u32 alpha) const
 {
-	pFont->SetColor(m_color);
+	pFont->SetColor(alpha >= 255 ? m_color : subst_alpha(m_color, (color_get_A(m_color) * alpha + 127) / 255));
 	pFont->Out(UI().ClientToScreenScaledX(x), UI().ClientToScreenScaledY(y), "%s", m_text.c_str());
 }

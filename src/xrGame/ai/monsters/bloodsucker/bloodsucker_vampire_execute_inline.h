@@ -248,8 +248,11 @@ void CStateBloodsuckerVampireExecuteAbstract::execute_vampire_continue()
 {
 	const CEntityAlive* enemy = object->EnemyMan.get_enemy();
 
+	// Anomaly Coop: the one in the grip fell: let go of him, whoever the enemy is by now
+	const CObject* held = m_coop_target != u16(-1) ? Level().Objects.net_Find(m_coop_target) : Actor();
+
 	//if (object->Position().distance_to(Actor()->Position()) > 2.f) {
-	if (!object->MeleeChecker.can_start_melee(enemy))
+	if (coop::npc_ai::player_down(held) || !object->MeleeChecker.can_start_melee(enemy))
 	{
 		object->com_man().ta_deactivate();
 		m_action = eActionCompleted;

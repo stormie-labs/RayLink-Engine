@@ -258,6 +258,12 @@ void CPoltergeist::update_detection()
 	}
 }
 
+// Anomaly Coop: nothing for a player who is down, no flames, no thrown objects (detection_target falls back on the host's actor)
+bool CPoltergeist::get_actor_ignore() const
+{
+	return m_actor_ignore || coop::npc_ai::player_down(detection_target());
+}
+
 CEntityAlive* CPoltergeist::detection_target() const
 {
 	if (m_target_id != u16(-1))

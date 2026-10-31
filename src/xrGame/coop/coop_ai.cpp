@@ -7,6 +7,7 @@
 #include "coop_join.h"
 #include "coop_survival.h"
 #include "xrCoop/coop_viewers.h"
+#include "xrCoop/coop_death_rules.h" // out_of_fight, monster_leaves
 
 #include "Level.h"
 #include "Actor.h"
@@ -144,8 +145,14 @@ bool player_out_of_fight(const CObject* obj)
 {
 	if (!obj || !mgr().active() || !is_player(obj))
 		return false;
-	const survival::Life l = survival::life_of(obj->ID());
-	return l == survival::Life::Dead || l == survival::Life::Spectating || l == survival::Life::Respawning;
+	return death::out_of_fight(u8(survival::life_of(obj->ID())));
+}
+
+bool player_down(const CObject* obj)
+{
+	if (!obj || !mgr().active() || !is_player(obj))
+		return false;
+	return death::monster_leaves(u8(survival::life_of(obj->ID())));
 }
 
 bool is_player(const CObject* obj)
@@ -375,14 +382,15 @@ void viewers_frame()
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers])
 {
 	u32 n = 0;
-	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && g_actor->Position().distance_to(pos) <= max_dist)
+	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor) &&
+		g_actor->Position().distance_to(pos) <= max_dist)
 		out[n++] = g_actor;
 	if (!mgr().is_host() || !world_up())
 		return n;
 	for (u32 peer = 1; peer < kMaxPlayers && n < kMaxNearPlayers; ++peer)
 	{
 		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
-		if (body && body->g_Alive() && body->Position().distance_to(pos) <= max_dist)
+		if (body && body->g_Alive() && !player_down(body) && body->Position().distance_to(pos) <= max_dist)
 			out[n++] = body;
 	}
 	return n;
@@ -420,7 +428,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 {
 	CEntityAlive* best = nullptr;
 	float best_d = max_dist;
-	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy())
+	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor))
 	{
 		const float d = g_actor->Position().distance_to(pos);
 		if (d <= best_d)
@@ -434,7 +442,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
 	{
 		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
-		if (!body || !body->g_Alive())
+		if (!body || !body->g_Alive() || player_down(body))
 			continue;
 		const float d = body->Position().distance_to(pos);
 		if (d <= best_d)

@@ -42,6 +42,9 @@ CUIMMShniaga::CUIMMShniaga()
 	m_mag_pos = 0;
 
 	m_selected = NULL;
+	m_silent = false;
+	m_magnifier_visible = true;
+	m_offset = 0;
 
 	m_start_time = 0;
 	m_origin = 0;
@@ -218,6 +221,19 @@ void CUIMMShniaga::ShowPage(enum_page_id page_id)
 }
 
 
+xr_vector<CUITextWnd*>* CUIMMShniaga::PageList(enum_page_id page)
+{
+	switch (page)
+	{
+	case epi_main: return &m_buttons;
+	case epi_new_game: return &m_buttons_new;
+	case epi_new_network_game: return &m_buttons_new_network;
+	default: return nullptr;
+	}
+}
+
+// A page whose list came out empty (every entry of the XML list hidden) shows nothing and selects nothing, instead of
+// reading the first element of an empty vector.
 void CUIMMShniaga::ShowMain()
 {
 	m_page = epi_main;
@@ -225,7 +241,10 @@ void CUIMMShniaga::ShowMain()
 	for (u32 i = 0; i < m_buttons.size(); i++)
 		m_view->AddWindow(m_buttons[i], false);
 
-	SelectBtn(m_buttons[0]);
+	if (m_buttons.empty())
+		m_selected = NULL;
+	else
+		SelectBtn(m_buttons[0]);
 }
 
 void CUIMMShniaga::ShowNewGame()
@@ -235,7 +254,10 @@ void CUIMMShniaga::ShowNewGame()
 	for (u32 i = 0; i < m_buttons_new.size(); i++)
 		m_view->AddWindow(m_buttons_new[i], false);
 
-	SelectBtn(m_buttons_new[0]);
+	if (m_buttons_new.empty())
+		m_selected = NULL;
+	else
+		SelectBtn(m_buttons_new[0]);
 }
 
 void CUIMMShniaga::ShowNetworkGame()
@@ -248,7 +270,10 @@ void CUIMMShniaga::ShowNetworkGame()
 	{
 		m_view->AddWindow(m_buttons_new_network[i], false);
 	}
-	SelectBtn(m_buttons_new_network[0]);
+	if (m_buttons_new_network.empty())
+		m_selected = NULL;
+	else
+		SelectBtn(m_buttons_new_network[0]);
 }
 
 
@@ -288,12 +313,10 @@ void CUIMMShniaga::SelectBtn(int btn)
 	m_view->Update();
 
 	R_ASSERT(btn >= 0);
-	if (epi_main == m_page)
-		m_selected = m_buttons[btn];
-	else if (epi_new_game == m_page)
-		m_selected = m_buttons_new[btn];
-	else if (epi_new_network_game == m_page)
-		m_selected = m_buttons_new_network[btn];
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	if (!lst || btn >= int(lst->size()))
+		return;
+	m_selected = (*lst)[btn];
 
 	m_selected_btn = btn;
 	ProcessEvent(E_Begin);
@@ -302,37 +325,24 @@ void CUIMMShniaga::SelectBtn(int btn)
 void CUIMMShniaga::SelectBtn(CUIWindow* btn)
 {
 	R_ASSERT(m_page >= 0);
-	for (int i = 0; i < (int)m_buttons.size(); ++i)
+	// the list of the page that is shown, up to its own size (the old loop ran to the size of the main list for every page)
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	if (!lst)
+		return;
+	for (int i = 0; i < (int)lst->size(); ++i)
 	{
-		if (0 == m_page)
+		if ((*lst)[i] == btn)
 		{
-			if (m_buttons[i] == btn)
-			{
-				SelectBtn(i);
-				return;
-			}
-		}
-		else if (1 == m_page)
-		{
-			if (m_buttons_new[i] == btn)
-			{
-				SelectBtn(i);
-				return;
-			}
-		}
-		else if (2 == m_page)
-		{
-			if (m_buttons_new_network[i] == btn)
-			{
-				SelectBtn(i);
-				return;
-			}
+			SelectBtn(i);
+			return;
 		}
 	}
 }
 
 void CUIMMShniaga::Draw()
 {
+	if (m_silent)
+		return;
 	CUIWindow::Draw();
 }
 
@@ -348,14 +358,18 @@ void CUIMMShniaga::Update()
 		ProcessEvent(E_Stop);
 
 
-	ProcessEvent(E_Update);
+	ProcessEvent(E_Update); // the menu music is kept going from here
 
+	if (m_silent)
+		return; // nothing under the cursor reacts: no focus, no wheel
 	CUIWindow::Update();
 }
 
 
 bool CUIMMShniaga::OnMouseAction(float x, float y, EUIMessages mouse_action)
 {
+	if (m_silent)
+		return false;
 	Fvector2 pos = UI().GetUICursor().GetCursorPosition();
 	Frect r;
 	m_magnifier->GetAbsoluteRect(r);
@@ -369,21 +383,70 @@ bool CUIMMShniaga::OnMouseAction(float x, float y, EUIMessages mouse_action)
 
 void CUIMMShniaga::OnBtnClick()
 {
+	if (!m_selected)
+		return;
 	if (0 == xr_strcmp("btn_new_game", m_selected->WindowName()))
 		ShowNewGame();
 	else if (0 == xr_strcmp("btn_new_back", m_selected->WindowName()))
 		ShowMain();
 	else
 	{
-		GetMessageTarget()->SendMessage(m_selected, BUTTON_CLICKED);
+		if (CUIWindow* target = GetMessageTarget())
+			target->SendMessage(m_selected, BUTTON_CLICKED);
 		ProcessEvent(E_Finilize);
 	}
+}
+
+int CUIMMShniaga::GetButtonCount()
+{
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	return lst ? int(lst->size()) : 0;
+}
+
+LPCSTR CUIMMShniaga::GetButtonName(int i)
+{
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	if (!lst || i < 0 || i >= int(lst->size()))
+		return nullptr;
+	return (*lst)[i]->WindowName().c_str();
+}
+
+LPCSTR CUIMMShniaga::GetButtonCaption(int i)
+{
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	if (!lst || i < 0 || i >= int(lst->size()))
+		return nullptr;
+	return (*lst)[i]->GetText();
+}
+
+bool CUIMMShniaga::PressButton(LPCSTR name)
+{
+	if (!name || !name[0])
+		return false;
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	if (!lst)
+		return false;
+	for (u32 i = 0; i < lst->size(); ++i)
+	{
+		if (0 == xr_strcmp(name, (*lst)[i]->WindowName().c_str()))
+		{
+			// what a click does: the button is the selected one, then the same OnBtnClick (btn_new_game and btn_new_back
+			// change the page, any other name goes to the message target as BUTTON_CLICKED, where the callbacks by name are)
+			m_selected = (*lst)[i];
+			m_selected_btn = int(i);
+			OnBtnClick();
+			return true;
+		}
+	}
+	return false;
 }
 
 #include <dinput.h>
 
 bool CUIMMShniaga::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {
+	if (m_silent)
+		return false;
 	if (WINDOW_KEY_PRESSED == keyboard_action)
 	{
 		switch (dik)
@@ -413,14 +476,8 @@ bool CUIMMShniaga::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 int CUIMMShniaga::BtnCount()
 {
 	R_ASSERT(-1);
-	if (m_page == 0)
-		return (int)m_buttons.size();
-	else if (m_page == 1)
-		return (int)m_buttons_new.size();
-	else if (m_page == 2)
-		return (int)m_buttons_new_network.size();
-	else
-		return -1;
+	xr_vector<CUITextWnd*>* lst = PageList(m_page);
+	return lst ? (int)lst->size() : -1;
 }
 
 float CUIMMShniaga::pos(float x1, float x2, u32 t)
@@ -444,15 +501,34 @@ float CUIMMShniaga::pos(float x1, float x2, u32 t)
 
 bool b_shniaganeed_pp = true;
 
-void CUIMMShniaga::SetVisibleMagnifier(bool f)
+// The magnifier is drawn by the post-process pass (RegisterPPDraw), by its position and not by its visibility: it is moved off the
+// screen when it must not show.
+void CUIMMShniaga::ApplyMagnifier()
 {
-	b_shniaganeed_pp = f;
 	Fvector2 pos = m_magnifier->GetWndPos();
-	if (f)
+	if (m_magnifier_visible && !m_silent)
 		pos.x = m_mag_pos;
 	else
 		pos.x = 1025;
 	m_magnifier->SetWndPos(pos);
+}
+
+void CUIMMShniaga::SetVisibleMagnifier(bool f)
+{
+	b_shniaganeed_pp = f;
+	m_magnifier_visible = f;
+	ApplyMagnifier();
+}
+
+// Show(false) alone would not do: a hidden window is not updated by its parent (the menu music, which Update keeps looping,
+// would stop after the first track), the magnifier is drawn by the post-process pass whatever the visibility of the window,
+// and the message routing of a click does not depend on it at all.
+void CUIMMShniaga::SetSilent(bool on)
+{
+	if (on == m_silent)
+		return;
+	m_silent = on;
+	ApplyMagnifier();
 }
 
 void CUIMMShniaga::ProcessEvent(EVENT ev)
@@ -462,9 +538,12 @@ void CUIMMShniaga::ProcessEvent(EVENT ev)
 	case E_Begin:
 		{
 			// init whell sound
-			m_sound->whell_Play();
+			if (!m_silent)
+				m_sound->whell_Play();
 
 			// calculate moving params
+			if (!m_selected)
+				break;
 			m_start_time = Device.dwTimeContinual;
 			m_origin = m_shniaga->GetWndPos().y;
 			m_destination = m_selected->GetWndPos().y - m_magnifier->GetWndPos().y;
@@ -481,7 +560,8 @@ void CUIMMShniaga::ProcessEvent(EVENT ev)
 	case E_Finilize:
 		if (!m_flags.test(fl_SoundFinalized))
 		{
-			m_sound->whell_Click();
+			if (!m_silent)
+				m_sound->whell_Click();
 
 			m_flags.set(fl_SoundFinalized, TRUE);
 		}

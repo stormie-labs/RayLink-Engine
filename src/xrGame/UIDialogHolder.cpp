@@ -184,7 +184,7 @@ void CDialogHolder::DoRenderDialogs()
 	for (; it != m_dialogsToRender.end(); ++it)
 	{
 		if ((*it).enabled && (*it).wnd && (*it).wnd->IsShown())
-			(*it).wnd->Draw();
+			(*it).wnd->DrawOrdered();
 	}
     m_b_in_render = false;
 }
