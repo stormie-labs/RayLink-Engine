@@ -788,5 +788,24 @@ inline bool one_conversion(const char* fmt, char conv)
 		}
 	return percents == 1 && ok;
 }
+// A hit after the fall is over (live 2026-11-01). NPCs keep shooting a body on the host as long as they see it, and what they
+// fired lands after the owner has gone: "back at your camp" and the next line a shot in the leg. Nothing counts while he is
+// dead, out of the run or on his way back, nor for kRespawnShieldMs after he stands up at the respawn point.
+constexpr uint32_t kRespawnShieldMs = 5000;
+
+constexpr bool hit_counts(bool gone, uint64_t now_ms, uint64_t shield_until_ms)
+{
+	return !gone && now_ms >= shield_until_ms;
+}
+
+// The volume while the spectator's camera flies to another player: the world he hears jumps with it, so it comes in softly.
+constexpr uint32_t kSpectateFadeMs = 700;
+constexpr float kSpectateFadeFrom = 0.1f;
+
+constexpr float spectate_volume(uint64_t since_ms)
+{
+	return since_ms >= kSpectateFadeMs ? 1.f : kSpectateFadeFrom + (1.f - kSpectateFadeFrom) * float(since_ms) / float(kSpectateFadeMs);
+}
+
 } // namespace death
 } // namespace coop

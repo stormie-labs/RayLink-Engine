@@ -19,6 +19,7 @@
 #include "xrCoop/coop_session.h"
 
 class CALifeObjectRegistry;
+struct GAME_NEWS_DATA;
 class NET_Packet;
 struct lua_State;
 
@@ -176,6 +177,9 @@ void print_status();
 void on_alife_objects_loaded(CALifeObjectRegistry& objects);
 // True while a coop client is loading the host's world.
 bool client_loading_world();
+// A client's PDA log is his own, not the one the host's save brings (xrCoop/coop_news_log.h).
+void client_news_added(const GAME_NEWS_DATA& news);
+void client_take_news_log(xr_vector<GAME_NEWS_DATA>& actor_log);
 // Received world snapshots are a private load cache, never a campaign save or quick-load target.
 bool is_client_cache_save(LPCSTR name);
 void client_cache_path(string_path& out, LPCSTR extension);

@@ -1630,6 +1630,27 @@ int l_player_safemode(lua_State* L)
 	return 1;
 }
 
+// coop.avatar_headlamp(obj_id) -> true, dx, dy, dz while the head torch of that player's character is on here: the unit
+// direction of its beam, as place_light (coop_equip.cpp) aims it. false when it is off, not known, or the character has
+// no view yet. scripts\coop_hud_glare
+int l_avatar_headlamp(lua_State* L)
+{
+	u16 id = 0;
+	float yaw = 0.f, pitch = 0.f;
+	if (!arg_local_id(L, 1, id) || !players::avatar_headlamp(id) || !players::avatar_view(id, yaw, pitch))
+	{
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	Fvector dir;
+	dir.setHP(yaw, -pitch);
+	lua_pushboolean(L, 1);
+	lua_pushnumber(L, lua_Number(dir.x));
+	lua_pushnumber(L, lua_Number(dir.y));
+	lua_pushnumber(L, lua_Number(dir.z));
+	return 4;
+}
+
 // W11: coop.talk_holder(npc_id) -> peer id of the player talking to that NPC (host only; 0 = the host
 // himself), nil if nobody, on a client or without a session.
 int l_talk_holder(lua_State* L)
@@ -1695,6 +1716,7 @@ void register_raw(lua_State* L)
 		{"bleed_left", &l_bleed_left},
 		{"revive_progress", &l_revive_progress}, // HUD v2 part 2: the revive / give-up holds for scripts\coop_hud_revive
 		{"player_safemode", &l_player_safemode},
+		{"avatar_headlamp", &l_avatar_headlamp}, // scripts\coop_hud_glare
 		{"instrument", &players::lua_instrument},
 		{"talk_holder", &l_talk_holder}, // W11
 		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)

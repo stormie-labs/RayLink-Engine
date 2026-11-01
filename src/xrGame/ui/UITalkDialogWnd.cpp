@@ -13,6 +13,7 @@
 #include "../level.h"
 #include "../actor.h"
 #include "../alife_registry_wrappers.h"
+#include "../coop/coop_join.h"
 #include "dinput.h"
 
 #define				TALK_XML				"talk.xml"
@@ -222,6 +223,7 @@ void CUITalkDialogWnd::AddAnswer(LPCSTR SpeakerName, LPCSTR str, bool bActor)
 	news_data.receive_time = Level().GetGameTime();
 
 	Actor()->game_news_registry->registry().objects().push_back(news_data);
+	coop::join::client_news_added(news_data);
 }
 
 void CUITalkDialogWnd::AddIconedAnswer(LPCSTR caption, LPCSTR text, LPCSTR texture_name, LPCSTR templ_name)
@@ -240,6 +242,7 @@ void CUITalkDialogWnd::AddIconedAnswer(LPCSTR caption, LPCSTR text, LPCSTR textu
 	news_data.receive_time = Level().GetGameTime();
 
 	Actor()->game_news_registry->registry().objects().push_back(news_data);
+	coop::join::client_news_added(news_data);
 }
 
 void CUITalkDialogWnd::SetOsoznanieMode(bool b)

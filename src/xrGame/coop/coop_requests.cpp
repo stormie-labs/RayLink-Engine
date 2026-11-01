@@ -2190,56 +2190,50 @@ Reason apply_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos)
 	return Reason::Ok;
 }
 
-// Ruling F2-32b: under lua_pcall, arg 1 the NPC's game object; returns the id of the player character leading its
-// squad as a companion, or nothing. The leaders are the host's Lua (coop_npc_companions: squad id -> proxy id, saved in
-// m_data.coop_npc_leaders, dropped when the squad stops being a companion squad); leader_of answers for an NPC.
-int lua_companion_leader_id(lua_State* L)
+// Ruling F2-32b: under lua_pcall, arg 1 the NPC's game object; returns whether it is a companion of the group. The
+// companion squads are the host's Lua (axr_companions, coop_npc_companions.is_group_companion answers for an NPC).
+int lua_is_group_companion(lua_State* L)
 {
 	lua_getglobal(L, "coop_npc_companions"); // _G.__index loads the module if it was not yet
 	if (!lua_istable(L, -1))
 		return 0;
-	lua_getfield(L, -1, "leader_of");
+	lua_getfield(L, -1, "is_group_companion");
 	if (!lua_isfunction(L, -1))
 		return 0;
 	lua_pushvalue(L, 1);
-	lua_call(L, 1, 1); // the leader's game object or nil
-	if (lua_isnil(L, -1))
-		return 0;
-	lua_getfield(L, -1, "id");
-	lua_pushvalue(L, -2);
 	lua_call(L, 1, 1);
 	return 1;
 }
 
-// Ruling F2-32b: is the live NPC `npc` (host numbering) a companion of character `proxy` (his squad's leader)? False
-// for an NPC without a game object here, without a leader, or when the Lua call fails (logged).
-bool companion_of(u16 npc, u16 proxy)
+// Ruling F2-32b: is the live NPC `npc` (host numbering) a companion of the group? False for an NPC without a game
+// object here, not in a companion squad, or when the Lua call fails (logged).
+bool group_companion(u16 npc)
 {
 	CGameObject* go = find_go(npc);
 	lua_State* L = go && go->lua_game_object() ? ai().script_engine().lua() : nullptr;
 	if (!L || !lua_checkstack(L, 8))
 		return false;
 	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &lua_companion_leader_id);
+	lua_pushcfunction(L, &lua_is_group_companion);
 	::luabind::object(L, go->lua_game_object()).pushvalue();
 	if (lua_pcall(L, 1, 1, 0) != 0)
 	{
 		if (log_allowed())
 		{
 			const char* err = lua_tostring(L, -1);
-			::Msg("! [coop] coop_npc_companions.leader_of(%u) failed (not a companion here): %s", npc, err ? err : "?");
+			::Msg("! [coop] coop_npc_companions.is_group_companion(%u) failed (not a companion here): %s", npc, err ? err : "?");
 		}
 		lua_settop(L, top);
 		return false;
 	}
-	const bool is = lua_isnumber(L, -1) && u16(lua_tonumber(L, -1)) == proxy;
+	const bool is = lua_toboolean(L, -1) != 0;
 	lua_settop(L, top);
 	return is;
 }
 
 // Ruling F2-32 (F2 T12 round 1): one side of a move for moves::check (xrCoop/coop_moves.h), from its top owner: the
 // ground, the requester's own character, another player, a live NPC (and whether the requester holds its talk lock or
-// leads its squad, Ruling F2-32b), a corpse or a box with their locks (the game object's flags, the server object's
+// it is a companion of the group, Ruling F2-32b), a corpse or a box with their locks (the game object's flags, the server object's
 // while offline), or anything else.
 moves::Side move_side(const Req& q, u16 id)
 {
@@ -2275,7 +2269,7 @@ moves::Side move_side(const Req& q, u16 id)
 		{
 			s.kind = moves::Side::LiveNpc;
 			s.talking = dialog::host_lock_of(q.from) == root;
-			s.companion = !s.talking && companion_of(root, q.proxy); // Ruling F2-32b
+			s.companion = !s.talking && group_companion(root); // Ruling F2-32b
 			return s;
 		}
 		s.kind = moves::Side::Corpse;
@@ -2311,7 +2305,7 @@ Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvect
 		return Reason::NotAllowed;
 	// Ruling F2-32 (F2 T12 round 1): with Ruling F2-30 a client moves items out of another's inventory to its actor; a
 	// live NPC's inventory, out or in, only under the requester's talk lock (a mechanic returning a repaired item, a
-	// dialog) or as his own companion (Ruling F2-32b: the stock companion inventory has no dialog), box and corpse locks
+	// dialog) or as a companion of the group (Ruling F2-32b: the stock companion inventory has no dialog), box and corpse locks
 	// as the stock UI keeps them. A stock script that moves against them is refused here, visibly.
 	if (const moves::Verdict side = moves::check(move_side(q, src), move_side(q, dst)); side != moves::Verdict::Ok)
 	{
@@ -2367,10 +2361,18 @@ Reason host_destroy(const Req& q, u16 item)
 		return Reason::Missing;
 	if (smart_cast<CSE_ALifeCreatureAbstract*>(e))
 		return Reason::NotAllowed;
-	const bool mine = events::root_of(item) == q.proxy ||
-	    (e->ID_Parent == kNoId && events::host_last_holder(item) == q.proxy);
+	const u16 root = events::root_of(item);
+	const bool mine = root == q.proxy || (e->ID_Parent == kNoId && events::host_last_holder(item) == q.proxy);
 	if (!mine)
-		return Reason::NotOwner;
+	{
+		if (e->ID_Parent == kNoId)
+			return Reason::NotOwner;
+		const moves::Verdict side = moves::destroy_check(move_side(q, root));
+		if (side != moves::Verdict::Ok)
+			return side == moves::Verdict::NotOwner ? Reason::NotOwner : Reason::NotAllowed;
+		if (position_of(q.proxy).distance_to(position_of(root)) > kReachRange)
+			return Reason::TooFar;
+	}
 	if (find_go(item))
 	{
 		// the standard chain (E3): the server releases it from ALife, the release hook tells clients

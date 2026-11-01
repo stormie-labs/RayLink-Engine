@@ -214,6 +214,9 @@ struct Local
 	u64 since = 0;
 	u64 bleed_end = 0;
 	u64 last_sent = 0;
+	u64 shield_until = 0; // death::hit_counts
+	u64 fade_at = 0; // the watched player changed: death::spectate_volume
+	bool fading = false;
 	// controls taken away while down
 	bool input_installed = false;
 	bool slots_blocked = false;
@@ -814,8 +817,16 @@ void enter_dead(CActor* a, u64 t)
 	send_my_state(t); // the host decides by its death mode
 }
 
+void end_spectate_fade()
+{
+	if (g_me.fading)
+		::Sound->set_master_volume(1.f);
+	g_me.fading = false;
+}
+
 void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 {
+	end_spectate_fade();
 	g_me.life = Life::Alive;
 	g_hook_life.store(u8(Life::Alive));
 	g_hook_damage.store(0);
@@ -832,6 +843,7 @@ void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 			c.SetRadiation(0.f);
 		c.SetHealth(clampr(health, kDownHealth, c.GetMaxHealth()));
 	}
+	g_me.shield_until = fresh ? t + death::kRespawnShieldMs : 0;
 	release_controls(a);
 	if (announce)
 		send_my_state(t);
@@ -2118,8 +2130,9 @@ void reviver_frame(CActor* a, u64 t)
 	send_revive_request(join::to_host(target), g_me.revive_seq, g_me.revive_item);
 }
 
-void spectate_frame(u64)
+void spectate_frame(u64 t)
 {
+	const u16 watched = g_me.spectate;
 	xr_vector<PlayerRef> players;
 	collect_players(players, false);
 	xr_vector<u16> watchable;
@@ -2145,6 +2158,17 @@ void spectate_frame(u64)
 	g_me.next_was_down = next;
 	g_me.prev_was_down = prev;
 	g_me.spectate = watchable[idx];
+	if (g_me.spectate != watched)
+	{
+		g_me.fade_at = t;
+		g_me.fading = true;
+	}
+	if (g_me.fading)
+	{
+		const float volume = death::spectate_volume(t - g_me.fade_at);
+		::Sound->set_master_volume(volume);
+		g_me.fading = volume < 1.f;
+	}
 
 	CGameObject* o = object_here(g_me.spectate);
 	Fvector head = o->Position();
@@ -2832,6 +2856,7 @@ void register_console()
 
 void reset()
 {
+	end_spectate_fade();
 	leave_session();
 	g_rules = console_rules();
 	g_world_rules = g_rules;
@@ -2990,6 +3015,14 @@ void actor_condition_hook(CActorCondition& c)
 }
 
 bool suppress_death_effector() { return live(); }
+
+bool ignores_hits()
+{
+	if (!live())
+		return false;
+	const Life l = g_me.life;
+	return !death::hit_counts(l == Life::Dead || l == Life::Spectating || l == Life::Respawning, now(), g_me.shield_until);
+}
 
 bool intercept_actor_kill(CEntity* victim, u16 killer_id)
 {

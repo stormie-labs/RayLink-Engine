@@ -2,6 +2,7 @@
 #include "actor.h"
 #include "hudmanager.h"
 #include "Actor_Flags.h"
+#include "coop/coop_join.h"
 #include "inventory.h"
 #include "xrserver_objects_alife_monsters.h"
 #include "xrServer.h"
@@ -545,6 +546,7 @@ BOOL CActor::net_Spawn(CSE_Abstract* DC)
 	//-------------------------------------
 	//  ,  
 	game_news_registry->registry().init(ID());
+	coop::join::client_take_news_log(game_news_registry->registry().objects());
 
 
 	if (!CInventoryOwner::net_Spawn(DC)) return FALSE;

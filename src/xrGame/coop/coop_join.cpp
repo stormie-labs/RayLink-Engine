@@ -40,6 +40,8 @@
 #include "space_restrictor.h" // 2026-10-24: a route restrictor is an exit while the actor is inside it
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
+#include "game_news.h"
+#include "xrCoop/coop_news_log.h"
 #include "alife_graph_registry.h"
 #include "xrServer.h"
 #include "xrServer_Objects_ALife_Monsters.h"
@@ -107,6 +109,7 @@ struct HostPeer
 
 struct State
 {
+	xr_vector<GAME_NEWS_DATA> my_news; // client: his PDA log, over every world of the session
 	// host
 	xr_map<PeerId, HostPeer> peers;
 	// client
@@ -3336,6 +3339,13 @@ void on_welcome(const WelcomeMsg&)
 u16 my_proxy() { return g.my_proxy; }
 
 bool client_loading_world() { return mgr().phase() == Phase::LoadingWorld; }
+
+void client_news_added(const GAME_NEWS_DATA& news) { news_log::on_news(mgr().is_client(), g.my_news, news); }
+
+void client_take_news_log(xr_vector<GAME_NEWS_DATA>& actor_log)
+{
+	news_log::on_actor_spawn(mgr().is_client(), actor_log, g.my_news);
+}
 
 bool is_client_cache_save(LPCSTR name)
 {

@@ -216,6 +216,8 @@ void actor_condition_hook(CActorCondition& c);
 // CActorCondition::UpdateCondition: true in a live session (the single-player death effector would end
 // in health -1 and the stock game-over flow).
 bool suppress_death_effector();
+// This machine's player takes no hit now (death::hit_counts). Main thread.
+bool ignores_hits();
 // CEntity::KillEntity (lead hook): a scripted or engine kill of the local actor during a session.
 // True = handled (the actor falls wounded instead), the caller must return.
 bool intercept_actor_kill(CEntity* victim, u16 killer_id);

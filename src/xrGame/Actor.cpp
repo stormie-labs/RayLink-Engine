@@ -1941,7 +1941,13 @@ void CActor::shedule_Update(u32 DT)
 	pCamBobbing->SetState(mstate_real, conditions().IsLimping(), IsZoomAimingMode());
 
 	// Звук тяжелого дыхания при усталости и хромании (Heavy breathing sound when tired or limping)
-	if (this == Level().CurrentControlEntity() && !g_dedicated_server)
+	if (coop::survival::camera_left_body()) // Anomaly Coop: he watches a teammate, his own body is quiet
+	{
+		m_HeavyBreathSnd.stop();
+		m_BloodSnd.stop();
+		m_DangerSnd.stop();
+	}
+	else if (this == Level().CurrentControlEntity() && !g_dedicated_server)
 	{
 		if (conditions().IsLimping() && g_Alive() && !psActorFlags.test(AF_GODMODE_RT))
 		{

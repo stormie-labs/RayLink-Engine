@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "coop_events.h"
+#include "coop_survival.h"
 #include "coop_requests.h"
 #include "coop_manager.h"
 #include "coop_net.h"
@@ -1147,6 +1148,7 @@ bool client_filter(NET_Packet& P)
 bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 {
 	if (coop::hold_loading_screen()) return true; // F3a T8 R1: nobody is hurt behind a held loading screen (a session never pauses)
+	if (survival::ignores_hits()) return true;
 	if (mgr().is_host())
 		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
 	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying() || monster_fx::client_playing())
