@@ -28,6 +28,10 @@ enum class Role : uint8_t
 	Client
 };
 
+// How a client's session ended (Session::end_code), or the name of the RejectReason of a kick after joining.
+constexpr const char* kEndLost = "lost"; // no word from the host: the link went silent or closed
+constexpr const char* kEndHostLeft = "host_left"; // the host's Bye: it stopped the session itself
+
 enum class PeerState : uint8_t
 {
 	Connecting, // transport connected, waiting for Hello / Welcome
@@ -148,6 +152,11 @@ public:
 	uint64_t keepalive_services() const; // helper services so far (diagnostics)
 	// A client: ms since anything (an acknowledgement too) came from the host; 0 when not a connected client.
 	uint32_t ms_since_host_heard() const;
+	// A client that has waited for a silent host long enough: the session ends here and now (on_disconnected, before this
+	// returns), as if the transport had lost it. ENet alone takes up to twice peer_timeout_ms. Not from a callback.
+	void drop_silent_host();
+	// A client: how the last session ended, valid from on_disconnected on (see kEndLost).
+	const std::string& end_code() const;
 
 	// Bulk transfer of an arbitrary byte blob in chunks over Lane::Bulk, with CRC32 check.
 	// Returns the blob id. R1 I4: a blob of the same kind still queued or streaming to that peer is cancelled, the

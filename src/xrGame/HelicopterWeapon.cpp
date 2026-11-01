@@ -165,7 +165,7 @@ void CHelicopter::OnShot()
 }
 
 // Anomaly Coop (audits H2, W3, W8): the host's shot on a client's copy, the stock OnShot without its decisions. Its bullets
-// deal no damage: the host's did. The barrel follows the host's aim while it fires.
+// deal no damage: the host's did. Between the shots the barrel follows the aim in the host's reports (coop_state).
 void CHelicopter::coop_shot(const Fvector& pos, const Fvector& dir, bool bullets)
 {
 	m_enemy.destEnemyPos.mad(pos, dir, 100.f);
@@ -196,14 +196,12 @@ void CHelicopter::coop_rocket(const Fvector& pos)
 void CHelicopter::coop_update_weapons()
 {
 	const bool firing = Device.dwTimeGlobal < m_coop_aim_until;
-	if (firing)
+	if (firing || Device.dwTimeGlobal < m_coop_track_until)
 		UpdateMGunDir();
 	else
-	{
 		m_tgt_rot.set(0.0f, 0.0f);
-		if (IsWorking())
-			MGunFireEnd();
-	}
+	if (!firing && IsWorking())
+		MGunFireEnd();
 	angle_lerp(m_cur_rot.x, m_tgt_rot.x, PI, Device.fTimeDelta);
 	angle_lerp(m_cur_rot.y, m_tgt_rot.y, PI, Device.fTimeDelta);
 	CShootingObject::UpdateFlameParticles();

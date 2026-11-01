@@ -85,8 +85,9 @@ void note_start(const char* address, u16 port);
 void note_start_failed(const char* why);
 // The next on_session_end comes from the player (coop_disconnect / the menu): not shown as an error.
 void note_user_stop();
-// The session ended (Manager::stop, transport lost). Main thread. Keeps the reason for the menu.
-void on_session_end(const char* reason);
+// The session ended (Manager::stop, transport lost). Main thread. Keeps the reason for the menu. `code`: how it ended
+// (Session::end_code), nullptr when this machine stopped it. A client it sends out of a world reads why in the main menu.
+void on_session_end(const char* reason, const char* code = nullptr);
 
 // --- engine events for Lua (W5). Called on the main thread; queued, delivered by frame() in game. ---
 // Host: a client stands at a level exit -> coop_main.on_transition_vote(nick).

@@ -210,12 +210,14 @@ public:
 	void coop_shot(const Fvector& pos, const Fvector& dir, bool bullets);
 	void coop_rocket(const Fvector& pos);
 	void coop_blast();
-	void coop_state(u8 flags, float health);
+	void coop_state(u8 flags, float health, const Fvector& aim);
 	u8 coop_flags();
+	Fvector coop_aim();
 
 private:
 	void coop_update_weapons();
 	u32 m_coop_aim_until;
+	u32 m_coop_track_until;
 	bool m_coop_engine_on;
 
 public:

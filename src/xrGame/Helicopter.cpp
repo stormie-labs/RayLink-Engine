@@ -46,6 +46,7 @@ void CHelicopter::init()
 	m_tgt_rot.set(0.0f, 0.0f);
 	m_bind_rot.set(0.0f, 0.0f);
 	m_coop_aim_until = 0;
+	m_coop_track_until = 0;
 	m_coop_engine_on = false;
 
 	m_allow_fire = FALSE;
@@ -397,7 +398,7 @@ void CHelicopter::UpdateCL()
 {
 	inherited::UpdateCL();
 	CExplosive::UpdateCL();
-	coop::presence::on_heli_state(this, coop_flags(), GetfHealth()); // Anomaly Coop: the host's scripts run the machine
+	coop::presence::on_heli_state(this, coop_flags(), GetfHealth(), coop_aim()); // Anomaly Coop: the host's scripts run the machine
 	if (state() != CHelicopter::eDead && coop::objects::client_drive_pose(this)) // Anomaly Coop: the host flies and shoots
 	{
 		if (PPhysicsShell())

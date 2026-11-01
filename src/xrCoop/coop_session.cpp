@@ -252,6 +252,7 @@ struct Session::Impl
 	bool m_deadline_set = false;
 	uint64_t m_deadline = 0;
 	bool m_transport_up = false;
+	std::string m_end_code = kEndLost;
 
 	std::map<uint16_t, Handler> m_handlers;
 	std::set<uint16_t> m_logged_unknown;
@@ -1248,7 +1249,7 @@ struct Session::Impl
 			return;
 		}
 		if (&c == m_server)
-			fail_client(reason.empty() ? std::string("host closed the session") : reason);
+			fail_client(reason.empty() ? std::string("host closed the session") : reason, kEndHostLeft);
 	}
 
 	// ------------------------------------------------------------------ client: handshake
@@ -1306,7 +1307,7 @@ struct Session::Impl
 		std::string reason = reject_reason_name(rm.reason);
 		if (!rm.text.empty())
 			reason += ": " + rm.text;
-		fail_client(reason);
+		fail_client(reason, reject_reason_name(rm.reason));
 	}
 
 	void client_peer_list(Conn& c, Reader& r)
@@ -1384,9 +1385,10 @@ struct Session::Impl
 	}
 
 	// Client: tear everything down and report on_disconnected.
-	void fail_client(std::string reason)
+	void fail_client(std::string reason, const char* code = kEndLost)
 	{
 		logf("client: disconnected: %s", reason.c_str());
+		m_end_code = code;
 		hard_stop(true);
 		emit([this, reason] {
 			if (m_self.on_disconnected)
@@ -1873,6 +1875,7 @@ bool Session::connect(const SessionConfig& cfg, const std::string& address, uint
 		s.set_epoch(0);
 		s.m_deadline_set = false;
 		s.m_transport_up = false;
+		s.m_end_code = kEndLost;
 		s.m_server_text = address + ":" + std::to_string(unsigned(port));
 		Conn* c = s.add_conn(peer);
 		c->info.id = kHostPeer;
@@ -2293,6 +2296,27 @@ uint32_t Session::ms_since_host_heard() const
 		return 0;
 	const uint32_t ms = net::Transport::ms_since_receive(m->m_server->peer);
 	return ms == UINT32_MAX ? 0 : ms;
+}
+
+void Session::drop_silent_host()
+{
+	Impl& s = *m;
+	try
+	{
+		if (s.m_role != Role::Client)
+			return;
+		s.fail_client("connection to host lost");
+		s.run_pending();
+	}
+	catch (...)
+	{
+		s.logf("internal exception in drop_silent_host() was suppressed");
+	}
+}
+
+const std::string& Session::end_code() const
+{
+	return m->m_end_code;
 }
 
 void Session::set_log(LogFn fn)

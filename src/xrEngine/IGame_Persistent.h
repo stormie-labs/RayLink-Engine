@@ -206,6 +206,9 @@ public:
 	// Anomaly Coop: called before a device reset (vid_restart, a resolution change, a monitor switch) starts. The reset
 	// blocks the frame loop for 10-20 s with GAMMA; the game layer keeps its co-op session link alive meanwhile.
 	virtual void OnDeviceResetBegin() {}
+	// Anomaly Coop (parity audit W5): a client's sky strikes only on the host's word, and the host tells of each bolt.
+	virtual bool OnThunderboltFollows() { return false; }
+	virtual void OnThunderbolt(LPCSTR id, float period, float duration, u32 seed) {}
 
 	struct pda_data
 	{

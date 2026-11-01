@@ -148,6 +148,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::EntitySound:
 	case Msg::EntityVisual:
 	case Msg::LampState:
+	case Msg::Thunderbolt:
 	case Msg::EntityHash:
 	case Msg::EntityRoster:
 	case Msg::EntityResync:

@@ -6,7 +6,7 @@
 // server, as the authority of a map, as a player, as a mirror) are in coop_manager.h (is_world_server() ...).
 //
 // T1 is the skeleton. Until the registry (T10) every player stands on the level of the one world, so the answers below are
-// those of a session without split levels, and the switches already work: the game rules coop_split_levels and
+// those of a session without split levels, and the switches are only stored: the game rules coop_split_levels and
 // coop_story_together and the machine settings coop_max_map_servers and coop_mapserver_linger (plan §3). The registry
 // (LevelMap, the table of servers and gates), the marks "online at a map server" (coop_levels_alife.cpp), the transfers and the
 // auditor (coop_levels_xfer.cpp), the map-server processes (coop_mapserver.cpp) and the bridge (coop_trunk.cpp) fill in
@@ -37,7 +37,7 @@ namespace levels
 using LevelId = u16;
 
 // Game rules and machine settings (console variables; the rules are set per game by coop_game_schema, plan §3).
-extern int g_coop_split_levels; // 1 = every player on his own map (default), 0 = one map for the group, as in F3
+extern int g_coop_split_levels; // 0 = one map for the group, as in F3 (default, the only mode today); 1 = every player on his own map (T9)
 extern int g_coop_story_together; // 1 = the story levels are entered together (default), 0 = apart as any level
 extern int g_coop_max_map_servers; // 0..7, default 3: how many background map servers the host's PC may run
 extern int g_coop_mapserver_linger; // seconds a map server stays after its last player left, default 60

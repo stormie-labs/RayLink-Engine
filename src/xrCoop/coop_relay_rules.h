@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "coop_wire.h"
@@ -154,9 +155,11 @@ enum HeliFlags : uint8_t
 	HeliLight = 2, // TurnLighting
 	HeliSmoke = 4, // StartFlame
 	HeliDead = 8,
+	HeliAiming = 16, // it has a target: the report's direction is where the gun looks
 };
 constexpr uint64_t kHeliStateMs = 1000;
-constexpr uint32_t kHeliAimMs = 600; // a client's barrel holds the last shot's direction this long
+constexpr uint32_t kHeliAimMs = 600; // a client's gun counts as firing this long after the last shot
+constexpr uint32_t kHeliTrackMs = 2500; // a client's barrel holds the reported aim this long: a lost report does not drop it
 
 inline uint8_t heli_health_byte(float health)
 {
@@ -230,6 +233,33 @@ inline bool read_lamps(Reader& r, std::vector<LampEntry>& out)
 		out.push_back(e);
 	}
 	return true;
+}
+
+// Msg::Thunderbolt (host -> clients, parity audit W5): str collection, f32 period, f32 duration, u32 seed. The seed is the
+// bolt: the same picture, the same direction from each machine's camera, the same clap (CEffect_Thunderbolt::Bolt).
+struct BoltMsg
+{
+	std::string id; // thunderbolt collection of the weather
+	float period = 0.f;
+	float duration = 0.f;
+	uint32_t seed = 0;
+};
+
+inline void write_bolt(Writer& w, const BoltMsg& b)
+{
+	w.str(b.id);
+	w.f32(b.period);
+	w.f32(b.duration);
+	w.u32(b.seed);
+}
+// False on overrun, no collection, or numbers the effect could not run on.
+inline bool read_bolt(Reader& r, BoltMsg& b)
+{
+	b.id = r.str();
+	b.period = r.f32();
+	b.duration = r.f32();
+	b.seed = r.u32();
+	return r.ok() && !b.id.empty() && std::isfinite(b.period) && std::isfinite(b.duration) && b.period >= 0.f && b.duration >= 0.f;
 }
 
 // Host: the last word on every lamp that changed in this world. The save carries the rest.

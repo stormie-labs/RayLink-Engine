@@ -443,7 +443,7 @@ void play_event(u16 id, const ShotEvent& e)
 	else if (e.kind == KindHeliRocket)
 		heli->coop_rocket(e.pos);
 	else if (e.kind == KindHeliState)
-		heli->coop_state(e.flags, relay::heli_health(e.ammo));
+		heli->coop_state(e.flags, relay::heli_health(e.ammo), e.dir);
 	else if (e.kind == KindHeliBlast)
 		heli->coop_blast();
 }
@@ -936,13 +936,13 @@ void on_heli_blast(CGameObject* heli)
 		record(heli_event(heli, KindHeliBlast, heli->Position(), Fvector().set(0.f, 0.f, 1.f)));
 }
 
-void on_heli_state(CGameObject* heli, u8 flags, float health)
+void on_heli_state(CGameObject* heli, u8 flags, float health, const Fvector& aim)
 {
 	if (!host_records())
 		return;
 	const u8 byte = relay::heli_health_byte(health);
 	const u64 now = mgr().now_ms();
-	ShotEvent e = heli_event(heli, KindHeliState, heli->Position(), Fvector().set(0.f, 0.f, 1.f));
+	ShotEvent e = heli_event(heli, KindHeliState, heli->Position(), aim);
 	e.flags = flags;
 	e.ammo = byte;
 	xrCriticalSectionGuard guard(&g_lock);

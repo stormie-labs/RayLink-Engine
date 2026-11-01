@@ -117,6 +117,7 @@ inline Need need_of(Msg type)
 	case Msg::EntityHealth:
 	case Msg::EntitySound: // a moment of sound, on either lane
 	case Msg::LampState: // the host sends its word again when a client is in the world (coop_lamps.cpp)
+	case Msg::Thunderbolt: // a moment of the sky
 	case Msg::EntityHash: // the next round brings it again, and a world that is back is compared then
 	case Msg::EntityRoster: // answers of a bucket that the next round asks for again
 	case Msg::EntityResync:

@@ -64,7 +64,7 @@ namespace coop
 //     Animation absence uses MotionID::invalidate (0xffff); (slot 0,index 0) is a valid motion.
 // 17 (2026-10-30): EntityVisual 0x012D (host -> all): a host creature took a new visual (GE_CHANGE_VISUAL); the motion ids
 //     of the snapshots belong to the host's model, a puppet that kept the old one played other motions.
-constexpr uint32_t kProtocolVersion = 18;
+constexpr uint32_t kProtocolVersion = 19;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -244,6 +244,9 @@ enum class Msg : uint16_t
 
 	// hanging lamps: the host's word on the lamps that changed (parity audit W2, xrCoop/coop_relay_rules.h)
 	LampState = 0x0138, // host -> clients: varu n, n x {u16 lamp, u8 LampBits}
+
+	// a bolt of lightning (parity audit W5, xrCoop/coop_relay_rules.h)
+	Thunderbolt = 0x0139, // host -> clients: str collection, f32 period, f32 duration, u32 seed
 };
 
 // Human-readable name for logs and stats ("Hello", "PlayerState", ...).
@@ -293,6 +296,11 @@ uint64_t manifest_fingerprint(const Manifest& m);
 // everything under textures\. Left out of the manifest, so a texture pack or another version of one does not refuse
 // a join (live 2026-10-29: a GAMMA client was refused for textures).
 bool manifest_visual_only(const std::string& gamedata_rel);
+
+// A loose gamedata file (same path rules) that the game or its addons write at run time: user options, caches, logs,
+// `*_user.ltx`, `*.flag`. Two players with identical content have different copies of them, so they are not content
+// (live 2026-10-29: a client was refused for `laser_settings_user.ltx` and `medik_welcomed.flag`).
+bool manifest_game_written(const std::string& gamedata_rel);
 
 struct ManifestDiff
 {

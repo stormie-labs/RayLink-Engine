@@ -21,7 +21,7 @@ namespace coop
 {
 namespace levels
 {
-int g_coop_split_levels = 1;
+int g_coop_split_levels = 0; // off until there is a map server: coop_mapserver.cpp and coop_trunk.cpp are stubs, nothing reads it
 int g_coop_story_together = 1;
 int g_coop_max_map_servers = 3;
 int g_coop_mapserver_linger = 60;

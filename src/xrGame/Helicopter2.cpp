@@ -139,10 +139,24 @@ u8 CHelicopter::coop_flags()
 		flags |= coop::relay::HeliSmoke;
 	if (state() == CHelicopter::eDead)
 		flags |= coop::relay::HeliDead;
+	if (isOnAttack())
+		flags |= coop::relay::HeliAiming;
 	return flags;
 }
 
-void CHelicopter::coop_state(u8 flags, float health)
+// Where the gun looks from the machine, as a direction: a client's copy stands a little elsewhere.
+Fvector CHelicopter::coop_aim()
+{
+	Fvector aim;
+	aim.sub(m_enemy.destEnemyPos, XFORM().c);
+	if (aim.square_magnitude() < EPS_L)
+		aim.set(0.f, 0.f, 1.f);
+	else
+		aim.normalize();
+	return aim;
+}
+
+void CHelicopter::coop_state(u8 flags, float health, const Fvector& aim)
 {
 	if (state() == CHelicopter::eDead)
 		return;
@@ -160,6 +174,11 @@ void CHelicopter::coop_state(u8 flags, float health)
 		TurnLighting(light);
 	if ((flags & coop::relay::HeliSmoke) && !m_flame_started)
 		StartFlame();
+	if (flags & coop::relay::HeliAiming)
+	{
+		m_enemy.destEnemyPos.mad(XFORM().c, aim, 100.f);
+		m_coop_track_until = Device.dwTimeGlobal + coop::relay::kHeliTrackMs;
+	}
 }
 
 void CHelicopter::SetDestPosition(Fvector* pos)
@@ -379,7 +398,7 @@ void CHelicopter::DieHelicopter()
 	m_engineSound.stop();
 	processing_deactivate();
 	m_dead = true;
-	coop::presence::on_heli_state(this, coop_flags(), 0.f); // Anomaly Coop (audit W8): the last report
+	coop::presence::on_heli_state(this, coop_flags(), 0.f, coop_aim()); // Anomaly Coop (audit W8): the last report
 }
 
 void SHeliEnemy::Load(LPCSTR section)

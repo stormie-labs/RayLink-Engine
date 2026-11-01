@@ -35,5 +35,14 @@ inline bool input_off_after_hold(bool off_before, uint32_t world_before, uint32_
 {
 	return off_before && world_before == world_now;
 }
+
+// CUISequencer keeps game_tutorials.xml for the process, but a DXML script edits it in Lua: G.A.M.M.A.'s
+// modxml_tutorial_hooks blanks the stock text of every "use" prompt and calls a function it generates in its own Lua state
+// instead. Every world has a new Lua state (restart_all), so the XML is only good in the world that read it. Single player
+// hid this: "press any key" starts a tutorial while the load is on, and that read the file again. A client has no such key.
+inline bool tutorials_xml_reusable(bool read_before, bool boot_complete, uint32_t world_read, uint32_t world_now)
+{
+	return read_before && boot_complete && world_read == world_now;
+}
 } // namespace ui_rules
 } // namespace coop

@@ -45,6 +45,11 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins);
 // Host: false, and a WeatherSync goes out at once. No session, or an ltx override: false.
 bool refuse_script_weather(const char* name);
 
+// CEffect_Thunderbolt (parity audit W5). A client in a session never schedules a bolt of his own: he draws the host's,
+// host_on_bolt sends each one with its seed. On each machine's own weather the sky would strike at other moments.
+bool bolts_follow();
+void host_on_bolt(const char* id, float period, float duration, u32 seed);
+
 // Console `time_factor` / `freeze_time` (engine device time scale, slow motion).
 // True during a session for any value other than 1: refused with a log line.
 bool refuse_engine_time_factor(float factor);

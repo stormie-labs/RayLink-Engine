@@ -2,6 +2,7 @@
 #include "gamepersistent.h"
 #include "coop/coop_manager.h"
 #include "coop/coop_join.h" // Anomaly Coop F3a: hold_loading_screen
+#include "coop/coop_worldstate.h" // Anomaly Coop: parity audit W5, a bolt is the host's
 #include "../xrEngine/fmesh.h"
 #include "../xrEngine/xr_ioconsole.h"
 #include "../xrEngine/gamemtllib.h"
@@ -299,6 +300,13 @@ float CGamePersistent::OnThunderboltSound(LPCSTR file, float distance)
 	if (ai().script_engine().functor("_G.COnThunderboltSound", funct))
 		return ambient_hook_volume_mult(funct(file, distance));
 	return 1.0f;
+}
+
+bool CGamePersistent::OnThunderboltFollows() { return coop::worldstate::bolts_follow(); }
+
+void CGamePersistent::OnThunderbolt(LPCSTR id, float period, float duration, u32 seed)
+{
+	coop::worldstate::host_on_bolt(id, period, duration, seed);
 }
 
 float CGamePersistent::OnRainSound(LPCSTR file)
@@ -604,6 +612,7 @@ void CGamePersistent::game_loaded()
 				 )
 		{
 			Msg("intro_start game_loaded");
+			CUISequencer::PreloadXml(); // Anomaly Coop: no "game_loaded" tutorial here, and that is what reads the file for this Lua state
 
             // demonized: Reset mouse state on loading the game
             pInput->resetMouseState();

@@ -187,14 +187,18 @@ BOOL CEffect_Thunderbolt::RayPick(const Fvector& s, const Fvector& d, float& dis
 
 #define FAR_DIST g_pGamePersistent->Environment().CurrentEnv->far_plane
 
-void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt)
+// Anomaly Coop (parity audit W5): every number of a bolt comes from its seed, so a client that gets the host's seed draws the same
+// bolt, in the same direction from his own camera, with the same clap. The global Random is shared with other threads.
+void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt, u32 seed)
 {
 	VERIFY(id.size());
+	const s32 start = s32(seed);
+	CRandom rng(start);
 	state = stWorking;
-	life_time = lt + Random.randF(-lt * 0.5f, lt * 0.5f);
+	life_time = lt + rng.randF(-lt * 0.5f, lt * 0.5f);
 	current_time = 0.f;
 
-	current = g_pGamePersistent->Environment().thunderbolt_collection(collection, id)->GetRandomDesc();
+	current = g_pGamePersistent->Environment().thunderbolt_collection(collection, id)->GetRandomDesc(rng);
 	VERIFY(current);
 
 	Fmatrix XF, S;
@@ -203,13 +207,13 @@ void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt)
 	CEnvironment& environment = g_pGamePersistent->Environment();
 	environment.CurrentEnv->sun_dir.getHP(sun_h, sun_p);
 	float alt = environment.p_var_alt; //Random.randF(environment.p_var_alt.x,environment.p_var_alt.y);
-	float lng = Random.randF(sun_h - environment.p_var_long + PI, sun_h + environment.p_var_long + PI);
-	float dist = Random.randF(FAR_DIST * environment.p_min_dist, FAR_DIST * .95f);
+	float lng = rng.randF(sun_h - environment.p_var_long + PI, sun_h + environment.p_var_long + PI);
+	float dist = rng.randF(FAR_DIST * environment.p_min_dist, FAR_DIST * .95f);
 	current_direction.setHP(lng, alt);
 	pos.mad(Device.vCameraPosition, current_direction, dist);
-	dev.x = Random.randF(-environment.p_tilt, environment.p_tilt);
-	dev.y = Random.randF(0, PI_MUL_2);
-	dev.z = Random.randF(-environment.p_tilt, environment.p_tilt);
+	dev.x = rng.randF(-environment.p_tilt, environment.p_tilt);
+	dev.y = rng.randF(0, PI_MUL_2);
+	dev.z = rng.randF(-environment.p_tilt, environment.p_tilt);
 	XF.setXYZi(dev);
 
 	Fvector light_dir = {0.f, -1.f, 0.f};
@@ -223,7 +227,7 @@ void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt)
 	XF.translate_over(pos);
 	current_xform.mul_43(XF, S);
 
-	float next_v = Random.randF();
+	float next_v = rng.randF();
 
 	if (next_v < environment.p_second_prop)
 	{
@@ -231,7 +235,7 @@ void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt)
 	}
 	else
 	{
-		next_lightning_time = Device.fTimeGlobal + period + Random.randF(-period * 0.3f, period * 0.3f);
+		next_lightning_time = Device.fTimeGlobal + period + rng.randF(-period * 0.3f, period * 0.3f);
 
 		// clap volume gate through the game layer (no script-engine reach from xrEngine). 0 skips the clap.
 		float clap_volume_mult = g_pGamePersistent
@@ -246,6 +250,19 @@ void CEffect_Thunderbolt::Bolt(shared_str id, float period, float lt)
 	current_direction.invert(); // for env-sun
 }
 
+bool CEffect_Thunderbolt::CoopBolt(shared_str id, float period, float life_time, u32 seed)
+{
+	for (CollectionVecIt it = collection.begin(); it != collection.end(); it++)
+	{
+		if ((*it)->section == id)
+		{
+			Bolt(id, period, life_time, seed);
+			return true;
+		}
+	}
+	return false;
+}
+
 void CEffect_Thunderbolt::OnFrame(shared_str id, float period, float duration)
 {
 	PROF_EVENT("CEffect_Thunderbolt::OnFrame");
@@ -255,9 +272,14 @@ void CEffect_Thunderbolt::OnFrame(shared_str id, float period, float duration)
 		bEnabled = enabled;
 		next_lightning_time = Device.fTimeGlobal + period + Random.randF(-period * 0.5f, period * 0.5f);
 	}
-	else if (bEnabled && (Device.fTimeGlobal > next_lightning_time))
+	else if (bEnabled && (Device.fTimeGlobal > next_lightning_time) && !g_pGamePersistent->OnThunderboltFollows())
 	{
-		if (state == stIdle && !!(id.size())) Bolt(id, period, duration);
+		if (state == stIdle && !!(id.size()))
+		{
+			const u32 seed = (u32(Random.randI()) << 15) | u32(Random.randI());
+			Bolt(id, period, duration, seed);
+			g_pGamePersistent->OnThunderbolt(id.c_str(), period, duration, seed);
+		}
 	}
 	if (state == stWorking)
 	{

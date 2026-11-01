@@ -86,6 +86,7 @@ const char* msg_name(Msg type)
 	case Msg::EntitySound: return "EntitySound";
 	case Msg::EntityVisual: return "EntityVisual";
 	case Msg::LampState: return "LampState";
+	case Msg::Thunderbolt: return "Thunderbolt";
 	case Msg::EntityHash: return "EntityHash";
 	case Msg::EntityRoster: return "EntityRoster";
 	case Msg::EntityResync: return "EntityResync";
@@ -188,6 +189,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::EntitySound:
 	case Msg::EntityVisual:
 	case Msg::LampState:
+	case Msg::Thunderbolt:
 	case Msg::EntityHash:
 	case Msg::EntityRoster:
 	case Msg::EntityTraits:
@@ -329,6 +331,22 @@ bool manifest_visual_only(const std::string& gamedata_rel)
 		if (std::tolower(static_cast<unsigned char>(gamedata_rel[i])) != kFolder[i])
 			return false;
 	return true;
+}
+
+bool manifest_game_written(const std::string& gamedata_rel)
+{
+	std::string low = gamedata_rel;
+	for (char& c : low)
+		c = c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	// localization.ltx: the game writes the chosen language at start (live check 2026-10-23: a second instance
+	// started after the host had it, the host did not, and the join was refused as a different mod list)
+	for (const char* exact : {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx"})
+		if (low == exact)
+			return true;
+	for (const std::string tail : {".log", ".txt", ".bak", ".tmp", ".flag", "_user.ltx"})
+		if (low.size() >= tail.size() && low.compare(low.size() - tail.size(), tail.size(), tail) == 0)
+			return true;
+	return false;
 }
 
 uint64_t manifest_fingerprint(const Manifest& m)

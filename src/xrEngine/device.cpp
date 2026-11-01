@@ -38,6 +38,7 @@
 #include "CustomHUD.h"
 #include "EngineThreading.h"
 #include "cursor_policy.h" // Anomaly Coop: free cursor in windowed menus
+#include "../xrCoop/coop_continual_clock.h" // Anomaly Coop
 #include "IGame_Level.h"
 
 #include "Rain.h"
@@ -677,7 +678,7 @@ void CRenderDevice::FrameMove()
 	dwFrame++;
 	Core.dwFrame = dwFrame;
 	renderdoc_poll_captures();
-	dwTimeContinual = TimerMM.GetElapsed_ms() - app_inactive_time;
+	dwTimeContinual = coop::continual_ms(TimerMM.GetElapsed_ms(), app_inactive_time, app_inactive_time_start, !!b_is_Active); // Anomaly Coop: it never goes back
 	if (psDeviceFlags.test(rsConstantFPS))
 	{
 		PROF_EVENT("Constant FPS");

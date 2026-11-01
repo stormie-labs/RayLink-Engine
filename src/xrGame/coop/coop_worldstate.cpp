@@ -6,6 +6,7 @@
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_callgate.h" // F2 T12
+#include "xrCoop/coop_relay_rules.h"
 
 #include "Level.h"
 #include "ai_space.h"
@@ -14,6 +15,7 @@
 #include "date_time.h"
 #include "../xrEngine/IGame_Persistent.h"
 #include "../xrEngine/Environment.h"
+#include "../xrEngine/thunderbolt.h"
 
 namespace coop
 {
@@ -158,6 +160,7 @@ struct State
 	WeatherState rx_weather;
 	u64 rx_weather_at = 0;
 	bool have_weather = false;
+	bool bolt_warned = false; // a client told once that the host's sky has a bolt this game lacks
 	bool weather_pending = false;
 	bool was_live = false;
 	u64 last_request_sent = 0;
@@ -645,6 +648,26 @@ void client_on_weather_sync(PeerId from, Reader& r)
 	g.weather_pending = true;
 }
 
+// ---------------------------------------------------------------- lightning
+
+void client_on_thunderbolt(PeerId from, Reader& r)
+{
+	if (from != kHostPeer || !mgr().is_client())
+		return;
+	relay::BoltMsg b;
+	if (!relay::read_bolt(r, b))
+	{
+		::Msg("! [coop] weather: malformed Thunderbolt");
+		return;
+	}
+	CEnvironment* e = g_pGamePersistent ? &g_pGamePersistent->Environment() : nullptr;
+	if (e && e->CurrentEnv && !e->eff_Thunderbolt->CoopBolt(b.id.c_str(), b.period, b.duration, b.seed) && !g.bolt_warned)
+	{
+		g.bolt_warned = true; // different weather mods: he stays without this one's bolts
+		::Msg("! [coop] weather: no thunderbolt collection '%s' here", b.id.c_str());
+	}
+}
+
 // ---------------------------------------------------------------- slow motion
 
 void enforce_device_time_factor()
@@ -664,6 +687,7 @@ void install_client(Endpoint& e)
 {
 	e.on(Msg::TimeSync, &client_on_time_sync);
 	e.on(Msg::WeatherSync, &client_on_weather_sync);
+	e.on(Msg::Thunderbolt, &client_on_thunderbolt);
 }
 
 void reset() { g = State(); }
@@ -784,6 +808,22 @@ bool refuse_script_weather(const char* name)
 		return false; // an ltx override makes it local
 	++g.refused_weather;
 	return true;
+}
+
+bool bolts_follow() { return mgr().is_client(); }
+
+void host_on_bolt(const char* id, float period, float duration, u32 seed)
+{
+	if (!mgr().is_host())
+		return;
+	relay::BoltMsg b;
+	b.id = id;
+	b.period = period;
+	b.duration = duration;
+	b.seed = seed;
+	Writer w(48);
+	relay::write_bolt(w, b);
+	net::host_broadcast(Msg::Thunderbolt, w, Lane::Unreliable); // cosmetic: the next bolt comes anyway
 }
 
 bool refuse_engine_time_factor(float factor)

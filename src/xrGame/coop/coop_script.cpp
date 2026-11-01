@@ -140,7 +140,7 @@ struct MenuMemo
 	u16 port = 0; // host: listen port, client: target port (0 = unknown, e.g. the -coop_host autostart)
 	std::string address; // client: target address
 	std::string last_error; // why the last session ended or could not start ("" = nothing to show)
-	std::string last_code; // RejectReason name for refusals, else "start" / "lost" / "left"
+	std::string last_code; // RejectReason name for refusals, else "start" / "left" / "failed" / Session::end_code
 	bool last_by_user = false;
 	u64 last_ms = 0;
 	u64 rejected_ms = 0; // a refusal is more precise than the disconnect that follows it
@@ -156,6 +156,16 @@ constexpr u64 kPendingSettleMs = 2000; // a new game changes level right after i
 constexpr u64 kRejectShadowMs = 3000;
 
 MenuMemo g_menu;
+
+// A client sent out of a world by the end of his session: the co-op window is not there to say why, so the main menu does as
+// soon as it stands (coop_ui.on_session_end). Survives reset().
+struct EndNotice
+{
+	bool pending = false;
+	std::string code;
+	std::string text;
+};
+EndNotice g_end;
 
 Stats g_stats;
 std::deque<Outgoing> g_outbox;
@@ -894,7 +904,7 @@ bool g_pump_on = false;
 
 void pump_sync()
 {
-	const bool need = g_reject.pending || !g_stash.empty() || g_menu.pending;
+	const bool need = g_reject.pending || g_end.pending || !g_stash.empty() || g_menu.pending;
 	if (need && !g_pump_on)
 	{
 		Device.seqFrame.Add(&g_pump, REG_PRIORITY_LOW);
@@ -987,6 +997,16 @@ bool ui_ready()
 	return g_pGameLevel && g_actor && CurrentGameUI();
 }
 
+// The way out of a world is over: the level is gone and the main menu stands. ui_ready() is true long before that, in the level
+// that is about to go.
+bool back_in_main_menu()
+{
+	if (!g_pGamePersistent || g_pGameLevel || Device.dwPrecacheFrame)
+		return false;
+	CMainMenu* menu = MainMenu();
+	return menu && menu->IsActive();
+}
+
 void set_field(lua_State* L, const char* name, const std::string& v)
 {
 	lua_pushlstring(L, v.data(), v.size());
@@ -1044,6 +1064,19 @@ void deliver_rejection()
 	}
 	else
 		++g_ui.failed; // logged by call_module; the log already has the full diff
+}
+
+void deliver_end_notice()
+{
+	const EndNotice n = std::move(g_end);
+	g_end = EndNotice();
+	call_module("coop_ui", "on_session_end", [&n](lua_State* L)
+	{
+		lua_newtable(L);
+		set_field(L, "code", n.code);
+		set_field(L, "text", n.text);
+		return 1;
+	});
 }
 
 // --- co-op menu (W4) -----------------------------------------------------------------------------
@@ -1172,6 +1205,8 @@ void _BCL UiPump::OnFrame()
 		else if (ui_ready())
 			deliver_rejection();
 	}
+	if (g_end.pending && back_in_main_menu())
+		deliver_end_notice();
 	pump_sync();
 }
 
@@ -1427,6 +1462,14 @@ int l_life_of(lua_State* L)
 	return 1;
 }
 
+// coop.out_of_run(character) -> host: the world says this character (0 = the host's) is out of a hardcore run
+int l_out_of_run(lua_State* L)
+{
+	u16 id = 0;
+	lua_pushboolean(L, mgr().is_host() && arg_local_id(L, 1, id) && survival::out_of_run(id));
+	return 1;
+}
+
 // coop.rollback_failed(character, seq): the host found no save to go back to, that death goes the checkpoint way
 int l_rollback_failed(lua_State* L)
 {
@@ -1643,6 +1686,7 @@ void register_raw(lua_State* L)
 		{"story_hold_infos", &l_story_hold_infos},
 		{"story_local_task", &l_story_local_task},
 		{"life_of", &l_life_of},
+		{"out_of_run", &l_out_of_run},
 		{"steam_invite_ready", &l_steam_invite_ready},
 		{"steam_invite", &l_steam_invite},
 		{"rollback_failed", &l_rollback_failed},
@@ -1838,6 +1882,7 @@ void note_start(const char* address, u16 port)
 	g_menu.port = port;
 	g_menu.address = address ? address : "";
 	g_menu.user_stop = false;
+	g_end = EndNotice(); // a new session: the last one is not news any more
 	if (!address)
 		menu_cancel_pending(nullptr);
 }
@@ -1846,7 +1891,7 @@ void note_start_failed(const char* why) { menu_error("start", why ? why : "could
 
 void note_user_stop() { g_menu.user_stop = true; }
 
-void on_session_end(const char* reason)
+void on_session_end(const char* reason, const char* code)
 {
 	const bool by_user = g_menu.user_stop;
 	g_menu.user_stop = false;
@@ -1855,7 +1900,14 @@ void on_session_end(const char* reason)
 	// A refusal (on_rejected) is followed by the transport closing: keep the precise one.
 	if (!by_user && g_menu.rejected_ms && mgr().now_ms() - g_menu.rejected_ms < kRejectShadowMs)
 		return;
-	menu_error(by_user ? "left" : "lost", reason && *reason ? reason : "the session ended", by_user);
+	menu_error(by_user ? "left" : code ? code : "failed", reason && *reason ? reason : "the session ended", by_user);
+	if (!by_user && mgr().is_client() && g_pGameLevel) // the same test as join::on_session_lost, which leaves the world
+	{
+		g_end.pending = true;
+		g_end.code = g_menu.last_code;
+		g_end.text = g_menu.last_error;
+		pump_sync();
+	}
 }
 
 void parity_command(const char* tag)

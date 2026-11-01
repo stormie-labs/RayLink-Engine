@@ -59,6 +59,6 @@ void on_monster_flinch(CGameObject* monster, u8 side);
 void on_heli_shot(CGameObject* heli, const Fvector& pos, const Fvector& dir);
 void on_heli_rocket(CGameObject* heli, const Fvector& pos);
 void on_heli_blast(CGameObject* heli);
-void on_heli_state(CGameObject* heli, u8 flags, float health);
+void on_heli_state(CGameObject* heli, u8 flags, float health, const Fvector& aim); // aim: a direction, read with relay::HeliAiming
 } // namespace presence
 } // namespace coop

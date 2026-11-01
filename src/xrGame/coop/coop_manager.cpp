@@ -31,7 +31,8 @@ constexpr u32 kPeerTimeoutMs = 10000;
 // Live 2026-10-24 (owner): "if the server does not answer, everything freezes on the client and he cannot move; out only
 // after 30 seconds". A live client whose host has said nothing (not even an acknowledgement) for kHostSilenceFreezeMs
 // pauses its game and shows the seconds left; the host back - it runs on. A client's own silence timeout is
-// kHostSilenceLeaveMs: then on_disconnected takes him out of the host's world (join::on_session_lost).
+// kHostSilenceLeaveMs: then on_disconnected takes him out of the host's world (join::on_session_lost). The count ends the
+// session itself: ENet lets go anywhere up to twice its timeout (live 2026-11-01: the line stood at 0 from 30 s to 51.6 s).
 constexpr u32 kHostSilenceFreezeMs = 2000;
 constexpr u32 kHostSilenceLeaveMs = 30000;
 // W9: how long one loading activity holds the link (re-armed by every load stage and by every frame until this machine
@@ -155,28 +156,6 @@ u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
 		h *= 1099511628211ull;
 	}
 	return h;
-}
-
-// Files under gamedata that Anomaly (and addons like MCM) write at run time: user options, caches,
-// logs. Two players with identical content have different copies of them, so they are not content.
-bool is_runtime_written(LPCSTR name)
-{
-	string_path low;
-	xr_strcpy(low, name);
-	xr_strlwr(low);
-	for (char* c = low; *c; ++c)
-		if (*c == '/')
-			*c = '\\';
-	// localization.ltx: the game writes the chosen language at start (live check 2026-10-23: a second instance
-	// started after the host had it, the host did not, and the join was refused as a different mod list)
-	static const char* exact[] = {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx",
-	    "configs\\localization.ltx.bak"};
-	for (const char* e : exact)
-		if (!xr_strcmp(low, e))
-			return true;
-	const size_t n = xr_strlen(low);
-	auto ends = [&](const char* ext) { const size_t k = xr_strlen(ext); return n >= k && !xr_strcmp(low + n - k, ext); };
-	return ends(".log") || ends(".txt") || ends(".bak") || ends(".tmp");
 }
 
 // Path relative to the game root, lowercase, backslashes.
@@ -344,7 +323,7 @@ const Manifest& Manager::manifest()
 	{
 		if (f.attrib & FS_File::flVFS)
 			continue;
-		if (is_runtime_written(f.name.c_str()))
+		if (manifest_game_written(f.name.c_str()))
 			continue; // per-player settings and caches the game rewrites while running: not content
 		if (manifest_visual_only(f.name.c_str()))
 			continue; // textures: how the world looks, not what the host and the clients simulate
@@ -424,7 +403,7 @@ void Manager::install_session_callbacks()
 	{
 		::Msg("! [coop] disconnected: %s", reason.c_str());
 		host_silence_off(); // the pause of a silent host does not outlive the session
-		script::on_session_end(reason.c_str()); // W4 menu: last error in the co-op window
+		script::on_session_end(reason.c_str(), m_session.end_code().c_str()); // W4 menu: last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
 		set_phase(Phase::Off);
@@ -587,7 +566,10 @@ void Manager::autostart()
 			{
 				::Msg("[coop] Steam invite accepted: joining the host through the tunnel");
 				if (active())
+				{
+					script::note_user_stop(); // the player's own choice, nothing to tell him in the main menu
 					stop("joined a friend through a Steam invite");
+				}
 				g_auto.host = false;
 				g_auto.connect = address;
 				g_auto.connect_tries = 0;
@@ -665,7 +647,12 @@ void host_silence_step()
 		::Msg("! [coop] the host does not answer (%u ms): the game waits for it, out after %u s", silent,
 		    kHostSilenceLeaveMs / 1000);
 	}
-	const u32 left = silent >= kHostSilenceLeaveMs ? 0 : (kHostSilenceLeaveMs - silent + 999) / 1000;
+	if (silent >= kHostSilenceLeaveMs)
+	{
+		mgr().session().drop_silent_host();
+		return;
+	}
+	const u32 left = (kHostSilenceLeaveMs - silent + 999) / 1000;
 	if (left != g_silence_shown)
 	{
 		g_silence_shown = left;

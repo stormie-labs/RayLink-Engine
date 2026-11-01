@@ -12,6 +12,8 @@
 #include "../UIGameCustom.h"
 #include "UIActorMenu.h"
 #include "UIPdaWnd.h"
+#include "../coop/coop_join.h" // Anomaly Coop: world_generation
+#include "xrCoop/coop_ui_rules.h"
 
 extern ENGINE_API BOOL bShowPauseString;
 
@@ -20,6 +22,8 @@ void CallFunction(shared_str const& func)
 	::luabind::functor<void> functor_to_call;
 	bool functor_exists = ai().script_engine().functor(func.c_str(), functor_to_call);
 	THROW3(functor_exists, "Cannot find script function described in tutorial item ", func.c_str());
+	if (!functor_exists)
+		Msg("! tutorial: no script function %s", func.c_str()); // Anomaly Coop: THROW3 says nothing in Release
 	if (functor_to_call.is_valid())
 		functor_to_call();
 }
@@ -100,6 +104,35 @@ CUISequencer::CUISequencer()
 }
 
 extern BOOL g_bootComplete;
+// Anomaly Coop: the file, read again for the Lua state of a new world (coop::ui_rules::tutorials_xml_reusable)
+static CUIXml& tutorials_xml()
+{
+    static CUIXml uiXml;
+    static bool uiXmlLoaded;
+    static u32 uiXmlWorld;
+    const u32 world = coop::join::world_generation();
+    if (coop::ui_rules::tutorials_xml_reusable(uiXmlLoaded, !!g_bootComplete, uiXmlWorld, world))
+    {
+        uiXml.SetLocalRoot(uiXml.GetRoot());
+    }
+    else
+    {
+        if (uiXmlLoaded && uiXmlWorld != world)
+            Msg("* tutorial: game_tutorials.xml read again for world %u", world);
+        uiXmlLoaded = true;
+        uiXmlWorld = world;
+        uiXml.ClearInternal();
+        uiXml.Load(CONFIG_PATH, UI_PATH, "game_tutorials.xml");
+        uiXml.SetLocalRoot(uiXml.GetRoot());
+    }
+    return uiXml;
+}
+
+void CUISequencer::PreloadXml()
+{
+    tutorials_xml();
+}
+
 void CUISequencer::Start(LPCSTR tutor_name)
 {
 	VERIFY(m_sequencer_items.size()==0);
@@ -110,20 +143,7 @@ void CUISequencer::Start(LPCSTR tutor_name)
 
 	m_name = tutor_name;
 
-    static CUIXml uiXml;
-    static bool uiXmlLoaded;
-    if (uiXmlLoaded && g_bootComplete)
-    {
-        uiXml.SetLocalRoot(uiXml.GetRoot());
-    }
-    else
-    {
-        uiXmlLoaded = true;
-        uiXml.ClearInternal();
-        uiXml.Load(CONFIG_PATH, UI_PATH, "game_tutorials.xml");
-        uiXml.SetLocalRoot(uiXml.GetRoot());
-    }
-        
+    CUIXml& uiXml = tutorials_xml();
 
 	int items_count = uiXml.GetNodesNum(tutor_name, 0, "item");
 	VERIFY(items_count>0);

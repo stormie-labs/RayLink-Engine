@@ -72,10 +72,10 @@ public:
 	~SThunderboltCollection();
 	void load(CInifile* pIni, CInifile* thunderbolts, LPCSTR sect);
 
-	SThunderboltDesc* GetRandomDesc()
+	SThunderboltDesc* GetRandomDesc(CRandom& rng) // Anomaly Coop: the bolt's own numbers, see CEffect_Thunderbolt::Bolt
 	{
 		VERIFY(palette.size() > 0);
-		return palette[Random.randI(palette.size())];
+		return palette[rng.randI(palette.size())];
 	}
 };
 
@@ -127,13 +127,16 @@ private:
 	// float p_fog_color;
 private:
 	BOOL RayPick(const Fvector& s, const Fvector& d, float& range);
-	void Bolt(shared_str id, float period, float life_time);
+	void Bolt(shared_str id, float period, float life_time, u32 seed);
 public:
 	CEffect_Thunderbolt();
 	~CEffect_Thunderbolt();
 
 	void OnFrame(shared_str id, float period, float duration);
 	void Render();
+
+	// Anomaly Coop (parity audit W5): a client's bolt on the host's word. False when this weather has no such collection.
+	bool CoopBolt(shared_str id, float period, float life_time, u32 seed);
 
 	shared_str AppendDef(CEnvironment& environment, CInifile* pIni, CInifile* thunderbolts, LPCSTR sect);
 };
