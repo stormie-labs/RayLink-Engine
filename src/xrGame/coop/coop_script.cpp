@@ -13,11 +13,13 @@
 #include "coop_instrument.h"
 #include "coop_dialog.h" // W11: dialog::host_talk_holder
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
+#include "coop_trade.h" // trade::lua_search_window
 #include "coop_money.h" // F2 T1: money::register_lua
 #include "coop_router.h" // F2 T10: router::register_lua (coop.route)
 #include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
 #include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
 #include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
+#include "xrCoop/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 
 #include "ai_space.h"
@@ -363,12 +365,12 @@ void deliver_later(PeerId from, std::string&& name, std::string&& payload)
 	g_inbox.push_back(std::move(e));
 }
 
-void host_relay(PeerId origin, s32 target, const std::string& name, const std::string& payload)
+void host_relay(PeerId origin, s32 target, const std::string& name, const std::string& payload, PeerId except)
 {
 	Writer w(name.size() + payload.size() + 16);
 	write_event(w, origin, target, name, payload);
 	if (target == kTargetAll)
-		net::host_broadcast(Msg::ScriptEvent, w, Lane::Reliable, origin);
+		net::host_broadcast(Msg::ScriptEvent, w, Lane::Reliable, except);
 	else
 		net::host_send(PeerId(target), Msg::ScriptEvent, w);
 	++g_stats.relayed;
@@ -398,9 +400,10 @@ void server_on_script_event(PeerId from, Reader& r)
 	std::string name, payload;
 	if (!read_event(from, r, wire_origin, target, name, payload) || !mgr().is_host())
 		return;
-	// P6: the sender must be in the world; a loading client has no business sending game events.
+	// P6: the sender must be in the world; a loading client has no business sending game events. A map server is a process of this PC.
+	const bool bridge = mapserver::is_bridge(from);
 	const bool ready = from == kHostPeer ? mgr().session().local() != nullptr :
-	    mgr().session().peer(from) != nullptr && !sync::host_peer_joining(from);
+	    bridge || (mgr().session().peer(from) != nullptr && !sync::host_peer_joining(from));
 	if (!ready)
 	{
 		++g_stats.drop_not_ready;
@@ -408,16 +411,17 @@ void server_on_script_event(PeerId from, Reader& r)
 			::Msg("! [coop] script event '%s' from #%u dropped: sender is not in the world yet", name.c_str(), from);
 		return;
 	}
-	const PeerId origin = from; // the wire origin of a client is never trusted
+	// the wire origin of a client is never trusted. What a map server tells a player, the world tells him: he knows no other process.
+	const PeerId origin = bridge ? kHostPeer : from;
 	++g_stats.received;
 	if (target == kTargetAll)
 	{
-		host_relay(origin, target, name, payload);
+		host_relay(origin, target, name, payload, from);
 		if (from != kHostPeer) // the host player's own event to everybody else: not back to the Lua that sent it
-			deliver_later(origin, std::move(name), std::move(payload));
+			deliver_later(from, std::move(name), std::move(payload));
 	}
 	else if (target == s32(kHostPeer))
-		deliver_later(origin, std::move(name), std::move(payload));
+		deliver_later(from, std::move(name), std::move(payload));
 	else if (target < 0 || PeerId(target) == from || !mgr().session().peer(PeerId(target)))
 	{
 		++g_stats.drop_invalid;
@@ -425,7 +429,7 @@ void server_on_script_event(PeerId from, Reader& r)
 			::Msg("! [coop] script event '%s' from #%u to #%d dropped: no such player", name.c_str(), from, target);
 	}
 	else
-		host_relay(origin, target, name, payload);
+		host_relay(origin, target, name, payload, from);
 }
 
 // A client: an event the world server relays. F3a T7: in the host's process the world server delivered every event its
@@ -479,12 +483,22 @@ void flush_outbox()
 				net::host_broadcast(Msg::ScriptEvent, w, Lane::Reliable, kHostPeer);
 			else if (o.target == s32(kHostPeer))
 				net::client_send(Msg::ScriptEvent, w);
-			else if (mgr().session().peer(PeerId(o.target)))
+			else if (mgr().session().peer(PeerId(o.target)) || mapserver::is_bridge(PeerId(o.target)))
 				net::host_send(PeerId(o.target), Msg::ScriptEvent, w);
 			else
 			{
 				++g_stats.send_rejected; // the player left meanwhile
 				continue;
+			}
+		}
+		else if (is_map_server() && o.target == kTargetAll)
+		{
+			// "everybody" of a map server is the players of its level; the world relays each, it has no path of its own to them
+			for (const PeerInfo& p : mgr().session().peers())
+			{
+				Writer one(o.name.size() + o.payload.size() + 16);
+				write_event(one, mgr().self(), s32(p.id), o.name, o.payload);
+				net::client_send(Msg::ScriptEvent, one);
 			}
 		}
 		else
@@ -699,9 +713,18 @@ int l_players(lua_State* L)
 		lua_setfield(L, -2, "loss");
 		lua_pushboolean(L, id == self);
 		lua_setfield(L, -2, "is_self");
+		// F3a: where he stands: the HUD says so of a player on another level, his markers and distance mean nothing here
+		const levels::LevelId level = levels::level_of_player(id);
+		if (level != levels::wire::kNoLevel)
+		{
+			lua_pushnumber(L, lua_Number(level));
+			lua_setfield(L, -2, "level");
+			lua_pushboolean(L, levels::split() && id != self && level != levels::my_level());
+			lua_setfield(L, -2, "elsewhere");
+		}
 		lua_rawseti(L, -2, ++index);
 	};
-	if (self != kInvalidPeer)
+	if (self != kInvalidPeer && !g_coop_dedicated) // a dedicated host is nobody in the list of the players
 		push_entry(self, mgr().nick(), 0, 0, 0.f); // our own actor is always id 0 here
 	for (const PeerInfo& p : mgr().session().peers())
 	{
@@ -817,7 +840,8 @@ int send_fail(lua_State* L, const char* why)
 // coop.send_event(name, payload, target) -> true | false, reason
 //   name    : 1..64 printable ASCII characters, no spaces
 //   payload : string up to 16 KiB (binary safe), nil = ""
-//   target  : -1 or nil = every other player, 0 = host, N = player N
+//   target  : -1 or nil = every other player, 0 = host, N = player N; the host's process also the bridge of a map server
+//             (coop.levels.map_servers); a map server also a player of its level, the world server relays it
 int l_send_event(lua_State* L)
 {
 	if (lua_type(L, 1) != LUA_TSTRING)
@@ -844,7 +868,7 @@ int l_send_event(lua_State* L)
 		if (lua_type(L, 3) != LUA_TNUMBER)
 			return send_fail(L, "target must be a number");
 		const lua_Number t = lua_tonumber(L, 3);
-		if (t < -1 || t > lua_Number(kMaxPlayers))
+		if (t < -1 || (t > lua_Number(kMaxPlayers) && !mapserver::is_bridge(PeerId(t))))
 			return send_fail(L, "bad target");
 		target = s32(t);
 	}
@@ -858,7 +882,9 @@ int l_send_event(lua_State* L)
 	const PeerId self = mgr().self();
 	if (target != kTargetAll && PeerId(target) == self && !to_own_world)
 		return send_fail(L, "target is this machine");
-	if (target != kTargetAll && !to_own_world && !mgr().session().peer(PeerId(target)))
+	const bool to_map_server = host && target > 0 && mapserver::is_bridge(PeerId(target));
+	const bool to_the_world = is_map_server() && target == s32(kHostPeer); // the session of its level does not list the host
+	if (target != kTargetAll && !to_own_world && !to_map_server && !to_the_world && !mgr().session().peer(PeerId(target)))
 		return send_fail(L, "no such player");
 	if (g_outbox.size() >= kMaxOutbox)
 		return send_fail(L, "send queue is full");
@@ -1656,7 +1682,7 @@ int l_avatar_headlamp(lua_State* L)
 int l_talk_holder(lua_State* L)
 {
 	lua_Number v = 0;
-	if (!mgr().is_host() || !arg_id(L, 1, v) || v >= lua_Number(0xffff))
+	if (!is_map_authority() || !arg_id(L, 1, v) || v >= lua_Number(0xffff))
 	{
 		lua_pushnil(L);
 		return 1;
@@ -1675,12 +1701,19 @@ int l_talk_holder(lua_State* L)
 int l_talk_recent(lua_State* L)
 {
 	lua_Number peer = 0, npc = 0, ms = 0;
-	const bool ok = mgr().is_host() && arg_id(L, 1, peer) && arg_id(L, 2, npc) && npc < lua_Number(0xffff) &&
+	const bool ok = is_map_authority() && arg_id(L, 1, peer) && arg_id(L, 2, npc) && npc < lua_Number(0xffff) &&
 	    lua_type(L, 3) == LUA_TNUMBER;
 	if (ok)
 		ms = lua_tonumber(L, 3);
 	lua_pushboolean(L, ok && ms >= 0 && ms <= 60000 &&
 	    dialog::host_talked_recently(PeerId(peer), u16(npc), u32(ms)) ? 1 : 0);
+	return 1;
+}
+
+// coop.protocol() -> the version of the wire protocol this exe speaks (the context line of the log, scripts\coop_main.script).
+int l_protocol(lua_State* L)
+{
+	lua_pushnumber(L, lua_Number(kProtocolVersion));
 	return 1;
 }
 
@@ -1720,9 +1753,11 @@ void register_raw(lua_State* L)
 		{"instrument", &players::lua_instrument},
 		{"talk_holder", &l_talk_holder}, // W11
 		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)
+		{"protocol", &l_protocol},
 		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter
 		{"lease_ids", &coop::requests::lua_lease_ids}, // F2 T12b: ids this client can create its own items with now
 		{"lease_waiting", &coop::requests::lua_lease_waiting}, // F2 T12b round 1: an item that waits for the host
+		{"search_window", &coop::trade::lua_search_window}, // what Anomaly's Lua inventory searches now (scripts\coop_mods_items)
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

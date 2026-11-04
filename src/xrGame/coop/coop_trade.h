@@ -41,6 +41,7 @@
 
 #include "xrCoop/coop_protocol.h"
 
+struct lua_State;
 class CTrade;
 class CUIActorMenu;
 class CUIDragDropListEx;
@@ -93,6 +94,9 @@ bool lua_trade_window_allowed();
 // --- engine hooks: actor menu (ui/UIActorMenu.cpp, ui/UIActorMenuDeadBodySearch.cpp) ---
 // CUIActorMenu::Show(status), first line (mode, partner and box are already set when opening).
 void on_actor_menu_shown(CUIActorMenu& menu, bool shown);
+// coop.search_window([id]): Anomaly's inventory, a Lua dialog, searches `id` now, no id: it closed (coop_mods_items.script, xrCoop/
+// coop_search_view.h). frame() tells the host as CUIActorMenu::Show tells it of the engine's window. Any thread.
+int lua_search_window(lua_State* L);
 // CUIActorMenu::Update, first line. Rebuilds the lists through the menu's public API when a shared
 // container changed elsewhere, a trade answer arrived or a container move was not applied.
 // True: the caller refreshes prices, weights and money labels (UpdateItemsPlace).

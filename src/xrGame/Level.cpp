@@ -248,14 +248,14 @@ CLevel::CLevel() :
     eEnvironment = Engine.Event.Handler_Attach("LEVEL:Environment", this);
     eEntitySpawn = Engine.Event.Handler_Attach("LEVEL:spawn", this);
     m_pBulletManager = xr_new<CBulletManager>();
-    if (!g_dedicated_server)
+    if (!g_dedicated_server || g_coop_headless)
     {
         m_map_manager = xr_new<CMapManager>();
         m_game_task_manager = xr_new<CGameTaskManager>();
     }
     m_dwDeltaUpdate = u32(fixed_step * 1000);
     m_seniority_hierarchy_holder = xr_new<CSeniorityHierarchyHolder>();
-    if (!g_dedicated_server)
+    if (!g_dedicated_server || g_coop_headless)
     {
         m_level_sound_manager = xr_new<CLevelSoundManager>();
         m_space_restriction_manager = xr_new<CSpaceRestrictionManager>();
@@ -330,7 +330,7 @@ CLevel::~CLevel()
     xr_delete(m_autosave_manager);
     xr_delete(m_debug_renderer);
     delete_data(m_debug_render_queue);
-    if (!g_dedicated_server)
+    if (!g_dedicated_server || g_coop_headless)
         ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);
     xr_delete(game);
     xr_delete(game_events);
@@ -744,7 +744,9 @@ void CLevel::ProcessGameEvents()
 
 //AVO: spawn antifreeze implementation, originally by alpet, reritten by demonized
 #ifdef SPAWN_ANTIFREEZE
-			if (spawn_antifreeze && g_bootComplete)
+			// Anomaly Coop: a map server has no load screen to keep g_bootComplete down while the level's first spawns come: postponed,
+			// its zones would update before the actor stands (live 2026-11-01, GAMMA: drx_da_main, db.actor nil on every load)
+			if (spawn_antifreeze && g_bootComplete && (!g_coop_headless || g_actor))
 			{
 				// Postpone M_EVENT for postponed spawns
 				//if (M_EVENT == ID && PostponedSpawn(dest))
@@ -1043,7 +1045,7 @@ void CLevel::OnFrame()
 
 	if (m_bNeed_CrPr)
 		make_NetCorrectionPrediction();
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		if (g_mt_config.test(mtMap))
 			Device.seqParallel.push_back(xr_make_delegate(m_map_manager, &CMapManager::Update));
@@ -1165,7 +1167,7 @@ void CLevel::OnFrame()
 	}
 
 	// defer LUA-GC-STEP
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		if (g_mt_config.test(mtLUA_GC))
 			Device.seqParallel.push_back(xr_make_delegate(this, &CLevel::script_gc));

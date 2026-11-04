@@ -24,6 +24,10 @@ void install_client(Endpoint& e); // F3a T4: the client's (a remote client's ses
 void frame(); // main thread, every frame while a session is active
 void reset(); // session started / ended
 void print_status();
+// The host's move (xrCoop/coop_soft_move.h): the world was away for `real_ms` and the map servers' clocks went on: the new world's goes to
+// where its old one would stand, or the next time sync would send everybody on them back. `host_clock`: the world's clock now, 0 with no world.
+void host_clock_ahead(u64 saved_clock, u64 real_ms);
+u64 host_clock();
 
 // --- engine hooks (each called from a one-line "Anomaly Coop" hook) ---
 

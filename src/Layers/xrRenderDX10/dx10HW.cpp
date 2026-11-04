@@ -308,6 +308,14 @@ void CHW::CreateDevice(HWND hwnd, bool move_window)
     m_move_window = move_window;
     CreateD3D();
 
+#if defined(USE_DX11)
+    if (g_coop_headless)
+    {
+        CreateHeadless();
+        return;
+    }
+#endif
+
     /* Partially implemented dynamic load
     typedef HRESULT _D3DxxCreateDeviceAndSwapChain(
         IDXGIAdapter *pAdapter,
@@ -711,6 +719,71 @@ void CHW::CreateDevice(HWND hwnd, bool move_window)
     // #endif
 }
 
+#if defined(USE_DX11)
+// Anomaly Coop: a map server (-coop_mapserver) is a windowless process that draws nothing. The renderer stays, the game needs its
+// models, sectors and the objects it creates at load, so a device must exist, and this one is the cheapest that does:
+// - WARP, not the hardware device: no video driver in the process (100+ MB of it, its threads, its shader cache), no VRAM of
+//   the card the host plays on, nothing the game's own device could lose. Nothing is ever drawn, so its speed does not matter;
+// - no swap chain: nothing to show, and CHW::Reset and updateWindowProps, which show the window and take the focus, never run.
+//   Device.Begin() refuses every frame (device.cpp), so nothing reaches Present either;
+// - the base targets are plain textures of 64x64: every target of CRenderTarget follows them (r4.cpp cuts the shadow map).
+void CHW::CreateHeadless()
+{
+    constexpr u32 size = 64;
+
+    Caps.id_vendor = 0x1414; // Microsoft, the Basic Render Driver: not the card the DXGI adapter names
+    Caps.id_device = 0x8c;
+    Caps.fTarget = D3DFMT_X8R8G8B8;
+    Caps.fDepth = selectDepthStencil(Caps.fTarget);
+
+    ZeroMemory(&m_ChainDesc, sizeof(m_ChainDesc));
+    ZeroMemory(&m_ChainDescFullscreen, sizeof(m_ChainDescFullscreen));
+    m_ChainDesc.Width = size;
+    m_ChainDesc.Height = size;
+    m_ChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    m_ChainDesc.SampleDesc.Count = 1;
+    m_ChainDesc.BufferCount = 1;
+    m_ChainDescFullscreen.Windowed = TRUE;
+    m_DriverType = D3D_DRIVER_TYPE_WARP;
+    m_SupportsVRR = false;
+
+    const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    ID3D11Device* device;
+    ID3D11DeviceContext* context;
+    R_CHK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, &level, 1,
+        D3D11_SDK_VERSION, &device, &FeatureLevel, &context));
+    R_CHK(device->QueryInterface(&pDevice));
+    R_CHK(context->QueryInterface(&pContext));
+    _RELEASE(device);
+    _RELEASE(context);
+    R_CHK(pContext->QueryInterface(__uuidof(ID3DUserDefinedAnnotation), (void**)&pAnnotation));
+
+    D3D_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = size;
+    desc.Height = size;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = m_ChainDesc.Format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D_USAGE_DEFAULT;
+    desc.BindFlags = D3D_BIND_RENDER_TARGET;
+    ID3DTexture2D* texture;
+    R_CHK(pDevice->CreateTexture2D(&desc, NULL, &texture));
+    R_CHK(pDevice->CreateRenderTargetView(texture, NULL, &pBaseRT));
+    _RELEASE(texture);
+
+    desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    desc.BindFlags = D3D_BIND_DEPTH_STENCIL;
+    R_CHK(pDevice->CreateTexture2D(&desc, NULL, &texture));
+    R_CHK(pDevice->CreateDepthStencilView(texture, NULL, &pBaseZB));
+    _RELEASE(texture);
+
+    fill_vid_mode_list(this);
+    Msg("* [coop] map server: WARP device, no swap chain, %ux%u targets", size, size);
+}
+#endif // USE_DX11
+
 void CHW::DestroyDevice()
 {
     //	Destroy state managers
@@ -1081,6 +1154,24 @@ extern bool use_reshade;
 extern bool init_reshade();
 extern void unregister_reshade();
 
+#ifdef USE_DX11
+// Anomaly Coop: ResizeBuffers refuses while the pipeline still holds a view of the back buffer, and its answer was not read: GetBuffer in
+// UpdateViews then ended the game on Alt-Tab (R_CHK, DXGI_ERROR_INVALID_CALL, a fullscreen game on two monitors).
+template <class Chain, class Context>
+static void resize_back_buffers(Chain* chain, Context* context, const DXGI_SWAP_CHAIN_DESC1& cd, UINT flags)
+{
+    HRESULT hr = chain->ResizeBuffers(cd.BufferCount, cd.Width, cd.Height, cd.Format, flags);
+    for (int i = 0; FAILED(hr) && i < 3; ++i)
+    {
+        Msg("! ResizeBuffers failed: 0x%08x, the pipeline lets go of the back buffer, try %d", u32(hr), i + 1);
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        context->Flush();
+        Sleep(100);
+        hr = chain->ResizeBuffers(cd.BufferCount, cd.Width, cd.Height, cd.Format, flags);
+    }
+}
+#endif
+
 void CHW::OnAppActivate()
 {
 #if defined(USE_DX11)
@@ -1110,12 +1201,7 @@ void CHW::OnAppActivate()
             flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         }
 
-        m_pSwapChain->ResizeBuffers(
-            cd.BufferCount,
-            cd.Width,
-            cd.Height,
-            cd.Format,
-            flags);
+        resize_back_buffers(m_pSwapChain, pContext, cd, flags);
 
         UpdateViews();
 #endif
@@ -1156,12 +1242,7 @@ void CHW::OnAppDeactivate()
             flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         }
 
-        m_pSwapChain->ResizeBuffers(
-            cd.BufferCount,
-            cd.Width,
-            cd.Height,
-            cd.Format,
-            flags);
+        resize_back_buffers(m_pSwapChain, pContext, cd, flags);
 
         UpdateViews();
 #endif

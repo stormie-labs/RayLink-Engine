@@ -104,7 +104,7 @@ CGameFont* GetFontLetterica25()
 // A font by the name XML gives it ("letterica18", "small" ...) or a script registered it with: nil when there is none.
 CGameFont* GetFontByName(LPCSTR name)
 {
-	if (g_dedicated_server || !GamePersistent().m_pUI_core)
+	if ((g_dedicated_server && !g_coop_headless) || !GamePersistent().m_pUI_core)
 		return nullptr;
 	return mngr().FindByName(name);
 }
@@ -112,7 +112,7 @@ CGameFont* GetFontByName(LPCSTR name)
 // RegisterFont(name, texture_base[, shader[, target_height]]) -> bool: see CFontManager::RegisterFont
 bool RegisterFont4(LPCSTR name, LPCSTR texture_base, LPCSTR shader, float target_height)
 {
-	if (g_dedicated_server || !GamePersistent().m_pUI_core)
+	if ((g_dedicated_server && !g_coop_headless) || !GamePersistent().m_pUI_core)
 	{
 		Msg("! [font] RegisterFont '%s': the UI is not up", name ? name : "(nil)");
 		return false;

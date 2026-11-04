@@ -229,7 +229,7 @@ CActor::CActor() : CEntityAlive(), current_ik_cam_shift(0)
 	m_iLastHittingWeaponID = u16(-1);
 	m_statistic_manager = NULL;
 	//-----------------------------------------------------------------------------------
-	m_memory = g_dedicated_server ? 0 : xr_new<CActorMemory>(this);
+	m_memory = (g_dedicated_server && !g_coop_headless) ? 0 : xr_new<CActorMemory>(this);
 	m_bOutBorder = false;
 	m_hit_probability = 1.f;
 	m_feel_touch_characters = 0;
@@ -305,7 +305,7 @@ void CActor::reinit()
 	material().reinit();
 
 	m_pUsableObject = NULL;
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		memory().reinit();
 
 	set_input_external_handler(0);
@@ -318,7 +318,7 @@ void CActor::reload(LPCSTR section)
 	CInventoryOwner::reload(section);
 	material().reload(section);
 	CStepManager::reload(section);
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		memory().reload(section);
 	m_location_manager->reload(section);
 }

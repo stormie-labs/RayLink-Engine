@@ -125,10 +125,10 @@ void CLevelChanger::feel_touch_new(CObject* tpObject)
 	VERIFY(l_tpActor);
 	if (!l_tpActor->g_Alive())
 		return;
-	if (coop::join::transition_owns_exit(m_b_enabled))
+	if (coop::join::transition_owns_exit(m_b_enabled, m_game_vertex_id))
 		return; // Anomaly Coop: in a session the group waits at the exit (join::frame): no dialog, no change of our own
 
-	if (m_bSilentMode || coop::join::exit_without_dialog(m_b_enabled))
+	if (m_bSilentMode || coop::join::exit_without_dialog(m_b_enabled, m_game_vertex_id))
 	{
 		NET_Packet p;
 		p.w_begin(M_CHANGE_LEVEL);
@@ -187,7 +187,7 @@ bool CLevelChanger::feel_touch_contact(CObject* object)
 void CLevelChanger::update_actor_invitation()
 {
 	if (m_bSilentMode) return;
-	if (coop::join::transition_owns_exit(m_b_enabled)) return; // Anomaly Coop: see feel_touch_new
+	if (coop::join::transition_owns_exit(m_b_enabled, m_game_vertex_id)) return; // Anomaly Coop: see feel_touch_new
 	xr_vector<CObject*>::iterator it = feel_touch.begin();
 	xr_vector<CObject*>::iterator it_e = feel_touch.end();
 
@@ -201,7 +201,7 @@ void CLevelChanger::update_actor_invitation()
 
 		if (m_entrance_time + 5.0f < Device.fTimeGlobal)
 		{
-			if (coop::join::exit_without_dialog(m_b_enabled)) // Anomaly Coop: the last friend left while he stood here
+			if (coop::join::exit_without_dialog(m_b_enabled, m_game_vertex_id)) // Anomaly Coop: the last friend left while he stood here
 			{
 				NET_Packet packet;
 				packet.w_begin(M_CHANGE_LEVEL);

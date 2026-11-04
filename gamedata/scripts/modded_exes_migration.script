@@ -53,6 +53,9 @@ function on_game_start()
 		end
 	end
 
-	axr_main.config:w_value("modded_exes", "version", MODDED_EXES_VERSION)
-	axr_main.config:save()
+	-- Anomaly Coop: only when it changed: the host's process and its map servers share this file, and a file mapped by one cannot be written by another
+	if saved_modded_exes_version ~= MODDED_EXES_VERSION then
+		axr_main.config:w_value("modded_exes", "version", MODDED_EXES_VERSION)
+		axr_main.config:save()
+	end
 end

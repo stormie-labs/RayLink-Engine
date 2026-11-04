@@ -2,9 +2,11 @@
 #include "coop_manager.h"
 
 #include "coop_join.h"
+#include "coop_mapserver.h"
 #include "coop_sync.h"
 #include "coop_script.h"
 #include "coop_autosave.h" // F3
+#include "coop_dedicated.h" // plan 12
 #include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "xrCoop/coop_link_hold.h"
 #include "../../xrCore/raylink_version.h" // build_id names the engine build
@@ -57,7 +59,7 @@ std::atomic<bool> g_crashed{false};
 void on_crash()
 {
 	g_crashed.store(true);
-	Manager::get().session().seal_connection_hold(); // atomics only: fine from any thread, also mid-crash
+	Manager::get().world_session().seal_connection_hold(); // atomics only: fine from any thread, also mid-crash
 	if (g_next_crash_handler)
 		g_next_crash_handler();
 }
@@ -118,6 +120,7 @@ struct AutoStart
 	u32 shots_every_s = 0;
 	u64 next_shot = 0;
 	u64 next_steam_join = 0;
+	bool map_server = false; // F3a: the key -coop_mapserver
 } g_auto;
 
 constexpr u32 kSteamJoinPollMs = 500;
@@ -194,12 +197,12 @@ u8 roles_of(Phase p)
 	switch (p)
 	{
 	case Phase::Off: return 0;
-	case Phase::Hosting: return u8(ProcessRole::WorldServer) | u8(ProcessRole::MapAuthority) | u8(ProcessRole::Player);
+	case Phase::Hosting: return dedicated::on() ? dedicated_roles() : host_roles();
 	case Phase::Connecting:
 	case Phase::Handshaked:
 	case Phase::ReceivingWorld:
 	case Phase::LoadingWorld:
-	case Phase::Live: return u8(ProcessRole::Player) | u8(ProcessRole::Mirror);
+	case Phase::Live: return client_roles();
 	}
 	return 0;
 }
@@ -244,6 +247,8 @@ void Manager::set_phase(Phase p)
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
 	m_roles = roles_of(p); // F3a T4
+	if (m_map_server && p != Phase::Off)
+		m_roles = map_server_roles();
 	set_crash_hook(p != Phase::Off); // R1 I2: a crash releases the link hold
 	if (p != Phase::Off && !g_crash_hook_exit_registered)
 	{
@@ -316,7 +321,10 @@ const Manifest& Manager::manifest()
 		e.hash = fnv1a(&a.size, sizeof(a.size));
 		m_manifest.push_back(std::move(e));
 	}
-	// Loose files in gamedata (addons). Name + size: cheap and catches different versions.
+	// Loose files in gamedata (addons). Name + size: cheap and catches different versions. A text file is read for its size
+	// without CR, once per process: no machine in a session has to have the other's line endings.
+	CTimer timer;
+	timer.Start();
 	FS_FileSet files;
 	FS.file_list(files, "$game_data$", FS_ListFiles);
 	for (const FS_File& f : files)
@@ -329,13 +337,19 @@ const Manifest& Manager::manifest()
 			continue; // textures: how the world looks, not what the host and the clients simulate
 		ManifestEntry e;
 		e.path = xr_string("gamedata\\").append(f.name).c_str();
-		const long size = f.size;
+		long size = f.size;
+		if (manifest_text_file(f.name.c_str()))
+			if (IReader* text = FS.r_open("$game_data$", f.name.c_str()))
+			{
+				size = long(manifest_lf_size(static_cast<const uint8_t*>(text->pointer()), size_t(text->length())));
+				FS.r_close(text);
+			}
 		e.hash = fnv1a(&size, sizeof(size));
 		m_manifest.push_back(std::move(e));
 	}
 	m_manifest_ready = true;
-	::Msg("[coop] content manifest: %u entries, fingerprint %016llx", (u32)m_manifest.size(),
-	    manifest_fingerprint(m_manifest));
+	::Msg("[coop] content manifest: %u entries, fingerprint %016llx, %u ms", (u32)m_manifest.size(),
+	    manifest_fingerprint(m_manifest), timer.GetElapsed_ms());
 	return m_manifest;
 }
 
@@ -366,18 +380,32 @@ void Manager::install_session_callbacks()
 	{
 		::Msg("[coop] player left: #%u (%s)", id, reason.c_str());
 		sync::on_peer_left(id);
-		if (is_host())
+		if (is_map_authority())
 			join::on_peer_left(id);
 		else
 			diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his avatar leaves this world too
 	};
-	m_session.on_welcome = [this](const WelcomeMsg& w)
+	install_world_callbacks(m_session);
+	install_world_callbacks(m_world);
+	m_world.on_peer_joined = nullptr; // a map server's players are its level's, from the host's table
+	m_world.on_peer_left = nullptr;
+	m_world.set_log(&log_line);
+	m_world.set_world_gate([this] { return world_state(); });
+
+	// F3a T4: what the modules set up once per process (settings, console commands, the route and call-gate tables); the
+	// handler tables are installed by role when a session starts (install_handlers).
+	sync::init();
+}
+
+void Manager::install_world_callbacks(Session& session)
+{
+	session.on_welcome = [this](const WelcomeMsg& w)
 	{
 		::Msg("[coop] accepted by host '%s' as #%u", w.host_nick.c_str(), w.slot);
 		set_phase(Phase::Handshaked);
 		join::on_welcome(w);
 	};
-	m_session.on_rejected = [this](const RejectMsg& r, const ManifestDiff& diff)
+	session.on_rejected = [this](const RejectMsg& r, const ManifestDiff& diff)
 	{
 		::Msg("! [coop] host refused: %s — %s", reject_reason_name(r.reason), r.text.c_str());
 		if (r.reason == RejectReason::ContentMismatch)
@@ -398,54 +426,64 @@ void Manager::install_session_callbacks()
 		script::on_rejected(r.reason, r.text.c_str(), diff); // W3d: refusal window (R-1.3, R-1.4)
 		join::on_session_lost(r.text.c_str());
 		set_phase(Phase::Off);
+		mapserver::server_session_over(); // F3a: a map server has no menu to go back to
 	};
-	m_session.on_disconnected = [this](const std::string& reason)
+	session.on_disconnected = [this](const std::string& reason)
 	{
 		::Msg("! [coop] disconnected: %s", reason.c_str());
 		host_silence_off(); // the pause of a silent host does not outlive the session
-		script::on_session_end(reason.c_str(), m_session.end_code().c_str()); // W4 menu: last error in the co-op window
+		script::on_session_end(reason.c_str(), world_session().end_code().c_str()); // W4 menu: last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
 		set_phase(Phase::Off);
+		mapserver::server_session_over(); // F3a: a map server without its host's process is nobody's
 	};
-	m_session.on_chat = [](PeerId from, const std::string& text)
+	session.on_chat = [](PeerId from, const std::string& text)
 	{
 		const PeerInfo* p = mgr().session().peer(from);
 		const char* who = p ? p->nick.c_str() : (from == kHostPeer ? "host" : "?");
 		::Msg("[coop] <%s> %s", who, text.c_str());
 		script::on_chat(who, text.c_str()); // HUD line (coop_main.on_chat)
 	};
-	m_session.on_blob_progress = [](PeerId from, u32 id, u32 kind, u64 done, u64 total)
+	session.on_blob_progress = [](PeerId from, u32 id, u32 kind, u64 done, u64 total)
 	{
 		join::on_blob_progress(from, id, kind, done, total);
 	};
-	m_session.on_blob_complete = [](PeerId from, u32 id, u32 kind, std::vector<u8>& data)
+	session.on_blob_complete = [](PeerId from, u32 id, u32 kind, std::vector<u8>& data)
 	{
 		join::on_blob_complete(from, id, kind, data);
 	};
-
-	// F3a T4: what the modules set up once per process (settings, console commands, the route and call-gate tables); the
-	// handler tables are installed by role when a session starts (install_handlers).
-	sync::init();
 }
 
-void Manager::install_handlers(bool hosting)
+void Manager::install_handlers(Tables tables)
 {
 	m_session.clear_handlers();
+	m_world.clear_handlers();
 	m_link.clear_handlers();
-	if (hosting)
+	switch (tables)
 	{
+	case Tables::Hosting:
 		// the world server: its handlers on the session; the host player, a client of it: his on the link
 		join::install_server(m_session);
 		sync::install_server(m_session);
+		mapserver::install_server(m_session);
+		if (dedicated::on())
+			break; // nobody plays in this process: no host player, no link (plan 12)
 		join::install_client(m_link);
 		sync::install_client(m_link);
-	}
-	else
-	{
+		break;
+	case Tables::Client:
 		// a remote client (player and mirror): the client's handlers on the session connected to the host
 		join::install_client(m_session);
 		sync::install_client(m_session);
+		break;
+	case Tables::MapServer:
+		// a map server: the host's handlers of a level for its virtual peers, the client's for the world on its bridge
+		sync::install_server(m_session);
+		join::install_client(m_world);
+		sync::install_client(m_world);
+		mapserver::install_client(m_world);
+		break;
 	}
 }
 
@@ -459,7 +497,9 @@ bool Manager::start_host(u16 port)
 	if (!join::host_can_start())
 		return false;
 
-	install_handlers(true); // F3a T4
+	install_handlers(Tables::Hosting); // F3a T4
+	if (dedicated::on())
+		m_session.attach_local(nullptr); // plan 12: peer 0 is nobody: players() has no such row, what is sent to it goes nowhere
 	std::string err;
 	if (!m_session.host(make_config(port), &err))
 	{
@@ -479,7 +519,7 @@ bool Manager::start_client(const char* address, u16 port)
 		::Msg("! [coop] already in a session (%s), use coop_disconnect first", phase_name(m_phase));
 		return false;
 	}
-	install_handlers(false); // F3a T4
+	install_handlers(Tables::Client); // F3a T4
 	std::string err;
 	SessionConfig cfg = make_config(port);
 	cfg.peer_timeout_ms = kHostSilenceLeaveMs; // the client waits for a silent host this long (frozen meanwhile)
@@ -493,6 +533,30 @@ bool Manager::start_client(const char* address, u16 port)
 	return true;
 }
 
+bool Manager::start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& token)
+{
+	if (active())
+		return false;
+	m_map_server = true;
+	install_handlers(Tables::MapServer);
+	std::string err;
+	SessionConfig cfg = make_config(port);
+	cfg.peer_timeout_ms = kHostSilenceLeaveMs;
+	// the host's process may be loading its own new world: it takes the Hello when it is up (plan §1.5 "the host's move")
+	cfg.connect_timeout_ms = mapserver::kConnectTimeoutMs;
+	cfg.hello_role = kHelloRoleMapServer;
+	cfg.hello_token = token;
+	if (!m_world.connect(cfg, "127.0.0.1", port, &err) || !m_session.host_virtual(cfg, m_world, &err))
+	{
+		::Msg("! [coop] map server: cannot connect to the host's process on port %u: %s", port, err.c_str());
+		m_map_server = false;
+		return false;
+	}
+	set_phase(Phase::Connecting);
+	::Msg("[coop] map server: connecting to the host's process on port %u", port);
+	return true;
+}
+
 void Manager::stop(const char* reason)
 {
 	g_auto.connect.clear(); // leaving is meant: autostart does not go back
@@ -500,6 +564,8 @@ void Manager::stop(const char* reason)
 		return;
 	autosave::host_on_session_end(); // F3: the host's last world save of the session, while the level still runs
 	m_session.shutdown(reason);
+	if (m_map_server)
+		m_world.shutdown(reason);
 	script::on_session_end(reason); // W4 menu: last error in the co-op window
 	join::on_session_lost(reason);
 	sync::reset();
@@ -547,6 +613,19 @@ void Manager::autostart()
 			g_auto.status_every_s = (u32)atoi(v.c_str());
 		if (cmd_param("-coop_shots", v))
 			g_auto.shots_every_s = (u32)atoi(v.c_str());
+		if (dedicated::on())
+		{
+			g_auto.host = true; // when its world is up
+			g_auto.host_port = dedicated::args().port;
+		}
+		g_auto.map_server = mapserver::parsed_key();
+		if (g_auto.map_server)
+		{
+			g_auto.host = false;
+			g_auto.connect.clear();
+			if (!start_map_server(mapserver::key().port, mapserver::key().token))
+				mapserver::server_session_over();
+		}
 		if (g_auto.host || !g_auto.connect.empty())
 			::Msg("[coop] autostart: host=%d port=%u connect='%s' status=%us shots=%us", g_auto.host, g_auto.host_port,
 			      g_auto.connect.c_str(), g_auto.status_every_s, g_auto.shots_every_s);
@@ -634,6 +713,8 @@ void host_silence_off()
 
 void host_silence_step()
 {
+	if (is_map_server())
+		return; // nobody plays here: it waits for the host's process until its link times out, then it exits
 	const u32 silent = mgr().is_live_client() && g_pGameLevel ? mgr().session().ms_since_host_heard() : 0;
 	if (silent < kHostSilenceFreezeMs)
 	{
@@ -663,6 +744,7 @@ void host_silence_step()
 
 void Manager::frame()
 {
+	dedicated::frame();
 	autostart();
 	if (m_phase == Phase::Off)
 		return;
@@ -678,6 +760,13 @@ void Manager::frame()
 	fs.joining_world = m_phase == Phase::LoadingWorld;
 	fs.crashed = g_crashed.load();
 	m_session.hold_connection(link_hold::keep_held(fs) ? kLoadHoldMs : 0);
+	if (m_map_server)
+	{
+		m_world.update(now_ms()); // the world server first: what a player said comes down in its Tunnels
+		if (m_phase == Phase::Off)
+			return;
+		m_session.set_world_epoch(m_world.world_epoch());
+	}
 	m_session.update(now_ms());
 	host_silence_step(); // live 2026-10-24: a silent host freezes the client
 	join::frame();
@@ -735,13 +824,17 @@ void Manager::print_status() const
 	sync::print_status();
 }
 
-void on_frame() { Manager::get().frame(); }
+void on_frame()
+{
+	Manager::get().frame();
+	mapserver_stats_frame();
+}
 
 void on_blocking_work()
 {
 	Manager& m = Manager::get();
 	if (m.active() && link_hold::may_arm(g_crashed.load()))
-		m.session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread; refused after a crash
+		m.world_session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread; refused after a crash
 }
 
 bool steam_invite_ready()

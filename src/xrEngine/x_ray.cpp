@@ -34,6 +34,8 @@
 #include "MonitorList.h"
 #include "renderdoc_integration.h"
 #include "../xrCore/raylink_version.h"
+#include "../xrCoop/coop_dedicated_rules.h" // Anomaly Coop
+#include "coop_host_console.h" // Anomaly Coop
 
 extern "C" void XR_EARLY_INIT();
 
@@ -659,10 +661,13 @@ void Startup()
 	logoWindow = NULL;
 
 	//Discord Rich Presence - Rezy
-	Init_Discord();
+	if (g_coop_headless)
+		use_discord = false; // Anomaly Coop: the player is the host's window, not this process
+	else
+		Init_Discord();
 
 	//Reshade
-	use_reshade = init_reshade();
+	use_reshade = !g_coop_headless && init_reshade();
 	if (use_reshade)
 		Msg("[ReShade]: Loaded compatibility addon");
 	else
@@ -834,6 +839,12 @@ struct damn_keys_filter
 		// Screen saver stuff
 
 		bScreenSaverState = FALSE;
+		dwStickyKeysFlags = 0;
+		dwFilterKeysFlags = 0;
+		dwToggleKeysFlags = 0;
+
+		if (g_coop_headless)
+			return; // Anomaly Coop: these belong to the user's desktop, the host's window has them
 
 		// Saveing current state
 		SystemParametersInfo(SPI_GETSCREENSAVEACTIVE, 0, (PVOID)&bScreenSaverState, 0);
@@ -963,6 +974,8 @@ void foo()
 #endif // 0
 
 ENGINE_API bool g_dedicated_server = false;
+ENGINE_API bool g_coop_headless = false; // Anomaly Coop: IGame_Persistent.h
+ENGINE_API bool g_coop_dedicated = false; // Anomaly Coop: IGame_Persistent.h
 
 #ifndef DEDICATED_SERVER
 
@@ -1013,6 +1026,42 @@ static void coop_steam_overlay_start()
 		CloseHandle(pump);
 }
 
+// Anomaly Coop: -coop_mapserver <level> <gvid> <port> <token>: a map server, the windowless process of the game that leads a
+// level for the host (F3a plan, 1.1 and 1.8), and -coop_dedicated [port]: the world server without a player, the same process with
+// a console window (plan 12). Their arguments are read in xrGame, only the key matters here, before anything starts: it decides
+// the mutex, the splash, the crash dialogs.
+extern int g_svDedicateServerUpdateReate;
+
+static void coop_headless_read_key(LPCSTR command_line)
+{
+	static const char key[] = "-coop_mapserver";
+	LPCSTR found = strstr(command_line, key);
+	const char after = found ? found[sizeof(key) - 1] : '\0';
+	const bool map_server = found && (found == command_line || found[-1] == ' ') && (after == ' ' || after == '\0');
+	g_coop_dedicated = !map_server && coop::dedicated::has_key(command_line);
+	if (!map_server && !g_coop_dedicated)
+		return;
+
+	g_coop_headless = true;
+	g_dedicated_server = true;
+	g_svDedicateServerUpdateReate = 30;
+	Debug.set_silent_fatal();
+	if (g_coop_dedicated)
+		coop_console::open();
+
+	// A process with no visible window is the first thing Windows 11 throttles: the timer falls back to 15.6 ms (the frame's
+	// Sleep makes 22 frames of the 30) and EcoQoS moves it to the slow cores. Loaded by hand, _WIN32_WINNT is older than this.
+	typedef BOOL(WINAPI* set_process_information)(HANDLE, int, PVOID, DWORD);
+	const set_process_information set_information = reinterpret_cast<set_process_information>(
+		GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessInformation"));
+	if (set_information)
+	{
+		// PROCESS_POWER_THROTTLING_STATE: version 1, the execution speed (1) and the timer resolution (4) under control, neither on
+		struct { ULONG version, control_mask, state_mask; } state = { 1, 1 | 4, 0 };
+		set_information(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &state, sizeof(state));
+	}
+}
+
 int APIENTRY WinMain_impl(HINSTANCE hInstance,
                           HINSTANCE hPrevInstance,
                           char* lpCmdLine,
@@ -1023,6 +1072,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 #else // DEDICATED_SERVER
 	Debug._initialize(false);
 #endif // DEDICATED_SERVER
+	coop_headless_read_key(lpCmdLine);
 
 	if (!IsDebuggerPresent())
 	{
@@ -1056,35 +1106,39 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	// Check for another instance
 #ifdef NO_MULTI_INSTANCES
 #define STALKER_PRESENCE_MUTEX "Local\\STALKER-COP"
-	char exePath[MAX_PATH] = {};
-	DWORD bytes = GetModuleFileNameA(NULL, exePath, MAX_PATH);
-	exePath[MAX_PATH - 1] = '\0';
-	if (bytes == 0)
-		return 2;
-
-	// Strip filename and focus on installation directory
-	char* cut = strrchr(exePath, '\\');
-	if (cut)
-		*cut = '\0';
-
-	// Normalize
-	xr_strlwr(exePath);
-
-	// Create hash
-	u32 pathHash = path_crc32(exePath, xr_strlen(exePath));
-
-	// Create unique mutex name  
-	string256 mutexName = {};
-	xr_sprintf(mutexName, sizeof(mutexName), STALKER_PRESENCE_MUTEX"_%08x", pathHash);
-
-	HANDLE hCheckPresenceMutex = CreateMutex(NULL, TRUE, mutexName);
-	if (!hCheckPresenceMutex)
-		return 2;
-
-	if (GetLastError() == ERROR_ALREADY_EXISTS)
+	HANDLE hCheckPresenceMutex = NULL;
+	if (!g_coop_headless) // Anomaly Coop: a map server runs beside the host's window, out of the same folder
 	{
-		CloseHandle(hCheckPresenceMutex);
-		return 1;
+		char exePath[MAX_PATH] = {};
+		DWORD bytes = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+		exePath[MAX_PATH - 1] = '\0';
+		if (bytes == 0)
+			return 2;
+
+		// Strip filename and focus on installation directory
+		char* cut = strrchr(exePath, '\\');
+		if (cut)
+			*cut = '\0';
+
+		// Normalize
+		xr_strlwr(exePath);
+
+		// Create hash
+		u32 pathHash = path_crc32(exePath, xr_strlen(exePath));
+
+		// Create unique mutex name
+		string256 mutexName = {};
+		xr_sprintf(mutexName, sizeof(mutexName), STALKER_PRESENCE_MUTEX"_%08x", pathHash);
+
+		hCheckPresenceMutex = CreateMutex(NULL, TRUE, mutexName);
+		if (!hCheckPresenceMutex)
+			return 2;
+
+		if (GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			CloseHandle(hCheckPresenceMutex);
+			return 1;
+		}
 	}
 #endif
 #else // DEDICATED_SERVER
@@ -1092,43 +1146,46 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 #endif // DEDICATED_SERVER
 
 	// Title window
-    logoWindow = CreateDialog(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_STARTUP), 0, logDlgProc);
-   
-	HWND logoPicture = GetDlgItem(logoWindow, IDC_STATIC_LOGO);
-	RECT logoRect;
-	GetWindowRect(logoPicture, &logoRect);
-	int splashW = logoRect.right - logoRect.left;
-	int splashH = logoRect.bottom - logoRect.top;
+	if (!g_coop_headless) // Anomaly Coop: a map server shows nothing
+	{
+		logoWindow = CreateDialog(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_STARTUP), 0, logDlgProc);
 
-	u32 screenW, screenH;
-	int monX, monY;
-	GetMonitorResolution(screenW, screenH);
-	GetMonitorPosition(monX, monY);
-	int x = monX + (screenW - splashW) / 2;
-	int y = monY + (screenH - splashH) / 2;
+		HWND logoPicture = GetDlgItem(logoWindow, IDC_STATIC_LOGO);
+		RECT logoRect;
+		GetWindowRect(logoPicture, &logoRect);
+		int splashW = logoRect.right - logoRect.left;
+		int splashH = logoRect.bottom - logoRect.top;
 
-    // verdatim: set the size of the splash window to be zero when the flag "-nosplashwindow" is given
-    if (strstr(xr_strdup(GetCommandLine()), "-nosplashwindow")) {
-        splashW = int(0);
-        splashH = int(0);
-    }
+		u32 screenW, screenH;
+		int monX, monY;
+		GetMonitorResolution(screenW, screenH);
+		GetMonitorPosition(monX, monY);
+		int x = monX + (screenW - splashW) / 2;
+		int y = monY + (screenH - splashH) / 2;
+
+		// verdatim: set the size of the splash window to be zero when the flag "-nosplashwindow" is given
+		if (strstr(xr_strdup(GetCommandLine()), "-nosplashwindow")) {
+			splashW = int(0);
+			splashH = int(0);
+		}
 
 
-	SetWindowPos(
-		logoWindow,
+		SetWindowPos(
+			logoWindow,
 #ifndef DEBUG
-        HWND_TOP,
+			HWND_TOP,
 #else
-        HWND_NOTOPMOST,
+			HWND_NOTOPMOST,
 #endif // NDEBUG
-		x,
-		y,
-		splashW,
-		splashH,
-		SWP_SHOWWINDOW
-	);
-	
-	UpdateWindow(logoWindow);
+			x,
+			y,
+			splashW,
+			splashH,
+			SWP_SHOWWINDOW
+		);
+
+		UpdateWindow(logoWindow);
+	}
 
 	// AVI
 	g_bIntroFinished = TRUE;
@@ -1149,9 +1206,14 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	// g_temporary_stuff = &trivial_encryptor::decode;
 
 	compute_build_id();
-	Core._initialize("xray", NULL, TRUE, fsgame[0] ? fsgame : NULL);
+	Core._initialize("xray", g_coop_dedicated ? coop_console::log_line : NULL, TRUE, fsgame[0] ? fsgame : NULL);
 	renderdoc_initialize();
-	coop_steam_overlay_start();
+	if (g_coop_dedicated)
+		Core.ParamsData.set(ECoreParams::nosound); // Anomaly Coop: and no Steam, the host's process holds it for this PC
+	else if (g_coop_headless)
+		psSoundSilent = true; // Anomaly Coop: the same, and the game of a level needs its sounds, nobody to hear them
+	else
+		coop_steam_overlay_start();
 
 	InitSettings();
 	// RayLink: "RayLink Engine b28 - S.T.A.L.K.E.R. Anomaly 1.5.3 (based on X-Ray Monolith v1.5.3)"
@@ -1244,7 +1306,9 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 		};
 
 #ifndef DEDICATED_SERVER
-		if (Core.ParamsData.test(ECoreParams::r2a))
+		if (g_coop_headless)
+			Console->Execute("renderer renderer_r4"); // Anomaly Coop: the only one of this exe, never user.ltx's
+		else if (Core.ParamsData.test(ECoreParams::r2a))
 			Console->Execute("renderer renderer_r2a");
 		else if (Core.ParamsData.test(ECoreParams::r2))
 			Console->Execute("renderer renderer_r2");
@@ -1281,7 +1345,8 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 #ifndef DEDICATED_SERVER
 #ifdef NO_MULTI_INSTANCES
 		// Delete application presence mutex
-		CloseHandle(hCheckPresenceMutex);
+		if (hCheckPresenceMutex)
+			CloseHandle(hCheckPresenceMutex);
 #endif
 	}
 	// here damn_keys_filter class instanse will be destroyed
@@ -1526,6 +1591,7 @@ void CApplication::OnEvent(EVENT E, u64 P1, u64 P2)
 			Console->Hide();
 			g_pGameLevel->net_Stop();
 			DEL_INSTANCE(g_pGameLevel);
+			g_loading_events.clear(); // Anomaly Coop: a level stopped before it loaded: its steps are methods of the object just deleted
 			Console->Show();
 
 			if ((FALSE == Engine.Event.Peek("KERNEL:quit")) && (FALSE == Engine.Event.Peek("KERNEL:start")))
@@ -1606,6 +1672,8 @@ void CApplication::LoadEnd()
 		Msg("* phase cmem: %lld K", Memory.mem_usage() / 1024);
 		Console->Execute("stat_memory");
 		g_appLoaded = TRUE;
+		if (g_coop_headless)
+			destroy_loading_shaders(); // Anomaly Coop: g_bootComplete, the load screen that does it is never up here
 		// DUMP_PHASE;
 	}
 }

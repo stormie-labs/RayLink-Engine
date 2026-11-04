@@ -200,7 +200,7 @@ u64 now_ms() { return mgr().now_ms(); }
 // Welcome and JoinRequest or from a world we have left. Kept, it would be applied to the world we load.
 bool before_live(Msg type)
 {
-	if (!rules::live_only(type) || mgr().is_live_client())
+	if (!rules::live_only(type) || is_live_mirror())
 		return false;
 	++g_c.dropped_before_live;
 	return true;
@@ -1239,7 +1239,7 @@ void client_on_rest(Reader& r)
 
 void client_on_state(PeerId, Reader& r)
 {
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	// Every kind waits for Live: samples, rests and animations of the old world or our own would be applied to the
 	// bodies of the world we load (pending until then), destroyed / broken / explosions are stale visuals (the
@@ -1318,7 +1318,7 @@ void client_on_state(PeerId, Reader& r)
 
 void client_on_zones(PeerId, Reader& r)
 {
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	if (before_live(Msg::ZoneState))
 		return; // a zone phase of another world: the host sends ours when we are in (host_on_peer_ready)
@@ -1533,7 +1533,7 @@ void host_on_activate(PeerId from, Reader& r)
 
 void host_on_request(PeerId from, Reader& r)
 {
-	if (!mgr().is_host() || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
+	if (!is_map_authority() || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
 		return;
 	switch (RequestKind(r.u8()))
 	{
@@ -1962,9 +1962,9 @@ void frame()
 {
 	if (!g_pGameLevel || !ai().get_alife())
 		return;
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_frame();
-	else if (mgr().is_live_client())
+	else if (is_live_mirror())
 		client_frame();
 }
 
@@ -2014,7 +2014,7 @@ void reset()
 
 void host_on_peer_ready(PeerId id)
 {
-	if (!mgr().is_host() || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
+	if (!is_map_authority() || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
 		return;
 	const u64 now = now_ms();
 	u32 zones = 0, bodies = 0, anims = 0;
@@ -2073,12 +2073,12 @@ void host_on_peer_ready(PeerId id)
 
 bool is_host_driven(const CGameObject* obj)
 {
-	return obj && mgr().is_client() && g_fixed.count(obj->ID()) != 0;
+	return obj && is_mirror() && g_fixed.count(obj->ID()) != 0;
 }
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		::Msg("[coop]   objects out: %llu sample packets (%llu entries), %llu rests, %llu zone msgs, %llu anim msgs, "
 		    "%u moved bodies",
@@ -2092,7 +2092,7 @@ void print_status()
 		    g_c.uses, g_c.pushes, g_c.throws_ok, g_c.throws_refused, g_c.throws_malformed, g_c.projectiles,
 		    g_c.consumed, g_c.consume_forced, g_c.activations, (u32)g_pending_throws.size());
 	}
-	else if (mgr().is_client())
+	else if (is_mirror())
 	{
 		::Msg("[coop]   objects in: %u bodies tracked, %u kinematic (%llu elements fixed), %llu samples, %llu rests "
 		    "(%llu applied), %llu poses applied, %llu shape mismatches, %llu forced online",
@@ -2118,7 +2118,7 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 		return;
 	const u64 now = now_ms();
 	const u16 id = obj->ID();
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		AnimEntry cur;
 		cur.id = id;
@@ -2150,7 +2150,7 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 		g_ev_anims.push_back(cur);
 		return;
 	}
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	auto it = g_anim_client.find(id);
 	if (it == g_anim_client.end())
@@ -2174,7 +2174,7 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 
 bool client_intercept_use(CGameObject* obj, CGameObject* who)
 {
-	if (!obj || !who || !mgr().is_client() || entities::client_applying())
+	if (!obj || !who || !is_mirror() || entities::client_applying())
 		return false;
 	if (who->ID() != kActor || !smart_cast<CPhysicObject*>(obj) || obj->H_Parent())
 		return false;
@@ -2199,7 +2199,7 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 		++g_c.uses_echo_dropped;
 		return true;
 	}
-	if (mgr().is_live_client())
+	if (is_live_mirror())
 	{
 		Writer w(4);
 		w.u8(u8(RequestKind::Use));
@@ -2212,7 +2212,7 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 
 void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj)
 {
-	if (!usable || !obj || !mgr().is_client() || usable->tip_text())
+	if (!usable || !obj || !is_mirror() || usable->tip_text())
 		return;
 	if (checkpoints::sources::is_sleeping_bag(obj->cNameSect()))
 		usable->set_tip_text("st_sleep"); // the stock ph_sleepbag.ltx tip
@@ -2220,7 +2220,7 @@ void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj)
 
 bool client_drive_pose(CGameObject* obj)
 {
-	if (!obj || !mgr().is_live_client())
+	if (!obj || !is_live_mirror())
 		return false;
 	auto it = g_bodies.find(obj->ID());
 	if (it == g_bodies.end() || !it->second.pose_only || it->second.samples.empty())
@@ -2242,16 +2242,16 @@ bool world_hit_blocked(CGameObject* obj)
 {
 	// WP2 forwards our own hits as claims and swallows the rest; this drops direct local calls too
 	// (collision damage). The host's destruction is replayed through g_hit_apply.
-	return obj && mgr().is_client() && g_hit_apply == 0;
+	return obj && is_mirror() && g_hit_apply == 0;
 }
 
 bool ph_destroy(CGameObject* obj, const SHit& fatal_hit)
 {
 	if (!obj)
 		return false;
-	if (mgr().is_client())
+	if (is_mirror())
 		return true; // fragments are host entities; they arrive through WP2's EntityLocal relay
-	if (!mgr().is_host() || !smart_cast<CDestroyablePhysicsObject*>(obj))
+	if (!is_map_authority() || !smart_cast<CDestroyablePhysicsObject*>(obj))
 		return false;
 	DestroyedEntry d;
 	d.id = obj->ID();
@@ -2269,9 +2269,9 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 {
 	if (!source || !part)
 		return false;
-	if (mgr().is_client())
+	if (is_mirror())
 		return true;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		g_ev_fragments.push_back(part->ID());
@@ -2281,19 +2281,19 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 
 void on_break(CGameObject* obj)
 {
-	if (!obj || !mgr().is_host())
+	if (!obj || !is_map_authority())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_ev_broken.push_back(obj->ID());
 }
 
-bool host_destroys(CGameObject* obj) { return obj && mgr().is_client(); }
+bool host_destroys(CGameObject* obj) { return obj && is_mirror(); }
 
 // ---------------------------------------------------------------- hooks: zones
 
 bool zone_switch_blocked(CCustomZone* zone)
 {
-	if (!zone || !mgr().is_client() || g_zone_apply > 0)
+	if (!zone || !is_mirror() || g_zone_apply > 0)
 		return false;
 	// A radiation field hits only in the state a CActor wakes it to, and the host's copy does not feel a player's character
 	// (CRadioactiveZone::feel_touch_contact): a client got a dose only with the host in the same field (live 2026-10-31).
@@ -2308,7 +2308,7 @@ int on_zone_state(CCustomZone* zone, u8 new_state)
 {
 	if (!zone)
 		return 0;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		ZoneEntry e;
 		e.id = zone->ID();
@@ -2322,7 +2322,7 @@ int on_zone_state(CCustomZone* zone, u8 new_state)
 		g_ev_zones.push_back(e);
 		return 0;
 	}
-	if (mgr().is_client() && g_zone_apply > 0 && g_zone_apply_id == zone->ID())
+	if (is_mirror() && g_zone_apply > 0 && g_zone_apply_id == zone->ID())
 		return int(_min<u32>(g_zone_apply_elapsed, 0x7fffffff));
 	return 0;
 }
@@ -2331,7 +2331,7 @@ bool zone_hit_blocked(CCustomZone* zone, u16 target_id)
 {
 	if (!zone || !mgr().active())
 		return false;
-	if (mgr().is_client())
+	if (is_mirror())
 		return target_id != kActor; // the local actor's own anomaly damage; the host hurts the rest
 	if (target_id != kActor && world::is_player_proxy(target_id))
 	{
@@ -2345,9 +2345,9 @@ bool campfire_turn_blocked(CGameObject* campfire, bool on)
 {
 	if (!campfire)
 		return false;
-	if (mgr().is_client())
+	if (is_mirror())
 		return g_zone_apply == 0; // the host lights and puts out fires
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		ZoneEntry e;
 		e.id = campfire->ID();
@@ -2366,7 +2366,7 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 		return dt;
 	const float length = anim.max_t - anim.min_t;
 	const float local = anim.t_current - anim.min_t;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		TorridPhase& p = g_torrid_host[zone->ID()];
@@ -2374,7 +2374,7 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 		p.length = length;
 		return dt;
 	}
-	if (!mgr().is_client() || length <= EPS_L)
+	if (!is_mirror() || length <= EPS_L)
 		return dt;
 	auto it = g_torrid_client.find(zone->ID());
 	if (it == g_torrid_client.end())
@@ -2395,9 +2395,9 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 
 bool client_forward_artefact_activation(CGameObject* artefact)
 {
-	if (!artefact || !mgr().is_client() || entities::client_applying())
+	if (!artefact || !is_mirror() || entities::client_applying())
 		return false;
-	if (mgr().is_live_client())
+	if (is_live_mirror())
 	{
 		Writer w(4);
 		w.u8(u8(RequestKind::Activate));
@@ -2410,11 +2410,11 @@ bool client_forward_artefact_activation(CGameObject* artefact)
 
 // ---------------------------------------------------------------- hooks: missiles and explosions
 
-bool skip_fake_missile(CGameObject* missile) { return missile && mgr().is_client(); }
+bool skip_fake_missile(CGameObject* missile) { return missile && is_mirror(); }
 
 void host_mark_projectile(CSE_Abstract* projectile)
 {
-	if (!projectile || !mgr().is_host())
+	if (!projectile || !is_map_authority())
 		return;
 	// The thrown copy becomes an ALife object when it leaves the hand (game_sv_Single::OnDetach), so
 	// coop_entities replicates its spawn and release; on_projectile_free() clears the flag again so it
@@ -2425,7 +2425,7 @@ void host_mark_projectile(CSE_Abstract* projectile)
 
 void on_projectile_free(CGameObject* missile)
 {
-	if (!missile || !mgr().is_host() || !smart_cast<CMissile*>(missile->H_Parent()))
+	if (!missile || !is_map_authority() || !smart_cast<CMissile*>(missile->H_Parent()))
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_ev_projectiles.emplace_back(missile->ID(), now_ms());
@@ -2433,10 +2433,10 @@ void on_projectile_free(CGameObject* missile)
 
 bool client_throw(CMissile* missile)
 {
-	if (!missile || !mgr().is_client() || entities::client_applying())
+	if (!missile || !is_mirror() || entities::client_applying())
 		return false;
 	CActor* actor = smart_cast<CActor*>(missile->H_Parent());
-	if (!actor || actor->ID() != kActor || !mgr().is_live_client())
+	if (!actor || actor->ID() != kActor || !is_live_mirror())
 		return false; // no fake missile here, so the engine throw stops by itself
 	Fvector pos, dir;
 	if (actor->inventory().ActiveItem() == static_cast<CInventoryItem*>(missile))
@@ -2484,7 +2484,7 @@ bool client_throw(CMissile* missile)
 
 bool explode_blocked(CGameObject* explosive)
 {
-	if (!explosive || !mgr().is_client())
+	if (!explosive || !is_mirror())
 		return false;
 	++g_c.explode_blocked;
 	return true;
@@ -2492,7 +2492,7 @@ bool explode_blocked(CGameObject* explosive)
 
 void on_explode(CGameObject* explosive, u16 initiator, const Fvector& pos, const Fvector& normal)
 {
-	if (!explosive || !mgr().is_host())
+	if (!explosive || !is_map_authority())
 		return;
 	ExplodeEntry x;
 	x.id = explosive->ID();
@@ -2504,6 +2504,6 @@ void on_explode(CGameObject* explosive, u16 initiator, const Fvector& pos, const
 	g_ev_explode.push_back(x);
 }
 
-bool explosion_visual_only(CGameObject* explosive) { return explosive && mgr().is_client(); }
+bool explosion_visual_only(CGameObject* explosive) { return explosive && is_mirror(); }
 } // namespace objects
 } // namespace coop

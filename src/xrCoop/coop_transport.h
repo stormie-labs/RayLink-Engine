@@ -15,6 +15,7 @@
 
 #include "coop_link_hold.h"
 #include "coop_protocol.h"
+#include "coop_soft_move.h"
 
 struct _ENetHost;
 struct _ENetPeer;
@@ -68,6 +69,19 @@ struct Event
 	uint8_t channel = 0;
 	uint32_t data = 0;
 	std::vector<uint8_t> bytes; // Receive: full packet (u16 type + payload)
+	bool relayed = false; // Receive: the relay sent it on too; what is left is the world's copy (softmove::Take::SentAndKept)
+};
+
+// What the relay did since it started (Transport::relay_start).
+struct RelayStats
+{
+	uint64_t to_servers = 0; // packets of players that went to their map server
+	uint64_t to_players = 0; // packets of map servers that went to their players
+	uint64_t kept = 0; // left for the main thread
+	uint64_t dropped = 0; // nobody to give them to
+	size_t inbox_max = 0; // the most events that waited for the main thread at once
+	size_t inbox_bytes_max = 0;
+	bool overflowed = false; // the inbox outgrew its limit: the relay stopped there
 };
 
 // Thread safety: every call that touches ENet state takes one process-wide lock, so the owner thread and the
@@ -129,10 +143,28 @@ public:
 	void seal_hold() { m_hold.seal(); }
 	uint64_t keepalive_services() const { return m_ka_services.load(std::memory_order_relaxed); }
 
+	// The host's move (xrCoop/coop_soft_move.h): while the owner loads a level, the helper thread is the road between the players and
+	// their map servers. It runs by itself, with no owner and no hold, for kRelayRunsMs at most: a process that hangs goes silent then.
+	// The inbox has no event limit meanwhile, only `inbox_bytes`: past that the relay stops by itself and everything stays in ENet, as
+	// without it. What the inbox holds at the start goes through the relay first: the order of a connection stays. Owner's thread.
+	void relay_start(std::shared_ptr<const softmove::Relay> relay, size_t inbox_bytes = kRelayInboxBytes);
+	void relay_stop();
+	bool relaying() const { return m_relaying.load(std::memory_order_relaxed); }
+	bool inbox_empty() const; // nothing waits that the helper took out of ENet
+	RelayStats relay_stats() const;
+	static uint32_t link_of(PeerHandle peer); // the ENet connectID: the connection, where a handle is only its slot
+
+	static constexpr uint32_t kRelayRunsMs = 180000;
+	static constexpr size_t kRelayInboxBytes = size_t(64) * 1024 * 1024;
+
 private:
+	struct Taken;
 	void keepalive_start();
 	void keepalive_stop();
 	void keepalive_loop();
+	bool relay_take(Taken& t);
+	void relay_pump();
+	void inbox_push(Taken&& t);
 
 	_ENetHost* m_host = nullptr;
 	bool m_enet_ref = false;
@@ -151,8 +183,16 @@ private:
 		uint32_t link = 0;
 	};
 	std::deque<Taken> m_inbox;
+	size_t m_inbox_bytes = 0;
 	link_hold::HoldWord m_hold; // steady clock deadline; released; or sealed by a crash
 	std::atomic<uint64_t> m_ka_services{0};
+	// The relay. Guarded by the I/O lock, but for what the helper asks before it takes that lock.
+	std::shared_ptr<const softmove::Relay> m_relay;
+	std::vector<softmove::Relay::Out> m_relay_out; // of one packet: kept for its capacity
+	RelayStats m_relay_stats;
+	size_t m_relay_cap = 0;
+	std::atomic<bool> m_relaying{false};
+	std::atomic<uint64_t> m_relay_until{0}; // steady clock
 };
 } // namespace net
 } // namespace coop

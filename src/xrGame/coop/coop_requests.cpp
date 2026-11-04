@@ -3,6 +3,7 @@
 #include "coop_requests.h"
 #include "coop_events.h"
 #include "coop_manager.h"
+#include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -20,6 +21,7 @@
 #include "xrCoop/coop_hits.h"
 #include "xrCoop/coop_moves.h" // Ruling F2-32 (F2 T12 round 1)
 #include "xrCoop/coop_id_lease.h" // F2 T12b
+#include "xrCoop/coop_local_zones.h" // personal map zones
 
 #include <cstring>
 
@@ -387,6 +389,9 @@ lease::Held<Action> g_held;
 // Round 2 (review N1): our ReqSpawn go no faster than the host takes them; the rest waits here, in order
 lease::SpawnPacer g_spawn_pacer;
 xr_deque<Action> g_spawn_backlog;
+// Personal map zones (xrCoop/coop_local_zones.h): script_zones of this client alone, under ids of the same lease. Under
+// g_out_lock, cleared with the pool.
+zones::Book g_zones;
 struct LeaseCounters
 {
 	u64 created = 0, temps = 0, clones = 0, confirmed = 0, retried = 0, rolled_back = 0, released_with_clone = 0;
@@ -702,7 +707,7 @@ u64 g_rebuilt = 0, g_rebuild_lost = 0;
 void client_rebuild_item(u16 local_item)
 {
 	if (local_item == kNoId || local_item == kActor || g_rebuilds.size() >= kMaxRebuilds ||
-	    g_rebuilds.count(local_item) || !mgr().is_live_client())
+	    g_rebuilds.count(local_item) || !is_live_mirror())
 		return;
 	CSE_Abstract* e = events::find_entity(local_item);
 	CGameObject* go = find_go(local_item);
@@ -796,7 +801,9 @@ void client_pump_rebuilds()
 // the id goes back (Msg::IdLeaseAck).
 
 // Level-change review: world_up, not g_pGameLevel (set when a level's construction starts) and a simulator that may be half built
-bool lease_world_ready() { return mgr().is_live_client() && world_up() && Level().Server; }
+u32 g_lease_epoch_was = 0; // the epoch before a move of the host's this machine stayed through (lease::epoch_taken)
+
+bool lease_world_ready() { return is_live_mirror() && world_up() && Level().Server; }
 
 // The ids belong to the generator of the world they were reserved in: another world here (the host's load, a rejoin of
 // ours: join::world_generation) leaves nothing of them, nor of the creates in flight. Under g_out_lock.
@@ -807,6 +814,7 @@ void lease_sync_world_locked()
 		return;
 	g_pool_world = world;
 	g_pool.clear();
+	g_zones.clear(); // their objects went with the old world's ALife
 	g_specs.clear();
 	g_spec_actions.clear();
 	g_give_back.clear();
@@ -1136,7 +1144,7 @@ void client_on_lease(PeerId from, Reader& r)
 		++g_lc.bad_leases;
 		return;
 	}
-	if (!lease_world_ready() || m.epoch != mgr().session().world_epoch())
+	if (!lease_world_ready() || !lease::epoch_taken(m.epoch, mgr().session().world_epoch(), g_lease_epoch_was))
 	{
 		++g_lc.stale_leases; // another world's: the host voided them with it
 		return;
@@ -1147,7 +1155,7 @@ void client_on_lease(PeerId from, Reader& r)
 	std::vector<u16> rejected;
 	xrCriticalSectionGuard guard(g_out_lock);
 	lease_sync_world_locked();
-	g_pool.add(m.epoch, m.ids,
+	g_pool.add(mgr().session().world_epoch(), m.ids,
 	    [&server](u16 id)
 	    {
 		    if (!server.IsFreeID(id))
@@ -1298,6 +1306,114 @@ CSE_Abstract* lua_forward(CSE_Abstract* e, const char* name)
 	return nullptr;
 }
 
+// ---------------------------------------------------------------- personal map zones (xrCoop/coop_local_zones.h)
+// Personal Adjustable Waypoint makes a script_zone under every pin and every right click on the PDA map (alife_create with no
+// parent); its map spot is the player's own. The host's request path knows items of our inventory only, so the create
+// answered nil, the map gave no menu and no pin could be set. The zone is made here and nowhere else: an object of our
+// ALife copy under a leased id, offline, not saved, no request to the host. alife():object(id) finds it, the spot finds its
+// object (CMapLocation::Update), and alife():release takes it out again and gives its id back to our pool.
+
+// nullptr: not made - the caller goes on as before (the request path refuses a world spawn).
+CSE_Abstract* local_zone_create(const char* section, const Fvector& pos, u32 level_vertex, u16 game_vertex)
+{
+	// the game vertex is what the ALife registries file the object by: a number outside the graph would index past them
+	if (!lease_world_ready() || !ai().get_alife() || !ai().get_game_graph() ||
+	    !ai().game_graph().valid_vertex_id(game_vertex))
+		return nullptr;
+	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, kNoId);
+	CSE_ALifeDynamicObject* d = e ? smart_cast<CSE_ALifeDynamicObject*>(e) : nullptr;
+	if (!d)
+	{
+		if (e)
+			F_entity_Destroy(e);
+		return nullptr;
+	}
+	u16 id = kNoId;
+	size_t ready = 0;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		lease_sync_world_locked();
+		id = g_zones.issue(g_pool);
+		ready = g_pool.size();
+	}
+	if (id == kNoId)
+	{
+		F_entity_Destroy(e);
+		if (log_allowed())
+			::Msg("! [coop] a personal map zone [%s] was not made: %u leased ids ready, %u are kept for items", section,
+			    (u32)ready, (u32)zones::kKeepForItems);
+		return nullptr;
+	}
+	xrServer* server = Level().Server;
+	// the id is ours: reserved in our generator (never free) and nothing here holds it, as create_leased asks
+	if (!server || server->IsFreeID(id) || server->ID_to_entity(id) || ai().alife().objects().object(id, true))
+	{
+		{
+			xrCriticalSectionGuard guard(g_out_lock);
+			g_zones.cancel(id);
+		}
+		return_unused_lease(id);
+		F_entity_Destroy(e);
+		++g_lc.not_created;
+		if (log_allowed())
+			::Msg("! [coop] a personal map zone [%s] could not take its leased id %u here", section, id);
+		return nullptr;
+	}
+	{
+		entities::ClientApply apply; // our own world takes it as the host's would: nothing of it is a request
+		e->ID = id;
+		name_with_id(e);
+		e->ID_Phantom = kNoId;
+		d->m_bOnline = false;
+		d->m_flags.set(CSE_ALifeObject::flCanSave, FALSE); // in no roster of the host's digest, in no save
+		alife_rw().register_object(d, true);
+	}
+	return e;
+}
+
+// alife():release of a zone made here: out of our ALife copy, its entity kept a while (a script may still hold the se_obj),
+// its id back in the pool. False: not a zone of ours - or one that is online, which our frozen ALife never does: the
+// stock code takes it.
+bool local_zone_release(CSE_Abstract* object)
+{
+	const u16 id = object->ID;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		lease_sync_world_locked();
+		if (!g_zones.has(id))
+			return false;
+	}
+	CSE_ALifeDynamicObject* e = lease_world_ready() ? ai().alife().objects().object(id, true) : nullptr;
+	if (!e || e != object || e->m_bOnline)
+	{
+		if (log_allowed())
+			::Msg("! [coop] a personal map zone %u is not an offline object of ours here: left to the stock release", id);
+		return false;
+	}
+	{
+		xrCriticalSectionGuard guard(g_quarantine_lock);
+		g_quarantine_marks.insert(e);
+	}
+	{
+		entities::ClientApply apply;
+		alife_rw().release(e, true);
+	}
+	xrServer& server = *Level().Server;
+	xrCriticalSectionGuard guard(g_out_lock);
+	// the release freed the id in the generator: reserved again, it is the pool's (and the host's lease of us is as it was)
+	const zones::Fate fate = g_zones.retire(g_pool, id,
+	    [&server](u16 i)
+	    {
+		    if (!server.IsFreeID(i))
+			    return false;
+		    server.PerformIDgen(i);
+		    return true;
+	    });
+	if (fate == zones::Fate::Lost && log_allowed())
+		::Msg("! [coop] the id %u of a released personal map zone is held here by something else: not lent out again", id);
+	return true;
+}
+
 // ---------------------------------------------------------------- host side
 
 enum Cat : u8
@@ -1392,7 +1508,7 @@ bool host_drops_requests_of(PeerId from) { return sync::host_peer_joining(from) 
 
 bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return false;
 	if (host_drops_requests_of(from))
 	{
@@ -1618,7 +1734,8 @@ void host_pump_leases()
 	{
 		if (p.state != PeerState::Joined)
 			continue;
-		if (sync::host_peer_joining(p.id))
+		// F3a: a player on a map server's level has his ids from it: what he spawns goes there, and only its own leases count there
+		if (sync::host_peer_joining(p.id) || !levels::on_host_level(p.id))
 		{
 			if (g_leases.count(p.id))
 			{
@@ -1661,7 +1778,7 @@ void host_pump_leases()
 // Msg::IdLeaseAck: ids the player gives back (busy on his machine, or his create was refused) go back to the generator.
 void host_on_lease_ack(PeerId from, Reader& r)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	lease::IdsMsg m;
 	if (!m.read(r))
@@ -2673,7 +2790,7 @@ void host_on_item_event(PeerId from, Reader& r)
 	// Fix round 1 (review 5): host_begin drops a request silently while its player joins or a world is precached. The
 	// client of an upgrade holds what it paid until the answer, so this one is answered: Offline (his world is being
 	// replaced; the new one brings the host's state of his items), with the balance after it.
-	if (mgr().is_host() && host_drops_requests_of(from))
+	if (is_map_authority() && host_drops_requests_of(from))
 	{
 		Reader peek = r;
 		Req dropped;
@@ -2907,6 +3024,12 @@ void host_on_launch(PeerId from, Reader& r)
 }
 } // namespace
 
+void client_keeps_world(u32 epoch)
+{
+	g_lease_epoch_was = mgr().session().world_epoch();
+	g_pool.keep_epoch(epoch);
+}
+
 void local_actor_hit(const SHit& hit, CObject* who, CObject* weapon)
 {
 	if (mgr().is_client())
@@ -3010,7 +3133,7 @@ void on_peer_left(PeerId id)
 	const auto his = [id](const spawn::QueuedRequest& r) { return PeerId(r.peer) == id; };
 	for (const std::string& key : g_spawn_queue.keys())
 		g_spawn_queue.drop_if(key, his, drop_queued);
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		// F2 T12b: what he still held goes back to this world's generator
 		host_sync_leases();
@@ -3020,12 +3143,12 @@ void on_peer_left(PeerId id)
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		host_pump_spawns(); // Ruling F2-21
 		host_pump_leases(); // F2 T12b
 	}
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	client_flush_launches(); // W3a: before the outbox (a launch usually precedes a drop of the launcher)
 	client_pump_leases(); // F2 T12b: retries go out with this frame's outbox
@@ -3042,7 +3165,7 @@ void register_console()
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		u64 ok = g_h.results[u32(Reason::Ok)], refused = 0;
 		for (u32 i = 1; i < u32(Reason::Count); ++i)
@@ -3141,10 +3264,17 @@ void print_status()
 	      "quarantined entities of an old world left unfreed",
 	    g_lc.held, (u32)held, g_lc.held_dropped, g_lc.clones_refused, g_lc.temps_left, g_lc.quarantine_left);
 	size_t backlog = 0;
+	zones::Book::Stats zone_stats;
+	size_t zones_alive = 0;
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
 		backlog = g_spawn_backlog.size();
+		zone_stats = g_zones.stats();
+		zones_alive = g_zones.size();
 	}
+	::Msg("[coop]   personal map zones: %u alive here, %llu made, %llu released, %llu refused (no leased id to spare), "
+	      "%llu ids not lent out again",
+	    (u32)zones_alive, zone_stats.issued, zone_stats.retired, zone_stats.refused, zone_stats.lost);
 	::Msg("[coop]   leased ids, round 2: %u spawn requests wait for the pace (%llu frames paced), %llu creates in the "
 	      "host's budget queue, %llu asked again for want of an answer, %llu taken back unanswered, %llu clones refused "
 	      "as not a variant",
@@ -3155,12 +3285,12 @@ void print_status()
 
 bool client_forward_spawn(CSE_Abstract* e)
 {
-	if (!e || !mgr().is_client())
+	if (!e || !is_mirror())
 		return false;
 	const u16 parent = e->ID_Parent;
 	if (parent == kNoId || events::root_of(parent) != kActor)
 		return false; // world-caused: loot, population, effects are the host's job
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
 		return true;
@@ -3197,7 +3327,7 @@ bool client_forward_spawn(CSE_Abstract* e)
 
 void client_destroy(u16 local_item, bool use)
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
 		return;
@@ -3210,7 +3340,7 @@ void client_destroy(u16 local_item, bool use)
 
 void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
 		return;
@@ -3267,7 +3397,7 @@ bool client_move_position(u16 local_item, const Fvector& pos)
 
 void client_hit(u16 local_target, const SHit& hit)
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
 		return;
@@ -3293,7 +3423,7 @@ void client_flush_outbox()
 
 void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)
 {
-	if (!mgr().is_live_client() || size > 512)
+	if (!is_live_mirror() || size > 512)
 		return;
 	Action a;
 	a.kind = Act::ItemEvent;
@@ -3308,7 +3438,7 @@ void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)
 
 void client_player_died(u16 local_killer)
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 		return;
 	Action a;
 	a.kind = Act::Died;
@@ -3318,7 +3448,7 @@ void client_player_died(u16 local_killer)
 
 bool client_launch(u16 local_launcher, u16 local_rocket)
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
 		return true; // nothing goes out before the world is live
@@ -3347,10 +3477,21 @@ bool lua_client()
 	return mgr().is_client() && (p == Phase::LoadingWorld || p == Phase::Live);
 }
 
+bool lua_mirror() { return lua_client() && is_mirror(); }
+
+bool local_zone(const char* section)
+{
+	return section && zones::wants(section, kNoId) && lease_world_ready() && spawnable_section(section);
+}
+
 CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vertex, u16 game_vertex, u16 parent,
     bool register_now, int ammo)
 {
 	temps_sync_world(); // round 1 (review I2)
+	// A script_zone without a parent (Personal Adjustable Waypoint's zone under a pin): ours alone, made here
+	if (register_now && local_zone(section) && zones::wants(section, parent))
+		if (CSE_Abstract* zone = local_zone_create(section, pos, level_vertex, game_vertex))
+			return zone;
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	if (!e)
 	{
@@ -3483,6 +3624,8 @@ bool lua_release(CSE_Abstract* object)
 	if (!object)
 		return true;
 	temps_sync_world(); // round 1 (review I2)
+	if (local_zone_release(object)) // a personal map zone of ours
+		return true;
 	if (std::find(g_lua_temps.begin(), g_lua_temps.end(), object) != g_lua_temps.end())
 	{
 		// never created: nothing to release; F2 T12b: its leased id serves the next create
@@ -3563,9 +3706,21 @@ int lua_lease_ids(lua_State* L)
 	return 1;
 }
 
+bool held_by_a_client(const char* name, u16 id)
+{
+	if (!levels::online_at_server(id))
+		return false;
+	++g_cl.lua_refused;
+	if (log_allowed())
+		::Msg("[coop] levels: %s on object %u refused: a client computes it (it comes home when he leaves it)", name, id);
+	return true;
+}
+
 bool lua_client_refuse(const char* name, u16 target, bool runs_while_applying)
 {
-	if (!lua_client())
+	if (held_by_a_client(name, target))
+		return true;
+	if (!lua_mirror())
 		return false;
 	// F2 T12: the call gate decides. These calls have no request path, so a client refuses them unless an ltx override
 	// runs them here (or, round 1, a host command is being applied and the caller allows it); the gate counts and logs.
@@ -3585,14 +3740,14 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 {
 	if (!npc || !hit || !mgr().active())
 		return false;
-	if (mgr().is_client())
+	if (is_mirror())
 	{
 		// host creatures and other players' avatars take damage on their owner's machine only
 		if (entities::client_applying())
 			return false;
 		return sync::is_remote_driven(npc);
 	}
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return false;
 	const u16 id = npc->ID();
 	if (!world::is_player_proxy(id))
@@ -3631,7 +3786,7 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 
 bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
 {
-	if (!actor || !hit || !mgr().is_host())
+	if (!actor || !hit || !is_map_authority())
 		return false;
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
 	// Collision damage (Actor.cpp) names the contact object as both initiator and weapon.
@@ -3644,7 +3799,7 @@ bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
 
 bool host_explode_as(u16 explosive, u16 initiator)
 {
-	if (!mgr().is_host() || !g_pGameLevel || !is_player(initiator) || !valid_go(initiator))
+	if (!is_map_authority() || !g_pGameLevel || !is_player(initiator) || !valid_go(initiator))
 		return false;
 	CGameObject* go = valid_go(explosive);
 	CExplosive* ex = go ? go->cast_explosive() : nullptr;

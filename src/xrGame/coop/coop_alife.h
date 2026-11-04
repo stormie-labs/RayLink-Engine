@@ -1,5 +1,5 @@
 // Anomaly Coop — ALife hooks: who keeps the world online, and who decides switching.
-// Called from ALife code, which in the MT build runs on the game thread between frames
+// Called from ALife code, which in the MT build runs on the secondary thread and is joined before the next FrameMove
 // (never concurrently with the network pump in FrameMove).
 #pragma once
 

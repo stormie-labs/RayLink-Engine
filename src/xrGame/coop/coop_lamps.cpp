@@ -132,7 +132,7 @@ void client_on_lamps(PeerId, Reader& r)
 		++g_st.malformed;
 		return;
 	}
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	const u64 now = mgr().now_ms();
 	for (const LampEntry& e : list)
@@ -189,12 +189,12 @@ void reset()
 void frame()
 {
 	const u64 now = mgr().now_ms();
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		tell_new_players();
 		send_changes(now);
 	}
-	else if (mgr().is_client())
+	else if (is_mirror())
 		client_check(now);
 }
 
@@ -205,7 +205,7 @@ void print_status()
 		xrCriticalSectionGuard guard(&g_lock);
 		book = u32(g_book.size());
 	}
-	if (mgr().is_host())
+	if (is_map_authority())
 		::Msg("[coop]   lamps: %u changed in this world, %llu entries sent", book, g_st.sent);
 	else
 		::Msg("[coop]   lamps: %llu words in, %llu applied, %u held, %llu malformed, %llu lamps never came", g_st.received,
@@ -214,7 +214,7 @@ void print_status()
 
 void on_changed(CHangingLamp* lamp, bool soft)
 {
-	if (!lamp || !mgr().is_host())
+	if (!lamp || !is_map_authority())
 		return;
 	const u8 state = state_of(lamp);
 	xrCriticalSectionGuard guard(&g_lock);

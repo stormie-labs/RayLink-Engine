@@ -448,7 +448,7 @@ void game_sv_GameState::Create(shared_str& options)
 		FS.r_close(F);
 	}
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		// loading scripts
 		ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorGame);
@@ -667,7 +667,7 @@ void game_sv_GameState::Update()
 		m_item_respawner.update(Level().timeServer());
 	}
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		if (Level().game)
 		{
@@ -699,7 +699,7 @@ game_sv_GameState::game_sv_GameState()
 
 game_sv_GameState::~game_sv_GameState()
 {
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorGame);
 	xr_delete(m_event_queue);
 

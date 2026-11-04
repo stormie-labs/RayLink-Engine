@@ -580,7 +580,7 @@ void on_equip(PeerId from, Reader& r)
 		return;
 	++g_equip_in;
 	u16 local_id;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		local_id = join::proxy_of_peer(from); // never trust the id a client claims
 		if (local_id == 0xffff)
@@ -692,7 +692,7 @@ void store_gear(u16 proxy, const std::vector<gear::Entry>& layout)
 void host_on_vitals(PeerId from, Reader& r)
 {
 	Vitals v;
-	if (!mgr().is_host() || !read_vitals(r, v))
+	if (!is_map_authority() || !read_vitals(r, v))
 		return;
 	const u16 proxy = join::proxy_of_peer(from);
 	if (proxy == 0xffff)

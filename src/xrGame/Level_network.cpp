@@ -83,13 +83,13 @@ void CLevel::remove_objects()
 	ph_commander().clear();
 	ph_commander_scripts().clear();
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		space_restriction_manager().clear();
 
 	psDeviceFlags.set(rsDisableObjectsAsCrows, b_stored);
 	g_b_ClearGameCaptions = true;
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		ai().script_engine().collect_all_garbage();
 
 	stalker_animation_data_storage().clear();
@@ -104,7 +104,7 @@ void CLevel::remove_objects()
 		if (!client_spawn_manager().registry().empty())
 			client_spawn_manager().dump				();
 #endif // DEBUG
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 #ifdef DEBUG
 		VERIFY(client_spawn_manager().registry().empty());
@@ -182,7 +182,7 @@ void CLevel::net_Stop()
     Device.LuaGC.clear();
     Device.LuaGCDebug.clear();
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		ai().script_engine().collect_all_garbage();
 
 #ifdef DEBUG
@@ -547,13 +547,16 @@ void CLevel::OnConnectResult(NET_Packet* P)
 void CLevel::ClearAllObjects()
 {
 	u32 CLObjNum = Level().Objects.o_count();
+	Msg("[coop] ClearAllObjects: %u object(s), no server here", CLObjNum); // a live check sees that this path ran
 
 	bool ParentFound = true;
 
-	while (ParentFound)
+	// Anomaly Coop: the lock holds the queue alone. ProcessGameEvents takes it itself and an SRW lock is no recursive one: a client that lost
+	// its session while its world loaded stood here for good. And a rejection may not arrive (a coop event filter): the passes end.
+	u32 passes = 0;
+	while (ParentFound && passes++ < 32)
 	{
 		ParentFound = false;
-        xrSRWLockGuard g(prefetch_lock);
 		for (u32 i = 0; i < CLObjNum; i++)
 		{
 			CObject* pObj = Level().Objects.o_get_by_iterator(i);
@@ -566,7 +569,10 @@ void CLevel::ClearAllObjects()
 			GEN.w_u16(GE_OWNERSHIP_REJECT);
 			GEN.w_u16(pObj->H_Parent()->ID());
 			GEN.w_u16(u16(pObj->ID()));
-			game_events->insert(GEN);
+			{
+				xrSRWLockGuard g(prefetch_lock);
+				game_events->insert(GEN);
+			}
 			if (g_bDebugEvents) ProcessGameEvents();
 			//-------------------------------------------------------------
 			ParentFound = true;
@@ -580,13 +586,13 @@ void CLevel::ClearAllObjects()
 
 	CLObjNum = Level().Objects.o_count();
 
-    xrSRWLockGuard g(prefetch_lock);
+	const bool gave_up = ParentFound; // Anomaly Coop
 	for (u32 i = 0; i < CLObjNum; i++)
 	{
 		CObject* pObj = Level().Objects.o_get_by_iterator(i);
 		if (pObj->H_Parent() != NULL)
 		{
-			if (IsGameTypeSingle())
+			if (IsGameTypeSingle() && !gave_up)
 			{
 				FATAL("pObj->H_Parent()==NULL");
 			}
@@ -603,7 +609,10 @@ void CLevel::ClearAllObjects()
 		GEN.w_u32(Level().timeServer());
 		GEN.w_u16(GE_DESTROY);
 		GEN.w_u16(u16(pObj->ID()));
-		game_events->insert(GEN);
+		{
+			xrSRWLockGuard g(prefetch_lock);
+			game_events->insert(GEN);
+		}
 		if (g_bDebugEvents) ProcessGameEvents();
 		//-------------------------------------------------------------
 		ParentFound = true;

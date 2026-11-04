@@ -27,7 +27,7 @@ namespace game
 // The game rules (§1.2, rows 1..20): the console commands of the co-op host. Everything else (coop_nick, fov, the money
 // limits, the sounds, coop_max_map_servers and coop_mapserver_linger of the host's PC) is the machine's own and stays out
 // of a game. coop_death_share is registered by the death build, coop_split_levels and coop_story_together (F3a, rows 18
-// and 19: "split levels" and "story maps together", both on by default) by the split-levels build, coop_finish_downed (row 20:
+// and 19: "split levels" and "story maps together", both on by default) by the split-levels build, coop_npc_finish_downed (row 20:
 // stalkers finish a downed player, on by default) by the AI; a command the console
 // does not know is refused by CvarLayer::apply, so the list may run ahead of the console.
 inline constexpr std::string_view kGameCvars[] = {
@@ -50,7 +50,7 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_death_share",
 	"coop_split_levels",
 	"coop_story_together",
-	"coop_finish_downed",
+	"coop_npc_finish_downed",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
 static_assert(kGameCvarCount == 20, "docs/GAME_SETTINGS.md §1.2 lists 20 game rules");

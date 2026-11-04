@@ -323,14 +323,41 @@ const char* reject_reason_name(RejectReason r)
 
 bool manifest_visual_only(const std::string& gamedata_rel)
 {
-	static const char kFolder[] = "textures";
-	const size_t n = sizeof(kFolder) - 1;
-	if (gamedata_rel.size() <= n + 1 || (gamedata_rel[n] != '\\' && gamedata_rel[n] != '/'))
+	for (const std::string folder : {"textures", "sounds"})
+	{
+		const size_t n = folder.size();
+		if (gamedata_rel.size() <= n + 1 || (gamedata_rel[n] != '\\' && gamedata_rel[n] != '/'))
+			continue;
+		size_t same = 0;
+		while (same < n && std::tolower(static_cast<unsigned char>(gamedata_rel[same])) == folder[same])
+			++same;
+		if (same == n)
+			return true;
+	}
+	return false;
+}
+
+bool manifest_text_file(const std::string& gamedata_rel)
+{
+	const size_t dot = gamedata_rel.find_last_of('.');
+	if (dot == std::string::npos)
 		return false;
-	for (size_t i = 0; i < n; ++i)
-		if (std::tolower(static_cast<unsigned char>(gamedata_rel[i])) != kFolder[i])
-			return false;
-	return true;
+	std::string tail = gamedata_rel.substr(dot + 1);
+	for (char& c : tail)
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	for (const char* text : {"ltx", "xml", "script", "lua", "pe", "pg", "ini", "h", "s", "ps", "vs", "gs", "cs", "hs", "ds", "hlsl", "fx", "json", "csv"})
+		if (tail == text)
+			return true;
+	return false;
+}
+
+uint64_t manifest_lf_size(const uint8_t* data, size_t size)
+{
+	uint64_t pairs = 0;
+	for (size_t i = 0; i + 1 < size; ++i)
+		if (data[i] == '\r' && data[i + 1] == '\n')
+			++pairs;
+	return size - pairs;
 }
 
 bool manifest_game_written(const std::string& gamedata_rel)

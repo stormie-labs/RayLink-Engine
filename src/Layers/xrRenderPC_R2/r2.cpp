@@ -608,7 +608,8 @@ void CRender::add_StaticWallmark(const wm_shader& S, const Fvector& P, float s, 
 
 void CRender::clear_static_wallmarks()
 {
-	Wallmarks->clear();
+	if (Wallmarks) // Anomaly Coop: a level stopped before it loaded
+		Wallmarks->clear();
 }
 
 void CRender::add_SkeletonWallmark(intrusive_ptr<CSkeletonWallmark> wm)

@@ -5,7 +5,7 @@
 
 void CGammaControl::Update()
 {
-	if (HW.pDevice)
+	if (HW.pDevice && HW.m_pSwapChain) // Anomaly Coop: a map server has none, and the gamma of the monitor is the player's
 	{
 		DXGI_GAMMA_CONTROL_CAPABILITIES GC;
 		DXGI_GAMMA_CONTROL G;

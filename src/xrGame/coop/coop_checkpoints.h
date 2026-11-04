@@ -60,7 +60,8 @@ void register_lua(lua_State* L);
 
 // A new camp for a character: he is a player's (or the host), alive, the record is valid, on this level and on a
 // vertex of its AI map. Written through to the character's custom data.
-bool host_set(u16 character, const checkpoint::Record& r);
+// `elsewhere`: a record from the authority of another level; this process has not the AI map to check it against.
+bool host_set(u16 character, const checkpoint::Record& r, bool elsewhere = false);
 // The object `source` is gone: every slot with a record from it rolls back (owner / group told, rollback = true).
 void host_source_lost(u16 source);
 // The arrival point of a level change (kind Arrival, no source; no level check: it is on the next level). The host's
@@ -71,13 +72,14 @@ void host_set_arrival(u16 character, const checkpoint::Record& r);
 // host's own when the new level is loaded).
 void host_on_level_change(const CSE_ALifeCreatureActor& actor);
 // A story checkpoint (stock xr_effects.scenario_autosave): kind Story where the host and every present living player
-// stands. True if at least one was set.
+// stands, a player on a map server's level where his entity's record says. True if at least one was set.
 bool host_story(const char* reason);
 // Where a character comes back to life on this level (checkpoint::resolve): his camp, the previous one, `anchor`, the
 // host's arrival point, else `body`. `kind` is the kind of the record used (None for the anchor and the body).
 // False (out = body) when there is no host world.
 bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& body, Fvector& out, checkpoint::Kind& kind);
 // A record of where `character` stands now (an object on this level); not valid if there is no object.
+checkpoint::Record record_far(u16 character, checkpoint::Kind kind, u16 source); // a player on a map server's level: where it last said he stands
 checkpoint::Record record_here(const CGameObject* character, checkpoint::Kind kind, u16 source);
 // The slot of a character, nullptr if he has no checkpoint. Valid until the next change of the store.
 const checkpoint::Slot* host_slot(u16 character);

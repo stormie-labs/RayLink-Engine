@@ -32,7 +32,11 @@ constexpr bool kOwnLevels = false;
 
 // The point the host's Lua picked for a new character can be used: it is a point of the game graph (`valid`) and on the
 // host's level, or (F3a) on any level.
-constexpr bool point_usable(bool valid, bool on_host_level) { return valid && (on_host_level || kOwnLevels); }
+// own_levels: a dedicated host, its own level is the service level and nobody starts there.
+constexpr bool point_usable(bool valid, bool on_host_level, bool own_levels = kOwnLevels)
+{
+	return valid && (on_host_level || own_levels);
+}
 
 // Host: the players who are choosing a new character (an offer is out) and since when.
 class Choosers

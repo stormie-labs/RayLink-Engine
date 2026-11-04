@@ -151,5 +151,6 @@ void CUICursor::SetUICursorPosition(Fvector2 pos)
 	p.y = iFloor(vPos.y / (UI_BASE_HEIGHT / (float)Device.clientHeight));
 	if (m_b_use_win_cursor)
 		ClientToScreen(Device.m_hWnd, (LPPOINT)&p);
-	SetCursorPos(p.x, p.y);
+	if (!g_coop_headless) // Anomaly Coop: the cursor of the desktop is the player's
+		SetCursorPos(p.x, p.y);
 }

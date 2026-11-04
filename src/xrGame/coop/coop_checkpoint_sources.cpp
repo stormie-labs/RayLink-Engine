@@ -8,6 +8,8 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h"
+#include "coop_mapserver.h"
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_script.h"
@@ -573,7 +575,7 @@ void new_world(u32 epoch, u64 now_ms)
 // False when there is no host world to look at.
 bool ensure_world()
 {
-	if (!mgr().is_host() || !g_pGameLevel || !ai().get_alife() || !ai().get_level_graph() || !ai().get_game_graph())
+	if (!is_map_authority() || !g_pGameLevel || !ai().get_alife() || !ai().get_level_graph() || !ai().get_game_graph())
 		return false;
 	settings();
 	const u32 epoch = join::host_world_epoch();
@@ -625,7 +627,27 @@ void tick_players(u64 now_ms)
 			continue; // a visit ends with death or leaving
 		const CGameObject* obj = object_here(c);
 		if (!obj)
+		{
+			// a player on a map server's level: its authority says what he stands at, the camp is written here all the same
+			levels::BodyFacts there;
+			const bool at_fire = levels::body_facts(c, there) && (Place(there.place) == Place::Campfire || Place(there.place) == Place::Mod);
+			if (!at_fire)
+				continue;
+			checkpoint::Dwell far_visit;
+			const auto far_was = g.dwell.find(c);
+			if (far_was != g.dwell.end())
+				far_visit = far_was->second;
+			if (checkpoint::dwell_update(far_visit, there.source, there.fight, now_ms, g_set.v.campfire_dwell_ms))
+			{
+				const Kind kind = Place(there.place) == Place::Mod ? Kind::Mod : Kind::Campfire;
+				if (host_set(c, record_far(c, kind, there.source), true))
+					++g_stat.camps;
+				else
+					++g_stat.camps_refused; // host_set logs why
+			}
+			next.emplace(c, far_visit);
 			continue;
+		}
 		float at[3];
 		to_array(obj->Position(), at);
 		const checkpoint::SourceSpot* s = checkpoint::nearest_spot(spots, at);
@@ -766,12 +788,28 @@ void release_object(u16 id)
 		alife_rw().release(e, true);
 }
 
-// A player's tent or sleeping bag (Rulings F3-6, I-1): paid with an item of his, put up by the host (he cannot create a
-// world object until F2 Task 12b), marked his and made his camp — or nothing at all. F3a T7: the host player's too.
+// A map server's book knows the tents of its save and of its level. His tents on other levels since then are in its copy of the world.
+size_t world_tents_of(const std::string& key)
+{
+	size_t n = 0;
+	for (const auto& it : ai().alife().objects().objects())
+	{
+		const CSE_ALifeDynamicObject* e = it.second;
+		checkpoint::TentMark m;
+		if (e && is_tent_section(e->s_name) && e->m_ini_string.size() && checkpoint::tent_mark_from_ini(e->m_ini_string.c_str(), m) &&
+		    m.owner == key)
+			++n;
+	}
+	return n;
+}
+
+// A player's tent or sleeping bag (Rulings F3-6, I-1): paid with an item of his, put up by the authority of his level (he cannot create
+// a world object until F2 Task 12b), marked his and made his camp — or nothing at all. F3a T7: the host player's too. On a map server
+// the camp and the book of the world are the world server's: it hears of the tent right after the tent's spawn (host_tent_up).
 void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& pos)
 {
 	const std::string key = key_of(character);
-	if (!g.book.may_place(key, kMaxPlayerTents))
+	if (is_map_server() ? world_tents_of(key) >= kMaxPlayerTents : !g.book.may_place(key, kMaxPlayerTents))
 		return refuse(character, what, Refusal::Limit);
 	const bool tent = what == ClaimWhat::Tent;
 	const u16 paid = carried_item(obj, character, tent ? g_set.tent_items : g_set.sleepbag_items);
@@ -808,7 +846,9 @@ void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& p
 		mark.item = paid_section;
 		write_mark(e, mark);
 		r.source = e->ID;
-		if (!host_set(character, r))
+		if (is_map_server())
+			levels::up_tent(e->ID, character);
+		else if (!host_set(character, r))
 		{
 			alife_rw().release(smart_cast<CSE_ALifeDynamicObject*>(e), true); // just made, not online yet
 			why = "the checkpoint was refused";
@@ -826,7 +866,8 @@ void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& p
 	::Msg("[coop] checkpoint sources: %s %u (%s) put up for character %u at (%.1f, %.1f, %.1f), paid with %s",
 	    checkpoint::claim_what_name(what), e->ID, section.c_str(), character, pos.x, pos.y, pos.z,
 	    paid_section.c_str());
-	script::queue_callback(kPlacedCallback, {script::cb_int(e->ID), script::cb_int(character)}); // T13: spawned_tents
+	if (!is_map_server())
+		script::queue_callback(kPlacedCallback, {script::cb_int(e->ID), script::cb_int(character)}); // T13: spawned_tents
 }
 
 // Ruling F3-8: a player packs up his own tent or sleeping bag at the spot: the host releases it and gives back the very
@@ -875,7 +916,8 @@ void pack_for(u16 character, const Fvector& pos)
 	}
 	release_object(tent);
 	g.book.forget(tent);
-	host_source_lost(tent); // his camp on it rolls back now, not at the next sweep
+	if (!is_map_server())
+		host_source_lost(tent); // his camp on it rolls back now, not at the next sweep; the world server's sweep does on a map server's word
 	++g_stat.packed;
 	::Msg("[coop] checkpoint sources: tent %u of character %u packed up, %s given back", tent, character,
 	    mark.item.c_str());
@@ -885,8 +927,8 @@ void pack_for(u16 character, const Fvector& pos)
 
 void host_on_claim(PeerId from, Reader& rd)
 {
-	if (!mgr().is_host())
-		return; // ClientOnly: only the host takes it
+	if (!is_map_authority())
+		return; // ClientOnly: the host takes it, and the map server of the sender's level (coop_scope.h also_to_level_authority)
 	ClaimWhat what = ClaimWhat::Tent;
 	float p[3];
 	if (!checkpoint::read_claim(rd, what, p))
@@ -928,6 +970,14 @@ const char* place_name(Place p)
 void install_server(Session& s) { s.on(Msg::CheckpointClaim, &host_on_claim); }
 
 void install_client(Endpoint&) {} // nothing the world server sends here
+
+void map_server_scan(u64 now_ms)
+{
+	if (!ensure_world() || now_ms < g.next_scan_ms)
+		return;
+	g.next_scan_ms = now_ms + kScanMs;
+	scan_level(now_ms);
+}
 
 void host_frame(u64 now_ms)
 {
@@ -1000,7 +1050,7 @@ void print_status()
 
 bool in_combat(const CGameObject* character)
 {
-	if (!character || !g_pGameLevel || !mgr().is_host())
+	if (!character || !g_pGameLevel || !is_map_authority())
 		return false;
 	const float r = settings().combat_radius;
 	const Fvector& at = character->Position();
@@ -1109,7 +1159,15 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 		return;
 	++g_stat.claims;
 	CGameObject* obj = object_here(character);
-	const bool in_world = survival::player_in_world(character);
+	const bool in_world = is_map_server() ? join::host_player_in_world(character) : survival::player_in_world(character);
+	const PeerId peer = survival::peer_of_character(character);
+	if (!obj && mgr().is_host() && peer != kInvalidPeer && !levels::on_host_level(peer))
+	{
+		// A tent is an object of his map: the copy of this claim went to the authority of his level, and that one answers him. Gone: nobody.
+		if (mapserver::bridge_of(levels::level_of_player(peer)) == kInvalidPeer)
+			return refuse(character, what, Refusal::Failed);
+		return;
+	}
 	if (!pos_ok(pos) || !obj || !in_world)
 	{
 		++g_stat.not_in_world;
@@ -1130,6 +1188,30 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 	// coop_tent_guard.script sends him the client's way). F2 Task 12b (ids leased to clients) may let a player create
 	// the tent himself.
 	place_for(character, what, obj, pos);
+}
+
+void host_tent_up(u16 tent, u16 character)
+{
+	if (!ensure_world())
+		return;
+	const CSE_ALifeDynamicObject* e = entity(tent);
+	checkpoint::TentMark mark;
+	if (!e || !is_tent_section(e->s_name) || !read_mark(tent, mark))
+	{
+		::Msg("! [coop] checkpoint sources: a map server speaks of tent %u, this world has no such tent", u32(tent));
+		return;
+	}
+	checkpoint::TentSeen seen;
+	seen.id = tent;
+	to_array(e->o_Position, seen.pos);
+	seen.what = what_of(e->s_name);
+	g.book.observe(std::vector<checkpoint::TentSeen>(1, seen), mgr().now_ms());
+	g.book.set_owner(tent, mark.owner);
+	++g_stat.placed;
+	script::queue_callback(kPlacedCallback, {script::cb_int(tent), script::cb_int(character)}); // T13: spawned_tents
+	// His tent stands and he paid for it; a camp that is refused leaves him a tent he can pack up.
+	if (!host_set(character, record_far(character, Kind::Tent, tent), true))
+		refuse(character, seen.what == u8(ClaimWhat::Sleepbag) ? ClaimWhat::Sleepbag : ClaimWhat::Tent, Refusal::Failed);
 }
 
 u16 host_tent_owner(u16 tent)

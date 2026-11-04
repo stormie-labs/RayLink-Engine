@@ -31,6 +31,7 @@ extern int g_coop_max_new_characters;
 // 1: print the C++ stacks of coop::diag (dbghelp loads the ~225 MB PDB and stalls the game 1-2 min the first time;
 // live 2026-10-23 a client froze after the host crashed). Off by default.
 extern int g_coop_diag_stacks;
+extern int g_coop_diag_fail_swap; // console coop_diag_fail_swap 1: the next load of this client ends as a world with no character for him
 
 namespace coop
 {
@@ -98,6 +99,12 @@ u32 host_world_epoch();
 void on_world_created();
 // Number of worlds created in this process (any role).
 u32 world_generation();
+// Host: the host's move that nobody notices is on (xrCoop/coop_soft_move.h): from before its save until the world it brings is served.
+bool host_soft_window();
+// ... and this player stays in his world through it.
+bool host_soft_stays(PeerId peer);
+// He stayed in his world through the move that made this world: what a new world wipes of everybody is still true of him.
+bool host_stayed_in_world(PeerId peer);
 // Host: move the group at once through the exit somebody waits at (console coop_accept_transition, the chat's /go),
 // whoever is missing. The level change is built from the host's own level changer (R2 I3).
 bool accept_transition();
@@ -112,12 +119,12 @@ bool accept_transition();
 // simultaneous load (LoadWait / LoadReady: every client in the world loads the transition's save with the host, the loading
 // screens come off together, hold_loading_screen below).
 // Hook of CLevelChanger (the stock "go?" dialog and the silent change of its zone): true = the group waits here, the
-// stock reaction stays off. False for a disabled exit (its own message stays), outside a session and for a host nobody
-// has joined.
-bool transition_owns_exit(bool exit_enabled);
-// A host alone in his session: the exit takes him at once, the stock "go?" dialog stays off too. False for a disabled exit
-// (its own message stays) and outside a session.
-bool exit_without_dialog(bool exit_enabled);
+// stock reaction stays off. False for a disabled exit (its own message stays), outside a session, for a host nobody
+// has joined and, with split levels on, for the host at an exit that takes him alone (`next_vertex`: where it leads).
+bool transition_owns_exit(bool exit_enabled, u16 next_vertex);
+// A host alone in his session, or one who goes alone: the exit takes him at once, the stock "go?" dialog stays off too. False for a
+// disabled exit (its own message stays) and outside a session.
+bool exit_without_dialog(bool exit_enabled, u16 next_vertex);
 // Hook of game_sv_Single::change_level, the one place every level change of the host goes through (the zone, the
 // dialog, jump_to_level of a guide): true = held, the group waits (a guide trip, which has no exit, needs everybody's
 // yes); false = the stock change goes on (no players besides the host, or the board's own change). `P` is read, not
@@ -140,11 +147,20 @@ void register_lua(lua_State* L);
 // is void; the 5 s between two admissions hold (a JoinRequest within them waits, JoinGate::Later, and goes after).
 // False if he is not a player of this session in the world (no entry, the host itself).
 bool host_rejoin_peer(PeerId peer, const char* why);
+// Host, F3a: the map server of `level` is gone: every player there loads anew (`why`: a string id, shown to him): on the same level when
+// a new one is coming, on the host's when none can (levels::host_player_loads).
+void host_rejoin_level(u16 level, const char* why);
 // Host, Ruling F3-9: the character of player key `key_digest` retired (F3 Task 10). Kept for this session and in the
 // world (the host actor's custom data, [coop_retired], death::note_retired_key: the newest 64): his new character, now
 // or in a later session, neither checks nor spends coop_max_new_characters, and (Ruling F3-10) starts with nothing -
 // no kit, no faction money, the offer has 0 points - unless coop_hardcore_new_kit is on (death::host_new_kit).
 void host_key_retired(const std::string& key_digest);
+
+// --- a map server (F3a): the players of its level, as the world server's LevelMap names them
+// He is on his way here: his character is his, his world traffic waits.
+void server_player_came(PeerId peer, u16 proxy);
+// He finished loading: his character comes online, he gets what is online here.
+void server_player_in_world(PeerId peer);
 
 // --- client ---
 // Client touched a level exit: the host decides. Only the id of the level changer goes to the host (R2 I3).

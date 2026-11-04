@@ -7,6 +7,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h"
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_script.h"
@@ -262,14 +263,24 @@ void host_request(u16 character, const Request& rq)
 	}
 	++g_stat.lie_downs;
 	CGameObject* obj = host_world_ready() ? object_here(character) : nullptr;
-	if (!obj)
+	levels::BodyFacts there; // a player on a map server's level: his body is no object here, its authority says what it sees
+	const bool elsewhere = !obj && host_world_ready() && levels::body_facts(character, there);
+	if (!obj && !elsewhere)
 		return refuse(character, Refusal::Busy); // the host's world is not up, or his character is not in it
 	const bool alive = survival::life_of(character) == survival::Life::Alive;
-	const bool fight = alive && checkpoints::sources::in_combat(obj);
+	const bool fight = alive && (elsewhere ? there.fight : checkpoints::sources::in_combat(obj));
 	u16 source = checkpoint::kNoSource;
 	Place place = Place::None;
 	if (alive && !rq.forced)
-		place = checkpoints::sources::rest_place(character, source);
+	{
+		if (elsewhere)
+		{
+			place = Place(there.place);
+			source = there.source;
+		}
+		else
+			place = checkpoints::sources::rest_place(character, source);
+	}
 	Refusal why = check_lie_down(alive, g_host.group.sleeping(), rq.forced, fight, place != Place::None);
 	if (why == Refusal::None && !g_host.group.may_lie_down(character))
 		why = Refusal::Busy; // asked before the camp is set: a camp never comes without the rest
@@ -284,7 +295,9 @@ void host_request(u16 character, const Request& rq)
 	// store refuses (host_set logged why: off the AI map, not this level...) refuses the lie-down, and he is told "camp".
 	if (!rq.forced)
 	{
-		if (!checkpoints::host_set(character, checkpoints::record_here(obj, kind_of(place), source)))
+		const checkpoint::Record camp =
+		    elsewhere ? checkpoints::record_far(character, kind_of(place), source) : checkpoints::record_here(obj, kind_of(place), source);
+		if (!checkpoints::host_set(character, camp, elsewhere))
 			return refuse(character, Refusal::Camp);
 		++g_stat.camps;
 	}
@@ -335,7 +348,8 @@ void host_tick(u64 now)
 	std::vector<Seen> present;
 	present.reserve(kMaxPlayers);
 	xr_vector<u16> characters;
-	characters.push_back(0);
+	if (mgr().session().local()) // a dedicated host has no player to wait for
+		characters.push_back(0);
 	for (const PeerInfo& p : mgr().session().peers())
 	{
 		const u16 proxy = join::proxy_of_peer(p.id);
@@ -348,17 +362,22 @@ void host_tick(u64 now)
 		if (life == survival::Life::Spectating)
 			continue; // out of a hardcore run: not one of the group (rest::decide)
 		const CGameObject* obj = object_here(c);
-		if (!obj)
+		levels::BodyFacts there;
+		const bool elsewhere = !obj && levels::body_facts(c, there); // on a map server's level he is one of the group all the same
+		if (!obj && !elsewhere)
 			continue;
 		Seen s;
 		s.id = c;
 		s.alive = life == survival::Life::Alive;
-		s.in_combat = s.alive && checkpoints::sources::in_combat(obj);
+		s.in_combat = s.alive && (elsewhere ? there.fight : checkpoints::sources::in_combat(obj));
 		present.push_back(s);
 	}
 	// T11 review M1: when everybody rests, each rest that is not a faint is looked at once more (Group::tick calls this
 	// once per sleep, not on every tick): one who walked away from his camp loses his rest ("place").
 	const Group::PlaceCheck at_place = [](uint16_t id) {
+		levels::BodyFacts there;
+		if (!object_here(id) && levels::body_facts(id, there))
+			return Place(there.place) != Place::None;
 		u16 source = checkpoint::kNoSource;
 		return checkpoints::sources::rest_place(id, source) != Place::None;
 	};

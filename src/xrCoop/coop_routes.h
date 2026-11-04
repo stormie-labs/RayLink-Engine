@@ -6,7 +6,8 @@
 //           calls it makes into the world are gated by the call router (§2.3)
 //   view  - everywhere (HUD, sound, particles, UI, data that every machine reads)
 //   none  - nowhere in co-op (mechanics the engine replaced, debug tools); `blocked` is the old name
-//   level - reserved for F3a (split levels); behaves as host until then
+//   level - the behaviour of an object online on a level: runs on the process that computes it (F3a): the host for its level
+//           and, with split levels, a map server
 // Names (callbacks and scripts) compare case-insensitively: an ltx reader may lowercase keys, Lua sends the real case.
 // F2 T10 adds what the router needs besides the table: script_key (a function's script from its Lua source) and the
 // call counters. F2 T11 adds the binder rules: whether a client calls a method the engine calls on a script binder.
@@ -19,6 +20,7 @@
 #include <functional>
 #include <initializer_list>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -671,12 +673,30 @@ public:
 		m_callbacks.clear();
 		m_scripts.clear();
 		m_prefixes.clear();
+		m_level_scripts.clear();
+		m_level_callbacks.clear();
 		m_binders.clear();
 	}
 
 	size_t size() const
 	{
 		return m_pairs.size() + m_forced.size() + m_callbacks.size() + m_scripts.size() + m_prefixes.size();
+	}
+
+	// F3a multilevel: [level_scripts] and [level_callbacks] (configs\coop_compat_split_levels.ltx). They do not change route(): a
+	// route says where a handler runs in a session with one level. They name, among the handlers that run on the host, the
+	// behaviour of an object online on a level (docs/SPLIT_LEVELS.md §4), which runs on the process that computes that level.
+	void add_level_script(std::string_view script) { m_level_scripts.insert(detail::lowered(detail::trimmed(script))); }
+	void add_level_callback(std::string_view callback) { m_level_callbacks.insert(detail::lowered(detail::trimmed(callback))); }
+	// A listed script, whatever the callback; a listed callback of a script that has no rule of its own (a world script keeps
+	// the host whatever it listens to).
+	bool level_behaviour(std::string_view callback, std::string_view script) const
+	{
+		const std::string sc = detail::lowered(script);
+		if (m_level_scripts.count(sc))
+			return true;
+		Domain by_script = Domain::Owner;
+		return !script_rule(sc, by_script) && m_level_callbacks.count(detail::lowered(callback)) != 0;
 	}
 
 	Domain route(std::string_view callback, std::string_view script) const
@@ -759,17 +779,19 @@ private:
 	std::map<std::string, Domain> m_forced;    // callback, lowercase
 	std::map<std::string, Domain> m_callbacks; // callback, lowercase
 	std::map<std::string, Domain> m_scripts;   // exact script, lowercase
+	std::set<std::string> m_level_scripts;     // F3a multilevel, lowercase
+	std::set<std::string> m_level_callbacks;   // F3a multilevel, lowercase
 	std::vector<Prefix> m_prefixes;            // script prefix without the *, lowercase
 	std::map<std::string, std::map<std::string, BinderAction>> m_binders; // binding -> method -> action, lowercase
 };
 
-// Host and level run only on the host; owner and view run everywhere; none runs nowhere.
-inline bool runs_here(Domain d, bool is_host)
+// Host runs only on the world server, level also on a map server; owner and view run everywhere; none runs nowhere.
+inline bool runs_here(Domain d, bool is_host, bool leads_level = false)
 {
 	switch (d)
 	{
-	case Domain::Host:
-	case Domain::Level: return is_host;
+	case Domain::Host: return is_host;
+	case Domain::Level: return is_host || leads_level;
 	case Domain::Owner:
 	case Domain::View: return true;
 	case Domain::None: return false;

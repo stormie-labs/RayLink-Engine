@@ -10,10 +10,16 @@ class XRCORE_API xrDebug
 private:
 	crashhandler* handler;
 	on_dialog* m_on_dialog;
+	bool m_silent_fatal; // Anomaly Coop: set_silent_fatal
 
 public:
 	void _initialize(const bool& dedicated);
 	void _destroy();
+
+	// Anomaly Coop: for a process with no window and nobody at its screen (a map server): a fatal error goes to the log and the
+	// process leaves at once with a non-zero code, no dialog, no crash save, the player's clipboard left alone.
+	void set_silent_fatal();
+	bool silent_fatal() const { return m_silent_fatal; }
 
 public:
 	crashhandler* get_crashhandler()

@@ -301,7 +301,7 @@ bool apply(CGameObject* obj)
 		if (it != g_puppets.end())
 			track_legs(obj, ka, it->second);
 	}
-	if (mgr().is_host() && world::is_player_proxy(obj->ID()))
+	if (is_map_authority() && world::is_player_proxy(obj->ID()))
 	{
 		sync_server_entity(obj);
 		npc_ai::on_proxy_frame(obj); // W11: light and view for the NPCs that look at this player

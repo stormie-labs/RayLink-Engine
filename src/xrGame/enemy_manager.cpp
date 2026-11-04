@@ -80,7 +80,7 @@ bool CEnemyManager::useful(const CEntityAlive* entity_alive) const
 	if (!entity_alive->g_Alive())
 		return (false);
 	// Anomaly Coop: a dead player's body is no enemy, and a monster leaves one who is down as well; a stalker only when the
-	// game rule coop_finish_downed is off
+	// game rule coop_npc_finish_downed is off
 	if (coop::npc_ai::player_out_for(entity_alive, m_stalker != nullptr))
 		return (false);
 
@@ -329,7 +329,8 @@ void CEnemyManager::on_enemy_change(const CEntityAlive* previous_enemy)
 	VERIFY(previous_enemy);
 	VERIFY(selected());
 
-	if (!previous_enemy->g_Alive())
+	// Anomaly Coop: a player out of this fight is no one to go back to by inertia
+	if (!previous_enemy->g_Alive() || coop::npc_ai::player_out_for(previous_enemy, m_stalker != nullptr))
 	{
 		m_last_enemy_change = Device.dwTimeGlobal;
 		return;
@@ -416,6 +417,10 @@ bool CEnemyManager::need_update(const bool& only_wounded) const
 		return (true);
 
 	if (!selected()->g_Alive())
+		return (true);
+
+	// Anomaly Coop: useful() judges only a new choice: one who went down while chosen would be shot until he is dead
+	if (coop::npc_ai::player_out_for(selected(), m_stalker != nullptr))
 		return (true);
 
 	if (!m_object->is_relation_enemy(selected()))

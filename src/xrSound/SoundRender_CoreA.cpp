@@ -367,6 +367,18 @@ void CSoundRender_CoreA::switch_device(LPCSTR device_name)
 
 void CSoundRender_CoreA::_initialize(int stage)
 {
+	if (psSoundSilent)
+	{
+		// Anomaly Coop: the stock core with nothing to play on: no device, no EFX, no target, so i_allow_play says no to every emitter and
+		// each only simulates. Everything above the emitters runs as with a sound card.
+		if (stage != 0)
+		{
+			Listener = SListener();
+			inherited::_initialize(stage);
+		}
+		return;
+	}
+
 	if (stage == 0)
 	{
 		pDeviceList = xr_new<ALDeviceList>();
@@ -510,7 +522,7 @@ void CSoundRender_CoreA::_initialize(int stage)
 
 void CSoundRender_CoreA::set_master_volume(float f)
 {
-	if (bPresent)
+	if (bPresent && pContext)
 	{
 		A_CHK(alListenerf (AL_GAIN,f));
 	}
@@ -561,6 +573,9 @@ void CSoundRender_CoreA::update_listener(const Fvector& P, const Fvector& D, con
 	}
 	Listener.orientation[0].set(D.x, D.y, -D.z);
 	Listener.orientation[1].set(N.x, N.y, -N.z);
+
+	if (!pContext)
+		return; // Anomaly Coop: a silent core: the emitters' culling reads the position above
 
 	A_CHK(alListener3f (AL_POSITION,Listener.position.x,Listener.position.y,-Listener.position.z));
 	A_CHK(alListener3f (AL_VELOCITY, Listener.prevVelocity.x, Listener.prevVelocity.y, -Listener.prevVelocity.z));

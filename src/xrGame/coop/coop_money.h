@@ -75,6 +75,8 @@ bool scripted_upgrades();
 // --- host ---
 // The balance of `peer`'s character, 0 if he has none.
 u32 host_balance(PeerId peer);
+// F3a, a map server: a balance as the world server's LevelMap names it (coop_money.cpp).
+void server_balance(PeerId peer, u32 balance);
 // Changes the balance of `peer`'s character by `delta` (never below 0, never above max_money unless it already is)
 // and sends it to its player. `why`: a literal for the log ("trade", "grant", ...); "trade" is counted as a trade in
 // coop_status, anything else as a grant. False if he has no character.

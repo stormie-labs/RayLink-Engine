@@ -376,7 +376,7 @@ void CHelicopter::DieHelicopter()
 
 		///PPhysicsShell()=P_build_Shell	(this,false);
 		PPhysicsShell()->EnabledCallbacks(TRUE);
-		if (!coop::mgr().is_client()) // Anomaly Coop (audit W8): the wreck blows up on the host's contact
+		if (!coop::is_mirror()) // Anomaly Coop (audit W8): the wreck blows up on the host's contact
 			PPhysicsShell()->set_ObjectContactCallback(CollisionCallbackDead);
 		PPhysicsShell()->set_ContactCallback(ContactShotMark);
 	}

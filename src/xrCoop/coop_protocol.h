@@ -64,7 +64,23 @@ namespace coop
 //     Animation absence uses MotionID::invalidate (0xffff); (slot 0,index 0) is a valid motion.
 // 17 (2026-10-30): EntityVisual 0x012D (host -> all): a host creature took a new visual (GE_CHANGE_VISUAL); the motion ids
 //     of the snapshots belong to the host's model, a puppet that kept the old one played other motions.
-constexpr uint32_t kProtocolVersion = 19;
+// 20 (F3a, owner 2026-11-01: every map is computed on the host's PC, a client never leads one): a LevelMap player row is {peer, level,
+//     in_world, proxy, money} (a map server takes its virtual peers from it), LevelMoveResult has no reason Led, Tunnel flags carry the
+//     lane, LevelEntity State names the character and has an op Money, a map server's bridge has a peer id of its own
+//     (coop_mapserver_rules.h kBridgeBase) in its Welcome.
+// 21 (F3a, a player's body on a map server's level): LevelEntity State ends with LevelBodyFacts, PlayerRevive has an op OpLosses from the
+//    world server to a map server.
+// 22 (F3a, one brain of the world): the state of an object handed over ends with the Lua logic of the object and its members.
+// 23: LevelBodyFacts has `talking`: the dialog allowance of the money book holds on a map server's level too.
+// 24 (F3a): the logic of a squad itself goes with the logic of its members: its smart and its target change hands with it.
+//    LevelEntity has an op Tent.
+// 25 (F3a): the state of an object handed over names its money: a trader's stayed with the map server that led him. PlayerRevive has an op
+//    OpStash from the world server to a map server, LevelEntity an op Stash the other way: a hardcore retirement of a player on its level.
+// 26 (F3a, the host's move that nobody notices, coop_soft_move.h): LoadWait has a reason (why this player loads) and two states, Away and
+//    Back, for who stays in his world.
+// 27 (F3a, what the static objects of a level keep, coop_levels_logic.h): LevelEntity has an op Logic, the bytes a binder would save.
+// 28 (F3a, a map server has no game record): PlayerRules ends with a party byte, friendly fire and whether stalkers finish a downed player.
+constexpr uint32_t kProtocolVersion = 28;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -292,10 +308,16 @@ using Manifest = std::vector<ManifestEntry>;
 // Order-independent fingerprint of a manifest (FNV-1a over sorted entries).
 uint64_t manifest_fingerprint(const Manifest& m);
 
-// A loose gamedata file (path relative to gamedata, any case, '\\' or '/') that only changes how the world looks:
-// everything under textures\. Left out of the manifest, so a texture pack or another version of one does not refuse
-// a join (live 2026-10-29: a GAMMA client was refused for textures).
+// A loose gamedata file (path relative to gamedata, any case, '\\' or '/') that only changes how the world looks or sounds:
+// everything under textures\ and sounds\. Left out of the manifest, so a texture pack or another version of one does not
+// refuse a join (live 2026-10-29: a GAMMA client was refused for textures).
 bool manifest_visual_only(const std::string& gamedata_rel);
+
+// A text file (same path rules): its size in the manifest is manifest_lf_size. The same file comes with CRLF from a PC with Git
+// for Windows and with LF from any other, and nothing the game reads differs (live 2026-11-01: 4953 files of one GAMMA).
+bool manifest_text_file(const std::string& gamedata_rel);
+// The size of `data` with every CRLF counted as one byte.
+uint64_t manifest_lf_size(const uint8_t* data, size_t size);
 
 // A loose gamedata file (same path rules) that the game or its addons write at run time: user options, caches, logs,
 // `*_user.ltx`, `*.flag`. Two players with identical content have different copies of them, so they are not content

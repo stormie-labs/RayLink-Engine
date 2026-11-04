@@ -6,7 +6,9 @@ namespace dx10BufferUtils
 	HRESULT IC CreateBuffer(ID3DBuffer** ppBuffer, const void* pData, UINT DataSize, bool bImmutable, bool bIndexBuffer)
 	{
 		D3D_BUFFER_DESC desc;
-		desc.ByteWidth = DataSize;
+		// Anomaly Coop: a map server loads the models for their bones and the CPU copies of their vertices. What only a draw
+		// call reads is a stub: the object must exist (CreateGeom asserts on a null buffer), WARP would keep the rest in this process.
+		desc.ByteWidth = g_coop_headless ? _min(DataSize, 16u) : DataSize;
 		//desc.Usage = bImmutable ? D3D_USAGE_IMMUTABLE : D3D_USAGE_DEFAULT;
 		desc.Usage = D3D_USAGE_DEFAULT;
 		desc.BindFlags = bIndexBuffer ? D3D_BIND_INDEX_BUFFER : D3D_BIND_VERTEX_BUFFER;

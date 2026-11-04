@@ -14,6 +14,7 @@
 #include "coop_autosave.h"
 #include "coop_ai.h" // scheduler viewers
 #include "coop_levels.h" // F3a
+#include "coop_dedicated.h" // plan 12
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -215,6 +216,7 @@ void register_console_commands()
 	CMD3(CCC_String, "coop_nick", g_coop_nick, sizeof(g_coop_nick));
 	CMD4(CCC_Integer, "coop_friendly_fire", &g_coop_friendly_fire, 0, 1); // host setting
 	CMD4(CCC_Integer, "coop_diag_stacks", &g_coop_diag_stacks, 0, 1); // C++ stacks of coop::diag (stall 1-2 min)
+	CMD4(CCC_Integer, "coop_diag_fail_swap", &g_coop_diag_fail_swap, 0, 1); // a live check of a session lost while the world loads
 	CMD4(CCC_Integer, "coop_max_new_characters", &g_coop_max_new_characters, int(limits::kNewCharactersMin),
 	    int(limits::kNewCharactersMax)); // host setting (Ruling F2-10 b, F2 T3 fix round 1)
 	survival::register_console();
@@ -225,5 +227,7 @@ void register_console_commands()
 	presence::register_console();
 	npc_ai::register_console(); // scheduler viewers: coop_viewer_range, coop_viewer_frame_radius
 	levels::register_console(); // F3a: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit
+	mapserver_stats_register_console(); // F3a: coop_mapserver_stats
+	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
 }
 } // namespace coop

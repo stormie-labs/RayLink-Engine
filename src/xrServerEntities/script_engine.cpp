@@ -263,6 +263,11 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
         }
     }
 
+    // Anomaly Coop: in the log too: script_log goes nowhere in a release, the launcher's reports read "LUA error"
+    Msg("! LUA error [BusyHandsDebug]: %s", lua_error_line.c_str());
+    for (auto const& s : stack)
+        Msg("!   %s", s.c_str());
+
     ::luabind::functor<void> funct;
     if (ai().script_engine().functor("_G.COnLuaBindFatalError", funct))
         funct(lua_error_line.c_str());

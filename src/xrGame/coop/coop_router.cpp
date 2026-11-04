@@ -3,6 +3,7 @@
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_router.h"
+#include "coop_levels.h"
 #include "coop_manager.h"
 #include "xrCoop/coop_routes.h"
 
@@ -142,6 +143,11 @@ void read_file(const std::string& name)
 			if (g.errors++ < kErrorsLogged)
 				::Msg("! [coop] configs\\%s: %s", name.c_str(), e.c_str());
 	}
+	// F3a multilevel: the behaviour of online objects, the keys of two sections (routes::Table::level_behaviour)
+	for (const auto& line : section_lines(ini, "level_scripts"))
+		g.table.add_level_script(line.first);
+	for (const auto& line : section_lines(ini, "level_callbacks"))
+		g.table.add_level_callback(line.first);
 	// F2 T11: [binder_host], `script_binding = method, method`
 	if (ini.section_exist(routes::kBinderHostSection))
 	{
@@ -182,7 +188,9 @@ Domain route_of(std::string_view callback, const std::string& script)
 	const auto it = g.cache.find(key);
 	if (it != g.cache.end())
 		return it->second;
-	const Domain d = g.table.route(callback, script);
+	Domain d = g.table.route(callback, script);
+	if (d == Domain::Host && g.table.level_behaviour(callback, script))
+		d = Domain::Level; // runs where Host runs, and on a map server
 	if (g.cache.size() >= kCacheMax)
 	{
 		g.cache.clear();
@@ -196,7 +204,7 @@ Domain route_of(std::string_view callback, const std::string& script)
 bool runs_now(Domain d)
 {
 	const Manager& m = mgr();
-	return !m.active() || routes::runs_here(d, m.is_host());
+	return !m.active() || routes::runs_here(d, m.is_host(), levels::leads_my_level());
 }
 
 bool arg_string(lua_State* L, int idx, std::string_view& out)
@@ -394,7 +402,7 @@ void register_lua(lua_State* L)
 
 routes::BinderAction binder_action(const char* binding, BinderMethod method)
 {
-	if (!binding || !*binding || !mgr().is_client()) // the host and single player run the stock code
+	if (!binding || !*binding || !is_mirror()) // the host, single player and a map server run the stock code
 		return routes::BinderAction::Run;
 	const size_t i = size_t(method);
 	if (i >= routes::kBinderMethodCount)

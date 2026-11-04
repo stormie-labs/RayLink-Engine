@@ -187,6 +187,8 @@ void CEffect_Rain::OnFrame()
 #ifdef DEDICATED_SERVER
     return;
 #endif
+	if (g_coop_headless)
+		return; // Anomaly Coop: no drops to see, no sound to hear
 
 	// Parse states
 	float rain_density = g_pGamePersistent->Environment().CurrentEnv->rain_density;
@@ -263,6 +265,9 @@ extern float r_rain_k;
 void CEffect_Rain::UpdateItems()
 {
 	PROF_EVENT("CEffect_Rain::UpdateItems");
+	if (g_coop_headless)
+		return; // Anomaly Coop: and no ray casts for them
+
 	xrCriticalSectionGuard guard(&rainCS);
 
 	float factor = g_pGamePersistent->Environment().CurrentEnv->rain_density;

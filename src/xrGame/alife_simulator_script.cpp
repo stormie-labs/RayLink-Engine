@@ -23,6 +23,7 @@
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 #include "coop/coop_story.h" // Anomaly Coop (F2 T12 round 1): alife():give_info of our actor
 #include "coop/coop_manager.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_levels.h" // Anomaly Coop: an object online at a client
 #include "Actor.h" // Anomaly Coop (F2 T12 round 1): g_actor
 #include "InventoryOwner.h"
 
@@ -50,7 +51,7 @@ CALifeSimulator* alife()
 // line. While a host command is applied the class rules still hold (round 1: as before T12, never the stock create).
 static coop::calls::Gate coop_spawn_gate(const char* name, bool own, const Fvector* position, LPCSTR section)
 {
-	if (!coop::requests::lua_client())
+	if (!coop::requests::lua_mirror())
 		return coop::calls::Gate::Run;
 	coop::callgate::Args args;
 	args.pos = position;
@@ -246,7 +247,7 @@ u32 get_level_id(CALifeSimulator* self)
 
 CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_SPAWN_ID spawn_id)
 {
-	if (coop::requests::lua_client() && coop::callgate::client_gate_own("alife:create", false) != coop::calls::Gate::Run) return nullptr; // Anomaly Coop (F2 T12 gate): a spawn-graph object is a world spawn
+	if (coop::requests::lua_mirror() && coop::callgate::client_gate_own("alife:create", false) != coop::calls::Gate::Run) return nullptr; // Anomaly Coop (F2 T12 gate): a spawn-graph object is a world spawn
 	const CALifeSpawnRegistry::SPAWN_GRAPH::CVertex* vertex = ai().alife().spawns().spawns().vertex(spawn_id);
 	THROW2(vertex, "Invalid spawn id!");
 
@@ -261,7 +262,7 @@ CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_S
 
 CSE_Abstract* CALifeSimulator__spawn_item(CALifeSimulator* self, LPCSTR section, const Fvector& position, u32 level_vertex_id, GameGraph::_GRAPH_ID game_vertex_id)
 {
-	switch (coop_spawn_gate("alife:create", false, &position, section)) // Anomaly Coop (F2 T12 gate): no parent, a world spawn
+	switch (coop_spawn_gate("alife:create", coop::requests::local_zone(section), &position, section)) // Anomaly Coop (F2 T12 gate): no parent, a world spawn - except a personal map zone, which is made on the client alone
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_create(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1), true);
 	case coop::calls::Gate::Refuse: return nullptr;
@@ -289,7 +290,7 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline)
+	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop: no game object here, the client who holds it gets it as any spawn
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	NET_Packet packet;
@@ -332,7 +333,7 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline)
+	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent, false);
@@ -361,7 +362,7 @@ CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section,
 		}
 	}
 
-	if (!object || !object->m_bOnline)
+	if (!object || !object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
 	{
 		CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent);
 
@@ -404,7 +405,7 @@ ALife::_SPAWN_ID CALifeSimulator__spawn_id(CALifeSimulator* self, ALife::_SPAWN_
 
 void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 {
-	if (coop::requests::lua_client() && coop::requests::lua_release(object)) return; // Anomaly Coop: the host releases (F2 T12 gate inside)
+	if (coop::requests::lua_mirror() && coop::requests::lua_release(object)) return; // Anomaly Coop: the host releases (F2 T12 gate inside)
 	VERIFY(self);
 	//	self->release						(object,true);
 
@@ -413,6 +414,7 @@ void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 	CSE_ALifeObject* alife_object = smart_cast<CSE_ALifeObject*>(object);
 	THROW(alife_object);
 	if (!alife_object) return;
+	if (coop::requests::held_by_a_client("alife:release", object->ID)) return; // Anomaly Coop
 	if (!alife_object->m_bOnline)
 	{
 		self->release(object, true);

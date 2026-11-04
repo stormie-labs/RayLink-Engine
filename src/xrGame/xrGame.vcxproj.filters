@@ -1,6 +1,9 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
+    <Filter Include="coop">
+      <UniqueIdentifier>{31b15f0a-b418-47f4-ad13-ef3330c0fab5}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Coop">
       <UniqueIdentifier>{d17423ea-af5d-423d-ae1d-80b823432c03}</UniqueIdentifier>
     </Filter>
@@ -2502,6 +2505,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_dedicated.h">
+      <Filter>coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_monster_fx.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7496,6 +7502,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_dedicated.cpp">
+      <Filter>coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_monster_fx.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
@@ -7503,6 +7512,9 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_mapserver.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_mapserver_stats.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_levels_xfer.cpp">

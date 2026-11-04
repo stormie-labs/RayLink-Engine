@@ -2,6 +2,8 @@
 #include "coop_players.h"
 #include "coop_manager.h"
 #include "coop_join.h"
+#include "coop_levels.h"
+#include "coop_net.h"
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_entities.h"
@@ -131,6 +133,8 @@ bool capture(State& s)
 // Host: a client sent its own state.
 void host_on_player_state(PeerId from, Reader& r)
 {
+	if (!levels::on_host_level(from))
+		return; // F3a multilevel: his body is no object here, and his coordinates mean nothing on this level
 	r.u16(); // avatar id claimed by the client: ignored, the host knows who it is
 	State s;
 	if (!s.read(r))
@@ -147,7 +151,7 @@ void host_on_player_state(PeerId from, Reader& r)
 	Writer w(64);
 	w.u16(proxy);
 	s.write(w);
-	mgr().session().broadcast(Lane::Unreliable, Msg::PlayerState, w, from);
+	net::host_stream(Msg::PlayerState, w, from);
 }
 
 // Client: state of the host (avatar 0) or of another client (its proxy id), host numbering.
@@ -167,7 +171,7 @@ void client_on_player_state(PeerId, Reader& r)
 
 void on_player_state(PeerId from, Reader& r)
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_on_player_state(from, r);
 	else if (mgr().is_live_client())
 		client_on_player_state(from, r);
@@ -292,7 +296,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
-	const u16 avatar = mgr().is_host() ? join::proxy_of_peer(id) : world::avatar_of(id);
+	const u16 avatar = is_map_authority() ? join::proxy_of_peer(id) : world::avatar_of(id);
 	if (avatar != 0xffff)
 	{
 		instrument_forget(avatar);
@@ -307,6 +311,8 @@ void frame()
 		return;
 	instrument_frame();
 	equip_frame();
+	if (ghost_actor())
+		return; // nobody's state
 	const u64 now = mgr().now_ms();
 	if (now - g_last_send < kSendIntervalMs)
 		return;
@@ -319,7 +325,7 @@ void frame()
 	w.u16(mgr().is_host() ? u16(0) : join::my_proxy());
 	s.write(w);
 	if (mgr().is_host())
-		mgr().session().broadcast(Lane::Unreliable, Msg::PlayerState, w);
+		net::host_stream(Msg::PlayerState, w);
 	else
 		mgr().session().send(kHostPeer, Lane::Unreliable, Msg::PlayerState, w);
 	++g_sent;

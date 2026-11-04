@@ -510,6 +510,15 @@ void CTexture::Load()
 		return;
 	}
 
+	// Anomaly Coop: a map server loads no texture. The guard of the old path (xrRender/SH_Texture.cpp) was never brought here.
+	if (g_coop_headless)
+	{
+		PostLoad();
+		flags.bLoading = false;
+		flags.bLoaded = true;
+		return;
+	}
+
 	Preload();
 
 	bool bCreateView = true;

@@ -26,6 +26,7 @@
 //
 // Host, single player and a client before the host's world (its own world still runs while the host's downloads):
 // always Run, nothing counted. A client in the host's world (requests::lua_client: LoadingWorld, Live): calls::decide.
+// A map server answers the same, except that a call on an object of its level runs (calls::decide_leading).
 //   - Arguments that fail (a position that is not a number, an id this world does not have) are refused.
 //   - While the client applies a host command (an engine apply scope entities::ClientApply, or the host's story:
 //     story::applying) a call runs: it is the host's change (the event router still drops echoes, R4 4).

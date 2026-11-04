@@ -303,6 +303,13 @@ private:
 
 // ---------------------------------------------------------------- client
 
+// An IdLease of world epoch `sent` for a player in epoch `mine`. `was`: the epoch he left in a move of the host's that did not change his
+// world (0: none): what his map server sent before it heard of the move is on its way, and good.
+inline bool epoch_taken(uint32_t sent, uint32_t mine, uint32_t was)
+{
+	return sent == mine || (was != 0 && sent == was);
+}
+
 class ClientPool
 {
 public:
@@ -340,6 +347,9 @@ public:
 		}
 		return added;
 	}
+
+	// The host's move: the epoch moved, the world did not: what the pool has stays good.
+	void keep_epoch(uint32_t epoch) { m_epoch = epoch; }
 
 	// The next id, first in first out; kNoId when empty. A taken id is the caller's (a temporary object, a create).
 	uint16_t take()

@@ -296,6 +296,11 @@ void CALifeMonsterDetailPathManager::on_switch_offline()
 	m_path.clear();
 }
 
+void CALifeMonsterDetailPathManager::skip_time()
+{
+	m_last_update_time = ai().alife().time_manager().game_time();
+}
+
 Fvector CALifeMonsterDetailPathManager::draw_level_position() const
 {
 	if (path().empty())

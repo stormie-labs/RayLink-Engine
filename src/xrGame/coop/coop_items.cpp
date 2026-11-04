@@ -3,6 +3,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_trade.h"
@@ -803,7 +804,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 			ii->m_fCondition = dequant(d.cond);
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
-		if (d.has_upgrades && !mgr().is_host())
+		if (d.has_upgrades && !is_map_authority())
 			ii->m_upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
@@ -859,7 +860,7 @@ void send_state(CInventoryItem* item, const Blob& blob)
 {
 	Writer w(blob.size() + 48);
 	write_state(w, join::to_host(item->object_id()), item->object().cNameSect().c_str(), 0, blob);
-	if (mgr().is_host())
+	if (is_map_authority())
 		net::host_broadcast(Msg::ItemState, w);
 	else
 		net::client_send(Msg::ItemState, w);
@@ -879,7 +880,7 @@ void scan_local(bool send_all)
 	CActor* actor = Actor();
 	if (!actor || actor->getDestroy())
 		return;
-	const bool host = mgr().is_host();
+	const bool host = is_map_authority();
 	xr_set<u16> present;
 	Blob blob;
 	for (PIItem item : actor->inventory().m_all)
@@ -1640,7 +1641,7 @@ void on_item_state(PeerId from, Reader& r)
 	const Op op = Op(r.u8());
 	if (!r.ok())
 		return;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		// Precaching a freshly loaded world: states and unloads made in the old one are dropped
 		// (the pump runs before join::frame() marks the peers as joining).
@@ -1648,8 +1649,8 @@ void on_item_state(PeerId from, Reader& r)
 			return;
 		if (op == Op::State)
 			host_on_state(from, r);
-		else if (op == Op::SpawnAmmo)
-			host_on_spawn_ammo(from, r);
+		else if (op == Op::SpawnAmmo && levels::on_host_level(from))
+			host_on_spawn_ammo(from, r); // this message reaches the world server and the map server of his level: the boxes are made at his body
 	}
 	else if (mgr().is_client() && op == Op::State)
 	{
@@ -1704,7 +1705,7 @@ void frame()
 		scan_now = g_scan_now;
 		g_scan_now = false;
 	}
-	const bool host = mgr().is_host();
+	const bool host = is_map_authority();
 	const bool live_client = mgr().is_live_client();
 	if ((!host && !live_client) || !g_pGameLevel || !ai().get_alife())
 	{
@@ -1779,7 +1780,7 @@ void print_status()
 	      "%llu authority (%llu kept ours), %llu ignored, %u pending (%llu dropped)",
 	    s.sent, s.foreign_sent, s.spawns_sent, s.received, s.applied, s.authority_applied, s.authority_skipped,
 	    s.ignored, (u32)g_pending.size(), s.pending_dropped);
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		u32 stuck = 0;
 		for (const auto& it : g_owned)
@@ -1804,7 +1805,7 @@ void print_status()
 
 void client_resend_state(u16 local_id)
 {
-	if (!mgr().is_live_client() || local_id == kNoId)
+	if (!is_live_mirror() || local_id == kNoId)
 		return;
 	g_sent[local_id] = Blob(); // differs from any captured state: the next scan sends ours
 	std::lock_guard<std::mutex> lock(g_lock);
@@ -1823,7 +1824,7 @@ void touch(CInventoryItem* item)
 
 bool client_spawn_ammo(CWeapon* weapon, u32 box_curr, const char* ammo_sect, u32 parent_id)
 {
-	if (!weapon || !mgr().is_live_client() || weapon->m_ammoTypes.empty())
+	if (!weapon || !is_live_mirror() || weapon->m_ammoTypes.empty())
 		return false;
 	const char* sect = ammo_sect ? ammo_sect : weapon->m_ammoTypes[0].c_str();
 	u16 parent = kNoId;
@@ -1852,7 +1853,7 @@ bool client_spawn_ammo(CWeapon* weapon, u32 box_curr, const char* ammo_sect, u32
 
 bool client_keep_empty_box(CWeaponAmmo* box)
 {
-	if (!box || !mgr().is_live_client())
+	if (!box || !is_live_mirror())
 		return false;
 	std::lock_guard<std::mutex> lock(g_lock);
 	g_touched.push_back(box->ID());

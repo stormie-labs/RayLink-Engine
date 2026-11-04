@@ -37,7 +37,7 @@ game_PlayerState::game_PlayerState(NET_Packet* account_info)
 	}
 	else
 	{
-		if (g_dedicated_server)
+		if (g_dedicated_server && !g_coop_headless)
 		{
 			setFlag(GAME_PLAYER_FLAG_SKIP);
 		}

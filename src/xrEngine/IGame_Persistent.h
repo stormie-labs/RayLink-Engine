@@ -239,5 +239,11 @@ public:
 };
 
 extern ENGINE_API bool g_dedicated_server;
+// Anomaly Coop: -coop_mapserver, the windowless process of the game that leads a level on the host's PC. It sets
+// g_dedicated_server for what that saves (textures, level visuals, particles), but it runs the single player game with
+// ALife, Lua and the object logic, so the game's own paths read both flags (HEADLESS_AUDIT.md).
+extern ENGINE_API bool g_coop_headless;
+// Anomaly Coop: -coop_dedicated: that process with a console window, as the world server without a player (docs/DEDICATED_HOST.md).
+extern ENGINE_API bool g_coop_dedicated;
 extern ENGINE_API IGame_Persistent* g_pGamePersistent;
 #endif //IGame_PersistentH

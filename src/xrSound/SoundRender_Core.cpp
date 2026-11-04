@@ -24,16 +24,24 @@ float psSoundVFactor = 1.0f;
 float psSoundVMusic = 1.f;
 float psSoundVMusicFactor = 1.f;
 int psSoundCacheSizeMB = 256;
+bool psSoundSilent = false;
 
 float snd_efx_environment_change_time = 1.66f;
 
 CSoundRender_Core* SoundRender = nullptr;
 CSound_manager_interface* Sound = nullptr;
 
+// Anomaly Coop: nothing is decoded without a device: the cache only gives the sources' tables their line size.
+static u32 cache_size_kb()
+{
+	return u32(psSoundSilent ? 1 : psSoundCacheSizeMB) * 1024;
+}
+
 CSoundRender_Core::CSoundRender_Core()
 {
 	bPresent = FALSE;
 	bUserEnvironment = FALSE;
+	m_is_supported = false; // Anomaly Coop: LoadEffect says, and a silent core never calls it
 	geom_MODEL = NULL;
 	geom_ENV = NULL;
 	geom_SOM = NULL;
@@ -76,7 +84,7 @@ void CSoundRender_Core::_initialize(int stage)
 
 	// Cache
 	cache_bytes_per_line = (sdef_target_block / 8) * 276400 / 1000;
-	cache.initialize(psSoundCacheSizeMB * 1024, cache_bytes_per_line);
+	cache.initialize(cache_size_kb(), cache_bytes_per_line);
 
 	bReady = TRUE;
 
@@ -162,7 +170,7 @@ void CSoundRender_Core::env_unload()
 void CSoundRender_Core::_restart()
 {
 	cache.destroy();
-	cache.initialize(psSoundCacheSizeMB * 1024, cache_bytes_per_line);
+	cache.initialize(cache_size_kb(), cache_bytes_per_line);
 	env_apply();
 }
 

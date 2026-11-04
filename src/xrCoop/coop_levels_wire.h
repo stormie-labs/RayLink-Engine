@@ -113,12 +113,14 @@ inline bool read_tail(Reader& r, std::vector<uint8_t>& out, size_t max)
 
 // ---------------------------------------------------------------- LevelMap (0x01D0, world server -> players and map servers)
 
-// Wire: u8 flags, u8 n, n x {u32 peer, u16 level, u8 role}, u8 m, m x {u16 level, u8 server, u8 state},
+// Wire: u8 flags, u8 n, n x {u32 peer, u16 level, u8 in_world, u16 proxy, u32 money}, u8 m, m x {u16 level, u8 server, u8 state},
 //       u8 g, g x {u16 level, u8 gate, str reason}.
-// A player row says on which level a player stands (kNoLevel while he loads); `role` is the Hello role of the node (0 a player,
-// 1 a map server). A server row says who leads a level: the host's process (at most one) or a map server, and its state. A gate
-// row is the world server's verdict on entering a level (the Gate of coop_levels_rules.h: 0 .. kLastGate) and the string id of
-// the placard that says why; the game sends the levels whose gate is not open.
+// A player row says on which level a player stands or is on his way to (kNoLevel: on none), whether he finished loading it and
+// which character he plays and what his balance is (protocol 20: a map server takes its virtual peers from these rows, and judges
+// a trade by that balance: the book is the world server's). A server row says who leads a
+// level: the host's process (at most one) or a map server, and its state. A gate row is the world server's verdict on entering a
+// level (the Gate of coop_levels_rules.h: 0 .. kLastGate) and the string id of the placard that says why; the game sends the
+// levels whose gate is not open.
 struct LevelMapMsg
 {
 	enum Flags : uint8_t
@@ -136,7 +138,9 @@ struct LevelMapMsg
 	{
 		uint32_t peer = 0;
 		uint16_t level = kNoLevel;
-		uint8_t role = kHelloRolePlayer;
+		uint8_t in_world = 0;
+		uint16_t proxy = kNoObject;
+		uint32_t money = 0;
 	};
 	struct Server
 	{
@@ -173,7 +177,9 @@ struct LevelMapMsg
 		{
 			w.u32(p.peer);
 			w.u16(p.level);
-			w.u8(p.role);
+			w.u8(p.in_world);
+			w.u16(p.proxy);
+			w.u32(p.money);
 		}
 		w.u8(uint8_t(servers.size()));
 		for (const Server& sv : servers)
@@ -205,8 +211,10 @@ struct LevelMapMsg
 			Player p;
 			p.peer = r.u32();
 			p.level = r.u16();
-			p.role = r.u8();
-			if (!r.ok() || !detail::slot_ok(p.peer) || p.role > kHelloRoleMapServer)
+			p.in_world = r.u8();
+			p.proxy = r.u16();
+			p.money = r.u32();
+			if (!r.ok() || !detail::slot_ok(p.peer) || p.in_world > 1)
 				return false;
 			for (const Player& seen : tmp.players)
 				if (seen.peer == p.peer)
@@ -273,7 +281,7 @@ struct LevelMoveMsg
 	uint8_t kind = Exit;
 	uint16_t changer = kNoObject; // Exit
 	uint16_t graph = kNoObject; // Trip: the game graph vertex
-	uint32_t node = kNoNode; // Trip: the level vertex
+	uint32_t node = kNoNode; // Trip: the level vertex; kNoNode: the sender could not tell, a vertex of another level
 	float pos[3] = {0.f, 0.f, 0.f}; // Trip
 	float dir[3] = {0.f, 0.f, 0.f}; // Trip
 
@@ -312,7 +320,7 @@ struct LevelMoveMsg
 			tmp.node = r.u32();
 			r.vec3(tmp.pos);
 			r.vec3(tmp.dir);
-			if (!r.ok() || tmp.graph == kNoObject || tmp.node == kNoNode)
+			if (!r.ok() || tmp.graph == kNoObject)
 				return false;
 			for (int i = 0; i < 3; ++i)
 				if (!detail::finite_coord(tmp.pos[i]) || !detail::finite_coord(tmp.dir[i]))
@@ -447,6 +455,12 @@ struct LevelEntityHead
 		Died = 2,
 		State = 3,
 		Item = 4,
+		Spawn = 5, // an object it made under its ids: the layout of EntitySpawn
+		Report = 6, // what it writes in the buckets LevelResync asked for: the layout of LevelReportBody
+		Money = 7, // a deal of a player of its level: u32 peer, u64 delta (two's complement), u8 1 for a trade
+		Tent = 8, // a tent or sleeping bag it put up for a player of its level, after its Spawn: u16 tent, u16 character
+		Stash = 9, // the stash of a retiring player of its level (OpStash) is over, after the Parent of his things: u16 character, u8 1: things stay on him
+		Logic = 10, // what the binder of a static object of its level would save: the layout of LevelLogicBody
 	};
 
 	uint8_t op = Destroy;
@@ -456,11 +470,131 @@ struct LevelEntityHead
 	bool read(Reader& r)
 	{
 		op = r.u8();
-		if (!r.ok() || op > Item)
+		if (!r.ok() || op > Logic)
 		{
 			*this = LevelEntityHead();
 			return false;
 		}
+		return true;
+	}
+};
+
+// The tail of LevelEntity State: what the authority of a level sees of a player's body and the world server does not, he is no object
+// there. `place` is checkpoints::sources::Place, `source` the object of that place.
+struct LevelBodyFacts
+{
+	uint8_t fight = 0;
+	uint8_t talking = 0; // he holds a talk lock there
+	uint8_t place = 0;
+	uint16_t source = kNoObject;
+
+	void write(Writer& w) const
+	{
+		w.u8(fight);
+		w.u8(talking);
+		w.u8(place);
+		w.u16(source);
+	}
+
+	bool read(Reader& r)
+	{
+		LevelBodyFacts tmp;
+		tmp.fight = r.u8();
+		tmp.talking = r.u8();
+		tmp.place = r.u8();
+		tmp.source = r.u16();
+		if (!r.ok())
+		{
+			*this = LevelBodyFacts();
+			return false;
+		}
+		*this = tmp;
+		return true;
+	}
+};
+
+// The body of LevelEntity Report. Wire: u32 buckets, u16 n, n x {u16 id, u32 gen}. What the auditor compares with the ledger
+// (coop_xfer.h audit): every object of those buckets that the sender writes, the gen he holds it under.
+struct LevelReportBody
+{
+	static constexpr size_t kMaxRows = 4096;
+	struct Row
+	{
+		uint16_t id = kNoObject;
+		uint32_t gen = 0;
+	};
+	uint32_t buckets = 0;
+	std::vector<Row> rows;
+
+	[[nodiscard]] bool write(Writer& w) const
+	{
+		if (rows.size() > kMaxRows)
+			return false;
+		w.u32(buckets);
+		w.u16(uint16_t(rows.size()));
+		for (const Row& row : rows)
+		{
+			w.u16(row.id);
+			w.u32(row.gen);
+		}
+		return true;
+	}
+
+	bool read(Reader& r)
+	{
+		*this = LevelReportBody();
+		LevelReportBody tmp;
+		tmp.buckets = r.u32();
+		const uint16_t n = r.u16();
+		if (!r.ok() || n > kMaxRows)
+			return false;
+		tmp.rows.resize(n);
+		for (Row& row : tmp.rows)
+		{
+			row.id = r.u16();
+			row.gen = r.u32();
+		}
+		if (!r.ok())
+			return false;
+		*this = std::move(tmp);
+		return true;
+	}
+};
+
+// The body of LevelEntity Logic (xrCoop/coop_levels_logic.h). Wire: u16 id, u16 n, n bytes: the client_data of its entity, as
+// CGameObject::net_Save writes it. Never empty: that would clear what the world server has.
+struct LevelLogicBody
+{
+	static constexpr size_t kMaxBytes = 8 * 1024; // the stock's max_objects_size_in_save: an object of a save has 16 KiB with its spawn data
+	uint16_t id = kNoObject;
+	std::vector<uint8_t> bytes;
+
+	bool fits() const { return id != kNoObject && !bytes.empty() && bytes.size() <= kMaxBytes; }
+
+	[[nodiscard]] bool write(Writer& w) const
+	{
+		if (!fits())
+			return false;
+		w.u16(id);
+		w.u16(uint16_t(bytes.size()));
+		w.bytes(bytes.data(), bytes.size());
+		return true;
+	}
+
+	bool read(Reader& r)
+	{
+		*this = LevelLogicBody();
+		LevelLogicBody tmp;
+		tmp.id = r.u16();
+		const uint16_t n = r.u16();
+		if (!r.ok() || n > kMaxBytes || n > r.remaining())
+			return false;
+		tmp.bytes.resize(n);
+		if (n && !r.bytes(tmp.bytes.data(), n))
+			return false;
+		if (!tmp.fits())
+			return false;
+		*this = std::move(tmp);
 		return true;
 	}
 };
@@ -731,14 +865,17 @@ struct LevelResyncMsg
 
 // Wire: u32 peer, u8 flags, u16 len, packet[len]. The packet is a whole game message (its 2-byte type first) of a player of the
 // map server's level: toward the map server it is what the player sent, toward the host's process what the map server sends to
-// him (flag AllOnMap: to every player of the map, `peer` unused). `peer` is a session slot. A Tunnel carries a game message
-// only: not a session message and not another Tunnel. The length is the rest of the packet.
+// him (flag AllOnMap: to every player of the map, `peer` unused). `peer` is a session slot. Two flags say on which lane the host's
+// process sends it on (protocol 20; neither: Reliable). A Tunnel carries a game message only: not a session message and not another
+// Tunnel. The length is the rest of the packet.
 struct TunnelMsg
 {
 	enum Flags : uint8_t
 	{
 		AllOnMap = 1,
-		Known = AllOnMap,
+		LaneUnreliable = 2,
+		LaneBulk = 4,
+		Known = AllOnMap | LaneUnreliable | LaneBulk,
 	};
 
 	uint32_t peer = 0;
@@ -775,7 +912,8 @@ struct TunnelMsg
 		packet.clear();
 		// the peer is a session slot, unless the packet is for everybody on the map (then it is unused)
 		const bool peer_ok = (flags & AllOnMap) != 0 || detail::slot_ok(peer);
-		if (!r.ok() || (flags & ~uint8_t(Known)) != 0 || !peer_ok || len < 2 || r.remaining() != len)
+		const bool one_lane = (flags & (LaneUnreliable | LaneBulk)) != (LaneUnreliable | LaneBulk);
+		if (!r.ok() || (flags & ~uint8_t(Known)) != 0 || !one_lane || !peer_ok || len < 2 || r.remaining() != len)
 		{
 			*this = TunnelMsg();
 			return false;
@@ -871,10 +1009,13 @@ struct MapServerOrderMsg
 
 // ---------------------------------------------------------------- LoadWait (0x01DE), LoadReady (0x01DF)
 
-// LoadWait wire: u8 state, u32 epoch, u16 level, u8 n, n x {u32 peer, u8 ready}. The barrier of a simultaneous load, as the world
-// server tells a player on his loading screen: Prepared (the world of this epoch is ready to be loaded: the save follows as a
+// LoadWait wire: u8 state, u32 epoch, u16 level, u8 reason, u8 n, n x {u32 peer, u8 ready}. The barrier of a simultaneous load, as the
+// world server tells a player on his loading screen: Prepared (the world of this epoch is ready to be loaded: the save follows as a
 // blob), Waiting (who is ready now), Enter (everybody is: leave the screen), Cancel (the load is off). `level` is the level
-// of the epoch.
+// of the epoch; `reason` says why a player loads: the group goes (Group), or the host went to `level` alone and this player stays where
+// he is, a world starts over under him (HostAlone).
+// The host's move that nobody notices (coop_soft_move.h), to who stays in his world, a player or a map server: Away (the world server is
+// gone until Back: nothing it should do will be done for a while, and it hears nothing), Back (it is there again).
 struct LoadWaitMsg
 {
 	enum State : uint8_t
@@ -883,6 +1024,13 @@ struct LoadWaitMsg
 		Waiting = 1,
 		Enter = 2,
 		Cancel = 3,
+		Away = 4,
+		Back = 5,
+	};
+	enum Reason : uint8_t
+	{
+		Group = 0,
+		HostAlone = 1,
 	};
 	struct Row
 	{
@@ -894,6 +1042,7 @@ struct LoadWaitMsg
 	uint32_t epoch = 0;
 	uint16_t level = kNoLevel;
 	std::vector<Row> rows;
+	uint8_t reason = Group;
 
 	// A row for each player of the session at the most.
 	bool fits() const { return rows.size() <= kMaxPlayers; }
@@ -906,6 +1055,7 @@ struct LoadWaitMsg
 		w.u8(state);
 		w.u32(epoch);
 		w.u16(level);
+		w.u8(reason);
 		w.u8(uint8_t(rows.size()));
 		for (const Row& row : rows)
 		{
@@ -922,8 +1072,9 @@ struct LoadWaitMsg
 		tmp.state = r.u8();
 		tmp.epoch = r.u32();
 		tmp.level = r.u16();
+		tmp.reason = r.u8();
 		const uint8_t n = r.u8();
-		if (!r.ok() || tmp.state > Cancel || n > kMaxPlayers)
+		if (!r.ok() || tmp.state > Back || tmp.reason > HostAlone || n > kMaxPlayers)
 			return false;
 		for (uint8_t i = 0; i < n; ++i)
 		{

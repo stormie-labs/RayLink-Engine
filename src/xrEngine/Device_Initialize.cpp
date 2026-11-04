@@ -71,7 +71,8 @@ PROTECT_API void CRenderDevice::Initialize()
 		AdjustWindowRect(&rc, m_dwWindowStyle, FALSE);
 
 		// Create the render window
-		m_hWnd = CreateWindowEx(WS_EX_TOPMOST,
+		// Anomaly Coop: a map server's window is never shown, and these keep it out of the taskbar and of the focus even so
+		m_hWnd = CreateWindowEx(g_coop_headless ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : WS_EX_TOPMOST,
 		                        wndclass, "S.T.A.L.K.E.R.: Anomaly - " RAYLINK_ENGINE_VERSION, m_dwWindowStyle,
 		                        /*rc.left, rc.top, */CW_USEDEFAULT, CW_USEDEFAULT,
 		                        (rc.right - rc.left), (rc.bottom - rc.top), 0L,

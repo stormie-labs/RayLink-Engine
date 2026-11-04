@@ -295,6 +295,39 @@ struct Choice
 	float pos[3];
 };
 
+// A player on a level his slot says nothing of: he came alone, the group's level change (host_on_level_change) did not count
+// him. Where he is first seen alive there is his arrival point, or a death on that level comes back where the body lies.
+inline bool needs_arrival(const Slot& s, const std::string& level)
+{
+	return !level.empty() && !(s.cur.valid() && s.cur.level == level) && !(s.prev.valid() && s.prev.level == level);
+}
+
+// The host's level change writes the arrival of who goes with him. With split levels who stays keeps his camps: a respawn looks
+// for a record on HIS level, an arrival on the host's would push it out and leave him the place of his body. `seat`: his level in the
+// table (a trip of the whole group seats everybody before the save), kNoSeat = none, nothing tells him apart from the group;
+// `stays`: the move leaves him in his world (softmove::stays).
+constexpr uint16_t kNoSeat = 0xffff;
+inline bool rides_with_host(bool split, bool stays, uint16_t seat, uint16_t target)
+{
+	return !split || (!stays && (seat == kNoSeat || seat == target));
+}
+
+// Where the record of a story checkpoint comes from. `elsewhere`: a map server leads his level, there is no object of his here.
+enum class StoryFrom : uint8_t
+{
+	Nothing,
+	Object,
+	Body,
+};
+inline StoryFrom story_from(bool living, bool elsewhere, bool object_here)
+{
+	if (!living)
+		return StoryFrom::Nothing;
+	if (elsewhere)
+		return StoryFrom::Body;
+	return object_here ? StoryFrom::Object : StoryFrom::Nothing;
+}
+
 // Where a player comes back to life on `level`: the current record, else the previous one, else the anchor, else the
 // arrival point, else where the body lies. `anchor` and `arrival` may be null. The anchor is the player's first living
 // position that the host recorded for them (HostRec), not the story spawn point of the level.

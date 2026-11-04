@@ -5,6 +5,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h" // F3a: a map server's deal goes to the world server
 #include "coop_sync.h"
 #include "coop_entities.h"
 #include "coop_events.h"
@@ -280,6 +281,7 @@ void send_balance(PeerId to, u32 balance, const ledger::MoneyNote& note = ledger
 	Writer w(ledger::kMoneyBalanceSize);
 	ledger::write(w, m);
 	net::host_send(to, Msg::MoneyBalance, w); // queued while he loads the world
+	levels::host_map_changed(); // his map server judges his next deal by the LevelMap (host_balance): now, not at the next 5 s
 }
 
 enum class Source : u8
@@ -340,6 +342,8 @@ ledger::Receiver receiver_of(PeerId to)
 {
 	ledger::Receiver r;
 	r.peer = to;
+	if (to == kHostPeer && !mgr().session().local())
+		return r; // a dedicated host: nobody plays there, the money would go to its ghost
 	if (to != kHostPeer)
 	{
 		const PeerInfo* p = mgr().session().peer(to);
@@ -389,7 +393,8 @@ void host_on_req(PeerId from, Reader& r)
 		send_balance(from, balance, ledger::note_gap(g_book.acked(from) + 1, skipped));
 	}
 	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's (F2-1).
-	const bool talking = dialog::host_lock_of(from) != kNoId;
+	levels::BodyFacts there; // on a map server's level the talk lock is its authority's
+	const bool talking = dialog::host_lock_of(from) != kNoId || (levels::body_facts(join::proxy_of_peer(from), there) && there.talking);
 	const ledger::Decision d =
 	    g_book.on_request(from, character_key_of(holder), q, balance, talking, to, policy(), mgr().now_ms());
 	if (d.stale)
@@ -655,10 +660,11 @@ int l_money_give(lua_State* L)
 	return mgr().is_host() ? host_player_give(L, to, u32(amount)) : client_give(L, to, u32(amount));
 }
 
-// coop.money_grant(peer, amount) -> ok, why: host; a negative amount takes money (never below 0).
+// coop.money_grant(peer, amount) -> ok, why: the authority of a level; a map server's goes to the book of the world (host_adjust). A negative
+// amount takes money (never below 0).
 int l_money_grant(lua_State* L)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return refuse(L, "host only");
 	PeerId peer = kInvalidPeer;
 	s64 amount = 0;
@@ -712,11 +718,19 @@ int l_money_set_rules(lua_State* L)
 	return done(L);
 }
 
-// coop.money_of(peer) -> RU | nil: host.
+// coop.money_of(peer) -> RU | nil: host; on a map server what the world server's table says of a player of its level.
 int l_money_of(lua_State* L)
 {
 	PeerId peer = kInvalidPeer;
 	u32 balance = 0;
+	if (is_map_server())
+	{
+		if (arg_peer(L, 1, peer) && join::proxy_of_peer(peer) != kNoId)
+			lua_pushnumber(L, lua_Number(host_balance(peer)));
+		else
+			lua_pushnil(L);
+		return 1;
+	}
 	const u16 holder = mgr().is_host() && arg_peer(L, 1, peer) ? holder_of(peer) : kNoId;
 	if (holder != kNoId && read_balance(holder, balance))
 		lua_pushnumber(L, lua_Number(balance));
@@ -868,8 +882,22 @@ float upgrade_min_percent() { return g_upgrade_min_percent; }
 
 bool scripted_upgrades() { return g_scripted_upgrades; }
 
+// F3a: the book is the world server's. A map server judges a deal by the last balance the world server's LevelMap named, and what the
+// deal changes goes up at once (coop_levels_xfer.cpp LevelEntity Money); the player's MoneyBalance comes from the world server.
+namespace
+{
+xr_map<PeerId, u32> g_server_balances;
+}
+
+void server_balance(PeerId peer, u32 balance) { g_server_balances[peer] = balance; }
+
 u32 host_balance(PeerId peer)
 {
+	if (is_map_server())
+	{
+		const auto it = g_server_balances.find(peer);
+		return it == g_server_balances.end() ? 0 : it->second;
+	}
 	u32 balance = 0;
 	const u16 holder = mgr().is_host() ? holder_of(peer) : kNoId;
 	return holder != kNoId && read_balance(holder, balance) ? balance : 0;
@@ -879,6 +907,13 @@ bool host_adjust(PeerId peer, s64 delta, const char* why)
 {
 	// Fix round 1: trades are counted apart from grants (coop_trade passes "trade").
 	const bool trade = why && !xr_strcmp(why, "trade");
+	if (is_map_server())
+	{
+		levels::up_money(peer, delta, trade);
+		u32& balance = g_server_balances[peer];
+		balance = u32(_max<s64>(0, s64(balance) + delta));
+		return true;
+	}
 	return adjust(peer, delta, why, trade ? Source::Trade : Source::Grant);
 }
 
@@ -925,6 +960,11 @@ bool host_set(PeerId peer, u32 amount, const char* why)
 
 void host_send_balance(PeerId peer)
 {
+	if (is_map_server())
+	{
+		levels::up_money(peer, 0, false); // the book is the world server's: a change of nothing makes it send his balance
+		return;
+	}
 	u32 balance = 0;
 	const u16 holder = mgr().is_host() ? holder_of(peer) : kNoId;
 	if (holder != kNoId && read_balance(holder, balance))

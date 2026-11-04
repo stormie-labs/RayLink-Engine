@@ -540,7 +540,7 @@ BOOL CSpectator::net_Spawn(CSE_Abstract* DC)
 void CSpectator::net_Destroy()
 {
 	inherited::net_Destroy();
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 		Level().MapManager().OnObjectDestroyNotify(ID());
 }
 

@@ -66,6 +66,8 @@ public:
 	//	Variables section
 #if defined(USE_DX11)	//	USE_DX10
 public:
+	void CreateHeadless(); // Anomaly Coop: the device of a map server (-coop_mapserver)
+
     IDXGIFactory2*          m_pFactory; //  DXGI factory
 	IDXGIAdapter1*			m_pAdapter;	//	pD3D equivalent
 	IDXGIOutput*			m_pOutput;	//	the output we render to (belongs to m_pAdapter)

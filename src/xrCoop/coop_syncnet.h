@@ -312,6 +312,19 @@ struct Cast
 	Value args;
 };
 
+// coop.sync.broadcast: the authority of a level tells its players. The world server, and a map server, which for the world is a client
+// (client() is true there) and for its level the host. A player has nobody to tell.
+inline bool may_broadcast(bool client, bool map_authority) { return !client || map_authority; }
+
+// A cast bound to a level, as a point always is: a point means nothing on another level, though a body's record there may lie near
+// the same numbers. `wanted`: the level the script names (a far view), kNoCastLevel = the level of this process; `his`: where the
+// player stands, kNoCastLevel = not known; `on_mine`: he stands on the level of this process.
+constexpr uint16_t kNoCastLevel = 0xffff;
+inline bool cast_reaches(uint16_t wanted, uint16_t his, bool on_mine)
+{
+	return wanted == kNoCastLevel || his == kNoCastLevel ? on_mine : his == wanted;
+}
+
 namespace detail
 {
 inline void write_name(Writer& w, const std::string& name)

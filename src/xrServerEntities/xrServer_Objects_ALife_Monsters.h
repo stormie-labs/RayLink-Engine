@@ -563,6 +563,7 @@ public:
 	MEMBER* member(ALife::_OBJECT_ID member_id, bool no_assert = false);
 	virtual void on_before_register();
 	void on_after_game_load();
+	bool coop_bind_members(bool forget);
 	virtual bool synchronize_location();
 	virtual void try_switch_online();
 	virtual void try_switch_offline();

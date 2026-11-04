@@ -9,6 +9,7 @@
 #include "stdafx.h"
 #include "coop/coop_join.h" // Anomaly Coop: the private join cache is not the player's last save
 #include "coop/coop_sync.h"
+#include "coop/coop_levels.h" // F3a multilevel: an object online at a client
 #include "coop/coop_checkpoints.h" // F3: arrival checkpoints on a level change
 #include "coop/coop_autosave.h" // F3: the host's autosave name on a level change
 #include "alife_update_manager.h"
@@ -105,9 +106,13 @@ void CALifeUpdateManager::update_switch()
 
 void CALifeUpdateManager::update_scheduled(bool init_ef)
 {
-	// Anomaly Coop: a client has no simulation of its own, the host's world is mirrored
+	// Anomaly Coop: a client has no simulation of its own, the host's world is mirrored. A map server runs what it holds and no
+	// commander's binder updates; everything else offline is the world server's.
 	if (coop::sync::alife_frozen())
+	{
+		coop::levels::xfer_scheduled();
 		return;
+	}
 
 	if (init_ef)
 		init_ef_storage();
@@ -456,6 +461,7 @@ void CALifeUpdateManager::teleport_object(ALife::_OBJECT_ID id, GameGraph::_GRAP
 	}
 #endif
 
+	if (coop::levels::online_at_server(id)) return; // Anomaly Coop: a client computes it; a story teleport waits until it comes home
 	if (object->m_bOnline)
 		switch_offline(object);
 	graph().change(object, object->m_tGraphID, game_vertex_id);

@@ -61,6 +61,9 @@ struct SessionConfig
 	std::string nick;
 	uint32_t connect_timeout_ms = 10000; // client: transport + handshake deadline
 	uint32_t peer_timeout_ms = 15000; // silence before a peer is dropped
+	// F3a: who connects (client): a player, or a map server of the host's PC with the token of its command line.
+	uint8_t hello_role = kHelloRolePlayer;
+	std::array<uint8_t, kHelloTokenSize> hello_token{};
 };
 
 // Per message type counters (P9 / R-12.4).
@@ -106,6 +109,7 @@ public:
 	void update(uint64_t now_ms);
 
 	Role role() const;
+	uint16_t listen_port() const; // host: the port it listens on
 	PeerId self() const; // host: 0; client: slot from Welcome, kInvalidPeer before
 	bool is_active() const; // host listening, or client joined
 	std::vector<PeerInfo> peers() const; // host: all clients; client: host + list from PeerList
@@ -131,6 +135,69 @@ public:
 	// hosting leaves it alone; a session that ends empties its queues. The link must outlive the session or be detached.
 	void attach_local(LocalLink* link);
 	LocalLink* local() const;
+
+	// F3a, the bridges (plan §1.3, xrCoop/coop_mapserver_rules.h). A map server is a process of the host's PC that connects with
+	// Hello role MapServer: taken from the loopback only and with a token issued here, once. It takes no player slot: its peer id is
+	// bridge_peer(k), it is in no peers() and no players(), it may send MsgSender::TrunkOnly (nobody else may) and no rate limit or
+	// in-filter applies to it. send(), send_blob() and kick() take its id like a player's; broadcast() reaches it with what
+	// bridge_takes admits. Host only.
+	void issue_bridge(uint32_t k, const std::array<uint8_t, kHelloTokenSize>& token);
+	void revoke_bridge(uint32_t k); // a token nobody used goes: its process was given up on
+	std::vector<PeerId> bridges() const; // the connected ones
+	bool bridge_connected(PeerId id) const;
+
+	// F3a: the host's last word on a game message that passed everything else (sender, epoch, rate): false drops it, quietly (the
+	// filter may have sent it on, coop_trunk.cpp). `packet` is the whole message, the 2-byte type first. Null: every message goes
+	// on. Kept across sessions, like the handlers.
+	using InFilter = bool (*)(PeerId from, Msg type, Lane lane, const uint8_t* packet, size_t size);
+	void set_in_filter(InFilter filter);
+
+	// F3a, the host's move that nobody else notices (xrCoop/coop_soft_move.h, docs/SPLIT_LEVELS.md §7a). Host only, main thread.
+	// soft_park: from now on the connections of these players and map servers are parked. What they send waits, in order, untouched by
+	// anything here (the world it would change is about to go), and the transport's helper thread is the road between them: the
+	// traffic of the level runs with the main thread away. What goes to them from here is dropped: it is of the world that goes. The
+	// session's world epoch moves under them without a word: nobody of them learns of it, and nothing of theirs is stale.
+	// soft_keep_out: the new world exists, what goes to them from here on is of the world they will live in: it waits too.
+	// soft_release: the road closes, what waited to go out goes, what they sent runs (a limited number per update, they stay behind it).
+	struct SoftPlayer
+	{
+		PeerId peer = kInvalidPeer;
+		uint16_t level = 0;
+	};
+	struct SoftServer
+	{
+		PeerId bridge = kInvalidPeer;
+		uint16_t level = 0;
+	};
+	struct SoftStats
+	{
+		uint64_t to_servers = 0, to_players = 0; // through the road
+		uint64_t road_dropped = 0; // the road had nobody to give it to
+		uint64_t parked = 0; // what waited for the main thread here
+		uint64_t held_out = 0, dropped_out = 0; // what the world sent the parked: kept for them, dropped
+		size_t inbox_max = 0, inbox_bytes_max = 0;
+		bool road_overflowed = false;
+	};
+	void soft_park(const std::vector<SoftPlayer>& players, const std::vector<SoftServer>& servers);
+	void soft_keep_out();
+	void soft_release();
+	bool soft_parked(PeerId id) const;
+	bool soft_replaying() const; // soft_release was called, what they said has not all run yet
+	void limit_events_per_update(int events); // what one update reads of the transport (the tests)
+	SoftStats soft_stats() const;
+
+	// F3a, a map server (plan §1.3): two sessions in one process. `world` is its connection to the host's process, a client of the
+	// world; this session is the host of its level with no transport of its own. Its peers are virtual: the players of the level, in
+	// the world server's numbering, whom the world server's LevelMap names. What is sent to one goes up `world` in a Msg::Tunnel, what
+	// a player sent comes down in one and runs here as a remote client's message (virtual_receive, the same checks, the same world
+	// gate), so the host's code of a level is the same code on a map server. send(kHostPeer) and what a session does for a client
+	// (the epoch, the hold of the link, the silence of the host) go to `world`; self() is the bridge. `world` must outlive this one.
+	bool host_virtual(const SessionConfig& cfg, Session& world, std::string* err);
+	bool is_virtual() const;
+	void virtual_join(PeerId id, const std::string& nick); // on_peer_joined follows
+	void virtual_leave(PeerId id, const std::string& reason); // on_peer_left follows
+	// A game message of player `from` out of a Tunnel (the 2-byte type first). Dropped if he is no virtual peer here.
+	void virtual_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size);
 
 	// Sends payload as message `type`. Host: to any client, and to the host player (0) over an attached LocalLink.
 	// Client: only to kHostPeer.
@@ -204,6 +271,8 @@ public:
 	// --- callbacks (all optional) ---
 	std::function<void(const PeerInfo&)> on_peer_joined; // host: client accepted; client: other player joined
 	std::function<void(PeerId, const std::string& reason)> on_peer_left;
+	std::function<void(PeerId)> on_bridge_joined; // host: a map server connected (Session::issue_bridge)
+	std::function<void(PeerId, const std::string& reason)> on_bridge_left; // host: its connection is gone
 	std::function<void(const WelcomeMsg&)> on_welcome; // client: accepted by host
 	std::function<void(const RejectMsg&, const ManifestDiff&)> on_rejected; // client
 	std::function<void(const std::string& reason)> on_disconnected; // client: lost host / closed

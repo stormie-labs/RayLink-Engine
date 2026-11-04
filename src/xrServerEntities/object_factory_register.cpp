@@ -189,6 +189,7 @@
 
 #ifndef NO_XR_GAME
 extern ENGINE_API bool g_dedicated_server;
+extern ENGINE_API bool g_coop_headless;
 #	define ADD(a,b,c,d)			add<a,b>(c,d)
 #	define ADD_MP(a,b,c,d,e,f)	add(xr_new<CObjectItemClientServerSingleMp<a,b,c,d> >(e,f))
 #else
@@ -435,7 +436,7 @@ void CObjectFactory::register_classes()
 	// because we do not have scripts
 	// and script functionality is not
 	// needed here
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless) // Anomaly Coop: a map server has the scripts, they register these clsids
 		return;
 
 	ADD(CElectricBall, CSE_ALifeItemArtefact, TEXT2CLSID("SCRPTART"), "artefact_s");

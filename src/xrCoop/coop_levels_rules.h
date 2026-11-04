@@ -3,7 +3,7 @@
 // server (Mk) leads every other level that has players. This header is the pure part of that, with no engine in it:
 //   - Gate / effective_gate   how a level is entered (free, better together, together) and how the two game rules
 //                             coop_split_levels and coop_story_together fold into it;
-//   - Table                   who sits on which level: who leads a level, whom its messages reach, who sees what;
+//   - Table                   who sits on which level: which process leads a level, whom its messages reach, who sees what;
 //   - decide_move             the verdict on a player's move: go, wait at the board, refused (the map-server cap);
 //   - ServerLife              the life of one map server: when to launch it, when to stop it (the pause, "linger");
 //   - FlushRound              the round in which every map server sends a full snapshot before a save.
@@ -159,6 +159,15 @@ public:
 		return n;
 	}
 
+	// Everybody who plays, `but` apart, stands on `level` already: nobody is left to wait for on the way in.
+	bool all_on(uint16_t level, uint32_t but) const
+	{
+		for (const Seat& s : seats_)
+			if (s.plays && s.peer != but && s.level != level)
+				return false;
+		return true;
+	}
+
 	// The count a map server of `level` is told with ServerLife::players: its players, 0 when the level has no map server
 	// (the host's process leads it, or nobody does).
 	uint32_t map_players(uint16_t level) const { return server_of(level) == Server::MapServer ? population(level) : 0; }
@@ -247,7 +256,7 @@ enum class ServerState : uint8_t
 	Lost, // the process died or hung: the world server resolves its journal, a new one starts if players wait
 };
 
-constexpr uint32_t kStartTimeoutMs = 120000; // a process that is not Ready by then is given up on
+constexpr uint32_t kStartTimeoutMs = 240000; // a process that is not Ready by then is given up on (a GAMMA load takes minutes)
 constexpr uint32_t kStopTimeoutMs = 15000; // a process that has not exited by then after Stop is killed
 constexpr uint32_t kDefaultLingerMs = 60000; // the pause: coop_mapserver_linger = 60 s
 constexpr uint32_t kFlushTimeoutMs = 3000; // a map server that has not sent its snapshot by then is left to its stream

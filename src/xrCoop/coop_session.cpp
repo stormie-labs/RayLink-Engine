@@ -11,6 +11,7 @@
 #include <bcrypt.h>
 
 #include "coop_session.h"
+#include "coop_mapserver_rules.h"
 #include "coop_transport.h"
 
 #include <algorithm>
@@ -192,6 +193,26 @@ struct Conn
 	net::ByteCounterPtr bulk = std::make_shared<net::ByteCounter>();
 	uint64_t out_due[size_t(Lane::Count)] = {}; // NetSim: keeps per-lane order under jitter
 	uint64_t in_due[size_t(Lane::Count)] = {};
+	bool bridge = false; // host: the connection of a map server (Session::issue_bridge)
+	bool virt = false; // a map server: a player of its level, no transport of his own (Session::host_virtual)
+	// host, the host's move (Session::soft_park)
+	bool park_in = false; // what it sends waits in in_parked; stays on until that is empty
+	bool park_out = false; // what goes to it is held (out_parked) or dropped
+	struct ParkedIn
+	{
+		Lane lane = Lane::Reliable;
+		bool relayed = false; // the road sent it on: what is left is the world's copy
+		std::vector<uint8_t> bytes;
+	};
+	std::deque<ParkedIn> in_parked;
+	struct ParkedOut
+	{
+		Lane lane = Lane::Reliable;
+		uint16_t type = 0;
+		std::vector<uint8_t> payload;
+	};
+	std::deque<ParkedOut> out_parked;
+	size_t out_parked_bytes = 0;
 };
 
 struct PeerListNotice
@@ -219,6 +240,10 @@ struct Session::Impl
 	std::vector<std::unique_ptr<Conn>> m_conns;
 	uint64_t m_next_serial = 1;
 	std::map<PeerId, Conn*> m_joined; // host: slot -> connection
+	std::map<PeerId, Conn*> m_bridges; // host: the map servers' connections (bridge_peer(k)), no slots
+	std::map<mapserver::Token, uint32_t> m_bridge_tokens; // host: token -> k, given out and not used yet
+	Session* m_upstream = nullptr; // a map server: its connection to the world server (Session::host_virtual)
+	Session::InFilter m_in_filter = nullptr; // Session::set_in_filter
 	Conn* m_server = nullptr; // client: connection to the host
 
 	// host
@@ -274,6 +299,14 @@ struct Session::Impl
 	};
 	std::multimap<uint64_t, OutItem> m_out_q;
 	std::multimap<uint64_t, InItem> m_in_q;
+
+	// the host's move (Session::soft_park)
+	static constexpr size_t kParkedOutBytes = size_t(8) * 1024 * 1024; // per connection: what the first frames of a world say
+	static constexpr uint32_t kReplayPerUpdate = 1024; // what the parked said runs in slices, a level just came up
+	bool m_soft_keep_out = false;
+	bool m_soft_replay = false;
+	int m_events_per_update = kMaxEventsPerUpdate;
+	Session::SoftStats m_soft;
 
 	std::deque<std::function<void()>> m_pending;
 	bool m_running_pending = false;
@@ -511,7 +544,8 @@ struct Session::Impl
 		c->serial = m_next_serial++;
 		c->peer = peer;
 		c->created_ms = m_now;
-		net::Transport::set_user(peer, c.get());
+		if (peer)
+			net::Transport::set_user(peer, c.get());
 		m_conns.push_back(std::move(c));
 		return m_conns.back().get();
 	}
@@ -532,6 +566,8 @@ struct Session::Impl
 			net::Transport::set_user(c->peer, nullptr);
 		for (auto it = m_joined.begin(); it != m_joined.end();)
 			it = (it->second == c) ? m_joined.erase(it) : std::next(it);
+		for (auto it = m_bridges.begin(); it != m_bridges.end();)
+			it = (it->second == c) ? m_bridges.erase(it) : std::next(it);
 		if (m_server == c)
 			m_server = nullptr;
 		for (auto it = m_conns.begin(); it != m_conns.end(); ++it)
@@ -548,7 +584,10 @@ struct Session::Impl
 		if (m_role == Role::Host)
 		{
 			auto it = m_joined.find(id);
-			return it == m_joined.end() ? nullptr : it->second;
+			if (it != m_joined.end())
+				return it->second;
+			auto bridge = m_bridges.find(id);
+			return bridge == m_bridges.end() ? nullptr : bridge->second;
 		}
 		if (m_role == Role::Client && m_cstate == CState::Joined && id == kHostPeer)
 			return m_server;
@@ -569,6 +608,11 @@ struct Session::Impl
 	void send_packet(Conn& c, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb,
 		bool bypass_sim)
 	{
+		if (c.virt)
+		{
+			tunnel_up(c, lane, type, a, na, b, nb);
+			return;
+		}
 		if (!c.peer)
 			return;
 		const size_t total = 2 + na + nb;
@@ -597,6 +641,32 @@ struct Session::Impl
 				static_cast<unsigned long long>(c.serial));
 	}
 
+	// A map server: a message to a player of its level, through the host's process (Session::host_virtual).
+	void tunnel_up(Conn& c, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb)
+	{
+		if (!m_upstream || type < uint16_t(Msg::GameBase))
+			return;
+		levels::wire::TunnelMsg t;
+		t.peer = c.info.id;
+		t.flags = mapserver::tunnel_lane_flags(lane);
+		t.packet.reserve(2 + na + nb);
+		t.packet.push_back(uint8_t(type & 0xFF));
+		t.packet.push_back(uint8_t(type >> 8));
+		if (na)
+			t.packet.insert(t.packet.end(), a, a + na);
+		if (nb)
+			t.packet.insert(t.packet.end(), b, b + nb);
+		Writer w(t.packet.size() + 8);
+		if (!t.write(w))
+		{
+			if (first_time("tunnel-size" + std::to_string(type)))
+				logf("%s of %zu bytes is over what a Tunnel carries: dropped", msg_name(type), t.packet.size());
+			return;
+		}
+		count_sent(type, t.packet.size());
+		m_upstream->send(kHostPeer, lane, Msg::Tunnel, w);
+	}
+
 	void send_core(Conn& c, Msg type, const Writer& w, Lane lane = Lane::Reliable, bool bypass_sim = false)
 	{
 		send_packet(c, lane, uint16_t(type), w.ptr(), w.size(), nullptr, 0, bypass_sim);
@@ -616,9 +686,15 @@ struct Session::Impl
 
 	// ------------------------------------------------------------------ receive path
 
-	void on_receive(Conn& c, uint8_t channel, std::vector<uint8_t>&& bytes)
+	void on_receive(Conn& c, uint8_t channel, std::vector<uint8_t>&& bytes, bool relayed)
 	{
 		const Lane lane = channel < uint8_t(Lane::Count) ? Lane(channel) : Lane::Reliable;
+		if (c.park_in)
+		{
+			c.in_parked.push_back(Conn::ParkedIn{lane, relayed, std::move(bytes)});
+			++m_soft.parked;
+			return;
+		}
 		const bool sim_on = m_sim.enabled();
 		if (sim_on || !m_in_q.empty())
 		{
@@ -647,8 +723,44 @@ struct Session::Impl
 		}
 	}
 
-	// `c` must not be used by the caller after dispatch(): handlers may drop it.
-	void dispatch(Conn& c, Lane /*lane*/, std::vector<uint8_t>&& bytes)
+	// What a parked connection said, in slices, after the host's move. It keeps the order: what comes meanwhile goes behind it.
+	void soft_replay()
+	{
+		if (!m_soft_replay)
+			return;
+		std::vector<uint64_t> serials;
+		for (const auto& c : m_conns)
+			if (c->park_in)
+				serials.push_back(c->serial);
+		uint32_t budget = kReplayPerUpdate;
+		const bool in_transport = !m_tp.inbox_empty(); // what the helper took out of ENet may be theirs: it counts as parked too
+		for (const uint64_t serial : serials)
+			for (;;)
+			{
+				Conn* c = find_serial(serial);
+				if (!c)
+					break; // it went, and what it said with it
+				if (c->in_parked.empty())
+				{
+					if (in_transport)
+						return;
+					c->park_in = false;
+					break;
+				}
+				if (!budget)
+					return;
+				--budget;
+				Conn::ParkedIn item = std::move(c->in_parked.front());
+				c->in_parked.pop_front();
+				dispatch(*c, item.lane, std::move(item.bytes), item.relayed, true);
+				run_pending();
+			}
+		m_soft_replay = false;
+	}
+
+	// `c` must not be used by the caller after dispatch(): handlers may drop it. `relayed`: the host's move, the road sent this on already;
+	// `replay`: it waited for the main thread, the time it arrived at was not now.
+	void dispatch(Conn& c, Lane lane, std::vector<uint8_t>&& bytes, bool relayed = false, bool replay = false)
 	{
 		if (bytes.size() < 2)
 		{
@@ -660,7 +772,7 @@ struct Session::Impl
 
 		if (type >= uint16_t(Msg::GameBase))
 		{
-			game_message(c, type, std::move(bytes));
+			game_message(c, lane, type, std::move(bytes), relayed, replay);
 			return;
 		}
 
@@ -729,7 +841,7 @@ struct Session::Impl
 
 	PeerId peer_id_of(const Conn& c) const { return m_role == Role::Host ? c.info.id : kHostPeer; }
 
-	void game_message(Conn& c, uint16_t type, std::vector<uint8_t>&& bytes)
+	void game_message(Conn& c, Lane lane, uint16_t type, std::vector<uint8_t>&& bytes, bool relayed = false, bool replay = false)
 	{
 		if (!is_joined(c))
 		{
@@ -742,10 +854,12 @@ struct Session::Impl
 		// logs and ignores it (malformed).
 		const bool host = m_role == Role::Host;
 		const MsgSender sender = msg_sender(static_cast<Msg>(type));
-		// Protocol 11: MsgSender::TrunkOnly is the bridge of a map server's, and no peer is a bridge yet (F3a T9 adds that
-		// kind of connection and lets it through): until then it is refused from everybody, on both roles, so that it can
-		// never pass as a message of either side.
-		if (sender == MsgSender::TrunkOnly || sender == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
+		// Protocol 11: MsgSender::TrunkOnly is what a map server sends the world server: refused from everybody else, on both
+		// roles, so that it can never pass as a message of either side. A Tunnel is the trunk's too, both ways (Either), and on the
+		// host's side it comes from a bridge alone.
+		const bool trunk = host && c.bridge;
+		if ((sender == MsgSender::TrunkOnly && !trunk) || (host && !trunk && static_cast<Msg>(type) == Msg::Tunnel) ||
+			sender == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
 		{
 			const std::string what =
 				std::string("unexpected ") + msg_name(type) + (host ? " from a client" : " from the host");
@@ -762,8 +876,14 @@ struct Session::Impl
 						msg_name(type), unsigned(c.info.id), unsigned(c.epoch), unsigned(m_epoch));
 				return;
 			}
-			if (!within_rate(c, type))
-				return;
+			if (!c.bridge)
+			{
+				// the buckets know one arrival time: the world's messages of a whole load, paced by the client, come at once here
+				if (!replay && !within_rate(c, type))
+					return;
+				if (!relayed && m_in_filter && !m_in_filter(c.info.id, static_cast<Msg>(type), lane, bytes.data(), bytes.size()))
+					return;
+			}
 		}
 		if (m_handlers.find(type) == m_handlers.end())
 		{
@@ -883,6 +1003,23 @@ struct Session::Impl
 		return false;
 	}
 
+	// The host's move: true when this message is the parking's (Session::soft_park): it waits for the end of the move, or it was of the
+	// world that went.
+	bool soft_out(Conn& c, Lane lane, uint16_t type, const Writer& payload)
+	{
+		if (!c.park_out)
+			return false;
+		if (!m_soft_keep_out || c.out_parked_bytes + payload.size() > kParkedOutBytes)
+		{
+			++m_soft.dropped_out;
+			return true;
+		}
+		c.out_parked_bytes += payload.size();
+		c.out_parked.push_back(Conn::ParkedOut{lane, type, payload.data()});
+		++m_soft.held_out;
+		return true;
+	}
+
 	// R2 I1, host: a game message goes to a client only in the world epoch it is in; SessionReset tells it the new
 	// one. A client still in the old world must not apply the new world's changes to it.
 	bool may_send(const Conn& c, Msg type)
@@ -953,6 +1090,13 @@ struct Session::Impl
 	// Malformed message. Host: kick the sender. Client: log and ignore.
 	void malformed(Conn& c, const char* what)
 	{
+		if (c.virt)
+		{
+			// a map server kicks nobody: the host's process checked him at receipt, this is a message of a bug
+			if (first_time(std::string("virt-malformed:") + what))
+				logf("malformed message from virtual peer %u ignored: %s", unsigned(c.info.id), what);
+			return;
+		}
 		if (m_role == Role::Host)
 		{
 			std::string text = std::string("Malformed message: ") + what;
@@ -981,7 +1125,7 @@ struct Session::Impl
 		{
 			Conn* c = conn_of(ev.peer);
 			if (c)
-				on_receive(*c, ev.channel, std::move(ev.bytes));
+				on_receive(*c, ev.channel, std::move(ev.bytes), ev.relayed);
 			break;
 		}
 		default:
@@ -1011,6 +1155,8 @@ struct Session::Impl
 			h.content_fp = manifest_fingerprint(m_cfg.manifest);
 			h.key = m_cfg.key;
 			h.nick = m_cfg.nick;
+			h.role = m_cfg.hello_role;
+			std::memcpy(h.token, m_cfg.hello_token.data(), kHelloTokenSize);
 			Writer w;
 			h.write(w);
 			send_core(*m_server, Msg::Hello, w);
@@ -1114,6 +1260,11 @@ struct Session::Impl
 				&m_cfg.manifest);
 			return;
 		}
+		if (h.role == kHelloRoleMapServer)
+		{
+			host_bridge_hello(c, h);
+			return;
+		}
 		// R1 I2: DuplicateKey = the host's own key (a game folder copied from the host) or a joined player's key whose
 		// link is alive (below). No advice to delete the key: a player who follows it on the wrong PC loses his
 		// character.
@@ -1181,6 +1332,53 @@ struct Session::Impl
 		broadcast_peer_list({});
 	}
 
+	// F3a: a map server of this PC. It takes the place of an old connection of the same number: a new process started for it.
+	void host_bridge_hello(Conn& c, const HelloMsg& h)
+	{
+		mapserver::Token token{};
+		std::memcpy(token.data(), h.token, token.size());
+		const auto issued = m_bridge_tokens.find(token);
+		switch (mapserver::hello_verdict(mapserver::loopback_address(c.info.address), issued != m_bridge_tokens.end()))
+		{
+		case mapserver::HelloVerdict::Accept: break;
+		case mapserver::HelloVerdict::NotLoopback:
+			reject_conn(c, RejectReason::Kicked, "A map server connects from the host's own PC.", nullptr);
+			return;
+		case mapserver::HelloVerdict::BadToken:
+			reject_conn(c, RejectReason::Kicked, "This token was not issued by this session.", nullptr);
+			return;
+		}
+		const uint32_t k = issued->second;
+		m_bridge_tokens.erase(issued); // one process, one use
+		const PeerId id = mapserver::bridge_peer(k);
+		const auto old = m_bridges.find(id);
+		if (old != m_bridges.end())
+			kick_conn(*old->second, RejectReason::Kicked, "a new map server took its place");
+		c.info.id = id;
+		c.info.state = PeerState::Joined;
+		c.info.key = h.key;
+		c.info.nick = sanitize_nick(h.nick, ("ms" + std::to_string(k)).c_str());
+		c.epoch = m_epoch;
+		c.bridge = true;
+		m_bridges[id] = &c;
+
+		WelcomeMsg w;
+		w.slot = id;
+		w.session_token = m_session_token;
+		w.host_nick = m_cfg.nick;
+		w.max_players = m_max_players;
+		w.world_epoch = m_epoch;
+		Writer ww;
+		w.write(ww);
+		send_core(c, Msg::Welcome, ww);
+		logf("host: map server %u connected from %s", unsigned(k), c.info.address.c_str());
+		emit([this, id] {
+			if (m_self.on_bridge_joined)
+				m_self.on_bridge_joined(id);
+		});
+		broadcast_peer_list({});
+	}
+
 	void broadcast_peer_list(const std::vector<PeerListNotice>& departed)
 	{
 		Writer w;
@@ -1199,6 +1397,8 @@ struct Session::Impl
 		}
 		for (const auto& kv : m_joined)
 			send_core(*kv.second, Msg::PeerList, w);
+		for (const auto& kv : m_bridges)
+			send_core(*kv.second, Msg::PeerList, w); // a map server names the players of its level by it
 	}
 
 	// Host: a joined client is gone (Bye, kick or transport loss).
@@ -1208,16 +1408,33 @@ struct Session::Impl
 			return;
 		const PeerId id = c.info.id;
 		c.info.state = PeerState::Leaving;
+		if (c.bridge)
+		{
+			m_bridges.erase(id);
+			logf("host: map server %u left: %s", unsigned(mapserver::bridge_index(id)), reason.c_str());
+			emit([this, id, reason] {
+				if (m_self.on_bridge_left)
+					m_self.on_bridge_left(id, reason);
+			});
+			return;
+		}
 		m_joined.erase(id);
 		logf("host: peer %u '%s' left: %s", unsigned(id), c.info.nick.c_str(), reason.c_str());
 		emit_peer_left(id, reason);
-		broadcast_peer_list({PeerListNotice{id, reason}});
+		if (!c.virt)
+			broadcast_peer_list({PeerListNotice{id, reason}});
 	}
 
 	void kick_conn(Conn& c, RejectReason reason, const std::string& text)
 	{
 		if (c.info.state != PeerState::Joined)
 			return;
+		if (c.virt)
+		{
+			// he is the world server's to kick: a map server has no way to him but the message it was going to refuse
+			logf("virtual peer %u is not kicked here: %s", unsigned(c.info.id), text.c_str());
+			return;
+		}
 		RejectMsg rm;
 		rm.reason = reason;
 		rm.text = text;
@@ -1665,7 +1882,7 @@ struct Session::Impl
 	void pump()
 	{
 		net::Event ev;
-		for (int i = 0; i < kMaxEventsPerUpdate && m_tp.active(); ++i)
+		for (int i = 0; i < m_events_per_update && m_tp.active(); ++i)
 		{
 			const int rc = m_tp.service(ev);
 			if (rc < 0)
@@ -1698,6 +1915,7 @@ struct Session::Impl
 		flush_out_q();
 		pump();
 		pop_in_q();
+		soft_replay();
 		if (!m_tp.active())
 		{
 			run_pending();
@@ -1736,6 +1954,9 @@ struct Session::Impl
 				net::Transport::set_user(c->peer, nullptr);
 		m_conns.clear();
 		m_joined.clear();
+		m_bridges.clear();
+		m_bridge_tokens.clear();
+		m_upstream = nullptr;
 		m_remote.clear();
 		m_server = nullptr;
 		m_tp.destroy();
@@ -1755,6 +1976,8 @@ struct Session::Impl
 		for (auto& cp : m_conns)
 		{
 			Conn& c = *cp;
+			if (c.virt)
+				continue;
 			if (is_joined(c))
 			{
 				send_packet(c, Lane::Reliable, uint16_t(Msg::Bye), w.ptr(), w.size(), nullptr, 0, true);
@@ -1818,7 +2041,8 @@ bool Session::host(const SessionConfig& cfg, std::string* err)
 		s.m_rng.seed(0x5EEDC00Full ^ (uint64_t(player_key_hash(cfg.key)) << 20));
 
 		std::string e;
-		if (!s.m_tp.listen(cfg.port, (s.m_max_players - 1) + kPendingPeerSlots, &e))
+		// F3a: the players, the bridges of the map servers, and room for the refusals of whoever else knocks
+		if (!s.m_tp.listen(cfg.port, (s.m_max_players - 1) + mapserver::kMaxBridges + kPendingPeerSlots, &e))
 		{
 			s.logf("host: cannot listen on port %u: %s", unsigned(cfg.port), e.c_str());
 			if (err)
@@ -1894,6 +2118,76 @@ bool Session::connect(const SessionConfig& cfg, const std::string& address, uint
 	}
 }
 
+bool Session::host_virtual(const SessionConfig& cfg, Session& world, std::string* err)
+{
+	Impl& s = *m;
+	if (s.m_role != Role::None)
+	{
+		if (err)
+			*err = "session is already active";
+		return false;
+	}
+	s.m_cfg = cfg;
+	s.m_cfg.nick = sanitize_nick(cfg.nick, "Map server");
+	s.m_max_players = kMaxPlayers;
+	s.m_upstream = &world;
+	s.m_role = Role::Host;
+	s.m_local = nullptr; // no host player here
+	s.set_epoch(world.world_epoch());
+	s.logf("map server: the host of its level, through the host's process");
+	return true;
+}
+
+bool Session::is_virtual() const { return m->m_upstream != nullptr; }
+
+void Session::virtual_join(PeerId id, const std::string& nick)
+{
+	Impl& s = *m;
+	if (!s.m_upstream || s.m_role != Role::Host || s.m_joined.count(id))
+		return;
+	Conn* c = s.add_conn(nullptr);
+	c->virt = true;
+	c->info.id = id;
+	c->info.state = PeerState::Joined;
+	c->info.nick = nick;
+	c->info.address = "through the host";
+	c->epoch = s.m_epoch;
+	s.m_joined[id] = c;
+	s.logf("map server: peer %u '%s' is on this level", unsigned(id), nick.c_str());
+	s.emit_peer_joined(c->info);
+}
+
+void Session::virtual_leave(PeerId id, const std::string& reason)
+{
+	Impl& s = *m;
+	const auto it = s.m_joined.find(id);
+	if (!s.m_upstream || it == s.m_joined.end())
+		return;
+	Conn* c = it->second;
+	s.remove_joined(*c, reason);
+	s.drop_conn(c);
+}
+
+void Session::virtual_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size)
+{
+	Impl& s = *m;
+	try
+	{
+		const auto it = s.m_joined.find(from);
+		if (!s.m_upstream || it == s.m_joined.end() || size < 2)
+		{
+			if (s.first_time("virt-nopeer" + std::to_string(from)))
+				s.logf("a Tunnel of peer %u, who is no player of this level: dropped", unsigned(from));
+			return;
+		}
+		s.dispatch(*it->second, lane, std::vector<uint8_t>(packet, packet + size));
+	}
+	catch (...)
+	{
+		s.logf("internal exception in virtual_receive() was suppressed");
+	}
+}
+
 void Session::shutdown(const char* reason)
 {
 	Impl& s = *m;
@@ -1932,11 +2226,16 @@ Role Session::role() const
 	return m->m_role;
 }
 
+uint16_t Session::listen_port() const
+{
+	return m->m_cfg.port;
+}
+
 PeerId Session::self() const
 {
 	switch (m->m_role)
 	{
-	case Role::Host: return kHostPeer;
+	case Role::Host: return m->m_upstream ? m->m_upstream->self() : kHostPeer;
 	case Role::Client: return m->m_cstate == Impl::CState::Joined ? m->m_self_id : kInvalidPeer;
 	default: return kInvalidPeer;
 	}
@@ -1946,7 +2245,7 @@ bool Session::is_active() const
 {
 	switch (m->m_role)
 	{
-	case Role::Host: return m->m_tp.active();
+	case Role::Host: return m->m_upstream ? m->m_upstream->is_active() : m->m_tp.active();
 	case Role::Client: return m->m_cstate == Impl::CState::Joined;
 	default: return false;
 	}
@@ -2036,6 +2335,99 @@ std::vector<PeerInfo> Session::players() const
 	return out;
 }
 
+void Session::set_in_filter(InFilter filter) { m->m_in_filter = filter; }
+
+void Session::soft_park(const std::vector<SoftPlayer>& players, const std::vector<SoftServer>& servers)
+{
+	Impl& s = *m;
+	if (s.m_role != Role::Host || s.m_upstream)
+		return;
+	s.m_soft = SoftStats();
+	s.m_soft_keep_out = false;
+	s.m_soft_replay = false;
+	auto relay = std::make_shared<softmove::Relay>();
+	for (const SoftServer& row : servers)
+		if (Conn* c = s.joined_conn(row.bridge))
+		{
+			c->park_in = c->park_out = true;
+			relay->add_bridge(c->peer, net::Transport::link_of(c->peer), row.bridge, row.level);
+		}
+	for (const SoftPlayer& row : players)
+		if (Conn* c = s.joined_conn(row.peer))
+		{
+			c->park_in = c->park_out = true;
+			relay->add_client(c->peer, net::Transport::link_of(c->peer), row.peer, row.level);
+		}
+	s.m_tp.relay_start(relay);
+}
+
+void Session::soft_keep_out() { m->m_soft_keep_out = true; }
+
+bool Session::soft_replaying() const { return m->m_soft_replay; }
+
+void Session::limit_events_per_update(int events) { m->m_events_per_update = events; }
+
+void Session::soft_release()
+{
+	Impl& s = *m;
+	s.m_tp.relay_stop();
+	s.m_soft_keep_out = false;
+	s.m_soft_replay = true;
+	for (auto& c : s.m_conns)
+	{
+		if (!c->park_out)
+			continue;
+		c->park_out = false;
+		for (Conn::ParkedOut& out : c->out_parked)
+			s.send_packet(*c, out.lane, out.type, out.payload.data(), out.payload.size(), nullptr, 0, false);
+		c->out_parked.clear();
+		c->out_parked_bytes = 0;
+	}
+}
+
+bool Session::soft_parked(PeerId id) const
+{
+	Conn* c = m->joined_conn(id);
+	return c && c->park_out;
+}
+
+Session::SoftStats Session::soft_stats() const
+{
+	SoftStats out = m->m_soft;
+	const net::RelayStats road = m->m_tp.relay_stats();
+	out.to_servers = road.to_servers;
+	out.to_players = road.to_players;
+	out.road_dropped = road.dropped;
+	out.inbox_max = road.inbox_max;
+	out.inbox_bytes_max = road.inbox_bytes_max;
+	out.road_overflowed = road.overflowed;
+	return out;
+}
+
+void Session::issue_bridge(uint32_t k, const std::array<uint8_t, kHelloTokenSize>& token)
+{
+	if (m->m_role != Role::Host || k == 0 || k > mapserver::kMaxBridges)
+		return;
+	revoke_bridge(k);
+	m->m_bridge_tokens[token] = k;
+}
+
+void Session::revoke_bridge(uint32_t k)
+{
+	for (auto it = m->m_bridge_tokens.begin(); it != m->m_bridge_tokens.end();)
+		it = it->second == k ? m->m_bridge_tokens.erase(it) : std::next(it);
+}
+
+std::vector<PeerId> Session::bridges() const
+{
+	std::vector<PeerId> out;
+	for (const auto& kv : m->m_bridges)
+		out.push_back(kv.first);
+	return out;
+}
+
+bool Session::bridge_connected(PeerId id) const { return m->m_bridges.count(id) != 0; }
+
 void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 {
 	Impl& s = *m;
@@ -2047,6 +2439,11 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 		{
 			if (s.first_time("client-send-peer"))
 				s.logf("send(%s): clients can only send to the host (peer 0), ignored", msg_name(type));
+			return;
+		}
+		if (s.m_upstream && to == kHostPeer)
+		{
+			s.m_upstream->send(kHostPeer, lane, type, payload); // a map server, as a client of the world
 			return;
 		}
 		if (s.m_role == Role::Host && to == kHostPeer && s.m_local)
@@ -2072,7 +2469,7 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 			s.logf("send(%s): payload of %zu bytes is too large, dropped", msg_name(type), payload.size());
 			return;
 		}
-		if (!s.may_send(*c, type))
+		if (s.soft_out(*c, lane, uint16_t(type), payload) || !s.may_send(*c, type))
 			return;
 		s.send_packet(*c, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 	}
@@ -2101,8 +2498,12 @@ void Session::broadcast(Lane lane, Msg type, const Writer& payload, PeerId excep
 			return;
 		}
 		for (const auto& kv : s.m_joined)
-			if (kv.first != except && s.may_send(*kv.second, type))
+			if (kv.first != except && !s.soft_out(*kv.second, lane, uint16_t(type), payload) && s.may_send(*kv.second, type))
 				s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
+		if (mapserver::bridge_takes(type)) // F3a: a map server is a client of the world
+			for (const auto& kv : s.m_bridges)
+				if (kv.first != except && !s.soft_out(*kv.second, lane, uint16_t(type), payload) && s.may_send(*kv.second, type))
+					s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 		if (s.m_local && except != kHostPeer)
 			s.m_local->push_to_client(type, lane, payload); // F3a T4: the host player (the link's gate decides)
 	}
@@ -2143,7 +2544,7 @@ uint32_t Session::send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data)
 			c = s.joined_conn(to);
 		else if (s.m_role == Role::Client && to == kHostPeer)
 			c = s.joined_conn(kHostPeer);
-		if (!c)
+		if (!c || c->virt)
 		{
 			s.logf("send_blob: peer %u is not joined, blob dropped", unsigned(to));
 			return 0;
@@ -2205,11 +2606,22 @@ void Session::set_world_epoch(uint32_t epoch)
 		s.set_epoch(epoch); // R1 1: the LocalLink too
 		if (s.m_role == Role::None)
 			return;
+		if (s.m_upstream)
+		{
+			// a map server: the world's epoch is its connection's, its players are in it by definition
+			s.m_upstream->set_world_epoch(epoch);
+			for (auto& c : s.m_conns)
+				c->epoch = epoch;
+		}
 		// Level-change review: a message that waited for the old world's return is void now (coop_world_gate.h)
 		if (const size_t voided = s.m_held.purge(epoch))
 			s.logf("%u waiting game message(s) made in world epoch %u are void: the world is epoch %u now", unsigned(voided),
 				unsigned(old), unsigned(epoch));
 		s.logf("world epoch %u (was %u)", unsigned(epoch), unsigned(old));
+		// the host's move: they stay in their world, and it is this one from now on. They hear nothing of it.
+		for (auto& c : s.m_conns)
+			if (c->park_in || c->park_out)
+				c->epoch = epoch;
 		// The world those blobs carry is gone: not a byte more of them.
 		for (auto& c : s.m_conns)
 			s.cancel_blobs(*c, [epoch](const OutBlob& b) { return b.epoch != epoch; }, "its world is gone");
@@ -2277,21 +2689,29 @@ void Session::send_chat(const std::string& text)
 
 void Session::hold_connection(uint32_t ms)
 {
-	m->m_tp.hold(ms);
+	if (Session* world = m->m_upstream)
+		world->hold_connection(ms);
+	else
+		m->m_tp.hold(ms);
 }
 
 void Session::seal_connection_hold()
 {
-	m->m_tp.seal_hold();
+	if (Session* world = m->m_upstream)
+		world->seal_connection_hold();
+	else
+		m->m_tp.seal_hold();
 }
 
 uint64_t Session::keepalive_services() const
 {
-	return m->m_tp.keepalive_services();
+	return m->m_upstream ? m->m_upstream->keepalive_services() : m->m_tp.keepalive_services();
 }
 
 uint32_t Session::ms_since_host_heard() const
 {
+	if (m->m_upstream)
+		return m->m_upstream->ms_since_host_heard();
 	if (m->m_role != Role::Client || !m->m_server)
 		return 0;
 	const uint32_t ms = net::Transport::ms_since_receive(m->m_server->peer);
@@ -2303,6 +2723,11 @@ void Session::drop_silent_host()
 	Impl& s = *m;
 	try
 	{
+		if (s.m_upstream)
+		{
+			s.m_upstream->drop_silent_host();
+			return;
+		}
 		if (s.m_role != Role::Client)
 			return;
 		s.fail_client("connection to host lost");

@@ -68,7 +68,7 @@ void client_set_owners(const xr_vector<AvatarOwner>& local_owners)
 	g_owners_known = true;
 }
 
-bool owners_known() { return mgr().is_host() || g_owners_known; }
+bool owners_known() { return is_map_authority() || g_owners_known; }
 
 bool is_player_proxy(u16 id) { return g_avatars.find(id) != g_avatars.end(); }
 

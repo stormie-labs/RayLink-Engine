@@ -44,8 +44,11 @@ bool player_out_of_fight(const CObject* obj);
 // him and turns to whoever is standing (death::monster_leaves; CEnemyManager::useful, CMonsterEnemyManager, the poltergeist).
 bool player_down(const CObject* obj);
 // What CEnemyManager::useful asks: is this player no enemy for a creature of that kind? A monster leaves one who is down (as
-// player_down); a stalker finishes him unless the host switched the game rule coop_finish_downed off (then as a monster).
+// player_down); a stalker leaves him too unless the host switched the game rule coop_npc_finish_downed on.
 bool player_out_for(const CObject* obj, bool stalker);
+// The game rule coop_npc_finish_downed; a map server has no game record, it takes it from the world's PlayerRules.
+bool finish_downed();
+void set_finish_downed(bool on);
 
 // Host, main thread, every frame of a driven player proxy (remote::apply): refreshes its light estimate
 // (twice a second) and its view direction.
@@ -82,6 +85,8 @@ void viewers_frame();
 // the character of a player who is in the world and not down (player_down); nullptr when none. Engine code that only knew
 // Actor() (the poltergeist's senses) asks this.
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
+// F3a: the actor of a map server: no creature sees or hears it (plan §1.6).
+bool ghost(const CObject* obj);
 // Audit F10: who a phantom born at `pos` flies at: the nearest player who is on his feet, of all the players, this machine's
 // view of it. A phantom has no snapshot, every machine's copy picks by itself. Stock (no session, nobody): this machine's entity.
 CObject* phantom_target(const Fvector& pos);

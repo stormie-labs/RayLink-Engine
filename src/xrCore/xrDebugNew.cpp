@@ -233,18 +233,60 @@ void xrDebug::gather_info(const char* expression, const char* description, const
 		if (shared_str_initialized)
 			xrLogger::FlushLog();
 
-		os_clipboard::copy_to_clipboard(assertion_info);
+		if (!m_silent_fatal) // Anomaly Coop
+			os_clipboard::copy_to_clipboard(assertion_info);
 	}
+}
+
+// Anomaly Coop: xrDebug::set_silent_fatal. Whatever the crash broke, the process does not stay: the crash handlers and the
+// stack walker below can hang on a lock the crashed thread holds, and the host's process waits for this one to die.
+static DWORD WINAPI silent_fatal_watchdog(LPVOID ms)
+{
+	Sleep(DWORD(UINT_PTR(ms)));
+	TerminateProcess(GetCurrentProcess(), 3);
+	return 0;
+}
+
+// Anomaly Coop: no dialog of ours. A map server (set_silent_fatal) has nobody at its screen. The launcher starts every game with the
+// key: its window shows the error, and that player keeps his crash save and his clipboard.
+static bool no_dialog()
+{
+	return Debug.silent_fatal() || strstr(GetCommandLine(), "-silent_error_mode");
+}
+
+static void silent_fatal_begin()
+{
+	static volatile LONG started = 0;
+	if (!no_dialog() || InterlockedExchange(&started, 1))
+		return;
+	// The log goes out on this thread: TerminateProcess would cut off the log's own, and the launcher reads the error there
+	xrLogger::SetImmediateMode(true);
+	const UINT_PTR ms = Debug.silent_fatal() ? 30000 : 180000; // a player's crash save comes first, a long one on a big game
+	CreateThread(NULL, 0, silent_fatal_watchdog, LPVOID(ms), 0, NULL);
+}
+
+void xrDebug::set_silent_fatal()
+{
+	m_silent_fatal = true;
+	// The system's own dialogs too: a DLL that does not load, a fault that never reaches our filter (a corrupted heap, a fast fail)
+	const UINT mode = SetErrorMode(0);
+	SetErrorMode(mode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 }
 
 void xrDebug::do_exit(const std::string& message)
 {
+	silent_fatal_begin();
 	// Anomaly Coop: CHECK_OR_EXIT is a crash too (a broken save, a missing level file): the crash handlers run as on
 	// every other crash path (a co-op session lets its link go at once, the console dumps its variables).
 	if (handler)
 		handler();
+	if (m_silent_fatal && shared_str_initialized)
+		Msg("! FATAL: %s", message.c_str());
+	else if (no_dialog() && shared_str_initialized)
+		Msg("FATAL ERROR\n\n[error]Description   : %s\n", message.c_str()); // what the launcher's window reads
 	xrLogger::FlushLog();
-	MessageBox(NULL, message.c_str(), RAYLINK_ENGINE_VERSION " - Error", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
+	if (!no_dialog())
+		MessageBox(NULL, message.c_str(), RAYLINK_ENGINE_VERSION " - Error", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
 	TerminateProcess(GetCurrentProcess(), 1);
 }
 
@@ -253,13 +295,16 @@ void xrDebug::do_exit(const std::string& message)
 void xrDebug::backend(const char* expression, const char* description, const char* argument0, const char* argument1,
                       const char* file, int line, const char* function, bool& ignore_always)
 {
+	silent_fatal_begin();
+
 	// Anomaly Coop: the crash handlers before the crash save. That save is a level save, and its hook armed the co-op
 	// link hold again (coop::on_blocking_work) while the handler that releases the hold for good had not run yet.
 	if (handler)
 		handler();
 
     // we save first
-    crash_saving::save();
+    if (!m_silent_fatal) // Anomaly Coop: the world is the host's, a map server saves nothing
+        crash_saving::save();
     
 	static xrCriticalSection CS
 #ifdef PROFILE_CRITICAL_SECTIONS
@@ -283,6 +328,11 @@ void xrDebug::backend(const char* expression, const char* description, const cha
 
     if (IsDebuggerPresent())
         DebugBreak();
+
+	// Anomaly Coop: the log has it all, gather_info wrote it. The key too: a process that crashes before the session set the flag holds
+	// a dialog nobody sits in front of
+	if (no_dialog())
+		TerminateProcess(GetCurrentProcess(), 1);
 
 	ShowCursor(true);
 	ShowWindow(GetActiveWindow(), SW_FORCEMINIMIZE);
@@ -809,6 +859,7 @@ void format_message(LPSTR buffer, const u32& buffer_size)
 //AVO: simplify function
 LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 {
+	silent_fatal_begin();
     xrLogger::SetImmediateMode(true);
 	string256 error_message;
 	format_message(error_message, sizeof(error_message));
@@ -825,7 +876,7 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 
     LogStackTrace(nullptr, true);
 
-	if (!IsDebuggerPresent())
+	if (!IsDebuggerPresent() && !Debug.silent_fatal()) // Anomaly Coop: the player's clipboard
 	{
 		os_clipboard::copy_to_clipboard("stack trace:\r\n\r\n");
 	}
@@ -868,6 +919,9 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 
     if (IsDebuggerPresent())
         DebugBreak();
+
+	if (no_dialog())
+		TerminateProcess(GetCurrentProcess(), 1); // Anomaly Coop: not back to the system either, the search ends in its dialog
 
 	ShowCursor(true);
 	ShowWindow(GetActiveWindow(), SW_FORCEMINIMIZE);
@@ -1199,6 +1253,9 @@ void xrDebug::_initialize(const bool& dedicated)
     SetupExceptionHandler(is_dedicated);
 #endif // USE_BUG_TRAP
 	previous_filter = ::SetUnhandledExceptionFilter(UnhandledFilter); // exception handler to all "unhandled" exceptions
+	// Anomaly Coop: a fault that never reaches the filter (a corrupted heap, a fast fail) leaves no system dialog for the launcher to wait on
+	if (no_dialog())
+		SetErrorMode(SetErrorMode(0) | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 
 #if 0
     struct foo

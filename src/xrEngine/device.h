@@ -36,6 +36,8 @@
 
 class engine_impl;
 
+extern ENGINE_API bool g_coop_headless; // Anomaly Coop: a map server, -coop_mapserver (IGame_Persistent.h)
+
 class IRenderDevice
 {
 public:
@@ -257,6 +259,22 @@ public:
 	xr_delegate<void()> ModelDefferClear;
 
 	bool isRendering;
+
+	// Anomaly Coop: the frames since the last coop_mapserver_stats: their work, without a map server's sleep to its frame rate
+	struct FrameWork
+	{
+		u32 frames = 0;
+		u32 total_ms = 0;
+		u32 worst_ms = 0;
+
+		void add(u32 ms)
+		{
+			++frames;
+			total_ms += ms;
+			if (ms > worst_ms)
+				worst_ms = ms;
+		}
+	} frame_work;
 
 	// LuaGC
 	int LuaGCCount;

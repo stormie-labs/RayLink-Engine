@@ -21,6 +21,9 @@ namespace net
 // F3a T4: to every player: the host player too, over the LocalLink, unless `except` is 0. The link passes only the
 // messages moved onto it (link_enabled, coop_local_link.h); none yet.
 void host_broadcast(Msg type, const Writer& payload, Lane lane = Lane::Reliable, PeerId except = kInvalidPeer);
+// Host: a state stream (unreliable, nothing queued) to the players of the host's level. F3a multilevel: the level test of
+// host_broadcast; without split levels this is Session::broadcast.
+void host_stream(Msg type, const Writer& payload, PeerId except = kInvalidPeer);
 // Host: to one client; queued while it loads (reliable lanes only, unreliable is dropped).
 // F3a T4: `to` 0 is the host player, over the LocalLink (only the messages moved onto it; the rest is dropped as before).
 void host_send(PeerId to, Msg type, const Writer& payload, Lane lane = Lane::Reliable);
@@ -40,7 +43,7 @@ void print_status(); // D16: the join queues
 
 // True if this machine is in a live session (host, or client in the world).
 inline bool live() { return mgr().is_host() || mgr().is_live_client(); }
-inline bool host() { return mgr().is_host(); }
+inline bool host() { return is_map_authority(); } // the host's half of a level: the host's process, a map server
 inline bool client() { return mgr().is_client(); }
 } // namespace net
 } // namespace coop

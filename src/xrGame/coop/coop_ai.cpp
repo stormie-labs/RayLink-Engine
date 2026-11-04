@@ -83,9 +83,9 @@ u32 g_lit_next = 0, g_lit_list_ms = 0;
 float g_viewer_range = viewers::kDefaultRange;
 float g_viewer_frame_radius = viewers::kDefaultFrameRadius;
 
-// Game rule coop_finish_downed (host setting, on by default): a stalker goes on shooting a player who is down. Off, he leaves
+// Game rule coop_npc_finish_downed (host setting, off by default): on, a stalker goes on shooting a player who is down. Off, he leaves
 // him like a monster does.
-int g_finish_downed = 1;
+int g_finish_downed = 0;
 
 struct Stats
 {
@@ -161,6 +161,10 @@ bool player_down(const CObject* obj)
 	return death::monster_leaves(u8(survival::life_of(obj->ID())));
 }
 
+bool finish_downed() { return g_finish_downed != 0; }
+
+void set_finish_downed(bool on) { g_finish_downed = on ? 1 : 0; }
+
 bool player_out_for(const CObject* obj, bool stalker)
 {
 	if (!obj || !mgr().active() || !is_player(obj))
@@ -186,7 +190,7 @@ bool is_remote_player(const CObject* obj)
 
 void on_proxy_frame(CGameObject* proxy)
 {
-	if (!proxy || !mgr().is_host() || !is_remote_player(proxy))
+	if (!proxy || !is_map_authority() || !is_remote_player(proxy))
 		return;
 	const u32 now = Device.dwTimeGlobal;
 	Proxy& p = g_proxies[proxy->ID()];
@@ -226,7 +230,7 @@ bool player_luminocity(const CGameObject* obj, float& lum)
 
 bool creature_luminocity(const CGameObject* obj, float& lum)
 {
-	if (!obj || !mgr().is_host())
+	if (!obj || !is_map_authority())
 		return false;
 	auto it = g_lit.find(obj->ID());
 	if (it == g_lit.end() || Device.dwTimeGlobal - it->second.ms > kLitFreshMs)
@@ -265,7 +269,7 @@ bool player_sees(const CEntityAlive* player, const CCustomMonster* observer, boo
 
 bool player_on_the_path(CAI_Stalker* npc)
 {
-	if (!npc || g_proxies.empty() || !mgr().is_host() || !g_pGameLevel)
+	if (!npc || g_proxies.empty() || !is_map_authority() || !g_pGameLevel)
 		return false;
 	const u32 now = Device.dwTimeGlobal;
 	for (const auto& it : g_proxies)
@@ -341,7 +345,7 @@ CObject* viewer_body(u32 peer)
 
 void viewers_frame()
 {
-	if (!mgr().is_host() || !world_up())
+	if (!is_map_authority() || !world_up())
 	{
 		shedule_viewers::clear();
 		return;
@@ -395,10 +399,10 @@ void viewers_frame()
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers])
 {
 	u32 n = 0;
-	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor) &&
+	if (!ghost_actor() && g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor) &&
 		g_actor->Position().distance_to(pos) <= max_dist)
 		out[n++] = g_actor;
-	if (!mgr().is_host() || !world_up())
+	if (!is_map_authority() || !world_up())
 		return n;
 	for (u32 peer = 1; peer < kMaxPlayers && n < kMaxNearPlayers; ++peer)
 	{
@@ -485,7 +489,7 @@ bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster)
 
 void on_player_reload(u16 player)
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		g_proxies[player].reload_ms = Device.dwTimeGlobal;
 }
 
@@ -507,11 +511,13 @@ bool player_jumping(const CObject* player)
 	return is_remote_player(player) && (players::avatar_mstate(player->ID()) & (mcJump | mcFall | mcLanding | mcLanding2)) != 0;
 }
 
+bool ghost(const CObject* obj) { return obj && ghost_actor() && obj == static_cast<const CObject*>(g_actor); }
+
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 {
 	CEntityAlive* best = nullptr;
 	float best_d = max_dist;
-	if (g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor))
+	if (!ghost_actor() && g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor))
 	{
 		const float d = g_actor->Position().distance_to(pos);
 		if (d <= best_d)
@@ -520,7 +526,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 			best_d = d;
 		}
 	}
-	if (!mgr().is_host() || !world_up())
+	if (!is_map_authority() || !world_up())
 		return best;
 	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
 	{
@@ -541,7 +547,7 @@ void register_console()
 {
 	CMD4(CCC_Float, "coop_viewer_range", &g_viewer_range, 0.f, viewers::kMaxRange); // host setting
 	CMD4(CCC_Float, "coop_viewer_frame_radius", &g_viewer_frame_radius, 0.f, viewers::kMaxFrameRadius); // host setting
-	CMD4(CCC_Integer, "coop_finish_downed", &g_finish_downed, 0, 1); // game rule (coop_game_schema c|coop_finish_downed)
+	CMD4(CCC_Integer, "coop_npc_finish_downed", &g_finish_downed, 0, 1); // game rule (coop_game_schema c|coop_npc_finish_downed)
 }
 
 void print_status()

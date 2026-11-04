@@ -1567,6 +1567,56 @@ inline Gate decide(CallClass cls, bool is_client, bool applying, bool own_target
 	return gate(cls, true, own_target, has_request_path);
 }
 
+// F3a: a map server leads its level. The events of its objects run there and what the world must know goes up (coop_events filter_event,
+// coop_levels_xfer), so a call on an object of its level runs as on the host. Asked as a client it was refused, and no trader had any stock,
+// no NPC gave back what he ate and nobody came to his place (live 2026-11-01, 39.8). What is not here stays as on a client: the clock, the
+// difficulty, the story and the relations have their own ways to the world server.
+inline constexpr std::string_view kLevelCalls[] = {
+	"alife:disable_info",
+	"alife:give_info",
+	"game_object:bleeding",
+	"game_object:buy_supplies",
+	"game_object:change_health",
+	"game_object:change_morale",
+	"game_object:change_power",
+	"game_object:change_psy_health",
+	"game_object:change_radiation",
+	"game_object:change_satiety",
+	"game_object:destroy_object",
+	"game_object:enable_level_changer",
+	"game_object:give_money",
+	"game_object:health",
+	"game_object:kill",
+	"game_object:morale",
+	"game_object:power",
+	"game_object:psy_health",
+	"game_object:radiation",
+	"game_object:satiety",
+	"game_object:set_health_ex",
+	"game_object:set_npc_position",
+	"game_object:take_item",
+	"game_object:transfer_item",
+	"game_object:transfer_money",
+	"hanging_lamp:turn_off",
+	"hanging_lamp:turn_on",
+	"level:spawn_item",
+	"level:spawn_phantom",
+};
+
+inline bool is_level_call(std::string_view name)
+{
+	for (std::string_view call : kLevelCalls)
+		if (detail::iequals(call, name))
+			return true;
+	return false;
+}
+
+// The answer on a map server: `client` is what decide() says. A request keeps its path, a bad number runs nowhere.
+inline Gate decide_leading(std::string_view name, Gate client, bool args_ok)
+{
+	return client == Gate::Refuse && args_ok && is_level_call(name) ? Gate::Run : client;
+}
+
 // The "own target" of the gated call sites, the same as the engine paths behind them:
 // transfer_item / take_item: our actor is a side of the move, the item is ours or it comes to us (Ruling F2-30; the
 // host checks owner, reach and the sides' locks in host_move).

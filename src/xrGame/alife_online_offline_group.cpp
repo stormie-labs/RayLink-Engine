@@ -241,6 +241,8 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_online()
 	MEMBERS::iterator E = m_members.end();
 	for (; I != E; ++I)
 	{
+		if (!(*I).second)
+			return; // Anomaly Coop: coop_bind_members, its packet is on the way
 		VERIFY3((*I).second->g_Alive(), "Incorrect situation : some of the OnlineOffline group members is dead",
 		        (*I).second->name_replace());
 		VERIFY3((*I).second->can_switch_online(),
@@ -286,6 +288,8 @@ void CSE_ALifeOnlineOfflineGroup::try_switch_offline()
 	MEMBERS::iterator E = m_members.end();
 	for (; I != E; ++I)
 	{
+		if (!(*I).second)
+			return; // Anomaly Coop: coop_bind_members, its packet is on the way
 		VERIFY3((*I).second->g_Alive(), "Incorrect situation : some of the OnlineOffline group members is dead",
 		        (*I).second->name_replace());
 		VERIFY3((*I).second->can_switch_offline(),
@@ -391,6 +395,59 @@ void CSE_ALifeOnlineOfflineGroup::on_after_game_load()
 		register_member(*i);
 }
 
+// Anomaly Coop: a squad a map server made came here as a packet: its members are ids (STATE_Read). Only a load binds them, and a squad that
+// comes home in the running world has none: the first update walked a null. What register_member does, without its word on where a member
+// stands: it may be an object of its own by now. `forget`: an id with no object goes, else it waits for its packet. True: all are bound.
+bool CSE_ALifeOnlineOfflineGroup::coop_bind_members(bool forget)
+{
+	xr_vector<ALife::_OBJECT_ID> gone;
+	bool placed = false;
+	CALifeGraphRegistry& graph = alife().graph();
+	MEMBERS::iterator I = m_members.begin();
+	MEMBERS::iterator E = m_members.end();
+	for (; I != E; ++I)
+	{
+		if ((*I).second)
+			continue;
+		CSE_ALifeMonsterAbstract* monster = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object((*I).first, true));
+		if (!monster)
+		{
+			gone.push_back((*I).first);
+			continue;
+		}
+		monster->m_bOnline = m_bOnline;
+		alife().scheduled().remove(monster, true);
+		const GameGraph::_GRAPH_ID vertex = monster->m_tGraphID;
+		if (ai().game_graph().valid_vertex_id(vertex))
+		{
+			const auto& here = graph.objects()[vertex].objects().objects();
+			if (here.find(monster->ID) != here.end())
+				graph.remove(monster, vertex, false);
+		}
+		graph.level().remove(monster, true);
+		monster->m_group_id = ID;
+		(*I).second = monster;
+		if (!placed && !ai().game_graph().valid_vertex_id(m_tGraphID) && ai().game_graph().valid_vertex_id(vertex))
+		{
+			// as the first member of register_member: a squad with no place stands where it does
+			placed = true;
+			o_Position = monster->o_Position;
+			m_tNodeID = monster->m_tNodeID;
+			m_tGraphID = vertex;
+			m_fGoingSpeed = monster->m_fGoingSpeed;
+			m_fCurrentLevelGoingSpeed = monster->m_fCurrentLevelGoingSpeed;
+		}
+	}
+	if (forget)
+		for (const ALife::_OBJECT_ID id : gone)
+			unregister_member(id);
+	if (!m_members.empty() && ai().game_graph().valid_vertex_id(m_tGraphID))
+		m_flags.set(flUsedAI_Locations, TRUE);
+	if (placed)
+		graph.add(this, m_tGraphID, false); // it stood in no graph point with no place
+	return forget || gone.empty();
+}
+
 ALife::_OBJECT_ID CSE_ALifeOnlineOfflineGroup::commander_id()
 {
 	if (!m_members.empty())
@@ -415,7 +472,8 @@ void CSE_ALifeOnlineOfflineGroup::clear_location_types()
 	MEMBERS::iterator E = m_members.end();
 	for (; I != E; ++I)
 	{
-		(*I).second->m_tpaTerrain.clear();
+		if ((*I).second) // Anomaly Coop: coop_bind_members, its packet is on the way
+			(*I).second->m_tpaTerrain.clear();
 	}
 }
 

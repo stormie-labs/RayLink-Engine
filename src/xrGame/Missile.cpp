@@ -196,7 +196,7 @@ void CMissile::spawn_fake_missile()
 		CSE_Abstract* object = Level().spawn_item(
 			*cNameSect(),
 			Position(),
-			(g_dedicated_server) ? u32(-1) : ai_location().level_vertex_id(),
+			(g_dedicated_server && !g_coop_headless) ? u32(-1) : ai_location().level_vertex_id(),
 			ID(),
 			true
 		);

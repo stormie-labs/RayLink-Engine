@@ -327,7 +327,7 @@ void CWallmarksEngine::AddStaticWallmark(CDB::TRI* pTri, const Fvector* pVerts, 
 void CWallmarksEngine::AddStaticWallmark(CDB::TRI* pTri, const Fvector* pVerts, const Fvector& contact_point,
 	ref_shader hShader, float sz, float ttl, bool ignore_opt, float rotation)
 {
-    if (!r_wallmarks_static)
+    if (!r_wallmarks_static || g_coop_headless) // Anomaly Coop: a map server: nobody sees them, the ray queries are for nothing
         return;
 
 	// Physics may add wallmarks in parallel with rendering
@@ -339,7 +339,7 @@ void CWallmarksEngine::AddStaticWallmark(CDB::TRI* pTri, const Fvector* pVerts, 
 void CWallmarksEngine::AddSkeletonWallmark(const Fmatrix* xf, CKinematics* obj, ref_shader& sh, const Fvector& start,
                                            const Fvector& dir, float size, float ttl, bool ignore_opt)
 {
-    if (!r_wallmarks_dynamic)
+    if (!r_wallmarks_dynamic || g_coop_headless) // Anomaly Coop: the same
         return;
 
 	VERIFY(obj&&xf&&(size>EPS_L));
@@ -350,7 +350,7 @@ void CWallmarksEngine::AddSkeletonWallmark(const Fmatrix* xf, CKinematics* obj, 
 
 void CWallmarksEngine::AddSkeletonWallmark(intrusive_ptr<CSkeletonWallmark> wm)
 {
-    if (!r_wallmarks_dynamic)
+    if (!r_wallmarks_dynamic || g_coop_headless) // Anomaly Coop: the same
         return;
 
 	lock.Enter			();

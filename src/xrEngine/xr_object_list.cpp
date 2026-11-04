@@ -225,7 +225,9 @@ void CObjectList::Update(bool bForce)
 
 				Device.Statistic->UpdateClient_crows = crows.size();
 				Objects* required_workload;
-				if (!psDeviceFlags.test(rsDisableObjectsAsCrows))
+				// Anomaly Coop: a crow is an object the renderer saw. A map server sees nothing and serves the players' clients:
+				// every object updates each frame, or they would all move at the rate of the scheduler
+				if (!psDeviceFlags.test(rsDisableObjectsAsCrows) && !g_coop_headless)
 					required_workload = &crows;
 				else
 				{

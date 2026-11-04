@@ -98,6 +98,7 @@ const char* reason_name(Reason r)
 	case Reason::Sleep: return "after sleep";
 	case Reason::LevelChange: return "level change";
 	case Reason::SessionEnd: return "end of the session";
+	case Reason::Transfer: return "a map server starts or stops";
 	case Reason::Manual: return "manual";
 	}
 	return "?";
@@ -733,6 +734,12 @@ void request(Reason r)
 	g_pending.busy_since = 0;
 }
 
+void request_before_transfer()
+{
+	if (transfer_save_needed(g_last.at_ms, mgr().now_ms()))
+		request(Reason::Transfer);
+}
+
 void frame()
 {
 	if (!mgr().is_host())
@@ -861,12 +868,12 @@ void host_on_level_exit()
 
 void print_status()
 {
-	::Msg("[coop]   autosave: ring %s, %s, keeps %d, saved timer %llu, after sleep %llu, level change %llu, end %llu, manual %llu; "
+	::Msg("[coop]   autosave: ring %s, %s, keeps %d, saved timer %llu, after sleep %llu, level change %llu, end %llu, transfer %llu, manual %llu; "
 	      "skipped %llu, failed %llu, slot moves failed %llu, dropped %llu%s%s",
 	    g_ring.game.empty() ? "coop_auto_N (shared)" : ("coop_auto_" + g_ring.game + "_N").c_str(),
 	    g_interval_min ? make_string("every %d min", g_interval_min).c_str() : "timer off", g_count,
 	    g_stat.saved[size_t(Reason::Timer)], g_stat.saved[size_t(Reason::Sleep)],
-	    g_stat.saved[size_t(Reason::LevelChange)], g_stat.saved[size_t(Reason::SessionEnd)],
+	    g_stat.saved[size_t(Reason::LevelChange)], g_stat.saved[size_t(Reason::SessionEnd)], g_stat.saved[size_t(Reason::Transfer)],
 	    g_stat.saved[size_t(Reason::Manual)], g_stat.skipped, g_stat.failed, g_stat.slots_failed, g_stat.dropped,
 	    g_pending.on ? make_string(", %s save waits", reason_name(g_pending.why)).c_str() : "",
 	    pause_holds(g_pause, mgr().now_ms()) ? ", PAUSED (Restore window)" : "");

@@ -217,6 +217,54 @@ inline Scope scope_of(Msg type)
 	return s;
 }
 
+// F3a multilevel: a message of the host's level and a player who stands on another one. The stream of a level (bodies, entities,
+// zones) means nothing there, but every machine keeps the same registry under the same ids (spec §2, recon §3.1): what is
+// created, destroyed, handed over or regrouped anywhere reaches everybody, whichever level it happens on. These are the Map
+// messages that do.
+inline bool reaches_every_level(Msg type)
+{
+	switch (type)
+	{
+	case Msg::EntitySpawn:
+	case Msg::EntityDestroy:
+	case Msg::EntityParent:
+	case Msg::EntitySquad: return true;
+	default: break;
+	}
+	return false;
+}
+
+// Does a broadcast of the host's process go to this player? `split` is the game rule (off: every message goes everywhere, as
+// always); `same_level` = he stands on the host's level. Addressed messages (net::host_send) are not asked.
+inline bool level_passes(Msg type, bool split, bool same_level)
+{
+	return !split || same_level || scope_of(type) != Scope::Map || reaches_every_level(type);
+}
+
+// F3a, the other way: what a player on another level sends. Map messages go to the authority of HIS level (route(),
+// Route::TunnelToServer), the map server of that level: nobody here is to act on them, his body is no object on this level.
+// These stay here too: they are his own data, and the world keeps them for the save and for the others' HUD.
+inline bool kept_from_every_level(Msg type)
+{
+	switch (type)
+	{
+	case Msg::PlayerVitals:
+	case Msg::PlayerEquip:
+	case Msg::ItemState:
+	case Msg::IdLeaseAck:
+	case Msg::StateDumpRequest: // the repair of his registry: an entity he misses comes from the world's copy
+		return true;
+	default: break;
+	}
+	return false;
+}
+
+// Does the world server take this message of a player? `same_level` = he stands on the host's level.
+inline bool level_takes(Msg type, bool split, bool same_level)
+{
+	return !split || same_level || scope_of(type) != Scope::Map || kept_from_every_level(type);
+}
+
 // What a process does with a message of scope `s` that it has received.
 enum class Route : uint8_t
 {

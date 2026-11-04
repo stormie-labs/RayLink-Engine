@@ -143,7 +143,7 @@ namespace xr_imgui
 
     void ide::OnFrame()
     {
-        if (!!!Device.b_is_Active) return;
+        if (!!!Device.b_is_Active || g_coop_headless) return; // Anomaly Coop: OnRender never comes, NewFrame must not either
 
         const float frametime = m_timer.GetElapsed_sec();
         m_timer.Start();

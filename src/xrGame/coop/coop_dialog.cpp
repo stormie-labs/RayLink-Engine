@@ -260,7 +260,7 @@ u8 host_try_lock(u16 npc, PeerId who, talks::Reason* why = nullptr)
 
 void host_on_lock(PeerId from, Reader& r)
 {
-	if (!mgr().is_host() || from == kHostPeer)
+	if (!is_map_authority() || from == kHostPeer)
 		return;
 	const u16 npc = r.u16();
 	const bool keepalive = r.u8() != 0;
@@ -293,7 +293,7 @@ void host_on_lock(PeerId from, Reader& r)
 
 void host_on_unlock(PeerId from, Reader& r)
 {
-	if (!mgr().is_host() || from == kHostPeer)
+	if (!is_map_authority() || from == kHostPeer)
 		return;
 	const u16 npc = r.u16();
 	if (!r.ok())
@@ -384,7 +384,7 @@ void notify_denied(u8 result, talks::Reason why = talks::Reason::None)
 
 void client_on_result(PeerId, Reader& r)
 {
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	talks::LockResultMsg msg;
 	if (!talks::read_lock_result(r, msg))
@@ -421,7 +421,7 @@ void client_on_result(PeerId, Reader& r)
 
 void client_on_revoke(PeerId, Reader& r)
 {
-	if (!mgr().is_client())
+	if (!is_mirror())
 		return;
 	const u16 npc = r.u16();
 	if (!r.ok() || npc != g_cl.granted)
@@ -540,9 +540,9 @@ void install_client(Endpoint& e)
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_frame();
-	else if (mgr().is_live_client())
+	else if (is_live_mirror())
 		client_frame();
 }
 
@@ -556,7 +556,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	u32 n = 0;
 	for (auto it = g_locks.begin(); it != g_locks.end();)
@@ -587,7 +587,7 @@ bool may_start_talk(CInventoryOwner* partner, bool disable_break)
 		return true;
 	if (world::is_player_proxy(local))
 		return false; // (a registered avatar is a player character: caught above)
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		const u8 result = host_try_lock(local, kHostPeer);
 		if (result == Granted)
@@ -643,7 +643,7 @@ void on_talk_window_closed()
 	}
 	if (!net::live())
 		return;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		if (g_host_talk != kNoId)
 		{
@@ -684,17 +684,17 @@ void hud_message_n(const char* string_id, const char* fallback, u32 n)
 
 PeerId host_talk_holder(u16 npc) // W11
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return kInvalidPeer;
 	auto it = g_locks.find(npc);
 	return it == g_locks.end() ? kInvalidPeer : it->second.holder;
 }
 
-u16 client_partner() { return mgr().is_client() ? g_cl.granted : kNoId; } // F2 T1
+u16 client_partner() { return is_mirror() ? g_cl.granted : kNoId; } // F2 T1
 
 bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms) // Ruling F2-34
 {
-	if (!mgr().is_host() || peer == kInvalidPeer)
+	if (!is_map_authority() || peer == kInvalidPeer)
 		return false;
 	const auto it = g_recent.find(peer);
 	static const talks::Recent kNone;
@@ -703,7 +703,7 @@ bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms) // Ruling F2-34
 
 u16 host_lock_of(PeerId peer) // F2 T1
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return kNoId;
 	for (const auto& it : g_locks)
 		if (it.second.holder == peer)
@@ -713,7 +713,7 @@ u16 host_lock_of(PeerId peer) // F2 T1
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		const u64 now = now_ms();
 		::Msg("[coop]   talk locks: %u held; %llu requests, %llu granted, %llu denied (%llu the NPC would not talk), "
@@ -726,7 +726,7 @@ void print_status()
 			    it.second.holder, (now - it.second.since) / 1000, (now - it.second.last_seen) / 1000);
 		}
 	}
-	else if (mgr().is_client())
+	else if (is_mirror())
 	{
 		::Msg("[coop]   talk: lock %u, pending %u, start %u; %llu requests, %llu granted, %llu denied; %llu started with talk forced "
 		    "on, %llu allowed but not started", g_cl.granted, g_cl.pending, g_cl.start, g_requests, g_grants, g_denies, g_forced,

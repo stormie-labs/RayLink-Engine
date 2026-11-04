@@ -462,6 +462,9 @@ void fire_marker_callback(u16 player_local, u16 object_local, Drop drop)
 	    {script::cb_int(player_local), script::cb_int(object_local), script::cb_str(marker_kind(drop))});
 }
 
+// A map server's broadcast goes to its players only and nothing brings it back: its own Lua sets the spot, coop_story takes it to the world.
+void map_server_marker(const Marker& q) { fire_marker_callback(q.character, q.object, q.drop); }
+
 // The items' EntityParent / the stash's EntitySpawn go out in this frame's events / entities pass, after this module:
 // a marker waits one frame so that every client has its object before the marker names it. F3a T7: the host player gets
 // it as a client does, over the internal channel (on_marker_msg fires his callback at the next pump).
@@ -478,6 +481,8 @@ void send_markers()
 		Writer w(kMarkerSize);
 		write(w, m);
 		net::host_broadcast(Msg::DeathMarker, w);
+		if (is_map_server())
+			map_server_marker(m);
 		++g_st.markers_sent;
 		g_markers.erase(g_markers.begin() + i);
 	}
@@ -680,26 +685,35 @@ void give_up(PendingStash& p, bool owner_same, Presence character)
 // Review minor 5 (T9): stashes still waiting for their items when the session ends or the world is replaced are empty
 // entities nobody will fill. They are released while the world still has them. After a load the id may name something
 // else, so the entity under it must still be a coop_death_stash with nothing in it; without a world they are forgotten.
-void abandon_stashes(const char* why)
+// `stayed`: a new world, the stashes of the players who stayed in theirs through the host's move stand as they stood.
+void abandon_stashes(const char* why, bool stayed = false)
 {
 	if (g_stashes.empty())
 		return;
-	const bool world = mgr().is_host() && g_pGameLevel && ai().get_alife();
+	const bool world = is_map_authority() && g_pGameLevel && ai().get_alife();
 	u32 released = 0;
-	if (world)
-		for (const PendingStash& p : g_stashes)
+	xr_vector<PendingStash> kept;
+	const size_t had = g_stashes.size();
+	for (PendingStash& p : g_stashes)
+	{
+		if (stayed && join::host_stayed_in_world(PeerId(p.owner.peer)))
 		{
-			const CSE_Abstract* e = events::find_entity(p.stash);
-			if (!e || xr_strcmp(e->s_name, kStashSection) || !e->children.empty())
-				continue;
-			release_stash(p.stash);
-			++released;
+			kept.push_back(std::move(p));
+			continue;
 		}
+		if (!world)
+			continue;
+		const CSE_Abstract* e = events::find_entity(p.stash);
+		if (!e || xr_strcmp(e->s_name, kStashSection) || !e->children.empty())
+			continue;
+		release_stash(p.stash);
+		++released;
+	}
 	g_st.stash_abandoned += released;
 	::Msg("[coop] death: %s, %u stashes were waiting: %u released empty, %u forgotten (the items stay with their "
 	      "characters)",
-	    why, u32(g_stashes.size()), released, u32(g_stashes.size()) - released);
-	g_stashes.clear();
+	    why, u32(had - kept.size()), released, u32(had - kept.size()) - released);
+	g_stashes.swap(kept);
 }
 
 bool stash_waiting(u16 stash)
@@ -762,7 +776,7 @@ void host_frame()
 		if (g_epoch != 0xffffffff && !g_markers.empty())
 			::Msg("[coop] death: a new world, %u markers of the old one dropped", u32(g_markers.size()));
 		g_epoch = epoch;
-		abandon_stashes("a new world");
+		abandon_stashes("a new world", true);
 		g_markers.clear();
 		g_gave_up.clear();
 	}
@@ -859,7 +873,7 @@ public:
 
 u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return 0;
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
@@ -921,7 +935,7 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 
 u16 host_move_to_stash(u16 character, bool everything, u16 seq)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return kNoId;
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
@@ -1117,7 +1131,7 @@ void reset()
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_frame();
 }
 

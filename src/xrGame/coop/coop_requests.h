@@ -65,6 +65,9 @@ namespace coop
 {
 namespace requests
 {
+// The host's move: this machine stayed in its world, whose epoch is `epoch` from now on. Before the session's own epoch moves.
+void client_keeps_world(u32 epoch);
+
 enum class Reason : u8
 {
 	Ok = 0,
@@ -122,6 +125,7 @@ bool client_launch(u16 local_launcher, u16 local_rocket);
 // The request paths of the call gate (coop_callgate.h, F2 T12): alife_simulator_script.cpp asks the gate first and
 // calls these on Request.
 bool lua_client(); // true on a coop client in the host's world: the hooks below apply
+bool lua_mirror(); // ... and his objects are copies: a map server runs the ALife calls of its Lua itself
 // Returns nullptr after forwarding/refusing; for register=false returns a temporary object
 // without an id that a later lua_register_spawn() forwards.
 CSE_Abstract* lua_create(const char* section, const Fvector& pos, u32 level_vertex, u16 game_vertex, u16 parent,
@@ -132,6 +136,11 @@ CSE_Abstract* lua_register_spawn(CSE_Abstract* object);
 // alife():release on a client, the gate included: true = handled here (an own item released through the host, a
 // refusal, a temporary object that was never created); false = the gate runs the stock code (an ltx override).
 bool lua_release(CSE_Abstract* object);
+// A script_zone with no parent (Personal Adjustable Waypoint's zone under a pin and a right click on the map) is made on the
+// client alone, under a leased id: true when a create of `section` with no parent is such a zone and can be made now. The
+// call gate asks it as "own" of alife():create (alife_simulator_script.cpp), so the create reaches lua_create instead of a
+// refusal; lua_create makes the zone, lua_release takes it out and keeps its id in the pool (xrCoop/coop_local_zones.h).
+bool local_zone(const char* section);
 // A refusal of the request path after the gate let the call through: counted, logged by the gate (name = a kCalls
 // name such as "alife:register"). Returns nullptr.
 CSE_Abstract* lua_refuse(const char* name, const char* why);
@@ -159,6 +168,9 @@ bool client_lease_waiting(u16 id);
 // this world). runs_while_applying: a host command being applied runs it (the round-1 gates); false keeps the refusal
 // then (the gates before round 1). true on a coop client = refuse (the gate counted and logged it).
 bool lua_client_refuse(const char* name, u16 target = u16(-1), bool runs_while_applying = false);
+// F3a multilevel, host: `id` is online at a client: the stock ways of such an object need a game object the host does not have
+// (recon §2.1). The call is refused and counted, the object stays his. True = refused.
+bool held_by_a_client(const char* name, u16 id);
 
 // --- damage (R-5.1) ---
 // CAI_Stalker::Hit hook. true = do not apply here. Host: a player character never takes damage

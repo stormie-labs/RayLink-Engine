@@ -393,6 +393,12 @@ void CRender::LoadSectors(IReader* fs)
 	{
 		CSector* S = (CSector*)Sectors[s];
 		dxRender_Visual* V = S->root();
+		if (!V) // Anomaly Coop: a map server loads no level visuals (r__sector.cpp): no volumes, the first one will do, nothing draws
+		{
+			if (!largest_sector)
+				largest_sector = S;
+			continue;
+		}
 		float vol = V->vis.box.getvolume();
 		if (vol > largest_sector_vol)
 		{

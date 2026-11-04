@@ -76,6 +76,14 @@
 //      late packet of an earlier life of the id and leaves the spawn alone: a late copy of an Abort already answered
 //      (x at or below the declined gen), a Drop {x != 0} (the answer to a destroy of an earlier life), a Done. Without
 //      this a fresh, unregistered spawn is lost (review round 3, H4 and paths a-c).
+//   R13 a reload of the host's process that keeps map servers (the host's move, coop_soft_move.h) is no load. R7 and R8 speak of a load
+//      that ends the map servers; here they do not end: their process, their connection and their Holder live on, so the ledger does too.
+//      Nothing touches it: it is memory of a process that does not die, the journal of that save is not read (it is an older copy of
+//      this very book), resolve_after_load does not run, no gen moves, no peer is registered again. The connections are parked from
+//      before the save until the new world is up, so the book, the save and the map servers cannot part: what the world did up to the
+//      save is in both, what a map server does after it waits. A grant left open times out as ever. The engine marks what the new
+//      simulator does not know is away (Keeper::marks) before its first update, and a map server that does not stay is ended the
+//      ordinary way: server_lost, its objects home.
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 

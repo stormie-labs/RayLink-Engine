@@ -495,7 +495,7 @@ void on_shot_msg(PeerId from, Reader& r)
 		return;
 	++g_stat.events_in;
 	u16 avatar;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		avatar = join::proxy_of_peer(from); // never trust the shooter a client claims
 		if (avatar == 0xffff || sync::host_peer_joining(from) || e.kind > KindLauncher)
@@ -818,7 +818,7 @@ void on_weapon_shot(CWeapon* w)
 		// Live 2026-10-29 (b28): "the client does not hear NPCs shoot". A puppet never fires (no brain, its object handler
 		// held at idle / strapped), so the host relays its own NPCs' shots. Avatars and proxies belong to their players.
 		CGameObject* npc = smart_cast<CGameObject*>(parent);
-		if (!mgr().is_host() || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
+		if (!is_map_authority() || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
 		    world::is_player_character(npc))
 			return;
 		e.shooter = npc->ID();
@@ -847,7 +847,7 @@ void on_weapon_shot(CWeapon* w)
 
 namespace
 {
-bool host_records() { return g_pGameLevel && mgr().is_host(); }
+bool host_records() { return g_pGameLevel && is_map_authority(); }
 
 // A creature whose doings the clients are told: an NPC or a monster, never a player's character.
 bool host_creature(CGameObject* go)
@@ -1026,7 +1026,7 @@ void print_status()
 	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s (v2.1: %u drawn)",
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
 	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off", u32(g_tags.size()));
-	if (mgr().is_host())
+	if (is_map_authority())
 		::Msg("[coop]   presence: npc shots out %llu (%llu with bullets), %llu events out of range or budget, %llu on the "
 		      "reliable lane; weapon sounds %llu, flinches %llu",
 		    g_stat.npc_shots_out, g_stat.npc_bullets_out, g_stat.npc_shots_far, g_stat.firm_out, g_stat.npc_sounds_out,

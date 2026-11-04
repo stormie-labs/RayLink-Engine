@@ -6,6 +6,7 @@
 #include "coop_alife.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_limits.h" // F2 T14 fix 1: limits::Pacer
+#include "xrCoop/coop_ghost_rules.h"
 #include "xrCoop/coop_task_target.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -986,6 +987,7 @@ void apply_record(TaskRec& rec, bool fresh)
 	CGameTask* t = find_task(rec.key());
 	if (!t)
 	{
+		const shared_str active = g_active_task_id; // before detach_task: the copy may be the active one
 		// Another running copy of the same id would block the engine: the host's view wins.
 		if (rec.state == eTaskStateInProgress)
 			if (CGameTask* other = m.HasGameTask(rec.id, true))
@@ -1010,7 +1012,6 @@ void apply_record(TaskRec& rec, bool fresh)
 		t->m_map_object_id = obj;
 		if (rec.state == eTaskStateInProgress)
 		{
-			const shared_str active = g_active_task_id;
 			if (!m.GiveGameTaskToActor(t, 0, false, 0))
 			{
 				::Msg("! [coop] story: cannot add task '%s' from the host", cs(rec.id));
@@ -1167,6 +1168,7 @@ struct RelKey
 	}
 };
 xr_set<RelKey> g_rel_dirty; // host: keys whose current value must be broadcast
+ghost::Log g_ghost_said; // a map server: what its logic said of "the actor", for the players of its level
 xr_map<u16, int> g_rep_delta; // host: proxy -> reputation change from attacks / fight help (sent in frame)
 
 RELATION_DATA& rel_data(u16 id) { return RELATION_REGISTRY::relation_registry().registry().objects(id); }
@@ -1601,7 +1603,9 @@ void client_swap_relations()
 
 bool client_relation_request(u8 op, int a, int b, int v)
 {
-	if (g_action_depth > 0)
+	// A mirror's fight is the host's to count. A map server is the authority of the fights on its level: what they do to goodwill it asks the
+	// world server for like any other relation, and hears it back.
+	if (g_action_depth > 0 && !is_map_server())
 	{
 		++g_stats.action_dropped;
 		return true;
@@ -1675,6 +1679,24 @@ void host_on_relation_request(PeerId from, u8 op, Reader& r)
 		break;
 	}
 	default: break;
+	}
+}
+
+// A map server: what its logic said of "the actor" goes to the players of its level, whenever they come. The outbox has its cap, and a
+// level's first look can say a lot at once.
+void ghost_frame()
+{
+	constexpr u32 kPerFrame = 16;
+	constexpr size_t kOutboxRoom = limits::kMaxRelationOutbox / 2;
+	if (!g_ghost_said.size())
+		return;
+	for (const PeerInfo& p : mgr().session().peers())
+	{
+		const u16 proxy = join::proxy_of_peer(p.id);
+		if (proxy == kNoId || g_outbox.relation_size() >= kOutboxRoom)
+			continue;
+		g_ghost_said.tell(proxy, kPerFrame,
+		    [](const ghost::Said& s) { client_relation_request(s.op, s.first, s.second, s.value); });
 	}
 }
 
@@ -2666,6 +2688,7 @@ void reset()
 	g_state_requests.clear();
 	g_last_reconcile = 0;
 	g_rel_dirty.clear();
+	g_ghost_said.clear();
 	g_rep_delta.clear();
 	g_spot_authors.clear();
 	g_spot_pending.clear();
@@ -2718,7 +2741,11 @@ void frame()
 	}
 	ensure_client_init();
 	replay_deferred();
+	if (is_map_server())
+		ghost_frame();
 	flush_outbox();
+	if (is_map_server())
+		host_flush_rep_deltas(); // a fight on its level: the player's machine owns his reputation, his next Progress tells the world server
 	if (mgr().now_ms() - g_last_reconcile >= kReconcileIntervalMs)
 		client_reconcile(false);
 	progress_frame();
@@ -2939,7 +2966,7 @@ RelationActionScope::RelationActionScope(CEntityAlive* from, int action)
 {
 	// Only the outermost call (ATTACK may call itself for FIGHT_HELP) measures the whole change. A kill is
 	// counted by the killer's own machine (its CEntityAlive::Die runs Action for its actor).
-	if (g_action_depth++ != 0 || action == RELATION_REGISTRY::KILL || !mgr().is_host() || !acts_as_actor(from))
+	if (g_action_depth++ != 0 || action == RELATION_REGISTRY::KILL || !is_map_authority() || !acts_as_actor(from))
 		return;
 	m_owner = smart_cast<CInventoryOwner*>(from);
 	if (!m_owner)
@@ -2959,6 +2986,19 @@ RelationActionScope::~RelationActionScope()
 		g_rep_delta[m_id] += delta; // sent from frame() (this may run on the game thread)
 }
 
+// A map server's actor is a ghost, and id 0 on the world server is the host's character: such a word is the players' of this level, it
+// never goes up as it is. Said while the level loads it waits for them as well.
+static bool ghost_said(const ghost::Said& s)
+{
+	if (!is_map_server() || !ghost::about_actor(s))
+		return false;
+	if (applying_any())
+		++g_stats.derived_dropped;
+	else
+		g_ghost_said.add(s);
+	return true;
+}
+
 bool on_personal_goodwill(u16 from, u16 to, int value, GoodwillOp op)
 {
 	if (!mgr().active() || !ai().get_alife() || !(is_player(from) || is_player(to)))
@@ -2968,9 +3008,11 @@ bool on_personal_goodwill(u16 from, u16 to, int value, GoodwillOp op)
 		g_rel_dirty.insert(RelKey{RelPersonal, from, to});
 		return false;
 	}
+	const u8 req = op == GoodwillOp::Set ? RelReqPersonalSet : op == GoodwillOp::Change ? RelReqPersonalChange : RelReqPersonalForce;
+	if (ghost_said(ghost::Said{req, false, from, to, value}))
+		return true;
 	if (!mgr().is_live_client())
 		return false;
-	const u8 req = op == GoodwillOp::Set ? RelReqPersonalSet : op == GoodwillOp::Change ? RelReqPersonalChange : RelReqPersonalForce;
 	return client_relation_request(req, from, to, value);
 }
 
@@ -2983,9 +3025,12 @@ bool on_community_goodwill(int community, u16 to, int value, GoodwillOp op)
 		g_rel_dirty.insert(RelKey{RelCommunity, community, to});
 		return false;
 	}
+	const u8 req = op == GoodwillOp::Change ? RelReqCommunityChange : RelReqCommunitySet;
+	if (ghost_said(ghost::Said{req, true, community, to, value}))
+		return true;
 	if (!mgr().is_live_client())
 		return false;
-	return client_relation_request(op == GoodwillOp::Change ? RelReqCommunityChange : RelReqCommunitySet, community, to, value);
+	return client_relation_request(req, community, to, value);
 }
 
 bool on_community_relation(int community_from, int community_to, int value)

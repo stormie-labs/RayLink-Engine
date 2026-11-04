@@ -325,6 +325,18 @@ void CEngineAPI::CreateRendererList()
 #else
 	// TODO: ask renderers if they are supported!
 	if (vid_quality_token != NULL) return;
+
+	// Anomaly Coop: a map server does not probe the GPU, that loads the video driver for nothing: R4 is what this exe links,
+	// on WARP (dx10HW.cpp). xrRender is attached in Initialize.
+	if (g_coop_headless)
+	{
+		vid_quality_token = xr_alloc<xr_token>(2);
+		vid_quality_token[0].id = 0;
+		vid_quality_token[0].name = "renderer_r4";
+		vid_quality_token[1].id = -1;
+		vid_quality_token[1].name = NULL;
+		return;
+	}
 	bool bSupports_r2 = false;
 	bool bSupports_r2_5 = false;
 	bool bSupports_r3 = false;

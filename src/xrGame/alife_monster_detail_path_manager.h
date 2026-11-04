@@ -67,6 +67,7 @@ public:
 	void update();
 	void on_switch_online();
 	void on_switch_offline();
+	void skip_time(); // Anomaly Coop: it comes from another process's simulation, the next update counts from now
 	IC void speed(const float& speed);
 
 public:

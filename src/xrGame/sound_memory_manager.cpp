@@ -28,6 +28,7 @@
 #include "movement_manager_space.h"
 #include "stalker_planner.h"
 #include "ai_sounds.h"
+#include "coop/coop_ai.h" // Anomaly Coop: the ghost of a map server
 
 #ifndef MASTER_GOLD
 #	include "actor.h"
@@ -133,6 +134,8 @@ void CSoundMemoryManager::feel_sound_new(CObject* object, int sound_type, CSound
                                          const Fvector& position, float sound_power)
 {
 	PROF_EVENT("SoundMemory::feel_sound_new");
+	if (coop::npc_ai::ghost(object)) // Anomaly Coop: a map server's actor is nobody
+		return;
 #ifndef MASTER_GOLD
 	if (object && smart_cast<CActor*>(object) && psAI_Flags.test(aiIgnoreActor))
 		return;
@@ -523,7 +526,7 @@ void CSoundMemoryManager::load(IReader& packet)
 			delayed_object.m_object_id,
 			m_object->ID());
 		if (!spawn_callback || !spawn_callback->m_object_callback)
-			if (!g_dedicated_server)
+			if (!g_dedicated_server || g_coop_headless)
 				Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
 #ifdef DEBUG
 		else {

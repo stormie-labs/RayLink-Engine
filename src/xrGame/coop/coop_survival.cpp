@@ -3,6 +3,8 @@
 #include "coop_survival.h"
 #include "coop_manager.h"
 #include "coop_join.h"
+#include "coop_levels.h"
+#include "coop_mapserver.h"
 #include "coop_world.h"
 #include "coop_net.h"
 #include "coop_script.h"
@@ -10,6 +12,8 @@
 #include "coop_death.h"
 #include "coop_checkpoints.h"
 #include "coop_money.h"
+#include "coop_ai.h"
+#include "coop_requests.h"
 #include "xrCoop/coop_checkpoint_store.h"
 #include "xrCoop/coop_revive_hold.h"
 
@@ -97,6 +101,8 @@ using revive::OpRefused;
 using revive::OpEvacuate;
 using revive::OpBegin;
 using revive::OpCancel;
+using revive::OpLosses;
+using revive::OpStash;
 using revive::OpReviving;
 using revive::OpStopped;
 using revive::OpDone;
@@ -193,6 +199,8 @@ death::Rules console_rules()
 	r.wear_pct = console_pct(g_cv_death_wear);
 	r.rank_pct = console_pct(g_cv_death_rank);
 	r.share_pct = console_share(g_cv_death_share);
+	r.friendly_fire = g_coop_friendly_fire != 0;
+	r.finish_downed = npc_ai::finish_downed();
 	return r;
 }
 
@@ -295,8 +303,13 @@ struct Retirement
 	bool releasing = false;
 	u64 next_try = 0;
 	u32 tries = 0;
+	// F3a: his body stands on a map server's level: the stash is made there (OpStash), its word comes back (host_stash_over)
+	bool at_map_server = false;
+	bool answered = false;
+	bool things_stay = false;
 };
 xr_map<u16, Retirement> g_retire;
+xr_vector<u16> g_stashing; // a map server: the retiring characters of its level whose stash is under way
 bool g_wipe_fired = false; // coop_group_wipe went out; again only after somebody stood up
 u64 g_rollback_at = 0; // rollback mode: when the host goes back to the last save, 0 = not on the way
 u32 g_epoch = 0xffffffff;
@@ -1242,7 +1255,8 @@ void host_check_wipe()
 	if (g_world_rules.mode == death::Mode::Rollback)
 		return; // the group is on its way back, nothing to stay and watch
 	std::vector<u8> lives;
-	lives.push_back(u8(g_me.life));
+	if (mgr().session().local()) // a dedicated host has no life of its own in the group
+		lives.push_back(u8(g_me.life));
 	for (const auto& it : g_players)
 		if (!world::is_parked(it.first))
 			lives.push_back(u8(it.second.life));
@@ -1260,13 +1274,18 @@ void host_check_wipe()
 bool host_order_respawn(u16 id, u16 seq)
 {
 	CGameObject* body = object_here(id);
-	if (!body)
+	// F3a multilevel: a player on another level has no object here. He comes back on his own level, from where his server entity
+	// stands; the anchor is a place on the level the host knows him on, it means nothing there.
+	const CSE_ALifeDynamicObject* away = !body && levels::host_character_elsewhere(id) && ai().get_alife() ?
+	    ai().alife().objects().object(id, true) :
+	    nullptr;
+	if (!body && !away)
 		return false;
 	HostRec& h = g_host[id];
 	h.ordered_seq = seq; // before the order: the owner's Respawning report clears it (the host player's too, F3a T7)
 	Fvector pos;
 	checkpoint::Kind kind = checkpoint::Kind::None;
-	if (!checkpoints::host_respawn_point(id, h.has_anchor ? &h.anchor : nullptr, body->Position(), pos, kind))
+	if (!checkpoints::host_respawn_point(id, body && h.has_anchor ? &h.anchor : nullptr, body ? body->Position() : away->o_Position, pos, kind))
 		::Msg("! [coop] respawn of %s: no checkpoint store in this world, back where the body lies", nick_of(id).c_str());
 	pos.y += kRespawnLift;
 	::Msg("[coop] respawn of %s (fall #%u): %s at (%.1f, %.1f, %.1f)", nick_of(id).c_str(), seq,
@@ -1282,11 +1301,31 @@ bool host_order_respawn(u16 id, u16 seq)
 	return true;
 }
 
+// The map server whose level his body stands on: the body is an object of that level, what touches it is done there. kInvalidPeer: here.
+PeerId bridge_of_body(u16 character)
+{
+	const PeerId peer = peer_of_character(character);
+	return peer != kInvalidPeer && !levels::on_host_level(peer) ? mapserver::bridge_of(levels::level_of_player(peer)) : kInvalidPeer;
+}
+
 // Checkpoint death: the items (coop_death, by coop_death_drop) and the money go now, the owner is evacuated for
 // coop_respawn_delay, host_frame respawns him.
 void host_take_losses_and_evacuate(u16 id, u16 seq)
 {
-	const u32 items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
+	const PeerId bridge = bridge_of_body(id);
+	u32 items = 0;
+	if (bridge != kInvalidPeer)
+	{
+		Writer w(8);
+		w.u8(OpLosses);
+		w.u16(id);
+		w.u16(seq);
+		w.u8(u8(g_world_rules.drop));
+		w.u8(g_world_rules.share_pct);
+		net::host_send(bridge, Msg::PlayerRevive, w);
+	}
+	else
+		items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
 	const u32 money = death::host_take_money(id, g_world_rules.money_pct);
 	::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(), seq,
 	    items, death::drop_name(g_world_rules.drop), u32(g_world_rules.share_pct), money, g_world_rules.delay_ms / 1000);
@@ -1714,8 +1753,9 @@ void host_retire_frame(u64 t)
 		}
 		const bool client = character != 0;
 		const bool here = client ? character_entity(character) != nullptr : local_actor() != nullptr;
-		const death::StashOutcome stash = death::host_stash_outcome(character);
-		const u32 left = client && stash != death::StashOutcome::Pending ? death::host_items_on(character) : 0;
+		const death::StashOutcome stash =
+		    r.at_map_server ? death::remote_stash_outcome(r.answered, r.things_stay, t - r.since) : death::host_stash_outcome(character);
+		const u32 left = client && !r.at_map_server && stash != death::StashOutcome::Pending ? death::host_items_on(character) : 0;
 		switch (death::retire_step(here, stash, left != 0, client))
 		{
 		case death::RetireStep::Wait: ++it; continue;
@@ -1763,6 +1803,7 @@ void host_new_character(u16 character)
 	death::learn_out(h.tracker, flag_read(character, kOutKey));
 	const xr_string who = nick_of(character);
 	const char* refused = nullptr;
+	const PeerId bridge = bridge_of_body(character);
 	switch (death::on_new_character(h.tracker, g_retire.find(character) != g_retire.end()))
 	{
 	case death::NewCharVerdict::Busy:
@@ -1770,7 +1811,7 @@ void host_new_character(u16 character)
 		return;
 	case death::NewCharVerdict::NotOut: refused = "he is not out of a hardcore run"; break;
 	case death::NewCharVerdict::Start:
-		if (character == 0 ? !local_actor() : !object_here(character))
+		if (bridge == kInvalidPeer && (character == 0 ? !local_actor() : !object_here(character)))
 			refused = "his character is not in the world here";
 		break;
 	}
@@ -1782,6 +1823,17 @@ void host_new_character(u16 character)
 	}
 	Retirement r;
 	r.since = now();
+	if (bridge != kInvalidPeer)
+	{
+		Writer w(4);
+		w.u8(OpStash);
+		w.u16(character);
+		net::host_send(bridge, Msg::PlayerRevive, w);
+		r.at_map_server = true;
+		g_retire[character] = r;
+		::Msg("[coop] %s starts a new character: his things go into a stash on his level", who.c_str());
+		return;
+	}
 	r.stash = death::host_move_to_stash(character, true); // everything, worn and quest items included
 	g_retire[character] = r;
 	if (r.stash != 0xffff)
@@ -1810,10 +1862,24 @@ void host_frame(u64 t)
 		// F3 Task 10: whoever was out of a hardcore run carries that too (kOutKey) and watches again. A retirement of
 		// the old world is void (its stash is released empty, death::abandon_stashes): he may ask again here.
 		g_epoch = epoch;
-		g_host.clear();
-		if (!g_retire.empty())
-			::Msg("[coop] a new world: %u retirement(s) of the old one dropped", u32(g_retire.size()));
-		g_retire.clear();
+		// Who stayed in his world through the host's move (xrCoop/coop_soft_move.h) lost nothing to this: his wounds, the revive over him, a
+		// retirement on his map server's level go on.
+		const auto stayed = [](u16 character) { return join::host_stayed_in_world(join::peer_of_proxy(character)); };
+		for (auto it = g_host.begin(); it != g_host.end();)
+			it = stayed(it->first) ? std::next(it) : g_host.erase(it);
+		u32 dropped = 0;
+		for (auto it = g_retire.begin(); it != g_retire.end();)
+		{
+			if (stayed(it->first))
+				++it;
+			else
+			{
+				it = g_retire.erase(it);
+				++dropped;
+			}
+		}
+		if (dropped)
+			::Msg("[coop] a new world: %u retirement(s) of the old one dropped", dropped);
 		g_wipe_fired = false;
 		g_rollback_at = 0;
 	}
@@ -1929,7 +1995,20 @@ void server_on_state(PeerId from, Reader& r)
 	const u16 seq = r.u16();
 	const u32 left = r.u32();
 	const std::string nick = r.str();
-	if (!r.ok() || life > u8(Life::Respawning) || !mgr().is_host())
+	if (!r.ok() || life > u8(Life::Respawning))
+		return;
+	if (is_map_server())
+	{
+		// the tunnel's copy: the body is an object of this level, and the report comes in step with his stream
+		const u16 own = character_of_peer(from);
+		if (own == 0xffff)
+			return;
+		if (Life(life) == Life::Dead)
+			host_read_worn(own, seq, r); // the losses are taken here, on the world server's word (OpLosses)
+		apply_remote_state(own, Life(life), seq, left, nick.c_str());
+		return;
+	}
+	if (!mgr().is_host())
 		return;
 	const u16 id = character_of_peer(from);
 	if (id == 0xffff)
@@ -1960,6 +2039,8 @@ void client_on_state(PeerId from, Reader& r)
 		return;
 	if (!mgr().is_live_client() || from != kHostPeer || id == my_host_id())
 		return; // our own state is ours
+	if (is_map_server() && peer_of_character(id) != kInvalidPeer)
+		return; // a player of this level: his own report came through the tunnel
 	apply_remote_state(id, Life(life), seq, left, nick.c_str());
 }
 
@@ -1967,8 +2048,10 @@ void client_on_state(PeerId from, Reader& r)
 void server_on_revive(PeerId from, Reader& r)
 {
 	const u8 op = r.u8();
-	if (!r.ok() || !mgr().is_host() || !revive::is_client_op(op))
+	if (!r.ok() || !is_map_authority() || !revive::is_client_op(op))
 		return; // orders come only from the world server
+	if (mgr().is_host() && !levels::on_host_level(from))
+		return; // the bodies stand on a map server's level: its copy is judged there
 	const u16 reviver = character_of_peer(from);
 	if (reviver == 0xffff)
 		return;
@@ -2006,6 +2089,26 @@ void server_on_revive(PeerId from, Reader& r)
 void client_on_revive(PeerId from, Reader& r)
 {
 	const u8 op = r.u8();
+	if (r.ok() && op == OpLosses)
+	{
+		const u16 character = r.u16();
+		const u16 seq = r.u16();
+		const u8 drop = r.u8();
+		const u8 share = r.u8();
+		if (r.ok() && is_map_server() && from == kHostPeer && drop <= u8(death::Drop::Keep))
+			death::host_apply_losses(character, seq, death::Drop(drop), share);
+		return;
+	}
+	if (r.ok() && op == OpStash)
+	{
+		const u16 character = r.u16();
+		if (r.ok() && is_map_server() && from == kHostPeer && std::find(g_stashing.begin(), g_stashing.end(), character) == g_stashing.end())
+		{
+			death::host_move_to_stash(character, true);
+			g_stashing.push_back(character);
+		}
+		return;
+	}
 	if (r.ok() && live() && from == kHostPeer && !revive::is_client_op(op))
 		apply_order(op, r);
 }
@@ -2031,6 +2134,25 @@ void on_new_character_msg(PeerId from, Reader&)
 // world server's own are g_world_rules).
 void on_rules_msg(PeerId from, Reader& r)
 {
+	if (is_map_server() && from == kHostPeer)
+	{
+		death::Rules rules = g_world_rules; // no player here: what it judges by (the revive of a player of its level)
+		if (!rules.read(r))
+		{
+			::Msg("! [coop] map server: malformed PlayerRules ignored, the rules stay as they were");
+			return;
+		}
+		static bool told = false; // the host sends them every few seconds
+		const bool changed = !told || !(rules == g_world_rules);
+		told = true;
+		g_world_rules = rules;
+		g_coop_friendly_fire = rules.friendly_fire ? 1 : 0; // no game record here: its console is the machine's
+		npc_ai::set_finish_downed(rules.finish_downed);
+		if (changed)
+			::Msg("[coop] map server: the world's rules: friendly fire %s, stalkers finish a downed player %s", rules.friendly_fire ? "on" : "off",
+			    rules.finish_downed ? "on" : "off");
+		return;
+	}
 	if (!is_player() || from != kHostPeer)
 		return;
 	death::Rules rules = g_rules;
@@ -2487,8 +2609,7 @@ void build_hud(u64 t)
 				line("Fire: next player   Aim: previous player", 0xffa0a0a0, false);
 			}
 			else
-				line(tr("st_coop_evac_no_allies", "Nobody is left alive. The world is not rolled back.").c_str(),
-				    0xffa0a0a0, false);
+				line(tr("st_coop_evac_no_watch", "Nobody here to watch.").c_str(), 0xffa0a0a0, false);
 		}
 		break;
 	case Life::Respawning: line("Respawning...", 0xfff0f0f0, true); break;
@@ -2561,6 +2682,7 @@ void leave_session()
 	forget_local();
 	g_host.clear(); // the respawn debts stay in the world (custom data), not here
 	g_retire.clear(); // a stash still waiting is released empty (death::reset); the character stays out
+	g_stashing.clear();
 	g_wipe_fired = false;
 	g_rollback_at = 0;
 	g_rules_from_host = false;
@@ -2610,6 +2732,13 @@ public:
 	void Info(TInfo& I) override { xr_strcpy(I, "test: drop my health to zero (falls wounded in a co-op session)"); }
 };
 } // namespace
+
+void host_send_rules(PeerId bridge)
+{
+	Writer w(16);
+	g_world_rules.write(w);
+	net::host_send(bridge, Msg::PlayerRules, w);
+}
 
 // ---------------------------------------------------------------- public
 
@@ -2696,6 +2825,12 @@ xr_string nick_of(u16 host_id)
 
 u16 character_of_peer(PeerId peer)
 {
+	if (is_map_server())
+	{
+		const auto& on = mapserver::trunk_peers().on();
+		const auto it = on.find(peer);
+		return it == on.end() ? u16(0xffff) : u16(it->second.proxy);
+	}
 	if (!mgr().is_host())
 		return 0xffff;
 	if (peer == kHostPeer)
@@ -2705,6 +2840,13 @@ u16 character_of_peer(PeerId peer)
 
 PeerId peer_of_character(u16 character)
 {
+	if (is_map_server())
+	{
+		for (const auto& it : mapserver::trunk_peers().on())
+			if (it.second.proxy == character)
+				return it.first;
+		return kInvalidPeer;
+	}
 	if (!mgr().is_host() || character == 0xffff)
 		return kInvalidPeer;
 	if (character == 0)
@@ -2810,11 +2952,20 @@ bool revive_progress(ReviveProgress& out)
 	return out.reviving || out.wounded;
 }
 
+void host_stash_over(u16 character, bool things_stay)
+{
+	const auto it = g_retire.find(character);
+	if (it == g_retire.end() || !it->second.at_map_server)
+		return; // it gave up waiting: he stays out and may ask again
+	it->second.answered = true;
+	it->second.things_stay = things_stay;
+}
+
 bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 {
 	out.clear();
-	if (!mgr().is_host())
-		return false;
+	if (!is_map_authority())
+		return false; // a map server takes the losses of its level and keeps the list of his Dead report (host_read_worn)
 	const auto it = g_host.find(character);
 	if (it == g_host.end() || !it->second.has_worn || it->second.worn_seq != seq)
 		return false;
@@ -2854,6 +3005,27 @@ void register_console()
 	CMD1(CCC_CoopNewCharacter, "coop_new_character"); // F3 Task 10
 }
 
+namespace
+{
+// A map server: the retirements of its level that are over go up, after the Parent of each thing that moved (the same queue). Its word
+// on what stayed on him counts: the body is its object.
+void server_stash_frame()
+{
+	for (size_t i = 0; i < g_stashing.size();)
+	{
+		const u16 character = g_stashing[i];
+		const death::StashOutcome stash = death::host_stash_outcome(character);
+		if (stash == death::StashOutcome::Pending)
+		{
+			++i;
+			continue;
+		}
+		levels::up_stash(character, stash == death::StashOutcome::GaveUp || death::host_items_on(character) != 0);
+		g_stashing.erase(g_stashing.begin() + i);
+	}
+}
+} // namespace
+
 void reset()
 {
 	end_spectate_fade();
@@ -2880,6 +3052,8 @@ void frame()
 	const u64 t = now();
 	if (mgr().is_host())
 		host_frame(t);
+	else if (is_map_server())
+		server_stash_frame();
 	if (!g_rules_from_host)
 		g_rules = console_rules(); // until the world server's rules arrive (F3a T7: the host player's too, over the link)
 
@@ -2943,6 +3117,7 @@ void print_status()
 	for (const auto& it : g_retire)
 		::Msg("[coop]   host: character %u retires, %llu s, stash %u %s", it.first, (t - it.second.since) / 1000,
 		    u32(it.second.stash), it.second.releasing ? "done, leaving the world" :
+		    it.second.at_map_server && !it.second.answered ? "waits for the map server of his level" :
 		    death::host_stash_pending(it.first) ? "waits for his things" : "is done");
 	for (const auto& it : g_host)
 	{
@@ -3026,6 +3201,9 @@ bool ignores_hits()
 
 bool intercept_actor_kill(CEntity* victim, u16 killer_id)
 {
+	// a ghost is nobody: what the stock world does to "the actor" (an emission, a script) means nothing here
+	if (victim && ghost_actor() && smart_cast<CActor*>(victim) == g_actor)
+		return true;
 	if (!victim || !live())
 		return false;
 	if (world::is_player_proxy(victim->ID()))

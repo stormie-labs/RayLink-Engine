@@ -316,8 +316,17 @@ enum class Reason : uint8_t
 	Sleep,
 	LevelChange,
 	SessionEnd,
+	Transfer, // requirement 8: a map server starts or stops
 	Manual
 };
+
+// Requirement 8: before a map server starts or stops the world is saved, unless a save of any reason is this fresh: a wave of players
+// through a transition starts several at once, and one save serves them all. last_ms 0 = none yet.
+constexpr uint64_t kTransferSaveFreshMs = 60 * 1000;
+inline bool transfer_save_needed(uint64_t last_ms, uint64_t now_ms)
+{
+	return last_ms == 0 || now_ms < last_ms || now_ms - last_ms >= kTransferSaveFreshMs;
+}
 
 // State of the timer. last_ms = host clock of the last save (0 = the start of the clock); busy_since = when the save
 // first came due while the host was busy (0 = not postponed).

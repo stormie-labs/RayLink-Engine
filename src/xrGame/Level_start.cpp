@@ -275,6 +275,8 @@ bool CLevel::net_start6()
 	else
 	{
 		Msg("! Failed to start client. Check the connection or level existance.");
+		if (g_coop_headless) // Anomaly Coop: no menu to fall back to: the host's process must see this one die, not wait for it
+			FATAL("[coop] map server: the level did not start");
 
 		if (m_connect_server_err == xrServer::ErrConnect && !psNET_direct_connect && !g_dedicated_server)
 		{
@@ -335,7 +337,7 @@ bool CLevel::net_start6()
 		return true;
 	}
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		if (CurrentGameUI())
 			CurrentGameUI()->OnConnected();

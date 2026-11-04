@@ -483,6 +483,9 @@ bool CVisualMemoryManager::should_ignore_object(CObject const* object) const
 		return true;
 	}
 
+	if (coop::npc_ai::ghost(object)) // Anomaly Coop: a map server's actor is nobody
+		return true;
+
 #ifndef MASTER_GOLD
 	if ( smart_cast<CActor const*>(object) && psAI_Flags.test(aiIgnoreActor) )
 	{
@@ -964,7 +967,7 @@ void CVisualMemoryManager::load(IReader& packet)
 			delayed_object.m_object_id,
 			m_object->ID());
 		if (!spawn_callback || !spawn_callback->m_object_callback)
-			if (!g_dedicated_server)
+			if (!g_dedicated_server || g_coop_headless)
 				Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
 #ifdef DEBUG
 		else {

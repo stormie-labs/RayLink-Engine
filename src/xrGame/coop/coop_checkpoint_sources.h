@@ -77,6 +77,7 @@ const char* place_name(Place p);
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void host_frame(u64 now_ms); // host, main thread: checkpoints::frame
+void map_server_scan(u64 now_ms); // a map server: its level's campfires and tents, for rest_place
 void player_frame(); // F3a T7, a player, main thread (checkpoints::frame): the host player's claim goes out
 void reset(); // checkpoints::reset
 void print_status(); // checkpoints::print_status
@@ -94,6 +95,8 @@ bool host_register_source(u16 id, float radius);
 bool host_unregister_source(u16 id);
 // Host: a claim of `character` (see the top of the file).
 void host_claim_tent(u16 character, checkpoint::ClaimWhat what, const Fvector& pos);
+// World server: a map server put up tent `tent` for `character` on its level: its owner into the book, his camp on it.
+void host_tent_up(u16 tent, u16 character);
 // Host: the character who owns tent `id` (by the key on it), 0xffff if nobody's or he is not in this world.
 u16 host_tent_owner(u16 tent);
 // Any machine: coop.checkpoint.claim_tent. True if the claim was handed to the host.

@@ -31,7 +31,7 @@ bool CLevel::Load_GameSpecific_Before()
 		!net_Hosts.empty())
 		ai().load(net_SessionName());
 
-	if (!g_dedicated_server && !ai().get_alife() && ai().get_game_graph() && FS.exist(fn_game, "$level$", "level.game"))
+	if ((!g_dedicated_server || g_coop_headless) && !ai().get_alife() && ai().get_game_graph() && FS.exist(fn_game, "$level$", "level.game"))
 	{
 		IReader* stream = FS.r_open(fn_game);
 		ai().patrol_path_storage_raw(*stream);
@@ -170,7 +170,7 @@ bool CLevel::Load_GameSpecific_After()
 		}
 	}
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		// loading scripts
 		ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);

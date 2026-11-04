@@ -98,7 +98,7 @@ CMainMenu::CMainMenu()
 	GetCDKeyFromRegistry();
 	m_demo_info_loader = NULL;
 
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless) // Anomaly Coop: CUIButton and CUIStatic read these unchecked
 	{
 		g_btnHint = xr_new<CUIButtonHint>();
 		g_statHint = xr_new<CUIButtonHint>();

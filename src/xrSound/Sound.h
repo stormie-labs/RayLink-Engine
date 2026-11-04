@@ -43,6 +43,9 @@ XRSOUND_API extern int psSoundTargets;
 XRSOUND_API extern float snd_efx_environment_change_time;
 XRSOUND_API extern float psSpeedOfSound;
 XRSOUND_API extern int psSoundCacheSizeMB;
+// Anomaly Coop: a map server. Set before CSound_manager_interface::_create. No device and nothing decoded, but the sounds are there as
+// always: a source knows its file and its length, an emitter runs by the clock and tells the objects around it (SoundRender_CoreA.cpp).
+XRSOUND_API extern bool psSoundSilent;
 XRSOUND_API extern xr_token* snd_devices_token;
 XRSOUND_API extern xr_string snd_device_name;
 

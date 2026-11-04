@@ -3,6 +3,7 @@
 #include "coop_instrument.h"
 #include "attachable_item.h"
 #include "coop_manager.h"
+#include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -77,6 +78,9 @@ u64 g_last_snapshot = 0;
 u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_sent = 0, g_snapshots_sent = 0;
 u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
 
+// F3a multilevel: online here, or "online at a client" (coop_levels_alife.cpp): a player of the host's level hears the first only.
+bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !levels::online_at_server(e->ID); }
+
 void write_packet(Writer& w, const NET_Packet& p)
 {
 	w.u16(u16(p.B.count));
@@ -107,7 +111,7 @@ void write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Pa
 {
 	w.u16(e->ID);
 	w.u16(e->ID_Parent);
-	w.boolean(e->m_bOnline);
+	w.boolean(online_here(e));
 	write_placement(w, e);
 	write_packet(w, spawn);
 	write_packet(w, update);
@@ -609,7 +613,7 @@ bool row_alive(CSE_ALifeDynamicObject* e)
 	CSE_ALifeMonsterAbstract* m = e->cast_monster_abstract();
 	if (!m)
 		return true;
-	if (e->m_bOnline && g_pGameLevel)
+	if (online_here(e) && g_pGameLevel)
 		if (CEntityAlive* a = smart_cast<CEntityAlive*>(Level().Objects.net_Find(e->ID)))
 			return !!a->g_Alive();
 	return m->g_Alive();
@@ -627,7 +631,7 @@ bool held_by_the_living(CSE_ALifeDynamicObject* e, bool& root_online)
 			break;
 		root = holder;
 	}
-	root_online = root->m_bOnline;
+	root_online = online_here(root);
 	if (root == e)
 		return false;
 	if (root->ID == 0 || world::is_player_character(root))
@@ -654,7 +658,7 @@ bool row_of(CSE_ALifeDynamicObject* e, reconcile::Row& r)
 	CSE_ALifeOnlineOfflineGroup* group = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e);
 	// A squad from the wire stays offline here and its members switch one by one (apply_group_switch): its vote tells.
 	if (r.parent == kNoId)
-		r.online = group && mgr().is_client() ? g_online.count(e->ID) != 0 : !!e->m_bOnline;
+		r.online = group && is_mirror() ? g_online.count(e->ID) != 0 : online_here(e);
 	r.alive = row_alive(e);
 	r.kind = reconcile::kind_of(e->s_name.c_str());
 	if (group)
@@ -725,14 +729,15 @@ void host_reconcile()
 	reconcile::write(w, reconcile::hash_bucket(bucket, rows));
 	for (const PeerInfo& p : peers)
 		if (peer_is_in_world(p))
-			net::host_send(p.id, Msg::EntityHash, w);
+			if (levels::passes_to(Msg::EntityHash, p.id)) // F3a multilevel: a digest of the host's level's stream
+				net::host_send(p.id, Msg::EntityHash, w);
 	++g_rc.digests;
 }
 
 void host_on_resync(PeerId from, Reader& r)
 {
 	const u8 bucket = r.u8();
-	if (!mgr().is_host() || !r.ok() || bucket >= xfer::kBuckets)
+	if (!is_map_authority() || !r.ok() || bucket >= xfer::kBuckets)
 		return;
 	for (const RosterAsk& ask : g_rc_asked)
 		if (ask.peer == from && ask.bucket == bucket)
@@ -1134,7 +1139,8 @@ void client_on_spawn(PeerId, Reader& r)
 	alife_rw().register_object(e, true);
 	g_id_retry.done(id_host);
 	// B2: a child follows its holder HERE; the host's flag of a child is its holder's state there (xrCoop/coop_mirror.h).
-	switch (mirror::placement(parent != kNoId, online, holder && holder->m_bOnline,
+	// F3a: on the world server a holder that a map server took is online by its flag alone (host_mark): that is no holder online here.
+	switch (mirror::placement(parent != kNoId, online, holder && online_here(holder),
 	    holder && alife_rw().server().ID_to_entity(parent)))
 	{
 	case mirror::Placement::SwitchVote:
@@ -1407,7 +1413,7 @@ void host_on_entity_request(PeerId from, Reader& r)
 		CSE_ALifeDynamicObject* squad = m && m->m_group_id != kNoId ? ai().alife().objects().object(m->m_group_id, true) : nullptr;
 		CSE_ALifeDynamicObject* who = squad ? squad : e;
 		Writer w(256);
-		write_switch(w, who, who->m_bOnline);
+		write_switch(w, who, online_here(who));
 		net::host_send(from, Msg::EntitySwitch, w);
 	}
 	if (what & reconcile::Parent)
@@ -1474,7 +1480,7 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 
 void install_server(Session& s)
 {
-	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (mgr().is_host()) host_on_entity_request(from, r); });
+	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (is_map_authority()) host_on_entity_request(from, r); });
 	s.on(Msg::EntityResync, &host_on_resync);
 }
 
@@ -1531,7 +1537,7 @@ void host_send_online_to(PeerId to)
 	for (const auto& it : ai().alife().objects().objects())
 	{
 		CSE_ALifeDynamicObject* e = it.second;
-		if (!e || !e->m_bOnline || e->ID_Parent != kNoId || e->ID == 0)
+		if (!e || !online_here(e) || e->ID_Parent != kNoId || e->ID == 0)
 			continue; // the host's actor is the client's proxy of him: no switch ever (host_on_switch skips 0)
 		Writer w(256);
 		write_switch(w, e, true);
@@ -1541,6 +1547,37 @@ void host_send_online_to(PeerId to)
 	g_host_switches += sent;
 	::Msg("[coop] online set of the new world -> #%u: %u object(s)", to, sent);
 }
+
+void write_entity(Writer& w, CSE_ALifeDynamicObject* e)
+{
+	NET_Packet spawn, update;
+	e->Spawn_Write(spawn, FALSE);
+	update.w_begin(M_UPDATE);
+	e->UPDATE_Write(update);
+	// the host's numbering on the wire: the only ids that differ here are his actor and his proxy, and those hold what he makes
+	w.u16(join::to_host(e->ID));
+	w.u16(e->ID_Parent == kNoId ? kNoId : join::to_host(e->ID_Parent));
+	w.boolean(false);
+	write_placement(w, e);
+	write_packet(w, spawn);
+	write_packet(w, update);
+}
+
+void host_spawn_from_leader(Reader& r)
+{
+	ApplyGuard guard;
+	client_on_spawn(kHostPeer, r);
+}
+
+void host_send_place(PeerId to, CSE_ALifeDynamicObject* e)
+{
+	Writer w(256);
+	write_switch(w, e, false);
+	net::host_send(to, Msg::EntitySwitch, w);
+	++g_host_switches;
+}
+
+void place_offline(CSE_ALifeDynamicObject* e, const Fvector& pos, const Fvector& ang, u32 node, u16 graph) { place(e, pos, ang, node, graph); }
 
 void host_collect_online(xr_vector<u16>& out)
 {
@@ -1552,27 +1589,32 @@ void host_collect_online(xr_vector<u16>& out)
 	for (const auto& it : ai().alife().objects().objects())
 	{
 		const CSE_ALifeDynamicObject* e = it.second;
-		if (e && e->m_bOnline && e->ID_Parent == kNoId)
+		if (e && online_here(e) && e->ID_Parent == kNoId)
 			out.push_back(e->ID);
 	}
 }
 
+bool host_records() { return is_map_authority() && !(is_map_server() && g_applying); }
+
 void host_on_entity_registered(CSE_ALifeDynamicObject* e)
 {
-	if (mgr().is_host() && e)
+	if (host_records() && e)
 		g_host_events.push_back({HostEventKind::Registered, e->ID, false});
+	if (e)
+		levels::up_spawned(e->ID); // F3a: a map server tells the world server
 }
 
 void host_on_entity_released(u16 id)
 {
 	syncapi::on_entity_destroyed(id); // F2 T14: its coop.sync scope goes (host, single player; any game thread)
-	if (mgr().is_host())
+	if (host_records())
 		g_host_events.push_back({HostEventKind::Released, id, false});
+	levels::xfer_on_released(id); // F3a: a map server tells the world server
 }
 
 void host_on_switch(CSE_ALifeDynamicObject* e, bool online)
 {
-	if (mgr().is_host() && e && e->ID != 0)
+	if (host_records() && e && e->ID != 0)
 		g_host_events.push_back({HostEventKind::Switched, e->ID, online});
 }
 
@@ -1612,7 +1654,7 @@ void on_client_live()
 
 void reconcile_frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_reconcile();
 	else if (mgr().is_live_client())
 		client_reconcile();
@@ -1675,7 +1717,7 @@ void mirror_on_destroy(xrServer& server, CSE_Abstract* entity)
 		    entity->ID, entity->s_name.c_str(), entity->ID_Parent, holder->name_replace(), Device.dwFrame);
 }
 
-bool is_mirrored(u16 id) { return mgr().is_client() && id != 0; }
+bool is_mirrored(u16 id) { return is_mirror() && id != 0; }
 
 bool client_applying() { return g_applying > 0; }
 
@@ -1684,7 +1726,7 @@ ClientApply::~ClientApply() { --g_applying; }
 
 bool intercept_local_spawn(CSE_Abstract* entity)
 {
-	if (!mgr().is_client() || g_applying || !entity)
+	if (!is_mirror() || g_applying || !entity)
 		return false;
 	// Only the host creates entities. Things our player caused (parent is our actor or one of
 	// its items) go to the host as a request; world-caused spawns (loot on death, smart
@@ -1806,7 +1848,7 @@ bool drive_mirror(CGameObject* obj)
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		// Level-change review: what the engine recorded while the world was not up belongs to a world that is gone, or is
 		// being built (every client rejoins from the new world's save): an id of the old one names another object in the
@@ -1826,7 +1868,7 @@ void print_status()
 {
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);

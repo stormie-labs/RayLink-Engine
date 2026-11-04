@@ -70,6 +70,11 @@ constexpr float kShareDefaultPct = 100.0f;
 constexpr float kShareMaxPct = 200.0f;
 constexpr uint32_t kShareMaxByte = 200; // Rules::share_pct on the wire
 
+// Protocol 28, the party byte that closes Rules: what a map server judges a hit and a downed player by. It has no game record, the
+// world's rules come to it here (coop_friendly_fire, coop_npc_finish_downed).
+constexpr uint8_t kPartyFriendlyFire = 1;
+constexpr uint8_t kPartyFinishDowned = 2;
+
 // The host's death settings; one copy, sent to every client (Msg::DeathRules). The defaults are the plan's numbers
 // (Ruling 22): T = 30 s, contusion 10 min, 10 % of the money, 10 % wear, no rank or reputation loss.
 struct Rules
@@ -82,16 +87,19 @@ struct Rules
 	uint32_t contusion_s = 600;    // the debuff after a respawn
 	uint8_t money_pct = 10, wear_pct = 10, rank_pct = 0;
 	uint8_t share_pct = 100; // build 10, coop_death_share: drop and lose take ltx share x share_pct / 100 (scale_shares)
+	bool friendly_fire = true; // coop_friendly_fire
+	bool finish_downed = false; // coop_npc_finish_downed
 
 	bool operator==(const Rules& o) const
 	{
 		return mode == o.mode && drop == o.drop && bleedout_ms == o.bleedout_ms && revive_health == o.revive_health &&
 			delay_ms == o.delay_ms && contusion_s == o.contusion_s && money_pct == o.money_pct &&
-			wear_pct == o.wear_pct && rank_pct == o.rank_pct && share_pct == o.share_pct;
+			wear_pct == o.wear_pct && rank_pct == o.rank_pct && share_pct == o.share_pct &&
+			friendly_fire == o.friendly_fire && finish_downed == o.finish_downed;
 	}
 
 	// mode, drop (u8), bleedout_ms (u32), revive_health (f32), delay_ms (u32), contusion_s (u32), money, wear, rank,
-	// share (u8). Build 10: drop 3 = keep, the share byte closes the packet.
+	// share (u8), party (u8). Build 10: drop 3 = keep; protocol 28: the party byte closes the packet.
 	void write(Writer& w) const
 	{
 		w.u8(static_cast<uint8_t>(mode));
@@ -104,6 +112,7 @@ struct Rules
 		w.u8(wear_pct);
 		w.u8(rank_pct);
 		w.u8(share_pct);
+		w.u8(static_cast<uint8_t>((friendly_fire ? kPartyFriendlyFire : 0) | (finish_downed ? kPartyFinishDowned : 0)));
 	}
 
 	// A short packet, an unknown mode or drop, or a health that is not a number: false, the rules stay as they were.
@@ -122,6 +131,7 @@ struct Rules
 		n.wear_pct = r.u8();
 		n.rank_pct = r.u8();
 		n.share_pct = r.u8();
+		const uint8_t party = r.u8();
 		if (!r.ok() || m > static_cast<uint8_t>(Mode::Rollback) || d > static_cast<uint8_t>(Drop::Keep))
 			return false;
 		if (!std::isfinite(n.revive_health))
@@ -136,6 +146,8 @@ struct Rules
 		n.wear_pct = static_cast<uint8_t>(detail::clamp_u32(n.wear_pct, 0, 100));
 		n.rank_pct = static_cast<uint8_t>(detail::clamp_u32(n.rank_pct, 0, 100));
 		n.share_pct = static_cast<uint8_t>(detail::clamp_u32(n.share_pct, 0, kShareMaxByte));
+		n.friendly_fire = (party & kPartyFriendlyFire) != 0;
+		n.finish_downed = (party & kPartyFinishDowned) != 0;
 		*this = n;
 		return true;
 	}
@@ -468,7 +480,7 @@ inline bool monster_leaves(uint8_t life)
 
 // The enemy filter of one creature (CEnemyManager::useful): does it leave this player alone? A monster always leaves a
 // wounded one; a stalker finishes him unless the host switched "stalkers finish a downed player" off
-// (coop_finish_downed 0, on by default: the stock behaviour of a stalker with a wounded enemy).
+// (coop_npc_finish_downed 1, off by default: on is the stock behaviour of a stalker with a wounded enemy).
 inline bool enemy_leaves(uint8_t life, bool stalker, bool finish_downed)
 {
 	return (stalker && finish_downed) ? out_of_fight(life) : monster_leaves(life);
@@ -647,6 +659,17 @@ enum class StashOutcome : uint8_t
 	GaveUp // T9 StashStep::GiveUp: his player stayed away while it was online, or he is someone else now: his things
 	       // are still on him
 };
+
+// F3a: a character on a map server's level retires there (his body and his things are its objects) and the world server waits for its
+// word. No word by then, the map server gone with it: his things stay on him, the same as a stash that gave up.
+constexpr uint64_t kRemoteStashWaitMs = 630000; // the stash itself may wait kStashAwayWaitMs for a player who left, and half a minute
+
+inline StashOutcome remote_stash_outcome(bool answered, bool things_stay, uint64_t waited_ms)
+{
+	if (answered)
+		return things_stay ? StashOutcome::GaveUp : StashOutcome::Done;
+	return waited_ms >= kRemoteStashWaitMs ? StashOutcome::GaveUp : StashOutcome::Pending;
+}
 
 // `released`: the character leaves the world when he retires (a client's); the host's actor stays and keeps whatever
 // the stash could not take. `items_left`: world items still on him (the server's word, after the stash). Fix round 1,

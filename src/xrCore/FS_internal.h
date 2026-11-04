@@ -27,7 +27,8 @@ public:
 			int handle = _sopen(fName.c_str(),_O_WRONLY | _O_TRUNC | _O_CREAT | _O_BINARY,SH_DENYWR);
             if (handle==-1)
                 Msg("!Can't create file: '%s'. Error: '%s'.", fName.c_str(), _sys_errlist[errno]);
-			hf = _fdopen(handle, "wb");
+			else // Anomaly Coop: _fdopen(-1) ends in the CRT's invalid parameter handler: a file mapped by another process of this game
+				hf = _fdopen(handle, "wb");
 		}
 		else
 		{

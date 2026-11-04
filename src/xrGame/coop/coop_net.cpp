@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "coop_net.h"
 #include "coop_sync.h"
+#include "coop_levels.h"
+#include "coop_mapserver.h"
 
 namespace coop
 {
@@ -36,17 +38,35 @@ void queue(PeerId to, Msg type, const Writer& payload, Lane lane)
 	queue_of_peer.push_back(std::move(q));
 	++g_queued_total;
 }
+
+// F3a: the map servers are clients of the world: what reaches every level reaches them, a bridge that loads its world gets it after.
+void to_bridges(Msg type, const Writer& payload, Lane lane, PeerId except)
+{
+	if (!mapserver::bridge_takes(type))
+		return;
+	for (const PeerId bridge : mapserver::host_bridges())
+	{
+		if (bridge == except)
+			continue;
+		if (sync::host_peer_joining(bridge))
+			queue(bridge, type, payload, lane);
+		else
+			mgr().session().send(bridge, lane, type, payload);
+	}
+}
 } // namespace
 
 void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	Session& s = mgr().session();
 	for (const PeerInfo& p : s.peers())
 	{
 		if (p.id == except || p.state != PeerState::Joined)
 			continue;
+		if (!levels::passes_to(type, p.id))
+			continue; // F3a multilevel: the stream of the host's level to a player on another one
 		if (sync::host_peer_joining(p.id))
 			queue(p.id, type, payload, lane);
 		else
@@ -55,11 +75,28 @@ void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except)
 	// F3a T4: the host player too, over the LocalLink (its gate decides; R1 5: no players() vector per message)
 	if (except != kHostPeer && s.local())
 		s.send(kHostPeer, lane, type, payload);
+	if (is_world_server())
+		to_bridges(type, payload, lane, except);
+}
+
+void host_stream(Msg type, const Writer& payload, PeerId except)
+{
+	if (!is_map_authority())
+		return;
+	Session& s = mgr().session();
+	if (!levels::split())
+	{
+		s.broadcast(Lane::Unreliable, type, payload, except);
+		return;
+	}
+	for (const PeerInfo& p : s.peers())
+		if (p.id != except && p.state == PeerState::Joined && levels::passes_to(type, p.id))
+			s.send(p.id, Lane::Unreliable, type, payload);
 }
 
 void host_send(PeerId to, Msg type, const Writer& payload, Lane lane)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	if (sync::host_peer_joining(to))
 		queue(to, type, payload, lane);
@@ -69,13 +106,15 @@ void host_send(PeerId to, Msg type, const Writer& payload, Lane lane)
 
 void client_send(Msg type, const Writer& payload, Lane lane)
 {
+	if (is_map_server() && !mapserver::map_server_sends(type))
+		return; // its actor is a ghost: nobody's body, nobody's hands
 	if (mgr().is_client())
 	{
 		mgr().session().send(kHostPeer, lane, type, payload);
 		return;
 	}
 	// F3a T4: the host player -> his own world server, over the LocalLink (only the messages moved onto it pass)
-	if (mgr().is_host())
+	if (mgr().is_host() && mgr().session().local())
 		mgr().local_link().push_to_server(type, lane, payload);
 }
 

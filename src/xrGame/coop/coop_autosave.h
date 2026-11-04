@@ -63,6 +63,9 @@ const std::string& game(); // the game that is set
 // for 5 minutes is dropped. Several requests before the save make one save. Anywhere else (a client, no session): nothing.
 void request(Reason r);
 
+// Requirement 8, a map server starts or stops: request(Transfer), unless a fresh save already holds this world.
+void request_before_transfer();
+
 // The Restore window is open (on = true, every frame while it is): no timer or requested save is written, no slot is
 // overwritten, the end-of-session save and the level change save stay out of the ring. The pause is a lease of 3 seconds:
 // a window that is closed in any way stops renewing it and it lapses by itself. suspend(false) lets it go on purpose, and

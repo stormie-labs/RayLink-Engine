@@ -18,7 +18,8 @@
 //   on_change(scope, prefix, fn(key, value, old, by_peer[, id]) | nil) -> true | false, why
 //   handler(name, fn(peer, args) -> ok, result | nil) -> true | false, why                               host
 //   request(name, args, fn(ok, result) | nil) -> true | false, why
-//   broadcast(name, args, {to = peer} | {pos = vector, radius = m} | nil) -> true, machines | false, why    host
+//   broadcast(name, args, {to = peer} | {pos = vector, radius = m, level = id | nil} | {level = id} | nil) -> true, machines | false, why
+//                                                 the authority of a level: the world server, a map server to the players of its level
 //   on(name, fn(args, from) | nil) -> true | false, why
 //   near(peer, obj_id, dist), owns(peer, item_id), in_container(peer, item_id, box_id) -> bool
 //   limit(name, burst, per_sec) -> true | false, why                                                    host

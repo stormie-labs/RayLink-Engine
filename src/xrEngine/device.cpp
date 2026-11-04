@@ -77,6 +77,9 @@ BOOL CRenderDevice::Begin()
 	PROF_EVENT("Render: Begin");
 
 #ifndef DEDICATED_SERVER
+	if (g_coop_headless)
+		return FALSE; // Anomaly Coop: a map server draws nothing: no seqRender, no End, no Present, no device state to ask
+
 	switch (m_pRender->GetDeviceState())
 	{
 	case IRenderDeviceRender::dsOK:
@@ -185,7 +188,7 @@ void CRenderDevice::PreCache(u32 amount, bool b_draw_loadscreen, bool b_wait_use
 #ifdef DEDICATED_SERVER
     amount = 0;
 #else
-	if (m_pRender->GetForceGPU_REF())
+	if (m_pRender->GetForceGPU_REF() || g_coop_headless) // Anomaly Coop: End() counts these frames down, a map server has no End()
 		amount = 0;
 #endif
 
@@ -354,9 +357,7 @@ void CRenderDevice::on_idle()
 
 	PROF_FRAME("Main Thread");
 
-#ifdef DEDICATED_SERVER
-    u32 FrameStartTime = TimerGlobal.GetElapsed_ms();
-#endif
+	const u32 FrameStartTime = timeGetTime(); // Anomaly Coop: not TimerGlobal, a paused game has frames too
 
 	START_PROFILE("Set stat gathering");
 	if (psDeviceFlags.test(rsStatistic))
@@ -501,7 +502,7 @@ void CRenderDevice::on_idle()
 	secondary_tasks.run(&XRay::Engine::GameThread);
 	
 #ifdef ECO_RENDER // ECO_RENDER START
-	if (Device.Paused() || IsMainMenuActive() || ps_framelimiter)
+	if (!g_coop_headless && (Device.Paused() || IsMainMenuActive() || ps_framelimiter)) // Anomaly Coop: this one spins, a map server sleeps below
 	{
 		PROF_EVENT("Eco Render");
 
@@ -556,13 +557,15 @@ void CRenderDevice::on_idle()
 		Device.LuaGCDebug();
 	}
 
-#ifdef DEDICATED_SERVER
-    u32 FrameEndTime = TimerGlobal.GetElapsed_ms();
-    u32 FrameTime = (FrameEndTime - FrameStartTime);
-    u32 DSUpdateDelta = 1000 / g_svDedicateServerUpdateReate;
-    if (FrameTime < DSUpdateDelta)
-        Sleep(DSUpdateDelta - FrameTime);
-#endif
+	// Anomaly Coop: the work of the frame without the sleep, for coop_mapserver_stats. A map server keeps to 30 frames a second.
+	const u32 FrameTime = timeGetTime() - FrameStartTime;
+	frame_work.add(FrameTime);
+	if (g_coop_headless)
+	{
+		const u32 DSUpdateDelta = 1000 / g_svDedicateServerUpdateReate;
+		if (FrameTime < DSUpdateDelta)
+			Sleep(DSUpdateDelta - FrameTime);
+	}
 	if (!b_is_Active)
 		Sleep(1);
 }
@@ -656,7 +659,10 @@ void CRenderDevice::Run()
 	seqAppStart.Process(rp_AppStart);
 
 	//m_pRender->ClearTarget();
-	SetForegroundWindow(m_hWnd);
+	if (g_coop_headless)
+		b_is_Active = TRUE; // Anomaly Coop: the hidden window is never activated, and the clocks of an inactive game stand still
+	else
+		SetForegroundWindow(m_hWnd);
 	message_loop();
 
 	seqAppEnd.Process(rp_AppEnd);
@@ -742,7 +748,7 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 
 	static int snd_emitters_ = -1;
 
-	if (g_bBenchmark)
+	if (g_bBenchmark || g_coop_headless) // Anomaly Coop: a map server serves players, it never stops the clock
 		return;
 #ifndef DEDICATED_SERVER
 	if (bOn)
@@ -818,7 +824,7 @@ bool CRenderDevice::Paused()
 // rectangle may have moved). Main thread only. ShowCursor is not touched here.
 void CRenderDevice::UpdateCursorClip(bool force)
 {
-	if (!m_hWnd)
+	if (!m_hWnd || g_coop_headless) // Anomaly Coop: ClipCursor is the desktop's, it would catch the player's cursor
 		return;
 
 	const bool want_clip = cursor_should_clip(m_window_focused, g_screenmode, m_ui_cursor_visible.load(),
@@ -843,6 +849,9 @@ void CRenderDevice::UpdateCursorClip(bool force)
 
 void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 {
+	if (g_coop_headless)
+		return; // Anomaly Coop: active from Run() on, whatever the desktop does
+
 	u16 fActive = LOWORD(wParam);
 	BOOL fMinimized = (BOOL)HIWORD(wParam);
 	BOOL bActive = ((fActive != WA_INACTIVE) && (!fMinimized)) ? TRUE : FALSE;

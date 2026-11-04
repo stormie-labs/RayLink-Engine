@@ -5,6 +5,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h"
 #include "coop_world.h"
 #include "coop_events.h"
 #include "coop_sync.h"
@@ -56,6 +57,7 @@ constexpr size_t kMaxEffectFns = 16; // on() handlers per name
 constexpr float kContainerReach = 15.f; // as coop_requests kReachRange: a player at a box he takes from
 constexpr float kMaxRadius = 100000.f;
 constexpr int kExportFormat = 1;
+static_assert(sn::kNoCastLevel == levels::wire::kNoLevel, "cast_reaches is asked with level_of_player");
 constexpr size_t kMaxScopeText = 32; // "player:4294967294" and the like
 
 // A message waiting in frame(): a client's for the host (paced), the host's for clients.
@@ -133,6 +135,7 @@ sn::RequestLimits g_limits; // host
 sn::Requests<Waiting> g_requests; // client: requests in flight
 limits::Pacer g_pacer; // client
 std::deque<Out> g_out;
+std::deque<Out> g_level_out; // a map server: casts for the players of its level; g_out is what it says to the world
 std::deque<Writer> g_player_out; // F3a T7, host: the host player's SyncRequests for his world server (sent by frame())
 std::deque<Call> g_calls;
 std::deque<HostCall> g_host_calls;
@@ -188,6 +191,7 @@ void follow_role()
 	g_as_client = c;
 	g_core.clear();
 	g_out.clear();
+	g_level_out.clear();
 	g_player_out.clear();
 	g_pacer.reset();
 	g_peer_digest.clear();
@@ -743,6 +747,39 @@ void out_to(PeerId peer, Msg type, Writer&& w)
 	o.type = type;
 	o.payload = std::move(w);
 	push_out(std::move(o));
+}
+
+// A cast to a player of this process's level, sent by frame(): Lua may run on the game thread. A map server's goes down the tunnel.
+void cast_to(PeerId peer, Writer&& w)
+{
+	if (!is_map_server())
+	{
+		out_to(peer, Msg::SyncCast, std::move(w));
+		return;
+	}
+	if (g_level_out.size() >= kMaxOutbox)
+	{
+		++g_stats.calls_dropped;
+		if (log_allowed(g_stats.calls_dropped))
+			::Msg("! [coop] coop.sync: the casts for the players of this level pile up, one for #%u dropped", peer);
+		return;
+	}
+	Out o;
+	o.peer = peer;
+	o.type = Msg::SyncCast;
+	o.payload = std::move(w);
+	g_level_out.push_back(std::move(o));
+}
+
+// A map server: what its Lua cast goes to the players of its level.
+void level_flush()
+{
+	while (!g_level_out.empty())
+	{
+		const Out& o = g_level_out.front();
+		net::host_send(o.peer, o.type, o.payload, Lane::Reliable);
+		g_level_out.pop_front();
+	}
 }
 
 // Host: one SyncSet of host_set / host_drop, queued for frame() (in order with everything else).
@@ -1585,7 +1622,9 @@ int l_request(lua_State* L)
 	return done(L);
 }
 
-// coop.sync.broadcast(name, args, {to = peer} | {pos = vector, radius = m} | nil) -> true, machines | false, why  host
+// coop.sync.broadcast(name, args, {to = peer} | {pos = vector, radius = m, level = id | nil} | {level = id} | nil) -> true, machines |
+// false, why. The authority of a level: the world server to everybody, a map server to the players of its level. A point is on the
+// level of this process unless `level` names another (a far view); {level = id} is everybody on that level.
 int l_broadcast(lua_State* L)
 {
 	follow_role();
@@ -1595,7 +1634,7 @@ int l_broadcast(lua_State* L)
 		return fail(L, "bad name");
 	if (!to_value(L, 2, args, why))
 		return fail(L, why);
-	if (client())
+	if (!sn::may_broadcast(client(), is_map_authority()))
 		return fail(L, "host only");
 	enum
 	{
@@ -1603,7 +1642,7 @@ int l_broadcast(lua_State* L)
 		To,
 		Radius
 	} mode = All;
-	double to = 0, radius = 0;
+	double to = 0, radius = 0, named = sn::kNoCastLevel;
 	Fvector pos;
 	pos.set(0.f, 0.f, 0.f);
 	if (lua_type(L, 3) == LUA_TTABLE)
@@ -1623,6 +1662,13 @@ int l_broadcast(lua_State* L)
 		lua_rawget(L, 3);
 		const bool radius_ok = arg_number(L, -1, radius) && radius > 0 && radius <= kMaxRadius;
 		lua_pop(L, 1);
+		lua_pushstring(L, "level");
+		lua_rawget(L, 3);
+		const bool has_level = !lua_isnil(L, -1);
+		const bool level_ok = has_level && arg_whole(L, -1, 0, double(sn::kNoCastLevel - 1), named);
+		lua_pop(L, 1);
+		if (has_level && !level_ok)
+			return fail(L, "bad target");
 		if (has_to)
 		{
 			if (!to_ok)
@@ -1631,7 +1677,7 @@ int l_broadcast(lua_State* L)
 		}
 		else if (p && radius_ok && validate::finite3(&pos.x))
 			mode = Radius;
-		else
+		else if (p || !has_level)
 			return fail(L, "bad target");
 	}
 	else if (!lua_isnoneornil(L, 3))
@@ -1644,28 +1690,34 @@ int l_broadcast(lua_State* L)
 	m.args = args;
 	Writer w(32 + m.name.size() + ss::encoded_size(m.args));
 	sn::write_cast(w, m);
-	const bool session = mgr().is_host();
+	const bool map_server = is_map_server(); // the peers of its session are the players of its level; its actor is nobody's
+	const bool session = mgr().is_host() || map_server;
 	if (mode == To)
 	{
 		const PeerId peer = PeerId(to);
-		if (peer == kHostPeer)
+		if (peer == kHostPeer && !map_server)
 			here = true;
 		else if (!session || !in_world(peer))
 			return fail(L, "no such player");
 		else
 		{
-			out_to(peer, Msg::SyncCast, std::move(w));
+			cast_to(peer, std::move(w));
 			++machines;
 		}
 	}
 	else
 	{
+		const u16 level = u16(named);
+		const bool bound = mode == Radius || level != sn::kNoCastLevel;
 		Fvector at;
-		here = mode == All || (position_of(0, at) && at.distance_to(pos) <= float(radius));
+		if (!map_server && (level == sn::kNoCastLevel || level == levels::my_level()))
+			here = mode == All || (position_of(0, at) && at.distance_to(pos) <= float(radius));
 		if (session)
 			for (const PeerInfo& p : mgr().session().peers())
 			{
 				if (p.id == kHostPeer || !in_world(p.id))
+					continue;
+				if (bound && !sn::cast_reaches(level, levels::level_of_player(p.id), levels::on_host_level(p.id)))
 					continue;
 				if (mode == Radius)
 				{
@@ -1673,7 +1725,7 @@ int l_broadcast(lua_State* L)
 					if (who == kNone || !position_of(who, at) || at.distance_to(pos) > float(radius))
 						continue;
 				}
-				out_to(p.id, Msg::SyncCast, Writer(w));
+				cast_to(p.id, Writer(w));
 				++machines;
 			}
 	}
@@ -1926,6 +1978,7 @@ void reset()
 	follow_role();
 	const bool was_client = client();
 	g_out.clear();
+	g_level_out.clear();
 	g_player_out.clear();
 	g_pacer.reset();
 	g_resync = false;
@@ -1960,6 +2013,7 @@ void frame()
 		}
 		g_was_live = live;
 		client_flush(now);
+		level_flush();
 		if (live)
 		{
 			for (auto& w : g_requests.expire(now))

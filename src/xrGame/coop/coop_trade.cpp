@@ -13,6 +13,7 @@
 #include "coop_money.h"
 #include "coop_items.h"
 #include "xrCoop/coop_talks.h" // R4 2: may_trade_with
+#include "xrCoop/coop_search_view.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -28,6 +29,8 @@
 #include "ai/stalker/ai_stalker.h"
 #include "ai_space.h"
 #include "alife_simulator.h"
+
+#include <atomic>
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife.h"
 #include "script_callback_ex.h"
@@ -297,6 +300,9 @@ struct ViewState
 	xr_vector<PendingMove> moves;
 };
 ViewState g_view;
+std::atomic<u16> g_search_now{kNoId}; // what the Lua inventory searches, local numbering: Lua may run on the game worker thread
+u16 g_search_sent = kNoId;
+u8 g_search_kind = ContNone;
 u64 g_rebuilds = 0, g_moves_failed = 0;
 
 void request_rebuild(u64 at)
@@ -614,8 +620,8 @@ void host_on_container(PeerId from, Reader& r)
 		CObject* o = find_object(id);
 		const bool real = o && (kind == ContBox ? smart_cast<CInventoryBox*>(o) != nullptr
 		                                        : (smart_cast<CInventoryOwner*>(o) && !alive(smart_cast<CInventoryOwner*>(o))));
-		if (real && !sync::host_peer_joining(from))
-			script::on_container_opened(from, id);
+		if (real && !sync::host_peer_joining(from) && may_see_contents(from, kind, id))
+			script::on_container_opened(from, id); // a box across the level is no window on it: no roll for a modified client
 	}
 	if (kind == ContTrader)
 	{
@@ -770,15 +776,15 @@ void on_trade_op(PeerId from, Reader& r)
 	switch (op)
 	{
 	case Op::Deal:
-		if (mgr().is_host() && from != kHostPeer)
+		if (is_map_authority() && from != kHostPeer)
 			host_on_deal(from, r);
 		break;
 	case Op::Result:
-		if (mgr().is_client())
+		if (is_mirror())
 			client_on_result(r);
 		break;
 	case Op::TraderMoney:
-		if (mgr().is_client())
+		if (is_mirror())
 			client_on_trader_money(r);
 		break;
 	default:
@@ -788,7 +794,7 @@ void on_trade_op(PeerId from, Reader& r)
 
 void send_container(bool open, u8 kind, u16 local_id)
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		if (open)
 		{
@@ -800,7 +806,7 @@ void send_container(bool open, u8 kind, u16 local_id)
 			g_open.erase(kHostPeer);
 		return;
 	}
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 		return;
 	Writer w(6);
 	w.u8(open ? 1 : 0);
@@ -817,19 +823,43 @@ void install_server(Session& s)
 	s.on(Msg::TradeOp, &on_trade_op);
 	s.on(Msg::ReqContainer, [](PeerId from, Reader& r)
 	{
-		if (mgr().is_host())
+		if (is_map_authority())
 			host_on_container(from, r);
 	});
 }
 
 void install_client(Endpoint& e) { e.on(Msg::TradeOp, &on_trade_op); }
 
+static void search_frame()
+{
+	u16 now = g_search_now.load();
+	if (now == kNoId && g_search_sent == kNoId)
+		return;
+	u8 kind = ContNone;
+	if (now != kNoId)
+	{
+		CObject* o = find_object(now);
+		CInventoryOwner* owner = o ? smart_cast<CInventoryOwner*>(o) : nullptr;
+		kind = o && smart_cast<CInventoryBox*>(o) ? ContBox : (owner && !alive(owner) ? ContCorpse : ContNone);
+		if (kind == ContNone)
+			now = kNoId; // a companion's bag, or the box went
+	}
+	const SearchStep step = search_step(g_search_sent, now, kNoId);
+	if (step.close)
+		send_container(false, g_search_kind, g_search_sent);
+	if (step.open)
+		send_container(true, kind, now);
+	g_search_sent = now;
+	g_search_kind = kind;
+}
+
 void frame()
 {
-	if (!mgr().is_client())
+	search_frame();
+	if (!is_mirror())
 		return;
 	client_sync_world();
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 		return;
 	const u64 now = now_ms();
 	for (auto it = g_callbacks.begin(); it != g_callbacks.end();)
@@ -860,6 +890,8 @@ void reset()
 {
 	g_peers.clear();
 	g_open.clear();
+	g_search_now.store(kNoId);
+	g_search_sent = kNoId;
 	g_pending.clear();
 	g_callbacks.clear();
 	g_view.labels = false;
@@ -875,7 +907,7 @@ void on_peer_left(PeerId id)
 
 bool client_transfer(CUIDragDropListEx* sell_list, CUIDragDropListEx* buy_list, CTrade* trade, bool trader_buys)
 {
-	if (!mgr().is_live_client() || !sell_list || !buy_list || !trade)
+	if (!is_live_mirror() || !sell_list || !buy_list || !trade)
 		return false;
 	CInventoryOwner* trader = trade->pThis.inv_owner;
 	CActor* a = Actor();
@@ -917,7 +949,7 @@ bool client_transfer(CUIDragDropListEx* sell_list, CUIDragDropListEx* buy_list, 
 
 bool client_donate(CTrade* trade, CInventoryItem* item)
 {
-	if (!mgr().is_live_client() || !trade || !item)
+	if (!is_live_mirror() || !trade || !item)
 		return false;
 	CInventoryOwner* trader = trade->pThis.inv_owner;
 	if (!trader)
@@ -931,7 +963,7 @@ bool client_donate(CTrade* trade, CInventoryItem* item)
 
 int client_money_in_flight()
 {
-	if (!mgr().is_live_client())
+	if (!is_live_mirror())
 		return 0;
 	client_sync_world();
 	s64 sum = 0;
@@ -942,7 +974,7 @@ int client_money_in_flight()
 
 int client_trader_money_in_flight(CInventoryOwner* trader)
 {
-	if (!mgr().is_live_client() || !trader)
+	if (!is_live_mirror() || !trader)
 		return 0;
 	client_sync_world();
 	const u16 host_id = join::to_host(id_of(trader));
@@ -953,11 +985,11 @@ int client_trader_money_in_flight(CInventoryOwner* trader)
 	return clamp_int(sum);
 }
 
-bool lua_trade_window_allowed() { return !mgr().is_client(); }
+bool lua_trade_window_allowed() { return !is_mirror(); }
 
 void on_local_trade_done(CTrade* trade)
 {
-	if (!mgr().is_host() || !trade || !trade->pThis.inv_owner)
+	if (!is_map_authority() || !trade || !trade->pThis.inv_owner)
 		return;
 	host_broadcast_trader_money(trade->pThis.inv_owner, kInvalidPeer);
 }
@@ -982,6 +1014,13 @@ bool deal_list_stale(CUIDragDropListEx* deal_list, CInventoryOwner* owner)
 				return true;
 	}
 	return false;
+}
+
+int lua_search_window(lua_State* L)
+{
+	const lua_Number id = lua_isnumber(L, 1) ? lua_tonumber(L, 1) : -1;
+	g_search_now.store(id >= 0 && id < lua_Number(kNoId) ? u16(id) : kNoId);
+	return 0;
 }
 
 void on_actor_menu_shown(CUIActorMenu& menu, bool shown)
@@ -1124,7 +1163,7 @@ void invalidate_views()
 
 bool host_container_open(u16 id)
 {
-	if (!mgr().is_host() || id == kNoId)
+	if (!is_map_authority() || id == kNoId)
 		return false;
 	for (const auto& it : g_open)
 		if (it.second.kind != ContNone && it.second.id == id)
@@ -1132,11 +1171,11 @@ bool host_container_open(u16 id)
 	return false;
 }
 
-bool trader_local_logic() { return !mgr().is_client(); }
+bool trader_local_logic() { return !is_mirror(); }
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		::Msg("[coop]   trade: %llu deals (%llu ok, %llu rejected), %llu items moved", g_host_deals, g_host_ok,
 		    g_host_rejected, g_host_items);
@@ -1150,7 +1189,7 @@ void print_status()
 			    sharing ? " (shared view)" : "");
 		}
 	}
-	else if (mgr().is_client())
+	else if (is_mirror())
 		::Msg("[coop]   trade: %llu deals sent (%llu ok, %llu rejected), %u waiting (%d RU)", g_cl_deals, g_cl_ok,
 		    g_cl_rejected, (u32)g_pending.size(), client_money_in_flight());
 	::Msg("[coop]   container view: %s %u, %llu rebuilds, %llu moves not applied", container_name(g_view.kind),

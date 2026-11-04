@@ -256,7 +256,7 @@ void client_on_effect(PeerId, Reader& r)
 		r.vec3(v);
 		dir.set(v[0], v[1], v[2]);
 	}
-	if (!r.ok() || !mgr().is_live_client() || !g_pGameLevel || kind >= kKinds)
+	if (!r.ok() || !is_live_mirror() || !g_pGameLevel || kind >= kKinds)
 	{
 		++g_dropped;
 		return;
@@ -376,7 +376,7 @@ void host_seen_frame(bool world_up)
 		std::copy(std::begin(g_seen_top), std::end(g_seen_top), top);
 		std::fill(std::begin(g_seen_top), std::end(g_seen_top), 0.f);
 	}
-	if (!world_up || !mgr().is_host())
+	if (!world_up || !is_map_authority())
 	{
 		std::fill(std::begin(g_seen_sent), std::end(g_seen_sent), 0.f);
 		return;
@@ -405,7 +405,7 @@ void host_flights(bool world_up)
 	}
 	if (g_flights.empty())
 		return;
-	if (!world_up || !mgr().is_host())
+	if (!world_up || !is_map_authority())
 	{
 		g_flights.clear();
 		return;
@@ -455,7 +455,7 @@ void frame(bool world_up)
 	host_seen_frame(world_up);
 	if (g_pending.empty())
 		return;
-	if (!world_up || !mgr().is_live_client())
+	if (!world_up || !is_live_mirror())
 	{
 		g_dropped += g_pending.size();
 		g_pending.clear();
@@ -485,7 +485,7 @@ void frame(bool world_up)
 
 bool host_send(const CObject* target, const CObject* monster, u8 kind, u8 phase, float value)
 {
-	if (!target || !monster || !mgr().is_host() || !npc_ai::is_remote_player(target))
+	if (!target || !monster || !is_map_authority() || !npc_ai::is_remote_player(target))
 		return false;
 	const PeerId peer = world::avatar_peer(target->ID());
 	if (peer == kInvalidPeer)
@@ -507,7 +507,7 @@ void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir)
 
 void host_shown(const CObject* monster, u8 kind, u8 phase, float value)
 {
-	if (!monster || !mgr().is_host())
+	if (!monster || !is_map_authority())
 		return;
 	Writer w(12);
 	w.u16(monster->ID());
@@ -520,7 +520,7 @@ void host_shown(const CObject* monster, u8 kind, u8 phase, float value)
 
 void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fvector& dir)
 {
-	if (!monster || !mgr().is_host())
+	if (!monster || !is_map_authority())
 		return;
 	Writer w(36);
 	w.u16(monster->ID());
@@ -536,7 +536,7 @@ void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fve
 
 void host_seen(const CCustomMonster* observer, const CObject* player, float value)
 {
-	if (!mgr().is_host() || !npc_ai::is_remote_player(player))
+	if (!is_map_authority() || !npc_ai::is_remote_player(player))
 		return;
 	const CEntityAlive* body = smart_cast<const CEntityAlive*>(player);
 	const PeerId peer = world::avatar_peer(player->ID());
@@ -548,7 +548,7 @@ void host_seen(const CCustomMonster* observer, const CObject* player, float valu
 
 void host_throw(CPhysicsShellHolder* object, const CObject* monster, float power)
 {
-	if (!object || !monster || !object->PPhysicsShell() || !mgr().is_host())
+	if (!object || !monster || !object->PPhysicsShell() || !is_map_authority())
 		return;
 	Throw t;
 	t.object = object->ID();

@@ -212,7 +212,7 @@ void ui_core::PopScissor()
 
 ui_core::ui_core()
 {
-	if (!g_dedicated_server)
+	if (!g_dedicated_server || g_coop_headless)
 	{
 		m_pUICursor = xr_new<CUICursor>();
 		m_pFontManager = xr_new<CFontManager>();

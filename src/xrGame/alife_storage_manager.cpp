@@ -17,6 +17,7 @@
 #include "alife_registry_container.h"
 #include "coop/coop_join.h"
 #include "coop/coop_manager.h" // Anomaly Coop
+#include "coop/coop_levels.h"
 #include "xrserver.h"
 #include "level.h"
 #include "../xrEngine/x_ray.h"
@@ -96,6 +97,7 @@ void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 		spawns().save(stream);
 		objects().save(stream);
 		registry().save(stream);
+		coop::levels::xfer_save(stream); // Anomaly Coop: split levels, the transfers in flight
 
 		source_count = stream.tell();
 		void* source_data = stream.pointer();
@@ -164,6 +166,7 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 	}
 
 	registry().load(source);
+	coop::levels::xfer_load(source); // Anomaly Coop: split levels, the transfers in flight
 
 	can_register_objects(true);
 

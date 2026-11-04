@@ -48,6 +48,8 @@ enum Op : uint8_t
 	OpReviving = 8,
 	OpStopped = 9,
 	OpDone = 10,
+	OpLosses = 11, // world server -> the map server of the body: u16 character, u16 seq, u8 drop mode, u8 share
+	OpStash = 12, // world server -> the map server of the body: u16 character, all he has goes into a stash there (a hardcore retirement)
 };
 
 // What a client may send under this message: the others are the host's orders.

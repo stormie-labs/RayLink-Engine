@@ -7,6 +7,7 @@
 #include "coop_alife.h"
 #include "coop_callgate.h" // F2 T12
 #include "xrCoop/coop_relay_rules.h"
+#include "xrCoop/coop_soft_move.h"
 
 #include "Level.h"
 #include "ai_space.h"
@@ -380,7 +381,7 @@ void host_weather_frame(u64 now)
 
 // Full state to every player who just finished loading the world (right before JoinComplete,
 // which coop_join sends after sync::host_end_join; the periodic refresh covers the rest).
-void host_join_frame()
+void host_join_frame(bool with_time)
 {
 	const std::vector<PeerInfo> peers = mgr().session().peers();
 	for (auto it = g.joining.begin(); it != g.joining.end();)
@@ -401,7 +402,8 @@ void host_join_frame()
 		}
 		if (!g.joining.erase(p.id))
 			continue;
-		host_send_time(p.id);
+		if (with_time)
+			host_send_time(p.id);
 		if (CEnvironment* e = env_ready())
 			host_send_weather(*e, p.id, Lane::Reliable);
 	}
@@ -411,9 +413,24 @@ void host_frame(u64 now)
 {
 	if (!alife_ready())
 		return;
-	host_join_frame();
+	host_join_frame(true);
 	host_time_frame(now);
 	host_weather_frame(now);
+}
+
+void host_clock_ahead_now(u64 saved_clock, u64 real_ms)
+{
+	if (!alife_ready())
+		return;
+	CALifeTimeManager& tm = alife_rw().time_manager();
+	const u64 delta = softmove::clock_behind(saved_clock, real_ms, tm.time_factor(), tm.game_time());
+	if (!delta)
+		return;
+	// as client_apply_time: the sky clock first, a step of a whole day ends a running weather fx
+	g_pGamePersistent->Environment().ChangeGameTime(float(delta % kDayMs) / 1000.f);
+	tm.coop_set_game_time(tm.game_time() + delta, tm.time_factor());
+	g.time_dirty = true;
+	::Msg("[coop] soft move: the world's clock goes on by %.1f game min", float(delta) / 60000.f);
 }
 
 void host_on_time_request(PeerId from, Reader& r)
@@ -692,6 +709,9 @@ void install_client(Endpoint& e)
 
 void reset() { g = State(); }
 
+void host_clock_ahead(u64 saved_clock, u64 real_ms) { host_clock_ahead_now(saved_clock, real_ms); }
+u64 host_clock() { return alife_ready() ? u64(alife_rw().time_manager().game_time()) : 0; }
+
 void frame()
 {
 	if (!mgr().active())
@@ -702,6 +722,12 @@ void frame()
 		host_frame(now);
 	else
 		client_frame(now);
+	if (is_map_server() && world_up())
+	{
+		// F3a: time is the world server's, the sky of a level is its authority's: one cycle, the section of this level
+		host_join_frame(false);
+		host_weather_frame(now);
+	}
 }
 
 void print_status()
@@ -793,7 +819,7 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 
 bool refuse_script_weather(const char* name)
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		g.weather_dirty = true;
 		return false;
@@ -810,11 +836,11 @@ bool refuse_script_weather(const char* name)
 	return true;
 }
 
-bool bolts_follow() { return mgr().is_client(); }
+bool bolts_follow() { return is_mirror(); }
 
 void host_on_bolt(const char* id, float period, float duration, u32 seed)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	relay::BoltMsg b;
 	b.id = id;

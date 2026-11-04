@@ -174,7 +174,7 @@ CGameObject* relay_source(CObject* owner)
 	return go;
 }
 
-bool host_recording() { return g_npc_sounds && g_have_clients && g_pGameLevel && mgr().is_host(); }
+bool host_recording() { return g_npc_sounds && g_have_clients && g_pGameLevel && is_map_authority(); }
 
 float radius_of(ref_sound& snd)
 {
@@ -451,7 +451,7 @@ void client_play(const NpcSound& s)
 
 void client_on_sound(PeerId, Reader& r)
 {
-	if (!mgr().is_live_client() || !g_pGameLevel || !g_npc_sounds)
+	if (!is_live_mirror() || !g_pGameLevel || !g_npc_sounds)
 		return;
 	const u8 count = r.u8();
 	for (u8 i = 0; i < count && r.ok(); ++i)
@@ -568,7 +568,7 @@ void queue_step(CGameObject* avatar, SGameMtlPair* pair, float power, LPCSTR sta
 
 // ---------------------------------------------------------------- Lua
 
-bool lua_ready() { return g_pGameLevel && g_actor && (mgr().is_host() || mgr().is_live_client()); }
+bool lua_ready() { return g_pGameLevel && g_actor && (is_map_authority() || is_live_mirror()); }
 
 // True if a script did AddScriptCallback(name): axr_main keeps the names in its local `intercepts` table (an
 // upvalue of make_callback); calling SendScriptCallback for an unknown name prints an error with a call stack.
@@ -715,11 +715,11 @@ void reset()
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		host_frame();
 	else
 		g_have_clients = false;
-	if (mgr().is_live_client() && g_pGameLevel)
+	if (is_live_mirror() && g_pGameLevel)
 		client_frame();
 	else
 		stop_all(); // out of the world: nothing of ours may outlive the level's objects
@@ -736,7 +736,7 @@ void register_console()
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 		::Msg("[coop]   npc sounds out (%s): %llu recorded, %llu deduped, %llu queue full; %llu sent (%llu reliable) in %llu "
 		      "packets, %llu out of range, %llu over the rate",
 		    g_npc_sounds ? "on" : "off", g_st.recorded, g_st.deduped, g_st.queue_full, g_st.sent, g_st.firm, g_st.packets,
@@ -754,7 +754,7 @@ void print_status()
 
 bool player_sound_blocked(CObject* owner)
 {
-	if (!g_npc_sounds || !mgr().is_live_client() || !owner)
+	if (!g_npc_sounds || !is_live_mirror() || !owner)
 		return false;
 	CGameObject* go = smart_cast<CGameObject*>(owner);
 	if (!go || go->ID() == 0 || world::is_player_proxy(go->ID()))

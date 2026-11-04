@@ -194,8 +194,11 @@ PROTECT_API void CRenderDevice::Create()
 		style = WS_POPUP;
 	}
 
-	SetWindowLongPtr(m_hWnd, GWL_STYLE, style);
-	SetWindowPos(m_hWnd, HWND_TOP, monX, monY, w, h, SWP_FRAMECHANGED);
+	if (!g_coop_headless) // Anomaly Coop: without SWP_NOACTIVATE this takes the focus from the player's game
+	{
+		SetWindowLongPtr(m_hWnd, GWL_STYLE, style);
+		SetWindowPos(m_hWnd, HWND_TOP, monX, monY, w, h, SWP_FRAMECHANGED);
+	}
 
 	Statistic = xr_new<CStats>();
 #ifdef DEBUG
@@ -240,7 +243,8 @@ PROTECT_API void CRenderDevice::Create()
 	// m_window_focused if it is not.
 	m_window_focused = true;
 	UpdateCursorClip(true);
-	SetActiveWindow(m_hWnd);
+	if (!g_coop_headless) // Anomaly Coop: the same
+		SetActiveWindow(m_hWnd);
 
 	string_path fname;
 	FS.update_path(fname, "$game_data$", "shaders.xr");

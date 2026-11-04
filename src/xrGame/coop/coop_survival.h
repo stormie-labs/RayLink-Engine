@@ -76,7 +76,8 @@
 //     Done     host -> reviver       {u16 target, u16 seq}  the Request went through (Lua coop_revive_done)
 //              Lua reads it all as coop.revive_progress() (revive_progress below).
 //   PlayerRules    host -> all  death::Rules::write (mode, drop, bleed-out, revive health, delay, contusion, %, and
-//                  since build 10 the share multiplier; drop 3 = keep). F3a T7: the host player takes them too; the
+//                  since build 10 the share multiplier; drop 3 = keep; protocol 28 the party byte, which a map server, a
+//                  process without a game record, judges by). F3a T7: the host player takes them too; the
 //                  world server decides by its own (rules() on the host)
 //   NewCharacter   client -> host  {}: out of a hardcore run, a new character (F3 Task 10; 2 per 5 s)  reliable
 // `seq` counts the falls of one player (never 0xffff, the tracker's "none"); every order names the fall it
@@ -145,6 +146,7 @@ PeerId peer_of_character(u16 character); // kInvalidPeer: nobody plays it now
 // world is served (R1: not in the frame a world was created in, as join::host_player_in_world keeps it for a client), a
 // client once he has loaded it (join::host_player_in_world).
 bool player_in_world(u16 character);
+void host_send_rules(PeerId bridge); // a map server that joined the world: the rules it judges a body of its level by
 // The world says `character` is out of a hardcore run ([coop_death] out = 1): he only watches, then starts anew.
 bool out_of_run(u16 character);
 
@@ -206,6 +208,8 @@ bool rollback_pending(); // host: the group waits for the load
 // host numbering, sorted, each id once and carried by the character when the report came (at most 40). False when
 // no report of that death brought the list (the host's own actor: its slots and belt are seen directly).
 bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out);
+// F3a, the world server: the map server of a retiring character's level is done with his things (LevelEntity Stash).
+void host_stash_over(u16 character, bool things_stay);
 
 // --- engine hooks ---
 

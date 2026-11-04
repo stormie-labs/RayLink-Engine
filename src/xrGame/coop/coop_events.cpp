@@ -3,6 +3,7 @@
 #include "coop_survival.h"
 #include "coop_requests.h"
 #include "coop_manager.h"
+#include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -336,6 +337,10 @@ bool filter_event(NET_Packet& P)
 	// items still go to the host (Ruling F2-12). What the router blocks or keeps local stays so; GE_MONEY goes on.
 	if (entities::client_applying())
 		return false;
+	// F3a: the objects of a map server's level are its own: their events run here as on the host, and what the world must know goes
+	// up afterwards (the hooks below, coop_levels_xfer.cpp). Money stays the world server's.
+	if (levels::leads_my_level() && type != GE_MONEY)
+		return false;
 
 	switch (type)
 	{
@@ -490,7 +495,7 @@ bool filter_message(NET_Packet& P)
 	{
 	case M_SPAWN:
 		P.r_pos = 0;
-		return filter_spawn(P);
+		return levels::leads_my_level() ? false : filter_spawn(P); // F3a: a map server spawns under its own ids (coop_levels_keeper.h)
 	case M_EVENT:
 		P.r_pos = 0;
 		return filter_event(P);
@@ -905,7 +910,7 @@ void on_player_died(PeerId from, Reader& r)
 	const u16 killer = r.u16();
 	if (!r.ok())
 		return;
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		character = join::proxy_of_peer(from);
 		if (character == kNoId || sync::host_peer_joining(from))
@@ -1087,14 +1092,14 @@ void reset()
 
 void frame()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		if (world_up())
 			host_flush();
 		else
 			host_discard();
 	}
-	else if (mgr().is_live_client() && world_up())
+	if (mgr().is_live_client() && world_up())
 	{
 		client_step_parents();
 		client_step_deaths();
@@ -1108,7 +1113,7 @@ void frame()
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (is_map_authority())
 	{
 		::Msg("[coop]   events out: %llu parent changes, %llu deaths, %llu player deaths, local %llu spawns / %llu "
 		      "destroys (%u relayed alive), %llu player rocket launches, %llu creature visuals",
@@ -1149,7 +1154,7 @@ bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 {
 	if (coop::hold_loading_screen()) return true; // F3a T8 R1: nobody is hurt behind a held loading screen (a session never pauses)
 	if (survival::ignores_hits()) return true;
-	if (mgr().is_host())
+	if (is_map_authority())
 		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
 	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying() || monster_fx::client_playing())
 		return false; // audit A5: a host monster's ability played here on the host's word hurts us directly
@@ -1162,7 +1167,8 @@ bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 
 void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent)
 {
-	if (!mgr().is_host())
+	levels::up_parent(item, new_parent); // F3a: a map server tells the world server
+	if (!entities::host_records())
 		return;
 	u16 holder = kNoId;
 	if (old_parent != kNoId)
@@ -1181,7 +1187,8 @@ void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent)
 
 void host_on_death(u16 victim, u16 killer)
 {
-	if (!mgr().is_host())
+	levels::up_died(victim, killer); // F3a: a map server tells the world server
+	if (!entities::host_records())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_deaths.emplace_back(victim, killer);
@@ -1220,7 +1227,7 @@ bool client_parent_pending(u16 item) { return g_parent_targets.count(item) != 0;
 
 void host_on_visual(u16 id)
 {
-	if (!mgr().is_host() || id == kActor)
+	if (!is_map_authority() || id == kActor)
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_visuals.insert(id);
@@ -1228,7 +1235,7 @@ void host_on_visual(u16 id)
 
 void host_on_destroy(const CSE_Abstract* entity)
 {
-	if (!entity || !mgr().is_host())
+	if (!entity || !is_map_authority())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_last_holder.erase(entity->ID);
@@ -1238,7 +1245,7 @@ void host_on_destroy(const CSE_Abstract* entity)
 
 void host_relay_local_spawn(CSE_Abstract* entity)
 {
-	if (!entity || !mgr().is_host())
+	if (!entity || !is_map_authority())
 		return;
 	NET_Packet spawn;
 	entity->Spawn_Write(spawn, FALSE);
@@ -1265,7 +1272,7 @@ void host_set_drop_position(u16 item, const Fvector& pos)
 void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvector& dir, const Fvector& vel,
     const Fvector& angular_vel, PeerId requester)
 {
-	if (!mgr().is_host())
+	if (!is_map_authority())
 		return;
 	Writer w(64);
 	w.u8(2);
@@ -1283,7 +1290,7 @@ void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvect
 
 bool client_refuse_vehicle(CGameObject* holder)
 {
-	if (!holder || !mgr().is_client() || !router_on() || entities::client_applying() || !smart_cast<CCar*>(holder))
+	if (!holder || !is_mirror() || !router_on() || entities::client_applying() || !smart_cast<CCar*>(holder))
 		return false;
 	// F2 T12: the call gate decides and logs (world, no request path: the host drives cars); round 1: refused while the
 	// host's story is applied too, as before T12 (an engine apply scope returned above)

@@ -10,6 +10,7 @@
 #include <enet/enet.h>
 #include <enet/time.h> // ENET_TIME_DIFFERENCE
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -199,6 +200,9 @@ void Transport::destroy()
 		enet_host_destroy(m_host);
 		m_host = nullptr;
 		m_inbox.clear(); // their peers are gone with the host
+		m_inbox_bytes = 0;
+		m_relay.reset();
+		m_relaying.store(false);
 	}
 	if (m_enet_ref)
 	{
@@ -249,6 +253,26 @@ static bool link_alive(const ENetPeer* peer, uint32_t link)
 	}
 }
 
+// The relay must not stop at a goodbye (disconnect_next): the zombies go behind everybody else in the dispatch queue, where they wait for
+// the owner, and what the others sent comes out past them. A peer stays queued, so ENet's NEEDS_DISPATCH flag stays true.
+static void zombies_last(ENetHost* host)
+{
+	ENetPeer* found[64];
+	size_t n = 0;
+	for (ENetListIterator it = enet_list_begin(&host->dispatchQueue); it != enet_list_end(&host->dispatchQueue) && n < 64;
+		it = enet_list_next(it))
+	{
+		ENetPeer* peer = reinterpret_cast<ENetPeer*>(it);
+		if (peer->state == ENET_PEER_STATE_ZOMBIE)
+			found[n++] = peer;
+	}
+	for (size_t i = 0; i < n; ++i)
+	{
+		enet_list_remove(&found[i]->dispatchList);
+		enet_list_insert(enet_list_end(&host->dispatchQueue), &found[i]->dispatchList);
+	}
+}
+
 // An ENet event as the owner gets it (a packet's bytes are copied and the packet freed).
 static void take_event(ENetEvent& e, Event& ev)
 {
@@ -291,6 +315,7 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 		{
 			Taken t = std::move(m_inbox.front());
 			m_inbox.pop_front();
+			m_inbox_bytes -= t.ev.bytes.size();
 			// A packet of a link the owner has reset (its slot may be someone else's now) or is closing itself is
 			// dropped, as ENet drops what it still holds then. One from a peer that has left since comes before its
 			// DISCONNECT: the owner gets the last word (a Reject, a Bye) the goodbye would have wiped in ENet.
@@ -299,7 +324,20 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 			ev = std::move(t.ev);
 			return 1;
 		}
-		rc = enet_host_service(m_host, &e, wait_ms);
+		for (;;)
+		{
+			rc = enet_host_service(m_host, &e, wait_ms);
+			if (rc <= 0 || !m_relay)
+				break;
+			// What the owner takes out of ENet goes the way of what the helper takes: the order of a connection is ENet's.
+			Taken t;
+			t.link = e.peer ? e.peer->connectID : 0;
+			take_event(e, t.ev);
+			if (relay_take(t))
+				continue;
+			ev = std::move(t.ev);
+			return 1;
+		}
 	}
 	if (rc <= 0)
 		return rc;
@@ -407,6 +445,12 @@ void Transport::set_user(PeerHandle peer, void* p)
 		peer->data = p;
 }
 
+bool Transport::inbox_empty() const
+{
+	IoLock io(g_io);
+	return m_inbox.empty();
+}
+
 bool Transport::outgoing_idle(PeerHandle peer)
 {
 	if (!peer)
@@ -488,6 +532,132 @@ void Transport::keepalive_stop()
 	m_hold.release(); // a seal stays
 }
 
+void Transport::inbox_push(Taken&& t)
+{
+	m_inbox_bytes += t.ev.bytes.size();
+	m_inbox.push_back(std::move(t));
+	if (m_relay)
+	{
+		m_relay_stats.inbox_max = std::max(m_relay_stats.inbox_max, m_inbox.size());
+		m_relay_stats.inbox_bytes_max = std::max(m_relay_stats.inbox_bytes_max, m_inbox_bytes);
+	}
+}
+
+// One event through the relay: true when nothing of it is left for the owner. Under the I/O lock.
+bool Transport::relay_take(Taken& t)
+{
+	if (t.ev.type != Event::Type::Receive)
+		return false;
+	m_relay_out.clear();
+	const softmove::Take take = m_relay->on_packet(t.ev.peer, t.link, t.ev.channel, t.ev.bytes.data(), t.ev.bytes.size(), m_relay_out);
+	for (softmove::Relay::Out& o : m_relay_out)
+	{
+		ENetPeer* to = static_cast<ENetPeer*>(const_cast<void*>(o.to));
+		if (to->connectID != o.link || to->state != ENET_PEER_STATE_CONNECTED)
+		{
+			++m_relay_stats.dropped; // he left, or his slot is somebody else's now
+			continue;
+		}
+		Packet p = make_packet(o.lane, o.type, o.body.data(), o.body.size(), nullptr, 0, nullptr);
+		ENetPacket* raw = p.m_p;
+		p.m_p = nullptr;
+		if (!raw || enet_peer_send(to, enet_uint8(o.lane), raw) < 0)
+		{
+			if (raw)
+				enet_packet_destroy(raw);
+			++m_relay_stats.dropped;
+			continue;
+		}
+		if (o.type == uint16_t(Msg::Tunnel))
+			++m_relay_stats.to_servers;
+		else
+			++m_relay_stats.to_players;
+	}
+	switch (take)
+	{
+	case softmove::Take::Keep: ++m_relay_stats.kept; return false;
+	case softmove::Take::Sent: return true;
+	case softmove::Take::SentAndKept:
+		++m_relay_stats.kept;
+		t.ev.relayed = true;
+		return false;
+	case softmove::Take::Dropped: ++m_relay_stats.dropped; return true;
+	}
+	return false;
+}
+
+// The helper's pass while the relay runs. Under the I/O lock.
+void Transport::relay_pump()
+{
+	ENetEvent e;
+	for (;;)
+	{
+		zombies_last(m_host);
+		if (disconnect_next(m_host))
+			return; // nothing but goodbyes left: they wait for the owner
+		if (m_inbox_bytes >= m_relay_cap)
+		{
+			// What the world has to hear after the load outgrew what we keep for it. Nothing is thrown away: the helper goes back to its
+			// own rules, everything stays in ENet and the road is closed until the owner comes back.
+			m_relay_stats.overflowed = true;
+			m_relay.reset();
+			m_relaying.store(false);
+			return;
+		}
+		if (enet_host_check_events(m_host, &e) <= 0)
+			return;
+		Taken t;
+		t.link = e.peer ? e.peer->connectID : 0;
+		take_event(e, t.ev);
+		if (!relay_take(t))
+			inbox_push(std::move(t));
+	}
+}
+
+void Transport::relay_start(std::shared_ptr<const softmove::Relay> relay, size_t inbox_bytes)
+{
+	IoLock io(g_io);
+	if (!m_host || !relay)
+		return;
+	m_relay = std::move(relay);
+	m_relay_stats = RelayStats();
+	m_relay_cap = inbox_bytes;
+	m_relay_until.store(steady_ms() + kRelayRunsMs);
+	// What came before the relay stands in front of what comes after it: it goes first, or a player's stream would run out of order.
+	for (auto it = m_inbox.begin(); it != m_inbox.end();)
+	{
+		const size_t size = it->ev.bytes.size();
+		const bool alive = it->ev.type == Event::Type::Receive && link_alive(it->ev.peer, it->link);
+		if (alive && relay_take(*it))
+		{
+			m_inbox_bytes -= size;
+			it = m_inbox.erase(it);
+		}
+		else
+			++it;
+	}
+	m_relaying.store(true);
+}
+
+void Transport::relay_stop()
+{
+	IoLock io(g_io);
+	m_relay.reset();
+	m_relaying.store(false);
+}
+
+RelayStats Transport::relay_stats() const
+{
+	IoLock io(g_io);
+	return m_relay_stats;
+}
+
+uint32_t Transport::link_of(PeerHandle peer)
+{
+	IoLock io(g_io);
+	return peer ? peer->connectID : 0;
+}
+
 void Transport::keepalive_loop()
 {
 	for (;;)
@@ -501,7 +671,8 @@ void Transport::keepalive_loop()
 		if (m_hold.sealed())
 			continue; // a crash: the link dies with the process
 		const bool alive = m_last_service_ms.load(std::memory_order_relaxed) + kOwnerAliveMs > now;
-		if (!alive && !m_hold.held(now))
+		const bool road = m_relaying.load(std::memory_order_relaxed) && now < m_relay_until.load(std::memory_order_relaxed);
+		if (!alive && !road && !m_hold.held(now))
 			continue; // a stalled owner without a hold (released, expired) must look dead to its peers
 		// Never wait for the lock: the owner (or another transport's helper) is using ENet right now.
 		std::unique_lock<std::recursive_mutex> io(g_io, std::try_to_lock);
@@ -510,6 +681,12 @@ void Transport::keepalive_loop()
 		// Acks, pings, sends, receives, timeouts. With no event structure ENet queues every state change (a timeout
 		// too) for dispatch instead of handing it out here.
 		enet_host_service(m_host, nullptr, 0);
+		if (m_relay)
+		{
+			relay_pump();
+			m_ka_services.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
 		// Then the queued events in order into the inbox, up to the first goodbye: ENet frees a peer's slot when it
 		// hands out its DISCONNECT, and the owner may still send to that peer until it has seen it. The goodbye and
 		// what follows wait in ENet for the owner's own enet_host_service. A full inbox (an owner held by a long
@@ -517,9 +694,10 @@ void Transport::keepalive_loop()
 		ENetEvent e;
 		while (m_inbox.size() < kMaxInbox && !disconnect_next(m_host) && enet_host_check_events(m_host, &e) > 0)
 		{
-			m_inbox.emplace_back();
-			m_inbox.back().link = e.peer ? e.peer->connectID : 0;
-			take_event(e, m_inbox.back().ev);
+			Taken t;
+			t.link = e.peer ? e.peer->connectID : 0;
+			take_event(e, t.ev);
+			inbox_push(std::move(t));
 		}
 		m_ka_services.fetch_add(1, std::memory_order_relaxed);
 	}

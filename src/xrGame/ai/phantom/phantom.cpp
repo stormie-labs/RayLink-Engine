@@ -361,7 +361,7 @@ void CPhantom::UpdatePosition(const Fvector& tgt_pos)
 
 void CPhantom::PsyHit(const CObject* object, float value)
 {
-	if (coop::mgr().is_client())
+	if (coop::is_mirror())
 		return; // Anomaly Coop (audit F10): the host's copy strikes, and the target gets it as PlayerHit. Not twice.
 
 	NET_Packet P;

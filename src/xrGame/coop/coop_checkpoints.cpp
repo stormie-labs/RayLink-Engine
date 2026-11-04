@@ -7,6 +7,7 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
+#include "coop_levels.h"
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_script.h"
@@ -43,6 +44,7 @@ using checkpoint::kNoSource;
 
 constexpr u16 kNoId = 0xffff;
 constexpr const char* kChangedCallback = "coop_checkpoint_changed";
+static_assert(checkpoint::kNoSeat == levels::wire::kNoLevel, "rides_with_host is asked with level_of_player");
 // F3 T6 R1 I-1: how often the host reads every cached slot again, so a character that is gone or whose id another
 // character got is announced as cleared (the reads are a few hundred bytes of custom data each).
 constexpr u64 kSweepMs = 1000;
@@ -60,6 +62,7 @@ struct Host
 	bool player_served = false; // F3a T7: the host player was in the world at the last frame (his list went to him)
 	int group_served = -1; // coop_checkpoints_group the players in the world were last served with
 	u64 next_sweep_ms = 0;
+	u64 next_arrival_ms = 0;
 	xr_set<u16> unreadable_told; // R1 M-2: characters whose unreadable record was logged in this world (<= kMaxSlots)
 };
 Host g_host;
@@ -402,6 +405,27 @@ void flush_outbox(bool group)
 	}
 }
 
+// Split levels: a player goes to another level on his own and host_on_level_change never hears of it. Where he is first seen
+// alive on a level his slot says nothing of is his arrival point there: his entity's record when a map server leads that level.
+void arrivals_frame()
+{
+	for (u16 proxy : g_host.in_world)
+	{
+		if (survival::life_of(proxy) != survival::Life::Alive || world::is_parked(proxy))
+			continue;
+		const bool away = levels::host_character_elsewhere(proxy);
+		const CGameObject* o = away ? nullptr : object_here(proxy);
+		if (!away && !o)
+			continue;
+		const Record r = away ? record_far(proxy, Kind::Arrival, kNoSource) : record_here(o, Kind::Arrival, kNoSource);
+		if (!r.valid())
+			continue;
+		const Slot* s = slot_of(proxy);
+		if (checkpoint::needs_arrival(s ? *s : Slot(), r.level))
+			host_set_arrival(proxy, r);
+	}
+}
+
 void host_frame()
 {
 	if (!ensure_loaded())
@@ -436,6 +460,11 @@ void host_frame()
 			send_view(proxy, group, switched && !group);
 		}
 	g_host.in_world.swap(now);
+	if (now_ms >= g_host.next_arrival_ms)
+	{
+		g_host.next_arrival_ms = now_ms + kSweepMs;
+		arrivals_frame();
+	}
 	// F3a T7: the host player (character 0, peer 0 over the internal channel) is served as a client is - the whole list
 	// when he comes into the world, again when the group view is switched (R1 M-8: the others' records, or "none").
 	const bool me_now = survival::player_in_world(0);
@@ -609,6 +638,24 @@ void register_console()
 
 // ---------------------------------------------------------------- host API
 
+checkpoint::Record record_far(u16 character, Kind kind, u16 source)
+{
+	Record r;
+	const CSE_ALifeDynamicObject* e = smart_cast<CSE_ALifeDynamicObject*>(character_entity(character));
+	if (!e || !ai().get_game_graph() || !ai().game_graph().valid_vertex_id(e->m_tGraphID))
+		return r;
+	r.level = level_of(e->m_tGraphID);
+	r.pos[0] = e->o_Position.x;
+	r.pos[1] = e->o_Position.y;
+	r.pos[2] = e->o_Position.z;
+	r.level_vertex = e->m_tNodeID;
+	r.game_vertex = e->m_tGraphID;
+	r.kind = kind;
+	r.source = source;
+	r.game_time_ms = game_time_ms();
+	return r;
+}
+
 checkpoint::Record record_here(const CGameObject* character, Kind kind, u16 source)
 {
 	Record r;
@@ -638,16 +685,16 @@ checkpoint::Record record_here(const CGameObject* character, Kind kind, u16 sour
 	return r;
 }
 
-bool host_set(u16 character, const Record& r)
+bool host_set(u16 character, const Record& r, bool elsewhere)
 {
 	if (!ensure_loaded())
 		return false;
 	const char* why = nullptr;
 	if (!r.valid())
 		why = "not a valid record";
-	else if (r.level != current_level())
+	else if (!elsewhere && r.level != current_level())
 		why = "not on this level";
-	else if (!ai().level_graph().valid_vertex_id(r.level_vertex))
+	else if (!elsewhere && !ai().level_graph().valid_vertex_id(r.level_vertex))
 		why = "no AI map vertex there";
 	else if (!ai().game_graph().valid_vertex_id(r.game_vertex))
 		why = "no game graph vertex"; // R1 M-6: a transition by game vertex (Task 14) needs one
@@ -742,14 +789,21 @@ void host_on_level_change(const CSE_ALifeCreatureActor& actor)
 	xr_vector<u16> players;
 	for (u16 proxy : g_host.in_world)
 		players.push_back(proxy);
-	unsigned n = 0;
+	const levels::LevelId target = levels::level_of_vertex(actor.m_tGraphID);
+	unsigned n = 0, stay = 0;
 	for (u16 proxy : players)
 	{
+		const PeerId peer = join::peer_of_proxy(proxy);
+		if (!checkpoint::rides_with_host(levels::split(), join::host_soft_stays(peer), levels::level_of_player(peer), target))
+		{
+			++stay;
+			continue;
+		}
 		Record r = host;
 		checkpoint::arrival_spot(host.pos, ++n, r.pos);
 		host_set_arrival(proxy, r);
 	}
-	::Msg("[coop] checkpoints: arrival on %s for the host and %u player(s)", host.level.c_str(), n);
+	::Msg("[coop] checkpoints: arrival on %s for the host and %u player(s), %u stay on their levels", host.level.c_str(), n, stay);
 }
 
 bool host_story(const char* reason)
@@ -763,11 +817,14 @@ bool host_story(const char* reason)
 	unsigned set = 0;
 	for (u16 c : characters)
 	{
-		if (survival::life_of(c) != survival::Life::Alive || (c != 0 && world::is_parked(c)))
-			continue;
-		const CGameObject* o = object_here(c);
-		if (o && host_set(c, record_here(o, Kind::Story, kNoSource)))
-			++set;
+		const bool living = survival::life_of(c) == survival::Life::Alive && (c == 0 || !world::is_parked(c));
+		const CGameObject* o = living ? object_here(c) : nullptr;
+		switch (checkpoint::story_from(living, levels::host_character_elsewhere(c), o != nullptr))
+		{
+		case checkpoint::StoryFrom::Object: set += host_set(c, record_here(o, Kind::Story, kNoSource)) ? 1 : 0; break;
+		case checkpoint::StoryFrom::Body: set += host_set(c, record_far(c, Kind::Story, kNoSource), true) ? 1 : 0; break;
+		case checkpoint::StoryFrom::Nothing: break;
+		}
 	}
 	++g_stat.stories;
 	if (log_allowed(g_stat.stories)) // R1 M-3: coop.checkpoint.story is open to every addon
@@ -781,13 +838,15 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 	kind = Kind::None;
 	if (!ensure_loaded())
 		return false;
-	const std::string level = current_level();
+	// F3a multilevel: a player on another level comes back on HIS level; the AI map of this process is not his
+	const CSE_ALifeDynamicObject* away = levels::host_character_elsewhere(character) ? ai().alife().objects().object(character, true) : nullptr;
+	const std::string level = away && ai().game_graph().valid_vertex_id(away->m_tGraphID) ? level_of(away->m_tGraphID) : current_level();
 	const CLevelGraph& lg = ai().level_graph();
 	Slot s;
 	if (const Slot* have = slot_of(character))
 		s = *have;
 	// a record on this level whose vertex is not on its AI map is no place to come back to (a corrupt save)
-	const auto usable = [&](const Record& r) { return r.valid() && (r.level != level || lg.valid_vertex_id(r.level_vertex)); };
+	const auto usable = [&](const Record& r) { return r.valid() && (away || r.level != level || lg.valid_vertex_id(r.level_vertex)); };
 	if (!usable(s.prev))
 		s.prev = Record();
 	if (!usable(s.cur))
@@ -802,7 +861,7 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 		a[1] = anchor->y;
 		a[2] = anchor->z;
 	}
-	const bool arrival = g_host.arrival.valid() && g_host.arrival.level == level &&
+	const bool arrival = !away && g_host.arrival.valid() && g_host.arrival.level == level &&
 		lg.valid_vertex_id(g_host.arrival.level_vertex);
 	const float b[3] = {body.x, body.y, body.z};
 	const checkpoint::Choice c = checkpoint::resolve(s, level, anchor ? a : nullptr, arrival ? g_host.arrival.pos : nullptr, b);

@@ -201,6 +201,15 @@ void CRender::create()
 {
 	Device.seqFrame.Add(this,REG_PRIORITY_HIGH + 0x12345678);
 
+	// Anomaly Coop: a map server draws nothing (dx10HW.cpp, CreateHeadless), its user.ltx asks for nothing here. The fluid manager
+	// is off for more than memory: Resources->Create is null with g_dedicated_server and it dereferences the shaders it gets.
+	if (g_coop_headless)
+	{
+		ps_r3_msaa = 0;
+		ps_r4_hdr10_on = 0;
+		ps_r2_ls_flags.set(R3FLAG_VOLUMETRIC_SMOKE, FALSE);
+	}
+
 	Engine.External.SetSkinningMode();
 	m_MSAASample = -1;
     o.volsize = 8;
@@ -352,6 +361,7 @@ void CRender::create()
 	if (Core.ParamsData.test(ECoreParams::smap2560)) o.smapsize = 2560;
 	if (Core.ParamsData.test(ECoreParams::smap3072)) o.smapsize = 3072;
 	if (Core.ParamsData.test(ECoreParams::smap4096)) o.smapsize = 4096;
+	if (g_coop_headless) o.smapsize = 64; // Anomaly Coop: the largest target there is
 
 	// gloss
 	char* g = strstr(Core.Params, "-gloss ");
@@ -813,7 +823,8 @@ void CRender::add_StaticWallmark(const wm_shader& S, const Fvector& P, float s, 
 
 void CRender::clear_static_wallmarks()
 {
-	Wallmarks->clear();
+	if (Wallmarks) // Anomaly Coop: a level stopped before it loaded
+		Wallmarks->clear();
 }
 
 void CRender::add_SkeletonWallmark(intrusive_ptr<CSkeletonWallmark> wm)

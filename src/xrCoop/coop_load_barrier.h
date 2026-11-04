@@ -107,6 +107,10 @@ public:
 		return waiting().empty() || elapsed(now) >= kLoadWaitMs;
 	}
 
+	// One mover's Enter: the barrier is open and he is ready. An Enter to a screen whose world still loads is lost: nothing would let
+	// that screen go.
+	bool enters(uint32_t peer, uint64_t now) const { return enter(now) && is_ready(peer); }
+
 	bool active() const { return active_; }
 	uint32_t epoch() const { return epoch_; }
 

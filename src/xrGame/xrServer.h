@@ -86,6 +86,15 @@ namespace file_transfer
 class clientdata_proxy;
 class server_info_uploader;
 
+namespace coop
+{
+namespace levels
+{
+bool leader_takes_ids(); // Anomaly Coop: coop_levels.h
+u16 leader_free_id();
+} // namespace levels
+} // namespace coop
+
 class xrServer : public IPureServer
 {
 private:
@@ -176,6 +185,8 @@ public:
 
 	IC u16 PerformIDgen(u16 ID)
 	{
+		if (ID == 0xffff && coop::levels::leader_takes_ids()) // Anomaly Coop: a map server takes ids of its own
+			ID = coop::levels::leader_free_id();
 		return (m_tID_Generator.tfGetID(ID));
 	}
 
