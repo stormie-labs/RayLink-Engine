@@ -320,8 +320,9 @@ bool manifest_text_file(const std::string& gamedata_rel);
 uint64_t manifest_lf_size(const uint8_t* data, size_t size);
 
 // A loose gamedata file (same path rules) that the game or its addons write at run time: user options, caches, logs,
-// `*_user.ltx`, `*.flag`. Two players with identical content have different copies of them, so they are not content
-// (live 2026-10-29: a client was refused for `laser_settings_user.ltx` and `medik_welcomed.flag`).
+// `*_user.ltx`, `*.flag`, `*_cache.ltx`, anything under a `cached\` folder. Two players with identical content have
+// different copies of them, so they are not content (live 2026-10-29: a client was refused for
+// `laser_settings_user.ltx` and `medik_welcomed.flag`; 2026-11-06: for 3DSS's and Experience Framework's caches).
 bool manifest_game_written(const std::string& gamedata_rel);
 
 struct ManifestDiff

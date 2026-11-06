@@ -370,9 +370,14 @@ bool manifest_game_written(const std::string& gamedata_rel)
 	for (const char* exact : {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx"})
 		if (low == exact)
 			return true;
-	for (const std::string tail : {".log", ".txt", ".bak", ".tmp", ".flag", "_user.ltx"})
+	// `*_cache.ltx` and any `\cached\` folder: settings caches a mod writes per player at run time (live 2026-11-06,
+	// b40.2: a client was refused for 3DSS's `ubgl_no_3db_settings_cache.ltx` and Experience Framework's
+	// `configs\experience_framework\cached\{configs,options}.ltx`, which his own game had written differently)
+	for (const std::string tail : {".log", ".txt", ".bak", ".tmp", ".flag", "_user.ltx", "_cache.ltx"})
 		if (low.size() >= tail.size() && low.compare(low.size() - tail.size(), tail.size(), tail) == 0)
 			return true;
+	if (low.find("\\cached\\") != std::string::npos)
+		return true;
 	return false;
 }
 
