@@ -52,6 +52,8 @@
 //   coop_rest_changed(local_id, state, hours)  every machine, for every change of a present player (a player gone or
 //     a world forgotten: "awake", 0). After a new world they go out once this machine is back in it.
 //   coop_rest_sleep(hours)                      every sleeper's machine: run the stock sleep effects (no time skip)
+//   coop_rest_skipped(hours)                    the world server, right after its skip: what the stock's actor_on_sleep does
+//     for the world at the skip (emission / psi-storm time_forwarded, a forced weather change), before the managers' next update
 //   coop_rest_refused(reason)                   the player's own machine: "place" | "combat" | "dead" | "busy" |
 //     "camp" (review M2: no checkpoint could be set where he lies). A new reason may be added later: an unknown one is
 //     shown as a refusal all the same.

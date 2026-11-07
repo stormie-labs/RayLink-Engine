@@ -26,6 +26,7 @@
 #include "GametaskManager.h"
 #include "coop/coop_presence.h" // Anomaly Coop
 #include "coop/coop_survival.h" // Anomaly Coop
+#include "../xrEngine/ui_size_policy.h" // Anomaly Coop
 
 extern CUIGameCustom* CurrentGameUI()
 {
@@ -662,6 +663,15 @@ void CHUDManager::Load()
 
 void CHUDManager::OnScreenResolutionChanged()
 {
+	// Anomaly Coop: never rebuild the game UI on a degenerate device size (ui_size_policy.h): the UI picks its XML
+	// variants by the size at this moment (0x0 gave zone_map.xml, the minimap top-left on G.A.M.M.A.). The UI built
+	// before stays; the next size change rebuilds it.
+	if (!ui_size_policy::hud_rebuild_allowed(Device.dwWidth, Device.dwHeight))
+	{
+		Msg("! [coop ui] game UI rebuild skipped: device size %ux%u", Device.dwWidth, Device.dwHeight);
+		return;
+	}
+
 	pUIGame->HideShownDialogs();
 
 	xr_delete(pWpnScopeXml);

@@ -36,6 +36,13 @@ u64 host_clock();
 // Host: true, and a TimeSync goes out at once. No session: true.
 bool allow_time_factor_change(float factor);
 
+// A jump of the game clock by delta_ms that the caller has just made (sky clock and ALife clock moved): level.change_game_time,
+// the shared sleep's skip_time, coop_time. Any thread; in a session the next frame() chooses both env sections of the sky again
+// for the new time when the jump is long (xrCoop/coop_sky_jump.h): the stock sky keeps its old sections until the next forced
+// weather change (live report 41.4: night at 10:30 after a sleep, day at 11:00). The engine's own clock jumps (a client
+// following the host, the host's move) note themselves. No session: nothing.
+void note_time_jump(s64 delta_ms);
+
 // level.change_game_time (Anomaly sleep, fast travel, scripted skips).
 // Client in a session: true, the caller must not move time; a request goes to the host, which shows
 // "[coop] <nick> wants to sleep" (R-10.2 v1: the host decides, nothing else happens). The call gate (F2 T12,

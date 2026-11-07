@@ -49,6 +49,7 @@ constexpr u64 kRefreshMs = 5000; // RestState goes out at least this often (step
 constexpr size_t kMaxWorldReason = 64; // set_world_block: a short reason ("emission"), only logged
 constexpr const char* kChangedCallback = "coop_rest_changed";
 constexpr const char* kSleepCallback = "coop_rest_sleep";
+constexpr const char* kSkippedCallback = "coop_rest_skipped"; // the world server, right after its skip
 constexpr const char* kRefusedCallback = "coop_rest_refused";
 constexpr size_t kRefusals = size_t(Refusal::Camp) + 1;
 
@@ -317,6 +318,12 @@ void skip_time(u8 hours)
 	const u32 seconds = u32(hours) * 3600;
 	g_pGamePersistent->Environment().ChangeGameTime(float(seconds));
 	alife_rw().time_manager().change_game_time(seconds * 1000);
+	// Live report 41.4: the stock sleep gets its forced weather change right after the skip (actor_on_sleep in the same call),
+	// here actor_on_sleep comes at dream_mid, after level_weathers' hour tick: the sky stayed on the old sections for an hour.
+	worldstate::note_time_jump(s64(seconds) * 1000);
+	// The world's Lua hears the skip now (script::frame of this frame, before the level scripts' next update): emission and
+	// psi-storm time_forwarded, the forced weather change (coop_rest.script on_skipped).
+	script::queue_callback(kSkippedCallback, {script::cb_int(hours)});
 }
 
 // decide said start: everybody present is Sleeping already (Group::tick).

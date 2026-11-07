@@ -16,6 +16,7 @@
 #include "ui/UIXmlInit.h"
 #include "ui/UIHelper.h"
 #include "ui/UIInventoryUtilities.h"
+#include "../xrEngine/xr_IOConsole.h" // Anomaly Coop: rs_screenmode for the UI build log line
 //////////////////////////////////////////////////////////////////////////
 
 CUIZoneMap::CUIZoneMap()
@@ -33,6 +34,19 @@ void CUIZoneMap::Init()
 {
 	CUIXml uiXml;
 	uiXml.Load(CONFIG_PATH, UI_PATH, "zone_map.xml");
+
+	// Anomaly Coop: one line per game UI build (level load, a resolution change, reload_hud_xml): the XML variant of
+	// every UI file follows the device size at this moment (ui_size_policy.h), the minimap's shows where it lands.
+	{
+		RECT rc = {};
+		GetClientRect(Device.m_hWnd, &rc);
+		const u8 family = UI().screenmode();
+		const LPCSTR window_mode = Console ? Console->GetToken("rs_screenmode") : nullptr;
+		Msg("* [coop ui] game UI built: device %ux%u (aspect %.3f), screenmode %u (%s), rs_screenmode %s, client %dx%d%s, zone_map: %s",
+			Device.dwWidth, Device.dwHeight, Device.dwHeight ? float(Device.dwWidth) / float(Device.dwHeight) : 0.f,
+			u32(family), family == 0 ? "4:3" : family == 1 ? "16:9" : "21:9", window_mode ? window_mode : "?",
+			int(rc.right), int(rc.bottom), IsIconic(Device.m_hWnd) ? " minimised" : "", uiXml.m_xml_file_name);
+	}
 
 	CUIXmlInit xml_init;
 	xml_init.InitStatic(uiXml, "minimap:background", 0, &m_background);

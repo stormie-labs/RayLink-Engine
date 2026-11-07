@@ -107,19 +107,23 @@ bool spawnable_section(const char* section)
 	    pSettings->line_exist(section, "class");
 }
 
-// F2 T12b round 2 (review N3): `clone` is a variant of `source` (lease::clone_family over their parent_section lines).
+// F2 T12b round 2 (review N3): `clone` is a variant of `source` (lease::clone_family over their parent_section lines),
+// or (2026-11-08, GAMMA's upgrade kits) the variant stock attach_scope makes of it with an addon of its `scopes`
+// (lease::addon_variant: wpn_vityaz + vitup = wpn_vityaz_vitup, which names itself in parent_section).
 bool clone_variant(LPCSTR source, LPCSTR clone)
 {
 	if (!source || !clone || !pSettings->section_exist(source) || !pSettings->section_exist(clone))
 		return false;
-	const auto parent = [](LPCSTR sec) -> LPCSTR
+	const auto line = [](LPCSTR sec, LPCSTR name) -> LPCSTR
 	{
-		if (!pSettings->line_exist(sec, "parent_section"))
+		if (!pSettings->line_exist(sec, name))
 			return "";
-		const LPCSTR v = pSettings->r_string(sec, "parent_section");
+		const LPCSTR v = pSettings->r_string(sec, name);
 		return v ? v : "";
 	};
-	return lease::clone_family(source, parent(source), clone, parent(clone));
+	const LPCSTR source_parent = line(source, "parent_section");
+	return lease::clone_family(source, source_parent, clone, line(clone, "parent_section")) ||
+	    lease::addon_variant(source, source_parent, line(source, "scopes"), clone);
 }
 
 // F2 T2 fix round 1 (Ruling F2-17): a section as spawn::missing_line asks about it (xrCoop/coop_spawn.h When). It never
@@ -3547,7 +3551,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	if (!section || !clone_variant(from->s_name.c_str(), section))
 	{
 		++g_lc.not_variant;
-		return lua_refuse("alife:clone_weapon", "not a variant of its weapon (scope, magnifier)");
+		return lua_refuse("alife:clone_weapon", "not a variant of its weapon (scope, magnifier, upgrade kit)");
 	}
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	CSE_ALifeItemWeaponMagazined* clone = smart_cast<CSE_ALifeItemWeaponMagazined*>(e);

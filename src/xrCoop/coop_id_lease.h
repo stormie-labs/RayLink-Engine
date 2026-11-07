@@ -74,6 +74,38 @@ inline bool clone_family(std::string_view source, std::string_view source_parent
 	return source == clone || source_base == clone_base || source_base == clone || clone_base == source;
 }
 
+// 2026-11-08 live report (GAMMA): a client could not fit an upgrade kit (PP Vityaz), the host could. A weapon kit (GAMMA's
+// mod_system_weapon_addons_upg_kits.ltx, 3DSS weapon_kit) is a scope-style addon whose variant is a weapon of its own:
+// item_weapon.attach_scope clones the bare weapon B into B_<kit>, and B_<kit> names itself in parent_section (its own
+// sights are its variants: wpn_vityaz_vitup_eot), so clone_family does not see B in it. Such an attach keeps to the
+// weapon's variants as stock attach_scope makes them: B its own base (parent_section = B), the clone named B_<addon>,
+// <addon> one of the comma-separated entries of B's `scopes` (check_scope; blanks around an entry do not count).
+inline bool addon_variant(std::string_view source, std::string_view source_parent, std::string_view source_scopes,
+    std::string_view clone)
+{
+	if (source.empty() || source_parent != source)
+		return false; // a scoped variant, or a weapon without the line: stock attach_scope fits nothing onto it
+	if (clone.size() <= source.size() + 1 || clone.substr(0, source.size()) != source || clone[source.size()] != '_')
+		return false;
+	const std::string_view addon = clone.substr(source.size() + 1);
+	constexpr std::string_view kBlanks = " \t";
+	std::size_t at = 0;
+	while (at <= source_scopes.size())
+	{
+		std::size_t end = source_scopes.find(',', at);
+		if (end == std::string_view::npos)
+			end = source_scopes.size();
+		std::string_view entry = source_scopes.substr(at, end - at);
+		const std::size_t first = entry.find_first_not_of(kBlanks);
+		entry = first == std::string_view::npos ? std::string_view() : entry.substr(first);
+		entry = entry.substr(0, entry.find_last_not_of(kBlanks) + 1);
+		if (entry == addon) // `addon` is never empty here
+			return true;
+		at = end + 1;
+	}
+	return false;
+}
+
 // Round 2 (review N1): the client's ReqSpawn pace (kSpawnPaceBurst in a row, then one per kSpawnPaceMs); a token bucket.
 class SpawnPacer
 {

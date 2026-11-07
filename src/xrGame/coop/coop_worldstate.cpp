@@ -7,6 +7,7 @@
 #include "coop_alife.h"
 #include "coop_callgate.h" // F2 T12
 #include "xrCoop/coop_relay_rules.h"
+#include "xrCoop/coop_sky_jump.h"
 #include "xrCoop/coop_soft_move.h"
 
 #include "Level.h"
@@ -177,8 +178,10 @@ struct State
 	u32 requests_seen = 0;
 	u64 last_refuse_log = 0;
 	bool warned_unknown_weather = false;
+	u32 sky_reselects = 0; // env sections chosen again after a jump of the clock (xrCoop/coop_sky_jump.h)
 };
 State g;
+sky::JumpNote g_sky_jumps; // outside State (an atomic): noted on any thread, taken by frame() on the main thread
 
 const char* str_of(const shared_str& s) { return s.c_str() ? s.c_str() : ""; }
 
@@ -259,6 +262,37 @@ void warn_unknown_weather(const char* what, const char* name)
 		return;
 	g.warned_unknown_weather = true;
 	::Msg("! [coop] weather: host uses %s '%s' that this game does not have (different weather mods?)", what, name);
+}
+
+// ---------------------------------------------------------------- the sky after a jump of the clock
+
+// Live report 41.4: after the shared sleep the sky stayed on the sections it had before (night at 10:30) until the next hour.
+// After a jump of the clock both env sections are chosen again for the new time of day, as a forced level.set_weather does after
+// its Invalidate (SelectEnvs' "first or forced start"), without its other effects: the cycle, a weather fx, the rain and the lens
+// flare stay as they are. On the host (and a map server) the new sections go out with the next WeatherSync; a client does the
+// same at its own jump, so it is right before that sync comes. See xrCoop/coop_sky_jump.h.
+void sky_frame()
+{
+	long long jump = 0;
+	if (!g_sky_jumps.take(jump))
+		return;
+	CEnvironment* e = env_ready();
+	if (!e || !sky::reselect_after_jump(jump, e->bWFX || e->m_paused))
+		return;
+	const CEnvironment::EnvVec& cycle = *e->CurrentWeather;
+	const float gt = sky::day_time(e->GetGameTime());
+	const sky::Pair p = sky::pick_pair(cycle, [](const CEnvDescriptor* d) { return d->exec_time; }, gt);
+	if (!p.ok)
+		return;
+	const char* was0 = str_of(e->Current[0]->m_identifier);
+	const char* was1 = str_of(e->Current[1]->m_identifier);
+	e->Current[0] = cycle[p.i0];
+	e->Current[1] = cycle[p.i1];
+	++g.sky_reselects;
+	const u32 mins = u32(gt / 60.f);
+	::Msg("[coop] sky: the clock jumped %.1f game h, env sections %s -> %s are now %s -> %s (%02u:%02u)",
+	    float(jump) / 3600000.f, was0, was1, str_of(e->Current[0]->m_identifier), str_of(e->Current[1]->m_identifier),
+	    (mins / 60) % 24, mins % 60);
 }
 
 // ---------------------------------------------------------------- host
@@ -429,6 +463,7 @@ void host_clock_ahead_now(u64 saved_clock, u64 real_ms)
 	// as client_apply_time: the sky clock first, a step of a whole day ends a running weather fx
 	g_pGamePersistent->Environment().ChangeGameTime(float(delta % kDayMs) / 1000.f);
 	tm.coop_set_game_time(tm.game_time() + delta, tm.time_factor());
+	g_sky_jumps.note(s64(delta));
 	g.time_dirty = true;
 	::Msg("[coop] soft move: the world's clock goes on by %.1f game min", float(delta) / 60000.f);
 }
@@ -493,6 +528,7 @@ void client_apply_time(u64 now)
 	// CEnvironment::SetGameTime counts a step back as a whole day and ends a running weather fx.
 	g_pGamePersistent->Environment().ChangeGameTime(float(delta % kDayMs) / 1000.f);
 	tm.coop_set_game_time(target, t.factor);
+	g_sky_jumps.note(delta); // the host slept / travelled / skipped: this sky follows at once, not at the next hour
 	++g.time_corrections;
 	if (delta > kLogJumpGameMs || delta < -kLogJumpGameMs || factor_differs)
 		::Msg("[coop] time: following the host clock (%+.1f game min, factor %.2f)", float(delta) / 60000.f, t.factor);
@@ -707,7 +743,17 @@ void install_client(Endpoint& e)
 	e.on(Msg::Thunderbolt, &client_on_thunderbolt);
 }
 
-void reset() { g = State(); }
+void reset()
+{
+	g = State();
+	g_sky_jumps.clear();
+}
+
+void note_time_jump(s64 delta_ms)
+{
+	if (mgr().active())
+		g_sky_jumps.note(delta_ms);
+}
 
 void host_clock_ahead(u64 saved_clock, u64 real_ms) { host_clock_ahead_now(saved_clock, real_ms); }
 u64 host_clock() { return alife_ready() ? u64(alife_rw().time_manager().game_time()) : 0; }
@@ -722,6 +768,7 @@ void frame()
 		host_frame(now);
 	else
 		client_frame(now);
+	sky_frame(); // after client_frame (its clock correction); the host's jumps came before (rest::frame, scripts, console)
 	if (is_map_server() && world_up())
 	{
 		// F3a: time is the world server's, the sky of a level is its authority's: one cycle, the section of this level
@@ -763,10 +810,12 @@ void print_status()
 	string32 host_blend = "";
 	if (!host && g.have_weather)
 		xr_sprintf(host_blend, " (host %.2f)", g.rx_weather.blend);
-	::Msg("[coop]   weather: %s%s%s, env %s -> %s, blend %.2f%s, %u %s, %u script changes refused",
+	::Msg("[coop]   weather: %s%s%s, env %s -> %s, blend %.2f%s, %u %s, %u script changes refused, %u chosen again after a "
+	      "jump of the clock",
 	    str_of(e->CurrentCycleName), e->bWFX ? ", fx " : "", e->bWFX ? str_of(e->CurrentWeatherName) : "",
 	    str_of(e->Current[0]->m_identifier), str_of(e->Current[1]->m_identifier), e->CurrentEnv->weight, host_blend,
-	    host ? g.weather_sent_count : g.weather_applies, host ? "syncs sent" : "applied", g.refused_weather);
+	    host ? g.weather_sent_count : g.weather_applies, host ? "syncs sent" : "applied", g.refused_weather,
+	    g.sky_reselects);
 }
 
 bool allow_time_factor_change(float factor)

@@ -62,6 +62,8 @@
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 
+#include "xrCoop/coop_prefetch_life.h" // Anomaly Coop: SPAWN_ANTIFREEZE prefetch thread life
+
 #ifdef DEBUG
 #include "level_debug.h"
 #include "ai/stalker/ai_stalker.h"
@@ -80,31 +82,42 @@ u32 lvInterpSteps = 0;
 #ifdef SPAWN_ANTIFREEZE
 BOOL spawn_antifreeze = TRUE;
 BOOL spawn_antifreeze_debug = FALSE;
-static HANDLE prefetch_thread_signal;
 
-static void unpausePrefetchThreadSignal()
+// Anomaly Coop: the thread's life is per level and outlives nothing (xrCoop/coop_prefetch_life.h). The stock code had
+// one static event for every level, a stop flag and a lock inside the CLevel, and ~CLevel freed the containers before it
+// signalled the thread, without waiting: a batch in flight wrote into freed memory (0xC0000374 at level change).
+struct PrefetchLock // xrSRWLock with the names of std::shared_mutex
 {
-	//if (spawn_antifreeze_debug) Msg("prefetch_thread_signal Set");
-	SetEvent(prefetch_thread_signal);
-}
+	xrSRWLock raw;
+	void lock() { raw.AcquireExclusive(); }
+	void unlock() { raw.ReleaseExclusive(); }
+	void lock_shared() { raw.AcquireShared(); }
+	void unlock_shared() { raw.ReleaseShared(); }
+};
 
-static void pausePrefetchThreadSignal()
+class PrefetchEvent // a manual-reset Win32 event, closed by its owner
 {
-	//if (spawn_antifreeze_debug) Msg("prefetch_thread_signal Reset");
-	ResetEvent(prefetch_thread_signal);
-}
+public:
+	PrefetchEvent() : h(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {}
+	~PrefetchEvent()
+	{
+		if (h)
+			CloseHandle(h);
+	}
+	PrefetchEvent(const PrefetchEvent&) = delete;
+	PrefetchEvent& operator=(const PrefetchEvent&) = delete;
+	void set() { SetEvent(h); }
+	void reset() { ResetEvent(h); }
+	bool wait(u32 ms) { return WaitForSingleObject(h, ms) == WAIT_OBJECT_0; }
 
-static void closePrefetchThreadSignal()
-{
-	if (spawn_antifreeze_debug) Msg("prefetch_thread_signal Close");
-	CloseHandle(prefetch_thread_signal);
-}
+private:
+	HANDLE h;
+};
+static_assert(coop::prefetch::kForever == INFINITE, "coop::prefetch::kForever is passed to WaitForSingleObject");
 
-static void createPrefetchThreadSignal()
+struct LevelPrefetchLife : coop::prefetch::Life<PrefetchLock, PrefetchEvent>
 {
-	if (spawn_antifreeze_debug) Msg("prefetch_thread_signal CreateEvent");
-	prefetch_thread_signal = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-}
+};
 
 struct spawn_and_prefetch_events
 {
@@ -112,8 +125,57 @@ struct spawn_and_prefetch_events
     spawn_events_data_map* spawn_events_data = nullptr;
     prefetch_event_queue* prefetch_events = nullptr;
     models_set* prefetched_models = nullptr;
-    bool* closeSignal = nullptr;
-    xrSRWLock* prefetch_lock = nullptr;
+    LevelPrefetchLife* life = nullptr;
+};
+
+// The level's containers as the prefetch thread sees them; coop::prefetch::run calls these under the level's lock.
+struct PrefetchWork
+{
+	using Batch = prefetch_event_queue;
+
+	NET_Queue_Event* spawn_events;
+	spawn_events_data_map* spawn_events_data;
+	prefetch_event_queue* prefetch_events;
+	models_set* prefetched_models;
+
+	bool empty_locked() const
+	{
+		if (!prefetch_events->empty())
+			return false;
+		if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] called, but prefetch_events queue is empty");
+		return true;
+	}
+	void take_locked(Batch& batch)
+	{
+		if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] started, queue size %d", prefetch_events->size());
+		batch.swap(*prefetch_events); // move the events to temp queue, so we can continue processing prefetch_events in the main thread
+	}
+	bool known_locked(const xr_string& model) const { return prefetched_models->find(model) != prefetched_models->end(); }
+	void prefetch(const xr_string& model)
+	{
+		PROF_EVENT("ProcessPrefetchEvents");
+		if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] Prefetching model '%s' for spawn event", model.c_str());
+		::Render->models_PrefetchOne(model.c_str(), false);
+	}
+	void remember_locked(const xr_string& model)
+	{
+		prefetched_models->insert(model); // add model to prefetched models set to avoid double prefetching
+	}
+	void deliver_locked(Batch& batch)
+	{
+		for (auto& E : batch)
+		{
+			spawn_events->insert(E.p); // reinsert the event to spawn_events queue for further processing
+			spawn_events_data->emplace(E.id, E); // store the prefetch event data for later use in ProcessSpawnEvents
+		}
+		if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] finished, spawn_events queue size %d", spawn_events->queue.size());
+	}
+	void leaving(size_t dropped)
+	{
+		if (spawn_antifreeze_debug && dropped)
+			Msg("[ProcessPrefetchEvents] level closing: a batch of %u spawn events in flight dropped", u32(dropped));
+		if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] closeSignal received, destroying thread");
+	}
 };
 
 u16	GetSpawnInfo(NET_Packet& P, u16& parent_id, shared_str& section)
@@ -278,8 +340,10 @@ CLevel::CLevel() :
     spawn_events_data = xr_new<spawn_events_data_map>();
     prefetch_events = xr_new<prefetch_event_queue>();
     prefetched_models = xr_new<models_set>();
-    auto events = new spawn_and_prefetch_events({ spawn_events, spawn_events_data, prefetch_events, prefetched_models, &closeSignal, &prefetch_lock });
-    createPrefetchThreadSignal();
+    if (spawn_antifreeze_debug) Msg("prefetch_thread_signal CreateEvent");
+    prefetch_life = xr_new<LevelPrefetchLife>(); // this level's own lock and events: no static handle shared between levels
+    prefetch_lock = &prefetch_life->lock.raw;
+    auto events = new spawn_and_prefetch_events({ spawn_events, spawn_events_data, prefetch_events, prefetched_models, prefetch_life });
     thread_spawn(ProcessPrefetchEvents, "Pre-Spawn Prefetcher Thread", 0, events);
     Msg("CLevel::CLevel() Spawn Antifreeze initialized");
 #endif
@@ -336,12 +400,35 @@ CLevel::~CLevel()
     xr_delete(game_events);
 
 #ifdef SPAWN_ANTIFREEZE
-    xr_delete(spawn_events);
-    xr_delete(spawn_events_data);
-    xr_delete(prefetch_events);
-    xr_delete(prefetched_models);
-    closeSignal = true; // signal ProcessPrefetchEvents thread to exit
-    unpausePrefetchThreadSignal();
+    // Anomaly Coop: stop the ProcessPrefetchEvents thread and wait until it has left, then free what it used. The stock
+    // code freed the containers first and signalled after, without waiting: a batch in flight wrote into freed memory.
+    {
+        const u32 stop_started = GetTickCount();
+        const bool left = coop::prefetch::shutdown(*prefetch_life, coop::prefetch::kStopWaitMs, [this] {
+            xr_delete(spawn_events);
+            xr_delete(spawn_events_data);
+            xr_delete(prefetch_events);
+            xr_delete(prefetched_models);
+            if (spawn_antifreeze_debug) Msg("prefetch_thread_signal Close");
+            xr_delete(prefetch_life); // closes this level's signal and exit events
+        });
+        if (left)
+        {
+            if (spawn_antifreeze_debug) Msg("[~CLevel] prefetch thread stopped in %u ms", GetTickCount() - stop_started);
+        }
+        else
+        {
+            // never free what a live thread may still touch: the containers, the events and the lock are leaked
+            Msg("! [~CLevel] the spawn prefetch thread did not stop in %u ms: its containers and events are leaked",
+                coop::prefetch::kStopWaitMs);
+            spawn_events = nullptr;
+            spawn_events_data = nullptr;
+            prefetch_events = nullptr;
+            prefetched_models = nullptr;
+            prefetch_life = nullptr;
+        }
+        prefetch_lock = nullptr;
+    }
 #endif
 
     xr_delete(m_pBulletManager);
@@ -564,79 +651,13 @@ void CLevel::SortSpawnEventsQueue()
 void CLevel::ProcessPrefetchEvents(void* args)
 {
     auto events = reinterpret_cast<spawn_and_prefetch_events*>(args);
-    auto spawn_events = events->spawn_events;
-    auto spawn_events_data = events->spawn_events_data;
-    auto prefetch_events = events->prefetch_events;
-    auto prefetched_models = events->prefetched_models;
-    auto closeSignal = events->closeSignal;
-    auto prefetch_lock = events->prefetch_lock;
+    PrefetchWork work{ events->spawn_events, events->spawn_events_data, events->prefetch_events, events->prefetched_models };
+    LevelPrefetchLife* life = events->life;
+    delete events;
 
-    while (true)
-    {
-        WaitForSingleObject(prefetch_thread_signal, INFINITE); // wait for prefetch queue event to be signaled
-
-        if (*closeSignal == true)
-        {
-            if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] closeSignal received, destroying thread");
-            closePrefetchThreadSignal();
-            delete events;
-            return;
-        }
-
-        {
-            xrSRWLockGuard g(prefetch_lock, true);
-            if (prefetch_events->empty())
-            {
-                if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] called, but prefetch_events queue is empty");
-                pausePrefetchThreadSignal();
-                continue;
-            }
-        }
-
-        PROF_EVENT("ProcessPrefetchEvents")
-            prefetch_event_queue saved_prefetch_events;
-        {
-            xrSRWLockGuard g(prefetch_lock);
-            if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] started, queue size %d", prefetch_events->size());
-            saved_prefetch_events.swap(*prefetch_events); // move the events to temp queue, so we can continue processing prefetch_events in the main thread
-            pausePrefetchThreadSignal();
-        }
-
-        for (const auto& E : saved_prefetch_events)
-        {
-            for (const auto& model : E.models)
-            {
-                bool not_prefetched = false;
-
-                {
-                    xrSRWLockGuard g(prefetch_lock, true);
-                    not_prefetched = prefetched_models->find(model) == prefetched_models->end();
-                }
-
-                if (not_prefetched)
-                {
-                    if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] Prefetching model '%s' for spawn event", model.c_str());
-                    ::Render->models_PrefetchOne(model.c_str(), false);
-
-                    {
-                        xrSRWLockGuard g(prefetch_lock);
-                        prefetched_models->insert(model); // add model to prefetched models set to avoid double prefetching
-                    }
-                }
-            }
-        }
-
-        {
-            xrSRWLockGuard g(prefetch_lock);
-            for (auto& E : saved_prefetch_events)
-            {
-                spawn_events->insert(E.p); // reinsert the event to spawn_events queue for further processing
-                spawn_events_data->emplace(E.id, E); // store the prefetch event data for later use in ProcessSpawnEvents
-            }
-
-            if (spawn_antifreeze_debug) Msg("[ProcessPrefetchEvents] finished, spawn_events queue size %d", spawn_events->queue.size());
-        }
-    }
+    // Anomaly Coop: the stock loop, with the stop protocol of coop_prefetch_life.h (stop flag and signal resets under the
+    // level's lock, early stop between models, no write once closing, `exited` set as the very last action)
+    coop::prefetch::run(*life, work);
 }
 
 // demonized: If called manually, be aware of ProcessPrefetchEvents thread, which may modify spawn_events queue at the same time, maybe fix later
@@ -933,7 +954,7 @@ void CLevel::ProcessGameEvents()
 	{
 		xrSRWLockGuard g(prefetch_lock);
 		prefetch_events->insert(prefetch_events->end(), events_to_prefetch.begin(), events_to_prefetch.end());
-		unpausePrefetchThreadSignal();
+		coop::prefetch::wake_locked(*prefetch_life);
 	}
 #endif
 

@@ -241,6 +241,7 @@ void change_time(u32 minutes)
 	const u32 seconds = minutes * 60;
 	g_pGamePersistent->Environment().ChangeGameTime(float(seconds));
 	single->alife().time_manager().change_game_time(seconds * 1000);
+	worldstate::note_time_jump(s64(seconds) * 1000); // the sky's sections follow at once (no level_weathers forces it here)
 }
 
 class CCC_CoopTime : public IConsole_Command

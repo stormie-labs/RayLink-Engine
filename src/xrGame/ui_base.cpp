@@ -2,6 +2,7 @@
 #include "ui_base.h"
 #include "GamePersistent.h"
 #include "UICursor.h"
+#include "../xrEngine/ui_size_policy.h" // Anomaly Coop
 
 CUICursor& GetUICursor() { return UI().GetUICursor(); };
 ui_core& UI() { return *GamePersistent().m_pUI_core; };
@@ -274,11 +275,8 @@ bool ui_core::is_widescreen()
 
 u8 ui_core::screenmode()
 {
-	if ((float(Device.dwWidth) / float(Device.dwHeight)) > 1.8f)
-		return u8(2);
-	else if ((float(Device.dwWidth) / float(Device.dwHeight)) > (UI_BASE_WIDTH / UI_BASE_HEIGHT + 0.01f))
-		return u8(1);
-	return u8(0);
+	// Anomaly Coop: the stock thresholds (> 1.8: _21, > 1024/768 + 0.01: _16), tested in tests/test_ui_size_policy.cpp
+	return ui_size_policy::layout_family(Device.dwWidth, Device.dwHeight);
 }
 
 float ui_core::get_current_kx()

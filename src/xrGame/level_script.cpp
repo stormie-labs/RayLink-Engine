@@ -344,6 +344,7 @@ void change_game_time(u32 days, u32 hours, u32 mins)
 		value *= 1000; //msec		
 		g_pGamePersistent->Environment().ChangeGameTime(fValue);
 		tpGame->alife().time_manager().change_game_time(value);
+		coop::worldstate::note_time_jump(s64(value)); // Anomaly Coop: in a session the sky's sections follow the jump at once
 	}
 }
 
