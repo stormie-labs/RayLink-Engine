@@ -19,6 +19,7 @@
 #include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
 #include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
 #include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
+#include "coop_debug.h" // protocol 29: debug::register_lua (coop.debug)
 #include "xrCoop/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 
@@ -1780,6 +1781,7 @@ void register_raw(lua_State* L)
 	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
 	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
 	levels::register_lua(L); // F3a: coop.levels.*, coop.is_world_server / is_map_authority / is_player / is_mirror (coop_levels.cpp)
+	debug::register_lua(L); // protocol 29: coop.debug.* (coop_debug.h)
 }
 } // namespace
 
@@ -1979,6 +1981,13 @@ void parity_command(const char* tag)
 		lua_pushstring(L, tag ? tag : "");
 		return 1;
 	});
+}
+
+CallResult call_now(const char* module, const char* fn, int (*push)(lua_State* L, const void* ctx), const void* ctx)
+{
+	if (!lua_ready())
+		return CallResult::NotReady;
+	return call_module(module, fn, [push, ctx](lua_State* L) { return push(L, ctx); }) ? CallResult::Done : CallResult::Failed;
 }
 
 void print_status()

@@ -142,6 +142,7 @@ const char* msg_name(Msg type)
 	case Msg::LoadReady: return "LoadReady";
 
 	case Msg::ScriptEvent: return "ScriptEvent";
+	case Msg::DebugState: return "DebugState";
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
 	}
@@ -221,6 +222,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::LevelResync:
 	case Msg::MapServerOrder:
 	case Msg::LoadWait: // F3a: the barrier of a simultaneous load, the world server's word
+	case Msg::DebugState: // protocol 29: only the world server holds the debug state
 	case Msg::StateDump: return MsgSender::HostOnly;
 
 	// a client's requests and reports

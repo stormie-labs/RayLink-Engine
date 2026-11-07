@@ -25,6 +25,7 @@
 #include "smart_cover_animation_selector.h"
 #include "clsid_game.h"
 #include "game_object_space.h"
+#include "coop/coop_ai.h" // Anomaly Coop (protocol 29): debug_unseen
 
 using smart_cover::animation_planner;
 using namespace StalkerDecisionSpace;
@@ -391,6 +392,8 @@ bool animation_planner::hit_callback(SHit const* hit)
 {
 	m_time_object_hit = Device.dwTimeGlobal;
 
+	if (coop::npc_ai::debug_unseen(hit->who)) // Anomaly Coop (protocol 29): invisible to the AI (ai_ignore_actor per player)
+		return (false);
 #ifndef MASTER_GOLD
 	if (hit->who && smart_cast<CActor*>(hit->who) && psAI_Flags.test(aiIgnoreActor))
 		return				(false);

@@ -314,7 +314,10 @@ void host_frame()
 	{
 		auto it = g_locks.find(g_host_talk);
 		if (it != g_locks.end() && it->second.holder == kHostPeer)
+		{
+			note_ended(kHostPeer, g_host_talk); // F2-34: the host's talk is remembered like a client's
 			g_locks.erase(it);
+		}
 		g_host_talk = kNoId;
 	}
 	for (auto it = g_locks.begin(); it != g_locks.end();)
@@ -649,7 +652,13 @@ void on_talk_window_closed()
 		{
 			auto it = g_locks.find(g_host_talk);
 			if (it != g_locks.end() && it->second.holder == kHostPeer)
+			{
+				// F2-34: the host player is a player like any other: his talk that ends is remembered as a client's
+				// (DialogUnlock, host_on_unlock). coop.talk_recent answers for him too; the Bar arena's fighter is the one
+				// who talked to Arnie last (live 2026-11-07: the host took the fight, a client went in).
+				note_ended(kHostPeer, g_host_talk);
 				g_locks.erase(it);
+			}
 			g_host_talk = kNoId;
 		}
 	}

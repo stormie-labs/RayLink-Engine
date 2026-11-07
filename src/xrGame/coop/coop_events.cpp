@@ -1150,9 +1150,17 @@ bool client_filter(NET_Packet& P)
 	return swallowed;
 }
 
-bool client_block_actor_hit(const CActor* actor, const SHit* hit)
+namespace
 {
-	if (coop::hold_loading_screen()) return true; // F3a T8 R1: nobody is hurt behind a held loading screen (a session never pauses)
+// Live 2026-11-07: every hit on the own actor goes into the journal of a transition (falls, who hit him, dropped hits).
+bool note_actor_hit(const CActor* actor, const SHit* hit, bool blocked)
+{
+	join::arrival_hit(actor, hit, blocked);
+	return blocked;
+}
+
+bool actor_hit_blocked(const CActor* actor, const SHit* hit)
+{
 	if (survival::ignores_hits()) return true;
 	if (is_map_authority())
 		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
@@ -1163,6 +1171,13 @@ bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 		return false;
 	++g_c.actor_hits_blocked; // the host sends this damage as PlayerHit
 	return true;
+}
+} // namespace
+
+bool client_block_actor_hit(const CActor* actor, const SHit* hit)
+{
+	if (coop::hold_loading_screen()) return note_actor_hit(actor, hit, true); // F3a T8 R1: nobody is hurt behind a held loading screen (a session never pauses)
+	return note_actor_hit(actor, hit, actor_hit_blocked(actor, hit));
 }
 
 void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent)

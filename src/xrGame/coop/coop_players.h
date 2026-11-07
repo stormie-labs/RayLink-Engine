@@ -43,6 +43,10 @@ void on_peer_left(PeerId id);
 void equip_install_server(Session& s); // F3a T4: PlayerEquip, PlayerVitals
 void equip_install_client(Endpoint& e); // F3a T4: PlayerEquip
 void equip_reset();
+// Live 2026-11-07, host: the arrival of a client's character on a new level. At the go: his last report (the vitals the
+// proxy keeps) and where he was put; at his WorldLoaded the window starts, his first report kWindowMs later is logged.
+void arrival_host_leaves(PeerId peer, u16 proxy, const char* nick, const char* level, float x, float y, float z);
+void arrival_host_entered(PeerId peer);
 void equip_frame();
 void equip_resend(); // force a full resend (after join)
 void equip_print_status();

@@ -17,6 +17,9 @@
 //     far from the host but next to a client thinks every 625 ms and walks at 1/6 of its speed (owner, build 10).
 //     Here: the characters of the other players are "viewers" of the scheduler (viewers_frame).
 //
+// Protocol 29 (the server's debug, work package 4): debug_unseen and player_god answer for a player by the personal flags of the state
+// this process acts on (coop_debug.h); the rules are xrCoop/coop_debug_rules.h (ai_ignores, blow_spares).
+//
 // Threading: on_proxy_frame runs on the main thread (UpdateCL, FrameMove); the queries run on the
 // game thread (schedule) or in bone callbacks. The game thread never runs during FrameMove, so the
 // per-proxy records written there are read without locks.
@@ -87,6 +90,17 @@ void viewers_frame();
 CEntityAlive* nearest_player(const Fvector& pos, float max_dist);
 // F3a: the actor of a map server: no creature sees or hears it (plan §1.6).
 bool ghost(const CObject* obj);
+// Protocol 29, the server's debug (docs/DEBUG_DESIGN.md §B.9, work package 4): `obj` is a player with the personal flag "invisible" and
+// this process runs the AI of his level (the world server: the host player's actor and the clients' proxies; a map server: the proxies
+// of its players). The AI leaves him out as the stock ai_ignore_actor leaves out the actor: the memory managers do not take him (vision,
+// hearing, hits, a smart cover's hit callback), he is no enemy (player_out_for) and nobody's nearest player. False on a player's
+// machine (puppets), out of a session, while the debug is off; cheap while nobody has the flag. Lua: coop.debug.unseen(id).
+bool debug_unseen(const CObject* obj);
+// A.2 p. 7: does a monster's stamina blow (a burer's anti-aim, a controller's melee) spare `who` - this machine's actor, or a remote
+// player's character the authority would send the blow to? In a session the server's flag god of his player decides, not this process's
+// AF_GODMODE (a g_god of before the session); the actor's scripted god (AF_GODMODE_RT) still spares; a ghost is spared. No session: the
+// stock GodMode().
+bool player_god(const CObject* who);
 // Audit F10: who a phantom born at `pos` flies at: the nearest player who is on his feet, of all the players, this machine's
 // view of it. A phantom has no snapshot, every machine's copy picks by itself. Stock (no session, nobody): this machine's entity.
 CObject* phantom_target(const Fvector& pos);

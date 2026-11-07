@@ -7,6 +7,8 @@
 #include "profiler.h"
 #include "string_concatenations.h"
 
+#include "../xrCoop/coop_log_keep.h" // Anomaly Coop: the logs of the last runs (pure rules, tests/test_log_keep.cpp)
+
 static xrLogger* theLogger = nullptr;
 XRCORE_API xr_queue <xrLogger::LogRecord>* xrLogger::logData;
 
@@ -317,6 +319,59 @@ xrLogger::~xrLogger()
 	InternalCloseLog();
 }
 
+// Anomaly Coop: before the new log truncates it, the log of the last run moves to <logs>\old\<name>_<time of its last
+// write>.log, and <logs>\old keeps the newest coop::log_keep::kKeep of that log (coop_log_keep.h). Reports came after the
+// next launch had overwritten the evidence (2026-11-07). Never fails the start: any error leaves the old log where it was
+// and the game goes on with its normal log. Only archives of this log inside <logs>\old are ever deleted.
+static void coop_keep_previous_log(const char* path)
+{
+	try
+	{
+		WIN32_FILE_ATTRIBUTE_DATA a{};
+		if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a) || (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+			return;
+		const u64 size = (u64(a.nFileSizeHigh) << 32) | u64(a.nFileSizeLow);
+		const std::string full(path);
+		const std::string stem = coop::log_keep::stem_of(full);
+		if (!coop::log_keep::worth_keeping(size) || stem.empty())
+			return;
+		const std::string folder = coop::log_keep::folder_of(full) + coop::log_keep::kFolder;
+		if (!CreateDirectoryA(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+			return;
+		FILETIME local{};
+		SYSTEMTIME st{};
+		if (!FileTimeToLocalFileTime(&a.ftLastWriteTime, &local) || !FileTimeToSystemTime(&local, &st))
+			return;
+		const coop::log_keep::Stamp when{st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond};
+		const std::string name = coop::log_keep::free_name(stem, when, [&folder](const std::string& n) {
+			return GetFileAttributesA((folder + "\\" + n).c_str()) != INVALID_FILE_ATTRIBUTES;
+		});
+		if (name.empty() || !MoveFileExA(path, (folder + "\\" + name).c_str(), MOVEFILE_COPY_ALLOWED))
+			return;
+
+		std::vector<std::string> names;
+		WIN32_FIND_DATAA fd{};
+		const HANDLE h = FindFirstFileA((folder + "\\*.log").c_str(), &fd);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			do
+			{
+				if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+					names.push_back(fd.cFileName);
+			} while (FindNextFileA(h, &fd));
+			FindClose(h);
+		}
+		u32 pruned = 0;
+		for (const std::string& n : coop::log_keep::to_prune(names, stem))
+			if (DeleteFileA((folder + "\\" + n).c_str()))
+				++pruned;
+		Msg("[coop] log: the last run's log is kept as %s\\%s (%u older removed)", coop::log_keep::kFolder, name.c_str(), pruned);
+	}
+	catch (...)
+	{
+	}
+}
+
 void xrLogger::InternalOpenLogFile()
 {
 	// IXRay format
@@ -338,6 +393,7 @@ void xrLogger::InternalOpenLogFile()
 	if (FS.path_exist("$logs$"))
 	{
 		FS.update_path(logFileName, "$logs$", logFileName);
+		coop_keep_previous_log(logFileName); // Anomaly Coop
 	}
 	logFile = FS.w_open(logFileName);
 	CHECK_OR_EXIT(logFile, "Can't create log file");

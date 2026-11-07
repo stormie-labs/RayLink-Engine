@@ -19,6 +19,8 @@
 #include "xrCoop/coop_session.h"
 
 class CALifeObjectRegistry;
+class CActor;
+struct SHit;
 struct GAME_NEWS_DATA;
 class NET_Packet;
 struct lua_State;
@@ -191,6 +193,13 @@ void print_status();
 // Client: ALife read the objects of the save but has not registered them yet (no children
 // lists, nothing online). Applies the role swap by rewriting ID_Parent.
 void on_alife_objects_loaded(CALifeObjectRegistry& objects);
+// Client, after ALife registered them (the new level's graph is loaded, the actor has not spawned): a character the host
+// put on the new level blind goes on its ground (live 2026-11-07, xrCoop/coop_arrival.h).
+void on_alife_registered();
+// The journal of this player's transition (live 2026-11-07): a health the co-op code set, a hit on the own actor (blocked:
+// dropped by co-op). No-ops when no transition is being watched.
+void arrival_apply(const char* what, float from, float to);
+void arrival_hit(const CActor* actor, const SHit* hit, bool blocked);
 // True while a coop client is loading the host's world.
 bool client_loading_world();
 // A client's PDA log is his own, not the one the host's save brings (xrCoop/coop_news_log.h).

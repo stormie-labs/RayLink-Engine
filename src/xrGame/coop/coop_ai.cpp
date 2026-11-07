@@ -6,12 +6,14 @@
 #include "coop_players.h"
 #include "coop_join.h"
 #include "coop_survival.h"
+#include "coop_debug.h" // protocol 29: the personal flags (debug_unseen, player_god)
 #include "xrCoop/coop_viewers.h"
 #include "xrCoop/coop_death_rules.h" // out_of_fight, monster_leaves
 #include "xrCoop/coop_enemy_rules.h"
 
 #include "Level.h"
 #include "Actor.h"
+#include "Actor_Flags.h" // player_god: GodMode, AF_GODMODE_RT
 #include "ActorEffector.h" // player_view_dir: the actor's camera
 #include "GameObject.h"
 #include "entity_alive.h"
@@ -91,6 +93,7 @@ struct Stats
 {
 	u64 light_estimates = 0, light_used = 0, sun_lit = 0, headlamps = 0, creature_estimates = 0, creature_used = 0;
 	u64 sees_asked = 0, sees_yes = 0, on_path = 0, look_checks = 0, look_yes = 0;
+	u64 debug_unseen = 0, debug_god = 0; // protocol 29: a player left out by the AI, a stamina blow spared (answers "yes")
 } g_stat;
 
 float max3(const Fvector& v) { return _max(v.x, _max(v.y, v.z)); }
@@ -145,6 +148,28 @@ const Proxy* fresh_record(u16 id)
 		return nullptr;
 	return &it->second;
 }
+
+// Protocol 29: who `obj` is for the debug's rules on this machine (xrCoop/coop_debug_rules.h Body), and the peer of his player
+// (kInvalidPeer when nobody plays him: an NPC, a ghost, a parked character).
+debug::Body body_of(const CObject* obj, PeerId& peer)
+{
+	peer = kInvalidPeer;
+	if (!obj)
+		return debug::Body::Other;
+	if (obj == static_cast<const CObject*>(g_actor))
+	{
+		if (ghost_actor() || !coop::is_player()) // the process's role Player (npc_ai::is_player asks about an object)
+			return debug::Body::Ghost;
+		peer = mgr().self();
+		return debug::Body::OwnPlayer;
+	}
+	if (!world::is_player_character(smart_cast<const CGameObject*>(obj)))
+		return debug::Body::Other;
+	peer = world::avatar_peer(obj->ID());
+	return peer == kInvalidPeer ? debug::Body::Other : debug::Body::Remote;
+}
+
+u8 flags_of(PeerId peer) { return peer == kInvalidPeer ? u8(0) : u8(debug::flags(peer)); }
 } // namespace
 
 bool player_out_of_fight(const CObject* obj)
@@ -169,7 +194,34 @@ bool player_out_for(const CObject* obj, bool stalker)
 {
 	if (!obj || !mgr().active() || !is_player(obj))
 		return false;
+	if (debug_unseen(obj))
+		return true; // protocol 29: invisible to the AI, nobody's enemy (a creature that chose him lets him go: need_update)
 	return death::enemy_leaves(u8(survival::life_of(obj->ID())), stalker, g_finish_downed != 0);
+}
+
+bool debug_unseen(const CObject* obj)
+{
+	if (!obj || !mgr().active() || !is_map_authority() || !debug::anyone_has(debug::kFlagInvisible))
+		return false;
+	PeerId peer = kInvalidPeer;
+	const debug::Body body = body_of(obj, peer);
+	if (!debug::ai_ignores(true, true, body, flags_of(peer)))
+		return false;
+	++g_stat.debug_unseen;
+	return true;
+}
+
+bool player_god(const CObject* who)
+{
+	if (!mgr().active())
+		return GodMode() != FALSE;
+	PeerId peer = kInvalidPeer;
+	const debug::Body body = body_of(who, peer);
+	const bool scripted = body == debug::Body::OwnPlayer && !!psActorFlags.test(AF_GODMODE_RT);
+	if (!debug::blow_spares(true, body, flags_of(peer), false, scripted))
+		return false;
+	++g_stat.debug_god;
+	return true;
 }
 
 bool is_player(const CObject* obj)
@@ -517,7 +569,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 {
 	CEntityAlive* best = nullptr;
 	float best_d = max_dist;
-	if (!ghost_actor() && g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor))
+	if (!ghost_actor() && g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor) && !debug_unseen(g_actor))
 	{
 		const float d = g_actor->Position().distance_to(pos);
 		if (d <= best_d)
@@ -531,7 +583,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
 	{
 		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
-		if (!body || !body->g_Alive() || player_down(body))
+		if (!body || !body->g_Alive() || player_down(body) || debug_unseen(body))
 			continue;
 		const float d = body->Position().distance_to(pos);
 		if (d <= best_d)
@@ -568,6 +620,8 @@ void print_status()
 	      "player sees: %llu asked, %llu yes | player on path %llu | look-at checks %llu, %llu yes",
 	    (u32)g_proxies.size(), g_stat.light_estimates, g_stat.sun_lit, g_stat.headlamps, g_stat.light_used,
 	    g_stat.sees_asked, g_stat.sees_yes, g_stat.on_path, g_stat.look_checks, g_stat.look_yes);
+	::Msg("[coop]   ai: the server's debug: an invisible player left out %llu times, stamina blows spared by god %llu", g_stat.debug_unseen,
+	    g_stat.debug_god);
 	for (const auto& it : g_proxies)
 		::Msg("[coop]   ai: proxy %u light %.2f%s, view %s", it.first, it.second.lum, it.second.headlamp ? " (headlamp)" : "",
 		    it.second.view_valid ? "known" : "unknown");

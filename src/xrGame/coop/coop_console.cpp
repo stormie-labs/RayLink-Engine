@@ -15,6 +15,7 @@
 #include "coop_ai.h" // scheduler viewers
 #include "coop_levels.h" // F3a
 #include "coop_dedicated.h" // plan 12
+#include "coop_debug.h" // protocol 29
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -229,5 +230,6 @@ void register_console_commands()
 	levels::register_console(); // F3a: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit
 	mapserver_stats_register_console(); // F3a: coop_mapserver_stats
 	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
+	debug::register_console(); // protocol 29: coop_debug, coop_dbg
 }
 } // namespace coop

@@ -9,8 +9,10 @@
 #include "coop_world.h"
 #include "coop_events.h"
 #include "coop_sync.h"
+#include "coop_debug.h" // protocol 29: the gate of coop.dbg.* requests
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_syncnet.h"
+#include "xrCoop/coop_lua_fn.h" // kept Lua functions in a table of their own (luabind shares the registry's slots)
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -151,6 +153,9 @@ u32 g_join_saves = 0; // fix 1: SavingForJoin guards alive (the host writes a jo
 Stats g_stats;
 
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+
+// Calls of kept Lua functions that did not run, by why (luafn::Fail): each kind logged by log_allowed of its own count.
+u64 g_not_called[luafn::kFailKinds] = {};
 
 // --- roles and players ----------------------------------------------------------------------------
 
@@ -629,49 +634,37 @@ bool lua_ready()
 	return !client() || mgr().is_live_client();
 }
 
-// Calls the registry function `ref` with what push(L) pushed, protected, with `nres` results for read(L) (on success
-// only). An error is logged and counted; the stack is left as it was.
+// Calls the kept function `ref` with what push(L) pushed, protected, with `nres` results for read(L) (on success only). The stack
+// is left as it was. A failure is counted and logged by its kind: a Lua error with its traceback, a call that could not be made
+// (no Lua state, nothing kept, the stack full, no function in the reference) with why; `why` (if given) gets the short reason an
+// answer carries (luafn::reason).
 template <class Push, class Read>
-bool pcall_ref(int ref, const char* what, const char* name, Push push, int nres, Read read)
+bool pcall_ref(int ref, const char* what, const char* name, Push push, int nres, Read read, std::string* why = nullptr)
 {
-	lua_State* L = lua();
-	if (!L || ref == LUA_NOREF || ref == LUA_REFNIL)
-		return false;
-	const int top = lua_gettop(L);
-	if (!lua_checkstack(L, 24))
-		return false;
-	lua_pushcfunction(L, &traceback);
-	const int errfunc = lua_gettop(L);
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-	if (!lua_isfunction(L, -1))
-	{
-		lua_settop(L, top);
-		return false;
-	}
-	const int nargs = push(L);
-	const bool ok = lua_pcall(L, nargs, nres, errfunc) == 0;
-	if (ok)
-		read(L);
-	else
+	std::string error;
+	const luafn::Fail f = luafn::call(lua(), ref, &traceback, push, nres, read, error);
+	if (f == luafn::Fail::None)
+		return true;
+	if (f == luafn::Fail::LuaError)
 	{
 		++g_stats.lua_errors;
 		if (log_allowed(g_stats.lua_errors))
-		{
-			const char* err = lua_tostring(L, -1);
 			::Msg("! [coop] lua error in coop.sync %s '%s' (#%llu, session continues): %s", what, name, g_stats.lua_errors,
-			    err ? err : "?");
-		}
+			    error.c_str());
 	}
-	lua_settop(L, top);
-	return ok;
+	else
+	{
+		const u64 n = ++g_not_called[size_t(f)];
+		if (log_allowed(n))
+			::Msg("! [coop] coop.sync %s '%s' not called (#%llu of this kind): %s", what, name, n,
+			    luafn::reason(f, error).c_str());
+	}
+	if (why)
+		*why = luafn::reason(f, error);
+	return false;
 }
 
-void unref(int ref)
-{
-	if (lua_State* L = lua())
-		if (ref != LUA_NOREF && ref != LUA_REFNIL)
-			luaL_unref(L, LUA_REGISTRYINDEX, ref);
-}
+void unref(int ref) { luafn::drop(lua(), ref); }
 
 // --- the frame pump outside a session ---------------------------------------------------------------
 
@@ -1034,6 +1027,8 @@ void on_request(PeerId from, Reader& r)
 		refusal = "not in the world";
 		++g_stats.not_in_world;
 	}
+	else if (debug::refuses_request(q.name))
+		refusal = debug::kRefusedOff; // protocol 29: while the server's debug is off only coop.dbg.view passes (counted there)
 	else if (g_handlers.find(q.name) == g_handlers.end())
 	{
 		refusal = "no handler"; // before the limits: a name nobody handles makes no bucket
@@ -1252,7 +1247,7 @@ void run_host_calls()
 		}
 		else
 		{
-			std::string why;
+			std::string why, not_run;
 			bool read = true;
 			const bool ran = pcall_ref(it->second, "handler", h.name.c_str(), [&](lua_State* L) {
 				lua_pushnumber(L, lua_Number(h.from));
@@ -1261,11 +1256,12 @@ void run_host_calls()
 			}, 2, [&](lua_State* L) {
 				ok = lua_toboolean(L, -2) != 0;
 				read = to_value(L, -1, result, why);
-			});
+			}, &not_run);
 			if (!ran)
 			{
+				// "handler error: <why>" (the first line of the Lua error, or why it was not called): the requester sees what broke
 				ok = false;
-				result = ss::make_string("handler error");
+				result = ss::make_string(not_run.empty() ? std::string("handler error") : "handler error: " + not_run);
 				++g_stats.handler_errors;
 			}
 			else if (!read)
@@ -1355,7 +1351,7 @@ bool arg_whole(lua_State* L, int idx, double lo, double hi, double& out)
 	return arg_number(L, idx, out) && out == std::floor(out) && out >= lo && out <= hi;
 }
 
-// The Lua function at idx as a registry reference of this state; LUA_NOREF for nil.
+// The Lua function at idx kept (coop_lua_fn.h: a table of its own, not the registry luabind shares); LUA_NOREF for nil.
 bool arg_function(lua_State* L, int idx, int& ref)
 {
 	ref = LUA_NOREF;
@@ -1363,18 +1359,11 @@ bool arg_function(lua_State* L, int idx, int& ref)
 		return true;
 	if (lua_type(L, idx) != LUA_TFUNCTION)
 		return false;
-	lua_pushvalue(L, idx);
-	ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	ref = luafn::keep(L, idx);
 	return true;
 }
 
-bool same_function(lua_State* L, int ref, int idx)
-{
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-	const bool same = lua_rawequal(L, -1, idx) != 0;
-	lua_pop(L, 1);
-	return same;
-}
+bool same_function(lua_State* L, int ref, int idx) { return luafn::same(L, ref, idx); }
 
 // coop.sync.set(scope, key, value) -> true | false, why
 int l_set(lua_State* L)
@@ -2111,6 +2100,9 @@ void print_status()
 	    s.casts, s.cast_machines, s.casts_in, s.effects, s.calls, s.lua_errors, s.calls_dropped, s.calls_stale,
 	    u32(g_calls.size()), u32(g_watches.size()), u32(g_handlers.size()), u32(g_effects.size()), u32(g_limits.rules()),
 	    s.bad_messages);
+	::Msg("[coop-sync] lua calls not made: no Lua state %llu, nothing kept %llu, stack full %llu, not a function %llu",
+	    g_not_called[size_t(luafn::Fail::NoState)], g_not_called[size_t(luafn::Fail::NoReference)],
+	    g_not_called[size_t(luafn::Fail::StackFull)], g_not_called[size_t(luafn::Fail::NotFunction)]);
 }
 
 void host_send_full(PeerId peer)

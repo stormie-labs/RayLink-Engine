@@ -28,10 +28,12 @@
 #include "xrCoop/coop_nametag.h"
 #include "xrCoop/coop_gear.h"
 #include "xrCoop/coop_checkpoint_rules.h"
+#include "xrCoop/coop_arrival.h" // live 2026-11-07: the host's view of a client's arrival
 
 #include "Level.h"
 #include "Actor.h"
 #include "ActorCondition.h"
+#include "Wound.h" // live 2026-11-07: the player's own bleeding comes back as a wound of his
 #include "ai/stalker/ai_stalker.h"
 #include "Inventory.h"
 #include "inventory_item.h"
@@ -147,6 +149,17 @@ u64 g_last_check = 0, g_last_refresh = 0, g_last_vitals = 0;
 xr_map<u16, Equip> g_pending;
 xr_map<u16, Equip> g_applied;
 bool g_vitals_restored = false;
+// Live 2026-11-07, host: a client's arrival on a new level, by peer (arrival_host_leaves / arrival_host_entered).
+struct HostArrival
+{
+	std::string nick, level;
+	float before[arrival::kVitalsCount] = {};
+	bool have_before = false;
+	u64 entered = 0; // his WorldLoaded; 0 until then
+};
+xr_map<PeerId, HostArrival> g_host_arrivals;
+u32 g_host_arrival_lines = 0;
+constexpr u32 kHostArrivalLines = 60;
 u64 g_equip_in = 0, g_equip_out = 0, g_vitals_out = 0, g_vitals_in = 0;
 // Layout of the owner's things (xrCoop/coop_gear.h). Client: what was last reported and when. Client, while its world
 // loads: the host's copy, by item. Host: how many reports it took / refused.
@@ -699,6 +712,17 @@ void host_on_vitals(PeerId from, Reader& r)
 		return;
 	store_vitals(proxy, v);
 	++g_vitals_in;
+	auto arr = g_host_arrivals.find(from);
+	if (arr != g_host_arrivals.end() && arr->second.entered && mgr().now_ms() >= arr->second.entered + arrival::kWindowMs)
+	{
+		const HostArrival& a = arr->second;
+		if (++g_host_arrival_lines <= kHostArrivalLines)
+			::Msg("[coop] arrival (host): '%s' on '%s' %.0f s after entering: hp %.3f bleed %.3f rad %.3f sat %.3f (his report); "
+			      "at the go hp %.3f bleed %.3f rad %.3f sat %.3f%s",
+			    a.nick.c_str(), a.level.c_str(), float(mgr().now_ms() - a.entered) / 1000.f, v.health, v.bleeding, v.radiation,
+			    v.satiety, a.before[0], a.before[5], a.before[2], a.before[1], a.have_before ? "" : " (no report before the go)");
+		g_host_arrivals.erase(arr);
+	}
 	// What follows the floats is the layout of his things; a sender without it ends here (the host keeps what it has).
 	std::vector<gear::Entry> layout;
 	switch (gear::read_tail(r, layout, last_slot_here()))
@@ -804,6 +828,44 @@ void client_send_vitals()
 	++g_vitals_out;
 }
 
+} // namespace
+
+void arrival_host_leaves(PeerId peer, u16 proxy, const char* nick, const char* level, float x, float y, float z)
+{
+	HostArrival a;
+	a.nick = nick ? nick : "?";
+	a.level = level ? level : "?";
+	const CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(proxy, true) : nullptr;
+	a.have_before = e && e->m_ini_string.size() && arrival::parse_vitals(e->m_ini_string.c_str(), a.before);
+	if (g_host_arrival_lines < kHostArrivalLines)
+		::Msg("[coop] arrival (host): '%s' goes to '%s' with hp %.3f bleed %.3f rad %.3f sat %.3f (his last report), put beside the "
+		      "exit's point [%.2f %.2f %.2f] at its height (his machine puts him on the ground)",
+		    a.nick.c_str(), a.level.c_str(), a.before[0], a.before[5], a.before[2], a.before[1], x, y, z);
+	g_host_arrivals[peer] = a;
+}
+
+void arrival_host_entered(PeerId peer)
+{
+	auto it = g_host_arrivals.find(peer);
+	if (it != g_host_arrivals.end())
+		it->second.entered = mgr().now_ms() ? mgr().now_ms() : 1;
+}
+
+namespace
+{
+// CEntityCondition::BleedingSpeed of one unit of wound size on this actor (its bleed_speed_k), measured with a wound that is
+// taken away again: the wounds must be cleared before.
+float bleed_speed_k(CActorCondition& c)
+{
+	CWound* w = c.AddWound(0.f, ALife::eHitTypeWound, 0);
+	if (!w)
+		return 0.f;
+	w->AddHit(1.f, ALife::eHitTypeWound);
+	const float k = c.BleedingSpeed();
+	c.ClearWounds();
+	return k;
+}
+
 // Client, once after join: our proxy (now the host avatar here) carries our saved vitals.
 void client_restore_vitals()
 {
@@ -832,14 +894,25 @@ void client_restore_vitals()
 		::Msg("[coop] new character: fresh condition (satiety, psy health, power)");
 		return;
 	}
-	if (v.bleeding <= 0.f)
-		c.ClearWounds();
+	// Live 2026-11-07: the wounds of the actor's client data are the host's: they always go, and the player's own bleeding
+	// comes back as one wound of its size. They went only when he was not bleeding: a bleeding client went on bleeding with
+	// the host's wounds after every level change.
+	c.ClearWounds();
+	const float wound = arrival::restore_wounds(v.bleeding, bleed_speed_k(c));
+	if (wound > 0.f)
+	{
+		if (CWound* w = c.AddWound(0.f, ALife::eHitTypeWound, 0))
+			w->AddHit(wound, ALife::eHitTypeWound);
+	}
+	const float was = c.GetHealth();
 	c.SetHealth(clampr(v.health, 0.05f, c.GetMaxHealth()));
+	join::arrival_apply("restore", was, c.GetHealth()); // live 2026-11-07: the spawn already has it (role swap): no jump
 	c.SetSatiety(v.satiety);
 	c.SetRadiation(v.radiation);
 	c.ChangePsyHealth(v.psy - c.GetPsyHealth());
 	c.ChangePower(v.power - c.GetPower());
-	::Msg("[coop] restored my condition: health %.2f, satiety %.2f, radiation %.2f", v.health, v.satiety, v.radiation);
+	::Msg("[coop] restored my condition: health %.2f, satiety %.2f, radiation %.2f, bleeding %.3f (now %.3f)", v.health,
+	    v.satiety, v.radiation, v.bleeding, c.BleedingSpeed());
 }
 } // namespace
 
@@ -935,6 +1008,7 @@ void equip_reset()
 	g_gear_table.clear();
 	g_gear_table_built = false;
 	g_gear_logged = true;
+	// g_host_arrivals stays: players::reset runs on a client going live too, and on the host's own world change
 }
 
 void equip_frame()

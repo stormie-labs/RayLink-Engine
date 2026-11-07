@@ -80,7 +80,10 @@ namespace coop
 //    Back, for who stays in his world.
 // 27 (F3a, what the static objects of a level keep, coop_levels_logic.h): LevelEntity has an op Logic, the bytes a binder would save.
 // 28 (F3a, a map server has no game record): PlayerRules ends with a party byte, friendly fire and whether stalkers finish a downed player.
-constexpr uint32_t kProtocolVersion = 28;
+// 29 (docs/DEBUG_DESIGN.md §B.3, owner 2026-11-07: debug is the server's, as sv_cheats): DebugState 0x01A1 (world server -> every player,
+//    the host player over the LocalLink, and every map server): on, its source, a serial, each player's personal flags
+//    (xrCoop/coop_debug_rules.h StateMsg).
+constexpr uint32_t kProtocolVersion = 29;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 
@@ -248,6 +251,9 @@ enum class Msg : uint16_t
 
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
+	// protocol 29 (docs/DEBUG_DESIGN.md §B.3): the server's debug, its state and the players' personal flags; layout and rules:
+	// xrCoop/coop_debug_rules.h StateMsg. World server -> every player (the host player over the LocalLink) and every map server.
+	DebugState = 0x01A1,
 	StateDumpRequest = 0x01B0, // client -> host: u16 id[, u8 what]: an entity it misses, a repair (coop_reconcile.h Repair)
 	StateDump = 0x01B1,
 

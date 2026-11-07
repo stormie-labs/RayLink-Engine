@@ -90,6 +90,7 @@ inline Need need_of(Msg type)
 	case Msg::RestState:
 	case Msg::RestSleep:
 	case Msg::PlayerRules: // survival rules: stored
+	case Msg::DebugState: // protocol 29: the newest state is kept, the flags are the process's (psActorFlags), no world needed
 	case Msg::PlayerDied: // relay and a log line
 
 	// --- F3a: the tables and the barrier keep their own books (coop_levels, coop_join), a map server's state is a number

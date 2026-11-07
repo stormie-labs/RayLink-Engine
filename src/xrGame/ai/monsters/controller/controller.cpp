@@ -40,6 +40,7 @@
 #include "controller_psy_hit.h"
 #include "../monster_cover_manager.h"
 #include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
+#include "../../../coop/coop_ai.h" // Anomaly Coop (protocol 29): player_god
 //#include "controller_psy_aura.h"
 
 #ifdef _DEBUG
@@ -773,7 +774,7 @@ void CController::HitEntity(const CEntity* pEntity, float fDamage, float impulse
 {
 	if (pEntity == Actor())
 		stamina_hit_actor();
-	else // Anomaly Coop (audit A5): a remote player's machine drains its own actor
+	else if (!coop::npc_ai::player_god(pEntity)) // Anomaly Coop (audit A5): a remote player's machine drains its own actor; not a god's
 		coop::monster_fx::host_send(pEntity, this, coop::monster_fx::kControllerStamina, 0, 0.f);
 
 	inherited::HitEntity(pEntity, fDamage, impulse, dir, hit_type, draw_hit_marks);
@@ -781,7 +782,7 @@ void CController::HitEntity(const CEntity* pEntity, float fDamage, float impulse
 
 void CController::stamina_hit_actor()
 {
-	if (GodMode())
+	if (coop::npc_ai::player_god(Actor())) // Anomaly Coop (A.2 p. 7): the god of the player it lands on, was GodMode() of the process
 		return;
 	Actor()->conditions().PowerHit(m_stamina_hit, false);
 	if (Actor()->conditions().GetPower() < m_stamina_hit)

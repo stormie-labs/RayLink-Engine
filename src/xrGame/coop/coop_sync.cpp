@@ -29,6 +29,7 @@
 #include "coop_callgate.h" // F2 T12
 #include "coop_levels.h" // F3a
 #include "coop_monster_fx.h" // audit A5
+#include "coop_debug.h" // protocol 29: the server's debug
 
 #include "Level.h"
 #include "Actor.h"
@@ -88,6 +89,7 @@ void install_server(Session& s)
 	objects::install_server(s);
 	levels::install_server(s); // F3a
 	monster_fx::install_server(s); // audit A5
+	debug::install_server(s); // protocol 29
 }
 
 void install_client(Endpoint& e)
@@ -113,6 +115,7 @@ void install_client(Endpoint& e)
 	objects::install_client(e);
 	levels::install_client(e); // F3a
 	monster_fx::install_client(e); // audit A5
+	debug::install_client(e); // protocol 29: DebugState (the host player's over the link, a map server's on its bridge)
 }
 
 void on_session_started()
@@ -140,6 +143,7 @@ void on_session_started()
 	callgate::reset(); // F2 T12: gated call counters, the log budget
 	levels::reset(); // F3a
 	g_joining.clear();
+	debug::on_session_started(); // protocol 29: on with the key -dbg of this host, else off
 }
 
 void on_peer_joined(const PeerInfo&) {}
@@ -154,6 +158,7 @@ void on_peer_left(PeerId id)
 	requests::on_peer_left(id); // F2 T2: his queued spawn requests (F2-21)
 	syncapi::on_peer_left(id); // F2 T14: his request limits
 	levels::on_peer_left(id); // F3a
+	debug::on_peer_left(id); // protocol 29: his personal flags go
 	net::host_drop(id);
 	g_joining.erase(id);
 }
@@ -185,6 +190,7 @@ void reset()
 	router::reset(); // F2 T10: call counters
 	callgate::reset(); // F2 T12: gated call counters, the log budget
 	levels::reset(); // F3a
+	debug::reset(); // protocol 29: the state goes, the flags this machine set on its actor are taken back
 	g_joining.clear();
 }
 
@@ -200,6 +206,7 @@ void host_end_join(PeerId id)
 	net::host_flush(id);
 	g_joining.erase(id);
 	money::host_on_peer_in_world(id); // F2 T1 fix round 1: the balance after the queued changes, once he is live
+	debug::host_on_peer_in_world(id); // protocol 29: the server's debug, a map server's bridge too
 }
 
 bool host_peer_joining(PeerId id) { return g_joining.count(id) != 0; }
@@ -262,6 +269,7 @@ void frame()
 	story::frame();
 	levels::frame(); // F3a: the registry and the map servers (T10, T9)
 	monster_fx::frame(up); // audit A5: abilities that came before their monster
+	debug::frame(); // protocol 29: a change of the server's debug goes out
 }
 
 void print_status()
@@ -292,6 +300,7 @@ void print_status()
 	items::print_status();
 	objects::print_status();
 	monster_fx::print_status(); // audit A5
+	debug::print_status(); // protocol 29
 }
 
 void dump_state(LPCSTR args)

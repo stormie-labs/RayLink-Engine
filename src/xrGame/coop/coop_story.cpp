@@ -595,6 +595,31 @@ struct SentTarget
 xr_map<u16, SentTarget> g_target_sent; // host: last place sent per target
 u64 g_target_last_scan = 0;
 
+// Client: what became of the host's places (coop_status), per target in host numbering.
+struct TargetRx
+{
+	u64 at = 0; // the last place from the host
+	u32 n = 0; // places from the host
+	task_target::Take take = task_target::Take::Unknown; // what was done with the last one
+};
+constexpr size_t kMaxTargetRx = 256;
+xr_map<u16, TargetRx> g_target_rx;
+xr_map<u16, u64> g_target_unknown_logged; // host id -> logged at
+u64 g_target_unknown = 0; // places for a target this machine has no copy of
+
+const char* take_name(task_target::Take t)
+{
+	switch (t)
+	{
+	case task_target::Take::Unknown: return "unknown here";
+	case task_target::Take::Follow: return "follows its game object";
+	case task_target::Take::Own: return "moved by this machine";
+	case task_target::Take::Offline: return "placed offline";
+	case task_target::Take::Online: return "placed online (no game object)";
+	}
+	return "?";
+}
+
 bool target_place(u16 local_id, TargetPlace& out)
 {
 	const CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(local_id, true) : nullptr;
@@ -635,21 +660,19 @@ void send_targets(const xr_vector<TargetPlace>& list, Send send)
 	}
 }
 
+bool spot_replicable(CMapLocation* ml, const shared_str& type); // map spots section below
+
 // The targets of the running tasks (with a spot): all of them for a resync, else those that moved.
 xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next)
 {
 	xr_vector<TargetPlace> out;
 	const u64 now = mgr().now_ms();
 	xr_set<u16> seen;
-	for (const SGameTaskKey& k : tasks().GetGameTasks())
+	const auto consider = [&](u16 local_id)
 	{
-		const CGameTask* t = k.game_task;
-		if (!t || is_local_task(k.task_id) || t->GetTaskState() != eTaskStateInProgress || !t->m_map_location.size() ||
-			t->m_map_object_id == kNoId || !seen.insert(t->m_map_object_id).second)
-			continue;
 		TargetPlace p;
-		if (!target_place(t->m_map_object_id, p))
-			continue;
+		if (!target_place(local_id, p))
+			return;
 		task_target::Place place;
 		place.x = p.pos[0];
 		place.y = p.pos[1];
@@ -665,7 +688,28 @@ xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next)
 		}
 		else if (next)
 			(*next)[p.id] = sent;
+	};
+	for (const SGameTaskKey& k : tasks().GetGameTasks())
+	{
+		const CGameTask* t = k.game_task;
+		if (!t || is_local_task(k.task_id) || t->GetTaskState() != eTaskStateInProgress || !t->m_map_location.size() ||
+			t->m_map_object_id == kNoId || !seen.insert(t->m_map_object_id).second)
+			continue;
+		consider(t->m_map_object_id);
 	}
+	// A shared spot of a task script on a squad (an assault task's red_location on the enemy squad, tasks_assault.script):
+	// a squad has no game object, every machine draws it at its own copy of the squad, which a client's ALife never moves.
+	if (ai().get_alife())
+		for (const SLocationKey& k : spots().Locations())
+		{
+			if (!k.location || k.object_id == kNoId || seen.count(k.object_id) || !spot_replicable(k.location, k.spot_type))
+				continue;
+			CSE_ALifeDynamicObject* e = ai().alife().objects().object(k.object_id, true);
+			if (!e || !e->cast_online_offline_group())
+				continue;
+			seen.insert(k.object_id);
+			consider(k.object_id);
+		}
 	return out;
 }
 
@@ -686,9 +730,42 @@ void send_targets_to(PeerId to)
 		send_targets(collect_targets(true, nullptr), [to](Writer& w) { net::host_send(to, Msg::TaskUpdate, w); });
 }
 
+// A target the host points at and this machine has no copy of: its spot has no place here. Once a minute per id.
+void log_unknown_target(u16 host_id, u16 local, u64 now)
+{
+	++g_target_unknown;
+	auto it = g_target_unknown_logged.find(host_id);
+	if (it != g_target_unknown_logged.end() && !task_target::log_due(it->second, now))
+		return;
+	if (it == g_target_unknown_logged.end() && g_target_unknown_logged.size() >= kMaxTargetRx)
+		g_target_unknown_logged.clear();
+	g_target_unknown_logged[host_id] = now;
+	const CGameTask* by = nullptr;
+	if (in_game())
+		for (const SGameTaskKey& k : tasks().GetGameTasks())
+			if (k.game_task && k.game_task->m_map_object_id == local)
+			{
+				by = k.game_task;
+				break;
+			}
+	::Msg("! [coop] story: task target %u of the host (task '%s') is unknown here: its spot has no place on this machine "
+		  "(%llu such places so far)", host_id, by ? cs(by->m_ID) : "?", g_target_unknown);
+}
+
+void note_target_rx(u16 host_id, task_target::Take take, u64 now)
+{
+	if (g_target_rx.size() >= kMaxTargetRx && g_target_rx.find(host_id) == g_target_rx.end())
+		g_target_rx.clear(); // bookkeeping for coop_status only
+	TargetRx& rx = g_target_rx[host_id];
+	rx.at = now;
+	++rx.n;
+	rx.take = take;
+}
+
 void client_on_task_targets(Reader& r)
 {
 	const u16 n = r.u16();
+	const u64 now = mgr().now_ms();
 	for (u16 i = 0; i < n; ++i)
 	{
 		const u16 id = r.u16();
@@ -700,17 +777,92 @@ void client_on_task_targets(Reader& r)
 			return;
 		if (!ai().get_alife())
 			continue;
-		CSE_ALifeDynamicObject* e = ai().alife().objects().object(local_id_of(id), true);
-		if (!e || e->m_bOnline)
-			continue; // online here: the spot follows the object itself
+		const u16 local = local_id_of(id);
+		CSE_ALifeDynamicObject* e = ai().alife().objects().object(local, true);
+		task_target::Here here;
+		here.known = e != nullptr;
+		here.online = e && e->m_bOnline;
+		here.held = e && e->ID_Parent != kNoId;
+		here.level_object = in_game() && Level().Objects.net_Find(local) != nullptr;
+		here.map_authority = is_map_authority();
+		const task_target::Take take = task_target::take(here);
+		note_target_rx(id, take, now);
+		if (take == task_target::Take::Unknown)
+		{
+			log_unknown_target(id, local, now);
+			continue;
+		}
+		const bool offline = take == task_target::Take::Offline;
+		if (!offline && take != task_target::Take::Online)
+			continue; // the spot follows the game object / this machine's own update moves it
+		// An online squad (Take::Online) has no game object: CMapLocation and the compass read its entity, which nothing here
+		// moves. Online it is in no graph registry (CSE_ALifeOnlineOfflineGroup::switch_online), so only its place changes.
+		const bool vertex_ok = ai().game_graph().valid_vertex_id(game_vertex);
 		// as coop_entities place(): only what lives in the graph registry moves between its vertices
-		if (e->ID_Parent == kNoId && e->used_ai_locations() && e->m_tGraphID != game_vertex &&
-			ai().game_graph().valid_vertex_id(game_vertex) && ai().game_graph().valid_vertex_id(e->m_tGraphID))
+		if (offline && e->ID_Parent == kNoId && e->used_ai_locations() && e->m_tGraphID != game_vertex && vertex_ok &&
+			ai().game_graph().valid_vertex_id(e->m_tGraphID))
 			alife_rw().graph().change(e, e->m_tGraphID, game_vertex);
 		e->o_Position.set(p[0], p[1], p[2]);
 		e->m_tNodeID = node;
-		e->m_tGraphID = game_vertex;
+		if (offline || vertex_ok)
+			e->m_tGraphID = game_vertex;
 	}
+}
+
+// coop_status: where each running task with a spot points and what this machine has of that target. The host's line and a
+// client's line for the same target name the same host id and, when the spot is in step, nearly the same place.
+void print_task_targets()
+{
+	if (!in_game())
+		return;
+	const bool host = mgr().is_host();
+	const u64 now = mgr().now_ms();
+	u32 n = 0;
+	for (const SGameTaskKey& k : tasks().GetGameTasks())
+	{
+		const CGameTask* t = k.game_task;
+		if (!t || is_local_task(k.task_id) || t->GetTaskState() != eTaskStateInProgress || !t->m_map_location.size() ||
+			t->m_map_object_id == kNoId)
+			continue;
+		if (++n > 32)
+		{
+			::Msg("[coop] story:   ... more task targets");
+			break;
+		}
+		const u16 local = t->m_map_object_id;
+		const u16 hid = host_id_of(local);
+		const CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(local, true) : nullptr;
+		const bool object = Level().Objects.net_Find(local) != nullptr;
+		string128 where = "no place";
+		if (e)
+		{
+			const Fvector p = e->draw_level_position();
+			xr_sprintf(where, "at %.1f %.1f %.1f gv %u", p.x, p.y, p.z, u32(e->m_tGraphID));
+		}
+		string128 sync = "";
+		if (host)
+		{
+			const auto it = g_target_sent.find(hid);
+			if (it != g_target_sent.end() && it->second.at)
+				xr_sprintf(sync, "place sent %llu ms ago", now - it->second.at);
+			else
+				xr_strcpy(sync, "place not sent");
+		}
+		else
+		{
+			const auto it = g_target_rx.find(hid);
+			if (it != g_target_rx.end())
+				xr_sprintf(sync, "%u places from the host, last %llu ms ago: %s", it->second.n, now - it->second.at,
+					take_name(it->second.take));
+			else
+				xr_strcpy(sync, "no place from the host");
+		}
+		::Msg("[coop] story:   task '%s' spot '%s' -> target %u (host %u): %s, %s, %s, %s; %s", cs(t->m_ID),
+			cs(t->m_map_location), u32(local), u32(hid), e ? "known" : "UNKNOWN here", e && e->m_bOnline ? "online" : "offline",
+			object ? "game object" : "no game object", where, sync);
+	}
+	if (!host)
+		::Msg("[coop] story: task target places for ids unknown here %llu", g_target_unknown);
 }
 
 void send_task_to(PeerId to, const CGameTask* t)
@@ -2681,6 +2833,9 @@ void reset()
 	g_host_last_scan = 0;
 	g_target_sent.clear();
 	g_target_last_scan = 0;
+	g_target_rx.clear();
+	g_target_unknown_logged.clear();
+	g_target_unknown = 0;
 	g_finisher.clear();
 	g_client_recs.clear();
 	g_known.clear();
@@ -2785,6 +2940,7 @@ void print_status()
 	    g_outbox.dropped_relation(), g_outbox.merged());
 	for (const auto& it : g_finisher)
 		::Msg("[coop] story:   task '%s' finished at the request of %s", cs(it.first), peer_name(it.second));
+	print_task_targets(); // owner 2026-11-07: task spots of host and client compared line by line
 	if (in_game()) // the Lua side of shared tasks (coop_tasks.script, W3c)
 		run_lua("@coop_story_status",
 		    "local ok, m = pcall(function() return coop_tasks end)\n"

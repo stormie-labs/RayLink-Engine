@@ -136,6 +136,8 @@ void CSoundMemoryManager::feel_sound_new(CObject* object, int sound_type, CSound
 	PROF_EVENT("SoundMemory::feel_sound_new");
 	if (coop::npc_ai::ghost(object)) // Anomaly Coop: a map server's actor is nobody
 		return;
+	if (coop::npc_ai::debug_unseen(object)) // Anomaly Coop (protocol 29): the server's debug, invisible to the AI (ai_ignore_actor per player)
+		return;
 #ifndef MASTER_GOLD
 	if (object && smart_cast<CActor*>(object) && psAI_Flags.test(aiIgnoreActor))
 		return;

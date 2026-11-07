@@ -77,6 +77,8 @@ inline constexpr Msg kLinkMessages[] = {
 	// F3a T8: the board (the host player's vote, his placard) and the simultaneous load (his LoadWait, his LoadReady)
 	Msg::TransitionVote, Msg::TransitionState, // coop_join: the waiting point
 	Msg::LoadWait, Msg::LoadReady, // coop_join: the simultaneous load
+	// protocol 29: the server's debug reaches the host player as every client (docs/DEBUG_DESIGN.md §B.3); his half sets his flags
+	Msg::DebugState, // coop_debug
 };
 
 // The game's gate of the link (LocalLink::set_gate): the world server sends the host player only these messages over the

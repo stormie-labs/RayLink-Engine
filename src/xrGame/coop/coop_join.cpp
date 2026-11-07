@@ -32,6 +32,7 @@
 #include "xrCoop/coop_soft_move.h" // F3a: the host's move that nobody notices
 #include "xrCoop/coop_transition.h" // protocol 10: the waiting point of a level change
 #include "xrCoop/coop_ui_rules.h" // the held screen's input
+#include "xrCoop/coop_arrival.h" // live 2026-11-07: a client's arrival on a new level (ground, health, journal)
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/CameraBase.h" // transition: the view of a player put back at the edge
@@ -43,6 +44,7 @@
 #include "level_graph.h"
 #include "Level.h"
 #include "Actor.h" // protocol 9: host_actor_faction
+#include "ActorCondition.h" // live 2026-11-07: the arrival journal's vitals
 #include "level_changer.h"
 #include "ActorEffector.h" // a client's way out of a route's fade
 #include "PostprocessAnimator.h"
@@ -127,6 +129,7 @@ struct State
 	u64 receive_started = 0;
 	bool load_issued = false;
 	bool swap_done = false;
+	bool arrival_check = false; // live 2026-11-07: the host put our character blind, the ground comes after the graph loads
 	u64 last_progress_log = 0;
 	// host: the world we serve (world_generation() when it was seen); a load or a level change
 	// replaces it (epoch++ in on_world_created, the session's world epoch with it: R2 I1)
@@ -326,6 +329,14 @@ constexpr u64 kTripAnswerMs = 10000; // a client whose trip got no answer in thi
 void load_screen_off(); // F3a T8: below, with the simultaneous load
 
 u32 g_world_generation = 0; // CALifeSimulator constructions in this process (outlives State)
+// Live 2026-11-07: the journal of this player's last transition (xrCoop/coop_arrival.h); outlives State and the level.
+arrival::Journal g_arrival;
+u32 g_arrival_from = 0; // g_world_generation when it began: only the new world's actor is sampled
+u32 g_arrival_lines = 0; // the lines of this process (kArrivalLines at most)
+constexpr u32 kArrivalLines = 60;
+constexpr u64 kArrivalGiveUpMs = 300000; // a world that never came: the line says so after this long
+void arrival_begin(const char* kind, u16 level); // below, before on_alife_objects_loaded
+void arrival_step(u64 now);
 u32 g_mirror_generation = 0; // B2: g_world_generation of the world loaded from a host's save (0: none), outlives State
 
 // ---------------------------------------------------------------- protocol 8: the choice window's script
@@ -633,6 +644,31 @@ bool set_faction(CSE_ALifeHumanStalker& proxy, const std::string& faction)
 	return true;
 }
 
+// Live 2026-11-07 (a GAMMA client broke a leg arriving with the group): a character the host puts on a level it has no
+// ground of (the movers of a transition, a late one brought to the group) carries `placed = 1` in its [coop] block; the
+// client puts its actor on the ground of the new level (on_alife_registered, xrCoop/coop_arrival.h). WorldLoaded clears it.
+void mark_arrival(u16 proxy)
+{
+	CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(proxy, true) : nullptr;
+	if (!e || !world::is_player_proxy(proxy))
+		return;
+	std::string text = e->m_ini_string.size() ? e->m_ini_string.c_str() : "";
+	arrival::mark_placed(text);
+	e->m_ini_string = text.c_str();
+}
+
+void unmark_arrival(u16 proxy)
+{
+	CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(proxy, true) : nullptr;
+	if (!e || !e->m_ini_string.size())
+		return;
+	std::string text = e->m_ini_string.c_str();
+	if (!arrival::placed_by_host(text))
+		return;
+	arrival::clear_placed(text);
+	e->m_ini_string = text.c_str();
+}
+
 // The group lives on one level. A character left behind (its player was away when the host
 // changed level) is moved next to the host: the client loads the level of its character.
 void bring_proxy_to_level(CSE_ALifeHumanStalker& proxy, LPCSTR nick)
@@ -647,6 +683,7 @@ void bring_proxy_to_level(CSE_ALifeHumanStalker& proxy, LPCSTR nick)
 	Fvector pos = actor->o_Position;
 	pos.x += 1.5f;
 	alife_rw().teleport_object(proxy.ID, actor->m_tGraphID, actor->m_tNodeID, pos);
+	mark_arrival(proxy.ID); // live 2026-11-07: put there blind, his machine puts him on the ground of the new level
 	::Msg("[coop] character of '%s' was on another level, moved to the group", nick);
 }
 
@@ -686,6 +723,7 @@ void bring_online(u16 proxy)
 {
 	if (proxy == kNoId || !ai().get_alife())
 		return;
+	unmark_arrival(proxy); // live 2026-11-07: his machine placed him (or he is back where he stood); no later save moves him
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
 	if (!e || e->m_bOnline || e->ID_Parent != kNoId)
 		return;
@@ -1385,6 +1423,7 @@ void host_on_world_loaded(PeerId from, Reader&)
 	::Msg("[coop] '%s' is in the world (load took %.1f s%s)", p ? p->nick.c_str() : "?",
 	    float(mgr().now_ms() - it->second.sent_at) / 1000.f, prepared ? ", a simultaneous load" : "");
 	levels::host_player_in_world(from); // F3a multilevel
+	players::arrival_host_entered(from); // live 2026-11-07: his first report kWindowMs from now goes into the log
 	bring_online(it->second.proxy); // W9: his character was kept out of the world while he was away or loading
 	sync::host_end_join(from);
 	mgr().session().send(from, Lane::Reliable, Msg::JoinComplete, Writer());
@@ -2081,6 +2120,9 @@ void host_place_movers(const xr_vector<Mover>& movers, const Arrival& at)
 		++i;
 		levels::host_player_moves(m.peer, level);
 		alife_rw().teleport_object(m.proxy, at.graph, at.node, pos);
+		mark_arrival(m.proxy); // live 2026-11-07: the point's height, not the ground's: his machine puts him on the ground
+		players::arrival_host_leaves(m.peer, m.proxy, nick_of_peer(m.peer).c_str(), level_name_by_id(level).c_str(),
+		    at.position.x, at.position.y, at.position.z);
 	}
 }
 
@@ -2874,6 +2916,7 @@ void client_prepared(const levels::wire::LoadWaitMsg& m, u64 now)
 	}
 	g.screen_level = m.level;
 	load_screen_reason(m);
+	arrival_begin(m.reason == levels::wire::LoadWaitMsg::HostAlone ? "reload (the host went alone)" : "group transition", m.level);
 	if (m.reason == levels::wire::LoadWaitMsg::HostAlone)
 		::Msg("[coop] load: the host went to '%s' alone (epoch %u): the world starts over, this player stays on his level, the host's save comes now",
 		    level_name_by_id(m.level).c_str(), m.epoch);
@@ -2954,6 +2997,7 @@ bool host_release(u32 goal)
 		host_place_movers(placed, at);
 	else if (levels::split())
 		levels::host_going_to(arrival);
+	arrival_begin(transition::is_guide(goal) ? "guide trip (host player)" : "level exit (host player)", arrival); // live 2026-11-07
 	FILETIME before;
 	GetSystemTimeAsFileTime(&before);
 	const u64 save_from = mgr().now_ms();
@@ -3708,6 +3752,10 @@ void client_on_load_wait(PeerId from, Reader& r)
 		else if (g.screen.prepared(m.epoch, false, now, g_world_generation)) // the host player: his process reloads by itself
 		{
 			g.screen_level = m.level;
+			if (!g_arrival.active())
+				arrival_begin("group transition (host player)", m.level);
+			else
+				g_arrival.set_to(level_name_by_id(m.level).c_str());
 			if (m.reason == levels::wire::LoadWaitMsg::HostAlone)
 				::Msg("[coop] load: to '%s' alone (epoch %u), the players left behind reload where they stand", level_name_by_id(m.level).c_str(), m.epoch);
 			else
@@ -4712,6 +4760,7 @@ void frame()
 		host_alone_step(mgr().now_ms()); // F3a: the host goes alone
 		host_watch_joins();
 		host_due_joins();
+		arrival_step(mgr().now_ms()); // live 2026-11-07: the host player's arrival journal
 		return;
 	}
 	// Client: downloading or loading the world must end in time (R-2.3). Protocol 8: choosing a character has the
@@ -4731,6 +4780,7 @@ void frame()
 	if (mgr().is_live_client())
 		transition_step(mgr().now_ms()); // his zone, his hold at the edge of the level, the placard's numbers
 	player_load_step(mgr().now_ms()); // F3a T8: LoadReady, the held screen, Enter (live comes with it)
+	arrival_step(mgr().now_ms()); // live 2026-11-07: this player's arrival journal
 	if (!mgr().active() || mgr().phase() != Phase::LoadingWorld || !g.swap_done)
 		return;
 	// Level is up and the local actor exists: tell the host.
@@ -4801,6 +4851,122 @@ void print_status()
 	}
 }
 
+// ---------------------------------------------------------------- live 2026-11-07: the arrival on a new level
+// xrCoop/coop_arrival.h. A GAMMA client lost health and broke a leg walking through a level changer with the group. One line
+// per transition on the player's machine ("[coop] arrival: ..."): the vitals before leaving and kWindowMs after arriving,
+// where the health went (hits, the condition's own update, co-op applies), and where his character was put. The host logs
+// each mover's last report at the go and his first report kWindowMs after he entered ("[coop] arrival (host): ...").
+namespace
+{
+arrival::Vitals4 own_vitals()
+{
+	arrival::Vitals4 v;
+	CActor* a = smart_cast<CActor*>(g_actor);
+	if (!a || !g_pGameLevel)
+		return v;
+	CActorCondition& c = a->conditions();
+	v.health = c.GetHealth();
+	v.bleeding = c.BleedingSpeed();
+	v.radiation = c.GetRadiation();
+	v.satiety = c.GetSatiety();
+	return v;
+}
+
+void arrival_begin(const char* kind, u16 level)
+{
+	if (!mgr().active() || is_map_server() || dedicated::on())
+		return;
+	g_arrival.begin(kind, level_name_by_id(level).c_str(), own_vitals(), mgr().now_ms());
+	g_arrival_from = g_world_generation;
+}
+
+void arrival_step(u64 now)
+{
+	if (!g_arrival.active())
+		return;
+	const bool new_world = g_world_generation != g_arrival_from && world_up() && g_actor && !Device.dwPrecacheFrame;
+	if (new_world)
+	{
+		g_arrival.frame(own_vitals().health, now);
+		const bool in = mgr().is_client() ? mgr().is_live_client() : g.screen.stage == transition::Load::None;
+		if (in)
+			g_arrival.arrived(now);
+	}
+	const bool stale = g_arrival.stale(now, kArrivalGiveUpMs);
+	if (!g_arrival.due(now) && !stale)
+		return;
+	const std::string line = g_arrival.finish(new_world ? own_vitals() : arrival::Vitals4());
+	if (++g_arrival_lines <= kArrivalLines)
+		::Msg("[coop] arrival: %s%s", line.c_str(), stale ? " (the new world never came)" : "");
+}
+} // namespace
+
+void arrival_apply(const char* what, float from, float to) { g_arrival.apply(what, from, to); }
+
+void arrival_hit(const CActor* actor, const SHit* hit, bool blocked)
+{
+	if (!g_arrival.active() || !hit)
+		return;
+	const CObject* who = hit->who;
+	string64 name;
+	if (!who)
+		xr_strcpy(name, "nobody");
+	else if (who == actor)
+		xr_strcpy(name, "self");
+	else
+		xr_sprintf(name, "'%s' %u", who->cName().c_str(), who->ID());
+	g_arrival.hit(ALife::g_cafHitType2String(hit->hit_type), hit->damage(), name, int(hit->boneID), blocked);
+}
+
+// Client, after ALife registered the loaded objects (alife_storage_manager.cpp): the new level's graph is loaded (the
+// actor's registration set the level up), the actor has not spawned. A character the host placed blind goes on the ground.
+void on_alife_registered()
+{
+	if (!g.arrival_check)
+		return;
+	g.arrival_check = false;
+	const CLevelGraph* lg = ai().get_level_graph();
+	CSE_ALifeCreatureActor* actor = ai().get_alife() ? ai().alife().graph().actor() : nullptr;
+	if (!lg || !actor)
+	{
+		::Msg("! [coop] arrival: no level graph (%p) or actor (%p) to put my character on the ground", lg, actor);
+		return;
+	}
+	const arrival::Ground ground = [lg](float x, float probe_y, float z, float& ground_y, u32& vertex)
+	{
+		const Fvector probe = {x, probe_y, z};
+		if (!lg->valid_vertex_position(probe))
+			return false;
+		const u32 id = lg->vertex_id(probe);
+		if (!lg->valid_vertex_id(id))
+			return false;
+		ground_y = lg->vertex_plane_y(id, x, z);
+		vertex = id;
+		return true;
+	};
+	const Fvector was = actor->o_Position;
+	arrival::Point own{was.x, was.y, was.z};
+	arrival::Point anchor = own;
+	if (lg->valid_vertex_id(actor->m_tNodeID))
+	{
+		const Fvector v = lg->vertex_position(actor->m_tNodeID); // the vertex the host gave: the level changer's point
+		anchor = arrival::Point{v.x, v.y, v.z};
+	}
+	const arrival::Placed p = arrival::place(own, anchor, ground);
+	if (p.how != arrival::How::NoGround)
+	{
+		actor->o_Position.set(p.at.x, p.at.y, p.at.z);
+		if (lg->valid_vertex_id(p.vertex))
+			actor->m_tNodeID = p.vertex;
+	}
+	string256 text;
+	xr_sprintf(text, "%s: [%.2f %.2f %.2f] -> [%.2f %.2f %.2f], ground %s%.2f (his point %+.2f over it), exit vertex %u",
+	    arrival::how_name(p.how), was.x, was.y, was.z, p.at.x, p.at.y, p.at.z, p.had_ground ? "" : "none ",
+	    p.had_ground ? p.at.y - arrival::kLift : 0.f, p.drop, actor->m_tNodeID);
+	g_arrival.place(text);
+	::Msg("[coop] arrival: the host put my character blind, %s", text);
+}
+
 void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 {
 	// B2: the world being loaded is the host's; on_world_created, at the end of this simulator's constructor, gives it
@@ -4838,6 +5004,12 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	}
 	if (!client_loading_world() || g.my_proxy == kNoId)
 		return;
+	g.arrival_check = false;
+	if (!g_arrival.active())
+	{
+		const CSE_ALifeDynamicObject* pe = objects.object(g.my_proxy, true);
+		arrival_begin("join", pe ? level_id_of(pe->m_tGraphID) : levels::wire::kNoLevel); // a world without a transition's go
+	}
 
 	CSE_ALifeCreatureActor* actor = smart_cast<CSE_ALifeCreatureActor*>(objects.object(0, true));
 	CSE_ALifeHumanStalker* proxy = smart_cast<CSE_ALifeHumanStalker*>(objects.object(g.my_proxy, true));
@@ -4859,9 +5031,16 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	swap_values(actor->m_tNodeID, proxy->m_tNodeID);
 	swap_values(actor->m_tGraphID, proxy->m_tGraphID);
 	{
+		// Live 2026-11-07: the actor spawns with the player's own health from his last report, not the proxy's (an unharmable
+		// stalker, 1.0) that coop_equip.cpp client_restore_vitals used to take down after going live, one frame's drop that
+		// GAMMA's Body Health System booked as a hit on a random body part. A new character has no report: the proxy's.
 		const float h = actor->get_health();
-		actor->set_health(proxy->get_health());
+		const float mine = arrival::spawn_health(proxy->m_ini_string.c_str(), proxy->get_health());
+		g_arrival.apply("swap", proxy->get_health(), mine);
+		actor->set_health(mine);
 		proxy->set_health(h);
+		// The host put the character here blind (mark_arrival): the ground comes once the new level's graph is loaded.
+		g.arrival_check = proxy->m_ini_string.size() && arrival::placed_by_host(proxy->m_ini_string.c_str());
 	}
 	// The host may sit in a vehicle; our character does not (net_Spawn would seat us in it).
 	actor->m_holderID = u16(-1);

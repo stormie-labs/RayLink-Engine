@@ -27,6 +27,7 @@
 #include "../../script_game_object.h"
 #include "../../../coop/coop_sound.h" // Anomaly Coop (audit M2)
 #include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F11)
+#include "../../../coop/coop_ai.h" // Anomaly Coop (protocol 29): player_god
 
 bool CBurer::can_scan = true;
 
@@ -248,7 +249,7 @@ void CBurer::CheckSpecParams(u32 spec_params)
 
 void xr_stdcall CBurer::StaminaHit()
 {
-	if (GodMode())
+	if (coop::npc_ai::player_god(Actor())) // Anomaly Coop (A.2 p. 7): the god of the player it lands on, was GodMode() of the process
 	{
 		return;
 	}

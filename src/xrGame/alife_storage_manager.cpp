@@ -172,6 +172,7 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 
 	for (I = B; I != E; ++I)
 		(*I).second->on_register();
+	coop::join::on_alife_registered(); // Anomaly Coop: a client's character put on the new level blind goes on its ground
 
 	if (!g_pGameLevel)
 		return;

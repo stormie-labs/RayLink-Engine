@@ -262,7 +262,8 @@ void CPoltergeist::update_detection()
 // Anomaly Coop: nothing for a player who is down, no flames, no thrown objects (detection_target falls back on the host's actor)
 bool CPoltergeist::get_actor_ignore() const
 {
-	return m_actor_ignore || coop::npc_ai::player_down(detection_target());
+	return m_actor_ignore || coop::npc_ai::player_down(detection_target()) ||
+	    coop::npc_ai::debug_unseen(detection_target()); // protocol 29: the server's debug, invisible to the AI
 }
 
 CEntityAlive* CPoltergeist::detection_target() const

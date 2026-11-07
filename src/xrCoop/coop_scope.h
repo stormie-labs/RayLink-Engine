@@ -124,7 +124,9 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::RestSleep:
 	case Msg::NewCharacter:
 	// the Lua RPC of mods runs in the world server's Lua
-	case Msg::ScriptEvent: out = Scope::World; return true;
+	case Msg::ScriptEvent:
+	// protocol 29: the server's debug is the world server's; every player and every map server gets it
+	case Msg::DebugState: out = Scope::World; return true;
 
 	// --- the authority of the sender's level: the stream of the body, the entities, the requests on them, dialogs, trade
 	case Msg::PlayerState:

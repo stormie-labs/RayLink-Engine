@@ -316,6 +316,7 @@ void register_mp_console_commands();
 #include "coop/coop_manager.h"
 #include "coop/coop_join.h" // Anomaly Coop: save ownership includes mirror teardown
 #include "coop/coop_worldstate.h" // Anomaly Coop: time_factor gating
+#include "coop/coop_debug.h" // Anomaly Coop: the -dbg cheats in a session (protocol 29)
 //-----------------------------------------------------------
 
 BOOL g_bCheckTime = FALSE;
@@ -2607,6 +2608,28 @@ public:
     }
 };
 
+// Anomaly Coop (docs/DEBUG_DESIGN.md §B.8): the engine's cheats of the -dbg key. In a co-op session a player's machine refuses them (the
+// server's debug decides, coop_debug on), the world server's g_god / g_unlimitedammo point at the personal flags (F7, coop_dbg god);
+// outside a session they run as the stock. coop::debug::refuse_local_cheat says why in the log.
+template <class Base>
+class CCC_CoopCheat : public Base
+{
+public:
+	using Base::Base;
+	virtual void Execute(LPCSTR args)
+	{
+		if (coop::debug::refuse_local_cheat(this->Name()))
+			return;
+		Base::Execute(args);
+	}
+};
+using CCC_CoopCheatMask = CCC_CoopCheat<CCC_Mask>;
+using CCC_CoopCheatFloat = CCC_CoopCheat<CCC_Float>;
+using CCC_CoopCheatJumpToLevel = CCC_CoopCheat<CCC_JumpToLevel>;
+using CCC_CoopCheatScript = CCC_CoopCheat<CCC_Script>;
+using CCC_CoopCheatScriptCommand = CCC_CoopCheat<CCC_ScriptCommand>;
+using CCC_CoopCheatPHGravity = CCC_CoopCheat<CCC_PHGravity>;
+
 void CCC_RegisterCommands()
 {
 	//Not needed for a singleplayer-only mod
@@ -2821,18 +2844,18 @@ void CCC_RegisterCommands()
 	CMD1(CCC_PHIterations, "ph_iterations");
 
 #ifdef DEBUG
-	CMD1(CCC_PHGravity, "ph_gravity");
+	CMD1(CCC_CoopCheatPHGravity, "ph_gravity"); // Anomaly Coop: refused on a player's machine in a session
 	CMD4(CCC_FloatBlock, "ph_timefactor", &phTimefactor, 0.000001f, 1000.f);
 	CMD4(CCC_FloatBlock, "ph_break_common_factor", &ph_console::phBreakCommonFactor, 0.f, 1000000000.f);
 	CMD4(CCC_FloatBlock, "ph_rigid_break_weapon_factor", &ph_console::phRigidBreakWeaponFactor, 0.f, 1000000000.f);
 	CMD4(CCC_Integer, "ph_tri_clear_disable_count", &ph_console::ph_tri_clear_disable_count, 0, 255);
 	CMD4(CCC_FloatBlock, "ph_tri_query_ex_aabb_rate", &ph_console::ph_tri_query_ex_aabb_rate, 1.01f, 3.f);
 	CMD3(CCC_Mask, "g_no_clip", &psActorFlags, AF_NO_CLIP);
-	CMD1(CCC_JumpToLevel, "jump_to_level");
-	CMD3(CCC_Mask, "g_god", &psActorFlags, AF_GODMODE);
-	CMD3(CCC_Mask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
-	CMD1(CCC_Script, "run_script");
-	CMD1(CCC_ScriptCommand, "run_string");
+	CMD1(CCC_CoopCheatJumpToLevel, "jump_to_level"); // Anomaly Coop: refused on a player's machine in a session
+	CMD3(CCC_CoopCheatMask, "g_god", &psActorFlags, AF_GODMODE);
+	CMD3(CCC_CoopCheatMask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
+	CMD1(CCC_CoopCheatScript, "run_script");
+	CMD1(CCC_CoopCheatScriptCommand, "run_string");
 	CMD1(CCC_TimeFactor, "time_factor");
 #endif // DEBUG
 
@@ -2841,15 +2864,16 @@ void CCC_RegisterCommands()
 #ifdef MASTER_GOLD
 	if (0 != Core.isDebug())
 	{
-		CMD1(CCC_JumpToLevel, "jump_to_level");
-		CMD3(CCC_Mask, "g_god", &psActorFlags, AF_GODMODE);
-		CMD3(CCC_Mask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
-		CMD1(CCC_Script, "run_script");
-		CMD1(CCC_ScriptCommand, "run_string");
+		// Anomaly Coop (protocol 29): the cheats refuse on a player's machine in a session (CCC_CoopCheat above)
+		CMD1(CCC_CoopCheatJumpToLevel, "jump_to_level");
+		CMD3(CCC_CoopCheatMask, "g_god", &psActorFlags, AF_GODMODE);
+		CMD3(CCC_CoopCheatMask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
+		CMD1(CCC_CoopCheatScript, "run_script");
+		CMD1(CCC_CoopCheatScriptCommand, "run_string");
 		//CMD3(CCC_Mask, "g_no_clip", &psActorFlags, AF_NO_CLIP);
-		CMD1(CCC_PHGravity, "ph_gravity");
+		CMD1(CCC_CoopCheatPHGravity, "ph_gravity");
 		CMD3(CCC_Mask, "log_missing_ini", &FS.m_Flags, FS.flPrintLTX);
-		CMD4(CCC_Float, "g_end_modif", &g_end_modif, 0.f, 10.f);
+		CMD4(CCC_CoopCheatFloat, "g_end_modif", &g_end_modif, 0.f, 10.f);
 	}
 #endif // MASTER_GOLD
 	//#endif // MASTER_GOLD

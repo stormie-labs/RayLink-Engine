@@ -51,6 +51,8 @@
 
 #include "script_export_space.h"
 
+struct lua_State;
+
 namespace coop
 {
 class Session;
@@ -71,6 +73,16 @@ void frame();
 void print_status();
 // The console command coop_parity [tag]: scripts\coop_parity.script (host: every machine dumps, client: refuses).
 void parity_command(const char* tag);
+// coop_dbg (coop_debug.cpp, protocol 29): <module>.<fn>(the arguments `push` puts on the stack, their count returned) now, protected,
+// if this machine's Lua is up in a co-op world. NotReady: nothing called; Failed: the function is missing or Lua raised an error (both
+// logged). Main thread.
+enum class CallResult : u8
+{
+	Done,
+	NotReady,
+	Failed,
+};
+CallResult call_now(const char* module, const char* fn, int (*push)(lua_State* L, const void* ctx), const void* ctx);
 // A chat line from another player arrived: shown in the HUD by coop_main.on_chat(nick, text).
 void on_chat(const char* nick, const char* text);
 // Client: the host refused the handshake. Keeps the reason, the host's text and the mod-list diff; a frame

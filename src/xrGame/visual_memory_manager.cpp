@@ -485,6 +485,8 @@ bool CVisualMemoryManager::should_ignore_object(CObject const* object) const
 
 	if (coop::npc_ai::ghost(object)) // Anomaly Coop: a map server's actor is nobody
 		return true;
+	if (coop::npc_ai::debug_unseen(object)) // Anomaly Coop (protocol 29): the server's debug, invisible to the AI (ai_ignore_actor per player)
+		return true;
 
 #ifndef MASTER_GOLD
 	if ( smart_cast<CActor const*>(object) && psAI_Flags.test(aiIgnoreActor) )

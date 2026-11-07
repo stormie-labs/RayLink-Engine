@@ -436,6 +436,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\coop_debug.h" />
     <ClInclude Include="coop\coop_dedicated.h" />
     <ClInclude Include="coop\coop_monster_fx.h" />
     <ClInclude Include="coop\coop_levels.h" />
@@ -2115,6 +2116,7 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\coop_debug.cpp" />
     <ClCompile Include="coop\coop_dedicated.cpp" />
     <ClCompile Include="coop\coop_monster_fx.cpp" />
     <ClCompile Include="coop\coop_trunk.cpp" />

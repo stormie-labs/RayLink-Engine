@@ -15,6 +15,7 @@
 #include "coop_money.h"
 #include "coop_dialog.h"
 #include "coop_callgate.h" // F2 T12
+#include "coop_debug.h" // protocol 29: god at the authority of a player's level
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
@@ -3774,6 +3775,8 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 			++g_h.friendly_fire_dropped;
 		return true; // friendly fire off; or anomalies, falls, physics: the player's own game computes them
 	}
+	if (debug::host_drops_hit(peer))
+		return true; // protocol 29, the server's debug: god (docs/DEBUG_DESIGN.md §B.9); his own machine has AF_GODMODE for the rest
 	Writer w(64);
 	w.u16(id);
 	write_hit(w, *hit, who ? who->ID() : kNoId, hit->weaponID); // no initiator: the owner keeps the damage (apply_to_actor)
