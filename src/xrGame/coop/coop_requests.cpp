@@ -16,6 +16,7 @@
 #include "coop_dialog.h"
 #include "coop_callgate.h" // F2 T12
 #include "coop_debug.h" // protocol 29: god at the authority of a player's level
+#include "coop_players.h" // the hit journal: where a player last said he stands
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_spawn.h"
 #include "xrCoop/coop_validate.h"
@@ -23,15 +24,19 @@
 #include "xrCoop/coop_moves.h" // Ruling F2-32 (F2 T12 round 1)
 #include "xrCoop/coop_id_lease.h" // F2 T12b
 #include "xrCoop/coop_local_zones.h" // personal map zones
+#include "xrCoop/coop_clone_slot.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
 
 #include <cstring>
 
 #include "Level.h"
 #include "Actor.h"
+#include "ActorCondition.h" // the hit journal: health now
 #include "GameObject.h"
 #include "Entity.h"
 #include "entity_alive.h"
 #include "InventoryOwner.h"
+#include "Inventory.h" // live 2026-11-08: a clone takes its old weapon's slot
+#include "inventory_item.h"
 #include "InventoryBox.h" // Ruling F2-32: box locks
 #include "Hit.h"
 #include "xrServer.h"
@@ -378,6 +383,7 @@ struct ClientCounters
 // creates may run on the game thread, the answers and the frame come on the main thread.
 lease::ClientPool g_pool; // ids reserved in our generator, ready for a create
 lease::SpecBook g_specs; // our creates the host has not answered yet
+cloneslot::Book g_clone_slots; // live 2026-11-08: the slots our clones take (their old weapons' ones); under g_out_lock
 xr_map<u16, Action> g_spec_actions; // the request of each of them, sent again after RateLimited
 struct LeasedTemp
 {
@@ -821,6 +827,7 @@ void lease_sync_world_locked()
 	g_pool.clear();
 	g_zones.clear(); // their objects went with the old world's ALife
 	g_specs.clear();
+	g_clone_slots.clear();
 	g_spec_actions.clear();
 	g_give_back.clear();
 	g_give_back_wait.clear();
@@ -906,6 +913,49 @@ void bring_online_in_holder(CSE_ALifeDynamicObject* e)
 	e->m_bOnline = true;
 }
 
+// Live 2026-11-08 (G.A.M.M.A., stable 41.6): a scope fitted to the SR-3M in a client's slot put the new weapon into the
+// backpack. Stock _g.alife_clone_weapon releases the old weapon, then registers the clone: in single player the slot is
+// free when the clone comes. Here the old weapon's release goes with the clone to the host (clone_source), so it held the
+// slot. It leaves the slot for the backpack now (it goes with the clone; its hands are hidden if it was in them), and the
+// clone takes that slot when it spawns (clone_spawn_slot; the engine activates it as it would in single player). Our own
+// placement: nothing of it goes to the host.
+void free_source_slot(u16 clone, u16 source)
+{
+	CActor* actor = smart_cast<CActor*>(Level().Objects.net_Find(kActor));
+	CInventoryItem* item = smart_cast<CInventoryItem*>(Level().Objects.net_Find(source));
+	if (!actor || !item || item->m_pInventory != &actor->inventory() || item->CurrPlace() != eItemPlaceSlot)
+		return;
+	const u16 slot = item->CurrSlot();
+	if (!actor->inventory().Ruck(item))
+		return;
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_clone_slots.plan(clone, source, slot, mgr().now_ms());
+}
+
+// A refused clone of ours is gone here: its old weapon gets its slot back (clone_slots_frame).
+void clone_slots_frame(u64 now)
+{
+	u16 source = kNoId, slot = NO_ACTIVE_SLOT;
+	{
+		xrCriticalSectionGuard guard(g_out_lock);
+		g_clone_slots.expire(now);
+		if (!g_clone_slots.restore(source, slot))
+			return;
+	}
+	CActor* actor = smart_cast<CActor*>(Level().Objects.net_Find(kActor));
+	CInventoryItem* item = smart_cast<CInventoryItem*>(Level().Objects.net_Find(source));
+	if (actor && item && item->m_pInventory == &actor->inventory())
+	{
+		CInventory& inv = actor->inventory();
+		if (slot > inv.LastSlot() || inv.ItemFromSlot(slot))
+			return; // the clone is still there (its destroy runs): later, or it expires
+		if (item->CurrPlace() == eItemPlaceRuck)
+			inv.Slot(slot, item);
+	}
+	xrCriticalSectionGuard guard(g_out_lock);
+	g_clone_slots.restored(source);
+}
+
 // `e` (a temporary object of make_temp, its parent our actor) becomes our item now under leased `id`: registered in our
 // ALife, online in our inventory, asked for with the same id. `source`: the weapon a clone replaces (local numbering).
 // False: not created (`e` untouched; the caller gives the id back).
@@ -934,6 +984,11 @@ bool create_leased(CSE_Abstract* e, u16 id, u16 source)
 	std::vector<u8> state;
 	if (items::capture_spawn_state(e, state)) // the state the script gave it, before our world touches it
 		a.bytes.assign(state.begin(), state.end());
+	if (source != kNoId)
+	{
+		free_source_slot(id, source); // live 2026-11-08: the clone takes its old weapon's slot
+		items::client_made_here(id); // live 2026-11-08: the host's push of it keeps our state (it showed 7 %)
+	}
 	{
 		entities::ClientApply apply; // our own world takes it as the host's would: nothing of it is a request
 		e->ID = id;
@@ -1025,6 +1080,7 @@ void rollback_leased(u16 id, const char* why)
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
 		g_give_back_wait.push_back(id);
+		g_clone_slots.refused(id, mgr().now_ms()); // live 2026-11-08: its old weapon gets its slot back
 	}
 	CSE_ALifeDynamicObject* e = lease_world_ready() ? ai().alife().objects().object(id, true) : nullptr;
 	if (!e)
@@ -1072,6 +1128,7 @@ void client_pump_leases()
 	if (!lease_world_ready())
 		return;
 	const u64 now = mgr().now_ms();
+	clone_slots_frame(now); // live 2026-11-08
 	lease::IdsMsg ack;
 	xr_vector<u16> unanswered; // round 2 (review N1): creates the host never answered
 	xr_vector<u32> holds;
@@ -1265,8 +1322,23 @@ void client_on_player_hit(PeerId, Reader& r)
 	if (!r.ok() || !hit_sane(hit))
 		return;
 	(void)character; // always our own character (host numbering)
-	apply_to_actor(hit, find_go(to_local_id(hit.whoID)), find_go(to_local_id(hit.weaponID)));
+	CObject* who = find_go(to_local_id(hit.whoID));
+	apply_to_actor(hit, who, find_go(to_local_id(hit.weaponID)));
 	++g_cl.hits_in;
+	// Live 2026-11-08: the damage the authority of this level (the host or a map server) passed on, in the client's own log.
+	static hits::Journal journal;
+	const hits::JournalLine l = hits::journal_note(journal, mgr().now_ms(), hit.power);
+	if (l.summary)
+		::Msg("[coop] hits <- the authority of my level: %u more hit(s) in the last 15 s, power %.3f in all", l.quiet_hits,
+		    l.quiet_power);
+	if (l.single)
+	{
+		const Fvector& me = Actor() ? Actor()->Position() : Fvector().set(0.f, 0.f, 0.f);
+		::Msg("[coop] hit <- the authority of my level: from %u [%s] (local %u), type %d, power %.3f, health now %.3f, I stand at "
+		      "(%.1f %.1f %.1f)",
+		    hit.whoID, who ? who->cNameSect().c_str() : "not here", to_local_id(hit.whoID), int(hit.hit_type), hit.power,
+		    Actor() ? Actor()->conditions().GetHealth() : -1.f, me.x, me.y, me.z);
+	}
 }
 
 // Item-like temporary entity without an id: what CALifeSimulatorBase::spawn_item builds, minus
@@ -3683,6 +3755,23 @@ bool keep_released(CSE_Abstract* entity)
 	return true;
 }
 
+bool clone_spawn_slot(u16 id, u16& slot)
+{
+	slot = NO_ACTIVE_SLOT;
+	CActor* actor = smart_cast<CActor*>(Level().Objects.net_Find(kActor));
+	if (!actor)
+		return false;
+	CInventory& inv = actor->inventory();
+	xrCriticalSectionGuard guard(g_out_lock);
+	const u16 planned = g_clone_slots.peek(id);
+	if (planned == cloneslot::kNone)
+		return false;
+	// a slot is never overwritten (CInventory::Take trusts a strict place): free only when nothing holds it
+	const bool free = planned <= inv.LastSlot() && !inv.ItemFromSlot(planned);
+	slot = g_clone_slots.spawn_slot(id, free);
+	return slot != cloneslot::kNone;
+}
+
 bool client_lease_waiting(u16 id) { return lease_waiting(id); }
 
 int lua_lease_waiting(lua_State* L)
@@ -3741,6 +3830,29 @@ bool lua_client_refuse(const char* name, u16 target, bool runs_while_applying)
 
 // ---------------------------------------------------------------- damage
 
+// Live 2026-11-08: a client's health ran down on a level a map server ran, and stopped when the map server went away; no log
+// said what hit him. Every hit passed on to a player is journaled here (hits::journal_note: the first ones of 15 s, then the
+// count and the sum): who, the type and power, and where his character stands here against where his machine says he is.
+void journal_sent_hit(u16 id, PeerId peer, const SHit& hit, hits::Source source, const CGameObject* who, const Fvector& here)
+{
+	static xr_map<u16, hits::Journal> journals;
+	const hits::JournalLine l = hits::journal_note(journals[id], mgr().now_ms(), hit.power);
+	const char* role = mgr().is_host() ? "host" : "map server";
+	if (l.summary)
+		::Msg("[coop] hits -> player #%u (character %u): %u more hit(s) in the last 15 s, power %.3f in all (%s)", peer, id,
+		    l.quiet_hits, l.quiet_power, role);
+	if (!l.single)
+		return;
+	Fvector reported;
+	u64 age = 0;
+	const bool known = players::reported_position(id, reported, age);
+	::Msg("[coop] hit -> player #%u (character %u): %s %u [%s], type %d, power %.3f; his character here (%.1f %.1f %.1f), his last report %s"
+	      "(%.1f %.1f %.1f) %.1f m away, %u ms old (%s)",
+	    peer, id, hits::source_name(source), hit.whoID, who ? who->cNameSect().c_str() : "-", int(hit.hit_type),
+	    hit.power, here.x, here.y, here.z, known ? "" : "NONE ", known ? reported.x : 0.f, known ? reported.y : 0.f,
+	    known ? reported.z : 0.f, known ? here.distance_to(reported) : -1.f, u32(_min<u64>(age, 0xffffffffull)), role);
+}
+
 bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 {
 	if (!npc || !hit || !mgr().active())
@@ -3786,6 +3898,7 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 	write_hit(w, *hit, who ? who->ID() : kNoId, hit->weaponID); // no initiator: the owner keeps the damage (apply_to_actor)
 	net::host_send(peer, Msg::PlayerHit, w);
 	++g_h.player_hits_sent;
+	journal_sent_hit(id, peer, *hit, h.source, who, npc->Position());
 	if (h.source == hits::Source::Object || h.source == hits::Source::Missing)
 		++g_h.explosion_hits_sent;
 	return true; // the character itself is never damaged or killed by the host

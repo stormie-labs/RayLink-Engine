@@ -24,6 +24,7 @@
 #include "coop_net.h"
 #include "coop_alife.h"
 #include "coop_survival.h"
+#include "coop_requests.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_nametag.h"
 #include "xrCoop/coop_gear.h"
@@ -936,6 +937,15 @@ void equip_install_client(Endpoint& e) { e.on(Msg::PlayerEquip, &on_equip_msg); 
 
 void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
 {
+	// Live 2026-11-08 (G.A.M.M.A.): our clone of a weapon (a scope, a kit, a detach) takes the slot its old weapon had, as
+	// in single player, where the old one is released before the clone is registered (xrCoop/coop_clone_slot.h)
+	u16 clone_slot = NO_ACTIVE_SLOT;
+	if (e.ID_Parent == 0 && mgr().is_client() && requests::clone_spawn_slot(e.ID, clone_slot))
+	{
+		place.type = eItemPlaceSlot;
+		place.slot_id = clone_slot;
+		return;
+	}
 	// Only the things of a client's own character in the world it came back to: they spawn as children of its actor
 	// (parent 0 after the role swap, coop_join on_alife_objects_loaded). Everything else keeps what the engine gave it.
 	if (e.ID_Parent != 0 || !mgr().is_client() || !join::client_loading_world())

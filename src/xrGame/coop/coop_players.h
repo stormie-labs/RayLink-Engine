@@ -68,6 +68,9 @@ u32 avatar_mstate(u16 avatar_id);
 // View direction of the player (the owner's torso yaw/pitch as CActor keeps them: direction =
 // Fvector().setHP(yaw, -pitch)). False if the avatar was never driven.
 bool avatar_view(u16 avatar_id, float& yaw, float& pitch);
+// Host or map server: where a player's own machine last said he stands (his newest PlayerState) and how old that is. False
+// when he never reported here (live 2026-11-08: the hit journal compares it with his character here).
+bool reported_position(u16 avatar_id, Fvector& pos, u64& age_ms);
 // coop_equip.cpp: safe mode (weapon lowered) of the player whose avatar is `avatar_id`, as last reported in
 // PlayerEquip; false if not known.
 bool avatar_safemode(u16 avatar_id, bool& lowered);

@@ -331,6 +331,18 @@ void frame()
 	++g_sent;
 }
 
+bool reported_position(u16 avatar_id, Fvector& pos, u64& age_ms)
+{
+	auto it = g_tracks.find(avatar_id);
+	if (it == g_tracks.end() || it->second.samples.empty())
+		return false;
+	const Sample& last = it->second.samples.back();
+	pos = last.s.pos;
+	const u64 now = mgr().now_ms();
+	age_ms = now > last.local_time ? now - last.local_time : 0;
+	return true;
+}
+
 bool drive_avatar(CAI_Stalker* avatar)
 {
 	auto it = g_tracks.find(avatar->ID());

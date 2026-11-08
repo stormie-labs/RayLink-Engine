@@ -84,6 +84,11 @@ void client_before_take(u16 local_item);
 // changed on it since (portions, a condition a mod set on the object) goes to the host with the next scan, as if the
 // host knew nothing of it. Main thread.
 void client_resend_state(u16 local_id);
+// Client (live report 2026-11-08, G.A.M.M.A.: a scope fitted to an SR-3M showed 7 %): we made our item `local_id` ourselves
+// under a leased id (a clone of our weapon for a scope, a kit, a detach). The host builds its copy from its own view of the
+// source and pushes it into our hands; that push keeps all our tags (but the upgrade list, the host's) and ours goes to the
+// host. Main thread.
+void client_made_here(u16 local_id);
 // Host: applies a client's blob to a fresh entity (not spawned yet) with the ItemState checks: kind, counts,
 // known upgrades and ammo types. False = refused (`why` says why); the entity may be half changed: discard it.
 bool host_apply_spawn_state(CSE_Abstract* entity, const u8* data, size_t size, const char*& why);

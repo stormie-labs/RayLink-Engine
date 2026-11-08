@@ -162,6 +162,10 @@ int lua_lease_ids(lua_State* L);
 int lua_lease_waiting(lua_State* L);
 // True while item `id` (local numbering) waits for the host: the roster does not call it extra.
 bool client_lease_waiting(u16 id);
+// Live 2026-11-08 (G.A.M.M.A., a scope fitted to the SR-3M in a client's slot went into the backpack): our clone `id` of a
+// weapon spawns in our actor - the slot its old weapon had (xrCoop/coop_clone_slot.h), while that slot is free. False: the
+// engine's own default. CInventoryItem::net_Spawn (coop_equip.cpp on_item_spawn), main thread.
+bool clone_spawn_slot(u16 id, u16& slot);
 // Lua calls that would change the client's frozen ALife copy (teleport_object, kill_entity,
 // set_switch_online/offline; W3a; F2 T12 round 1: set_interactive, the restrictions). A wrapper over the call gate
 // (F2 T12): name is the kCalls name ("alife:kill_entity"), target the object id (0xffff = none; else it must exist in

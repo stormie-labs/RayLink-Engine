@@ -82,5 +82,69 @@ inline bool host_actor_drops(Source source, bool collision, bool friendly_fire)
 {
 	return source == Source::Player && !collision && !friendly_fire;
 }
+
+inline const char* source_name(Source s)
+{
+	switch (s)
+	{
+	case Source::Missing: return "an initiator not online";
+	case Source::Self: return "himself";
+	case Source::Player: return "a player";
+	case Source::Creature: return "a creature";
+	case Source::Object: return "an object";
+	}
+	return "?";
+}
+
+// The journal of the damage passed on to one player (the host or a map server) or taken from the authority (a client), live
+// 2026-11-08: a client's health ran down on a level a map server ran and stopped when the map server went away, and no log
+// said what hit him. Every hit counts. The first kJournalFirst hits of a kJournalWindowMs window get a line of their own;
+// the rest are counted quietly, and the next hit after the window says how many there were and how much they took. A steady
+// drain writes at most kJournalFirst + 1 lines per window and player.
+constexpr uint64_t kJournalWindowMs = 15000;
+constexpr uint32_t kJournalFirst = 3;
+
+struct Journal
+{
+	uint64_t start = 0; // 0: no window yet
+	uint32_t lines = 0; // hits of this window that had a line
+	uint32_t quiet_hits = 0;
+	float quiet_power = 0.f;
+};
+
+struct JournalLine
+{
+	bool single = false; // a line for this hit
+	bool summary = false; // a line for the quiet hits of the window that just closed
+	uint32_t quiet_hits = 0;
+	float quiet_power = 0.f;
+};
+
+inline JournalLine journal_note(Journal& j, uint64_t now, float power)
+{
+	JournalLine out;
+	if (j.start == 0 || now - j.start >= kJournalWindowMs)
+	{
+		if (j.quiet_hits)
+		{
+			out.summary = true;
+			out.quiet_hits = j.quiet_hits;
+			out.quiet_power = j.quiet_power;
+		}
+		j = Journal();
+		j.start = now ? now : 1;
+	}
+	if (j.lines < kJournalFirst)
+	{
+		++j.lines;
+		out.single = true;
+	}
+	else
+	{
+		++j.quiet_hits;
+		j.quiet_power += power;
+	}
+	return out;
+}
 } // namespace hits
 } // namespace coop

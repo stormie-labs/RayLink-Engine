@@ -101,6 +101,16 @@ std::uint32_t changed_since(const D& now, const D& base, SameUpgrades&& same_upg
 // coop_ledger.h), never the owner's.
 constexpr std::uint32_t kOwnerTakeTags = kAll & ~std::uint32_t(Upgrades);
 
+// Live report 2026-11-08 (stable 41.6, G.A.M.M.A., a scope on a client's SR-3M showed 7 %): an item the owner made
+// itself under a leased id (a weapon's clone for a scope, a kit, a detach) is the owner's whole. The host builds its copy
+// from its own view of the source and pushes it into the owner's hands; that view may be older than the owner's live
+// weapon. The tags the owner keeps over the host's push: all of them (but the upgrade list) for an item it made itself,
+// the ones its take callbacks changed (`changed_since_take`) for an item the host's take gave it.
+inline std::uint32_t push_keeps(bool made_here, std::uint32_t changed_since_take)
+{
+	return (made_here ? kOwnerTakeTags : changed_since_take) & kOwnerTakeTags;
+}
+
 // What the owner's copy becomes when the host's push `host` arrives: the host's tags, except those in `mine` (changed by
 // the owner since the take, see changed_since), which stay as `now` has them.
 template <class D>

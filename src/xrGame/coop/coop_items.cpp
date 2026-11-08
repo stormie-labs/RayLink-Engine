@@ -158,6 +158,7 @@ std::mutex g_lock;
 xr_vector<u16> g_touched; // local ids
 xr_vector<SpawnReq> g_spawns;
 bool g_scan_now = false;
+xr_vector<u16> g_made_here; // client_made_here (a Lua create may run on the game thread): into g_take_base on the main thread
 WeaponFiredFn g_fired = nullptr;
 
 // ---------------------------------------------------------------- owner side (main thread)
@@ -187,8 +188,10 @@ struct TakeBase
 {
 	ItemData data;
 	u64 time = 0;
+	bool made_here = false; // client_made_here: our own leased create, every tag is ours (itemtags::push_keeps)
 };
 xr_map<u16, TakeBase> g_take_base;
+constexpr u32 kMadeHereMs = 120000; // a made item's base waits this long for the host's push (its budget queue may hold it)
 
 // ---------------------------------------------------------------- host side (main thread)
 
@@ -889,12 +892,39 @@ void reject(Reason why, PeerId from, u16 id, const char* detail)
 
 // Client: the tags of our item `id` that we changed ourselves since the host's take put it into our character (our take
 // callbacks), and the copy from before the take. 0: no take base, or nothing changed.
+// Client: our own creates (client_made_here) get their take base, on the main thread.
+void drain_made_here()
+{
+	xr_vector<u16> made;
+	{
+		std::lock_guard<std::mutex> lock(g_lock);
+		made.swap(g_made_here);
+	}
+	for (u16 id : made)
+	{
+		TakeBase& b = g_take_base[id];
+		b.data = ItemData();
+		b.made_here = true;
+		b.time = mgr().now_ms();
+	}
+}
+
 u32 take_changes(u16 id, const ItemData& now)
+{
+	auto it = g_take_base.find(id);
+	if (it == g_take_base.end() || it->second.made_here)
+		return 0; // a made item: the host does not have it yet, ours goes with the answer to its push (client_apply)
+	return itemtags::changed_since(now, it->second.data, same_upgrades) & itemtags::kOwnerTakeTags;
+}
+
+// The tags we keep over the host's push of item `id` (2026-11-08): all of an item we made, the take's changes of a taken one.
+u32 push_keeps(u16 id, const ItemData& now)
 {
 	auto it = g_take_base.find(id);
 	if (it == g_take_base.end())
 		return 0;
-	return itemtags::changed_since(now, it->second.data, same_upgrades) & itemtags::kOwnerTakeTags;
+	return itemtags::push_keeps(it->second.made_here,
+	    it->second.made_here ? 0u : itemtags::changed_since(now, it->second.data, same_upgrades));
 }
 
 void scan_local(bool send_all)
@@ -1014,6 +1044,7 @@ void send_spawns(xr_vector<SpawnReq>& spawns)
 // Returns false if the entity does not exist yet.
 bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 {
+	drain_made_here();
 	CSE_Abstract* e = find_entity(id);
 	if (!e)
 		return false;
@@ -1034,14 +1065,21 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 			return true;
 		}
 		auto base = g_take_base.find(id);
+		if (!item && base != g_take_base.end() && base->second.made_here)
+		{
+			++g_stats.authority_skipped; // our made item is not online here yet: its entity keeps our state
+			return true;
+		}
 		if (item && base != g_take_base.end())
 		{
 			// Live report 2026-11-08 (GAMMA): the push of an item the host's take just gave us. What we changed
 			// ourselves since that take (GAMMA pinned the looted gun at 0.83) stays ours; the rest is the host's copy,
 			// fresher than ours (an NPC's magazine). Before, the whole push won: the gun went red in our hands.
+			// The same day: an item we made ourselves (a scope's clone) keeps every tag but the upgrade list - the host
+			// built it from its own view of the source (7 % instead of our 83 %).
 			ItemData now;
 			capture_object(item, now);
-			const u32 mine = take_changes(id, now);
+			const u32 mine = push_keeps(id, now);
 			g_take_base.erase(base);
 			const ItemData merged = itemtags::take_push(d, now, mine);
 			apply_object(item, merged, false);
@@ -1105,6 +1143,7 @@ void client_on_state(Reader& r)
 
 void process_pending(u64 now)
 {
+	drain_made_here();
 	for (auto it = g_pending.begin(); it != g_pending.end();)
 	{
 		if (client_apply(it->first, it->second.section.c_str(), it->second.flags, it->second.blob))
@@ -1119,7 +1158,8 @@ void process_pending(u64 now)
 	}
 	// A take whose push came before the take itself (applied to a world item then) waits for none.
 	for (auto it = g_take_base.begin(); it != g_take_base.end();)
-		it = now - it->second.time > kTakeBaseMs ? g_take_base.erase(it) : std::next(it);
+		it = now - it->second.time > (it->second.made_here ? kMadeHereMs : kTakeBaseMs) ? g_take_base.erase(it)
+		                                                                                  : std::next(it);
 }
 
 // ---------------------------------------------------------------- host side
@@ -1741,6 +1781,7 @@ void reset()
 		g_touched.clear();
 		g_spawns.clear();
 		g_scan_now = false;
+		g_made_here.clear();
 	}
 	g_sent.clear();
 	g_pending.clear();
@@ -1882,6 +1923,15 @@ void client_before_take(u16 local_item)
 	TakeBase& b = g_take_base[local_item];
 	capture_object(item, b.data);
 	b.time = mgr().now_ms();
+	b.made_here = false;
+}
+
+void client_made_here(u16 local_id)
+{
+	if (!is_live_mirror() || local_id == kNoId)
+		return;
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_made_here.push_back(local_id);
 }
 
 void client_resend_state(u16 local_id)
