@@ -53,6 +53,7 @@ constexpr u32 kModifyScanMs = 100; // scan after an inventory change, at most th
 constexpr u32 kEnforceMs = 500; // host: re-apply owner state if the host copy drifted
 constexpr u32 kGraceMs = 3000; // host: late state of an item that just left the sender's hands
 constexpr u32 kPendingMs = 30000; // client: state for an entity that does not exist yet
+constexpr u32 kTakeBaseMs = 30000; // client: how long the copy before a take waits for the host's push (as kPendingMs)
 constexpr float kForeignRange = 50.f; // a corpse / stash a player unloads must be near that player
 constexpr size_t kMaxBlob = kMaxItemState; // shared with ReqSpawn (coop_spawn.h)
 constexpr u32 kLauncherCap = 3; // rounds a launcher magazine may report (stock launchers hold 1)
@@ -139,6 +140,7 @@ struct Stats
 	u64 dropped_before_live = 0; // R2 I2: client, ItemState that came before we were live
 	u64 upgrades_sold = 0; // F2 T5 fix round 1: host, sold upgrades installed on its copy and sent to the others
 	u64 world_states = 0; // parity audit F1: host, states of world items a client asked for or opened
+	u64 take_kept = 0; // live report 2026-11-08: client, what its take callbacks changed kept over the host's push
 };
 Stats g_stats;
 
@@ -177,6 +179,16 @@ struct Pending
 	u64 time = 0;
 };
 xr_map<u16, Pending> g_pending; // client: local id
+
+// Client (live report 2026-11-08, GAMMA): our copy of an item right before the host's take put it into our character
+// (local id). What our own take callbacks change on it then is ours (GAMMA pins a taken gun at 0.83): it goes to the host
+// at once (scan_local) and survives the host's push of its copy (client_apply), which fills in only the rest.
+struct TakeBase
+{
+	ItemData data;
+	u64 time = 0;
+};
+xr_map<u16, TakeBase> g_take_base;
 
 // ---------------------------------------------------------------- host side (main thread)
 
@@ -875,6 +887,16 @@ void reject(Reason why, PeerId from, u16 id, const char* detail)
 
 // ---------------------------------------------------------------- owner side
 
+// Client: the tags of our item `id` that we changed ourselves since the host's take put it into our character (our take
+// callbacks), and the copy from before the take. 0: no take base, or nothing changed.
+u32 take_changes(u16 id, const ItemData& now)
+{
+	auto it = g_take_base.find(id);
+	if (it == g_take_base.end())
+		return 0;
+	return itemtags::changed_since(now, it->second.data, same_upgrades) & itemtags::kOwnerTakeTags;
+}
+
 void scan_local(bool send_all)
 {
 	CActor* actor = Actor();
@@ -900,6 +922,21 @@ void scan_local(bool send_all)
 			{
 				send_state(item, blob);
 				++g_stats.sent;
+			}
+			else
+			{
+				// Live report 2026-11-08: what our take callbacks changed (GAMMA pins a looted gun at 0.83) is ours,
+				// the host never saw it. Only those tags go: the rest of our copy may be stale (an NPC's magazine).
+				ItemData now;
+				capture_object(item, now);
+				if (const u32 mine = take_changes(id, now))
+				{
+					Blob part;
+					write_data(itemtags::only_tags(now, mine), part);
+					send_state(item, part);
+					++g_stats.sent;
+					++g_stats.take_kept;
+				}
 			}
 		}
 		else if (it->second != blob)
@@ -927,6 +964,7 @@ void scan_local(bool send_all)
 				++g_stats.sent;
 			}
 		}
+		g_take_base.erase(it->first);
 		it = g_sent.erase(it);
 	}
 }
@@ -995,6 +1033,31 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 			++g_stats.ignored;
 			return true;
 		}
+		auto base = g_take_base.find(id);
+		if (item && base != g_take_base.end())
+		{
+			// Live report 2026-11-08 (GAMMA): the push of an item the host's take just gave us. What we changed
+			// ourselves since that take (GAMMA pinned the looted gun at 0.83) stays ours; the rest is the host's copy,
+			// fresher than ours (an NPC's magazine). Before, the whole push won: the gun went red in our hands.
+			ItemData now;
+			capture_object(item, now);
+			const u32 mine = take_changes(id, now);
+			g_take_base.erase(base);
+			const ItemData merged = itemtags::take_push(d, now, mine);
+			apply_object(item, merged, false);
+			apply_entity(e, merged, false);
+			Blob cur;
+			capture_blob(item, cur);
+			if (mine)
+			{
+				send_state(item, cur); // the host's copy takes ours (it may have pushed before our first scan's part came)
+				++g_stats.sent;
+				++g_stats.take_kept;
+			}
+			g_sent[id] = cur;
+			++g_stats.authority_applied;
+			return true;
+		}
 		if (item)
 		{
 			Blob cur;
@@ -1054,6 +1117,9 @@ void process_pending(u64 now)
 		else
 			++it;
 	}
+	// A take whose push came before the take itself (applied to a world item then) waits for none.
+	for (auto it = g_take_base.begin(); it != g_take_base.end();)
+		it = now - it->second.time > kTakeBaseMs ? g_take_base.erase(it) : std::next(it);
 }
 
 // ---------------------------------------------------------------- host side
@@ -1678,6 +1744,7 @@ void reset()
 	}
 	g_sent.clear();
 	g_pending.clear();
+	g_take_base.clear();
 	g_owned.clear();
 	g_logged_tags.clear();
 	g_left.clear();
@@ -1800,7 +1867,21 @@ void print_status()
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
 	if (mgr().is_client())
-		::Msg("[coop]   items in: %llu states dropped before live (R2 I2)", s.dropped_before_live);
+		::Msg("[coop]   items in: %llu states dropped before live (R2 I2), %llu take changes kept over the host's push "
+		      "(%u waiting)",
+		    s.dropped_before_live, s.take_kept, (u32)g_take_base.size());
+}
+
+void client_before_take(u16 local_item)
+{
+	if (!is_live_mirror() || local_item == kNoId)
+		return;
+	CInventoryItem* item = find_item(local_item);
+	if (!item)
+		return;
+	TakeBase& b = g_take_base[local_item];
+	capture_object(item, b.data);
+	b.time = mgr().now_ms();
 }
 
 void client_resend_state(u16 local_id)

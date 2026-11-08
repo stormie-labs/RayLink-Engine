@@ -18,7 +18,8 @@
 //   export would overwrite it with stale values), keeps re-applying it if the host copy drifts,
 //   and relays the result to the other clients. The host's own actor items are broadcast too,
 //   so everybody's copies match. An item entering a player's inventory gets the host's state
-//   pushed to that player (it may be stale there: NPC guns, stash contents).
+//   pushed to that player (it may be stale there: NPC guns, stash contents); what the player's own
+//   take callbacks changed on it meanwhile stays his and goes to the host (client_before_take).
 //
 // Wire (Msg::ItemState, ids in host numbering):
 //   u8 op = 1 State      u16 item, str section, u8 flags (1 = host authority), varu n, n bytes blob
@@ -74,6 +75,11 @@ void set_weapon_fired_handler(WeaponFiredFn fn);
 // never as raw spawn bytes; the host builds the entity from its own section and applies the blob. ---
 // Client: the blob of an entity that is not created yet. False = not an inventory item (nothing to carry).
 bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob);
+// Client (live report 2026-11-08, GAMMA): the host's take is about to put item `local_item` into our character (WP2 parent
+// relay, before GE_OWNERSHIP_TAKE runs our take callbacks). Its state now is the baseline: what our callbacks change on it
+// (GAMMA pins a looted gun at 0.83) is the owner's, goes to the host with the next scan and survives the host's push of
+// its copy; the tags we did not touch take the host's (fresher) values. Main thread.
+void client_before_take(u16 local_item);
 // Client (F2 T12b): the host has just created our item `local_id` that we created at once under a leased id; what we
 // changed on it since (portions, a condition a mod set on the object) goes to the host with the next scan, as if the
 // host knew nothing of it. Main thread.

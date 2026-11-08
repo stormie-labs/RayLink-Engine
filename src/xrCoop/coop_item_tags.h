@@ -83,6 +83,85 @@ std::uint32_t diverged(const D& cur, const D& owner, SameUpgrades&& same_upgrade
 	return m;
 }
 
+// Live report 2026-11-08 (GAMMA, a looted gun went red in a client's hands). The host moves an item into a player's
+// character and then pushes its own state of it (coop_items.cpp host_push, authority flag): the player's copy may be
+// stale (an NPC's magazine, a corpse's condition). By then the owner's own take callbacks have run on it (GAMMA's "Guns
+// Have No Condition", grok_gun_condition_fixed: a taken firearm is pinned at 0.83 in actor_on_item_take; parts keep the
+// wear). What the owner changed itself since the take is the owner's and must survive the host's push.
+
+// Tags whose value differs between `now` (the owner's copy) and `base` (the same copy right before the take), whichever
+// side carries them.
+template <class D, class SameUpgrades>
+std::uint32_t changed_since(const D& now, const D& base, SameUpgrades&& same_upgrades)
+{
+	return diverged(now, base, same_upgrades) | diverged(base, now, same_upgrades);
+}
+
+// The tags an owner keeps from its own copy over the host's push. The upgrade list is the host's (a mechanic's sale,
+// coop_ledger.h), never the owner's.
+constexpr std::uint32_t kOwnerTakeTags = kAll & ~std::uint32_t(Upgrades);
+
+// What the owner's copy becomes when the host's push `host` arrives: the host's tags, except those in `mine` (changed by
+// the owner since the take, see changed_since), which stay as `now` has them.
+template <class D>
+D take_push(D host, const D& now, std::uint32_t mine)
+{
+	mine &= kOwnerTakeTags;
+	if (mine & Cond)
+	{
+		host.has_cond = now.has_cond;
+		host.cond = now.cond;
+	}
+	if (mine & Box)
+	{
+		host.has_box = now.has_box;
+		host.box = now.box;
+	}
+	if (mine & Addons)
+	{
+		host.has_addons = now.has_addons;
+		host.addons = now.addons;
+	}
+	if (mine & Scope)
+	{
+		host.has_scope = now.has_scope;
+		host.scope = now.scope;
+	}
+	if (mine & Main)
+	{
+		host.has_main = now.has_main;
+		host.main_count = now.main_count;
+		host.main_type = now.main_type;
+	}
+	if (mine & Launcher)
+	{
+		host.has_launcher = now.has_launcher;
+		host.gl_count = now.gl_count;
+		host.gl_type = now.gl_type;
+	}
+	if (mine & Uses)
+	{
+		host.has_uses = now.has_uses;
+		host.uses = now.uses;
+	}
+	return host;
+}
+
+// Only the tags in `mask` of `d`: a partial state. A receiver applies and enforces only the tags a state carries.
+template <class D>
+D only_tags(D d, std::uint32_t mask)
+{
+	d.has_cond = d.has_cond && (mask & Cond);
+	d.has_upgrades = d.has_upgrades && (mask & Upgrades);
+	d.has_box = d.has_box && (mask & Box);
+	d.has_addons = d.has_addons && (mask & Addons);
+	d.has_scope = d.has_scope && (mask & Scope);
+	d.has_main = d.has_main && (mask & Main);
+	d.has_launcher = d.has_launcher && (mask & Launcher);
+	d.has_uses = d.has_uses && (mask & Uses);
+	return d;
+}
+
 // Parity audit F1: the digest of the state of an item nobody alive holds, as the host and a client each see it
 // (coop_reconcile.h). Condition in steps of 1/1024: a step apart is a change, a float's last bits are not. The upgrades
 // are the host's and a mechanic's business (they go out with ItemState when sold). `with_uses`: portions live in the

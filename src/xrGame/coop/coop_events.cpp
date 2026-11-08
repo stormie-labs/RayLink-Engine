@@ -15,6 +15,7 @@
 #include "coop_story.h"
 #include "coop_callgate.h" // F2 T12
 #include "coop_monster_fx.h" // audit A5
+#include "coop_items.h" // live report 2026-11-08: the owner's copy before a take
 #include "xrCoop/coop_rules.h"
 
 #include "Level.h"
@@ -574,6 +575,8 @@ Step step_parent(u16 item, const ParentTarget& t)
 		}
 		if (target)
 		{
+			if (t.parent == kActor)
+				items::client_before_take(item); // before our take callbacks change it (GAMMA pins a looted gun)
 			inject_item_event(transfer ? GE_TRADE_BUY : GE_OWNERSHIP_TAKE, t.parent, item);
 			return e->ID_Parent == t.parent ? Step::Done : Step::Fail;
 		}
