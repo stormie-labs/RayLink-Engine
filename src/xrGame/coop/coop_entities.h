@@ -45,7 +45,7 @@ void host_send_online_to(PeerId to); // F3a T8: the host's online set to a mover
 // F3a, world server: where an offline object stands, to the map server of the level (EntitySwitch offline, to it alone).
 void host_send_place(PeerId to, CSE_ALifeDynamicObject* e);
 // F3a, a map server: what it made under its own ids, in EntitySpawn's layout; world server: it, into the world there.
-void write_entity(Writer& w, CSE_ALifeDynamicObject* e);
+bool write_entity(Writer& w, CSE_ALifeDynamicObject* e);
 void host_spawn_from_leader(Reader& r);
 // F3a multilevel: an offline object goes to this place in the registries of this machine.
 void place_offline(CSE_ALifeDynamicObject* e, const Fvector& pos, const Fvector& ang, u32 node, u16 graph);

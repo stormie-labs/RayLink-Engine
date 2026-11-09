@@ -329,7 +329,8 @@ void client_flush_up()
 			if (!e)
 				continue; // made and gone within a frame: nobody needs to hear of it
 			head.write(w);
-			entities::write_entity(w, e);
+			if (!entities::write_entity(w, e))
+				continue;
 			break;
 		case Head::Tent:
 			if (!e)

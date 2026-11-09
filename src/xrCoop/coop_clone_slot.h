@@ -18,7 +18,7 @@ namespace coop
 namespace cloneslot
 {
 constexpr std::uint16_t kNone = 0xFFFF;
-constexpr std::uint64_t kKeepMs = 60000; // a plan nobody used by then is dropped (the clone never spawned, a lost answer)
+constexpr std::uint64_t kKeepMs = 60000; // a refused, removed clone leaves this long to restore its source
 
 class Book
 {
@@ -27,7 +27,7 @@ public:
 	void plan(std::uint16_t clone, std::uint16_t source, std::uint16_t slot, std::uint64_t now)
 	{
 		drop(clone);
-		m_plans.push_back(Plan{clone, source, slot, now, false});
+		m_plans.push_back(Plan{clone, source, slot, now});
 	}
 
 	// The clone spawns in our inventory: the slot it takes, kNone for the engine's own default (no plan, or the slot was
@@ -35,10 +35,12 @@ public:
 	std::uint16_t spawn_slot(std::uint16_t clone, bool slot_free)
 	{
 		for (auto it = m_plans.begin(); it != m_plans.end(); ++it)
-			if (it->clone == clone && !it->refused)
+			if (it->clone == clone && !it->spawned && !it->refused && !it->removed)
 			{
 				const std::uint16_t slot = it->slot;
-				m_plans.erase(it);
+				it->spawned = true;
+				if (it->confirmed)
+					m_plans.erase(it);
 				return slot_free ? slot : kNone;
 			}
 		return kNone;
@@ -48,17 +50,29 @@ public:
 	std::uint16_t peek(std::uint16_t clone) const
 	{
 		for (const Plan& p : m_plans)
-			if (p.clone == clone && !p.refused)
+			if (p.clone == clone && !p.spawned && !p.refused && !p.removed)
 				return p.slot;
 		return kNone;
 	}
 
-	// The host refused the clone: its source gets the slot back (restore). False: no plan (none made, or the clone took
-	// its slot already).
+	// The host accepted the clone. A delayed local spawn still needs its planned slot once.
+	void confirmed(std::uint16_t clone)
+	{
+		for (auto it = m_plans.begin(); it != m_plans.end(); ++it)
+			if (it->clone == clone && !it->refused)
+			{
+				it->confirmed = true;
+				if (it->spawned || it->removed)
+					m_plans.erase(it);
+				return;
+			}
+	}
+
+	// The host refused the clone. Its source waits for the clone's actual removal before restore.
 	bool refused(std::uint16_t clone, std::uint64_t now)
 	{
 		for (Plan& p : m_plans)
-			if (p.clone == clone && !p.refused)
+			if (p.clone == clone && !p.refused && !p.confirmed)
 			{
 				p.refused = true;
 				p.at = now;
@@ -67,12 +81,25 @@ public:
 		return false;
 	}
 
-	// A source to put back into its slot (the caller checks that both are there and calls restored(), or leaves it to
-	// expire).
+	// Called only once neither a server entity nor a game object holds the clone's id.
+	void removed(std::uint16_t clone, std::uint64_t now)
+	{
+		for (auto it = m_plans.begin(); it != m_plans.end(); ++it)
+			if (it->clone == clone && !it->removed)
+			{
+				it->removed = true;
+				it->at = now;
+				if (it->confirmed)
+					m_plans.erase(it);
+				return;
+			}
+	}
+
+	// A refused clone is gone here: its source may take a free slot. The caller retries while the slot is occupied.
 	bool restore(std::uint16_t& source, std::uint16_t& slot) const
 	{
 		for (const Plan& p : m_plans)
-			if (p.refused)
+			if (p.refused && p.removed)
 			{
 				source = p.source;
 				slot = p.slot;
@@ -84,7 +111,7 @@ public:
 	void restored(std::uint16_t source)
 	{
 		for (auto it = m_plans.begin(); it != m_plans.end(); ++it)
-			if (it->refused && it->source == source)
+			if (it->refused && it->removed && it->source == source)
 			{
 				m_plans.erase(it);
 				return;
@@ -94,7 +121,13 @@ public:
 	void expire(std::uint64_t now)
 	{
 		for (auto it = m_plans.begin(); it != m_plans.end();)
-			it = now - it->at > kKeepMs ? m_plans.erase(it) : it + 1;
+		{
+			const bool finished = it->refused && it->removed;
+			if (finished && now >= it->at && now - it->at > kKeepMs)
+				it = m_plans.erase(it);
+			else
+				++it;
+		}
 	}
 
 	void clear() { m_plans.clear(); }
@@ -105,7 +138,10 @@ private:
 	{
 		std::uint16_t clone, source, slot;
 		std::uint64_t at;
-		bool refused;
+		bool spawned = false;
+		bool confirmed = false;
+		bool refused = false;
+		bool removed = false;
 	};
 
 	void drop(std::uint16_t clone)

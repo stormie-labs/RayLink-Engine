@@ -229,6 +229,8 @@ void CWeaponMagazined::Load(LPCSTR section)
 
 void CWeaponMagazined::FireStart()
 {
+	if (coop::items::client_pending(this))
+		return;
 	if (!IsMisfire())
 	{
 		if (IsValid())
@@ -278,6 +280,11 @@ void CWeaponMagazined::FireStart()
 void CWeaponMagazined::FireEnd()
 {
 	inherited::FireEnd();
+	if (coop::items::client_pending(this))
+	{
+		m_bFireSingleShot = false;
+		m_pendingShot = false;
+	}
 
 	// Alundaio: Removed auto-reload since it's widely asked by just about everyone who is a gun whore
 	// Lander: Reinstated as a cvar
@@ -291,6 +298,8 @@ void CWeaponMagazined::FireEnd()
 
 void CWeaponMagazined::Reload()
 {
+	if (coop::items::client_pending(this))
+		return;
 	inherited::Reload();
 	TryReload();
 }
@@ -420,6 +429,8 @@ int CWeaponMagazined::CheckAmmoBeforeReload(u8& v_ammoType)
 
 void CWeaponMagazined::UnloadMagazine(bool spawn_ammo)
 {
+	if (coop::items::client_pending(this))
+		return;
 	last_hide_bullet = -1;
 	HUD_VisualBulletUpdate();
 
@@ -477,6 +488,8 @@ void CWeaponMagazined::UnloadMagazine(bool spawn_ammo)
 
 void CWeaponMagazined::ReloadMagazine()
 {
+	if (coop::items::client_pending(this))
+		return;
 	m_needReload = false;
 	m_BriefInfo_CalcFrame = 0;
 
@@ -664,6 +677,11 @@ void CWeaponMagazined::UpdateCL()
 {
 	PROF_EVENT();
 	inherited::UpdateCL();
+	if (coop::items::client_pending(this))
+	{
+		FireEnd();
+		return;
+	}
 	float dt = Device.fTimeDelta;
 
 	//когда происходит апдейт состояния оружия

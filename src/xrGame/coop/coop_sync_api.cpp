@@ -1781,6 +1781,20 @@ int l_near(lua_State* L)
 }
 
 // coop.sync.owns(peer, item_id) -> bool
+// Stable public identity used by saved player scopes. Other players are visible to their host only.
+int l_player_digest(lua_State* L)
+{
+	follow_role();
+	double peer = 0;
+	std::string digest;
+	if (!mgr().active() || !arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) ||
+	    (PeerId(peer) != self_peer() && !in_world(PeerId(peer))) || !peer_digest(PeerId(peer), digest))
+		lua_pushnil(L);
+	else
+		lua_pushlstring(L, digest.data(), digest.size());
+	return 1;
+}
+
 int l_owns(lua_State* L)
 {
 	double peer = 0, id = 0;
@@ -2168,6 +2182,7 @@ void register_lua(lua_State* L)
 		{"on", &l_on},
 		{"near", &l_near},
 		{"owns", &l_owns},
+		{"player_digest", &l_player_digest},
 		{"in_container", &l_in_container},
 		{"limit", &l_limit},
 		{"export", &l_export},

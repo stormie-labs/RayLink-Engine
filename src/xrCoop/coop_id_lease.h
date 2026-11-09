@@ -529,7 +529,7 @@ public:
 			}
 			else if (s.seq && !s.queued && now >= s.sent_at && now - s.sent_at >= kAnswerTimeoutMs)
 			{
-				if (s.resends >= kMaxResends)
+				if (s.resends >= kMaxResends && s.source == kNoId)
 				{
 					d.rollback.push_back(s.id);
 					it = m_specs.erase(it);

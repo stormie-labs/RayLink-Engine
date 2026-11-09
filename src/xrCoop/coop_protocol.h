@@ -83,7 +83,7 @@ namespace coop
 // 29 (docs/DEBUG_DESIGN.md §B.3, owner 2026-11-07: debug is the server's, as sv_cheats): DebugState 0x01A1 (world server -> every player,
 //    the host player over the LocalLink, and every map server): on, its source, a serial, each player's personal flags
 //    (xrCoop/coop_debug_rules.h StateMsg).
-constexpr uint32_t kProtocolVersion = 29;
+constexpr uint32_t kProtocolVersion = 30;
 constexpr uint16_t kDefaultPort = 27960;
 constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
 

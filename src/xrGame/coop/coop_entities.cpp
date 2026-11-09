@@ -107,7 +107,7 @@ void write_placement(Writer& w, const CSE_ALifeDynamicObject* e)
 	w.u16(e->m_tGraphID);
 }
 
-void write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Packet& update)
+bool write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Packet& update)
 {
 	w.u16(e->ID);
 	w.u16(e->ID_Parent);
@@ -115,6 +115,7 @@ void write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Pa
 	write_placement(w, e);
 	write_packet(w, spawn);
 	write_packet(w, update);
+	return requests::write_clone_initial(w, e);
 }
 
 void host_send_spawn(CSE_ALifeDynamicObject* e)
@@ -125,7 +126,8 @@ void host_send_spawn(CSE_ALifeDynamicObject* e)
 	e->UPDATE_Write(update);
 
 	Writer w(spawn.B.count + update.B.count + 32);
-	write_spawn(w, e, spawn, update);
+	if (!write_spawn(w, e, spawn, update))
+		return;
 	net::host_broadcast(Msg::EntitySpawn, w);
 	++g_host_spawns;
 }
@@ -1044,6 +1046,8 @@ void bring_child_online(CSE_ALifeDynamicObject* e)
 	e->m_bOnline = true;
 }
 
+void client_on_destroy(PeerId, Reader& r);
+
 void client_on_spawn(PeerId, Reader& r)
 {
 	const u16 id_host = r.u16();
@@ -1058,8 +1062,16 @@ void client_on_spawn(PeerId, Reader& r)
 	NET_Packet spawn, update;
 	if (!read_packet(r, spawn) || !read_packet(r, update) || !ai().get_alife())
 		return;
+	std::vector<u8> initial;
+	if (!requests::read_clone_initial(r, id, initial))
+		return;
 	if (ai().alife().objects().object(id, true))
 	{
+		if (!initial.empty() && !requests::stage_clone_initial(ai().alife().objects().object(id, true), initial, true))
+		{
+			g_id_retry.add(id_host, mgr().now_ms());
+			return;
+		}
 		g_id_retry.done(id_host);
 		return; // already have it (P6: repeat is harmless)
 	}
@@ -1111,6 +1123,13 @@ void client_on_spawn(PeerId, Reader& r)
 	spawn.r_pos = 0;
 	e->Spawn_Read(spawn);
 	apply_update(e, update);
+	// Script metadata must exist even for callbacks invoked by register_object/bring_child_online.
+	e->ID = id;
+	if (!requests::stage_clone_initial(e, initial))
+	{
+		F_entity_Destroy(abstract);
+		return;
+	}
 	ApplyGuard guard;
 	e->ID = alife_rw().server().PerformIDgen(id); // free: checked above
 	e->ID_Parent = parent;
@@ -1165,6 +1184,19 @@ void client_on_spawn(PeerId, Reader& r)
 		break;
 	case mirror::Placement::Offline:
 		break;
+	}
+	if (!initial.empty())
+	{
+		const bool activated = requests::clone_activate(id);
+		requests::clone_finish(id, activated);
+		if (!activated)
+		{
+			Writer gone;
+			gone.u16(id_host);
+			Reader removal(gone.data().data(), gone.data().size());
+			client_on_destroy(kHostPeer, removal);
+			return;
+		}
 	}
 	++g_client_spawns;
 }
@@ -1403,7 +1435,8 @@ void host_on_entity_request(PeerId from, Reader& r)
 		update.w_begin(M_UPDATE);
 		e->UPDATE_Write(update);
 		Writer w(spawn.B.count + update.B.count + 32);
-		write_spawn(w, e, spawn, update);
+		if (!write_spawn(w, e, spawn, update))
+			return;
 		net::host_send(from, Msg::EntitySpawn, w);
 	}
 	if ((what & reconcile::Switch) && e->ID_Parent == kNoId)
@@ -1548,7 +1581,7 @@ void host_send_online_to(PeerId to)
 	::Msg("[coop] online set of the new world -> #%u: %u object(s)", to, sent);
 }
 
-void write_entity(Writer& w, CSE_ALifeDynamicObject* e)
+bool write_entity(Writer& w, CSE_ALifeDynamicObject* e)
 {
 	NET_Packet spawn, update;
 	e->Spawn_Write(spawn, FALSE);
@@ -1561,6 +1594,7 @@ void write_entity(Writer& w, CSE_ALifeDynamicObject* e)
 	write_placement(w, e);
 	write_packet(w, spawn);
 	write_packet(w, update);
+	return requests::write_clone_initial(w, e);
 }
 
 void host_spawn_from_leader(Reader& r)
@@ -1606,6 +1640,7 @@ void host_on_entity_registered(CSE_ALifeDynamicObject* e)
 
 void host_on_entity_released(u16 id)
 {
+	items::forget_item(id);
 	syncapi::on_entity_destroyed(id); // F2 T14: its coop.sync scope goes (host, single player; any game thread)
 	if (host_records())
 		g_host_events.push_back({HostEventKind::Released, id, false});

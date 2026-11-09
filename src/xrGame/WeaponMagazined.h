@@ -212,6 +212,7 @@ public:
 		m_iCurFireMode = mode;
 		SetQueueSize(GetCurrentFireMode());
 	};
+	int GetFireModeIndex() const { return m_iCurFireMode; }
 
 	virtual void save(NET_Packet& output_packet);
 	virtual void load(IReader& input_packet);

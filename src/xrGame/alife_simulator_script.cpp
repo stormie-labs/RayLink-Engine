@@ -20,6 +20,7 @@
 #include "xrServer.h"
 #include "level.h"
 #include "coop/coop_requests.h" // Anomaly Coop
+#include "coop/coop_items.h"
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 #include "coop/coop_story.h" // Anomaly Coop (F2 T12 round 1): alife():give_info of our actor
 #include "coop/coop_manager.h" // Anomaly Coop (F2 T12 round 1)
@@ -406,6 +407,12 @@ ALife::_SPAWN_ID CALifeSimulator__spawn_id(CALifeSimulator* self, ALife::_SPAWN_
 void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 {
 	if (coop::requests::lua_mirror() && coop::requests::lua_release(object)) return; // Anomaly Coop: the host releases (F2 T12 gate inside)
+	if (coop::requests::cancel_unregistered_clone(object))
+	{
+		self->server().FreeID(object->ID, 0);
+		F_entity_Destroy(object);
+		return;
+	}
 	VERIFY(self);
 	//	self->release						(object,true);
 
@@ -535,6 +542,14 @@ CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 	case coop::calls::Gate::Refuse: return nullptr;
 	case coop::calls::Gate::Run: break;
 	}
+	const u16 clone_id = object->ID;
+	if (!coop::requests::before_clone_register(object))
+	{
+		coop::requests::after_clone_register(clone_id, false);
+		self->server().FreeID(clone_id, 0);
+		F_entity_Destroy(object);
+		return nullptr;
+	}
 	NET_Packet packet;
 	packet.w_begin(M_SPAWN);
 	packet.w_stringZ(object->s_name);
@@ -549,7 +564,13 @@ CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 	u16 dummy;
 	packet.r_begin(dummy);
 
-	return (self->server().Process_spawn(packet, clientID));
+	CSE_Abstract* result = self->server().Process_spawn(packet, clientID);
+	if (!coop::requests::after_clone_register(clone_id, result != nullptr) && result)
+	{
+		self->release(result, true);
+		return nullptr;
+	}
+	return result;
 }
 
 CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, LPCSTR section, const Fvector& position,
@@ -571,7 +592,11 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
 
 		CSE_ALifeItemWeaponMagazined* clone = smart_cast<CSE_ALifeItemWeaponMagazined*>(absClone);
 		if (!clone)
-			return (0);
+		{
+			self->server().FreeID(absClone->ID, 0);
+			F_entity_Destroy(absClone);
+			return nullptr;
+		}
 
 		clone->wpn_flags = wpnmag->wpn_flags;
 		clone->m_addon_flags = wpnmag->m_addon_flags;
@@ -579,6 +604,12 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
 		clone->ammo_type = wpnmag->ammo_type;
 		clone->m_upgrades = wpnmag->m_upgrades;
 		clone->set_ammo_elapsed(wpnmag->get_ammo_elapsed());
+		if (!coop::requests::prepare_local_clone(object, absClone))
+		{
+			self->server().FreeID(absClone->ID, 0);
+			F_entity_Destroy(absClone);
+			return nullptr;
+		}
 
 		return bRegister ? reprocess_spawn(self, absClone) : absClone;
 		// (self->server().Process_spawn(packet, clientID));

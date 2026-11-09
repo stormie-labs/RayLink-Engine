@@ -28,8 +28,8 @@
 //   1 condition u16 (q 1/65535)   2 upgrades u8 n + n str (install order)   3 ammo box u16
 //   4 addons u8 flags   5 scope index u8   6 main magazine u16 count + u8 ammo type
 //   7 launcher magazine u16 count + u8 type (weapons with a grenade launcher)   8 portions u8
-// Main/launcher magazines are stored independent of the launcher mode (the mode itself is not
-// synced: it is cosmetic and switching it has side effects).
+// Replacement snapshots also carry 9 active launcher mode, 10 fire mode index, 11 per-round main magazine types.
+// Their spawn restoration applies these after native weapon initialization, including both launcher magazines.
 #pragma once
 
 #include "xrCoop/coop_session.h"
@@ -75,6 +75,14 @@ void set_weapon_fired_handler(WeaponFiredFn fn);
 // never as raw spawn bytes; the host builds the entity from its own section and applies the blob. ---
 // Client: the blob of an entity that is not created yet. False = not an inventory item (nothing to carry).
 bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob);
+bool replacement_state(CSE_Abstract* source, const u8* data, size_t size, std::vector<u8>& out);
+void stage_spawn_state(u16 id, const std::vector<u8>& blob);
+void discard_spawn_state(u16 id);
+void forget_item(u16 id); // hook queues now, owner/host tracking at the next main-thread pass
+void prepare_clone_state(u16 source, u16 target);
+void restore_spawn_state(CWeapon* weapon, CSE_Abstract* entity, bool launcher_ready = false);
+void restore_item_state(CSE_Abstract* entity, const std::vector<u8>& blob, CInventoryItem* object = nullptr);
+bool client_pending(CWeapon* weapon);
 // Client (live report 2026-11-08, GAMMA): the host's take is about to put item `local_item` into our character (WP2 parent
 // relay, before GE_OWNERSHIP_TAKE runs our take callbacks). Its state now is the baseline: what our callbacks change on it
 // (GAMMA pins a looted gun at 0.83) is the owner's, goes to the host with the next scan and survives the host's push of

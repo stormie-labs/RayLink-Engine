@@ -1039,6 +1039,7 @@ BOOL CWeapon::net_Spawn(CSE_Abstract* DC)
 
 	VERIFY((u32) iAmmoElapsed == m_magazine.size());
 	m_bAmmoWasSpawned = false;
+	coop::items::restore_spawn_state(this, DC);
 
 	return bResult;
 }
@@ -1454,6 +1455,8 @@ void CWeapon::UpdatePosition(const Fmatrix& trans)
 BOOL interruptFireOnAimToggle = FALSE;
 bool CWeapon::Action(u16 cmd, u32 flags)
 {
+	if (coop::items::client_pending(this))
+		return true;
 	if (inherited::Action(cmd, flags)) return true;
 
 	CActor* pActor = smart_cast<CActor*>(H_Parent());

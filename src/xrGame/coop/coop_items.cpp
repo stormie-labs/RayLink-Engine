@@ -7,6 +7,7 @@
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_trade.h"
+#include "coop_requests.h"
 
 #include <algorithm>
 #include <mutex>
@@ -75,6 +76,9 @@ enum Tag : u8
 	TagMain = 6,
 	TagLauncher = 7,
 	TagUses = 8,
+	TagMode = 9,
+	TagFireMode = 10,
+	TagCartridges = 11,
 };
 
 using Blob = std::vector<u8>;
@@ -101,6 +105,12 @@ struct ItemData
 	u8 gl_type = 0;
 	bool has_uses = false;
 	u8 uses = 0;
+	bool has_mode = false;
+	bool grenade_mode = false;
+	bool has_fire_mode = false;
+	u8 fire_mode = 0;
+	bool has_cartridges = false;
+	std::vector<u8> cartridges;
 };
 
 enum class Reason : u8
@@ -159,11 +169,13 @@ xr_vector<u16> g_touched; // local ids
 xr_vector<SpawnReq> g_spawns;
 bool g_scan_now = false;
 xr_vector<u16> g_made_here; // client_made_here (a Lua create may run on the game thread): into g_take_base on the main thread
+xr_vector<u16> g_forgotten, g_clear_pending;
 WeaponFiredFn g_fired = nullptr;
 
 // ---------------------------------------------------------------- owner side (main thread)
 
 xr_map<u16, Blob> g_sent; // own items: last captured/reported state (local id), not an acknowledgement
+xr_map<u16, Blob> g_spawn_states; // complete replacement state, consumed after the weapon's native spawn
 bool g_was_live = false;
 bool g_resync = false;
 u64 g_last_scan = 0;
@@ -430,6 +442,25 @@ void write_data(const ItemData& d, Blob& out)
 		p.u8(d.uses);
 		put(w, TagUses, p);
 	}
+	if (d.has_mode)
+	{
+		p.clear();
+		p.u8(d.grenade_mode ? 1 : 0);
+		put(w, TagMode, p);
+	}
+	if (d.has_fire_mode)
+	{
+		p.clear();
+		p.u8(d.fire_mode);
+		put(w, TagFireMode, p);
+	}
+	if (d.has_cartridges)
+	{
+		p.clear();
+		for (u8 type : d.cartridges)
+			p.u8(type);
+		put(w, TagCartridges, p);
+	}
 	out = w.data();
 }
 
@@ -492,6 +523,25 @@ bool read_data(const u8* data, size_t size, ItemData& d)
 		case TagUses:
 			d.uses = p.u8();
 			d.has_uses = p.ok();
+			break;
+		case TagMode:
+		{
+			const u8 mode = p.u8();
+			if (!p.ok() || mode > 1 || p.remaining())
+				return false;
+			d.has_mode = true;
+			d.grenade_mode = mode != 0;
+			break;
+		}
+		case TagFireMode:
+			d.fire_mode = p.u8();
+			d.has_fire_mode = p.ok() && !p.remaining();
+			if (!d.has_fire_mode)
+				return false;
+			break;
+		case TagCartridges:
+			d.has_cartridges = true;
+			d.cartridges.assign(p.cursor(), p.cursor() + size_t(len));
 			break;
 		default:
 			break; // newer field: skipped by length
@@ -626,6 +676,11 @@ void capture_object(CInventoryItem* item, ItemData& d, bool upgrades = true)
 			d.scope = w->m_cur_scope;
 		}
 		CWeaponMagazinedWGrenade* g = smart_cast<CWeaponMagazinedWGrenade*>(w);
+		if (g)
+		{
+			d.has_mode = true;
+			d.grenade_mode = g->m_bGrenadeMode;
+		}
 		const u16 cur_count = u16(_max(0, w->GetAmmoElapsed()));
 		d.has_main = true;
 		if (g && g->m_bGrenadeMode)
@@ -655,8 +710,8 @@ void capture_object(CInventoryItem* item, ItemData& d, bool upgrades = true)
 	}
 }
 
-// Fallback when the item has no game object here. The launcher magazine and portions live only
-// in the game object's save data, so they are left out.
+// Entity state, using the live WGL object when its current mode hides the rifle magazine in the CSE.
+// Portions still require a game object.
 bool capture_entity(CSE_Abstract* e, ItemData& d, bool upgrades = true)
 {
 	d = ItemData();
@@ -678,6 +733,21 @@ bool capture_entity(CSE_Abstract* e, ItemData& d, bool upgrades = true)
 		d.has_addons = true;
 		d.addons = w->m_addon_flags.get();
 		CSE_ALifeItemWeaponMagazinedWGL* g = smart_cast<CSE_ALifeItemWeaponMagazinedWGL*>(e);
+		if (g)
+		{
+			d.has_mode = true;
+			d.grenade_mode = g->m_bGrenadeMode;
+			if (CWeaponMagazinedWGrenade* live = smart_cast<CWeaponMagazinedWGrenade*>(find_item(e->ID)))
+			{
+				capture_object(live, d, upgrades); // normalizes both magazines regardless of the active mode
+				if (upgrades)
+					d.upgrades = ii->m_upgrades; // the entity retains authority over installed upgrades
+				return true;
+			}
+			d.has_launcher = true;
+			d.gl_count = g->m_bGrenadeMode ? w->a_elapsed : w->a_elapsed_grenades.grenades_count;
+			d.gl_type = g->m_bGrenadeMode ? w->ammo_type : w->a_elapsed_grenades.grenades_type;
+		}
 		if (!g || !g->m_bGrenadeMode)
 		{
 			d.has_main = true;
@@ -829,6 +899,12 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 	CSE_ALifeItemWeapon* w = smart_cast<CSE_ALifeItemWeapon*>(e);
 	if (!w)
 		return;
+	if (d.has_fire_mode)
+		if (CSE_ALifeItemWeaponMagazined* magazined = smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
+			magazined->m_u8CurFireMode = d.fire_mode;
+	if (d.has_cartridges)
+		if (CSE_ALifeItemWeaponShotGun* shotgun = smart_cast<CSE_ALifeItemWeaponShotGun*>(e))
+			shotgun->m_AmmoIDs.assign(d.cartridges.begin(), d.cartridges.end());
 	if (!ammo_only && d.has_addons)
 		w->m_addon_flags.assign(d.addons);
 	// a_elapsed / ammo_type describe the magazine of the current launcher mode (the online
@@ -893,8 +969,35 @@ void reject(Reason why, PeerId from, u16 id, const char* detail)
 // Client: the tags of our item `id` that we changed ourselves since the host's take put it into our character (our take
 // callbacks), and the copy from before the take. 0: no take base, or nothing changed.
 // Client: our own creates (client_made_here) get their take base, on the main thread.
+void drain_forgotten()
+{
+	xr_vector<u16> gone, pending;
+	{
+		std::lock_guard<std::mutex> lock(g_lock);
+		gone.swap(g_forgotten);
+		pending.swap(g_clear_pending);
+	}
+	for (u16 id : pending)
+		g_pending.erase(id);
+	for (u16 id : gone)
+	{
+		g_sent.erase(id);
+		g_pending.erase(id);
+		g_take_base.erase(id);
+		g_owned.erase(id);
+		g_left.erase(id);
+		g_unload_used.erase(id);
+		g_releasing.erase(id);
+		for (auto& proxy : g_proxy_items)
+			proxy.second.erase(std::remove(proxy.second.begin(), proxy.second.end(), id), proxy.second.end());
+		for (auto it = g_logged_tags.begin(); it != g_logged_tags.end();)
+			it = u16(*it >> 8) == id ? g_logged_tags.erase(it) : std::next(it);
+	}
+}
+
 void drain_made_here()
 {
+	drain_forgotten();
 	xr_vector<u16> made;
 	{
 		std::lock_guard<std::mutex> lock(g_lock);
@@ -941,6 +1044,8 @@ void scan_local(bool send_all)
 			continue;
 		const u16 id = item->object_id();
 		present.insert(id);
+		if (!host && requests::client_lease_waiting(id))
+			continue;
 		capture_blob(item, blob);
 		auto it = g_sent.find(id);
 		if (it == g_sent.end())
@@ -1045,6 +1150,8 @@ void send_spawns(xr_vector<SpawnReq>& spawns)
 bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 {
 	drain_made_here();
+	if (requests::client_lease_waiting(id))
+		return true; // the initial replacement envelope is the only state allowed across this fence
 	CSE_Abstract* e = find_entity(id);
 	if (!e)
 		return false;
@@ -1247,7 +1354,17 @@ bool host_validate_kind(CSE_Abstract* e, const ItemData& d, const char*& why)
 			return false;
 		}
 	}
-	const bool weapon_fields = d.has_main || d.has_launcher || d.has_addons || d.has_scope;
+	if (d.has_mode && !smart_cast<CSE_ALifeItemWeaponMagazinedWGL*>(e))
+	{
+		why = "launcher mode for a non-launcher";
+		return false;
+	}
+	if (d.has_fire_mode && !smart_cast<CSE_ALifeItemWeaponMagazined*>(e))
+	{
+		why = "fire mode for a non-magazined weapon";
+		return false;
+	}
+	const bool weapon_fields = d.has_main || d.has_launcher || d.has_addons || d.has_scope || d.has_cartridges;
 	if (weapon_fields && !smart_cast<CSE_ALifeItemWeapon*>(e))
 	{
 		why = "weapon state for a non-weapon";
@@ -1281,6 +1398,20 @@ bool host_validate_counts(CSE_Abstract* e, CInventoryItem* item, const ItemData&
 	{
 		why = "more rounds than the launcher holds";
 		return false;
+	}
+	if (d.has_cartridges)
+	{
+		if (!d.has_main || d.cartridges.size() != d.main_count)
+		{
+			why = "cartridge order does not match the magazine";
+			return false;
+		}
+		for (u8 type : d.cartridges)
+			if (type >= c.main_types)
+			{
+				why = "unknown cartridge type";
+				return false;
+			}
 	}
 	return true;
 }
@@ -1357,6 +1488,7 @@ void host_release_box(u16 id, CSE_Abstract* e)
 
 void host_on_state(PeerId from, Reader& r)
 {
+	drain_forgotten();
 	const u16 id = r.u16();
 	const std::string section = r.str();
 	r.u8(); // flags: only the host sets them
@@ -1785,10 +1917,13 @@ void reset()
 {
 	{
 		std::lock_guard<std::mutex> lock(g_lock);
+		g_spawn_states.clear();
 		g_touched.clear();
 		g_spawns.clear();
 		g_scan_now = false;
 		g_made_here.clear();
+		g_forgotten.clear();
+		g_clear_pending.clear();
 	}
 	g_sent.clear();
 	g_pending.clear();
@@ -1810,6 +1945,7 @@ void reset()
 
 void frame()
 {
+	drain_forgotten();
 	xr_vector<u16> touched;
 	xr_vector<SpawnReq> spawns;
 	bool scan_now = false;
@@ -2011,11 +2147,154 @@ void set_weapon_fired_handler(WeaponFiredFn fn) { g_fired = fn; }
 bool capture_spawn_state(CSE_Abstract* entity, std::vector<u8>& blob)
 {
 	blob.clear();
+	if (entity)
+	{
+		std::lock_guard<std::mutex> lock(g_lock);
+		if (std::any_of(g_spawns.begin(), g_spawns.end(), [entity](const SpawnReq& spawn) { return spawn.weapon == entity->ID; }))
+			return false; // an earlier unload must reach the host under this source instance first
+		const auto pending = g_spawn_states.find(entity->ID);
+		if (pending != g_spawn_states.end())
+		{
+			blob = pending->second;
+			return true;
+		}
+	}
 	ItemData d;
 	if (!entity || !capture_entity(entity, d))
 		return false;
+	// In grenade mode an offline CSE has no rifle count/type. Refuse an incomplete replacement snapshot.
+	if (smart_cast<CSE_ALifeItemWeaponMagazinedWGL*>(entity) && !d.has_main)
+		return false;
+	CWeapon* weapon = smart_cast<CWeapon*>(find_item(entity->ID));
+	if (weapon)
+	{
+		capture_object(weapon, d);
+		if (CSE_ALifeInventoryItem* server = smart_cast<CSE_ALifeInventoryItem*>(entity))
+			d.upgrades = server->m_upgrades;
+		if (CWeaponMagazined* magazined = smart_cast<CWeaponMagazined*>(weapon))
+		{
+			d.has_fire_mode = true;
+			d.fire_mode = u8(magazined->GetFireModeIndex());
+		}
+		CWeaponMagazinedWGrenade* launcher = smart_cast<CWeaponMagazinedWGrenade*>(weapon);
+		const auto& magazine = launcher && launcher->m_bGrenadeMode ? launcher->m_magazine2 : weapon->m_magazine;
+		d.has_cartridges = true;
+		for (const CCartridge& cartridge : magazine)
+			d.cartridges.push_back(cartridge.m_LocalAmmoType);
+	}
+	else
+	{
+		if (CSE_ALifeItemWeaponMagazined* magazined = smart_cast<CSE_ALifeItemWeaponMagazined*>(entity))
+		{
+			d.has_fire_mode = true;
+			d.fire_mode = magazined->m_u8CurFireMode;
+		}
+		if (CSE_ALifeItemWeaponShotGun* shotgun = smart_cast<CSE_ALifeItemWeaponShotGun*>(entity))
+			if (shotgun->m_AmmoIDs.size() == d.main_count)
+			{
+				d.has_cartridges = true;
+				d.cartridges.assign(shotgun->m_AmmoIDs.begin(), shotgun->m_AmmoIDs.end());
+			}
+	}
 	write_data(d, blob);
 	return true;
+}
+
+bool replacement_state(CSE_Abstract* source, const u8* data, size_t size, std::vector<u8>& out)
+{
+	ItemData d;
+	CSE_ALifeInventoryItem* item = smart_cast<CSE_ALifeInventoryItem*>(source);
+	if (!item || !read_data(data, size, d))
+		return false;
+	d.has_upgrades = true;
+	d.upgrades = item->m_upgrades;
+	write_data(d, out);
+	return true;
+}
+
+void stage_spawn_state(u16 id, const std::vector<u8>& blob)
+{
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_spawn_states[id] = blob;
+}
+
+void discard_spawn_state(u16 id)
+{
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_spawn_states.erase(id);
+}
+
+void forget_item(u16 id)
+{
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_spawn_states.erase(id);
+	g_touched.erase(std::remove(g_touched.begin(), g_touched.end(), id), g_touched.end());
+	g_made_here.erase(std::remove(g_made_here.begin(), g_made_here.end(), id), g_made_here.end());
+	g_spawns.erase(std::remove_if(g_spawns.begin(), g_spawns.end(),
+	    [id](const SpawnReq& spawn) { return spawn.weapon == id || spawn.parent == id; }), g_spawns.end());
+	g_forgotten.push_back(id); // owner/host tracking belongs to the main thread
+}
+
+void prepare_clone_state(u16 source, u16 target)
+{
+	forget_item(target);
+	std::lock_guard<std::mutex> lock(g_lock);
+	g_clear_pending.push_back(source);
+}
+
+void restore_item_state(CSE_Abstract* entity, const std::vector<u8>& blob, CInventoryItem* object)
+{
+	ItemData d;
+	if (!entity || !read_data(blob.data(), blob.size(), d))
+		return;
+	CInventoryItem* item = object ? object : find_item(entity->ID);
+	if (!item)
+		stage_spawn_state(entity->ID, blob); // an offline mirror consumes the complete state when it comes online
+	if (item)
+	{
+		apply_object(item, d, false);
+		CWeaponMagazinedWGrenade* weapon = smart_cast<CWeaponMagazinedWGrenade*>(item);
+		CWeapon* gun = smart_cast<CWeapon*>(item);
+		if (gun && d.has_cartridges)
+		{
+			auto& magazine = weapon && weapon->m_bGrenadeMode ? weapon->m_magazine2 : gun->m_magazine;
+			const auto& types = weapon && weapon->m_bGrenadeMode ? weapon->m_ammoTypes2 : gun->m_ammoTypes;
+			if (magazine.size() == d.cartridges.size())
+				for (size_t i = 0; i < magazine.size(); ++i)
+					if (d.cartridges[i] < types.size())
+						magazine[i].Load(types[d.cartridges[i]].c_str(), d.cartridges[i], gun->m_APk);
+		}
+		if (CWeaponMagazined* magazined = smart_cast<CWeaponMagazined*>(item))
+			if (d.has_fire_mode)
+				magazined->SetFireMode(d.fire_mode);
+		if (weapon && d.has_mode && weapon->m_bGrenadeMode != d.grenade_mode && weapon->IsGrenadeLauncherAttached())
+			weapon->PerformSwitchGL();
+		if (CSE_ALifeItemWeaponMagazinedWGL* server = smart_cast<CSE_ALifeItemWeaponMagazinedWGL*>(entity))
+			if (weapon)
+				server->m_bGrenadeMode = weapon->m_bGrenadeMode;
+	}
+	apply_entity(entity, d, false);
+}
+
+void restore_spawn_state(CWeapon* weapon, CSE_Abstract* entity, bool launcher_ready)
+{
+	if (!weapon || (!launcher_ready && smart_cast<CWeaponMagazinedWGrenade*>(weapon)))
+		return;
+	Blob blob;
+	{
+		std::lock_guard<std::mutex> lock(g_lock);
+		const auto it = g_spawn_states.find(entity->ID);
+		if (it == g_spawn_states.end())
+			return;
+		blob = it->second;
+		g_spawn_states.erase(it);
+	}
+	restore_item_state(entity, blob, weapon);
+}
+
+bool client_pending(CWeapon* weapon)
+{
+	return weapon && is_live_mirror() && requests::client_lease_waiting(weapon->ID());
 }
 
 // R3 В6: the checks of host_on_state for an entity the host is about to create from its own section.

@@ -25,8 +25,10 @@
 #include "xrCoop/coop_id_lease.h" // F2 T12b
 #include "xrCoop/coop_local_zones.h" // personal map zones
 #include "xrCoop/coop_clone_slot.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
+#include "xrCoop/coop_replacement.h"
 
 #include <cstring>
+#include <algorithm>
 
 #include "Level.h"
 #include "Actor.h"
@@ -37,6 +39,7 @@
 #include "InventoryOwner.h"
 #include "Inventory.h" // live 2026-11-08: a clone takes its old weapon's slot
 #include "inventory_item.h"
+#include "WeaponMagazined.h"
 #include "InventoryBox.h" // Ruling F2-32: box locks
 #include "Hit.h"
 #include "xrServer.h"
@@ -385,6 +388,46 @@ lease::ClientPool g_pool; // ids reserved in our generator, ready for a create
 lease::SpecBook g_specs; // our creates the host has not answered yet
 cloneslot::Book g_clone_slots; // live 2026-11-08: the slots our clones take (their old weapons' ones); under g_out_lock
 xr_map<u16, Action> g_spec_actions; // the request of each of them, sent again after RateLimited
+xr_map<u16, replacement::Snapshot> g_clone_prepared;
+xr_map<std::pair<PeerId, u16>, std::vector<u8>> g_clone_committed;
+xr_set<u16> g_clone_confirmed, g_clone_canonical;
+u64 g_clone_nonce = 0;
+u32 g_clone_world = 0;
+void rollback_leased(u16 id, const char* why);
+
+lua_State* clone_function(const char* name, int& top)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L)
+		return nullptr;
+	top = lua_gettop(L);
+	lua_getglobal(L, "coop_economy_mdata");
+	if (lua_istable(L, -1))
+		lua_getfield(L, -1, name);
+	if (!lua_isfunction(L, -1))
+	{
+		lua_settop(L, top);
+		return nullptr;
+	}
+	return L;
+}
+
+bool clone_return(lua_State* L, int top, int args, std::string* text = nullptr)
+{
+	bool ok = lua_pcall(L, args, 1, 0) == 0;
+	if (ok && text)
+	{
+		size_t size = 0;
+		const char* bytes = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &size) : nullptr;
+		ok = bytes && size && size <= kMaxItemState;
+		if (ok)
+			text->assign(bytes, size);
+	}
+	else if (ok)
+		ok = lua_toboolean(L, -1) != 0;
+	lua_settop(L, top);
+	return ok;
+}
 struct LeasedTemp
 {
 	u16 id = kNoId;
@@ -515,6 +558,16 @@ void send_action(const Action& a)
 	{
 	case Act::Spawn:
 	{
+		if (a.flags & 0x80) // local rider activation failed after the speculative spawn
+		{
+			{
+				xrCriticalSectionGuard guard(g_out_lock);
+				g_specs.forget(a.lease);
+				g_spec_actions.erase(a.lease);
+			}
+			rollback_leased(a.lease, "replacement rider activation failed");
+			return;
+		}
 		const u32 seq = track(Msg::ReqSpawn, a.item);
 		Writer w(a.bytes.size() + a.section.size() + 32);
 		const float p[3] = {a.pos.x, a.pos.y, a.pos.z};
@@ -828,6 +881,9 @@ void lease_sync_world_locked()
 	g_zones.clear(); // their objects went with the old world's ALife
 	g_specs.clear();
 	g_clone_slots.clear();
+	g_clone_prepared.clear();
+	g_clone_confirmed.clear();
+	g_clone_canonical.clear();
 	g_spec_actions.clear();
 	g_give_back.clear();
 	g_give_back_wait.clear();
@@ -944,7 +1000,9 @@ void clone_slots_frame(u64 now)
 	}
 	CActor* actor = smart_cast<CActor*>(Level().Objects.net_Find(kActor));
 	CInventoryItem* item = smart_cast<CInventoryItem*>(Level().Objects.net_Find(source));
-	if (actor && item && item->m_pInventory == &actor->inventory())
+	if (!actor || !item)
+		return; // the source's game object may still be returning online
+	if (item->m_pInventory == &actor->inventory())
 	{
 		CInventory& inv = actor->inventory();
 		if (slot > inv.LastSlot() || inv.ItemFromSlot(slot))
@@ -982,7 +1040,16 @@ bool create_leased(CSE_Abstract* e, u16 id, u16 source)
 	a.lease = id;
 	a.source = source;
 	std::vector<u8> state;
-	if (items::capture_spawn_state(e, state)) // the state the script gave it, before our world touches it
+	if (source != kNoId)
+	{
+		const auto prepared = g_clone_prepared.find(id);
+		if (prepared == g_clone_prepared.end() || !before_clone_register(e) ||
+		    !replacement::encode(prepared->second, state))
+			return false;
+	}
+	else
+		items::capture_spawn_state(e, state);
+	if (!state.empty())
 		a.bytes.assign(state.begin(), state.end());
 	if (source != kNoId)
 	{
@@ -1001,6 +1068,8 @@ bool create_leased(CSE_Abstract* e, u16 id, u16 source)
 		alife_rw().register_object(d, true);
 		bring_online_in_holder(d);
 	}
+	if (source != kNoId && !clone_activate(id))
+		a.flags |= 0x80; // rollback after the Lua clone wrapper has finished its source clear
 	xrCriticalSectionGuard guard(g_out_lock);
 	g_specs.add(id, source);
 	g_spec_actions[id] = a;
@@ -1076,6 +1145,7 @@ void return_unused_lease(u16 id)
 // destroyed item, its entity kept a while (the quarantine) - and the id goes back to the host once it is gone here.
 void rollback_leased(u16 id, const char* why)
 {
+	after_clone_register(id, false);
 	++g_lc.rolled_back;
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
@@ -1158,10 +1228,12 @@ void client_pump_leases()
 		}
 		for (auto it = g_give_back_wait.begin(); it != g_give_back_wait.end();)
 		{
-			if (ai().alife().objects().object(*it, true) || Level().Server->ID_to_entity(*it))
+			if (ai().alife().objects().object(*it, true) || Level().Server->ID_to_entity(*it) ||
+			    Level().Objects.net_Find(*it))
 				++it; // its destroy has not run yet
 			else
 			{
+				g_clone_slots.removed(*it, now);
 				g_give_back.push_back(*it);
 				it = g_give_back_wait.erase(it);
 			}
@@ -1262,6 +1334,7 @@ void client_on_result(PeerId, Reader& r)
 			g_spec_actions.erase(leased);
 		if (outcome == lease::Outcome::Confirmed)
 		{
+			g_clone_slots.confirmed(leased);
 			// round 1 (review C1): what waited for the item goes out first with the next flush, in its order (an action
 			// that names another pending item waits again there)
 			std::vector<Action> back = g_held.release(leased);
@@ -1276,6 +1349,7 @@ void client_on_result(PeerId, Reader& r)
 	{
 	case lease::Outcome::Confirmed:
 		++g_lc.confirmed;
+		after_clone_register(leased, true);
 		items::client_resend_state(leased); // what changed on it while the host had not made it yet
 		break;
 	case lease::Outcome::Retry: ++g_lc.retried; break;
@@ -1912,11 +1986,16 @@ Reason host_destroy(const Req& q, u16 item);
 // Round 1 (review I1): the state a clone is built with - the host's own source, captured as the client's lua_clone
 // copies it (condition, upgrades, addons, magazine), checked like a client's blob (host_apply_spawn_state). Empty when
 // there is no source.
-void clone_state(u16 source, std::vector<u8>& out)
+bool clone_state(u16 source, u16 target, const u8* data, size_t size, std::vector<u8>& out)
 {
 	out.clear();
-	if (source != kNoId)
-		items::capture_spawn_state(events::find_entity(source), out);
+	if (source == kNoId)
+		return true;
+	replacement::Snapshot snapshot;
+	CSE_Abstract* original = events::find_entity(source);
+	return original && replacement::decode(data, size, snapshot) && snapshot.source == source && snapshot.target == target &&
+	    snapshot.source_name == original->name_replace() && !snapshot.native.empty() &&
+	    items::replacement_state(original, snapshot.native.data(), snapshot.native.size(), out);
 }
 
 // The leased create is made (`created` is `id`): the id is the world's now. A clone's source goes with it.
@@ -1929,10 +2008,6 @@ void host_leased_made(const Req& q, u16 id, u16 created, u16 source)
 	if (source == kNoId)
 		return;
 	++g_hl.clones;
-	const Reason gone = host_destroy(q, source);
-	if (gone != Reason::Ok && log_allowed())
-		::Msg("! [coop] the clone %u of player #%u is made, its source %u stays: %s", created, q.from, source,
-		    reason_name(gone));
 }
 
 // Who would hold a client's new item: checked before anything is constructed (R3 В6 review).
@@ -2016,6 +2091,63 @@ Reason host_spawn(CSE_Abstract* e, u16 parent, u16& created, u16 leased = kNoId)
 		++g_h.spawns_local;
 	}
 	return Reason::Ok;
+}
+
+Reason host_replace(const Req& q, CSE_Abstract* entity, u16 parent, u16& created, u16 target, u16 source,
+    const u8* bytes, size_t size)
+{
+	if (source == kNoId)
+		return host_spawn(entity, parent, created, target);
+	replacement::Snapshot snapshot;
+	std::vector<u8> native;
+	if (!replacement::decode(bytes, size, snapshot) || !clone_state(source, target, bytes, size, native))
+	{
+		F_entity_Destroy(entity);
+		return Reason::Malformed;
+	}
+	entity->ID = target;
+	name_with_id(entity);
+	if (!clone_stage(source, target, entity->name_replace(), snapshot.metadata, 1, replacement::token(snapshot)))
+	{
+		F_entity_Destroy(entity);
+		return Reason::NotAllowed;
+	}
+	items::stage_spawn_state(target, native);
+	Writer initial;
+	if (!write_clone_initial(initial, entity))
+	{
+		clone_finish(target, false);
+		items::discard_spawn_state(target);
+		F_entity_Destroy(entity);
+		return Reason::Malformed;
+	}
+	Reason result = host_spawn(entity, parent, created, target);
+	if (result == Reason::Ok && !clone_activate(target))
+		result = Reason::Engine;
+	Writer final_initial;
+	if (result == Reason::Ok && !write_clone_initial(final_initial, events::find_entity(created)))
+		result = Reason::Malformed;
+	if (result == Reason::Ok)
+		result = host_destroy(q, source);
+	if (result != Reason::Ok)
+	{
+		if (created != kNoId)
+			host_destroy(q, created);
+		clone_finish(target, false);
+		items::discard_spawn_state(target);
+		items::restore_item_state(events::find_entity(source), native);
+		return result;
+	}
+	clone_finish(target, true);
+	g_clone_committed[{q.from, target}] = std::vector<u8>(bytes, bytes + size);
+	return Reason::Ok;
+}
+
+bool clone_committed(PeerId peer, u16 target, const u8* bytes, size_t size)
+{
+	const auto it = g_clone_committed.find({peer, target});
+	return it != g_clone_committed.end() && it->second.size() == size &&
+	    std::equal(it->second.begin(), it->second.end(), bytes);
 }
 
 // Review round 2, Important 1: the item `parent` (one of the asker's, not his character) takes the new entity: the host
@@ -2168,7 +2300,8 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 	Reason why = Reason::Ok;
 	// round 1 (review I1): a clone from the host's source as it is now, never from the client's blob
 	std::vector<u8> source_state;
-	clone_state(r.source, source_state);
+	if (!clone_state(r.source, r.id, r.state.data(), r.state.size(), source_state))
+		return refuse(Reason::Offline);
 	const spawn::StateRef state = spawn::spawn_state(r.source, r.state.data(), r.state.size(), source_state);
 	CSE_Abstract* e = build_spawn(q, r.parent, section, r.pos, state.data, state.size, why);
 	if (!e)
@@ -2179,7 +2312,7 @@ spawn::Turn create_queued(const std::string& key, spawn::QueuedRequest& r)
 		return refuse(Reason::NotAllowed); // F2 T12b: a clone is a magazined weapon
 	}
 	u16 created = kNoId;
-	why = host_spawn(e, r.parent, created, r.id); // consumes the entity
+	why = host_replace(q, e, r.parent, created, r.id, r.source, r.state.data(), r.state.size());
 	if (why != Reason::Ok)
 		return refuse(why);
 	if (r.id != kNoId)
@@ -2226,6 +2359,16 @@ void host_on_spawn(PeerId from, Reader& r)
 	spawn::Request s;
 	if (!spawn::read_body(r, layout, s))
 		return reply(q, Reason::Malformed, kNoId);
+	if (g_clone_world != join::world_generation())
+	{
+		g_clone_committed.clear();
+		g_clone_world = join::world_generation();
+	}
+	if (s.source != kNoId)
+	{
+		if (clone_committed(from, s.id, s.state, s.state_size))
+			return reply(q, Reason::Ok, s.id);
+	}
 	if (!validate::finite3(s.pos))
 	{
 		if (note_bad(BadNumber))
@@ -2264,7 +2407,8 @@ void host_on_spawn(PeerId from, Reader& r)
 		// F2 T12b round 1 (review I1): a clone is built from the host's own source (as lua_clone copies it on the
 		// client), whatever the client's blob says; the budget pays only the price difference
 		std::vector<u8> source_state;
-		clone_state(s.source, source_state);
+		if (!clone_state(s.source, s.id, s.state, s.state_size, source_state))
+			return reply(q, Reason::Offline, s.parent);
 		const spawn::StateRef state = spawn::spawn_state(s.source, s.state, s.state_size, source_state);
 		e = build_spawn(q, s.parent, section, s.pos, state.data, state.size, why);
 		if (!e)
@@ -2325,7 +2469,7 @@ void host_on_spawn(PeerId from, Reader& r)
 	g_spawn_quest_gifts += gift ? 1 : 0;
 	// Allow needs a rule and no missing line: `e` was built above.
 	u16 created = kNoId;
-	const Reason why = host_spawn(e, s.parent, created, s.id);
+	const Reason why = host_replace(q, e, s.parent, created, s.id, s.source, s.state, s.state_size);
 	if (why != Reason::Ok && !spawn::budget_free(facts))
 		spawn::refund(budget, facts.cost, g_spawn_policy); // Ruling F2-21 (3): the engine refused what was charged
 	if (why == Reason::Ok && s.id != kNoId)
@@ -3101,6 +3245,214 @@ void host_on_launch(PeerId from, Reader& r)
 }
 } // namespace
 
+bool clone_export(u16 source, std::string& metadata, const char* stamp)
+{
+	metadata.clear();
+	int top = 0;
+	lua_State* L = clone_function("clone_export", top);
+	if (!L)
+		return false;
+	lua_pushnumber(L, source);
+	if (stamp)
+		lua_pushstring(L, stamp);
+	return clone_return(L, top, stamp ? 2 : 1, &metadata);
+}
+
+bool clone_stage(u16 source, u16 target, const char* name, const std::string& metadata, int trust, const std::string& token)
+{
+	int top = 0;
+	lua_State* L = clone_function("clone_stage", top);
+	if (!L)
+		return false;
+	lua_pushnumber(L, source);
+	lua_pushnumber(L, target);
+	lua_pushstring(L, name);
+	lua_pushlstring(L, metadata.data(), metadata.size());
+	lua_pushnumber(L, trust);
+	lua_pushlstring(L, token.data(), token.size());
+	return clone_return(L, top, 6);
+}
+
+bool clone_activate(u16 target)
+{
+	int top = 0;
+	lua_State* L = clone_function("clone_activate", top);
+	if (!L)
+		return false;
+	lua_pushnumber(L, target);
+	return clone_return(L, top, 1);
+}
+
+bool clone_finish(u16 target, bool accepted)
+{
+	int top = 0;
+	lua_State* L = clone_function("clone_finish", top);
+	if (!L)
+		return false;
+	lua_pushnumber(L, target);
+	lua_pushboolean(L, accepted);
+	return clone_return(L, top, 2);
+}
+
+bool prepare_local_clone(CSE_Abstract* source, CSE_Abstract* target)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!source || !target || target->ID == kNoId)
+		return false;
+	replacement::Snapshot snapshot;
+	snapshot.source = join::to_host(source->ID);
+	snapshot.target = join::to_host(target->ID);
+	snapshot.source_name = source->name_replace() ? source->name_replace() : "";
+	snapshot.nonce = (mgr().now_ms() << 16) ^ ++g_clone_nonce;
+	std::vector<u8> encoded;
+	if (!items::capture_spawn_state(source, snapshot.native))
+		return false;
+	if (mgr().active() && (!clone_export(source->ID, snapshot.metadata) || !replacement::encode(snapshot, encoded)))
+		return false;
+	const char* why = nullptr;
+	if (!items::host_apply_spawn_state(target, snapshot.native.data(), snapshot.native.size(), why) ||
+	    (!snapshot.metadata.empty() &&
+	        !clone_stage(source->ID, target->ID, target->name_replace(), snapshot.metadata, 0, replacement::token(snapshot))))
+		return false;
+	items::prepare_clone_state(source->ID, target->ID);
+	items::stage_spawn_state(target->ID, snapshot.native);
+	Writer initial;
+	if (!snapshot.metadata.empty() && !write_clone_initial(initial, target))
+	{
+		clone_finish(target->ID, false);
+		items::discard_spawn_state(target->ID);
+		return false;
+	}
+	g_clone_prepared[target->ID] = std::move(snapshot);
+	if (CWeaponMagazined* weapon = smart_cast<CWeaponMagazined*>(find_go(source->ID)))
+		weapon->FireEnd();
+	return true;
+}
+
+bool before_clone_register(CSE_Abstract* target)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	const auto it = target ? g_clone_prepared.find(target->ID) : g_clone_prepared.end();
+	if (it == g_clone_prepared.end())
+		return true; // an ordinary create
+	const auto& snapshot = it->second;
+	if (!snapshot.metadata.empty() && !clone_stage(join::to_local(snapshot.source), target->ID, target->name_replace(), snapshot.metadata, 0,
+	        replacement::token(snapshot)))
+		return false;
+	items::stage_spawn_state(target->ID, snapshot.native);
+	return true;
+}
+
+bool after_clone_register(u16 target, bool accepted)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	const auto it = g_clone_prepared.find(target);
+	if (it == g_clone_prepared.end())
+		return accepted;
+	if (accepted && is_live_mirror() && !it->second.metadata.empty() && !g_clone_canonical.count(target))
+	{
+		g_clone_confirmed.insert(target);
+		return true; // EntitySpawn is queued by registration and can follow ReqResult. Keep the item fenced until both.
+	}
+	accepted = accepted && (it->second.metadata.empty() || clone_activate(target));
+	if (!accepted)
+		items::restore_item_state(events::find_entity(join::to_local(it->second.source)), it->second.native);
+	if (!it->second.metadata.empty())
+		clone_finish(target, accepted);
+	if (!accepted)
+		items::forget_item(target);
+	g_clone_prepared.erase(it);
+	g_clone_confirmed.erase(target);
+	g_clone_canonical.erase(target);
+	return accepted;
+}
+
+bool cancel_unregistered_clone(CSE_Abstract* object)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!object || !g_clone_prepared.count(object->ID) || events::find_entity(object->ID))
+		return false;
+	after_clone_register(object->ID, false);
+	return true;
+}
+
+bool write_clone_initial(Writer& w, CSE_Abstract* entity)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!smart_cast<CSE_ALifeItemWeaponMagazined*>(entity))
+	{
+		w.varu(0);
+		return true;
+	}
+	replacement::Snapshot snapshot;
+	snapshot.target = join::to_host(entity->ID);
+	snapshot.nonce = (mgr().now_ms() << 16) ^ ++g_clone_nonce;
+	snapshot.source_name = entity->name_replace() ? entity->name_replace() : "";
+	const std::string stamp = replacement::token(snapshot);
+	if (!clone_export(entity->ID, snapshot.metadata, stamp.c_str()))
+		return false;
+	items::capture_spawn_state(entity, snapshot.native); // an offline GL may have only its native save payload
+	std::vector<u8> bytes;
+	if (!replacement::encode(snapshot, bytes))
+		return false;
+	w.varu(bytes.size());
+	w.bytes(bytes.data(), bytes.size());
+	return true;
+}
+
+bool read_clone_initial(Reader& r, u16 target, std::vector<u8>& initial)
+{
+	initial.clear();
+	const u64 size = r.varu();
+	if (!r.ok() || size > kMaxItemState || size > r.remaining())
+		return false;
+	if (!size)
+		return true;
+	replacement::Snapshot snapshot;
+	if (!replacement::decode(r.cursor(), size_t(size), snapshot) || snapshot.target != join::to_host(target))
+		return false;
+	initial.assign(r.cursor(), r.cursor() + size_t(size));
+	return r.skip(size_t(size));
+}
+
+bool stage_clone_initial(CSE_Abstract* entity, const std::vector<u8>& initial, bool existing)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!entity)
+		return false;
+	if (initial.empty())
+		return !smart_cast<CSE_ALifeItemWeaponMagazined*>(entity);
+	replacement::Snapshot snapshot;
+	if (!replacement::decode(initial.data(), initial.size(), snapshot) || snapshot.source_name != entity->name_replace())
+		return false;
+	if (existing && !g_clone_prepared.count(entity->ID))
+	{
+		int top = 0;
+		lua_State* L = clone_function("clone_adopt", top);
+		if (!L)
+			return false;
+		lua_pushnumber(L, entity->ID);
+		lua_pushlstring(L, snapshot.metadata.data(), snapshot.metadata.size());
+		return clone_return(L, top, 2);
+	}
+	if (!clone_stage(kNoId, entity->ID, entity->name_replace(), snapshot.metadata, 2, replacement::token(snapshot)))
+		return false;
+	if (!snapshot.native.empty())
+	{
+		if (existing)
+			items::restore_item_state(entity, snapshot.native);
+		else
+			items::stage_spawn_state(entity->ID, snapshot.native);
+	}
+	if (existing && g_clone_prepared.count(entity->ID))
+	{
+		g_clone_canonical.insert(entity->ID);
+		if (g_clone_confirmed.count(entity->ID))
+			return after_clone_register(entity->ID, true);
+	}
+	return true;
+}
+
 void client_keeps_world(u32 epoch)
 {
 	g_lease_epoch_was = mgr().session().world_epoch();
@@ -3193,6 +3545,11 @@ void reset()
 		xrCriticalSectionGuard guard(g_out_lock);
 		g_pool.clear();
 		g_specs.clear();
+		g_clone_slots.clear();
+		g_clone_prepared.clear();
+		g_clone_committed.clear();
+		g_clone_confirmed.clear();
+		g_clone_canonical.clear();
 		g_spec_actions.clear();
 		g_temp_leases.clear(); // their objects went with g_lua_temps
 		g_give_back.clear();
@@ -3404,6 +3761,8 @@ bool client_forward_spawn(CSE_Abstract* e)
 
 void client_destroy(u16 local_item, bool use)
 {
+	if (client_lease_waiting(local_item))
+		return;
 	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
@@ -3417,6 +3776,8 @@ void client_destroy(u16 local_item, bool use)
 
 void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 {
+	if (client_lease_waiting(local_item))
+		return;
 	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
@@ -3500,6 +3861,8 @@ void client_flush_outbox()
 
 void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)
 {
+	if (client_lease_waiting(local_item))
+		return;
 	if (!is_live_mirror() || size > 512)
 		return;
 	Action a;
@@ -3525,6 +3888,8 @@ void client_player_died(u16 local_killer)
 
 bool client_launch(u16 local_launcher, u16 local_rocket)
 {
+	if (client_lease_waiting(local_launcher))
+		return true;
 	if (!is_live_mirror())
 	{
 		++g_cl.not_live;
@@ -3625,12 +3990,16 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 		++g_lc.not_variant;
 		return lua_refuse("alife:clone_weapon", "not a variant of its weapon (scope, magnifier, upgrade kit)");
 	}
+	const u16 id = callgate::is_own(from->ID) ? take_lease(section, parent) : kNoId;
+	if (id == kNoId)
+		return lua_refuse("alife:clone_weapon", "no leased id for a complete replacement");
 	CSE_Abstract* e = make_temp(section, pos, level_vertex, game_vertex, parent);
 	CSE_ALifeItemWeaponMagazined* clone = smart_cast<CSE_ALifeItemWeaponMagazined*>(e);
 	if (!clone)
 	{
 		if (e)
 			F_entity_Destroy(e);
+		return_unused_lease(id);
 		return nullptr;
 	}
 	clone->wpn_flags = from->wpn_flags;
@@ -3639,8 +4008,16 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	clone->ammo_type = from->ammo_type;
 	clone->m_upgrades = from->m_upgrades;
 	clone->set_ammo_elapsed(from->get_ammo_elapsed());
+	e->ID = id;
+	name_with_id(e);
+	if (!prepare_local_clone(from, e))
+	{
+		e->ID = kNoId;
+		F_entity_Destroy(e);
+		return_unused_lease(id);
+		return lua_refuse("alife:clone_weapon", "incomplete, oversized or incompatible replacement snapshot");
+	}
 	// F2 T12b: a clone of our own weapon into our actor takes a leased id; the host releases the source with it
-	const u16 id = callgate::is_own(from->ID) ? take_lease(section, parent) : kNoId;
 	if (!register_now)
 	{
 		g_lua_temps.push_back(e);
@@ -3660,7 +4037,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 			return e;
 		return_unused_lease(id); // round 1 (review M1)
 	}
-	lua_forward(e, "alife:clone_weapon");
+	after_clone_register(id, false);
 	F_entity_Destroy(e);
 	return nullptr;
 }
@@ -3683,6 +4060,7 @@ CSE_Abstract* lua_register_spawn(CSE_Abstract* object)
 			return object;
 		}
 		object->ID = kNoId;
+		after_clone_register(leased.id, false);
 		return_unused_lease(leased.id); // round 1 (review M1)
 		if (leased.source != kNoId)
 		{
@@ -3709,6 +4087,7 @@ bool lua_release(CSE_Abstract* object)
 		LeasedTemp leased;
 		if (take_temp_lease(object, leased))
 		{
+			after_clone_register(leased.id, false);
 			object->ID = kNoId;
 			xrCriticalSectionGuard guard(g_out_lock);
 			g_pool.put_back(leased.id);
@@ -3772,7 +4151,18 @@ bool clone_spawn_slot(u16 id, u16& slot)
 	return slot != cloneslot::kNone;
 }
 
-bool client_lease_waiting(u16 id) { return lease_waiting(id); }
+bool client_lease_waiting(u16 id)
+{
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (std::find(g_give_back_wait.begin(), g_give_back_wait.end(), id) != g_give_back_wait.end())
+		return true; // a refused speculative object is still being removed here
+	if (g_clone_prepared.count(id))
+		return true;
+	for (const auto& clone : g_clone_prepared)
+		if (join::to_local(clone.second.source) == id)
+			return true;
+	return lease_waiting(id);
+}
 
 int lua_lease_waiting(lua_State* L)
 {
@@ -3781,7 +4171,7 @@ int lua_lease_waiting(lua_State* L)
 	{
 		const lua_Number id = lua_tonumber(L, 1);
 		if (id >= 0 && id < lua_Number(kNoId))
-			waiting = lease_waiting(u16(id));
+			waiting = client_lease_waiting(u16(id));
 	}
 	lua_pushboolean(L, waiting ? 1 : 0);
 	return 1;

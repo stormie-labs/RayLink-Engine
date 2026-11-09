@@ -241,6 +241,8 @@ bool CWeaponShotgun::HaveCartridgeInInventory(u8 cnt)
 
 u8 CWeaponShotgun::AddCartridge(u8 cnt)
 {
+	if (coop::items::client_pending(this))
+		return cnt;
 	if (IsMisfire()) bMisfire = false;
 
 	if (m_set_next_ammoType_on_reload != undefined_ammo_type)

@@ -162,6 +162,18 @@ int lua_lease_ids(lua_State* L);
 int lua_lease_waiting(lua_State* L);
 // True while item `id` (local numbering) waits for the host: the roster does not call it extra.
 bool client_lease_waiting(u16 id);
+// Replacement metadata is staged synchronously before registration on every process.
+bool clone_export(u16 source, std::string& metadata, const char* stamp = nullptr);
+bool clone_stage(u16 source, u16 target, const char* name, const std::string& metadata, int trust, const std::string& token);
+bool clone_activate(u16 target);
+bool clone_finish(u16 target, bool accepted);
+bool prepare_local_clone(CSE_Abstract* source, CSE_Abstract* target);
+bool before_clone_register(CSE_Abstract* target);
+bool after_clone_register(u16 target, bool accepted);
+bool cancel_unregistered_clone(CSE_Abstract* object);
+bool write_clone_initial(Writer& w, CSE_Abstract* entity);
+bool read_clone_initial(Reader& r, u16 target, std::vector<u8>& initial);
+bool stage_clone_initial(CSE_Abstract* entity, const std::vector<u8>& initial, bool existing = false);
 // Live 2026-11-08 (G.A.M.M.A., a scope fitted to the SR-3M in a client's slot went into the backpack): our clone `id` of a
 // weapon spawns in our actor - the slot its old weapon had (xrCoop/coop_clone_slot.h), while that slot is free. False: the
 // engine's own default. CInventoryItem::net_Spawn (coop_equip.cpp on_item_spawn), main thread.

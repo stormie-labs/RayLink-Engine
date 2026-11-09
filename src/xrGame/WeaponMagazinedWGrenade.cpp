@@ -119,6 +119,7 @@ BOOL CWeaponMagazinedWGrenade::net_Spawn(CSE_Abstract* DC)
 			CRocketLauncher::SpawnRocket(*fake_grenade_name, this);
 		}
 	}
+	coop::items::restore_spawn_state(this, DC, true);
 	return l_res;
 }
 
@@ -286,6 +287,8 @@ void CWeaponMagazinedWGrenade::AmmoTypeForEach2(const ::luabind::functor<bool> &
 
 bool CWeaponMagazinedWGrenade::Action(u16 cmd, u32 flags)
 {
+	if (coop::items::client_pending(this))
+		return true;
 	if (m_bGrenadeMode && cmd == kWPN_FIRE)
 	{
 		if (IsPending())
@@ -520,6 +523,8 @@ void CWeaponMagazinedWGrenade::OnMagazineEmpty()
 
 void CWeaponMagazinedWGrenade::ReloadMagazine()
 {
+	if (coop::items::client_pending(this))
+		return;
 	inherited::ReloadMagazine();
 
 	//перезарядка подствольного гранатомета
