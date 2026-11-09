@@ -8,6 +8,7 @@
 #include "coop_autosave.h" // F3
 #include "coop_dedicated.h" // plan 12
 #include "coop_dialog.h" // hud_message_n: the host-silence line
+#include "coop_health_ledger.h" // live 2026-11-09: the own actor's health ledger
 #include "xrCoop/coop_link_hold.h"
 #include "../../xrCore/raylink_version.h" // build_id names the engine build
 
@@ -771,6 +772,7 @@ void Manager::frame()
 	host_silence_step(); // live 2026-10-24: a silent host freezes the client
 	join::frame();
 	sync::frame();
+	health_ledger::frame(); // live 2026-11-09: who lowered the own actor's health (a diagnostic line)
 }
 
 void Manager::print_status() const

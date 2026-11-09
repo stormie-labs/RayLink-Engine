@@ -17,6 +17,7 @@
 #include "coop_monster_fx.h" // audit A5
 #include "coop_items.h" // live report 2026-11-08: the owner's copy before a take
 #include "xrCoop/coop_rules.h"
+#include "xrCoop/coop_object_identity.h" // live RL-UGYE-3WGE: one id, one object on a mirror
 
 #include "Level.h"
 #include "Car.h"
@@ -101,6 +102,15 @@ struct Counters
 	u64 parent_sent = 0, deaths_sent = 0, player_deaths = 0, local_spawn_sent = 0, local_destroy_sent = 0,
 	    launches_relayed = 0, visuals_sent = 0;
 } g_c;
+
+// One id, one object on a mirror (xrCoop/coop_object_identity.h). The game thread; the resync list is read by frame().
+identity::OncePerId g_spawn_once, g_export_once, g_update_once;
+xr_vector<u16> g_update_resync; // local ids whose update did not fit their entity: the host is asked at the next frame
+struct IdentityCounters
+{
+	u64 spawns_stale = 0, spawns_other_kind = 0, spawns_duplicate = 0, exports_unregistered = 0, exports_other_kind = 0,
+	    updates_skipped = 0;
+} g_ic;
 
 u32 g_log_count = 0;
 bool log_allowed() { return ++g_log_count <= kLogBurst || (g_log_count % 100) == 0; }
@@ -667,6 +677,12 @@ void client_step_parents()
 			++g_c.parent_timeouts;
 			::Msg("! [coop] item %u [%s]: could not move it to %u in time", join::to_host(item), entity_name(item),
 			    t.parent == kNoId ? kNoId : join::to_host(t.parent));
+			// RL-UGYE-3WGE: no entity here but a game object under the id - one that outlived its entity. It writes no
+			// update any more (client_export_allowed), and an entity the host sends for the id gets its own object.
+			if (!find_entity(item))
+				if (CGameObject* go = find_go(item))
+					::Msg("! [coop] item %u: a game object [%s] stands here without its entity; it no longer speaks for the id",
+					    join::to_host(item), go->cNameSect().c_str());
 		}
 		else if (s == Step::Fail)
 		{
@@ -1076,6 +1092,22 @@ void install_client(Endpoint& e)
 	e.on(Msg::PlayerDied, &on_player_died);
 }
 
+// RL-UGYE-3WGE: the objects whose update did not fit their entity here, asked for once (the host's word on them).
+static void client_ask_resync()
+{
+	xr_vector<u16> ids;
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		ids.swap(g_update_resync);
+	}
+	for (const u16 id : ids)
+	{
+		Writer w(4);
+		w.u16(join::to_host(id));
+		net::client_send(Msg::StateDumpRequest, w);
+	}
+}
+
 void reset()
 {
 	xrCriticalSectionGuard guard(g_lock);
@@ -1091,6 +1123,10 @@ void reset()
 	g_death_asked.clear();
 	g_log_count = 0;
 	g_vehicle_note = false;
+	g_update_resync.clear();
+	g_spawn_once.reset();
+	g_export_once.reset();
+	g_update_once.reset();
 }
 
 void frame()
@@ -1106,6 +1142,7 @@ void frame()
 	{
 		client_step_parents();
 		client_step_deaths();
+		client_ask_resync();
 		if (g_vehicle_note)
 		{
 			g_vehicle_note = false;
@@ -1141,6 +1178,10 @@ void print_status()
 	::Msg("[coop]   echo dropped: %llu spawns / world-object requests made in reaction to the host's story (R4 4); "
 	      "%llu world messages (parents, deaths, local entities) dropped before live (R2 I2)",
 	    g_c.echo_dropped, g_c.dropped_before_live);
+	::Msg("[coop]   one id, one object: spawns not made %llu stale / %llu of a reused id / %llu duplicate, updates held "
+	      "back %llu unregistered / %llu of another kind, update reads skipped %llu",
+	    g_ic.spawns_stale, g_ic.spawns_other_kind, g_ic.spawns_duplicate, g_ic.exports_unregistered,
+	    g_ic.exports_other_kind, g_ic.updates_skipped);
 }
 
 bool client_filter(NET_Packet& P)
@@ -1326,6 +1367,82 @@ u16 host_last_holder(u16 item)
 	xrCriticalSectionGuard guard(g_lock);
 	auto it = g_last_holder.find(item);
 	return it == g_last_holder.end() ? kNoId : it->second;
+}
+
+// ---------------------------------------------------------------- one id, one object on a mirror (RL-UGYE-3WGE)
+
+bool client_spawn_allowed(const CSE_Abstract* spawn)
+{
+	if (!spawn || spawn->ID == kNoId || !g_pGameLevel || !Level().Server || !join::world_is_mirror())
+		return true;
+	const u16 id = spawn->ID;
+	CSE_Abstract* e = Level().Server->ID_to_entity(id);
+	const CObject* live = Level().Objects.net_Find(id);
+	const bool live_same_kind = live && !live->getDestroy() && live->cNameSect() == spawn->s_name;
+	const identity::Spawn v = identity::spawn_verdict(true, e != nullptr, e && e->s_name == spawn->s_name, live_same_kind);
+	if (v == identity::Spawn::Make)
+		return true;
+	const char* why = "?";
+	switch (v)
+	{
+	case identity::Spawn::Stale:
+		++g_ic.spawns_stale;
+		why = "its entity is gone here (the spawn outlived its destroy)";
+		break;
+	case identity::Spawn::OtherKind:
+		++g_ic.spawns_other_kind;
+		why = "the id belongs to another entity here now";
+		break;
+	case identity::Spawn::Duplicate:
+		++g_ic.spawns_duplicate;
+		why = "a live object of it holds the id already";
+		break;
+	default: break;
+	}
+	if (g_spawn_once.first(id))
+		::Msg("! [coop] game object %u [%s] not made: %s (entity here: [%s])", join::to_host(id), spawn->s_name.c_str(),
+		    why, e ? e->s_name.c_str() : "none");
+	return false;
+}
+
+bool client_export_allowed(CObject* obj)
+{
+	if (!obj || !g_pGameLevel || !Level().Server || !join::world_is_mirror())
+		return true;
+	const u16 id = u16(obj->ID());
+	CSE_Abstract* e = Level().Server->ID_to_entity(id);
+	const identity::Export v = identity::export_verdict(true, Level().Objects.net_Find(id) == obj, e != nullptr,
+	    e && e->s_name == obj->cNameSect());
+	if (v == identity::Export::Send)
+		return true;
+	if (v == identity::Export::NotRegistered)
+		++g_ic.exports_unregistered;
+	else
+		++g_ic.exports_other_kind;
+	if (g_export_once.first(id))
+		::Msg("! [coop] game object %u [%s] writes no update: %s (entity here: [%s])", join::to_host(id),
+		    obj->cNameSect().c_str(),
+		    v == identity::Export::NotRegistered ? "another object is the level's one for its id" :
+		                                           "the entity under its id is of another kind",
+		    e ? e->s_name.c_str() : "none");
+	return false;
+}
+
+bool client_update_mismatch(CSE_Abstract* e, u32 read, u32 size)
+{
+	if (!e || identity::update_verdict(join::world_is_mirror(), read, size) != identity::Update::Skip)
+		return false;
+	++g_ic.updates_skipped;
+	if (g_update_once.first(e->ID))
+	{
+		const CObject* go = g_pGameLevel ? Level().Objects.net_Find(e->ID) : nullptr;
+		::Msg("! [coop] update of %u: its entity [%s] read %u bytes of %u (the level's object here: [%s]); skipped, the "
+		      "host is asked for it",
+		    join::to_host(e->ID), e->s_name.c_str(), read, size, go ? go->cNameSect().c_str() : "none");
+		xrCriticalSectionGuard guard(g_lock);
+		g_update_resync.push_back(e->ID);
+	}
+	return true;
 }
 } // namespace events
 } // namespace coop

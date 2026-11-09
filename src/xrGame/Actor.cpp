@@ -10,6 +10,7 @@
 #include "coop/coop_events.h" // Anomaly Coop
 #include "coop/coop_objects.h" // Anomaly Coop: client_usable_tip
 #include "coop/coop_survival.h" // Anomaly Coop: camera_left_body
+#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the hits in the own actor's health ledger
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -555,6 +556,7 @@ struct playing_pred
 void CActor::Hit(SHit* pHDS)
 {
 	if (coop::events::client_block_actor_hit(this, pHDS)) return; // Anomaly Coop: the host sends it as PlayerHit
+	const coop::health_ledger::HitScope coop_ledger_hit(this, pHDS->damage()); // Anomaly Coop (live 2026-11-09): a diagnostic
 	bool b_initiated = pHDS->aim_bullet; // physics strike by poltergeist
 
 	pHDS->aim_bullet = false;

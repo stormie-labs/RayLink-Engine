@@ -39,6 +39,7 @@
 #include "detail_path_manager.h"
 #include "Inventory.h"
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
+#include "coop/coop_objects.h" // Anomaly Coop: script cycles of world physic objects (levers)
 #include "InventoryOwner.h"
 #include "CharacterPhysicsSupport.h"
 
@@ -149,11 +150,17 @@ void CScriptGameObject::set_item(MonsterSpace::EObjectAction object_action, CScr
 
 void CScriptGameObject::play_cycle(LPCSTR anim, bool mix_in)
 {
+	if (coop::objects::script_cycle_blocked(&object())) // Anomaly Coop: a client's copy of a lever shows the host's cycle
+		return;
 	IKinematicsAnimated* sa = smart_cast<IKinematicsAnimated*>(object().Visual());
 	if (sa)
 	{
 		MotionID m = sa->ID_Cycle(anim);
-		if (m) sa->PlayCycle(m, (BOOL)mix_in);
+		if (m)
+		{
+			sa->PlayCycle(m, (BOOL)mix_in);
+			coop::objects::on_script_cycle(&object(), anim, mix_in); // Anomaly Coop: the host's cycle goes to the players
+		}
 		else
 		{
 			ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "CGameObject : has not cycle %s",

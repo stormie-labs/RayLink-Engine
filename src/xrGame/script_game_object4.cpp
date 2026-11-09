@@ -52,6 +52,7 @@
 #include "BottleItem.h"
 #include "WeaponKnife.h"
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): who changed the own actor's health
 
 class CWeapon;
 
@@ -456,7 +457,9 @@ void CScriptGameObject::SetHealthEx(float hp)
 	if (coop::callgate::client_gate("game_object:set_health_ex", &object()) == coop::calls::Gate::Refuse)
 		return; // Anomaly Coop (F2 T12 round 1 gate): another's creature is the host's
 	clamp(hp, -0.01f, 1.0f);
+	const float coop_was = obj->GetfHealth(); // Anomaly Coop (live 2026-11-09): the health ledger, a diagnostic
 	obj->SetfHealth(hp);
+	coop::health_ledger::script_set(obj, coop_was);
 }
 
 //-AVO

@@ -14,6 +14,7 @@
 #include "coop_money.h"
 #include "coop_ai.h"
 #include "coop_requests.h"
+#include "coop_health_ledger.h" // live 2026-11-09: the co-op's writes of the own actor's health
 #include "xrCoop/coop_checkpoint_store.h"
 #include "xrCoop/coop_revive_hold.h"
 
@@ -662,7 +663,7 @@ void hold_controls(CActor* a)
 	g_hook_owner.store(&c);
 	c.ClearWounds(); // the bleed-out timer is the bleeding: wounds would only shorten it twice
 	if (c.GetHealth() != kDownHealth)
-		c.SetHealth(kDownHealth); // GodMode or no condition update this frame
+		health_ledger::coop_set_health(c, kDownHealth); // GodMode or no condition update this frame
 }
 
 // Build 10: my actor gets its own motions and its aiming twist back (it stands up, the session ends, or its visual has no
@@ -854,7 +855,7 @@ void stand_up(CActor* a, float health, bool fresh, u64 t, bool announce = true)
 		c.ClearWounds();
 		if (fresh)
 			c.SetRadiation(0.f);
-		c.SetHealth(clampr(health, kDownHealth, c.GetMaxHealth()));
+		health_ledger::coop_set_health(c, clampr(health, kDownHealth, c.GetMaxHealth()));
 	}
 	g_me.shield_until = fresh ? t + death::kRespawnShieldMs : 0;
 	release_controls(a);
@@ -2727,7 +2728,7 @@ public:
 			::Msg("! [coop] coop_wound_me: only in a co-op session, in a level");
 			return;
 		}
-		a->conditions().SetHealth(0.f); // the condition hook turns this into the wounded state
+		health_ledger::coop_set_health(a->conditions(), 0.f); // the condition hook turns this into the wounded state
 	}
 	void Info(TInfo& I) override { xr_strcpy(I, "test: drop my health to zero (falls wounded in a co-op session)"); }
 };
@@ -3173,7 +3174,7 @@ void actor_condition_hook(CActorCondition& c)
 		if (h < kDownHealth)
 			g_hook_damage.fetch_add(u32(_min(kDownHealth - h, 100.f) * 1000.f + 0.5f)); // huge hits: no float->u32 overflow
 		if (h != kDownHealth)
-			c.SetHealth(kDownHealth);
+			health_ledger::coop_set_health(c, kDownHealth);
 		// One who is down takes no more dose: the actor stays in the world, and zones and artefacts went on adding to it, up
 		// to a revive that kept it all (live 2026-10-31). A respawn clears it in stand_up.
 		c.SetRadiation(g_hook_rad);
@@ -3182,7 +3183,7 @@ void actor_condition_hook(CActorCondition& c)
 	if (h <= 0.f)
 	{
 		g_hook_rad = c.GetRadiation();
-		c.SetHealth(kDownHealth);
+		health_ledger::coop_set_health(c, kDownHealth);
 		g_hook_owner.store(&c);
 		g_hook_life.store(u8(Life::Wounded)); // pinned from now on; frame() completes the fall
 		g_hook_fell.store(true);
@@ -3218,7 +3219,7 @@ bool intercept_actor_kill(CEntity* victim, u16 killer_id)
 	if (g_hook_life.load() == u8(Life::Alive) || g_hook_owner.load() != &a->conditions())
 	{
 		g_hook_rad = a->conditions().GetRadiation();
-		a->conditions().SetHealth(kDownHealth);
+		health_ledger::coop_set_health(a->conditions(), kDownHealth);
 		g_hook_owner.store(&a->conditions());
 		g_hook_life.store(u8(Life::Wounded));
 		g_hook_fell.store(true);

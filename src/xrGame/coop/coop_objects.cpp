@@ -13,6 +13,7 @@
 #include "coop_checkpoint_sources.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_motion_rules.h"
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -53,6 +54,7 @@
 #include "../xrphysics/PhysicsShell.h"
 #include "../xrphysics/PhysicsCommon.h"
 #include "../Include/xrRender/animation_blend.h"
+#include "../Include/xrRender/KinematicsAnimated.h"
 #include "../xrEngine/motion.h"
 
 namespace coop
@@ -89,6 +91,7 @@ enum class StateKind : u8
 	Destroyed = 4,
 	Broken = 5,
 	Explode = 6,
+	Motion = 7, // live 2026-11-09: a script's play_cycle on a world physic object (ph_button levers), xrCoop/coop_motion_rules.h
 };
 enum class ZoneKind : u8
 {
@@ -179,6 +182,9 @@ struct Counters
 	    switches_blocked = 0;
 	u64 dropped_before_live = 0; // R2 I2: EntityState / ZoneState that came before we were live
 	u64 uses_echo_dropped = 0;   // R4 4: obj:use() on a world object from a reaction to the host's story
+	// script cycles of world physic objects (coop_motion_rules.h): host words out; client words in, replayed, held, local
+	// play_cycle calls dropped, malformed words
+	u64 motions_sent = 0, motions_in = 0, motions_played = 0, motions_held = 0, cycles_dropped = 0, motions_malformed = 0;
 };
 
 xrCriticalSection g_lock;
@@ -447,6 +453,15 @@ struct TorridPhase
 xr_map<u16, TorridPhase> g_torrid_host;
 xr_map<u16, AnimEntry> g_anim_host; // last phase sent per animated physic object
 xr_map<u16, u64> g_anim_host_ms;
+// Script cycles of world physic objects (live 2026-11-09, X-16 levers), under g_lock: the last per object and the calls not
+// said yet, in the order the scripts made them.
+motion::Book g_motion_book;
+struct MotionEvent
+{
+	motion::Word w; // host id, played_ms filled when it leaves
+	u64 at = 0;
+};
+xr_vector<MotionEvent> g_ev_motions;
 
 struct HostBody
 {
@@ -543,6 +558,17 @@ struct ClientAnim
 	u64 received = 0;
 };
 xr_map<u16, ClientAnim> g_anim_client;
+// The host's word on the script cycle of each world physic object (local ids), under g_lock: the gate of a script's
+// play_cycle reads it on the game thread.
+struct HeldMotion
+{
+	motion::Word w; // local id
+	u64 received = 0;
+	bool fresh = true; // not played since it came
+	const CObject* copy = nullptr; // the object it was last played on
+};
+xr_map<u16, HeldMotion> g_motion_words;
+u64 g_next_motion_check = 0;
 struct PendingDestroyed
 {
 	DestroyedEntry d;
@@ -1129,6 +1155,76 @@ void client_apply_events()
 	}
 }
 
+// ---------------------------------------------------------------- client: script cycles of world physic objects
+
+// The animated visual of a free world physic object, or null (the objects the host's words are about).
+IKinematicsAnimated* cycle_visual(CGameObject* go)
+{
+	if (!go || go->getDestroy() || go->H_Parent() || !smart_cast<CPhysicObject*>(go))
+		return nullptr;
+	return smart_cast<IKinematicsAnimated*>(go->Visual());
+}
+
+// True if a blend of `m` plays on the visual and is not fading out.
+bool cycle_shown(IKinematicsAnimated* sa, const MotionID& m)
+{
+	for (u16 part = 0; part < MAX_PARTS; ++part)
+		for (u32 i = 0, n = sa->LL_PartBlendsCount(part); i < n; ++i)
+		{
+			const CBlend* b = sa->LL_PartBlend(part, i);
+			if (b && b->motionID == m && b->blend_state() == CBlend::eAccrue)
+				return true;
+		}
+	return false;
+}
+
+// Holds the copy to the host's word (under g_lock). The host's call is replayed as the script made it
+// (CScriptGameObject::play_cycle: ID_Cycle, then PlayCycle with the script's mix-in), the new blends put where the host's are.
+// False: the copy is not here (yet).
+bool play_word(u16 id, HeldMotion& h, u64 now)
+{
+	CGameObject* go = find_go(id);
+	IKinematicsAnimated* sa = cycle_visual(go);
+	if (!sa)
+		return false;
+	const MotionID m = sa->ID_Cycle_Safe(h.w.cycle.c_str()); // the stock ID_Cycle asserts on a name the visual lacks
+	if (!m.valid())
+	{
+		h.fresh = false;
+		h.copy = go;
+		return true;
+	}
+	if (!motion::must_play(h.fresh, h.copy == go, cycle_shown(sa, m)))
+		return true;
+	if (!h.fresh)
+		++g_c.motions_held;
+	sa->PlayCycle(m, (BOOL)h.w.mix_in);
+	const float played_s = float(u64(h.w.played_ms) + (now > h.received ? now - h.received : 0)) / 1000.f;
+	for (u16 part = 0; part < MAX_PARTS; ++part)
+		for (u32 i = 0, n = sa->LL_PartBlendsCount(part); i < n; ++i)
+		{
+			CBlend* b = sa->LL_PartBlend(part, i);
+			if (b && b->motionID == m && b->blend_state() == CBlend::eAccrue)
+				b->timeCurrent = motion::phase_after(played_s, b->speed, b->timeTotal, !!b->stop_at_end, SAMPLE_SPF + EPS);
+		}
+	h.fresh = false;
+	h.copy = go;
+	++g_c.motions_played;
+	return true;
+}
+
+// Every kCheckMs, and at once in the frame after a word came. A copy that is not here yet gets its word when it comes.
+void client_hold_motions()
+{
+	const u64 now = now_ms();
+	if (now < g_next_motion_check)
+		return;
+	g_next_motion_check = now + motion::kCheckMs;
+	xrCriticalSectionGuard guard(g_lock);
+	for (auto& it : g_motion_words)
+		play_word(it.first, it.second, now);
+}
+
 // ---------------------------------------------------------------- client: message handlers
 
 u64 to_local_time(u32 remote)
@@ -1271,6 +1367,29 @@ void client_on_state(PeerId, Reader& r)
 			c.a = a;
 			c.received = now_ms();
 		}
+		break;
+	}
+	case StateKind::Motion:
+	{
+		const u8 count = r.u8();
+		const u64 now = now_ms();
+		for (u8 k = 0; k < count && r.ok(); ++k)
+		{
+			motion::Word w;
+			if (!motion::read_word(r, w))
+			{
+				++g_c.motions_malformed;
+				break;
+			}
+			w.id = join::to_local(w.id);
+			xrCriticalSectionGuard guard(g_lock);
+			HeldMotion& h = g_motion_words[w.id];
+			h.w = w;
+			h.received = now;
+			h.fresh = true;
+			++g_c.motions_in;
+		}
+		g_next_motion_check = 0; // the next frame plays it (applying happens in frame(), like the other kinds)
 		break;
 	}
 	case StateKind::Destroyed:
@@ -1664,8 +1783,10 @@ void host_flush_events()
 	xr_vector<u16> broken;
 	xr_vector<ExplodeEntry> explode;
 	xr_vector<u16> fragments;
+	xr_vector<MotionEvent> motions;
 	{
 		xrCriticalSectionGuard guard(g_lock);
+		motions.swap(g_ev_motions);
 		zones.swap(g_ev_zones);
 		anims.swap(g_ev_anims);
 		destroyed.swap(g_ev_destroyed);
@@ -1696,6 +1817,21 @@ void host_flush_events()
 		}
 		b.flush();
 		g_c.anim_msgs += b.packets();
+	}
+	if (!motions.empty())
+	{
+		// the calls in the order the scripts made them (a section's cycle, then the next section's in the same frame)
+		const u64 now = now_ms();
+		Batcher b(Msg::EntityState, u8(StateKind::Motion), false, Lane::Reliable, kInvalidPeer);
+		for (MotionEvent& e : motions)
+		{
+			e.w.played_ms = motion::Book::played(e.at, now);
+			Writer w(16 + u32(e.w.cycle.size()));
+			motion::write_word(w, e.w);
+			b.add(w);
+		}
+		b.flush();
+		g_c.motions_sent += motions.size();
 	}
 	for (const DestroyedEntry& d : destroyed)
 	{
@@ -1942,6 +2078,7 @@ void client_frame()
 	client_apply_bodies();
 	client_apply_events();
 	client_push_check();
+	client_hold_motions();
 }
 } // namespace
 
@@ -1984,7 +2121,11 @@ void reset()
 		g_ev_projectiles.clear();
 		g_zone_switch_ms.clear();
 		g_torrid_host.clear();
+		g_motion_book.clear();
+		g_ev_motions.clear();
+		g_motion_words.clear();
 	}
+	g_next_motion_check = 0;
 	g_anim_host.clear();
 	g_anim_host_ms.clear();
 	g_host_bodies.clear();
@@ -2068,7 +2209,32 @@ void host_on_peer_ready(PeerId id)
 			++anims;
 		}
 	}
-	::Msg("[coop] objects -> #%u: %u zone states, %u moved bodies, %u animated objects", id, zones, bodies, anims);
+	u32 motions = 0;
+	{
+		// the last script cycle of each world physic object (a lever pulled before he came is down for him too)
+		xr_vector<motion::Word> words;
+		{
+			xrCriticalSectionGuard guard(g_lock);
+			for (const auto& it : g_motion_book.entries())
+			{
+				motion::Word w;
+				if (g_motion_book.word(it.first, now, w))
+					words.push_back(w);
+			}
+		}
+		Batcher b(Msg::EntityState, u8(StateKind::Motion), false, Lane::Reliable, id);
+		for (const motion::Word& w : words)
+		{
+			if (ai().get_alife() && !ai().alife().objects().object(w.id, true))
+				continue; // released since
+			Writer ww(16 + u32(w.cycle.size()));
+			motion::write_word(ww, w);
+			b.add(ww);
+			++motions;
+		}
+	}
+	::Msg("[coop] objects -> #%u: %u zone states, %u moved bodies, %u animated objects, %u script cycles", id, zones, bodies,
+	    anims, motions);
 }
 
 bool is_host_driven(const CGameObject* obj)
@@ -2091,6 +2257,8 @@ void print_status()
 		    "%llu projectiles, %llu consumed (%llu kept by the client), %llu artefact activations, %u throws pending",
 		    g_c.uses, g_c.pushes, g_c.throws_ok, g_c.throws_refused, g_c.throws_malformed, g_c.projectiles,
 		    g_c.consumed, g_c.consume_forced, g_c.activations, (u32)g_pending_throws.size());
+		::Msg("[coop]   objects out: %llu script cycles of world physic objects said, %u objects in the book",
+		    g_c.motions_sent, (u32)g_motion_book.size());
 	}
 	else if (is_mirror())
 	{
@@ -2107,6 +2275,10 @@ void print_status()
 		    g_c.uses_sent, g_c.uses_echo_dropped, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent,
 		    g_c.sleeping_bags_used, g_c.tents_used);
 		::Msg("[coop]   objects in: %llu state / zone messages dropped before live (R2 I2)", g_c.dropped_before_live);
+		::Msg("[coop]   objects in: %llu script cycle words (%llu malformed), %llu played (%llu held again), %u objects held, "
+		    "%llu own play_cycle calls dropped",
+		    g_c.motions_in, g_c.motions_malformed, g_c.motions_played, g_c.motions_held, (u32)g_motion_words.size(),
+		    g_c.cycles_dropped);
 	}
 }
 
@@ -2155,6 +2327,11 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 	auto it = g_anim_client.find(id);
 	if (it == g_anim_client.end())
 		return;
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		if (g_motion_words.count(id))
+			return; // a script cycle shows (the host's word, coop_motion_rules.h): m_anim_blend is not what the visual plays
+	}
 	const AnimEntry& a = it->second.a;
 	float expected = a.time;
 	if (a.playing)
@@ -2208,6 +2385,40 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who)
 		++g_c.uses_sent;
 	}
 	return true;
+}
+
+bool script_cycle_blocked(CGameObject* obj)
+{
+	if (!obj || !is_mirror())
+		return false;
+	const bool free_physic_object = !obj->H_Parent() && smart_cast<CPhysicObject*>(obj) != nullptr;
+	bool word = false;
+	if (free_physic_object)
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		word = g_motion_words.count(obj->ID()) != 0;
+	}
+	if (motion::local_cycle(true, free_physic_object, word) == motion::LocalCycle::Play)
+		return false;
+	++g_c.cycles_dropped;
+	return true;
+}
+
+void on_script_cycle(CGameObject* obj, const char* anim, bool mix_in)
+{
+	if (!obj || !anim || !*anim || !mgr().active() || !is_map_authority())
+		return;
+	if (obj->H_Parent() || !smart_cast<CPhysicObject*>(obj) || xr_strlen(anim) > motion::kMaxCycleName)
+		return;
+	const u64 now = now_ms();
+	MotionEvent e;
+	e.w.id = obj->ID();
+	e.w.cycle = anim;
+	e.w.mix_in = mix_in;
+	e.at = now;
+	xrCriticalSectionGuard guard(g_lock);
+	g_motion_book.note(e.w.id, e.w.cycle, mix_in, now);
+	g_ev_motions.push_back(e);
 }
 
 void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj)

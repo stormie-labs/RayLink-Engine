@@ -20,6 +20,7 @@
 #include "ui/UIPdaWnd.h"
 #include "../xrNetServer/NET_AuthCheck.h"
 #include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_join.h" // Anomaly Coop: world_is_mirror (RL-UGYE-3WGE)
 #include "coop/coop_manager.h" // Anomaly Coop
 #include "coop/coop_autosave.h" // Anomaly Coop
 #include "coop/coop_game_settings.h" // Anomaly Coop
@@ -191,6 +192,28 @@ void CLevel::net_Stop()
 }
 
 
+// Anomaly Coop (RL-UGYE-3WGE): CObjectList::net_Export on a co-op client, where an object that does not speak for its id
+// (another object is the level's one for it, or the entity there is of another kind) writes no update: its server would
+// read the chunk in the entity's format (xrServer::Process_update, "Beer from the creator").
+static u32 coop_client_net_Export(CObjectList& objects, NET_Packet& Packet, u32 start, u32 max_object_size)
+{
+	u32 position;
+	for (; start < objects.o_count(); start++)
+	{
+		CObject* P = objects.o_get_by_iterator(start);
+		if (P->net_Relevant() && !P->getDestroy() && coop::events::client_export_allowed(P))
+		{
+			Packet.w_u16(u16(P->ID()));
+			Packet.w_chunk_open8(position);
+			P->net_Export(Packet);
+			Packet.w_chunk_close8(position);
+			if (max_object_size >= (NET_PacketSizeLimit - Packet.w_tell()))
+				break;
+		}
+	}
+	return start + 1;
+}
+
 void CLevel::ClientSend()
 {
 	if (GameID() != eGameIDSingle && OnClient())
@@ -239,7 +262,8 @@ void CLevel::ClientSend()
 	while (1)
 	{
 		P.w_begin(M_UPDATE);
-		start = Objects.net_Export(&P, start, max_objects_size);
+		start = coop::join::world_is_mirror() ? coop_client_net_Export(Objects, P, start, max_objects_size) // Anomaly Coop
+		                                      : Objects.net_Export(&P, start, max_objects_size);
 
 		if (P.B.count > 2)
 		{

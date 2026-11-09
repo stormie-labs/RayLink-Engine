@@ -23,6 +23,7 @@
 #include "ui/UIStatic.h"
 #include "coop/coop_survival.h" // Anomaly Coop
 #include "coop/coop_ai.h" // Anomaly Coop: player_down
+#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the condition in the own actor's health ledger
 
 #define MAX_SATIETY					1.0f
 #define START_SATIETY				0.5f
@@ -303,7 +304,9 @@ void CActorCondition::UpdateCondition()
 	UpdateSatiety();
 	UpdateBoosters();
 
+	const float coop_ledger_was = GetHealth(); // Anomaly Coop (live 2026-11-09): the health ledger, a diagnostic
 	inherited::UpdateCondition();
+	coop::health_ledger::condition_update(*this, coop_ledger_was);
 	coop::survival::actor_condition_hook(*this); // Anomaly Coop
 
 	if (IsGameTypeSingle())

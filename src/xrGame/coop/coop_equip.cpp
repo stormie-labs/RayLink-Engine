@@ -25,6 +25,7 @@
 #include "coop_alife.h"
 #include "coop_survival.h"
 #include "coop_requests.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
+#include "coop_health_ledger.h" // live 2026-11-09: the restore in the own actor's health ledger
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_nametag.h"
 #include "xrCoop/coop_gear.h"
@@ -906,7 +907,7 @@ void client_restore_vitals()
 			w->AddHit(wound, ALife::eHitTypeWound);
 	}
 	const float was = c.GetHealth();
-	c.SetHealth(clampr(v.health, 0.05f, c.GetMaxHealth()));
+	health_ledger::coop_set_health(c, clampr(v.health, 0.05f, c.GetMaxHealth())); // live 2026-11-09: in the health ledger
 	join::arrival_apply("restore", was, c.GetHealth()); // live 2026-11-07: the spawn already has it (role swap): no jump
 	c.SetSatiety(v.satiety);
 	c.SetRadiation(v.radiation);

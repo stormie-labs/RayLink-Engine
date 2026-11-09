@@ -623,7 +623,7 @@ inline constexpr Call kCalls[] = {
 	{"game_object:patrol", CallClass::Read},
 	{"game_object:patrol_path_make_inactual", CallClass::World},
 	{"game_object:phantom_set_enemy", CallClass::World},
-	{"game_object:play_cycle", CallClass::View}, // an animation or particles of this machine's copy
+	{"game_object:play_cycle", CallClass::View}, // an animation of this machine's copy; a free physic object (a lever) holds the host's word (coop_motion_rules.h)
 	{"game_object:play_hud_motion", CallClass::View},
 	{"game_object:play_sound", CallClass::World}, // an NPC's sound set and speech; the host's AI plays them
 	{"game_object:poltergeist_get_actor_ignore", CallClass::Read},

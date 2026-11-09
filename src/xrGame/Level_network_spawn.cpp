@@ -10,6 +10,7 @@
 #include "../xrEngine/xr_object.h"
 #include "../xrEngine/IGame_Persistent.h"
 #include "coop/coop_remote.h" // Anomaly Coop
+#include "coop/coop_events.h" // Anomaly Coop
 
 void CLevel::cl_Process_Spawn(NET_Packet& P)
 {
@@ -30,6 +31,12 @@ void CLevel::cl_Process_Spawn(NET_Packet& P)
 		E->UPDATE_Read(P);
 
 	if (!E->match_configuration())
+	{
+		F_entity_Destroy(E);
+		return;
+	}
+	// Anomaly Coop (RL-UGYE-3WGE): on a co-op client no game object for an entity that is gone or whose id another one has now
+	if (!coop::events::client_spawn_allowed(E))
 	{
 		F_entity_Destroy(E);
 		return;

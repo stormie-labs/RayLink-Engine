@@ -27,6 +27,7 @@ class NET_Packet;
 class CSE_Abstract;
 class CActor;
 class CGameObject;
+class CObject;
 struct SHit;
 
 namespace coop
@@ -72,6 +73,18 @@ void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvect
     const Fvector& angular_vel, PeerId requester);
 // Last player character that held a now free item (0 = host actor, proxy id, 0xffff = none).
 u16 host_last_holder(u16 item);
+
+// --- one id, one object on a mirror (xrCoop/coop_object_identity.h, live RL-UGYE-3WGE 2026-11-09). The game thread
+// (CLevel::net_Update). Single player and the host: the stock behaviour (true / nothing). ---
+// CLevel::cl_Process_Spawn: false = this M_SPAWN makes no game object (its entity is gone or another one has the id
+// now, or a live object of its section holds the id). Logged once per id.
+bool client_spawn_allowed(const CSE_Abstract* spawn);
+// CLevel::ClientSend: false = this object writes no update (another object is the level's one for its id, or the
+// entity under its id is of another section). Logged once per id.
+bool client_export_allowed(CObject* obj);
+// xrServer::Process_update: `e` read `read` bytes of a chunk of `size`. true = skip the chunk (a mirror: logged once per
+// id, the host asked for the object at the next frame); false = the stock FATAL.
+bool client_update_mismatch(CSE_Abstract* e, u32 read, u32 size);
 
 // --- both ---
 // Server entity by id (ALife registry first, then the server's online entities).

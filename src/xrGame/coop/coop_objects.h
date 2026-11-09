@@ -28,6 +28,8 @@
 //     4 Destroyed (reliable)   u16 id, u16 bone, u16 hit_type, vec3 dir, f32 impulse, vec3 p_in_bone
 //     5 Broken    (reliable)   u16 id
 //     6 Explode   (reliable)   u16 id, u16 initiator, vec3 pos, vec3 normal, str section
+//     7 Motion    (reliable)   u8 count, entries: u16 id, str cycle, u8 mix_in, u32 played_ms (a script's play_cycle on a
+//                 free physic object: the live call, and the last of each object to a player who enters)
 //   ZoneState host -> clients (reliable)
 //     1 Zones     u16 count, entries: u16 id, u8 state, u32 elapsed_ms, u8 campfire (0 off, 1 on, 0xff n/a),
 //                 f32 animator time (-1 if none)
@@ -85,6 +87,11 @@ bool client_intercept_use(CGameObject* obj, CGameObject* who);
 // Client: the "Sleep" tip on a sleeping bag (its ph_idle logic runs on the host only); called by CActor's pick when the
 // usable object it looks at has no tip.
 void client_usable_tip(CUsableScriptObject* usable, CGameObject* obj);
+// CScriptGameObject::play_cycle (live 2026-11-09, the X-16 levers; xrCoop/coop_motion_rules.h): the cycle a script plays on a
+// free world physic object (ph_button: a lever's up / down) is the host's. Before the call: true = drop it (a client whose
+// copy holds the host's word on that object). After a cycle was played: the host says it to the players of its world.
+bool script_cycle_blocked(CGameObject* obj);
+void on_script_cycle(CGameObject* obj, const char* anim, bool mix_in);
 // CHelicopter::UpdateCL (hook requested from the lead): true = placed from host poses, skip own movement.
 bool client_drive_pose(CGameObject* obj);
 

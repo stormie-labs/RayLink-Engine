@@ -48,6 +48,7 @@
 #include "Pda.h"
 #include "player_hud.h"
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): who changed the own actor's health
 #include "script_attachment_manager.h"
 #include "CustomDevice.h"
 
@@ -136,8 +137,24 @@ BIND_FUNCTION10(&object(), CScriptGameObject::GetRange, CEntityAlive, ffGetRange
 	CALL_FUNCTION01(C, I)
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetHealth, CEntityAlive, conditions().GetHealth, float, -1);
-COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetHealth, CEntityAlive, conditions().SetHealth, float, float, "game_object:health");
-COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::ChangeHealth, CEntityAlive, conditions().ChangeHealth, float, float, "game_object:change_health");
+// Anomaly Coop (live 2026-11-09, a diagnostic): health and change_health are COOP_GATED_BIND_FUNCTION01 written out (the
+// same macros, the same call), plus the health ledger (coop/coop_health_ledger.h): which script changed the own actor's
+// health, `health = v` by what it changed, change_health(v) by what it queued for the next condition update.
+DECLARE_FUNCTION11(CScriptGameObject::SetHealth, void, float)
+	CAST_OBJECT0(&object(), CScriptGameObject::SetHealth, CEntityAlive)
+	if (coop::callgate::client_gate("game_object:health", &object()) == coop::calls::Gate::Refuse)
+		return;
+	const float coop_was = l_tpEntity->conditions().GetHealth();
+	l_tpEntity->conditions().SetHealth((float)(f));
+	coop::health_ledger::script_set(l_tpEntity, coop_was);
+}
+DECLARE_FUNCTION11(CScriptGameObject::ChangeHealth, void, float)
+	CAST_OBJECT0(&object(), CScriptGameObject::ChangeHealth, CEntityAlive)
+	if (coop::callgate::client_gate("game_object:change_health", &object()) == coop::calls::Gate::Refuse)
+		return;
+	l_tpEntity->conditions().ChangeHealth((float)(f));
+	coop::health_ledger::script_change(l_tpEntity, (float)(f));
+}
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetPsyHealth, CEntityAlive, conditions().GetPsyHealth, float, -1);
 COOP_GATED_BIND_FUNCTION01(&object(), CScriptGameObject::SetPsyHealth, CEntityAlive, conditions().SetPsyHealth, float, float, "game_object:psy_health");

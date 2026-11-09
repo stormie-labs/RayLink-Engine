@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "xrServer.h"
 #include "xrServer_Objects.h"
+#include "coop/coop_events.h" // Anomaly Coop
 
 int g_Dump_Update_Read = 0;
 
@@ -34,7 +35,11 @@ void xrServer::Process_update(NET_Packet& P, ClientID sender)
 
 			if (g_Dump_Update_Read) Msg("* %s : %d - %d", E->name(), size, P.r_tell() - _pos);
 
-			if ((P.r_tell() - _pos) != size)
+			// Anomaly Coop (RL-UGYE-3WGE): on a co-op client a read that does not fit the chunk is skipped (logged once per id,
+			// the host asked for the object), never FATAL: the object that speaks for the id writes again next frame
+			if ((P.r_tell() - _pos) != size && coop::events::client_update_mismatch(E, P.r_tell() - _pos, size))
+				P.r_seek(_pos + size);
+			else if ((P.r_tell() - _pos) != size)
 			{
 				string16 tmp;
 				CLSID2TEXT(E->m_tClassID, tmp);
