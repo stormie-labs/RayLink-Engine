@@ -163,7 +163,7 @@ WeaponFiredFn g_fired = nullptr;
 
 // ---------------------------------------------------------------- owner side (main thread)
 
-xr_map<u16, Blob> g_sent; // own items: the state the host has (local id)
+xr_map<u16, Blob> g_sent; // own items: last captured/reported state (local id), not an acknowledgement
 bool g_was_live = false;
 bool g_resync = false;
 u64 g_last_scan = 0;
@@ -1096,11 +1096,18 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 			++g_stats.authority_applied;
 			return true;
 		}
+		// g_sent is the last report, not an unchanged-since-take baseline. Once we track
+		// this ownership, a delayed/repeated host push must not refund spent ammunition.
+		// A fresh take's baseline is handled above, including its locally changed tags.
+		// Protect the entity too when its online object is temporarily absent.
+		auto it = g_sent.find(id);
+		if (it != g_sent.end())
+			d = itemtags::only_tags(d, itemtags::kAll &
+			    ~u32(itemtags::Box | itemtags::Main | itemtags::Launcher));
 		if (item)
 		{
 			Blob cur;
 			capture_blob(item, cur);
-			auto it = g_sent.find(id);
 			if (it != g_sent.end() && it->second != cur)
 			{
 				++g_stats.authority_skipped;

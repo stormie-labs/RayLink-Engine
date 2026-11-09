@@ -16,6 +16,8 @@ protected:
 	virtual void StopIdleParticles(bool bIdleLight = true);
 	virtual BOOL AlwaysTheCrow();
 	virtual void UpdateWorkload(u32 dt);
+	void SwitchZoneState(EZoneState new_state) override;
+	void OnStateSwitch(EZoneState new_state) override;
 
 public:
 	CZoneCampfire();

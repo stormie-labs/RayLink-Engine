@@ -6,6 +6,7 @@
 #include "level.h"
 #include "actor.h"
 #include "script_game_object.h"
+#include "coop/coop_items.h"
 
 CWeaponShotgun::CWeaponShotgun()
 {
@@ -275,8 +276,10 @@ u8 CWeaponShotgun::AddCartridge(u8 cnt)
 	VERIFY((u32)iAmmoElapsed == m_magazine.size());
 
 	//выкинуть коробку патронов, если она пустая
-	if (m_pCurrentAmmo && !m_pCurrentAmmo->m_boxCurr && OnServer())
+	if (m_pCurrentAmmo && !m_pCurrentAmmo->m_boxCurr && OnServer() &&
+		!coop::items::client_keep_empty_box(m_pCurrentAmmo))
 		m_pCurrentAmmo->SetDropManual(TRUE);
+	coop::items::touch(this);
 
 	return cnt;
 }

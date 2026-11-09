@@ -1183,7 +1183,13 @@ void CWeaponMagazinedWGrenade::net_Spawn_install_upgrades(Upgrades_type saved_up
 
 bool CWeaponMagazinedWGrenade::GetBriefInfo(II_BriefInfo& info)
 {
-	VERIFY(m_pInventory);
+	// This override computes its own brief info without calling the base method.
+	if (!m_pInventory)
+	{
+		info.clear();
+		m_BriefInfo_CalcFrame = 0;
+		return false;
+	}
 	/*
 	    if(!inherited::GetBriefInfo(info))
 	    return false;

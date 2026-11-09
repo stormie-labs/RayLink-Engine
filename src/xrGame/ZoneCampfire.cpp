@@ -4,6 +4,7 @@
 #include "GamePersistent.h"
 #include "../xrEngine/LightAnimLibrary.h"
 #include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_manager.h"
 
 /*
 CZoneCampfire* g_zone = NULL;
@@ -96,6 +97,25 @@ void CZoneCampfire::turn_off_script()
 bool CZoneCampfire::is_on()
 {
 	return m_turned_on;
+}
+
+void CZoneCampfire::SwitchZoneState(EZoneState new_state)
+{
+	// The host skips damage to player proxies. A mirror must run the fire's damage
+	// cycle for its own actor, even when nobody stands in the host's copy.
+	if (coop::is_mirror())
+		inherited::OnStateSwitch(new_state);
+	else
+		inherited::SwitchZoneState(new_state);
+}
+
+void CZoneCampfire::OnStateSwitch(EZoneState new_state)
+{
+	// Host snapshots may toggle the fire, but must not replace its local damage phase.
+	// Local transitions above call the inherited implementation directly.
+	if (coop::is_mirror() && new_state != eZoneStateDisabled && ZoneState() != eZoneStateDisabled)
+		return;
+	inherited::OnStateSwitch(new_state);
 }
 
 void CZoneCampfire::shedule_Update(u32 dt)

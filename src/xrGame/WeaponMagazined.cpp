@@ -1940,7 +1940,13 @@ void CWeaponMagazined::net_Import(NET_Packet& P)
 
 bool CWeaponMagazined::GetBriefInfo(II_BriefInfo& info)
 {
-	VERIFY(m_pInventory);
+	// The HUD can still query a weapon while an ownership transfer detaches it.
+	if (!m_pInventory)
+	{
+		info.clear();
+		m_BriefInfo_CalcFrame = 0; // Rebuild cleared data when the weapon is taken again.
+		return false;
+	}
 	string32 int_str;
 
 	int ae = GetAmmoElapsed();
