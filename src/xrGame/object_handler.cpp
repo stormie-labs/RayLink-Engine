@@ -26,6 +26,7 @@
 #include "stalker_animation_manager.h"
 #include "object_handler_planner_impl.h"
 #include "effectorshot.h"
+#include "coop/coop_world.h"
 
 extern int g_ai_unlimited_ammo;
 
@@ -75,7 +76,10 @@ BOOL CObjectHandler::net_Spawn(CSE_Abstract* DC)
 	CSE_ALifeTraderAbstract* trader = smart_cast<CSE_ALifeTraderAbstract*>(abstract);
 	VERIFY(trader);
 
-	m_infinite_ammo = !!trader->m_trader_flags.test(CSE_ALifeTraderAbstract::eTraderFlagInfiniteAmmo);
+	// Player characters use a stalker proxy, but must never receive NPC ammo supplies.
+	// The section check also works before the proxy registry is populated and while parked.
+	m_infinite_ammo = !coop::world::is_player_character(abstract) &&
+		!!trader->m_trader_flags.test(CSE_ALifeTraderAbstract::eTraderFlagInfiniteAmmo);
 	return (TRUE);
 }
 

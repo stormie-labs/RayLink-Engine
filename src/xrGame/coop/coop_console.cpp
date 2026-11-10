@@ -16,6 +16,7 @@
 #include "coop_levels.h" // F3a
 #include "coop_dedicated.h" // plan 12
 #include "coop_debug.h" // protocol 29
+#include "coop_items.h"
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -116,6 +117,18 @@ public:
 	void Info(TInfo& I) override { xr_strcpy(I, "co-op session status, players, RTT and traffic by message type"); }
 };
 
+class CCC_CoopInventory : public IConsole_Command
+{
+public:
+	CCC_CoopInventory(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override
+	{
+		items::print_inventory();
+		xrLogger::FlushLog();
+	}
+	void Info(TInfo& I) override { xr_strcpy(I, "local weapon, ammunition and item-sync diagnostic"); }
+};
+
 class CCC_CoopChat : public IConsole_Command
 {
 public:
@@ -206,6 +219,7 @@ void register_console_commands()
 	CMD1(CCC_CoopConnect, "coop_connect");
 	CMD1(CCC_CoopDisconnect, "coop_disconnect");
 	CMD1(CCC_CoopStatus, "coop_status");
+	CMD1(CCC_CoopInventory, "coop_inventory");
 	CMD1(CCC_CoopChat, "coop_chat");
 	CMD1(CCC_CoopNetSim, "coop_netsim");
 	CMD1(CCC_CoopDump, "coop_dump");

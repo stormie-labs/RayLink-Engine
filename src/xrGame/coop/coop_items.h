@@ -51,6 +51,7 @@ void install_client(Endpoint& e); // F3a T4: the client's (a remote client's ses
 void reset();
 void frame(); // main thread, from the coop pump: capture/send, host tracking, pending applies
 void print_status();
+void print_inventory(); // local diagnostic; never changes or requests inventory state
 
 // --- engine hooks (any game thread; they only record, frame() sends) ---
 

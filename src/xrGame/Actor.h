@@ -929,4 +929,5 @@ IC CActorCondition& CActor::conditions() const
 
 extern CActor* g_actor;
 CActor* Actor();
+float GetActorVisibility();
 extern const float s_fFallTime;

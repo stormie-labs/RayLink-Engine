@@ -2056,6 +2056,51 @@ void print_status()
 		    s.dropped_before_live, s.take_kept, (u32)g_take_base.size());
 }
 
+void print_inventory()
+{
+	print_status();
+	CActor* actor = g_pGameLevel ? Actor() : nullptr;
+	if (!actor)
+		return;
+	::Msg("[coop-inventory] actor=%u unlimited_ammo=%u", actor->ID(), actor->unlimited_ammo() ? 1u : 0u);
+	PIItem active = actor->inventory().ActiveItem();
+	::Msg("[coop-inventory] active=%u remote=%u alive=%u", active ? active->object_id() : kNoId,
+	    actor->Remote() ? 1u : 0u, actor->g_Alive() ? 1u : 0u);
+	for (PIItem item : actor->inventory().m_all)
+	{
+		if (!item || item->object().getDestroy()) continue;
+		ItemData d;
+		capture_object(item, d);
+		if (!d.has_main && !d.has_box) continue;
+		const u16 id = item->object_id();
+		CSE_Abstract* e = find_entity(id);
+		::Msg("[coop-inventory] id=%u host=%u section=%s parent=%u root=%u cond=%u mag=%u box=%u pending=%u",
+		    id, join::to_host(id), item->object().cNameSect().c_str(), e ? e->ID_Parent : kNoId,
+		    e ? entity_root(e) : kNoId, d.cond, d.main_count, d.box, requests::client_lease_waiting(id) ? 1u : 0u);
+		if (CWeapon* gun = smart_cast<CWeapon*>(item))
+			::Msg("[coop-inventory] weapon=%u state=%u next=%u pending=%u misfire=%u working=%u unlimited=%u cartridges=%u",
+			    id, gun->GetState(), gun->GetNextState(), gun->IsPending() ? 1u : 0u,
+			    gun->IsMisfire() ? 1u : 0u, gun->IsWorking() ? 1u : 0u, gun->unlimited_ammo() ? 1u : 0u,
+			    u32(gun->m_magazine.size()));
+		std::string metadata;
+		if (d.has_main && requests::clone_export(id, metadata))
+		{
+			// Hex chunks preserve the bounded serializer's exact bytes without control characters in the log.
+			static const char hex[] = "0123456789abcdef";
+			for (size_t offset = 0; offset < metadata.size(); offset += 128)
+			{
+				std::string encoded;
+				for (size_t i = offset; i < metadata.size() && i < offset + 128; ++i)
+				{
+					const u8 byte = u8(metadata[i]);
+					encoded += hex[byte >> 4]; encoded += hex[byte & 15];
+				}
+				::Msg("[coop-inventory] metadata %u %u %s", id, u32(offset), encoded.c_str());
+			}
+		}
+	}
+}
+
 void client_before_take(u16 local_item)
 {
 	if (!is_live_mirror() || local_item == kNoId)
