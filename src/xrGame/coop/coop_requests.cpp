@@ -2486,6 +2486,17 @@ Reason apply_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos)
 	const bool online = gi && (src == kNoId || valid_go(src)) && (dst == kNoId || valid_go(dst));
 	if (online)
 	{
+		// Ownership on the server leads the game-object event queue. Never detach from a stale
+		// inventory, or give an item the recipient's queued TAKE will immediately reject.
+		const u16 local_src = gi->H_Parent() ? gi->H_Parent()->ID() : kNoId;
+		if (local_src != src)
+			return Reason::Moved;
+		if (CInventoryOwner* recipient = smart_cast<CInventoryOwner*>(valid_go(dst)))
+		{
+			CInventoryItem* inventory_item = smart_cast<CInventoryItem*>(gi);
+			if (!inventory_item || !recipient->inventory().CanTakeItem(inventory_item))
+				return Reason::NotAllowed;
+		}
 		const bool transfer = src != kNoId && dst != kNoId;
 		if (src != kNoId)
 			inject_item_event(transfer ? GE_TRADE_SELL : GE_OWNERSHIP_REJECT, src, item);
@@ -2493,7 +2504,17 @@ Reason apply_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos)
 			inject_item_event(transfer ? GE_TRADE_BUY : GE_OWNERSHIP_TAKE, dst, item);
 		CSE_Abstract* e = events::find_entity(item);
 		if (!e || e->ID_Parent != dst)
+		{
+			// SELL can succeed while BUY fails. Restore the same entity through normal events;
+			// returning Engine alone would leave a gift on the ground instead of with its sender.
+			if (src != kNoId && e && e->ID_Parent == kNoId)
+			{
+				inject_item_event(GE_TRADE_BUY, src, item);
+				if (e->ID_Parent != src)
+					::Msg("! [coop] transfer item %u: could not restore sender %u after recipient %u refused", item, src, dst);
+			}
 			return Reason::Engine;
+		}
 		if (drop_pos && dst == kNoId)
 		{
 			NET_Packet P; // after the reject in the same queue: the item has its physics shell by then
@@ -3772,6 +3793,18 @@ void client_destroy(u16 local_item, bool use)
 	a.kind = use ? Act::Use : Act::Destroy;
 	a.item = local_item;
 	push(std::move(a));
+}
+
+bool host_transfer_item(u16 item, u16 from, u16 to)
+{
+	if (!is_map_authority())
+		return false;
+	CSE_Abstract* e = events::find_entity(item);
+	const Reason why = !e ? Reason::Missing : e->ID_Parent != from ? Reason::Moved :
+	    from == to ? Reason::Ok : apply_move(item, from, to, nullptr);
+	if (why != Reason::Ok)
+		::Msg("! [coop] script transfer item %u from %u to %u refused: %s", item, from, to, reason_name(why));
+	return true;
 }
 
 void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)

@@ -17,6 +17,7 @@
 #include "coop_monster_fx.h" // audit A5
 #include "coop_items.h" // live report 2026-11-08: the owner's copy before a take
 #include "xrCoop/coop_rules.h"
+#include "xrCoop/coop_reconcile.h"
 #include "xrCoop/coop_object_identity.h" // live RL-UGYE-3WGE: one id, one object on a mirror
 
 #include "Level.h"
@@ -74,6 +75,7 @@ struct ParentTarget
 	u64 since = 0;
 	bool dump_asked = false;
 	bool extended = false; // D5: item and holder were asked for again after the first timeout
+	bool failed = false; // count a rejected attempt once; keep retrying until the bounded timeout
 };
 xr_map<u16, ParentTarget> g_parent_targets; // item (local id) -> where the host says it is
 
@@ -643,8 +645,15 @@ void client_step_parents()
 		const u16 item = it->first;
 		ParentTarget& t = it->second;
 		const Step s = step_parent(item, t);
-		if (s == Step::Wait)
+		if (s != Step::Done)
 		{
+			if (s == Step::Fail && !t.failed)
+			{
+				t.failed = true;
+				++g_c.parent_failed;
+				::Msg("! [coop] item %u [%s]: holder %u not applied yet; retrying", join::to_host(item),
+				    entity_name(item), t.parent == kNoId ? kNoId : join::to_host(t.parent));
+			}
 			if (!t.dump_asked && !find_entity(item) && now - t.since > kDumpAfterMs)
 			{
 				Writer w(4);
@@ -669,6 +678,8 @@ void client_step_parents()
 						continue;
 					Writer w(4);
 					w.u16(join::to_host(id));
+					// Default Spawn|Died cannot repair an existing item's wrong holder.
+					w.u8(reconcile::Spawn | reconcile::Parent | reconcile::State);
 					net::client_send(Msg::StateDumpRequest, w);
 				}
 				++it;
@@ -683,12 +694,6 @@ void client_step_parents()
 				if (CGameObject* go = find_go(item))
 					::Msg("! [coop] item %u: a game object [%s] stands here without its entity; it no longer speaks for the id",
 					    join::to_host(item), go->cNameSect().c_str());
-		}
-		else if (s == Step::Fail)
-		{
-			++g_c.parent_failed;
-			::Msg("! [coop] item %u [%s]: cannot apply the host's holder %u here", join::to_host(item),
-			    entity_name(item), t.parent == kNoId ? kNoId : join::to_host(t.parent));
 		}
 		else
 			++g_c.parent_applied;
@@ -761,6 +766,16 @@ void client_on_entity_parent(PeerId, Reader& r)
 	t.parent = new_h == kNoId ? kNoId : join::to_local(new_h);
 	t.pos.set(p[0], p[1], p[2]);
 	t.since = mgr().now_ms();
+	// A repair reply can repeat the same desired holder. Keep its original retry
+	// budget; otherwise every reply restarts the timeout and requests repeat forever.
+	const auto pending = g_parent_targets.find(item);
+	if (pending != g_parent_targets.end() && pending->second.parent == t.parent)
+	{
+		t.since = pending->second.since;
+		t.dump_asked = pending->second.dump_asked;
+		t.extended = pending->second.extended;
+		t.failed = pending->second.failed;
+	}
 	entities::client_on_holder_changed(item, t.parent, t.online); // a dropped item stays online here
 	g_parent_targets[item] = t; // latest wins (state, not events: P5)
 	client_step_parents();

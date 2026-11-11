@@ -107,6 +107,9 @@ void client_destroy(u16 local_item, bool use);
 // Ownership change: from/to are local ids (0xffff = the world). Back-to-back reject + take of
 // one item (box -> actor) merge into one transfer.
 void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags);
+// Trusted host Lua transfers use the same checked delivery/rollback as remote requests.
+// True means handled, including refusal; false outside the map-authority session.
+bool host_transfer_item(u16 item, u16 from, u16 to);
 // Updates the drop position of a queued move (GE_CHANGE_POS right after a drop). False if none.
 bool client_move_position(u16 local_item, const Fvector& pos);
 void client_hit(u16 local_target, const SHit& hit);

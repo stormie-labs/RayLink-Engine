@@ -14,6 +14,7 @@
 #include "coop_items.h"
 #include "xrCoop/coop_talks.h" // R4 2: may_trade_with
 #include "xrCoop/coop_search_view.h"
+#include "xrCoop/coop_reconcile.h"
 
 #include "Level.h"
 #include "Actor.h"
@@ -168,9 +169,12 @@ u16 local_parent(u16 id)
 void move_item(u16 from_id, u16 to_id, u16 item_id)
 {
 	NET_Packet P;
-	CGameObject::u_EventGen(P, GE_TRADE_SELL, from_id);
-	P.w_u16(item_id);
-	CGameObject::u_EventSend(P);
+	if (from_id != kNoId)
+	{
+		CGameObject::u_EventGen(P, GE_TRADE_SELL, from_id);
+		P.w_u16(item_id);
+		CGameObject::u_EventSend(P);
+	}
 	CGameObject::u_EventGen(P, GE_TRADE_BUY, to_id);
 	P.w_u16(item_id);
 	CGameObject::u_EventSend(P);
@@ -265,9 +269,11 @@ struct TradeCallback
 	bool actor_sells;
 	u32 price;
 	u64 deadline;
+	bool repair_asked = false;
 };
 xr_vector<TradeCallback> g_callbacks;
 constexpr u64 kCallbackWaitMs = 3000;
+constexpr u64 kCallbackRepairWaitMs = 45000; // includes the ownership mirror's retry window
 u64 g_cl_deals = 0, g_cl_ok = 0, g_cl_rejected = 0;
 
 // The host's save of a new world holds the outcome of every deal sent so far: nothing is pending.
@@ -413,6 +419,54 @@ u8 price_list(CTrade& pricing, CInventoryOwner* trader, const xr_vector<u16>& li
 // player's is his balance, coop_money; F2 T1). Both sides are checked after the whole deal, so what
 // the player sells pays for what he buys and the other way round. The host prices the deal
 // (d.sell_total, d.buy_total); the client sends item ids only (R4 2).
+bool transfer_ready(u16 item_id, u16 from, CInventoryOwner* to)
+{
+	CGameObject* go = smart_cast<CGameObject*>(find_object(item_id));
+	CInventoryItem* item = go ? smart_cast<CInventoryItem*>(go) : nullptr;
+	// SELL can detach an object that is leaving the level, or whose previous
+	// ownership event has not reached its game object. BUY may then reject it.
+	return item && !go->getDestroy() && !go->object_removed() && server_parent(item_id) == from &&
+	    local_parent(item_id) == from && to->inventory().CanTakeItem(item);
+}
+
+bool transfer_deal(const Deal& d, CInventoryOwner* proxy, CInventoryOwner* trader)
+{
+	struct Move { u16 item, from, to; };
+	xr_vector<Move> moved;
+	moved.reserve(d.sell.size() + d.buy.size());
+	const auto transfer = [&](u16 id, CInventoryOwner* from, CInventoryOwner* to)
+	{
+		CInventoryItem* item = smart_cast<CInventoryItem*>(find_object(id));
+		from->on_before_sell(item);
+		to->on_before_buy(item);
+		moved.push_back({id, id_of(from), id_of(to)});
+		move_item(id_of(from), id_of(to), id);
+		// Local-server ownership is synchronous; the inventory events follow next frame.
+		return server_parent(id) == id_of(to);
+	};
+	bool complete = true;
+	for (u16 id : d.sell)
+		if (!(complete = transfer(id, proxy, trader))) break;
+	if (complete)
+		for (u16 id : d.buy)
+			if (!(complete = transfer(id, trader, proxy))) break;
+	if (complete) return true;
+
+	// No money has moved. Return both halves of a barter, including a last
+	// item detached by SELL but refused by BUY. Never duplicate/recreate it.
+	for (auto it = moved.rbegin(); it != moved.rend(); ++it)
+	{
+		const u16 parent = server_parent(it->item);
+		if (parent == it->from) continue;
+		if (parent == it->to || parent == kNoId)
+			move_item(parent, it->from, it->item);
+		if (server_parent(it->item) != it->from)
+			::Msg("! [coop] trade #%u rollback: item %u could not return to %u (holder %u); no money charged",
+			    d.seq, it->item, it->from, server_parent(it->item));
+	}
+	return false;
+}
+
 u8 host_apply(PeerId from, Deal& d, s64& delta)
 {
 	delta = 0;
@@ -463,6 +517,10 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 		return c;
 	if (const u8 c = check(d.buy, trader_id))
 		return c;
+	for (u16 id : d.sell)
+		if (!transfer_ready(id, proxy_id, trader)) return ItemGone;
+	for (u16 id : d.buy)
+		if (!transfer_ready(id, trader_id, proxy)) return ItemGone;
 
 	// R4 2: the host's prices. A temporary CTrade: the trader's own one may hold the host actor's trade with him.
 	// A gift is free, as the stock DonateCurrentItem (TransferItem with b_free).
@@ -494,20 +552,8 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 		if (CAI_Trader* ai_trader = smart_cast<CAI_Trader*>(trader))
 			ai_trader->callback(GameObject::eTradePerformTradeOperation)(d.buy_total, d.sell_total);
 
-	for (u16 id : d.sell)
-	{
-		CInventoryItem* item = smart_cast<CInventoryItem*>(find_object(id));
-		proxy->on_before_sell(item);
-		trader->on_before_buy(item);
-		move_item(proxy_id, trader_id, id);
-	}
-	for (u16 id : d.buy)
-	{
-		CInventoryItem* item = smart_cast<CInventoryItem*>(find_object(id));
-		trader->on_before_sell(item);
-		proxy->on_before_buy(item);
-		move_item(trader_id, proxy_id, id);
-	}
+	if (!transfer_deal(d, proxy, trader))
+		return ItemGone;
 	g_host_items += n;
 
 	if (net != 0)
@@ -864,8 +910,25 @@ void frame()
 	const u64 now = now_ms();
 	for (auto it = g_callbacks.begin(); it != g_callbacks.end();)
 	{
-		if (local_parent(it->item) != it->expect_parent && now < it->deadline)
+		if (local_parent(it->item) != it->expect_parent)
 		{
+			if (now >= it->deadline)
+			{
+				if (it->repair_asked)
+				{
+					::Msg("! [coop] trade: item %u did not reach holder %u locally; purchase callback skipped",
+					    join::to_host(it->item), join::to_host(it->expect_parent));
+					request_rebuild(now);
+					it = g_callbacks.erase(it);
+					continue;
+				}
+				Writer w(4);
+				w.u16(join::to_host(it->item));
+				w.u8(reconcile::Spawn | reconcile::Parent | reconcile::State);
+				net::client_send(Msg::StateDumpRequest, w);
+				it->repair_asked = true;
+				it->deadline = now + kCallbackRepairWaitMs;
+			}
 			++it;
 			continue;
 		}

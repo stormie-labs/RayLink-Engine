@@ -6,6 +6,7 @@
 #include "script_game_object.h"
 #include "script_game_object_impl.h"
 #include "InventoryOwner.h"
+#include "coop/coop_requests.h"
 #include "Pda.h"
 #include "xrMessages.h"
 #include "character_info.h"
@@ -625,6 +626,9 @@ void CScriptGameObject::TransferItem(CScriptGameObject* pItem, CScriptGameObject
 	// and the host checks owner and reach. Between two others' inventories it is the host's.
 	if (coop::callgate::client_gate_own("game_object:transfer_item",
 			coop::calls::own_move(coop::callgate::is_own(pIItem->object().ID()), coop::callgate::is_own(pForWho->object().ID()))) == coop::calls::Gate::Refuse)
+		return;
+
+	if (coop::requests::host_transfer_item(pIItem->object().ID(), object().ID(), pForWho->object().ID()))
 		return;
 
 	// выбросить у себя
