@@ -49,6 +49,7 @@
 class CSE_Abstract;
 class CAI_Stalker;
 class CActor;
+class CWeaponMagazined;
 struct SHit;
 struct lua_State;
 
@@ -65,6 +66,8 @@ namespace coop
 {
 namespace requests
 {
+// True: a mirror handled the request; keep the silencer attached until its answer.
+bool client_detach_silencer(CWeaponMagazined* weapon, const char* section);
 // The host's move: this machine stayed in its world, whose epoch is `epoch` from now on. Before the session's own epoch moves.
 void client_keeps_world(u32 epoch);
 

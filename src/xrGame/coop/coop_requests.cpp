@@ -362,7 +362,44 @@ struct Inflight
 	u16 item;
 	u64 sent;
 	u32 hold = 0; // F2 T5: released by the answer (or the timeout)
+	xr_string silencer;
+	std::vector<u8> retry;
+	u32 world = 0;
 };
+
+xr_set<u16> g_detaching_silencers;
+
+int lua_silencer_state(lua_State* L)
+{
+	lua_getglobal(L, "coop_mods_items");
+	if (!lua_istable(L, -1)) return 0;
+	lua_getfield(L, -1, "native_silencer_state");
+	if (!lua_isfunction(L, -1)) return 0;
+	lua_pushvalue(L, 1);
+	lua_pushvalue(L, 2);
+	lua_call(L, 2, 1);
+	return 1;
+}
+
+float silencer_state(CWeaponMagazined* weapon, bool commit)
+{
+	lua_State* L = weapon ? ai().script_engine().lua() : nullptr;
+	if (!L || !lua_checkstack(L, 8)) return -1.f;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, lua_silencer_state);
+	::luabind::object(L, weapon->lua_game_object()).pushvalue();
+	lua_pushboolean(L, commit);
+	float condition = 1.f;
+	if (lua_pcall(L, 2, 1, 0) != 0)
+	{
+		::Msg("! [coop] silencer metadata for weapon %u failed: %s", weapon->ID(), lua_tostring(L, -1));
+		condition = -1.f;
+	}
+	else if (lua_isnumber(L, -1))
+		condition = float(lua_tonumber(L, -1));
+	lua_settop(L, top);
+	return condition;
+}
 
 // The router may run on the game thread; sending happens in frame() on the main thread.
 xrCriticalSection g_out_lock;
@@ -647,6 +684,12 @@ void send_action(const Action& a)
 		w.u16(u16(a.bytes.size()));
 		w.bytes(a.bytes.data(), a.bytes.size());
 		ledger::write(w, ledger::UpgradePayment{to_host_id(a.mechanic), a.paid}); // F2 T5
+		if (a.ge_type == GE_ADDON_DETACH)
+		{
+			g_inflight[seq].silencer = a.section;
+			g_inflight[seq].retry = w.data();
+			g_inflight[seq].world = join::world_generation();
+		}
 		net::client_send(Msg::ReqItemEvent, w);
 		++g_cl.sent[6];
 		break;
@@ -733,9 +776,24 @@ void client_flush()
 	const u64 now = mgr().now_ms();
 	for (auto it = g_inflight.begin(); it != g_inflight.end();)
 	{
+		if (!it->second.silencer.empty() && it->second.world != join::world_generation())
+		{
+			g_detaching_silencers.erase(it->second.item);
+			it = g_inflight.erase(it);
+			continue; // Old object ids must never be replayed into a loaded world.
+		}
 		if (now - it->second.sent > kResultTimeoutMs)
 		{
 			++g_cl.timeouts;
+			if (!it->second.silencer.empty())
+			{
+				Writer retry;
+				retry.bytes(it->second.retry.data(), it->second.retry.size());
+				net::client_send(Msg::ReqItemEvent, retry);
+				it->second.sent = now;
+				++it;
+				continue; // Same sequence: a late answer must not create a second addon.
+			}
 			money::client_release(it->second.hold); // F2 T5: the next balance from the host decides
 			it = g_inflight.erase(it);
 		}
@@ -1358,15 +1416,35 @@ void client_on_result(PeerId, Reader& r)
 	}
 	Msg type = Msg::ReqResult;
 	u16 local_item = kNoId;
+	xr_string detached_silencer;
+	bool silencer_world_matches = false;
 	auto it = g_inflight.find(seq);
 	if (it != g_inflight.end())
 	{
 		type = it->second.type;
 		local_item = it->second.item;
+		detached_silencer = it->second.silencer;
+		silencer_world_matches = it->second.world == join::world_generation();
 		// F2 T5: an upgrade's answer. The host sends the balance right after it (charged or not), so the money shown
 		// stays as it is until then.
 		money::client_release(it->second.hold);
 		g_inflight.erase(it);
+	}
+	if (!detached_silencer.empty())
+	{
+		g_detaching_silencers.erase(local_item);
+		if (accepted && silencer_world_matches)
+		{
+			CWeaponMagazined* weapon = smart_cast<CWeaponMagazined*>(find_go(local_item));
+			if (weapon)
+			{
+				entities::ClientApply apply;
+				weapon->Detach(detached_silencer.c_str(), false);
+				silencer_state(weapon, true);
+				// Send the cleared flag before the player can attach another silencer.
+				items::client_send_state_now(local_item);
+			}
+		}
 	}
 	if (accepted)
 	{
@@ -1377,7 +1455,7 @@ void client_on_result(PeerId, Reader& r)
 	// F2 T5 fix round 1 (review 1): our item has the upgrade the host refused; it is built again from the host's
 	// entity. Not for Offline / NoProxy: our world is being replaced (or we have no character), and the next world
 	// comes with the host's state of our items.
-	if (type == Msg::ReqItemEvent && reason != u8(Reason::Offline) && reason != u8(Reason::NoProxy))
+	if (type == Msg::ReqItemEvent && detached_silencer.empty() && reason != u8(Reason::Offline) && reason != u8(Reason::NoProxy))
 		client_rebuild_item(local_item);
 	if (type == Msg::ReqTake || type == Msg::ReqDrop || type == Msg::ReqTransfer)
 		trade::invalidate_views(); // an open box/body window shows the real content again
@@ -3027,6 +3105,101 @@ bool read_item_event(Reader& r, ItemEventBody& b)
 	return r.ok() && b.size <= sizeof(b.data) && r.bytes(b.data, b.size) && ledger::read(r, b.pay);
 }
 
+struct SilencerReceipt
+{
+	u32 seq;
+	u16 item;
+	std::string section;
+	Reason reason;
+};
+xr_map<PeerId, xr_deque<SilencerReceipt>> g_silencer_receipts;
+u32 g_silencer_world = 0;
+
+Reason host_detach_silencer(const Req& q, u16 item, const char* section, float condition)
+{
+	if (!_valid(condition) || condition < 0.f || condition > 1.f)
+		return Reason::Malformed;
+	if (events::root_of(item) != q.proxy)
+		return Reason::NotOwner;
+	CWeaponMagazined* weapon = smart_cast<CWeaponMagazined*>(find_go(item));
+	if (!weapon || weapon->getDestroy())
+		return Reason::Offline;
+	if (!weapon->SilencerAttachable() || !weapon->IsSilencerAttached() ||
+	    weapon->GetSilencerName() != section)
+		return Reason::NotAllowed;
+	const Reason holder = host_spawn_holder(q, q.proxy);
+	if (holder != Reason::Ok)
+		return holder;
+	if (!spawnable_section(section))
+		return Reason::BadSection;
+	const spawn::ClassRule* rule = spawn::class_rule(pSettings->r_string(section, "class"));
+	if (!rule || missing_item_line(section, *rule).line)
+		return Reason::BadSection;
+	const float pos[3] = {weapon->Position().x, weapon->Position().y, weapon->Position().z};
+	Reason why = Reason::Ok;
+	CSE_Abstract* addon = build_spawn(q, q.proxy, section, pos, nullptr, 0, why);
+	if (!addon)
+		return why;
+	CSE_ALifeInventoryItem* inventory = smart_cast<CSE_ALifeInventoryItem*>(addon);
+	if (!inventory)
+	{
+		F_entity_Destroy(addon);
+		return Reason::NotAllowed;
+	}
+	inventory->m_fCondition = condition;
+	// ItemState still accepts addon flags from the owner. Keep the existing spawn
+	// policy/budget: this path must not turn a forged flag into unlimited free items.
+	const spawn::SectionFacts facts = spawn_facts(section);
+	spawn::CostBudget& budget = g_spawn_budgets.of(spawn_budget_key(q.proxy));
+	const auto verdict = spawn::judge(rule, nullptr, facts, budget, g_spawn_policy, mgr().now_ms());
+	if (verdict != spawn::SpawnVerdict::Allow)
+	{
+		F_entity_Destroy(addon);
+		return verdict == spawn::SpawnVerdict::OverBudget ? Reason::RateLimited : Reason::NotAllowed;
+	}
+	const auto refund = [&]() { if (!spawn::budget_free(facts)) spawn::refund(budget, facts.cost, g_spawn_policy); };
+	u16 created = kNoId;
+	why = host_spawn(addon, q.proxy, created);
+	if (why != Reason::Ok)
+	{
+		refund();
+		return why; // The gun still has its silencer; no optimistic deletion or budget queue.
+	}
+	CSE_Abstract* result = events::find_entity(created);
+	if (!result || result->ID_Parent != q.proxy || !weapon->Detach(section, false))
+	{
+		host_destroy(q, created);
+		refund();
+		return Reason::Engine;
+	}
+	items::host_silencer_detached(item, q.from);
+	silencer_state(weapon, true);
+	return Reason::Ok;
+}
+
+void host_on_silencer_detach(const Req& q, const ItemEventBody& body)
+{
+	Reader data(body.data, body.size);
+	const std::string section = data.str();
+	const float condition = data.f32();
+	if (!data.ok() || data.remaining() || body.pay.paid || body.pay.mechanic != kNoId ||
+	    !validate::resource_name_ok(section.c_str(), spawn::kMaxSection))
+		return reply(q, Reason::Malformed, body.item);
+	if (g_silencer_world != join::world_generation())
+	{
+		g_silencer_receipts.clear();
+		g_silencer_world = join::world_generation();
+	}
+	auto& receipts = g_silencer_receipts[q.from];
+	for (const SilencerReceipt& receipt : receipts)
+		if (receipt.seq == q.seq)
+			return reply(q, receipt.item == body.item && receipt.section == section ? receipt.reason : Reason::Malformed, body.item);
+	const Reason why = allow(q.from, CatMisc) ? host_detach_silencer(q, body.item, section.c_str(), condition) : Reason::RateLimited;
+	receipts.push_back({q.seq, body.item, section, why});
+	if (receipts.size() > 128) receipts.pop_front();
+	reply(q, why, body.item);
+}
+
 void host_on_item_event(PeerId from, Reader& r)
 {
 	// Fix round 1 (review 5): host_begin drops a request silently while its player joins or a world is precached. The
@@ -3042,6 +3215,11 @@ void host_on_item_event(PeerId from, Reader& r)
 		ItemEventBody b;
 		if (read_item_event(peek, b))
 		{
+			if (b.type == GE_ADDON_DETACH)
+			{
+				reply(dropped, Reason::Offline, b.item);
+				return;
+			}
 			++g_upgrades.answered_dropped;
 			answer_upgrade(dropped, Reason::Offline, b.item, b.pay.paid);
 		}
@@ -3057,6 +3235,8 @@ void host_on_item_event(PeerId from, Reader& r)
 	const u16 size = b.size;
 	const u8* data = b.data;
 	const ledger::UpgradePayment& pay = b.pay; // F2 T5: the event bytes are followed by the payment
+	if (type == GE_ADDON_DETACH)
+		return host_on_silencer_detach(q, b);
 	const auto answer = [&q, item, &pay](Reason why) { answer_upgrade(q, why, item, pay.paid); };
 	if (!allow(from, CatMisc))
 		return answer(Reason::RateLimited); // fix round 1 (review 5): with the balance, as every other answer
@@ -3543,6 +3723,9 @@ void reset()
 		g_launches.clear(); // W3a
 	}
 	g_inflight.clear();
+	g_detaching_silencers.clear();
+	g_silencer_receipts.clear();
+	g_silencer_world = 0;
 	g_rebuilds.clear(); // F2 T5 fix round 1
 	g_limits.clear();
 	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
@@ -3584,6 +3767,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
+	g_silencer_receipts.erase(id);
 	// Ruling F2-21, review round 4 minor: his waiting spawn requests go at once, unanswered.
 	const auto his = [id](const spawn::QueuedRequest& r) { return PeerId(r.peer) == id; };
 	for (const std::string& key : g_spawn_queue.keys())
@@ -3737,6 +3921,31 @@ void print_status()
 }
 
 // ---------------------------------------------------------------- client API
+
+bool client_detach_silencer(CWeaponMagazined* weapon, const char* section)
+{
+	if (!is_mirror() || entities::client_applying())
+		return false;
+	if (!weapon || !is_live_mirror() || client_lease_waiting(weapon->ID()) ||
+	    events::root_of(weapon->ID()) != kActor || g_detaching_silencers.count(weapon->ID()))
+		return true;
+	const float condition = silencer_state(weapon, false);
+	if (!_valid(condition) || condition < 0.f || condition > 1.f)
+		return true;
+	items::client_send_state_now(weapon->ID()); // Includes an attach performed earlier in this same frame.
+	Action action;
+	action.kind = Act::ItemEvent;
+	action.item = weapon->ID();
+	action.ge_type = GE_ADDON_DETACH;
+	action.section = section;
+	Writer body;
+	body.str(section);
+	body.f32(condition);
+	action.bytes.assign(body.data().begin(), body.data().end());
+	g_detaching_silencers.insert(weapon->ID());
+	push(std::move(action));
+	return true;
+}
 
 bool client_forward_spawn(CSE_Abstract* e)
 {

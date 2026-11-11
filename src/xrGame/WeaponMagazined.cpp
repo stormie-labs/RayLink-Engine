@@ -26,6 +26,7 @@
 #include "../build_config_defines.h"
 #include "WeaponRG6.h"
 #include "coop/coop_items.h" // Anomaly Coop
+#include "coop/coop_requests.h"
 
 extern ENGINE_API bool g_dedicated_server;
 ENGINE_API extern float psHUD_FOV_def;
@@ -1511,6 +1512,8 @@ bool CWeaponMagazined::Detach(const char* item_section_name, bool b_spawn_item)
 			Msg("ERROR: silencer addon already detached.");
 			return true;
 		}
+		if (b_spawn_item && coop::requests::client_detach_silencer(this, item_section_name))
+			return false; // The host must create the loose addon before this flag is removed.
 		m_flagsAddOnState &= ~CSE_ALifeItemWeapon::eWeaponAddonSilencer;
 
 		UpdateAddonsVisibility();

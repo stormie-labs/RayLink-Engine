@@ -214,6 +214,7 @@ struct Owned
 	bool stuck = false; // the host copy does not take this state: do not retry until the next one
 };
 xr_map<u16, Owned> g_owned; // items of players' characters with the owner's last state
+xr_map<u16, PeerId> g_detached_silencers; // fence old owner snapshots until its detach acknowledgement
 xr_set<u32> g_logged_tags; // R3 В1: (item id << 8 | itemtags::Bit) already reported as different from the owner's state
 struct Left
 {
@@ -985,6 +986,7 @@ void drain_forgotten()
 		g_pending.erase(id);
 		g_take_base.erase(id);
 		g_owned.erase(id);
+		g_detached_silencers.erase(id);
 		g_left.erase(id);
 		g_unload_used.erase(id);
 		g_releasing.erase(id);
@@ -1486,6 +1488,17 @@ void host_release_box(u16 id, CSE_Abstract* e)
 	++g_stats.boxes_released;
 }
 
+void filter_detached_silencer(u16 id, PeerId from, ItemData& data)
+{
+	const auto detached = g_detached_silencers.find(id);
+	if (detached == g_detached_silencers.end() || detached->second != from || !data.has_addons)
+		return;
+	if (!(data.addons & CSE_ALifeItemWeapon::eWeaponAddonSilencer))
+		g_detached_silencers.erase(detached);
+	else
+		data.addons &= ~CSE_ALifeItemWeapon::eWeaponAddonSilencer;
+}
+
 void host_on_state(PeerId from, Reader& r)
 {
 	drain_forgotten();
@@ -1548,6 +1561,7 @@ void host_on_state(PeerId from, Reader& r)
 		return;
 	}
 	host_sanitize(e, item, d);
+	filter_detached_silencer(id, from, d);
 	Blob clean;
 	write_data(d, clean);
 	if (item)
@@ -1929,6 +1943,7 @@ void reset()
 	g_pending.clear();
 	g_take_base.clear();
 	g_owned.clear();
+	g_detached_silencers.clear();
 	g_logged_tags.clear();
 	g_left.clear();
 	g_proxy_items.clear();
@@ -1971,6 +1986,7 @@ void frame()
 		if (!g_host_precaching)
 		{
 			g_owned.clear();
+			g_detached_silencers.clear();
 			g_left.clear();
 			g_proxy_items.clear();
 			g_unload_used.clear();
@@ -2129,6 +2145,34 @@ void client_resend_state(u16 local_id)
 	g_sent[local_id] = Blob(); // differs from any captured state: the next scan sends ours
 	std::lock_guard<std::mutex> lock(g_lock);
 	g_scan_now = true;
+}
+
+void client_send_state_now(u16 local_id)
+{
+	CInventoryItem* item = is_live_mirror() ? find_item(local_id) : nullptr;
+	if (!item || requests::client_lease_waiting(local_id))
+		return;
+	Blob blob;
+	capture_blob(item, blob);
+	g_sent[local_id] = blob;
+	send_state(item, blob);
+	++g_stats.sent;
+}
+
+void host_silencer_detached(u16 id, PeerId owner)
+{
+	CSE_Abstract* entity = find_entity(id);
+	CInventoryItem* item = find_item(id);
+	if (!entity || !item)
+		return;
+	ItemData state;
+	capture_object(item, state);
+	apply_entity(entity, state, false);
+	auto owned = g_owned.find(id);
+	if (owned != g_owned.end())
+		owned->second.data = state;
+	g_detached_silencers[id] = owner;
+	host_send_view(id, entity, item, nullptr, 0, owner);
 }
 
 void touch(CInventoryItem* item)

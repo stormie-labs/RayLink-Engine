@@ -93,6 +93,8 @@ void client_before_take(u16 local_item);
 // changed on it since (portions, a condition a mod set on the object) goes to the host with the next scan, as if the
 // host knew nothing of it. Main thread.
 void client_resend_state(u16 local_id);
+void client_send_state_now(u16 local_id);
+void host_silencer_detached(u16 id, PeerId owner);
 // Client (live report 2026-11-08, G.A.M.M.A.: a scope fitted to an SR-3M showed 7 %): we made our item `local_id` ourselves
 // under a leased id (a clone of our weapon for a scope, a kit, a detach). The host builds its copy from its own view of the
 // source and pushes it into our hands; that push keeps all our tags (but the upgrade list, the host's) and ours goes to the
