@@ -1788,7 +1788,7 @@ void host_push(u16 id, PeerId peer)
 void host_track_proxies(u64 now)
 {
 	xr_set<u16> seen;
-	for (PeerId peer = 1; peer < kMaxPlayers; ++peer)
+	for (PeerId peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		const u16 proxy = join::proxy_of_peer(peer);
 		if (proxy == kNoId)

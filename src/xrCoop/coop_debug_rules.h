@@ -66,8 +66,8 @@ struct FlagRow
 
 // Msg::DebugState, world server -> every player (the host player over the LocalLink) and every map server, at every change, at the end
 // of a player's join and of a map server's.
-// Wire: u8 on (0 | 1), u8 source (Source), u32 serial, varu n (n <= kMaxPlayers), n x {u32 peer, u8 flags}.
-// Off has the source Off and no rows (switching off clears every flag); on has a source; a row per player with flags, peers < kMaxPlayers,
+// Wire: u8 on (0 | 1), u8 source (Source), u32 serial, varu n (n <= kMaxPeerSlots), n x {u32 peer, u8 flags}.
+// Off has the source Off and no rows (switching off clears every flag); on has a source; a row per player with flags, peers < kMaxPeerSlots,
 // each once, flags within kFlagsAll.
 struct StateMsg
 {
@@ -109,7 +109,7 @@ inline bool read_state(Reader& r, StateMsg& out)
 	const uint8_t source = r.u8();
 	m.serial = r.u32();
 	const uint64_t n = r.varu();
-	if (!r.ok() || on > 1 || source > uint8_t(Source::Console) || n > kMaxPlayers)
+	if (!r.ok() || on > 1 || source > uint8_t(Source::Console) || n > kMaxPeerSlots)
 		return false;
 	m.on = on == 1;
 	m.source = Source(source);
@@ -121,7 +121,7 @@ inline bool read_state(Reader& r, StateMsg& out)
 		FlagRow row;
 		row.peer = r.u32();
 		row.flags = r.u8();
-		if (!r.ok() || row.peer >= kMaxPlayers || (row.flags & ~kFlagsAll) != 0)
+		if (!r.ok() || row.peer >= kMaxPeerSlots || (row.flags & ~kFlagsAll) != 0)
 			return false;
 		for (const FlagRow& seen : m.rows)
 			if (seen.peer == row.peer)
@@ -184,7 +184,7 @@ public:
 	}
 	FlagsResult set_flags(PeerId peer, uint8_t flags)
 	{
-		if (peer >= kMaxPlayers)
+		if (peer >= kMaxPeerSlots)
 			return FlagsResult::BadPeer;
 		if ((flags & ~kFlagsAll) != 0)
 			return FlagsResult::BadFlags;
@@ -355,24 +355,43 @@ enum class Operator : uint8_t
 	NoSession, // no co-op session
 	NotServer, // a process without the world server: a client, a map server
 	DebugOff, // coop_dbg while the debug is off (owner 2026-11-07: as sv_cheats)
+	ToServer, // plan 2026-11-12 §2.3: the operator of a world server (a client): the line goes to the server as an OperatorCommand
+	ServerConsoleOnly, // a command only the world server's own console runs (the Lua of `coop_dbg lua`): never over the network
 };
 
-// coop_debug on|off: the world server's console in a session (the state alone is shown anywhere).
-inline Operator switch_allowed(bool active, bool world_server)
+// The commands of coop_dbg that only the world server's own console runs (coop_debug_cmds.script class "operator": Lua on the server's
+// PC). No line that came over the network runs one, the operator's neither. `cmd` as parse_console_line keeps it (lower case).
+inline bool server_console_only(std::string_view cmd) { return cmd == "lua"; }
+
+// coop_debug on|off: the world server's console in a session (the state alone is shown anywhere). `op`: this client holds the host's
+// rights of a world server (Session::self_host_rights): his own console sends the line to the server, which decides.
+inline Operator switch_allowed(bool active, bool world_server, bool op = false)
 {
 	if (!active)
 		return Operator::NoSession;
-	return world_server ? Operator::Ok : Operator::NotServer;
+	if (world_server)
+		return Operator::Ok;
+	return op ? Operator::ToServer : Operator::NotServer;
 }
 
 // coop_dbg <cmd> ...: the world server's console in a session with the debug on. `help` lists the commands while it is off too: it
-// changes nothing.
-inline Operator console_allowed(bool active, bool world_server, bool on, std::string_view cmd)
+// changes nothing. The operator's console sends any line but the server console's own (the server knows whether its debug is on).
+inline Operator console_allowed(bool active, bool world_server, bool on, std::string_view cmd, bool op = false)
 {
-	const Operator o = switch_allowed(active, world_server);
+	const Operator o = switch_allowed(active, world_server, op);
+	if (o == Operator::ToServer)
+		return server_console_only(cmd) ? Operator::ServerConsoleOnly : Operator::ToServer;
 	if (o != Operator::Ok)
 		return o;
 	return on || cmd == "help" ? Operator::Ok : Operator::DebugOff;
+}
+
+// The world server, coop_dbg of its operator (Msg::OperatorCommand): the rule of its own console, less what only that console runs.
+inline Operator remote_console_allowed(bool active, bool on, std::string_view cmd)
+{
+	if (server_console_only(cmd))
+		return Operator::ServerConsoleOnly;
+	return console_allowed(active, true, on, cmd);
 }
 
 constexpr size_t kMaxConsoleLine = 1024; // the whole line after coop_dbg

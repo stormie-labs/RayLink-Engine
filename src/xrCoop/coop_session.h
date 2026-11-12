@@ -49,6 +49,12 @@ struct PeerInfo
 	float packet_loss = 0.f; // 0..1 as reported by the transport
 	std::string address; // "ip:port"
 	bool local = false; // F3a T4: the host player over the LocalLink (in players() of a host with one attached)
+	// Protocol 31 (xrCoop/coop_roster.h): false only for seat 0 of a world server, whose seat plays no character (a client
+	// learns it from Welcome flags, the host from SessionConfig::host_plays). Such a seat is in no list of players.
+	bool plays = true;
+	// Protocol 31: this player is the operator of a world server and holds the host's rights (xrCoop/coop_operator.h; a client
+	// learns it from the PeerList flag Operator). Seat 0 of an ordinary host has the rights without this flag.
+	bool host_rights = false;
 };
 
 struct SessionConfig
@@ -62,8 +68,16 @@ struct SessionConfig
 	uint32_t connect_timeout_ms = 10000; // client: transport + handshake deadline
 	uint32_t peer_timeout_ms = 15000; // silence before a peer is dropped
 	// F3a: who connects (client): a player, or a map server of the host's PC with the token of its command line.
+	// Protocol 31, a player (role Player) presents the operator token here (-coop_operator <hex> of the creator's game; zeros
+	// for everybody else).
 	uint8_t hello_role = kHelloRolePlayer;
 	std::array<uint8_t, kHelloTokenSize> hello_token{};
+	// Protocol 31, host only. host_plays: the host's own seat is a player (an ordinary host). A world server (-coop_dedicated)
+	// sets false: its seat is in no list, the Welcome says so (HostSeatPlays off) and max_players counts clients only
+	// (limits::client_capacity). operator_token: the token of -coop_operator (op::find_token); all zeros = no operator. The first
+	// player key that presents it from the loopback becomes the operator for the life of this Session (op::operator_verdict).
+	bool host_plays = true;
+	std::array<uint8_t, kHelloTokenSize> operator_token{};
 };
 
 // Per message type counters (P9 / R-12.4).
@@ -281,6 +295,20 @@ public:
 	std::function<void(PeerId, const std::string& text)> on_chat;
 
 	void send_chat(const std::string& text); // client -> host -> all; host -> all
+
+	// Protocol 31, the operator (xrCoop/coop_operator.h, docs/plans/2026-11-12-split-levels-native.md §2.3).
+	// Client: sends one console line to the host as Msg::OperatorCommand. false if this is not a joined client. It does not check
+	// the rights or the line: the host is the judge (Lua checks has_host_rights before, stage 3).
+	bool send_operator_command(const std::string& line);
+	// Client: the host's PeerList gave this client the flag Operator. false on a host (its own rights are is_host()).
+	bool self_host_rights() const;
+	// Host: a line of the operator that passed the rate (kClientRateRules OperatorCommand), the length and the list
+	// (op::command_verdict Run). Stage 3 runs it on the server's console (dedicated::run_for). Called from update(), like the
+	// other callbacks.
+	std::function<void(PeerId from, const std::string& line)> on_operator_command;
+	// Host: OperatorCommands refused after the rate limit (not the operator, too long, not on the list), for the life of the
+	// Session; each refusal is logged with its op::command_name.
+	uint64_t operator_refused() const;
 
 	void set_log(LogFn fn);
 	void set_netsim(const NetSim& sim);

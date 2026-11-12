@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "coop_protocol.h"
+#include "coop_world_stage.h"
 
 namespace coop
 {
@@ -90,7 +91,7 @@ private:
 		bool open = false; // an offer waits for his answer
 		uint64_t since_ms = 0; // the first offer
 	};
-	std::map<PeerId, Entry> m_peers; // at most kMaxPlayers - 1
+	std::map<PeerId, Entry> m_peers; // at most limits::kMaxClientSlots
 };
 
 // Client: the choice as the window gives it (faction, "sec,sec,..." of the bought gear; spaces around a section and
@@ -152,6 +153,35 @@ inline std::string character_faction(const std::string& world, const std::string
 	if (char_name_valid(host_actor))
 		return host_actor;
 	return "stalker";
+}
+
+// ---------------------------------------------------------------- plan 2026-11-12 stage 5: the creator's character from [creator]
+// The world server staged its new world from coop_new_world.ltx (coop_world_stage.h). The creator chose his character in the new world
+// screen already: when he joins first, the host makes it from the record's `creator` (coop_join.cpp host_make_creator) instead of the
+// choice window. Everybody else, and the creator in every other case, gets the window (CharOffer) as before.
+static_assert(world_stage::kMaxLoadout == CharChoiceMsg::kMaxBuy, "a loadout of the staging file fits one choice");
+
+struct CreatorFacts
+{
+	bool host_rights = false; // PeerInfo::host_rights: the operator's token, loopback only (coop_operator.h)
+	bool has_proxy = false; // his key has a character in this world already: he returns, found by key
+	bool creator = false; // the world's record has a `creator`
+	bool used = false; // ... and it was made into a character once already
+	size_t loadout = 0; // entries of creator.loadout
+	bool bare = false; // creator.bare: he chose to start with nothing
+};
+
+// Whether the character is made from the record now. Never for a peer without the token, whatever the record says.
+inline bool make_creator(const CreatorFacts& f)
+{
+	return f.host_rights && !f.has_proxy && f.creator && !f.used && (f.loadout > 0 || f.bare);
+}
+
+// The synthetic choice of the creator: the world's faction and his loadout as one copy per entry (make_choice). Its faction is only logged by
+// the host, as every client's (character_faction). False when it is no choice the host would read: the window instead.
+inline bool creator_choice(const std::string& faction, const std::string& loadout_csv, CharChoiceMsg& out)
+{
+	return make_choice(faction, loadout_csv, out);
 }
 } // namespace newchar
 } // namespace coop

@@ -86,6 +86,12 @@ void suspend(bool on);
 const char* level_change_name();
 const char* level_change_temp_name();
 const char* level_change_commit();
+// A world server's own level change outside a session (its ghost goes to the service level while the world is made): the name the
+// world is written to and the new level loads from, nullptr in any other process. The server's savedgames are its creator's own
+// (xrCoop/coop_world_server_rules.h rewrite_saves): the stock "<user> - autosave" would replace the player's own autosave there, and
+// with a mod that names saves after the character it stayed in his load menu as "server - autosave" (live 2026-11-13). The
+// autosaves' temporary name is nobody's save: every list hides it and the next autosave clears it.
+const char* world_server_level_change_name();
 
 // Manager::stop on the host, before the session is shut down: the last save of the session, at once, whatever the
 // host is doing (only a level that cannot be saved at all skips it, and a Restore window that is open). Nothing on a client.

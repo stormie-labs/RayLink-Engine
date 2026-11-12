@@ -30,7 +30,7 @@ namespace mapserver
 {
 // ---------------------------------------------------------------- bridges
 
-// A map server is no player: its connection has a peer id of its own, far from the slots of the players (0 .. kMaxPlayers - 1).
+// A map server is no player: its connection has a peer id of its own, far from the slots of the players (0 .. kMaxPeerSlots - 1).
 // k = 1 .. kMaxBridges is the number of the map server, the one of its fsgame_ms<k>.ltx and of its slice of ids
 // (coop_levels_keeper.h leader_ids_of).
 constexpr uint32_t kMaxBridges = 7; // coop_max_map_servers is 0..7
@@ -38,6 +38,7 @@ constexpr PeerId kBridgeBase = 0x100;
 
 constexpr PeerId bridge_peer(uint32_t k) { return kBridgeBase + k; }
 constexpr bool is_bridge(PeerId peer) { return peer > kBridgeBase && peer <= kBridgeBase + kMaxBridges; }
+static_assert(kBridgeBase >= kMaxPeerSlots, "a bridge's id is no player slot");
 // The number of a map server by its bridge, 0 for anybody else.
 constexpr uint32_t bridge_index(PeerId peer) { return is_bridge(peer) ? peer - kBridgeBase : 0; }
 

@@ -7,6 +7,7 @@
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "xrCoop/coop_soft_move.h"
+#include "xrCoop/coop_operator.h" // op::redact
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "Actor.h"
@@ -436,7 +437,7 @@ bool parsed_key()
 		me.parsed = true;
 		me.is = parse_args(Core.Params, me.args);
 		if (Core.Params && strstr(Core.Params, kKey) && !me.is)
-			::Msg("! [coop] map server: the key -coop_mapserver cannot be read: '%s'", Core.Params);
+			::Msg("! [coop] map server: the key -coop_mapserver cannot be read: '%s'", op::redact(Core.Params).c_str());
 	}
 	return me.is;
 }

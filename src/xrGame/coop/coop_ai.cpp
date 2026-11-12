@@ -404,7 +404,7 @@ void viewers_frame()
 	}
 	Fvector at[viewers::kMaxViewers];
 	u32 n = 0;
-	for (u32 peer = 1; peer < kMaxPlayers && n < viewers::kMaxViewers; ++peer)
+	for (u32 peer = 1; peer < kMaxPeerSlots && n < viewers::kMaxViewers; ++peer)
 		if (const CObject* body = viewer_body(peer))
 			at[n++] = body->Position();
 	shedule_viewers::set(at, n, g_viewer_range, g_viewer_frame_radius);
@@ -456,7 +456,7 @@ u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearP
 		out[n++] = g_actor;
 	if (!is_map_authority() || !world_up())
 		return n;
-	for (u32 peer = 1; peer < kMaxPlayers && n < kMaxNearPlayers; ++peer)
+	for (u32 peer = 1; peer < kMaxPeerSlots && n < kMaxNearPlayers; ++peer)
 	{
 		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
 		if (body && body->g_Alive() && !player_down(body) && body->Position().distance_to(pos) <= max_dist)
@@ -474,7 +474,7 @@ CObject* phantom_target(const Fvector& pos)
 	{
 		// nearest_player knows only this machine's actor here
 		float best_d = best ? best->Position().distance_to(pos) : flt_max;
-		for (u32 peer = 0; peer < kMaxPlayers; ++peer)
+		for (u32 peer = 0; peer < kMaxPeerSlots; ++peer)
 		{
 			const u16 id = world::avatar_of(peer);
 			CEntityAlive* body = id == 0xffff ? nullptr : smart_cast<CEntityAlive*>(Level().Objects.net_Find(id));
@@ -580,7 +580,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 	}
 	if (!is_map_authority() || !world_up())
 		return best;
-	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
+	for (u32 peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		CEntityAlive* body = smart_cast<CEntityAlive*>(viewer_body(peer));
 		if (!body || !body->g_Alive() || player_down(body) || debug_unseen(body))

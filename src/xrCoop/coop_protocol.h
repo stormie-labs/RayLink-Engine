@@ -83,11 +83,22 @@ namespace coop
 // 29 (docs/DEBUG_DESIGN.md §B.3, owner 2026-11-07: debug is the server's, as sv_cheats): DebugState 0x01A1 (world server -> every player,
 //    the host player over the LocalLink, and every map server): on, its source, a serial, each player's personal flags
 //    (xrCoop/coop_debug_rules.h StateMsg).
-constexpr uint32_t kProtocolVersion = 30;
+// 30: atomic weapon replacement and initial spawn metadata.
+// 31 (docs/plans/2026-11-12-split-levels-native.md §1.3, §2): a world server's own seat plays no character and the creator's
+//    game holds the host's rights. Welcome ends with `u8 flags` (HostSeatPlays), a PeerList row ends with `u8 flags` (Operator),
+//    core Msg::OperatorCommand 0x000B (the operator -> the server: one console line, xrCoop/coop_operator.h).
+constexpr uint32_t kProtocolVersion = 31;
 constexpr uint16_t kDefaultPort = 27960;
-constexpr uint32_t kMaxPlayers = 8; // host + 7 clients
+// The seats that play: an ordinary host + 7 clients, or a world server's 8 clients (its own seat plays no character,
+// SessionConfig::host_plays; limits::client_capacity). Counts of players and SessionConfig/Welcome max_players.
+constexpr uint32_t kMaxPlayers = 8;
+// The slot ids: seat 0 (the host) and the client slots 1 .. kMaxPlayers (owner 2026-11-13: a world server takes 8 clients).
+// Every check of a player's peer id (`peer < kMaxPeerSlots`), every array indexed by one and every list that may have a row
+// per slot uses this, not kMaxPlayers. Protocol 31 (unreleased) widened the accepted ranges of AvatarList, DebugState, LevelMap,
+// LoadWait, TransitionState and the level Packet's peer from 0..7 / 8 rows to 0..8 / 9 rows; no field changed its width.
+constexpr uint32_t kMaxPeerSlots = kMaxPlayers + 1;
 
-// Transport peer slot: the host is always 0, clients get 1..kMaxPlayers-1.
+// Transport peer slot: the host is always 0, clients get 1..kMaxPeerSlots-1 (an ordinary host gives at most 1..7).
 using PeerId = uint32_t;
 constexpr PeerId kHostPeer = 0;
 constexpr PeerId kInvalidPeer = 0xFFFFFFFFu;
@@ -117,6 +128,9 @@ enum class Msg : uint16_t
 	PeerList = 0x0008, // host -> all: joined players (slot, nick, key hash)
 	Chat = 0x0009,
 	WorldEpoch = 0x000A, // client -> host: u32 world epoch the client rejoins (Session::set_world_epoch)
+	// protocol 31: the operator -> the server: OperatorCommandMsg, one console line (xrCoop/coop_operator.h; Session checks the
+	// sender, the rate, the length and the list, then on_operator_command)
+	OperatorCommand = 0x000B,
 
 	// --- game (dispatched to registered handlers) ---
 	GameBase = 0x0100,
@@ -371,15 +385,24 @@ struct HelloMsg
 };
 
 // Host -> client on acceptance.
+// Wire: u32 slot, u64 session_token, str host_nick, u32 max_players, u32 world_epoch, u8 flags (protocol 31).
 struct WelcomeMsg
 {
+	enum Flags : uint8_t
+	{
+		HostSeatPlays = 1, // protocol 31: seat 0 is a player (an ordinary host); off on a world server (SessionConfig::host_plays)
+		Known = HostSeatPlays,
+	};
+
 	PeerId slot = kInvalidPeer; // client's own peer id
 	uint64_t session_token = 0; // random per session; used to rejoin after level change
 	std::string host_nick;
 	uint32_t max_players = kMaxPlayers;
 	uint32_t world_epoch = 0; // the world the host serves now (Session::set_world_epoch)
+	uint8_t flags = HostSeatPlays;
 
 	void write(Writer& w) const;
+	// False on overrun or an unknown flag.
 	bool read(Reader& r);
 };
 
@@ -394,11 +417,35 @@ struct RejectMsg
 	bool read(Reader& r);
 };
 
+// One row of Msg::PeerList (host -> all: varu n, n x PeerListEntry, then varu d, d x {u32 slot, str reason} of who left).
+// Wire: u32 slot, str nick, u32 key_hash, u8 flags (protocol 31).
 struct PeerListEntry
 {
+	enum Flags : uint8_t
+	{
+		Operator = 1, // protocol 31: this player holds the host's rights on a world server (xrCoop/coop_operator.h)
+		Known = Operator,
+	};
+	static constexpr size_t kMinWire = 4 + 1 + 4 + 1; // an empty nick
+
 	PeerId slot = kInvalidPeer;
 	std::string nick;
 	uint32_t key_hash = 0; // short hash of the key (never send other players' keys)
+	uint8_t flags = 0;
+
+	void write(Writer& w) const;
+	// False on overrun or an unknown flag.
+	bool read(Reader& r);
+};
+
+// Protocol 31, the operator -> the server (core, Lane::Reliable). Wire: str line. The server takes at most
+// op::kMaxLine bytes of it and only the lines of op::allowed (coop_operator.h); read() checks the layout only.
+struct OperatorCommandMsg
+{
+	std::string line;
+
+	void write(Writer& w) const;
+	bool read(Reader& r);
 };
 
 // R3 В3: the player who plays a character, as Msg::AvatarList carries it (host numbering).
@@ -412,14 +459,14 @@ struct AvatarOwner
 // actor (0, kHostPeer) and the character of every player in the world; one whose player is away or still loading is
 // not listed. Nick and colour are not repeated: every machine has them by peer (PeerList nick, colour slot from the
 // peer id).
-// Wire: u8 count (<= kMaxPlayers), count x (u16 avatar, u32 peer).
+// Wire: u8 count (<= kMaxPeerSlots), count x (u16 avatar, u32 peer).
 struct AvatarListMsg
 {
 	std::vector<AvatarOwner> owners;
 
 	void write(Writer& w) const;
-	// False (owners cleared) on overrun, more rows than kMaxPlayers, avatar 0xFFFF, a peer that is no player slot
-	// (>= kMaxPlayers), a character or a player listed twice, id 0 for anybody but the host or the host with another id.
+	// False (owners cleared) on overrun, more rows than kMaxPeerSlots, avatar 0xFFFF, a peer that is no player slot
+	// (>= kMaxPeerSlots), a character or a player listed twice, id 0 for anybody but the host or the host with another id.
 	bool read(Reader& r);
 };
 

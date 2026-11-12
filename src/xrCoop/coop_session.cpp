@@ -11,7 +11,9 @@
 #include <bcrypt.h>
 
 #include "coop_session.h"
+#include "coop_limits.h"
 #include "coop_mapserver_rules.h"
+#include "coop_operator.h"
 #include "coop_transport.h"
 
 #include <algorithm>
@@ -250,6 +252,12 @@ struct Session::Impl
 	uint64_t m_host_fp = 0;
 	uint64_t m_session_token = 0;
 	uint32_t m_max_players = kMaxPlayers;
+	// host, protocol 31 (coop_operator.h): the player key the operator token is bound to, for the life of this Session (a new token
+	// in a later host() unbinds it), and the OperatorCommands refused after the rate limit
+	bool m_operator_bound = false;
+	PlayerKey m_operator_key{};
+	std::array<uint8_t, kHelloTokenSize> m_operator_bound_token{};
+	uint64_t m_operator_refused = 0;
 	// host, set by the game once, kept across sessions like the handlers
 	std::set<uint32_t> m_client_blob_kinds; // R1 I3
 	struct RateRule
@@ -273,6 +281,7 @@ struct Session::Impl
 	PeerId m_self_id = kInvalidPeer;
 	PeerInfo m_host_info;
 	std::map<PeerId, PeerInfo> m_remote; // other players, from PeerList
+	bool m_self_host_rights = false; // protocol 31: the PeerList flag Operator on this client's own row
 	std::string m_server_text;
 	bool m_deadline_set = false;
 	uint64_t m_deadline = 0;
@@ -825,6 +834,12 @@ struct Session::Impl
 			else
 				malformed(c, "unexpected WorldEpoch");
 			break;
+		case Msg::OperatorCommand:
+			if (host)
+				host_operator_command(c, r);
+			else
+				malformed(c, "unexpected OperatorCommand");
+			break;
 		default:
 			if (m_logged_unknown.insert(type).second)
 				logf("unknown core message %s dropped", msg_name(type));
@@ -1300,7 +1315,11 @@ struct Session::Impl
 				unsigned(previous->info.id), previous->info.nick.c_str(), unsigned(silent_ms), c.info.address.c_str());
 			kick_conn(*previous, RejectReason::Kicked, "connection replaced: the same player key reconnected");
 		}
-		if (m_joined.size() + 1 >= m_max_players)
+		// protocol 31: max_players counts the seats that play; a world server's own seat is not one (limits::client_capacity).
+		// While an operator token is set and its holder is not in, the last place is his: a session filled by other players
+		// would have nobody who may kick or restore (security review 2026-11-12).
+		const bool place_held = operator_configured() && !operator_joined() && !would_be_operator(c, h);
+		if (m_joined.size() + (place_held ? 1 : 0) >= limits::client_capacity(m_max_players, m_cfg.host_plays))
 		{
 			reject_conn(c, RejectReason::SessionFull,
 				"The session is full (" + std::to_string(m_max_players) + " players).", nullptr);
@@ -1314,6 +1333,7 @@ struct Session::Impl
 		c.info.state = PeerState::Joined;
 		c.info.key = h.key;
 		c.info.nick = sanitize_nick(h.nick, ("Player" + std::to_string(slot)).c_str());
+		c.info.host_rights = operator_of(c, h); // protocol 31; the Welcome is the same whatever it says
 		c.epoch = m_epoch; // R2 I1: a newcomer is in the world the host serves now
 		m_joined[slot] = &c;
 
@@ -1323,6 +1343,7 @@ struct Session::Impl
 		w.host_nick = m_cfg.nick;
 		w.max_players = m_max_players;
 		w.world_epoch = m_epoch;
+		w.flags = welcome_flags();
 		Writer ww;
 		w.write(ww);
 		send_core(c, Msg::Welcome, ww);
@@ -1368,6 +1389,7 @@ struct Session::Impl
 		w.host_nick = m_cfg.nick;
 		w.max_players = m_max_players;
 		w.world_epoch = m_epoch;
+		w.flags = welcome_flags();
 		Writer ww;
 		w.write(ww);
 		send_core(c, Msg::Welcome, ww);
@@ -1379,15 +1401,113 @@ struct Session::Impl
 		broadcast_peer_list({});
 	}
 
+	// Protocol 31: what the Welcome says of the host's own seat.
+	uint8_t welcome_flags() const { return m_cfg.host_plays ? uint8_t(WelcomeMsg::HostSeatPlays) : uint8_t(0); }
+
+	bool operator_configured() const { return !op::token_none(m_cfg.operator_token.data(), kHelloTokenSize); }
+	bool operator_joined() const
+	{
+		for (const auto& kv : m_joined)
+			if (kv.second->info.host_rights)
+				return true;
+		return false;
+	}
+	// What operator_of would answer, with nothing bound and nothing logged: asked before the place is given.
+	bool would_be_operator(const Conn& c, const HelloMsg& h) const
+	{
+		const bool presented = !op::token_none(h.token, kHelloTokenSize);
+		const bool bound = m_operator_bound && op::token_equal(m_operator_bound_token.data(), m_cfg.operator_token.data(), kHelloTokenSize);
+		const bool matches = op::token_equal(h.token, m_cfg.operator_token.data(), kHelloTokenSize) && presented && operator_configured();
+		return op::operator_verdict(mapserver::loopback_address(c.info.address), matches, bound ? &m_operator_key : nullptr, h.key) ==
+			op::Verdict::Operator;
+	}
+
+	// Protocol 31 (coop_operator.h, plan §2.2): does this player's Hello make him the operator? Every answer lets him in the same
+	// way; only the server's log tells the verdicts apart, and never with the token.
+	bool operator_of(const Conn& c, const HelloMsg& h)
+	{
+		const bool presented = !op::token_none(h.token, kHelloTokenSize);
+		const bool configured = !op::token_none(m_cfg.operator_token.data(), kHelloTokenSize);
+		if (m_operator_bound && !op::token_equal(m_operator_bound_token.data(), m_cfg.operator_token.data(), kHelloTokenSize))
+			m_operator_bound = false; // another token now: its binding starts anew
+		const bool matches = op::token_equal(h.token, m_cfg.operator_token.data(), kHelloTokenSize) && presented && configured;
+		const op::Verdict v = op::operator_verdict(
+			mapserver::loopback_address(c.info.address), matches, m_operator_bound ? &m_operator_key : nullptr, h.key);
+		switch (v)
+		{
+		case op::Verdict::Operator:
+			if (!m_operator_bound)
+			{
+				m_operator_bound = true;
+				m_operator_key = h.key;
+				m_operator_bound_token = m_cfg.operator_token;
+			}
+			logf("host: operator: peer %u '%s' holds the host's rights", unsigned(c.info.id), c.info.nick.c_str());
+			return true;
+		case op::Verdict::OtherKey:
+			logf("! host: peer %u '%s' presented the operator token with another player key: an ordinary player",
+				unsigned(c.info.id), c.info.nick.c_str());
+			return false;
+		case op::Verdict::NoMatch:
+			if (presented)
+				logf("host: peer %u '%s' presented a token that is not the operator's: an ordinary player", unsigned(c.info.id),
+					c.info.nick.c_str());
+			return false;
+		case op::Verdict::NotLoopback:
+			if (presented)
+				logf("host: peer %u '%s' presented a token from another PC: not looked at, an ordinary player",
+					unsigned(c.info.id), c.info.nick.c_str());
+			return false;
+		}
+		return false;
+	}
+
+	// Protocol 31, host: one console line of the operator (plan §2.3). The rate first (a token of the row OperatorCommand), then
+	// the sender, the length and the list (op::command_verdict). A refusal is counted and logged, the sender is not kicked and
+	// gets no answer. What passes goes to on_operator_command: stage 3 runs it.
+	void host_operator_command(Conn& c, Reader& r)
+	{
+		OperatorCommandMsg msg;
+		if (c.info.state != PeerState::Joined || !msg.read(r))
+		{
+			malformed(c, "OperatorCommand");
+			return;
+		}
+		if (!within_rate(c, uint16_t(Msg::OperatorCommand)))
+			return;
+		const op::Command v = op::command_verdict(c.info.host_rights && !c.bridge && !c.virt, msg.line);
+		if (v != op::Command::Run)
+		{
+			++m_operator_refused;
+			if (m_operator_refused != 1 && m_operator_refused % 100 != 0)
+				return; // one line for the first refusal and for every 100th: a player cannot fill the log with them
+			std::string shown = msg.line.substr(0, 64);
+			sanitize_chat(shown);
+			logf("host: operator command from peer %u '%s' refused (%s): '%s'%s", unsigned(c.info.id), c.info.nick.c_str(),
+				op::command_name(v), shown.c_str(), msg.line.size() > 64 ? "..." : "");
+			return;
+		}
+		const PeerId from = c.info.id;
+		const std::string line = msg.line;
+		logf("host: operator command from peer %u: %s", unsigned(from), line.c_str());
+		emit([this, from, line] {
+			if (m_self.on_operator_command)
+				m_self.on_operator_command(from, line);
+		});
+	}
+
 	void broadcast_peer_list(const std::vector<PeerListNotice>& departed)
 	{
 		Writer w;
 		w.varu(m_joined.size());
 		for (const auto& kv : m_joined)
 		{
-			w.u32(kv.first);
-			w.str(kv.second->info.nick);
-			w.u32(player_key_hash(kv.second->info.key));
+			PeerListEntry e;
+			e.slot = kv.first;
+			e.nick = kv.second->info.nick;
+			e.key_hash = player_key_hash(kv.second->info.key);
+			e.flags = kv.second->info.host_rights ? uint8_t(PeerListEntry::Operator) : uint8_t(0);
+			e.write(w);
 		}
 		w.varu(departed.size());
 		for (const PeerListNotice& d : departed)
@@ -1489,6 +1609,8 @@ struct Session::Impl
 		m_host_info.state = PeerState::Joined;
 		m_host_info.nick = w.host_nick;
 		m_host_info.address = m_server_text;
+		m_host_info.plays = (w.flags & WelcomeMsg::HostSeatPlays) != 0; // protocol 31
+		m_self_host_rights = false; // the PeerList says
 		c.info = m_host_info;
 		logf("client: welcome from '%s', my slot is %u", w.host_nick.c_str(), unsigned(w.slot));
 		emit([this, w] {
@@ -1533,7 +1655,7 @@ struct Session::Impl
 			return;
 		std::map<PeerId, PeerListEntry> entries;
 		const uint64_t count = r.varu();
-		if (!r.ok() || count > r.remaining() / 9)
+		if (!r.ok() || count > r.remaining() / PeerListEntry::kMinWire)
 		{
 			malformed(c, "PeerList");
 			return;
@@ -1541,11 +1663,11 @@ struct Session::Impl
 		for (uint64_t i = 0; i < count; ++i)
 		{
 			PeerListEntry e;
-			e.slot = r.u32();
-			e.nick = r.str();
-			e.key_hash = r.u32();
-			if (!r.ok())
-				break;
+			if (!e.read(r))
+			{
+				malformed(c, "PeerList");
+				return;
+			}
 			entries[e.slot] = e;
 		}
 		std::map<PeerId, std::string> departed;
@@ -1584,18 +1706,23 @@ struct Session::Impl
 		for (const auto& kv : entries)
 		{
 			const PeerId id = kv.first;
+			const bool rights = (kv.second.flags & PeerListEntry::Operator) != 0; // protocol 31
+			if (id == m_self_id)
+				m_self_host_rights = rights;
 			if (id == m_self_id || id == kHostPeer)
 				continue;
 			auto it = m_remote.find(id);
 			if (it != m_remote.end())
 			{
 				it->second.nick = kv.second.nick;
+				it->second.host_rights = rights;
 				continue;
 			}
 			PeerInfo pi;
 			pi.id = id;
 			pi.state = PeerState::Joined;
 			pi.nick = kv.second.nick;
+			pi.host_rights = rights;
 			m_remote[id] = pi;
 			emit_peer_joined(pi);
 		}
@@ -1964,6 +2091,7 @@ struct Session::Impl
 		m_cstate = CState::Idle;
 		m_self_id = kInvalidPeer;
 		m_host_info = PeerInfo();
+		m_self_host_rights = false;
 		m_deadline_set = false;
 		m_transport_up = false;
 	}
@@ -2042,7 +2170,8 @@ bool Session::host(const SessionConfig& cfg, std::string* err)
 
 		std::string e;
 		// F3a: the players, the bridges of the map servers, and room for the refusals of whoever else knocks
-		if (!s.m_tp.listen(cfg.port, (s.m_max_players - 1) + mapserver::kMaxBridges + kPendingPeerSlots, &e))
+		if (!s.m_tp.listen(cfg.port,
+				limits::client_capacity(s.m_max_players, cfg.host_plays) + mapserver::kMaxBridges + kPendingPeerSlots, &e))
 		{
 			s.logf("host: cannot listen on port %u: %s", unsigned(cfg.port), e.c_str());
 			if (err)
@@ -2328,6 +2457,7 @@ std::vector<PeerInfo> Session::players() const
 		me.key = m->m_cfg.key;
 		me.address = "local";
 		me.local = true;
+		me.plays = m->m_cfg.host_plays; // protocol 31
 		out.push_back(std::move(me));
 	}
 	std::vector<PeerInfo> remote = peers();
@@ -2658,6 +2788,34 @@ Session::WorldGateStats Session::world_gate_stats() const
 	out.gaps = m->m_gaps;
 	return out;
 }
+
+bool Session::send_operator_command(const std::string& line)
+{
+	Impl& s = *m;
+	try
+	{
+		if (s.m_role != Role::Client || s.m_cstate != Impl::CState::Joined || !s.m_server)
+			return false;
+		OperatorCommandMsg msg;
+		msg.line = line;
+		Writer w;
+		msg.write(w);
+		s.send_core(*s.m_server, Msg::OperatorCommand, w);
+		return true;
+	}
+	catch (...)
+	{
+		s.logf("internal exception in send_operator_command() was suppressed");
+		return false;
+	}
+}
+
+bool Session::self_host_rights() const
+{
+	return m->m_role == Role::Client && m->m_cstate == Impl::CState::Joined && m->m_self_host_rights;
+}
+
+uint64_t Session::operator_refused() const { return m->m_operator_refused; }
 
 void Session::send_chat(const std::string& text)
 {

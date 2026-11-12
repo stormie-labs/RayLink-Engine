@@ -23,6 +23,7 @@ const char* msg_name(Msg type)
 	case Msg::PeerList: return "PeerList";
 	case Msg::Chat: return "Chat";
 	case Msg::WorldEpoch: return "WorldEpoch";
+	case Msg::OperatorCommand: return "OperatorCommand";
 
 	// Msg::GameBase aliases Msg::JoinRequest (same value) and is reported under that name.
 	case Msg::JoinRequest: return "JoinRequest";
@@ -295,7 +296,8 @@ MsgSender msg_sender(Msg type)
 	case Msg::BlobEnd:
 	case Msg::PeerList:
 	case Msg::Chat:
-	case Msg::WorldEpoch: return MsgSender::Either;
+	case Msg::WorldEpoch:
+	case Msg::OperatorCommand: return MsgSender::Either;
 	}
 	return MsgSender::Either; // not a message of the protocol: no handler takes it
 }
@@ -510,6 +512,7 @@ void WelcomeMsg::write(Writer& w) const
 	w.str(host_nick);
 	w.u32(max_players);
 	w.u32(world_epoch);
+	w.u8(flags); // protocol 31
 }
 
 bool WelcomeMsg::read(Reader& r)
@@ -519,6 +522,32 @@ bool WelcomeMsg::read(Reader& r)
 	host_nick = r.str();
 	max_players = r.u32();
 	world_epoch = r.u32();
+	flags = r.u8();
+	return r.ok() && (flags & ~uint8_t(Known)) == 0;
+}
+
+void PeerListEntry::write(Writer& w) const
+{
+	w.u32(slot);
+	w.str(nick);
+	w.u32(key_hash);
+	w.u8(flags); // protocol 31
+}
+
+bool PeerListEntry::read(Reader& r)
+{
+	slot = r.u32();
+	nick = r.str();
+	key_hash = r.u32();
+	flags = r.u8();
+	return r.ok() && (flags & ~uint8_t(Known)) == 0;
+}
+
+void OperatorCommandMsg::write(Writer& w) const { w.str(line); }
+
+bool OperatorCommandMsg::read(Reader& r)
+{
+	line = r.str();
 	return r.ok();
 }
 
@@ -544,7 +573,7 @@ bool RejectMsg::read(Reader& r)
 
 void AvatarListMsg::write(Writer& w) const
 {
-	const size_t count = std::min<size_t>(owners.size(), kMaxPlayers);
+	const size_t count = std::min<size_t>(owners.size(), kMaxPeerSlots);
 	w.u8(uint8_t(count));
 	for (size_t i = 0; i < count; ++i)
 	{
@@ -557,7 +586,7 @@ bool AvatarListMsg::read(Reader& r)
 {
 	owners.clear();
 	const uint8_t count = r.u8();
-	if (!r.ok() || count > kMaxPlayers)
+	if (!r.ok() || count > kMaxPeerSlots)
 		return false;
 	std::vector<AvatarOwner> rows;
 	rows.reserve(count);
@@ -566,7 +595,7 @@ bool AvatarListMsg::read(Reader& r)
 		AvatarOwner o;
 		o.avatar = r.u16();
 		o.peer = r.u32();
-		if (!r.ok() || o.avatar == 0xFFFF || o.peer >= kMaxPlayers)
+		if (!r.ok() || o.avatar == 0xFFFF || o.peer >= kMaxPeerSlots)
 			return false;
 		// id 0 is the host's own actor, and the host plays nothing else
 		if ((o.avatar == 0) != (o.peer == kHostPeer))

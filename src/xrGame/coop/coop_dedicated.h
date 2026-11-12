@@ -11,6 +11,9 @@
 #pragma once
 
 #include "xrCoop/coop_dedicated_rules.h"
+#include "xrCoop/coop_protocol.h" // PeerId
+
+#include <string>
 
 class CALifeObjectRegistry;
 
@@ -34,5 +37,15 @@ void frame();
 bool place_ghost(CALifeObjectRegistry& objects);
 // The commands; from coop::register_console_commands.
 void register_console();
+
+// Plan 2026-11-12 §2.3: a line of the operator of a world server (Session::on_operator_command: it passed the rate, the sender, the length
+// and op::allowed). Checked again here (still joined, still the operator, op::command_verdict), then decided by what it means for him:
+// coop_kick never kicks himself, coop_dbg runs as his peer's request and never a command of the server's own console, coop_game_set is
+// not run (no table of game values on the server yet). The rest goes the way of a line of the server's own pipe, not recorded in the
+// console's history. What the command says through the answers below goes back to him as the ScriptEvent "coop.op.answer"
+// ({ cmd = <first word>, text = <lines joined by "\n">, ok = bool }). Host, main thread.
+void run_for(PeerId from, const std::string& line);
+// A line a command of this process says to its operator: kept while run_for runs a command, nothing otherwise.
+void answer_line(const char* line);
 } // namespace dedicated
 } // namespace coop

@@ -20,8 +20,11 @@
 #include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
 #include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
 #include "coop_debug.h" // protocol 29: debug::register_lua (coop.debug)
+#include "coop_world_server.h" // plan 2026-11-12 stage 6a: world_server::register_lua (coop.world_server, coop.machine_memory)
 #include "xrCoop/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
+#include "xrCoop/coop_roster.h" // plan 2026-11-12 stage 3: who is listed as a player, who has the host's badge
+#include "xrCoop/coop_operator.h" // op::kMaxLine: coop.operator_command
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -74,6 +77,7 @@ struct ChatLine
 {
 	std::string nick, text;
 	u64 t_ms = 0;
+	PeerId from = kInvalidPeer; // the sender's peer, kInvalidPeer if not known
 };
 
 // Engine facts for Lua (W5), queued by engine code, delivered from frame().
@@ -553,7 +557,11 @@ void deliver_chat()
 		{
 			lua_pushlstring(L, c.nick.data(), c.nick.size());
 			lua_pushlstring(L, c.text.data(), c.text.size());
-			return 2;
+			if (c.from == kInvalidPeer)
+				lua_pushnil(L);
+			else
+				lua_pushnumber(L, lua_Number(c.from));
+			return 3;
 		}))
 			++g_stats.chat_delivered;
 	}
@@ -687,17 +695,42 @@ bool arg_id(lua_State* L, int idx, lua_Number& out)
 	return out >= 0 && out <= lua_Number(0xffffffffu);
 }
 
+// Plan 2026-11-12 stage 3 (xrCoop/coop_roster.h): whether the host's seat is a player. A host knows its own (a dedicated host's is not), a
+// client from peer 0's row (Welcome flags HostSeatPlays); a session with no row 0 (a map server's) counts as an ordinary host.
+bool host_seat_plays()
+{
+	if (mgr().is_host())
+		return !g_coop_dedicated;
+	return roster::host_plays_in(mgr().session().peers(), true);
+}
+
+// This machine's own row for the roster rules: it plays unless it is a host whose seat does not; a client holds the host's rights when
+// the host's PeerList says so (Session::self_host_rights).
+PeerInfo self_row(PeerId self)
+{
+	PeerInfo me;
+	me.id = self;
+	me.state = PeerState::Joined;
+	me.plays = !(mgr().is_host() && g_coop_dedicated);
+	me.host_rights = mgr().session().self_host_rights();
+	return me;
+}
+
 // coop.players() -> { {id=, nick=, avatar_id= (local numbering, nil if unknown), rtt=, loss= (0..1, the transport's
-// smoothed packet loss; 0 for ourselves), is_self=}, ... } (loss: scripts\coop_hud_netgraph)
+// smoothed packet loss; 0 for ourselves), is_self=, is_host= (the host's badge: the playing host's row, or the operator's when the
+// host's seat plays no character)}, ... } (loss: scripts\coop_hud_netgraph). A seat that plays no character (a world server's own) is
+// in no row (coop_roster.h).
 int l_players(lua_State* L)
 {
 	lua_newtable(L);
 	if (!mgr().active())
 		return 1;
 	const PeerId self = mgr().self();
+	const bool host_plays = host_seat_plays();
 	int index = 0;
-	auto push_entry = [L, &index, self](PeerId id, const char* nick, u16 avatar, u32 rtt, float loss)
+	auto push_entry = [L, &index, self, host_plays](const PeerInfo& row, const char* nick, u16 avatar, u32 rtt, float loss)
 	{
+		const PeerId id = row.id;
 		lua_newtable(L);
 		lua_pushnumber(L, lua_Number(id));
 		lua_setfield(L, -2, "id");
@@ -714,6 +747,8 @@ int l_players(lua_State* L)
 		lua_setfield(L, -2, "loss");
 		lua_pushboolean(L, id == self);
 		lua_setfield(L, -2, "is_self");
+		lua_pushboolean(L, roster::host_badge(row, host_plays));
+		lua_setfield(L, -2, "is_host");
 		// F3a: where he stands: the HUD says so of a player on another level, his markers and distance mean nothing here
 		const levels::LevelId level = levels::level_of_player(id);
 		if (level != levels::wire::kNoLevel)
@@ -725,14 +760,77 @@ int l_players(lua_State* L)
 		}
 		lua_rawseti(L, -2, ++index);
 	};
-	if (self != kInvalidPeer && !g_coop_dedicated) // a dedicated host is nobody in the list of the players
-		push_entry(self, mgr().nick(), 0, 0, 0.f); // our own actor is always id 0 here
+	const PeerInfo me = self_row(self);
+	if (self != kInvalidPeer && roster::listed(me)) // a dedicated host is nobody in the list of the players
+		push_entry(me, mgr().nick(), 0, 0, 0.f); // our own actor is always id 0 here
 	for (const PeerInfo& p : mgr().session().peers())
 	{
-		if (p.id == self)
+		if (p.id == self || !roster::listed(p))
 			continue;
-		push_entry(p.id, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms, p.packet_loss);
+		push_entry(p, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms, p.packet_loss);
 	}
+	return 1;
+}
+
+// coop.server_link() -> a joined client: { id = 0, nick = the host's, rtt = ms, loss = 0..1 (the transport's smoothed loss), plays = the
+// host's seat is a player, operator = this client holds the host's rights } of its connection to the host (the world server); nil on a
+// host, a map server and outside a session. The net graph and the test plan take the server's ping from here, not from a row of
+// coop.players() (a world server's seat is in no list).
+int l_server_link(lua_State* L)
+{
+	const Manager& m = mgr();
+	const PeerInfo* h = m.active() && m.is_client() && m.session().role() == Role::Client ? m.session().peer(kHostPeer) : nullptr;
+	if (!h)
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_newtable(L);
+	lua_pushnumber(L, lua_Number(h->id));
+	lua_setfield(L, -2, "id");
+	lua_pushstring(L, h->nick.c_str());
+	lua_setfield(L, -2, "nick");
+	lua_pushnumber(L, lua_Number(h->rtt_ms));
+	lua_setfield(L, -2, "rtt");
+	lua_pushnumber(L, lua_Number(h->packet_loss));
+	lua_setfield(L, -2, "loss");
+	lua_pushboolean(L, h->plays);
+	lua_setfield(L, -2, "plays");
+	lua_pushboolean(L, m.session().self_host_rights());
+	lua_setfield(L, -2, "operator");
+	return 1;
+}
+
+// coop.has_host_rights() -> bool: this process is the host (coop.is_host()), or a client the world server made its operator.
+int l_has_host_rights(lua_State* L)
+{
+	lua_pushboolean(L, mgr().is_host() || mgr().session().self_host_rights());
+	return 1;
+}
+
+// coop.operator_command(line) -> true | false, why ("bad_line", "not_joined", "not_operator"). Sends one console line to the world
+// server (Msg::OperatorCommand); the server checks the rights and the line again and answers with the ScriptEvent "coop.op.answer"
+// ({ cmd, ok, text }). true says it was sent, not that it ran.
+int fail2(lua_State* L, const char* why);
+int l_operator_command(lua_State* L)
+{
+	size_t n = 0;
+	const char* s = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &n) : nullptr;
+	if (!s || n == 0 || n > op::kMaxLine)
+		return fail2(L, "bad_line");
+	const Manager& m = mgr();
+	if (!m.active() || !m.is_client() || m.session().role() != Role::Client)
+		return fail2(L, "not_joined");
+	if (!m.session().self_host_rights())
+		return fail2(L, "not_operator");
+	// A line the server would refuse (op::allowed) gets no answer from it: say so here (live 2026-11-13: "coop_dbg lua x=1" was
+	// "sent" and nothing came back).
+	const std::string line(s, n);
+	if (!op::allowed(line))
+		return fail2(L, "bad_line");
+	if (!mgr().session().send_operator_command(line))
+		return fail2(L, "not_joined");
+	lua_pushboolean(L, 1);
 	return 1;
 }
 
@@ -1310,9 +1408,11 @@ int l_session_info(lua_State* L)
 	// players: this machine first, then the session's peers (client: host + the PeerList)
 	lua_newtable(L);
 	int index = 0;
-	auto push_player = [L, &index](PeerId id, const char* nick, u32 rtt, float loss, bool joined, bool self,
+	const bool host_plays = m.active() && host_seat_plays();
+	auto push_player = [L, &index, host_plays](const PeerInfo& row, const char* nick, u32 rtt, float loss, bool joined, bool self,
 	                       const char* address)
 	{
+		const PeerId id = row.id;
 		lua_newtable(L);
 		set_field(L, "id", lua_Number(id));
 		set_field(L, "nick", std::string(nick ? nick : ""));
@@ -1320,7 +1420,7 @@ int l_session_info(lua_State* L)
 		set_field(L, "loss", lua_Number(loss));
 		set_bool(L, "joined", joined);
 		set_bool(L, "is_self", self);
-		set_bool(L, "is_host", id == kHostPeer);
+		set_bool(L, "is_host", roster::host_badge(row, host_plays)); // plan 2026-11-12 stage 3 (coop_roster.h)
 		if (address && *address)
 			set_field(L, "address", std::string(address));
 		lua_rawseti(L, -2, ++index);
@@ -1328,13 +1428,14 @@ int l_session_info(lua_State* L)
 	if (m.active())
 	{
 		const PeerId self = m.self();
-		if (self != kInvalidPeer)
-			push_player(self, m.nick(), 0, 0.f, true, true, nullptr);
+		const PeerInfo me = self_row(self);
+		if (self != kInvalidPeer && roster::listed(me)) // a world server's own seat is no player (coop_roster.h)
+			push_player(me, m.nick(), 0, 0.f, true, true, nullptr);
 		for (const PeerInfo& p : m.session().peers())
 		{
-			if (p.id == self)
+			if (p.id == self || !roster::listed(p))
 				continue;
-			push_player(p.id, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
+			push_player(p, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
 			    m.is_host() ? p.address.c_str() : nullptr);
 		}
 	}
@@ -1722,6 +1823,9 @@ void register_raw(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
 		{"players", &l_players},
+		{"server_link", &l_server_link}, // plan 2026-11-12 stage 3
+		{"has_host_rights", &l_has_host_rights},
+		{"operator_command", &l_operator_command},
 		{"members", &l_members},
 		{"avatar_of", &l_avatar_of},
 		{"peer_of_avatar", &l_peer_of_avatar},
@@ -1782,6 +1886,7 @@ void register_raw(lua_State* L)
 	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
 	levels::register_lua(L); // F3a: coop.levels.*, coop.is_world_server / is_map_authority / is_player / is_mirror (coop_levels.cpp)
 	debug::register_lua(L); // protocol 29: coop.debug.* (coop_debug.h)
+	world_server::register_lua(L); // plan 2026-11-12 stage 6a: coop.world_server.*, coop.machine_memory (coop_world_server.h)
 }
 } // namespace
 
@@ -1902,7 +2007,7 @@ void queue_callback(const char* name, std::initializer_list<CallbackArg> args)
 	push_engine_event(std::move(e));
 }
 
-void on_chat(const char* nick, const char* text)
+void on_chat(const char* nick, const char* text, uint32_t from)
 {
 	if (!text || !*text)
 		return;
@@ -1914,6 +2019,7 @@ void on_chat(const char* nick, const char* text)
 	ChatLine c;
 	c.nick = nick ? nick : "?";
 	c.text = text;
+	c.from = from;
 	c.t_ms = mgr().now_ms();
 	g_chat.push_back(std::move(c));
 }

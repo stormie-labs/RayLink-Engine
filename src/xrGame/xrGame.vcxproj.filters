@@ -2523,6 +2523,9 @@
     <ClInclude Include="coop\coop_levels.h">
       <Filter>Coop</Filter>
     </ClInclude>
+    <ClInclude Include="coop\coop_levels_map.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_game_settings.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -2614,6 +2617,9 @@
       <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_world.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_world_server.h">
       <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_join.h">
@@ -7641,6 +7647,9 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_world.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_world_server.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_join.cpp">

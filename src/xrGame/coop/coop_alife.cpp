@@ -23,7 +23,7 @@ float observer_distance(const Fvector& pos)
 	if (!is_map_authority())
 		return best;
 
-	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
+	for (u32 peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		const u16 proxy = join::proxy_of_peer(peer);
 		if (proxy == 0xffff || !levels::on_host_level(peer))

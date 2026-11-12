@@ -51,9 +51,13 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_split_levels",
 	"coop_story_together",
 	"coop_npc_finish_downed",
+	// Owner 2026-11-13: the old split mode stays, the new one is a choice of its own. On: a new world with split levels runs as a
+	// world server, a process of its own on the creator's PC, and his game joins it. Only Lua reads it (the new game screen,
+	// Continue); the engine keeps the value in the game's record like any rule.
+	"coop_world_server",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
-static_assert(kGameCvarCount == 20, "docs/GAME_SETTINGS.md §1.2 lists 20 game rules");
+static_assert(kGameCvarCount == 21, "docs/GAME_SETTINGS.md §1.2 lists 21 game rules");
 
 // The longest value of a rule: a number or a token name (the longest of them, "checkpoint", has ten characters).
 constexpr size_t kMaxCvarValue = 64;

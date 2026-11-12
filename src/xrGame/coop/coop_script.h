@@ -83,8 +83,10 @@ enum class CallResult : u8
 	Failed,
 };
 CallResult call_now(const char* module, const char* fn, int (*push)(lua_State* L, const void* ctx), const void* ctx);
-// A chat line from another player arrived: shown in the HUD by coop_main.on_chat(nick, text).
-void on_chat(const char* nick, const char* text);
+// A chat line arrived: shown in the HUD by coop_main.on_chat(nick, text, from). `from`: the sender's peer id (0 = the host or the world
+// server; Lua shows a line of a world server's own seat from "World" by this, never by a nick a player could take); 0xffffffff
+// (kInvalidPeer): not known, Lua gets nil.
+void on_chat(const char* nick, const char* text, uint32_t from = 0xffffffffu);
 // Client: the host refused the handshake. Keeps the reason, the host's text and the mod-list diff; a frame
 // pump shows them through coop_ui.on_rejected as soon as a dialog can be opened (main menu or in game).
 // Main thread (Session callback). Survives reset(); a newer refusal replaces an unshown one.

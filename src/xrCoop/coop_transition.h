@@ -66,7 +66,7 @@
 #include <vector>
 
 #include "coop_load_barrier.h" // F3a T3: levels::LoadBarrier, kLoadWaitMs
-#include "coop_protocol.h" // Writer, Reader, Msg, kMaxPlayers
+#include "coop_protocol.h" // Writer, Reader, Msg, kMaxPeerSlots
 
 namespace coop
 {
@@ -642,7 +642,7 @@ struct StateMsg
 		countdown_ms = r.u32();
 		load_ms = r.u32();
 		const uint8_t n = r.u8();
-		if (!r.ok() || s > uint8_t(State::Going) || kind > 1 || level.size() > kMaxLevelName || n > kMaxPlayers)
+		if (!r.ok() || s > uint8_t(State::Going) || kind > 1 || level.size() > kMaxLevelName || n > kMaxPeerSlots)
 			return false;
 		state = State(s);
 		rows.clear();
@@ -678,8 +678,8 @@ inline StateMsg state_message(const Status& s, const std::string& level)
 	m.total = uint16_t(s.total);
 	m.load_ms = s.load_ms;
 	m.rows = s.rows;
-	if (m.rows.size() > kMaxPlayers)
-		m.rows.resize(kMaxPlayers);
+	if (m.rows.size() > kMaxPeerSlots)
+		m.rows.resize(kMaxPeerSlots);
 	return m;
 }
 

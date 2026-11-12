@@ -819,6 +819,8 @@ const char* level_change_name()
 
 const char* level_change_temp_name() { return g_level_slot ? kTempStem : nullptr; }
 
+const char* world_server_level_change_name() { return g_coop_dedicated ? kTempStem : nullptr; }
+
 const char* level_change_commit()
 {
 	const uint32_t first = g_level_slot;

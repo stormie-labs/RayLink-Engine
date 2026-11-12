@@ -72,8 +72,8 @@ xr_vector<Throw> g_flights;
 // Audit F11: the strongest NPC about to notice each remote player, since the last look.
 constexpr u16 kSeenSource = 0xfffe; // the key of the host's word in the actor's table of who notices it: no object has it
 xrCriticalSection g_seen_lock; // vision runs in AI think, frame() takes them
-float g_seen_top[kMaxPlayers] = {};
-float g_seen_sent[kMaxPlayers] = {};
+float g_seen_top[kMaxPeerSlots] = {};
+float g_seen_sent[kMaxPeerSlots] = {};
 u32 g_seen_next = 0;
 
 struct Playing
@@ -370,7 +370,7 @@ void host_seen_frame(bool world_up)
 	if (now < g_seen_next)
 		return;
 	g_seen_next = now + enemy_rules::kSeenEachMs;
-	float top[kMaxPlayers];
+	float top[kMaxPeerSlots];
 	{
 		xrCriticalSectionGuard guard(&g_seen_lock);
 		std::copy(std::begin(g_seen_top), std::end(g_seen_top), top);
@@ -381,7 +381,7 @@ void host_seen_frame(bool world_up)
 		std::fill(std::begin(g_seen_sent), std::end(g_seen_sent), 0.f);
 		return;
 	}
-	for (u32 peer = 1; peer < kMaxPlayers; ++peer)
+	for (u32 peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		if (!enemy_rules::seen_worth_sending(g_seen_sent[peer], top[peer]))
 			continue;
@@ -540,7 +540,7 @@ void host_seen(const CCustomMonster* observer, const CObject* player, float valu
 		return;
 	const CEntityAlive* body = smart_cast<const CEntityAlive*>(player);
 	const PeerId peer = world::avatar_peer(player->ID());
-	if (!body || peer >= kMaxPlayers || !observer->is_relation_enemy(body))
+	if (!body || peer >= kMaxPeerSlots || !observer->is_relation_enemy(body))
 		return;
 	xrCriticalSectionGuard guard(&g_seen_lock);
 	g_seen_top[peer] = std::max(g_seen_top[peer], value);

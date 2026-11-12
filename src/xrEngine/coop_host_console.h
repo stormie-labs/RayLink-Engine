@@ -5,6 +5,7 @@
 //
 // A standard input that is a pipe or a file at the start (a launcher, a test) is read beside the window.
 // -coop_hidden (plan 2026-11-12 stage 1): no window at all, only that input; its end (the launcher or the host's game died) is quit.
+// With it, a standard output that is a pipe or a file gets, in UTF-8, the lines the window would show and the @rl lines (stage 2).
 // Text in the game is cp1251, the window speaks UTF-16: the conversion is here.
 #pragma once
 
@@ -22,6 +23,13 @@ ENGINE_API void set_log_level(int level);
 ENGINE_API int log_level();
 // Writes a line whatever the log level: answers to the operator.
 ENGINE_API void print(const char* line);
+// -coop_hidden with a redirected standard output (plan 2026-11-12 stage 2): an "@rl ..." line for the parent
+// (xrCoop/coop_world_server_rules.h format), on that output only, never in the log or the window. Any thread, never blocks.
+ENGINE_API void rl_line(const char* line);
+// That output is on: -coop_hidden, a pipe or a file, and the parent has not closed it.
+ENGINE_API bool output_on();
+// Waits up to `ms` until every line queued so far is written (the last lines before the process exits). False: not all of it.
+ENGINE_API bool flush_output(unsigned ms);
 ENGINE_API void set_title(const char* title);
 // Main thread: the next line typed, false if there is none.
 ENGINE_API bool next_line(char* out, size_t size);

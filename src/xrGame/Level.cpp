@@ -63,6 +63,7 @@
 #include "alife_object_registry.h"
 
 #include "xrCoop/coop_prefetch_life.h" // Anomaly Coop: SPAWN_ANTIFREEZE prefetch thread life
+#include "xrCoop/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
 
 #ifdef DEBUG
 #include "level_debug.h"
@@ -348,7 +349,7 @@ CLevel::CLevel() :
     Msg("CLevel::CLevel() Spawn Antifreeze initialized");
 #endif
 
-    Msg("%s", Core.Params);
+    Msg("%s", coop::op::redact(Core.Params).c_str()); // Anomaly Coop: one-time tokens stay out of the log
     //crash_saving::save_impl = crash_saving::_save_impl; // CLevel ready, we can save now
 }
 

@@ -9,6 +9,8 @@
 #include "coop_money.h"
 #include "coop_net.h"
 #include "xrCoop/coop_scope.h"
+#include "xrCoop/coop_roster.h" // who is a player (plan 2026-11-12 stage 3)
+#include "coop_levels_map.h" // the rows of the LevelMap
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -33,6 +35,7 @@ namespace levels
 {
 int g_coop_split_levels = 0;
 int g_coop_story_together = 1;
+int g_coop_world_server = 0; // owner 2026-11-13: the new mode is a choice of its own; Lua reads it, the engine keeps it
 int g_coop_max_map_servers = 3;
 int g_coop_mapserver_linger = 60;
 int g_coop_soft_host_move = 1;
@@ -130,8 +133,8 @@ void host_send_map()
 {
 	wire::LevelMapMsg m;
 	m.flags = u8((split() ? wire::LevelMapMsg::Split : 0) | (story_together() ? wire::LevelMapMsg::StoryTogether : 0));
-	std::vector<u16> levels_seen;
-	for (const Seat& s : g.table.seats())
+	// plan 2026-11-12 stage 3: a seat that plays no character (the dedicated host's own) is on no map: no row, no server row for its level
+	for (const Seat& s : map_rows::listed_seats(g.table.seats()))
 	{
 		wire::LevelMapMsg::Player p;
 		p.peer = s.peer;
@@ -140,10 +143,8 @@ void host_send_map()
 		p.proxy = s.peer == kHostPeer ? u16(0) : join::proxy_of_peer(s.peer);
 		p.money = s.peer == kHostPeer ? 0 : money::host_balance(s.peer);
 		m.players.push_back(p);
-		if (s.level != wire::kNoLevel && std::find(levels_seen.begin(), levels_seen.end(), s.level) == levels_seen.end())
-			levels_seen.push_back(s.level);
 	}
-	for (u16 level : levels_seen)
+	for (u16 level : map_rows::levels_of(g.table.seats()))
 	{
 		wire::LevelMapMsg::Server row;
 		row.level = level;
@@ -290,8 +291,10 @@ u32 players_on(LevelId level)
 	}
 	if (level != my_level())
 		return 0;
-	// the peers() of the host are the clients, of a client the host and the others: this machine's own player is one more
-	return 1 + u32(mgr().session().peers().size());
+	// the peers() of the host are the clients, of a client the host and the others: this machine's own player is one more, unless it is
+	// a host whose seat plays no character; a seat that does not play is nobody (coop_roster.h)
+	const u32 self = mgr().is_host() && dedicated::on() ? 0u : 1u;
+	return self + roster::player_count(mgr().session().peers());
 }
 
 bool on_host_level(PeerId peer)
@@ -555,6 +558,9 @@ void register_console()
 {
 	CMD4(CCC_Integer, "coop_split_levels", &g_coop_split_levels, 0, 1); // game rule, applies at the world's start
 	CMD4(CCC_Integer, "coop_story_together", &g_coop_story_together, 0, 1); // game rule
+	// game rule (xrCoop/coop_game_values.h): a new world with split levels runs as a world server and its creator's game joins it. The
+	// new game screen and Continue read it; nothing in the engine does (a world server is split by being one: game_split)
+	CMD4(CCC_Integer, "coop_world_server", &g_coop_world_server, 0, 1);
 	CMD4(CCC_Integer, "coop_max_map_servers", &g_coop_max_map_servers, 0, 7); // machine setting
 	CMD4(CCC_Integer, "coop_mapserver_linger", &g_coop_mapserver_linger, 0, 3600); // machine setting, seconds
 	CMD4(CCC_Integer, "coop_soft_host_move", &g_coop_soft_host_move, 0, 1); // the way back for a live check: not a rule of the game
@@ -643,7 +649,7 @@ int l_my_level(lua_State* L)
 int l_level_of_player(lua_State* L)
 {
 	u32 peer = 0;
-	if (!arg_whole(L, 1, double(kMaxPlayers - 1), peer))
+	if (!arg_whole(L, 1, double(kMaxPeerSlots - 1), peer))
 		lua_pushnil(L);
 	else
 		push_level(L, level_of_player(PeerId(peer)));
@@ -676,7 +682,7 @@ int l_level_name(lua_State* L)
 int l_on_host_level(lua_State* L)
 {
 	u32 peer = 0;
-	lua_pushboolean(L, !arg_whole(L, 1, double(kMaxPlayers - 1), peer) || on_host_level(PeerId(peer)));
+	lua_pushboolean(L, !arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) || on_host_level(PeerId(peer)));
 	return 1;
 }
 // coop.levels.squads_at(bridge) -> the host's process: the ids of the squads that map server holds
@@ -757,7 +763,7 @@ int l_map_servers(lua_State* L)
 int l_bridge_of_player(lua_State* L)
 {
 	u32 peer = 0;
-	const PeerId bridge = arg_whole(L, 1, double(kMaxPlayers - 1), peer) && mgr().is_host() && !on_host_level(PeerId(peer)) ?
+	const PeerId bridge = arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && !on_host_level(PeerId(peer)) ?
 	    mapserver::bridge_of(level_of_player(PeerId(peer))) :
 	    kInvalidPeer;
 	if (bridge == kInvalidPeer)
@@ -772,7 +778,7 @@ int l_talking(lua_State* L)
 {
 	u32 peer = 0;
 	BodyFacts facts;
-	const bool told = arg_whole(L, 1, double(kMaxPlayers - 1), peer) && mgr().is_host() && body_facts(join::proxy_of_peer(PeerId(peer)), facts);
+	const bool told = arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && body_facts(join::proxy_of_peer(PeerId(peer)), facts);
 	lua_pushboolean(L, told && facts.talking);
 	return 1;
 }

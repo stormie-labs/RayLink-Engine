@@ -442,6 +442,7 @@
     <ClInclude Include="coop\coop_dedicated.h" />
     <ClInclude Include="coop\coop_monster_fx.h" />
     <ClInclude Include="coop\coop_levels.h" />
+    <ClInclude Include="coop\coop_levels_map.h" />
     <ClInclude Include="coop\coop_game_settings.h" />
     <ClInclude Include="coop\coop_callgate.h" />
     <ClInclude Include="coop\coop_sync_api.h" />
@@ -473,6 +474,7 @@
     <ClInclude Include="coop\coop_sync.h" />
     <ClInclude Include="coop\coop_players.h" />
     <ClInclude Include="coop\coop_world.h" />
+    <ClInclude Include="coop\coop_world_server.h" />
     <ClInclude Include="coop\coop_join.h" />
     <ClInclude Include="coop\coop_manager.h" />
     <ClInclude Include="..\3rd party\fastdelegate\fastdelegate.h" />
@@ -2163,6 +2165,7 @@
     <ClCompile Include="coop\coop_players.cpp" />
     <ClCompile Include="coop\coop_instrument.cpp" />
     <ClCompile Include="coop\coop_world.cpp" />
+    <ClCompile Include="coop\coop_world_server.cpp" />
     <ClCompile Include="coop\coop_join.cpp" />
     <ClCompile Include="coop\coop_console.cpp" />
     <ClCompile Include="coop\coop_manager.cpp" />

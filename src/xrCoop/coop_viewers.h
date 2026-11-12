@@ -33,7 +33,7 @@ struct Point
 	float x, y, z;
 };
 
-constexpr unsigned kMaxViewers = 8; // a host plus seven clients (kMaxPlayers); the host's camera is not in the list
+constexpr unsigned kMaxViewers = 8; // the clients: 7 of an ordinary host, 8 of a world server (kMaxPlayers); the host's camera is not in the list
 constexpr float kScaleDistance = 200.f; // CObject::shedule_Scale: distance / 200
 constexpr float kDefaultRange = 100.f; // m: a viewer matters for objects this close to it (console coop_viewer_range)
 constexpr float kMaxRange = 300.f;

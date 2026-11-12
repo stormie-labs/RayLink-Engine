@@ -232,8 +232,12 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 
 	string256 autoave_name;
 	LPCSTR coop_name = coop::autosave::level_change_name(); // Anomaly Coop: the host's coop_auto_N in a session
+	// Anomaly Coop: a world server outside a session never writes the stock name into the savedgames it shares with its creator
+	LPCSTR server_name = coop_name ? nullptr : coop::autosave::world_server_level_change_name();
 	if (coop_name)
 		xr_strcpy(autoave_name, coop_name);
+	else if (server_name)
+		xr_strcpy(autoave_name, server_name);
 	else
 		strconcat(sizeof(autoave_name), autoave_name, Core.UserName, " - ", "autosave");
 	LPCSTR temp0 = strstr(**m_server_command_line, "/");

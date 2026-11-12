@@ -11,7 +11,7 @@
 // The caller sends such a message another way (a blob for a big cargo, two packets for the squads) or not at all. The fixed
 // layouts have no limit to break and write() is void. A message within its limits is written and read back whole.
 //
-// Numbers of levels are game graph level ids (u16 on the wire, kNoLevel = none), players are session slots (PeerId < kMaxPlayers,
+// Numbers of levels are game graph level ids (u16 on the wire, kNoLevel = none), players are session slots (PeerId < kMaxPeerSlots,
 // the host is 0), objects are ids in the world server's numbering. The enums are numbered here, in the order of the plan's
 // table where it lists names alone; the logic that sends and handles them keeps its own types (coop_xfer.h, coop_levels_rules.h,
 // coop_load_barrier.h) and converts at the engine's edge.
@@ -48,7 +48,7 @@ constexpr uint32_t kNoNode = 0xFFFFFFFFu; // no level vertex
 // (coop_join.h BlobWorldSave); 2 is left for the prepared save of a simultaneous load (T8).
 constexpr uint32_t kBlobLevelState = 3;
 
-constexpr size_t kMaxMapPlayers = kMaxPlayers; // a row per player in the session
+constexpr size_t kMaxMapPlayers = kMaxPeerSlots; // a row per player slot of the session (seat 0 and clients 1 .. 8)
 constexpr size_t kMaxMapServers = 8; // the host's process and at most 7 map servers (coop_max_map_servers is 0..7)
 constexpr size_t kMaxMapGates = 128; // levels with a gate in one table
 constexpr size_t kMaxGateReason = 64; // a string id of the placard
@@ -96,7 +96,7 @@ inline bool printable(const std::string& s, size_t max)
 
 inline bool slot_ok(uint32_t peer)
 {
-	return peer < kMaxPlayers;
+	return peer < kMaxPeerSlots;
 }
 
 // Reads the `n` bytes left in `r` into `out` (the free tail of a message), at most `max`.
@@ -1045,7 +1045,7 @@ struct LoadWaitMsg
 	uint8_t reason = Group;
 
 	// A row for each player of the session at the most.
-	bool fits() const { return rows.size() <= kMaxPlayers; }
+	bool fits() const { return rows.size() <= kMaxPeerSlots; }
 
 	// False, nothing written, for more rows: a player cut away would be taken for one nobody waits for.
 	[[nodiscard]] bool write(Writer& w) const
@@ -1074,7 +1074,7 @@ struct LoadWaitMsg
 		tmp.level = r.u16();
 		tmp.reason = r.u8();
 		const uint8_t n = r.u8();
-		if (!r.ok() || tmp.state > Back || tmp.reason > HostAlone || n > kMaxPlayers)
+		if (!r.ok() || tmp.state > Back || tmp.reason > HostAlone || n > kMaxPeerSlots)
 			return false;
 		for (uint8_t i = 0; i < n; ++i)
 		{

@@ -71,6 +71,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::BlobEnd:
 	case Msg::PeerList:
 	case Msg::Chat:
+	case Msg::OperatorCommand:
 	case Msg::WorldEpoch: out = Scope::Core; return true;
 
 	// --- the world server: the join and the world's lifecycle (Join*, Transition*), the level moves of F3a

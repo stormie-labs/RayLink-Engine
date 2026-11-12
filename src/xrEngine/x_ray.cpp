@@ -35,6 +35,7 @@
 #include "renderdoc_integration.h"
 #include "../xrCore/raylink_version.h"
 #include "../xrCoop/coop_dedicated_rules.h" // Anomaly Coop
+#include "../xrCoop/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
 #include "coop_host_console.h" // Anomaly Coop
 
 extern "C" void XR_EARLY_INIT();
@@ -1279,7 +1280,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 		extern bool ignore_verify;
 		ignore_verify = !Core.ParamsData.test(ECoreParams::dbgdev);
 
-		Msg("command line %s", Core.Params);
+		Msg("command line %s", coop::op::redact(Core.Params).c_str()); // Anomaly Coop: one-time tokens stay out of the log
 		/*Msg("params: ");
 		for (const auto& v: Core.ParamsData.getBitsetAsMap())
 		{

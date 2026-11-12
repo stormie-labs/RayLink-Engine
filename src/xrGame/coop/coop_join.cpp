@@ -760,8 +760,8 @@ void host_send_owners()
 		bool listed = false;
 		for (const AvatarOwner& o : m.owners)
 			listed = listed || o.avatar == proxy;
-		if (listed || it.first == kHostPeer || it.first >= kMaxPlayers || m.owners.size() >= kMaxPlayers)
-			continue; // cannot happen (one character per player key, slots 1..7): clients would refuse the whole table
+		if (listed || it.first == kHostPeer || it.first >= kMaxPeerSlots || m.owners.size() >= kMaxPeerSlots)
+			continue; // cannot happen (one character per player key, slots 1..8): clients would refuse the whole table
 		AvatarOwner o;
 		o.avatar = proxy;
 		o.peer = it.first;
@@ -913,9 +913,15 @@ bool host_offer_character(PeerId from, const PeerInfo& p, const char* refusal)
 	return true;
 }
 
+// Plan 2026-11-12 stage 5 (below host_make_new_character): the creator's character from the world's staging file, no window.
+bool host_make_creator(PeerId from, const PeerInfo& p);
+void host_mark_creator_made(const char* nick);
+
 // The world for a player whose join the gate admitted: his character (found by key) and a fresh save of the world, or
 // (protocol 8) the offer of a new character, whose choice brings the world (host_on_char_choice). false if neither
 // could be sent (the player is gone or was kicked with the reason).
+// Plan 2026-11-12 stage 5: the operator (host_rights) without a character, in a world staged with a creator, gets his character made
+// from the record instead of the offer (host_make_creator); everybody else, and he in every other case, gets the offer.
 bool host_send_world(PeerId from)
 {
 	const PeerInfo* p = mgr().session().peer(from);
@@ -942,6 +948,8 @@ bool host_send_world(PeerId from)
 	}
 	if (!host_admits_new_key(from, *p, key_digest))
 		return false;
+	if (p->host_rights && host_make_creator(from, *p))
+		return true; // made (or, if that failed, the offer instead): host_make_new_character sent the world or the offer
 	if (host_offer_character(from, *p, nullptr))
 		return true; // the join stays in flight while he chooses
 	if (dedicated::on())
@@ -984,7 +992,10 @@ struct CharPlan
 // Protocol 8: player `from` chose. The host's Lua checks the choice and picks the start of the faction; the engine
 // makes the character there (offline: its player is not in the world yet), strips the NPC supplies, sets the faction;
 // the Lua gives the kit and the money; then the world save. A refused choice is offered again with the reason.
-void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg& m)
+// Plan 2026-11-12 stage 5: `exact` is the creator's character (host_make_creator): the Lua gives exactly the record's loadout, money and start
+// (host_plan_character / host_make_character with exact), and the record's creator is marked used after success. If it fails he gets the
+// offer, as anybody: the window is then his first choice.
+void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg& m, bool exact = false)
 {
 	if (!host_can_start())
 	{
@@ -1026,7 +1037,8 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 		lua_pushnumber(L, lua_Number(from));
 		lua_pushlstring(L, faction.data(), faction.size());
 		lua_pushlstring(L, buy.data(), buy.size());
-		return 3;
+		lua_pushboolean(L, exact ? 1 : 0);
+		return 4;
 	};
 	CharPlan plan;
 	const LuaCall planned = call_char("host_plan_character", push_choice, 1, [&](lua_State* L, int at) {
@@ -1047,8 +1059,9 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	if (planned != LuaCall::Done || !plan.ok)
 	{
 		++g.choices_refused;
-		::Msg("[coop] '%s' chose %s: refused (%s), asked again", p.nick.c_str(), faction.c_str(),
-		    planned == LuaCall::Done ? plan.reason.c_str() : "the host's script failed");
+		::Msg("[coop] '%s' chose %s: refused (%s), asked again%s", p.nick.c_str(), faction.c_str(),
+		    planned == LuaCall::Done ? plan.reason.c_str() : "the host's script failed",
+		    exact ? " (the creator's character from the staging file: the window instead)" : "");
 		host_ask_again(from, p, plan.reason.c_str());
 		return;
 	}
@@ -1086,7 +1099,8 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 		    lua_pushlstring(L, faction.data(), faction.size());
 		    lua_pushlstring(L, buy.data(), buy.size());
 		    lua_pushboolean(L, kit);
-		    return 5;
+		    lua_pushboolean(L, exact ? 1 : 0);
+		    return 6;
 	    },
 	    2, [&](lua_State* L, int at) {
 		    made = lua_toboolean(L, at) != 0;
@@ -1096,7 +1110,8 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	    });
 	if (given != LuaCall::Done || !made)
 	{
-		::Msg("! [coop] new character of '%s' not made (%s): released, asked again", p.nick.c_str(), why.c_str());
+		::Msg("! [coop] new character of '%s' not made (%s): released, asked again%s", p.nick.c_str(), why.c_str(),
+		    exact ? " (the creator's character from the staging file: the window instead)" : "");
 		if (had_entry)
 			hp.proxy = kNoId;
 		else
@@ -1109,10 +1124,132 @@ void host_make_new_character(PeerId from, const PeerInfo& p, const CharChoiceMsg
 	g.choosers.forget(from);
 	++g.characters_made;
 	::Msg("[coop] '%s' chose %s: character %u made before the world (%u NPC item(s) stripped, %.0f RU), sending the "
-	      "world",
-	    p.nick.c_str(), faction.c_str(), u32(proxy_id), stripped, plan.money);
+	      "world%s",
+	    p.nick.c_str(), faction.c_str(), u32(proxy_id), stripped, plan.money,
+	    exact ? " (the creator's character from the staging file, no window)" : "");
+	if (exact)
+		host_mark_creator_made(p.nick.c_str());
 	if (!host_send_save(from, p, *proxy))
 		g.gate.forget(from);
+}
+
+// ---------------------------------------------------------------- plan 2026-11-12 stage 5: the creator's character
+
+// coop_dedicated.<name at 1>, or nil; protected as char_lookup (the first lookup loads the script).
+int dedicated_lookup(lua_State* L)
+{
+	const char* fn = lua_tostring(L, 1);
+	lua_getglobal(L, "coop_dedicated");
+	if (!fn || !lua_istable(L, -1))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_getfield(L, -1, fn);
+	return 1;
+}
+
+// Protected call of coop_dedicated.<fn>() with one result, which `read(L, index)` reads. Never throws, leaves the stack as it was.
+template <typename Read>
+LuaCall call_dedicated(const char* fn, Read read)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 16))
+		return LuaCall::Missing;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &char_traceback);
+	const int errfunc = lua_gettop(L);
+	lua_pushcfunction(L, &dedicated_lookup);
+	lua_pushstring(L, fn);
+	if (lua_pcall(L, 1, 1, errfunc) != 0)
+	{
+		const char* err = lua_tostring(L, -1);
+		::Msg("! [coop] lua error looking up coop_dedicated.%s: %s", fn, err ? err : "?");
+		lua_settop(L, top);
+		return LuaCall::Failed;
+	}
+	if (!lua_isfunction(L, -1))
+	{
+		lua_settop(L, top);
+		return LuaCall::Missing;
+	}
+	if (lua_pcall(L, 0, 1, errfunc) != 0)
+	{
+		const char* err = lua_tostring(L, -1);
+		::Msg("! [coop] lua error in coop_dedicated.%s: %s", fn, err ? err : "?");
+		lua_settop(L, top);
+		return LuaCall::Failed;
+	}
+	read(L, errfunc + 1);
+	lua_settop(L, top);
+	return LuaCall::Done;
+}
+
+// The record's creator is made: the next save keeps creator.used, a restart never makes him a second character from the file.
+void host_mark_creator_made(const char* nick)
+{
+	bool marked = false;
+	const LuaCall call = call_dedicated("creator_made", [&](lua_State* L, int at) { marked = lua_toboolean(L, at) != 0; });
+	if (call != LuaCall::Done || !marked)
+		::Msg("! [coop] the creator's character of '%s' is made, but the record's creator could not be marked used (%s): his key finds the "
+		      "character from now on, the mark is only for a world without it",
+		    nick, call == LuaCall::Done ? "no creator in the record" : "coop_dedicated.creator_made failed");
+}
+
+// The operator `from` (host_rights: the token of the session, loopback only) joins a world without a character for his key. If the world was
+// staged from coop_new_world.ltx with a creator not made yet, and he chose a loadout (or to start bare) there, his character is made from it
+// through host_make_new_character with `exact`: no window. True: done that way (the world or, on a failure, the offer went out); false: the
+// caller offers the window as to anybody. Never for a peer without host_rights.
+bool host_make_creator(PeerId from, const PeerInfo& p)
+{
+	newchar::CreatorFacts f;
+	f.host_rights = p.host_rights;
+	f.has_proxy = false; // host_send_world: no character for his key
+	if (!f.host_rights)
+		return false;
+	std::string loadout;
+	const LuaCall call = call_dedicated("creator_facts", [&](lua_State* L, int at) {
+		if (!lua_istable(L, at))
+			return;
+		lua_getfield(L, at, "creator");
+		f.creator = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		lua_getfield(L, at, "used");
+		f.used = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		lua_getfield(L, at, "bare");
+		f.bare = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		lua_Number count = 0;
+		if (lua_number_field(L, at, "count", count) && count > 0)
+			f.loadout = size_t(_min(count, lua_Number(1e6)));
+		loadout = lua_string_field(L, at, "loadout");
+	});
+	if (call != LuaCall::Done)
+	{
+		::Msg("! [coop] '%s' is the operator, but coop_dedicated.creator_facts %s: the character window", p.nick.c_str(),
+		    call == LuaCall::Missing ? "is missing" : "failed");
+		return false;
+	}
+	if (!newchar::make_creator(f))
+	{
+		if (f.creator)
+			::Msg("[coop] '%s' is the operator; the world's creator %s: the character window", p.nick.c_str(),
+			    f.used ? "was made already" : "chose no loadout");
+		return false;
+	}
+	const std::string faction = newchar::character_faction(coop::game::world_faction(), host_actor_faction(), std::string());
+	CharChoiceMsg m;
+	if (!newchar::creator_choice(faction, loadout, m))
+	{
+		::Msg("! [coop] '%s' is the world's creator, but his loadout is no choice (%u entries, faction %s): the character window",
+		    p.nick.c_str(), u32(f.loadout), faction.c_str());
+		return false;
+	}
+	::Msg("[coop] '%s' is the operator and the world's creator: his character from the staging file (%u item(s)%s), no window",
+	    p.nick.c_str(), u32(m.buy.size()), f.bare ? ", bare" : "");
+	host_make_new_character(from, p, m, true);
+	return true;
 }
 
 // Protocol 8, host: a player's choice of his new character.
@@ -2193,7 +2330,7 @@ levels::wire::LoadWaitMsg load_wait_msg(u8 state, u32 epoch)
 	if (state == levels::wire::LoadWaitMsg::Waiting || state == levels::wire::LoadWaitMsg::Enter)
 		for (const auto& row : g.load.rows())
 		{
-			if (m.rows.size() >= kMaxPlayers)
+			if (m.rows.size() >= kMaxPeerSlots)
 				break;
 			levels::wire::LoadWaitMsg::Row r;
 			r.peer = row.first;

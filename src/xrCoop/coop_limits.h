@@ -177,7 +177,27 @@ constexpr RateRule kClientRateRules[] = {
 	// One per loading screen of the player (the epoch of the load barrier, plan §1.5); a reconnect repeats it once. 4 in a
 	// row, then one per second.
 	{Msg::LoadReady, 4, 1000},
+
+	// Protocol 31: the operator's console lines (docs/plans/2026-11-12-split-levels-native.md §2.3). A human at a console or a
+	// button of the "Co-op" window: 4 in a row, then one per second. A core message: Session takes the token itself
+	// (host_operator_command), before the length and the list are checked.
+	{Msg::OperatorCommand, 4, 1000},
 };
+
+// Protocol 31: the slot ids a client may hold, 1 .. kMaxClientSlots (= kMaxPlayers: a world server's 8 clients, owner
+// 2026-11-13). Every peer check of the wire layouts and of the game is `peer < kMaxPeerSlots` (AvatarList, LevelMap, LoadWait,
+// DebugState, TransitionState, coop_monster_fx.cpp arrays, the loops of coop_ai.cpp / coop_alife.cpp / coop_items.cpp).
+constexpr uint32_t kMaxClientSlots = kMaxPeerSlots - 1;
+static_assert(kMaxClientSlots == kMaxPlayers, "a world server's seats that play are all clients");
+
+// How many clients a host takes: `max_players` counts the seats that play, and the host's own seat is one of them only when
+// it plays (an ordinary host: max_players - 1 = 7; a world server's seat, SessionConfig::host_plays false, is not: 8). Never
+// more than the client slot ids. The one place of the capacity rule: Session's join check and its transport size use it.
+inline uint32_t client_capacity(uint32_t max_players, bool host_plays)
+{
+	const uint32_t seats = host_plays ? (max_players > 0 ? max_players - 1 : 0) : max_players;
+	return seats < kMaxClientSlots ? seats : kMaxClientSlots;
+}
 
 // Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
 // new keys farmed the starting kit and money, and every such character stays in the save for good. A session makes

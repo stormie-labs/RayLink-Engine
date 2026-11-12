@@ -3,6 +3,8 @@
 #include "coop_debug.h"
 #include "coop_manager.h"
 #include "xrCoop/coop_dedicated_rules.h" // log_shown: what the dedicated window shows of the log
+#include "xrCoop/coop_operator.h" // op::allowed: what the operator's console may send (plan 2026-11-12 §2.3)
+#include "coop_dedicated.h" // answer_line: the answers to an operator's command
 #include "coop_net.h"
 #include "coop_script.h"
 #include "coop_ai.h" // coop.debug.unseen: npc_ai::debug_unseen
@@ -54,9 +56,29 @@ void say(const char* line)
 	::Msg("%s", line);
 	if (!dedicated::log_shown(line, coop_console::log_level()))
 		coop_console::print(line);
+	dedicated::answer_line(line); // a line of the operator's command (dedicated::run_for) goes back to him too
 }
 
 void say(const std::string& line) { say(line.c_str()); }
+
+// This process is a client that holds the host's rights of a world server (plan 2026-11-12 §2.3).
+bool operator_here() { return mgr().is_client() && mgr().session().self_host_rights(); }
+
+// The operator's console: the line goes to the world server as an OperatorCommand; the server checks it again and answers.
+void send_to_server(const std::string& line)
+{
+	if (!op::allowed(line))
+	{
+		say("! [coop] " + line.substr(0, line.find(' ')) + ": this line cannot go to the server (one blank between words, no ';')");
+		return;
+	}
+	if (!mgr().session().send_operator_command(line))
+	{
+		say("! [coop] the world server is not reachable now");
+		return;
+	}
+	say("[coop] sent to the world server: " + line);
+}
 
 bool world_server_now() { return mgr().active() && is_world_server(); }
 
@@ -222,14 +244,16 @@ void console_switch(LPCSTR args)
 		print_state();
 		return;
 	}
-	switch (switch_allowed(mgr().active(), is_world_server()))
+	switch (switch_allowed(mgr().active(), is_world_server(), operator_here()))
 	{
 	case Operator::Ok: break;
 	case Operator::NoSession:
 		say("! [coop] coop_debug: no co-op session (a host started with the key -dbg has the debug on from the start)");
 		return;
+	case Operator::ToServer: send_to_server(sw == Switch::On ? "coop_debug on" : "coop_debug off"); return;
 	case Operator::NotServer:
 	case Operator::DebugOff:
+	case Operator::ServerConsoleOnly:
 		say("! [coop] coop_debug: the server's debug is switched in the server's console (the host's, or the dedicated host's window)");
 		return;
 	}
@@ -296,12 +320,14 @@ void console_dbg(LPCSTR args)
 		say("! coop_dbg: " + why);
 		return;
 	}
-	switch (console_allowed(mgr().active(), is_world_server(), g_server.on(), parsed.cmd))
+	switch (console_allowed(mgr().active(), is_world_server(), g_server.on(), parsed.cmd, operator_here()))
 	{
 	case Operator::Ok: break;
 	case Operator::NoSession: say("! [coop] coop_dbg: no co-op session"); return;
 	case Operator::NotServer: say("! [coop] coop_dbg: the server's console only (the host's, or the dedicated host's window)"); return;
 	case Operator::DebugOff: say("! [coop] coop_dbg: debug_off (coop_debug on first)"); return;
+	case Operator::ServerConsoleOnly: say("! [coop] coop_dbg " + parsed.cmd + ": the world server's own console only"); return;
+	case Operator::ToServer: send_to_server("coop_dbg " + std::string(detail::trim(line))); return;
 	}
 	const ConsoleCall call{&line, &parsed};
 	switch (script::call_now("coop_debug_server", "console", &push_console_call, &call))
@@ -345,7 +371,7 @@ bool arg_peer(lua_State* L, int idx, PeerId& out)
 	if (lua_type(L, idx) != LUA_TNUMBER)
 		return false;
 	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v) || v < 0.0 || v >= double(kMaxPlayers) || v != std::floor(v))
+	if (!std::isfinite(v) || v < 0.0 || v >= double(kMaxPeerSlots) || v != std::floor(v))
 		return false;
 	out = PeerId(v);
 	return true;
@@ -485,6 +511,58 @@ int l_unseen(lua_State* L)
 	return 1;
 }
 } // namespace
+
+// ---------------------------------------------------------------- the operator of a world server (plan 2026-11-12 §2.3)
+
+// Declared in coop_dedicated.cpp (run_for), the one caller. `rest`: what follows "coop_dbg " in a line that passed op::command_verdict.
+// The line runs as a request of the operator's peer, never as the server's console: coop_debug_server.operator_console(line, parsed,
+// peer) decides with his identity (a script without that function refuses: nothing runs). The server console's own commands (Lua) are
+// refused here, before any Lua.
+void operator_dbg(PeerId from, const std::string& rest)
+{
+	ConsoleLine parsed;
+	std::string why;
+	if (!parse_console_line(rest, parsed, why))
+	{
+		say("! coop_dbg: " + why);
+		return;
+	}
+	switch (remote_console_allowed(mgr().active(), g_server.on(), parsed.cmd))
+	{
+	case Operator::Ok: break;
+	case Operator::NoSession: say("! [coop] coop_dbg: no co-op session"); return;
+	case Operator::DebugOff: say("! [coop] coop_dbg: debug_off (coop_debug on first)"); return;
+	case Operator::ServerConsoleOnly:
+	case Operator::NotServer:
+	case Operator::ToServer:
+		::Msg("! [coop] operator #%u: coop_dbg %s refused (the server's console only)", from, parsed.cmd.c_str());
+		say("! [coop] coop_dbg " + parsed.cmd + ": the world server's own console only");
+		return;
+	}
+	struct Call
+	{
+		const std::string* line;
+		const ConsoleLine* parsed;
+		PeerId peer;
+	};
+	const Call call{&rest, &parsed, from};
+	const auto push = [](lua_State* L, const void* ctx) -> int
+	{
+		const Call& c = *static_cast<const Call*>(ctx);
+		const ConsoleCall inner{c.line, c.parsed};
+		push_console_call(L, &inner);
+		lua_pushnumber(L, lua_Number(c.peer));
+		return 3;
+	};
+	switch (script::call_now("coop_debug_server", "operator_console", push, &call))
+	{
+	case script::CallResult::Done: break;
+	case script::CallResult::NotReady: say("! [coop] coop_dbg: the world's Lua is not up yet (no level)"); break;
+	case script::CallResult::Failed:
+		say("! [coop] coop_dbg: refused, coop_debug_server.operator_console failed or is missing, see the log");
+		break;
+	}
+}
 
 // ---------------------------------------------------------------- the module
 

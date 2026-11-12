@@ -7,6 +7,10 @@
 #include "coop_script.h"
 #include "coop_autosave.h" // F3
 #include "coop_dedicated.h" // plan 12
+#include "coop_world_server.h" // plan 2026-11-12 stage 6a: the token of the world server this game started
+#include "../../xrEngine/coop_host_console.h" // plan 2026-11-12 stage 2: the @rl lines of the dedicated autostart
+#include "xrCoop/coop_world_server_rules.h"
+#include "xrCoop/coop_operator.h" // protocol 31: the operator's token
 #include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "coop_health_ledger.h" // live 2026-11-09: the own actor's health ledger
 #include "coop_lua_errors.h" // 2026-11: Lua errors survived in a session
@@ -388,6 +392,9 @@ void Manager::install_session_callbacks()
 		else
 			diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his avatar leaves this world too
 	};
+	// plan 2026-11-12 stage 3: a line of the world server's operator that passed the session's checks runs on this server's console
+	// (dedicated::run_for checks him and the line again; nothing on a host that is not a world server)
+	m_session.on_operator_command = [](PeerId from, const std::string& line) { dedicated::run_for(from, line); };
 	install_world_callbacks(m_session);
 	install_world_callbacks(m_world);
 	m_world.on_peer_joined = nullptr; // a map server's players are its level's, from the host's table
@@ -446,7 +453,7 @@ void Manager::install_world_callbacks(Session& session)
 		const PeerInfo* p = mgr().session().peer(from);
 		const char* who = p ? p->nick.c_str() : (from == kHostPeer ? "host" : "?");
 		::Msg("[coop] <%s> %s", who, text.c_str());
-		script::on_chat(who, text.c_str()); // HUD line (coop_main.on_chat)
+		script::on_chat(who, text.c_str(), from); // HUD line (coop_main.on_chat); the sender's peer, not only his nick
 	};
 	session.on_blob_progress = [](PeerId from, u32 id, u32 kind, u64 done, u64 total)
 	{
@@ -504,7 +511,16 @@ bool Manager::start_host(u16 port)
 	if (dedicated::on())
 		m_session.attach_local(nullptr); // plan 12: peer 0 is nobody: players() has no such row, what is sent to it goes nowhere
 	std::string err;
-	if (!m_session.host(make_config(port), &err))
+	SessionConfig cfg = make_config(port);
+	cfg.host_plays = !dedicated::on(); // protocol 31: a world server's own seat plays no character (Welcome.flags)
+	op::Token operator_token;
+	if (dedicated::on() && op::find_token(Core.Params, operator_token))
+	{
+		// plan 2026-11-12 §2.2: the game that presents this token from this PC holds the host's rights. The token is never logged.
+		cfg.operator_token = operator_token;
+		::Msg("[coop] dedicated: an operator token is set (-coop_operator)");
+	}
+	if (!m_session.host(cfg, &err))
 	{
 		::Msg("! [coop] cannot host on port %u: %s", port, err.c_str());
 		return false;
@@ -526,6 +542,17 @@ bool Manager::start_client(const char* address, u16 port)
 	std::string err;
 	SessionConfig cfg = make_config(port);
 	cfg.peer_timeout_ms = kHostSilenceLeaveMs; // the client waits for a silent host this long (frozen meanwhile)
+	// protocol 31, plan 2026-11-12 §2.2: the creator's game presents the token of its own world server. Only to this PC: a token
+	// is worth nothing anywhere else, and no other host has to see it.
+	op::Token operator_token;
+	// This PC is a literal 127.a.b.c and nothing else (op::loopback_literal: "127.0.0.1.evil.example" is another machine, security
+	// review 2026-11-12). The token is this process's own key -coop_operator (a launcher, a test), or the one of the world server
+	// this game started on that port (coop_world_server.h: it never leaves this process's memory).
+	// The token in memory goes only to 127.0.0.1 itself, and only once that server has said it listens on the port (operator_token_for).
+	const bool own_key = address && op::loopback_literal(address) && op::find_token(Core.Params, operator_token);
+	if (own_key || (address && !xr_strcmp(address, "127.0.0.1") && world_server::operator_token_for(port, operator_token)))
+		cfg.hello_token = operator_token;
+	SecureZeroMemory(operator_token.data(), operator_token.size()); // the copy on this stack; the session keeps its own for the Hello
 	if (!m_session.connect(cfg, address, port, &err))
 	{
 		::Msg("! [coop] cannot connect to %s:%u: %s", address, port, err.c_str());
@@ -584,7 +611,7 @@ void Manager::send_chat(const char* text)
 	}
 	m_session.send_chat(text);
 	::Msg("[coop] <%s> %s", nick(), text);
-	script::on_chat(nick(), text); // our own line in the HUD too
+	script::on_chat(nick(), text, self()); // our own line in the HUD too
 }
 
 void Manager::set_netsim(const NetSim& sim)
@@ -671,23 +698,39 @@ void Manager::autostart()
 		// GAMMA world, a busy port) stayed without a session and said it once (2026-11-01). Its own window may be nobody's: it tries again.
 		const dedicated::WorldFacts facts = join::host_world_facts();
 		const dedicated::HostAutostart::Step step = g_auto.dedicated_host.tick(now, dedicated::world_wait(facts));
+		// plan 2026-11-12 stage 2: the same moments as @rl lines for the parent of a -coop_hidden server (nothing without its output)
+		static bool s_session_said = false;
 		if (step.act == dedicated::HostAutostart::Do::GiveUp)
 		{
 			g_auto.host_done = true;
 			::Msg("! [coop] dedicated: gave up waiting for the world after %llu s: %s. coop_host %u starts the session by hand", step.waited_ms / 1000,
 			    dedicated::wait_text(step.reason), u32(g_auto.host_port));
+			string256 why;
+			xr_sprintf(why, "gave up waiting for the world after %llu s: %s", step.waited_ms / 1000, dedicated::wait_text(step.reason));
+			coop_console::rl_line(world_server::format(world_server::Record::of_error("gave_up", why)).c_str());
 		}
 		else if (step.say)
+		{
 			::Msg("[coop] dedicated: waiting for the world (%s): level %d ready %d precache %d alife %d alife-actor %d g_actor %d alive %d, %llu s",
 			    dedicated::wait_text(step.reason), facts.level, facts.ready, facts.precache, facts.alife, facts.alife_actor, facts.client_actor,
 			    facts.alive, step.waited_ms / 1000);
+			coop_console::rl_line(
+			    world_server::format(world_server::Record::of_wait(dedicated::wait_code(step.reason), dedicated::wait_text(step.reason))).c_str());
+		}
 		if (step.act == dedicated::HostAutostart::Do::Try)
 		{
+			if (!s_session_said)
+			{
+				s_session_said = true;
+				coop_console::rl_line(world_server::format(world_server::Record::of_phase(world_server::Phase::Session)).c_str());
+			}
 			if (start_host(g_auto.host_port))
 			{
 				g_auto.host_done = true;
 				g_auto.dedicated_host.up();
 				::Msg("[coop] dedicated: the session is up on port %u, %llu s after the level came", u32(g_auto.host_port), step.waited_ms / 1000);
+				coop_console::rl_line(world_server::format(world_server::Record::of_ready(g_auto.host_port)).c_str());
+				coop_console::rl_line(world_server::format(world_server::Record::of_phase(world_server::Phase::Ready)).c_str());
 			}
 			else
 				g_auto.dedicated_host.refused(now);
