@@ -651,7 +651,9 @@ void client_step_parents()
 			{
 				t.failed = true;
 				++g_c.parent_failed;
-				::Msg("! [coop] item %u [%s]: holder %u not applied yet; retrying", join::to_host(item),
+				// Not an error yet: the holder's own spawn is still on its way (one session of 2026-11-12 sent 34 of these as
+				// "errors"). The final "could not move it ... in time" below keeps its mark.
+				::Msg("[coop] item %u [%s]: holder %u not applied yet; retrying", join::to_host(item),
 				    entity_name(item), t.parent == kNoId ? kNoId : join::to_host(t.parent));
 			}
 			if (!t.dump_asked && !find_entity(item) && now - t.since > kDumpAfterMs)
@@ -1414,9 +1416,11 @@ bool client_spawn_allowed(const CSE_Abstract* spawn)
 		break;
 	default: break;
 	}
+	// A stale or repeated spawn is the guard at work (80 "error" reports in three days, 2026-11-12): a plain line. Only an id
+	// that belongs to another entity now keeps the mark: that one would have ended in the FATAL.
 	if (g_spawn_once.first(id))
-		::Msg("! [coop] game object %u [%s] not made: %s (entity here: [%s])", join::to_host(id), spawn->s_name.c_str(),
-		    why, e ? e->s_name.c_str() : "none");
+		::Msg("%s[coop] game object %u [%s] not made: %s (entity here: [%s])", v == identity::Spawn::OtherKind ? "! " : "",
+		    join::to_host(id), spawn->s_name.c_str(), why, e ? e->s_name.c_str() : "none");
 	return false;
 }
 

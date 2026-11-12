@@ -4,6 +4,7 @@
 // xrCoop/coop_dedicated_rules.h log_shown. Closing the window or Ctrl+C asks the game to save and quit.
 //
 // A standard input that is a pipe or a file at the start (a launcher, a test) is read beside the window.
+// -coop_hidden (plan 2026-11-12 stage 1): no window at all, only that input; its end (the launcher or the host's game died) is quit.
 // Text in the game is cp1251, the window speaks UTF-16: the conversion is here.
 #pragma once
 

@@ -33,6 +33,7 @@ namespace luabind
         error_callback_fun error_callback = 0;
         error_callback_fun error_callback_not_crash = 0;
 		cast_failed_callback_fun cast_failed_callback = 0;
+		error_survive_callback_fun error_survive_callback = 0; // Anomaly Coop (2026-11)
 #endif
 	}
 
@@ -70,6 +71,17 @@ namespace luabind
 	cast_failed_callback_fun get_cast_failed_callback()
 	{
 		return cast_failed_callback;
+	}
+
+	// Anomaly Coop (2026-11): Lua errors survived in a co-op session (error.hpp)
+	void set_error_survive_callback(error_survive_callback_fun e)
+	{
+		error_survive_callback = e;
+	}
+
+	error_survive_callback_fun get_error_survive_callback()
+	{
+		return error_survive_callback;
 	}
 
 #endif

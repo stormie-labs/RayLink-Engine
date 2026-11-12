@@ -17,6 +17,7 @@
 #include "coop_dedicated.h" // plan 12
 #include "coop_debug.h" // protocol 29
 #include "coop_items.h"
+#include "coop_lua_errors.h" // 2026-11: coop_lua_errors
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -245,5 +246,6 @@ void register_console_commands()
 	mapserver_stats_register_console(); // F3a: coop_mapserver_stats
 	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
 	debug::register_console(); // protocol 29: coop_debug, coop_dbg
+	lua_errors::register_console(); // 2026-11: coop_lua_errors (Lua errors survived in a session)
 }
 } // namespace coop

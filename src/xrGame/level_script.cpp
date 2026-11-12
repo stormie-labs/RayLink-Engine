@@ -1677,10 +1677,14 @@ void hud_adj_state(bool state)
 
 LPCSTR vid_modes_string()
 {
-	xr_string resolutions = "";
+	// Anomaly Coop (reports RL-MSYY-7HAC, RL-NBSV-UM22, RL-U48B-CSHH, 2026-11): stock returned c_str() of a local string, a
+	// pointer to freed memory; the options menu (ui_options cont_vid_mode) sometimes read garbage there and the game ended
+	// in "attempt to perform arithmetic on local 'w'". The string now lives between calls (luabind copies it at once).
+	static xr_string resolutions;
+	resolutions.clear();
 
 	xr_token* tok = vid_mode_token;
-	while (tok->name)
+	while (tok && tok->name)
 	{
 		if (strlen(resolutions.c_str()) > 0)
 			resolutions.append(",");

@@ -9,6 +9,7 @@
 #include "coop_dedicated.h" // plan 12
 #include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "coop_health_ledger.h" // live 2026-11-09: the own actor's health ledger
+#include "coop_lua_errors.h" // 2026-11: Lua errors survived in a session
 #include "xrCoop/coop_link_hold.h"
 #include "../../xrCore/raylink_version.h" // build_id names the engine build
 
@@ -121,6 +122,7 @@ struct AutoStart
 	u32 shots_every_s = 0;
 	u64 next_shot = 0;
 	u64 next_steam_join = 0;
+	dedicated::HostAutostart dedicated_host; // plan 2026-11-12 stage 1: the dedicated host tries until its world is up
 	bool map_server = false; // F3a: the key -coop_mapserver
 } g_auto;
 
@@ -659,7 +661,39 @@ void Manager::autostart()
 		}
 	}
 
-	if (g_auto.host && !g_auto.host_done && !active() && level_ready)
+	if (g_auto.host && !g_auto.host_done && !active() && dedicated::on() && dedicated::quitting())
+	{
+		// the level is going away with the process: "waiting for the world (no level yet)" after "the host goes down" was noise (live 2026-11-12)
+	}
+	else if (g_auto.host && !g_auto.host_done && !active() && dedicated::on())
+	{
+		// One try was all an ordinary host gets, and a dedicated host that is refused once (the world not quite up in the first frame of a new
+		// GAMMA world, a busy port) stayed without a session and said it once (2026-11-01). Its own window may be nobody's: it tries again.
+		const dedicated::WorldFacts facts = join::host_world_facts();
+		const dedicated::HostAutostart::Step step = g_auto.dedicated_host.tick(now, dedicated::world_wait(facts));
+		if (step.act == dedicated::HostAutostart::Do::GiveUp)
+		{
+			g_auto.host_done = true;
+			::Msg("! [coop] dedicated: gave up waiting for the world after %llu s: %s. coop_host %u starts the session by hand", step.waited_ms / 1000,
+			    dedicated::wait_text(step.reason), u32(g_auto.host_port));
+		}
+		else if (step.say)
+			::Msg("[coop] dedicated: waiting for the world (%s): level %d ready %d precache %d alife %d alife-actor %d g_actor %d alive %d, %llu s",
+			    dedicated::wait_text(step.reason), facts.level, facts.ready, facts.precache, facts.alife, facts.alife_actor, facts.client_actor,
+			    facts.alive, step.waited_ms / 1000);
+		if (step.act == dedicated::HostAutostart::Do::Try)
+		{
+			if (start_host(g_auto.host_port))
+			{
+				g_auto.host_done = true;
+				g_auto.dedicated_host.up();
+				::Msg("[coop] dedicated: the session is up on port %u, %llu s after the level came", u32(g_auto.host_port), step.waited_ms / 1000);
+			}
+			else
+				g_auto.dedicated_host.refused(now);
+		}
+	}
+	else if (g_auto.host && !g_auto.host_done && !active() && level_ready)
 	{
 		g_auto.host_done = true;
 		start_host(g_auto.host_port);
@@ -779,6 +813,7 @@ void Manager::print_status() const
 {
 	::Msg("[coop] build '%s', protocol %u", build_id(), kProtocolVersion);
 	::Msg("[coop] phase %s, self #%u, nick '%s'", phase_name(m_phase), m_session.self(), nick());
+	lua_errors::print_status(); // 2026-11: also outside a session (the switch, what was survived before)
 	if (!active())
 		return;
 	::Msg("[coop] silence timeout %u ms, keep-alive services %llu", kPeerTimeoutMs, m_session.keepalive_services());

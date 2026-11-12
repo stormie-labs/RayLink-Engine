@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <set>
 #include <luabind/class_info.hpp>
+#include "coop/coop_lua_errors.h" // Anomaly Coop (2026-11): Lua errors survived in a co-op session
 
 #ifdef USE_DEBUGGER
 #	ifndef USE_LUA_STUDIO
@@ -280,6 +281,11 @@ void printLuaStack()
 
 int CScriptEngine::lua_pcall_failed(lua_State* L)
 {
+	// Anomaly Coop (2026-11): in a co-op session (coop_lua_errors 1) the error is logged here, while its stack still exists,
+	// and survived: the error goes back as the result and the call proxy returns a safe value (coop/coop_lua_errors.h)
+	if (coop::lua_errors::on_pcall_error(L))
+		return 1;
+
 	ai().script_engine().print_stack();
 	print_output(L, "", LUA_ERRRUN);
 	ai().script_engine().on_error(L);
@@ -330,6 +336,7 @@ void CScriptEngine::setup_callbacks()
 #if !XRAY_EXCEPTIONS
 		::luabind::set_error_callback(CScriptEngine::lua_error);
         ::luabind::set_error_callback_not_crash(CScriptEngine::lua_error_not_crash);
+		::luabind::set_error_survive_callback(coop::lua_errors::take_token); // Anomaly Coop (2026-11)
 #endif
 
 		::luabind::set_pcall_callback(CScriptEngine::lua_pcall_failed);

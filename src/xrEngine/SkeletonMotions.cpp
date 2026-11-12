@@ -277,14 +277,22 @@ motions_container::~motions_container()
 
 bool motions_container::has(shared_str key)
 {
+	xrCriticalSectionGuard guard(&lock);
 	return (container.find(key) != container.end());
 }
 
 motions_value* motions_container::dock(shared_str key, IReader* data, vecBones* bones)
 {
+	// Anomaly Coop: the map is touched only under `lock` (see SkeletonMotions.h); the file is loaded outside it, so the
+	// main thread never waits for another thread's load. Two threads that loaded the same file meet at the insert: the
+	// second one drops its copy and takes the first one's (stock inserted nothing and returned a value the container did
+	// not own).
 	motions_value* result = 0;
-	SharedMotionsMapIt I = container.find(key);
-	if (I != container.end()) result = I->second;
+	{
+		xrCriticalSectionGuard guard(&lock);
+		SharedMotionsMapIt I = container.find(key);
+		if (I != container.end()) result = I->second;
+	}
 	if (0 == result)
 	{
 		// loading motions
@@ -293,7 +301,19 @@ motions_value* motions_container::dock(shared_str key, IReader* data, vecBones* 
 		result->m_dwReference = 0;
 		BOOL bres = result->load(key.c_str(), data, bones);
 		if (bres)
-			container.insert(mk_pair(key, result));
+		{
+			motions_value* spare = 0;
+			{
+				xrCriticalSectionGuard guard(&lock);
+				std::pair<SharedMotionsMapIt, bool> at = container.insert(mk_pair(key, result));
+				if (!at.second)
+				{
+					spare = result;
+					result = at.first->second;
+				}
+			}
+			xr_delete(spare); // outside the lock
+		}
 		else
 			xr_delete(result);
 	}
@@ -302,6 +322,7 @@ motions_value* motions_container::dock(shared_str key, IReader* data, vecBones* 
 
 void motions_container::clean(bool force_destroy)
 {
+	xrCriticalSectionGuard guard(&lock);
 	SharedMotionsMapIt it = container.begin();
 	SharedMotionsMapIt _E = container.end();
 	if (force_destroy)
@@ -336,6 +357,7 @@ void motions_container::clean(bool force_destroy)
 
 void motions_container::dump()
 {
+	xrCriticalSectionGuard guard(&lock);
 	SharedMotionsMapIt it = container.begin();
 	SharedMotionsMapIt _E = container.end();
 	Log("--- motion container --- begin:");
@@ -343,7 +365,7 @@ void motions_container::dump()
 	for (u32 k = 0; it != _E; k++, it++)
 	{
 		sz += it->second->mem_usage();
-		Msg("#%3d: [%3d/%5d Kb] - %s", k, it->second->m_dwReference, it->second->mem_usage() / 1024, it->first.c_str());
+		Msg("#%3d: [%3d/%5d Kb] - %s", k, u32(it->second->m_dwReference), it->second->mem_usage() / 1024, it->first.c_str());
 	}
 	Msg("--- items: %d, mem usage: %d Kb ", container.size(), sz / 1024);
 	Log("--- motion container --- end.");

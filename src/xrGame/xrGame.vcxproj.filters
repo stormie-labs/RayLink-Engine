@@ -2508,6 +2508,9 @@
     <ClInclude Include="coop\coop_health_ledger.h">
       <Filter>Coop</Filter>
     </ClInclude>
+    <ClInclude Include="coop\coop_lua_errors.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_debug.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -7509,6 +7512,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="coop\coop_health_ledger.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_lua_errors.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_debug.cpp">

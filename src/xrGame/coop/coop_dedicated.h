@@ -22,6 +22,8 @@ namespace dedicated
 bool on();
 // The world being created is this process's new one, not a save: Lua sets the game up for it.
 bool new_world();
+// The operator, the launcher's pipe or the window asked for the end: the world is being saved and torn down.
+bool quitting();
 // Its key, parsed once. The port of its session.
 const Args& args();
 

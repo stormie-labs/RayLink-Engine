@@ -2,6 +2,8 @@
 //////////////////////////////////////////////////////////////////////
 #pragma once
 
+#include <atomic>
+
 // refs
 class dxRender_Visual;
 
@@ -53,10 +55,21 @@ private:
 	REGISTRY Registry; // Just pairing of pointer / Name
 	POOL Pool; // Unused / Inactive
 	BOOL bLogging;
-	BOOL bForceDiscard;
-	BOOL bAllowChildrenDuplicate;
+	// Anomaly Coop: bForceDiscard and bAllowChildrenDuplicate were members shared by every thread; they are per-thread
+	// now (thread_local in ModelPool.cpp): they mean "this thread is deleting a base" / "this thread is loading a base".
 	xrCriticalSection deffered_del_lock;
 	xrSRWLock ModelsLock;
+	// Anomaly Coop: PoolLock guards Registry, Pool and ModelsToDelete (ModelsToDeleteDeffer stays under
+	// deffered_del_lock, Models under ModelsLock). The spawn-prefetch thread and the main thread both create and delete
+	// models; the unlocked maps were corrupted (0xC0000374 at quit). It is held only around container operations, never
+	// across model loading, Spawn, shader resets or deletes. Lock order: deffered_del_lock -> ModelsLock -> PoolLock
+	// (PoolLock is the innermost: nothing else of the pool is acquired while it is held). See temp\modelpool\DESIGN.md.
+	xrCriticalSection PoolLock;
+	std::atomic<u32> PoolOwner{ 0 };                    // thread id holding PoolLock (diagnostic only)
+	std::atomic<const char*> PoolOwnerWhere{ nullptr }; // the entry point it holds it in (diagnostic only)
+	u32 PoolDepth = 0;                                  // recursion depth of the owner; touched only under PoolLock
+	class PoolGuard;
+	friend class PoolGuard;
 
 	void Destroy();
 public:

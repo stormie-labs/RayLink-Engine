@@ -3,6 +3,7 @@
 #define SkeletonMotionsH
 
 //#include "skeletoncustom.h"
+#include <atomic>
 #include "bone.h"
 #include "skeletonmotiondefs.h"
 // refs
@@ -221,7 +222,9 @@ struct ENGINE_API motions_value
 	accel_map m_cycle; // motion data itself (shared)
 	accel_map m_fx; // motion data itself (shared)
 	CPartition m_partition; // partition
-	u32 m_dwReference;
+	// Anomaly Coop: atomic. The main thread, the spawn-prefetch thread and the prefetch task all take and drop
+	// references to the same shared motions (shared_motions::create / destroy).
+	std::atomic<u32> m_dwReference;
 	BoneMotionMap m_motions;
 	MotionDefVec m_mdefs;
 
@@ -247,6 +250,12 @@ class ENGINE_API motions_container
 {
 	DEFINE_MAP(shared_str, motions_value*, SharedMotionsMap, SharedMotionsMapIt);
 	SharedMotionsMap container;
+	// Anomaly Coop: guards `container`. Animated models are loaded by the main thread, by the spawn-prefetch thread
+	// (Level.cpp ProcessPrefetchEvents -> models_PrefetchOne) and by the prefetch task of IGame_Persistent::Prefetch;
+	// has / dock ran find and insert on the unlocked map from all of them (the same race as CModelPool::Registry,
+	// 0xC0000374). Held only around the map, never across the loading of a motion file. A leaf lock: nothing else is
+	// acquired under it.
+	xrCriticalSection lock;
 public:
 	motions_container();
 	~motions_container();

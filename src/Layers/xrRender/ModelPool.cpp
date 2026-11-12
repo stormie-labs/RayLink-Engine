@@ -27,6 +27,92 @@
 	#include "IGame_Persistent.h"
 #endif
 
+#include <new>
+
+// Anomaly Coop: the pool's containers are shared by the main thread, the spawn-prefetch thread (Level.cpp,
+// ProcessPrefetchEvents -> models_PrefetchOne) and the prefetch task of IGame_Persistent::Prefetch (models_Prefetch).
+// See ModelPool.h (PoolLock) and temp\modelpool\DESIGN.md.
+namespace
+{
+// Were CModelPool members written by whichever thread was loading or deleting a base: one thread's
+// "loading a base" (no child duplication) or "deleting a base" (discard children) leaked into the other thread's work.
+thread_local BOOL t_bForceDiscard = FALSE;
+thread_local BOOL t_bAllowChildrenDuplicate = TRUE;
+
+// Contention detector: a line per distinct pair of entry points (waiter, holder), at most kMaxContentionLines.
+constexpr u32 kMaxContentionLines = 20;
+struct ContentionPair
+{
+	const char* waiter;
+	const char* holder;
+};
+ContentionPair g_contention_pairs[kMaxContentionLines]; // written only under PoolLock
+u32 g_contention_pair_count = 0;                         // written only under PoolLock
+std::atomic<u32> g_contentions{ 0 };                     // every contended entry
+std::atomic<u32> g_contentions_reported{ 0 };            // value of g_contentions at the last summary line
+
+// A damaged std::map / multimap (size says non-empty, the tree is empty) must not be erased or cleared: its nodes may
+// be freed already. Forget it instead: a fresh empty container is built over it, the old head node leaks.
+template <typename Container>
+void abandon_damaged(Container& c)
+{
+	::new (static_cast<void*>(&c)) Container();
+}
+} // namespace
+
+class CModelPool::PoolGuard : xray::noncopyable
+{
+public:
+	PoolGuard(CModelPool& pool, const char* where) : m_pool(pool)
+	{
+		if (!m_pool.PoolLock.TryEnter()) // a recursive section: fails only while another thread holds it
+		{
+			const u32 holder = m_pool.PoolOwner.load(std::memory_order_relaxed);
+			const char* holder_where = m_pool.PoolOwnerWhere.load(std::memory_order_relaxed);
+			m_pool.PoolLock.Enter();
+			note_contention(where, holder, holder_where);
+		}
+		if (m_pool.PoolDepth++ == 0)
+		{
+			m_pool.PoolOwner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+			m_pool.PoolOwnerWhere.store(where, std::memory_order_relaxed);
+		}
+	}
+	~PoolGuard()
+	{
+		if (--m_pool.PoolDepth == 0)
+		{
+			m_pool.PoolOwner.store(0, std::memory_order_relaxed);
+			m_pool.PoolOwnerWhere.store(nullptr, std::memory_order_relaxed);
+		}
+		m_pool.PoolLock.Leave();
+		if (m_report_where) // logged after the lock is released: the log never runs under PoolLock
+			Msg("[coop] ModelPool: thread %u waited for thread %u in %s (holder in %s)", GetCurrentThreadId(),
+				m_report_holder, m_report_where, m_report_holder_where ? m_report_holder_where : "?");
+	}
+
+private:
+	void note_contention(const char* where, u32 holder, const char* holder_where) // under PoolLock
+	{
+		g_contentions.fetch_add(1, std::memory_order_relaxed);
+		const char* hw = holder_where ? holder_where : "?";
+		for (u32 i = 0; i < g_contention_pair_count; ++i)
+			if (g_contention_pairs[i].waiter == where && g_contention_pairs[i].holder == hw)
+				return;
+		if (g_contention_pair_count >= kMaxContentionLines)
+			return;
+		g_contention_pairs[g_contention_pair_count++] = { where, hw };
+		m_report_where = where;
+		m_report_holder = holder;
+		m_report_holder_where = holder_where;
+	}
+
+	CModelPool& m_pool;
+	const char* m_report_where = nullptr;
+	const char* m_report_holder_where = nullptr;
+	u32 m_report_holder = 0;
+};
+
 dxRender_Visual* CModelPool::Instance_Create(u32 type)
 {
 	dxRender_Visual* V = NULL;
@@ -88,8 +174,8 @@ dxRender_Visual* CModelPool::Instance_Duplicate(dxRender_Visual* V)
 	N->Copy(V);
 	N->Spawn();
 	{
-		// inc ref counter
-		xrSRWLockGuard g(ModelsLock, true);
+		// inc ref counter. Anomaly Coop: exclusive, it writes refs (a shared lock let two threads lose an increment)
+		xrSRWLockGuard g(ModelsLock);
 		auto it = std::lower_bound(Models.begin(), Models.end(), V, std::less<>{});
 		if (it != Models.end() && it->model == V)
 		{
@@ -203,21 +289,46 @@ dxRender_Visual* CModelPool::Instance_Register(LPCSTR N, dxRender_Visual* V)
 void CModelPool::Destroy()
 {
 	// Pool
-	Pool.clear();
-
-	// Registry
-	while (!Registry.empty())
 	{
-		REGISTRY_IT it = Registry.begin();
-		dxRender_Visual* V = (dxRender_Visual*)it->first;
-		if (!V)
+		PoolGuard g(*this, "Destroy");
+		if (!Pool.empty() && Pool.begin() == Pool.end())
 		{
-			Registry.erase(it);
-			continue;
+			Msg("! ModelPool: Pool size %u but the tree is empty: the pool was damaged, it is dropped", u32(Pool.size()));
+			abandon_damaged(Pool);
+		}
+		Pool.clear();
+	}
+
+	// Registry. Anomaly Coop: each entry is read under PoolLock, the visual is deleted outside it (Discard erases the
+	// entry under the lock). A damaged tree (size says non-empty but the tree is empty, or the entry just deleted is
+	// still first) ends as a log line instead of erasing end() and freeing the head node twice (0xC0000374 at quit).
+	dxRender_Visual* last = nullptr;
+	for (;;)
+	{
+		dxRender_Visual* V;
+		{
+			PoolGuard g(*this, "Destroy");
+			if (Registry.empty())
+				break;
+			REGISTRY_IT it = Registry.begin();
+			if (it == Registry.end() || (last && it->first == last))
+			{
+				Msg("! ModelPool: Registry size %u but the tree is %s: the registry was damaged, it is dropped",
+					u32(Registry.size()), it == Registry.end() ? "empty" : "stuck");
+				abandon_damaged(Registry);
+				break;
+			}
+			V = (dxRender_Visual*)it->first;
+			if (!V)
+			{
+				Registry.erase(it);
+				continue;
+			}
 		}
 #ifdef _DEBUG
 		Msg				("ModelPool: Destroy object: '%s'",*V->dbg_name);
 #endif
+		last = V;
 		DeleteInternal(V,TRUE);
 	}
 
@@ -239,8 +350,6 @@ void CModelPool::Destroy()
 CModelPool::CModelPool()
 {
 	bLogging = TRUE;
-	bForceDiscard = FALSE;
-	bAllowChildrenDuplicate = TRUE;
 	g_pMotionsContainer = xr_new<motions_container>();
 }
 
@@ -277,16 +386,25 @@ dxRender_Visual* CModelPool::Create(const char* name, IReader* data, bool assert
 	xr_strcpy(low_name, name);
 	strlwr(low_name);
 	if (strext(low_name)) *strext(low_name) = 0;
-	
-	// 0. Search POOL
-	POOL_IT it = Pool.find(low_name);
-	if (it != Pool.end())
+	const shared_str key(low_name); // made before PoolLock: the string table has its own lock
+
+	// 0. Search POOL. Anomaly Coop: the instance leaves the pool in the same locked section that finds it, so no other
+	// thread can take it too; Spawn runs on the instance this thread now owns, outside the lock.
+	dxRender_Visual* Pooled = nullptr;
+	{
+		PoolGuard g(*this, "Create");
+		POOL_IT it = Pool.find(key);
+		if (it != Pool.end())
+		{
+			Pooled = it->second;
+			Pool.erase(it);
+		}
+	}
+	if (Pooled)
 	{
 		// 1. Instance found
-		dxRender_Visual* Model = it->second;
-		Model->Spawn();
-		Pool.erase(it);
-		return Model;
+		Pooled->Spawn();
+		return Pooled;
 	}
 	else
 	{
@@ -295,8 +413,8 @@ dxRender_Visual* CModelPool::Create(const char* name, IReader* data, bool assert
 
 		if (0 == Base)
 		{
-			// 2. If not found
-			bAllowChildrenDuplicate = FALSE;
+			// 2. If not found (loading runs outside every pool lock)
+			t_bAllowChildrenDuplicate = FALSE;
 			if (data) Base = Instance_Load(low_name, data, TRUE);
 			else Base = Instance_Load(low_name, TRUE, assert);
 			if (!Base)
@@ -304,14 +422,17 @@ dxRender_Visual* CModelPool::Create(const char* name, IReader* data, bool assert
 				// If not found and assert is false, return nullptr
 				return nullptr;
 			}
-			bAllowChildrenDuplicate = TRUE;
+			t_bAllowChildrenDuplicate = TRUE;
 #ifdef _EDITOR
 			if (!Base)		return 0;
 #endif
 		}
 		// 3. If found - return (cloned) reference
 		dxRender_Visual* Model = Instance_Duplicate(Base);
-		Registry.insert(mk_pair(Model, low_name));
+		{
+			PoolGuard g(*this, "Create");
+			Registry.insert(mk_pair(Model, key));
+		}
 		return Model;
 	}
 }
@@ -333,7 +454,7 @@ dxRender_Visual* CModelPool::CreateChild(LPCSTR name, IReader* data)
 		else Base = Instance_Load(low_name,FALSE);
 	}
 
-	dxRender_Visual* Model = bAllowChildrenDuplicate ? Instance_Duplicate(Base) : Base;
+	dxRender_Visual* Model = t_bAllowChildrenDuplicate ? Instance_Duplicate(Base) : Base;
 	return Model;
 }
 
@@ -344,17 +465,22 @@ void CModelPool::DeleteInternal(dxRender_Visual* & V, BOOL bDiscard)
 	VERIFY(!g_bRendering);
 	if (!V) return;
 	V->Depart();
-	if (bDiscard || bForceDiscard)
+	if (bDiscard || t_bForceDiscard)
 	{
 		Discard(V, TRUE);
 	}
 	else
 	{
 		//
-		REGISTRY_IT it = Registry.find(V);
-		if (it != Registry.end())
+		bool registered;
+		{
+			PoolGuard g(*this, "DeleteInternal");
+			registered = Registry.find(V) != Registry.end();
+		}
+		if (registered)
 		{
 			// Registry entry found - move it to pool and reset changed shader/texture if necessary
+			// (the reset may create shaders and textures: outside the lock, on the visual this thread owns)
 			xr_vector<IRenderVisual*>* children = V->get_children();
 			if (children)
 				for (auto* child : *children)
@@ -362,7 +488,20 @@ void CModelPool::DeleteInternal(dxRender_Visual* & V, BOOL bDiscard)
 			else
 				V->ResetShaderTexture();
 
-			Pool.insert(mk_pair(it->second, V));
+			// Anomaly Coop: the entry is looked up again in the section that pools the visual: find and insert are
+			// one locked section, no iterator outlives a lock.
+			bool pooled = false;
+			{
+				PoolGuard g(*this, "DeleteInternal");
+				REGISTRY_IT it = Registry.find(V);
+				if (it != Registry.end())
+				{
+					Pool.insert(mk_pair(it->second, V));
+					pooled = true;
+				}
+			}
+			if (!pooled) // only a concurrent Destroy can do that; leaking beats a second delete
+				Msg("! ModelPool: a visual lost its registry entry while it was being pooled: it is leaked");
 		}
 		else
 		{
@@ -392,6 +531,7 @@ void CModelPool::Delete(dxRender_Visual* &V, BOOL bDiscard)
 	if (g_bRendering)
 	{
 		VERIFY(!bDiscard);
+		PoolGuard g(*this, "Delete");
 		ModelsToDelete.push_back(V);
 	}
 	else
@@ -403,9 +543,21 @@ void CModelPool::Delete(dxRender_Visual* &V, BOOL bDiscard)
 
 void CModelPool::DeleteQueue()
 {
-	for (u32 it = 0; it < ModelsToDelete.size(); it++)
-		DeleteInternal(ModelsToDelete[it]);
-	ModelsToDelete.clear();
+	// Anomaly Coop: the queue is taken under PoolLock and deleted outside it; what is queued meanwhile (another
+	// thread's Delete while rendering, or this loop's own children) is taken by the next round, in the same order.
+	xr_vector<dxRender_Visual*> batch;
+	for (;;)
+	{
+		{
+			PoolGuard g(*this, "DeleteQueue");
+			batch.swap(ModelsToDelete);
+		}
+		if (batch.empty())
+			break;
+		for (u32 it = 0; it < batch.size(); it++)
+			DeleteInternal(batch[it]);
+		batch.clear();
+	}
 }
 
 void CModelPool::DeleteQueuedDeffer()
@@ -423,12 +575,24 @@ void CModelPool::DeleteQueuedDeffer()
 
 void CModelPool::Discard(dxRender_Visual* & V, BOOL b_complete)
 {
-	//
-	REGISTRY_IT it = Registry.find(V);
-	if (it != Registry.end())
+	// Anomaly Coop: the registry entry is found and erased in one locked section, before the visual is freed (an
+	// address freed first could be registered again by another thread before the erase). ModelsLock is taken after
+	// PoolLock is released (lock order: ModelsLock -> PoolLock, never the reverse).
+	shared_str name;
+	bool registered = false;
+	{
+		PoolGuard g(*this, "Discard");
+		REGISTRY_IT it = Registry.find(V);
+		if (it != Registry.end())
+		{
+			name = it->second;
+			Registry.erase(it);
+			registered = true;
+		}
+	}
+	if (registered)
 	{
 		// Base
-		const shared_str& name = it->second;
 		xrSRWLockGuard g(ModelsLock);
 
 		for (u32 i = 0; i < Models.size(); i++)
@@ -442,11 +606,11 @@ void CModelPool::Discard(dxRender_Visual* & V, BOOL b_complete)
 					I->refs--;
 					if (0 == I->refs)
 					{
-						bForceDiscard = TRUE;
+						t_bForceDiscard = TRUE;
 						I->model->Release();
 						xr_delete(I->model);
 						Models.erase(I);
-						bForceDiscard = FALSE;
+						t_bForceDiscard = FALSE;
 					}
 					break;
 				}
@@ -458,9 +622,8 @@ void CModelPool::Discard(dxRender_Visual* & V, BOOL b_complete)
 				}
 			}
 		}
-		// Registry
+		// Registry (the entry was erased above)
 		xr_delete(V);
-		Registry.erase(it);
 	}
 	else
 	{
@@ -502,9 +665,12 @@ bool CModelPool::Exists(LPCSTR N)
 	if (strext(low_name)) *strext(low_name) = 0;
 
 	// Search pool and return early if exists
-	POOL_IT it = Pool.find(low_name);
-	if (it != Pool.end())
-		return true;
+	{
+		const shared_str key(low_name);
+		PoolGuard g(*this, "Exists");
+		if (Pool.find(key) != Pool.end())
+			return true;
+	}
 
 	// Search for already loaded model (reference, base model) and return early if exists
 	dxRender_Visual* Base = Instance_Find(low_name);
@@ -538,13 +704,29 @@ dxRender_Visual* CModelPool::CreatePG(PS::CPGDef* source)
 
 void CModelPool::ClearPool(BOOL b_complete)
 {
-	POOL_IT _I = Pool.begin();
-	POOL_IT _E = Pool.end();
+	// Anomaly Coop: the pool is taken whole under PoolLock and discarded outside it (Discard frees visuals and takes
+	// ModelsLock). Instances pooled by another thread meanwhile stay pooled for the next clear.
+	POOL taken;
+	{
+		PoolGuard g(*this, "ClearPool");
+		if (!Pool.empty() && Pool.begin() == Pool.end())
+		{
+			Msg("! ModelPool: Pool size %u but the tree is empty: the pool was damaged, it is dropped", u32(Pool.size()));
+			abandon_damaged(Pool);
+		}
+		taken.swap(Pool);
+	}
+	POOL_IT _I = taken.begin();
+	POOL_IT _E = taken.end();
 	for (; _I != _E; _I++)
 	{
 		Discard(_I->second, b_complete);
 	}
-	Pool.clear();
+	taken.clear();
+
+	const u32 contentions = g_contentions.load(std::memory_order_relaxed);
+	if (contentions != g_contentions_reported.exchange(contentions, std::memory_order_relaxed))
+		Msg("[coop] ModelPool: %u contended entries between threads so far (serialised by PoolLock)", contentions);
 }
 
 void CModelPool::dump()
@@ -567,6 +749,7 @@ void CModelPool::dump()
 	sz = 0;
 	k = 0;
 	int free_cnt = 0;
+	PoolGuard pg(*this, "dump"); // after ModelsLock: lock order ModelsLock -> PoolLock
 	for (REGISTRY_IT it = Registry.begin(); it != Registry.end(); it++)
 	{
 		CKinematics* K = PCKinematics((dxRender_Visual*)it->first);
@@ -591,9 +774,9 @@ void CModelPool::memory_stats(u32& vb_mem_video, u32& vb_mem_system, u32& ib_mem
 	ib_mem_video = 0;
 	ib_mem_system = 0;
 
+	xrSRWLockGuard g(ModelsLock, true); // Anomaly Coop: before the iterators are taken, not after
 	xr_vector<ModelDef>::iterator it = Models.begin();
 	xr_vector<ModelDef>::const_iterator en = Models.end();
-	xrSRWLockGuard g(ModelsLock, true);
 
 	for (; it != en; ++it)
 	{

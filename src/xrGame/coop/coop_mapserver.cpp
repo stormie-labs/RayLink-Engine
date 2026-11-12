@@ -56,6 +56,8 @@ struct Server
 struct Host
 {
 	std::map<u16, Server> servers; // by level
+	std::map<u16, softmove::ServerVerdict> verdicts; // why kept or not at the last host_stop_for_move, by level: a log line, nothing else.
+	                                                 // Apart from `servers`: a server that stopped may be gone from there by the go
 	std::vector<PeerId> bridges; // Server::k of those that run (host_bridges)
 	bool hold_launch = false; // the host's move: nothing starts until its save is written
 	HANDLE job = nullptr; // the processes end with this one, however it ends
@@ -594,12 +596,14 @@ void host_stop_for_move(u16 target, bool soft)
 {
 	const u64 now = mgr().now_ms();
 	g.hold_launch = true;
+	g.verdicts.clear();
 	for (auto& it : g.servers)
 	{
 		Server& s = it.second;
 		const levels::ServerState state = s.life.state();
 		const bool leads = (state == levels::ServerState::Ready || state == levels::ServerState::Serving) && bridge_of(it.first) != kInvalidPeer;
 		s.kept = softmove::keeps_server(soft, leads, it.first, target);
+		g.verdicts[it.first] = softmove::server_verdict(soft, leads, it.first, target);
 		if (s.kept)
 			continue;
 		if (s.life.state() == levels::ServerState::Starting)
@@ -636,6 +640,12 @@ std::vector<Session::SoftServer> host_kept()
 			out.push_back(row);
 		}
 	return out;
+}
+
+softmove::ServerVerdict host_verdict(u16 level)
+{
+	const auto it = g.verdicts.find(level);
+	return it == g.verdicts.end() ? softmove::ServerVerdict::None : it->second;
 }
 
 bool host_keeps(u16 level)

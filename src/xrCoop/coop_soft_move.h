@@ -31,6 +31,16 @@ constexpr uint64_t kReloadWatchMs = 10000;
 
 // ---------------------------------------------------------------- who stays
 
+// What became of the map server of a level at the host's go (host_stop_for_move): kept, or why not. None: the level has none.
+enum class ServerVerdict : uint8_t
+{
+	None,
+	Kept,
+	SwitchOff, // coop_soft_host_move 0
+	NotLeading, // not Ready or Serving, or its bridge is not connected
+	Target, // the host goes to its level
+};
+
 // A player at the host's go, as the world server sees him.
 struct Facts
 {
@@ -42,6 +52,7 @@ struct Facts
 	bool choosing = false; // in the choice of a character
 	bool server_ready = false; // the map server of his level leads it and is connected; there is none on the host's old level
 	bool on_target = false; // he stands on the level the host goes to: its map server closes, the host's process leads it from now on
+	ServerVerdict server = ServerVerdict::None; // only for why_reloads: what server_ready is made of
 };
 
 inline bool stays(const Facts& f)
@@ -53,6 +64,79 @@ inline bool stays(const Facts& f)
 constexpr bool keeps_server(bool soft_on, bool ready, uint16_t level, uint16_t target)
 {
 	return soft_on && ready && level != target;
+}
+
+// keeps_server, with the reason when it does not keep.
+constexpr ServerVerdict server_verdict(bool soft_on, bool ready, uint16_t level, uint16_t target)
+{
+	return !soft_on ? ServerVerdict::SwitchOff : level == target ? ServerVerdict::Target : !ready ? ServerVerdict::NotLeading : ServerVerdict::Kept;
+}
+
+// Why a player reloads through the host's move (stage 1b of docs/plans/2026-11-12-split-levels-no-reloads.md): a line each, nothing changes.
+enum class Reload : uint8_t
+{
+	Stays,
+	NotJoined,
+	NotInWorld,
+	NoCharacter,
+	Loading,
+	Joining,
+	Choosing,
+	OnTarget,
+	SwitchOff,
+	NoServer,
+	ServerNotLeading,
+	ServerNotKept,
+};
+
+// The first member of stays() that fails, in its order; Stays exactly when stays().
+inline Reload why_reloads(const Facts& f)
+{
+	if (stays(f))
+		return Reload::Stays;
+	if (!f.joined)
+		return Reload::NotJoined;
+	if (!f.known)
+		return Reload::NotInWorld;
+	if (!f.proxy)
+		return Reload::NoCharacter;
+	if (f.loading)
+		return Reload::Loading;
+	if (f.joining)
+		return Reload::Joining;
+	if (f.choosing)
+		return Reload::Choosing;
+	if (f.on_target)
+		return Reload::OnTarget;
+	switch (f.server)
+	{
+	case ServerVerdict::SwitchOff: return Reload::SwitchOff;
+	case ServerVerdict::None: return Reload::NoServer;
+	case ServerVerdict::NotLeading: return Reload::ServerNotLeading;
+	case ServerVerdict::Target: return Reload::OnTarget;
+	case ServerVerdict::Kept: break;
+	}
+	return Reload::ServerNotKept;
+}
+
+inline const char* reload_text(Reload r)
+{
+	switch (r)
+	{
+	case Reload::Stays: return "stays";
+	case Reload::NotJoined: return "not in the session yet";
+	case Reload::NotInWorld: return "not in the world: no join of his reached it";
+	case Reload::NoCharacter: return "his character is unknown";
+	case Reload::Loading: return "on his loading screen";
+	case Reload::Joining: return "the world still waits for his join";
+	case Reload::Choosing: return "choosing a character";
+	case Reload::OnTarget: return "he is on the level the host goes to";
+	case Reload::SwitchOff: return "the soft move is off (coop_soft_host_move 0)";
+	case Reload::NoServer: return "his level has no map server (none left, or the host's own level)";
+	case Reload::ServerNotLeading: return "his map server is not Ready/Serving or not connected";
+	case Reload::ServerNotKept: return "his map server is not kept";
+	}
+	return "unknown";
 }
 
 // ---------------------------------------------------------------- the window

@@ -37,6 +37,10 @@ extern int g_coop_diag_fail_swap; // console coop_diag_fail_swap 1: the next loa
 
 namespace coop
 {
+namespace dedicated
+{
+struct WorldFacts; // xrCoop/coop_dedicated_rules.h
+}
 // F0 final review (task 14 diagnostics): CGameObject::lua_game_object prints a C++ stack for the first
 // kDestroyedObjectStacks accesses to a destroyed object after a player left a co-op session, not since the process
 // started (single player and loads spent them, and every stack stalls the thread that prints it).
@@ -68,6 +72,7 @@ void install_client(Endpoint& e);
 
 // --- host ---
 bool host_can_start(); // in a level with ALife and a living actor
+dedicated::WorldFacts host_world_facts(); // what host_can_start asks, member by member, quietly (the dedicated host's autostart)
 void on_host_started();
 void on_peer_joined(const PeerInfo& p);
 void on_peer_left(PeerId id); // parks the player's proxy and takes it out of the world

@@ -589,6 +589,22 @@ private:
 	};
 
 
+	namespace detail
+	{
+		// Anomaly Coop (2026-11): a survived Lua error in a call returning a luabind::object returns one holding nil, as if the
+		// function had returned nil (error.hpp: safe_result)
+		template<> struct safe_result<object>
+		{
+			static object get(lua_State* L)
+			{
+				lua_pushnil(L);
+				lua_reference ref;
+				ref.set(L);
+				return object(L, ref, true);
+			}
+		};
+	}
+
 	// *************************************
 	// OBJECT
 
@@ -710,11 +726,16 @@ private:
 #ifndef LUABIND_NO_EXCEPTIONS
 				throw error(L);
 #else
-				error_callback_fun e = get_error_callback();
-				if (e) e(L);
-	
-				assert(0 && "the lua function threw an error and exceptions are disabled."
+				if (pcall_error_survived(L)) // Anomaly Coop (2026-11): a Lua error survived in a co-op session (error.hpp)
+				{
+					lua_pop(L, 1); // the error: the call returns nil
+					lua_pushnil(L);
+				}
+				else
+				{
+					assert(0 && "the lua function threw an error and exceptions are disabled."
 					"if you want to handle this error use luabind::set_error_callback()");
+				}
 				
 #endif
 			}
@@ -824,15 +845,16 @@ private:
 #ifndef LUABIND_NO_EXCEPTIONS
 				throw luabind::error(L);
 #else
-				error_callback_fun e = get_error_callback();
-				if (e) e(L);
-                else
-                {
-
-                    assert(0 && "the lua function threw an error and exceptions are disabled."
+				if (pcall_error_survived(L)) // Anomaly Coop (2026-11): a Lua error survived in a co-op session (error.hpp)
+				{
+					lua_pop(L, 1); // the error: the call returns nothing
+					return;
+				}
+				if (!get_error_callback())
+				{
+					assert(0 && "the lua function threw an error and exceptions are disabled."
                         "if you want to handle this error use luabind::set_error_callback()");
-                    
-                }
+				}
 #endif
 			}
 		}
@@ -850,11 +872,16 @@ private:
 #ifndef LUABIND_NO_EXCEPTIONS
 				throw luabind::error(L);
 #else
-				error_callback_fun e = get_error_callback();
-				if (e) e(L);
-	
-				assert(0 && "the lua function threw an error and exceptions are disabled."
+				if (pcall_error_survived(L)) // Anomaly Coop (2026-11): a Lua error survived in a co-op session (error.hpp)
+				{
+					lua_pop(L, 1); // the error: the call returns nil
+					lua_pushnil(L);
+				}
+				else
+				{
+					assert(0 && "the lua function threw an error and exceptions are disabled."
 					"if you want to handle this error use luabind::set_error_callback()");
+				}
 				
 #endif
 			}

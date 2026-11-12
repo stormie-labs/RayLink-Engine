@@ -370,6 +370,7 @@ bool on() { return g_coop_dedicated; }
 const Args& args() { return g.args; }
 
 bool new_world() { return g.new_world; }
+bool quitting() { return g.quitting; }
 
 void frame()
 {

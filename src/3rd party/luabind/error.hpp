@@ -84,7 +84,37 @@ namespace luabind
     LUABIND_API error_callback_fun get_error_callback_not_crash();
 	LUABIND_API cast_failed_callback_fun get_cast_failed_callback();
 
+	// Anomaly Coop (2026-11): asked by a call proxy after a failed pcall, before the error callback. True = the error (still on
+	// top of the stack) was logged and is survived: the proxy drops it and returns safe_result<Ret>; false = the stock path.
+	// Unset (the default, and in every module but xrGame) = always the stock path.
+	typedef bool(*error_survive_callback_fun)(lua_State*);
+	LUABIND_API void set_error_survive_callback(error_survive_callback_fun e);
+	LUABIND_API error_survive_callback_fun get_error_survive_callback();
+
+	namespace detail
+	{
+		// After a failed pcall: true = survived (the error object is still on top); false = the error callback has run (it does
+		// not return in a release build: Debug.fatal), exactly the stock path.
+		inline bool pcall_error_survived(lua_State* L)
+		{
+			if (error_survive_callback_fun s = get_error_survive_callback())
+				if (s(L))
+					return true;
+			if (error_callback_fun e = get_error_callback())
+				e(L);
+			return false;
+		}
+	}
+
 #endif
+
+	namespace detail
+	{
+		// What a call proxy returns for a survived error: nothing for void (no use), false / 0 / a zeroed value for the rest,
+		// "" for a string, nullptr for a pointer; a luabind::object holding nil (its specialisation is in object.hpp).
+		template<class T> struct safe_result { static T get(lua_State*) { return T(); } };
+		template<> struct safe_result<const char*> { static const char* get(lua_State*) { return ""; } };
+	}
 
 	typedef int(*pcall_callback_fun)(lua_State*);
 	LUABIND_API void set_pcall_callback(pcall_callback_fun e);

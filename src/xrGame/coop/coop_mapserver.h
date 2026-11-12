@@ -19,6 +19,7 @@
 #include "xrCoop/coop_levels_wire.h"
 #include "xrCoop/coop_mapserver_rules.h"
 #include "xrCoop/coop_session.h"
+#include "xrCoop/coop_soft_move.h" // host_verdict
 
 namespace coop
 {
@@ -64,6 +65,8 @@ bool host_all_stopped();
 // The servers that stay through this move, connected.
 std::vector<Session::SoftServer> host_kept();
 bool host_keeps(u16 level);
+// Why the server of `level` was kept or not at the last host_stop_for_move; None: the level has no server.
+softmove::ServerVerdict host_verdict(u16 level);
 // The move is over, or off: nobody is kept. What happened to a server that stayed is looked at now: a process lost meanwhile had
 // nobody to tell (its players were parked), they reload now. `world_is_new`: this ends a move, in the world it brought, which is up.
 void host_soft_over(bool world_is_new = false);

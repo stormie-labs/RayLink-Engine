@@ -2493,24 +2493,31 @@ void host_held_step(u64 now)
 
 // --- F3a: the host's move that nobody notices (xrCoop/coop_soft_move.h, docs/SPLIT_LEVELS.md §7a "Переход хоста")
 
+// A player at the host's go to `target`, as softmove::stays asks.
+softmove::Facts host_soft_facts(const PeerInfo& p, u16 level, u16 target)
+{
+	const auto it = g.peers.find(p.id);
+	softmove::Facts f;
+	f.joined = p.state == PeerState::Joined;
+	f.known = it != g.peers.end();
+	f.proxy = f.known && it->second.proxy != kNoId;
+	f.loading = f.known && it->second.loading;
+	f.joining = sync::host_peer_joining(p.id);
+	f.choosing = g.choosers.in_choice(p.id);
+	f.server_ready = mapserver::host_keeps(level);
+	f.on_target = level == target;
+	f.server = mapserver::host_verdict(level);
+	return f;
+}
+
 // Who stays in his world through a move to `target`: in the world, on a level whose map server stays.
 std::vector<Session::SoftPlayer> host_pick_stays(u16 target)
 {
 	std::vector<Session::SoftPlayer> out;
 	for (const PeerInfo& p : mgr().session().peers())
 	{
-		const auto it = g.peers.find(p.id);
 		const u16 level = levels::level_of_player(p.id);
-		softmove::Facts f;
-		f.joined = p.state == PeerState::Joined;
-		f.known = it != g.peers.end();
-		f.proxy = f.known && it->second.proxy != kNoId;
-		f.loading = f.known && it->second.loading;
-		f.joining = sync::host_peer_joining(p.id);
-		f.choosing = g.choosers.in_choice(p.id);
-		f.server_ready = mapserver::host_keeps(level);
-		f.on_target = level == target;
-		if (!softmove::stays(f))
+		if (!softmove::stays(host_soft_facts(p, level, target)))
 			continue;
 		Session::SoftPlayer row;
 		row.peer = p.id;
@@ -2518,6 +2525,25 @@ std::vector<Session::SoftPlayer> host_pick_stays(u16 target)
 		out.push_back(row);
 	}
 	return out;
+}
+
+// Stage 1b of docs/plans/2026-11-12-split-levels-no-reloads.md: in the logs of 11-08 every move of the host reloaded somebody and not one line
+// said why. One line per player who is not kept, once per move of the host; nothing else changes.
+void host_say_why_not_kept(const std::vector<Session::SoftPlayer>& stay, u16 target)
+{
+	for (const PeerInfo& p : mgr().session().peers())
+	{
+		if (mapserver::is_bridge(p.id)) // a map server's bridge is a peer of the session too, and no player
+			continue;
+		if (std::any_of(stay.begin(), stay.end(), [&p](const Session::SoftPlayer& row) { return row.peer == p.id; }))
+			continue;
+		const u16 level = levels::level_of_player(p.id);
+		softmove::Facts f = host_soft_facts(p, level, target);
+		softmove::Reload why = softmove::why_reloads(f);
+		if (why == softmove::Reload::Stays)
+			why = softmove::Reload::ServerNotKept; // the move took nobody (no server kept): his server's verdict is the reason
+		::Msg("[coop] soft move: %s reloads: %s (level '%s')", nick_of_peer(p.id).c_str(), softmove::reload_text(why), level_name_by_id(level).c_str());
+	}
 }
 
 void host_say_world(u8 state, PeerId to)
@@ -2642,6 +2668,7 @@ void host_alone_go()
 	xr_vector<Mover> movers = host_pick_movers(true);
 	for (const Session::SoftPlayer& row : stay)
 		movers.erase(std::remove_if(movers.begin(), movers.end(), [&row](const Mover& m) { return m.peer == row.peer; }), movers.end());
+	host_say_why_not_kept(stay, level);
 	levels::host_going_to(level);
 	for (const Mover& m : movers)
 		levels::host_player_reloads(m.peer);
@@ -3977,6 +4004,20 @@ void install_client(Endpoint& e)
 	e.on(Msg::SessionReset, &client_on_session_reset);
 	e.on(Msg::AvatarList, &client_on_avatar_list); // R3 В3
 	e.on(Msg::LoadWait, &client_on_load_wait); // F3a T8
+}
+
+dedicated::WorldFacts host_world_facts()
+{
+	dedicated::WorldFacts f;
+	f.level = g_pGameLevel != nullptr;
+	f.ready = f.level && g_pGameLevel->bReady;
+	f.precache = Device.dwPrecacheFrame != 0;
+	f.alife = ai().get_alife() != nullptr;
+	const CSE_ALifeCreatureActor* actor = f.alife ? ai().alife().graph().actor() : nullptr;
+	f.alife_actor = actor != nullptr;
+	f.client_actor = g_actor != nullptr;
+	f.alive = actor && actor->get_health() > 0.f;
+	return f;
 }
 
 bool host_can_start()

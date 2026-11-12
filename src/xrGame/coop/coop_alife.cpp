@@ -53,6 +53,13 @@ SwitchVote switch_vote(const CSE_ALifeDynamicObject* e)
 {
 	if (mgr().is_client())
 		return client_switch_vote(e->ID);
+	// The dedicated host's actor is a ghost (ghost_actor): it watches nothing, so observer_distance is flt_max for every object, the
+	// ghost itself included, and nothing brought it online. Without its object on the client of this process there is no g_actor,
+	// world_up() is false and no session starts: live 2026-11-12 on b44 (alife actor on fake_start, online false, db.actor nil), and
+	// the unexplained "the session did not come up" of 2026-11-01. A map server's ghost comes online as the actor of a client
+	// (client_switch_vote); this one has nobody to vote for it.
+	if (g_coop_dedicated && e == ai().alife().graph().actor())
+		return SwitchVote::Online;
 	if (world::is_player_character(e) && !(is_map_authority() && join::host_player_in_world(e->ID)))
 		return SwitchVote::Offline; // W9: his player is not in the session (or still loading)
 	return SwitchVote::Default;

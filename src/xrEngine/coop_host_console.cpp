@@ -18,6 +18,8 @@ constexpr size_t kMaxQueuedLines = 64;
 constexpr DWORD kCloseWaitMs = 4500; // Windows ends a closing console's process after 5 s: the world's last save has this long
 
 std::atomic<bool> g_open{false};
+std::atomic<bool> g_window{false}; // false with -coop_hidden: the console of the process is nobody's, its title is not ours to set
+std::atomic<bool> g_eof_quits{false}; // -coop_hidden: the end of the launcher's pipe is quit
 std::atomic<int> g_level{coop::dedicated::kLogDefault};
 std::atomic<bool> g_quit_asked{false};
 std::atomic<bool> g_quit_done{false};
@@ -83,6 +85,8 @@ DWORD WINAPI read_stream(LPVOID handle)
 		{
 			if (!line.empty())
 				push_line(line);
+			if (g_eof_quits)
+				g_quit_asked = true; // the launcher, or the host's game that owned it, is gone: save the world and go
 			return 0;
 		}
 		for (DWORD i = 0; i < got; ++i)
@@ -126,16 +130,24 @@ void open()
 	const HANDLE given = GetStdHandle(STD_INPUT_HANDLE);
 	const DWORD kind = given && given != INVALID_HANDLE_VALUE ? GetFileType(given) : FILE_TYPE_UNKNOWN;
 	const bool stream = kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK;
-	if (!AllocConsole())
-		return;
-	g_out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-	SetConsoleTitleW(L"RayLink: dedicated host");
+	// -coop_hidden: no window of its own (a process started with CREATE_NO_WINDOW has a console already, AllocConsole would fail and
+	// take the reader of the pipe with it); the launcher owns the pipe, and its end means quit
+	const coop::dedicated::ConsolePlan plan = coop::dedicated::console_plan(coop::dedicated::has_hidden_key(GetCommandLineA()), stream);
+	if (plan.window)
+	{
+		if (!AllocConsole())
+			return;
+		g_out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+		SetConsoleTitleW(L"RayLink: dedicated host");
+	}
 	SetConsoleCtrlHandler(on_control, TRUE);
+	g_window = plan.window;
+	g_eof_quits = plan.eof_quits;
 	g_open = true;
-	const HANDLE window = CreateThread(nullptr, 0, read_window, nullptr, 0, nullptr);
+	const HANDLE window = plan.window ? CreateThread(nullptr, 0, read_window, nullptr, 0, nullptr) : nullptr;
 	if (window)
 		CloseHandle(window);
-	const HANDLE reader = stream ? CreateThread(nullptr, 0, read_stream, given, 0, nullptr) : nullptr;
+	const HANDLE reader = plan.read_input ? CreateThread(nullptr, 0, read_stream, given, 0, nullptr) : nullptr;
 	if (reader)
 		CloseHandle(reader);
 }
@@ -144,7 +156,7 @@ bool is_open() { return g_open; }
 
 void log_line(const char* line)
 {
-	if (g_open && coop::dedicated::log_shown(line, g_level))
+	if (g_open && g_window && coop::dedicated::log_shown(line, g_level))
 		write_line(line);
 }
 
@@ -153,13 +165,13 @@ int log_level() { return g_level; }
 
 void print(const char* line)
 {
-	if (g_open)
+	if (g_open && g_window)
 		write_line(line);
 }
 
 void set_title(const char* title)
 {
-	if (!g_open)
+	if (!g_open || !g_window)
 		return;
 	const int n = MultiByteToWideChar(kGameCodePage, 0, title, -1, nullptr, 0);
 	std::wstring text(size_t(n > 0 ? n : 1), L'\0');
