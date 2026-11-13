@@ -168,29 +168,27 @@ XRCORE_API extern intrusive_ptr<str_container> g_pStringContainer;
 class shared_str
 {
 private:
+	// One pointer. RayLink 2026-11-13: a second one, to the container, stood here so that the container outlived every handle. It was
+	// 8 bytes in each of about 26 million handles of a process with G.A.M.M.A. (the engine's own "shared_str objects[...]" line: about
+	// 210 MB a process, the game client and every server alike), and every copy of a string changed the container's non-atomic
+	// counter from whatever thread made the copy. The container now lives as long as the process (xrMemory.cpp _initialize keeps a
+	// reference that is never released), so a handle needs none. Strings were never removed before either (str_container::erase
+	// and str_value::on_deferred_release do nothing): what a handle means is unchanged.
 	intrusive_ptr<str_value> p_ = nullptr;
-	intrusive_ptr<str_container> container_ptr = nullptr;
 
 public:
 	void _set(str_c rhs)
 	{
-		auto gc = g_pStringContainer;
+		str_container* gc = g_pStringContainer.get();
 		if (gc)
-		{
 			p_ = gc->dock(rhs);
-			container_ptr = gc;
-		}
 		else
-		{
 			p_ = nullptr;
-			container_ptr = nullptr;
-		}
 	}
 
 	void _set(shared_str const& rhs)
 	{
 		p_ = rhs.p_;
-		container_ptr = rhs.container_ptr;
 	}
 
 	const str_value* _get() const { return p_.get(); }
@@ -236,7 +234,6 @@ public:
 	void swap(shared_str& rhs)
 	{
 		std::swap(p_, rhs.p_);
-		std::swap(container_ptr, rhs.container_ptr);
 	}
 
 	bool equal(const shared_str& rhs) const { return (p_ == rhs.p_); }

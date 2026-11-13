@@ -105,6 +105,12 @@ void xrMemory::_initialize(BOOL bDebug)
 
 	// DUMP_PHASE;
     g_pStringContainer = str_container::create();
+	// RayLink 2026-11-13: the container lives as long as the process. A shared_str holds no reference to it (xrstring.h: it is one
+	// pointer now), and a static shared_str may be destroyed after _destroy() has released g_pStringContainer: its string must
+	// still be there. This reference is never released; the OS takes the memory back when the process ends.
+	static intrusive_ptr<str_container>* string_container_forever = nullptr;
+	if (!string_container_forever)
+		string_container_forever = new intrusive_ptr<str_container>(g_pStringContainer);
 	shared_str_initialized = true;
 	// DUMP_PHASE;
 	g_pSharedMemoryContainer = xr_new<smem_container>();
@@ -128,8 +134,8 @@ void xrMemory::_destroy()
     if (debug_mode) dbg_dump_str_leaks();
 #endif // DEBUG_MEMORY_MANAGER
 
-	// Release own reference of g_pStringContainer
-	// The actual str_container will be destroyed only when no shared_str instances hold it
+	// Release own reference of g_pStringContainer. The container itself stays for the rest of the process (_initialize keeps a
+	// reference for good): strings of shared_str objects destroyed later are still valid.
     g_pStringContainer = nullptr;
 
 	xr_delete(g_pSharedMemoryContainer);

@@ -319,6 +319,11 @@ enum class Reason : uint8_t
 	Transfer, // requirement 8: a map server starts or stops
 	Manual
 };
+// The numbers go to the script's journal of the world's saves (gamedata/scripts/coop_saves_journal.script, WHY): a new reason is
+// added at the end, and there too.
+static_assert(int(Reason::Timer) == 0 && int(Reason::Sleep) == 1 && int(Reason::LevelChange) == 2 && int(Reason::SessionEnd) == 3 &&
+              int(Reason::Transfer) == 4 && int(Reason::Manual) == 5,
+              "the script's journal reads a reason by its number");
 
 // Requirement 8: before a map server starts or stops the world is saved, unless a save of any reason is this fresh: a wave of players
 // through a transition starts several at once, and one save serves them all. last_ms 0 = none yet.

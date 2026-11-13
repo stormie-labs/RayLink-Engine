@@ -36,7 +36,9 @@ CScriptIniFile* reload_system_ini()
 void section_for_each(CScriptIniFile* self, ::luabind::functor<bool> functor)
 {
 	typedef CInifile::Root sections_type;
-	sections_type& sections = self->sections();
+	// Anomaly Coop: read through the const object. The non-const sections() gives the object's own copy for a write, and scripts
+	// walk system_ini() with this: it would take its own copy of system.ltx just to be read.
+	const sections_type& sections = static_cast<const CInifile*>(self)->sections();
 
 	sections_type::const_iterator i = sections.begin();
 	sections_type::const_iterator e = sections.end();

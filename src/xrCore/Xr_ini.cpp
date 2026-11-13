@@ -108,7 +108,7 @@ BOOL CInifile::Sect::line_exist(LPCSTR L, LPCSTR* val)
 
 // Initialize the static cache member
 BOOL dltx_use_cache = TRUE;
-xr_unordered_flat_map<xr_string, CInifile::Root> CInifile::CachedData;
+xr_unordered_flat_map<xr_string, std::shared_ptr<const CInifile::Root>> CInifile::CachedData;
 xrCriticalSection CInifile::CacheCS;
 void CInifile::InvalidateCache(LPCSTR path) {
 	if (path)
@@ -124,14 +124,93 @@ void CInifile::InvalidateCache(LPCSTR path) {
 	else
 	{
 		xrCriticalSectionGuard g(CacheCS);
-		for (auto& p : CachedData)
-		{
-			p.second.clear();
-		}
+		// the objects that share a root keep it; the cache lets go of its own reference
 		CachedData.clear();
 		CachedData.rehash(0);
 	}
 };
+
+// Anomaly Coop: the CInifile objects alive now (CInifile::LiveStats). The set and its lock are never freed: an ini that dies
+// while the process exits, after the statics are gone, still finds them.
+namespace
+{
+xrCriticalSection& live_lock()
+{
+	static xrCriticalSection* lock = new xrCriticalSection();
+	return *lock;
+}
+xr_unordered_flat_set<CInifile*>& live_set()
+{
+	static xr_unordered_flat_set<CInifile*>* set = new xr_unordered_flat_set<CInifile*>();
+	return *set;
+}
+} // namespace
+
+// Called at the end of a constructor: the data is loaded, another thread's report reads sizes that do not move under it.
+void CInifile::LiveAdd()
+{
+	xrCriticalSectionGuard g(live_lock());
+	live_set().insert(this);
+}
+
+void CInifile::LiveRemove()
+{
+	xrCriticalSectionGuard g(live_lock());
+	live_set().erase(this);
+}
+
+void CInifile::LiveStats(xr_vector<LiveRow>& rows, u64& instances, u64& sections, u64& items, u64& distinct_items)
+{
+	rows.clear();
+	instances = sections = items = distinct_items = 0;
+	xr_unordered_flat_map<xr_string, LiveRow> by_file;
+	xr_unordered_flat_set<const Root*> seen;
+	{
+		xrCriticalSectionGuard g(live_lock());
+		for (const CInifile* ini : live_set())
+		{
+			xr_string name(ini->m_file_name[0] ? ini->m_file_name : "<from memory>");
+			toLowerCase(name);
+			LiveRow& row = by_file[name];
+			++row.instances;
+			++instances;
+			const Root& root = ini->data();
+			row.sections += root.size();
+			sections += root.size();
+			const bool first = seen.insert(&root).second;
+			for (const Sect& sect : root)
+			{
+				row.items += sect.Data.size();
+				items += sect.Data.size();
+				if (first)
+					distinct_items += sect.Data.size();
+			}
+		}
+	}
+	rows.reserve(by_file.size());
+	for (auto& pair : by_file)
+	{
+		pair.second.file = pair.first;
+		rows.push_back(pair.second);
+	}
+	std::sort(rows.begin(), rows.end(), [](const LiveRow& a, const LiveRow& b) { return a.items != b.items ? a.items > b.items : a.file < b.file; });
+}
+
+// The object's own data, for a write. An object that shares its root (see m_shared in the header) takes its copy here, once.
+// The readers of this object keep reading the shared root until the copy is whole: m_view moves last.
+CInifile::Root& CInifile::data_own()
+{
+	if (m_view.load(std::memory_order_acquire) == &DATA)
+		return DATA;
+	static xrCriticalSection* lock = new xrCriticalSection(); // never freed: an ini may be written while the process exits
+	xrCriticalSectionGuard g(*lock);
+	if (m_view.load(std::memory_order_acquire) != &DATA)
+	{
+		DATA = *m_shared;
+		m_view.store(&DATA, std::memory_order_release);
+	}
+	return DATA;
+}
 
 void CInifile::InsertIntoDATA(xr_unordered_flat_map<shared_str, Items>& FinalData)
 {
@@ -163,6 +242,7 @@ CInifile::CInifile(IReader* F, LPCSTR path
 	     , allow_include_func
 #endif
 	);
+	LiveAdd();
 }
 
 CInifile::CInifile(LPCSTR szFileName,
@@ -202,7 +282,10 @@ CInifile::CInifile(LPCSTR szFileName,
 			{
 				if (print_dltx_warnings)
 					Msg("[DLTX] [%s] Found data in cache", m_file_name);
-                DATA = CachedDataIt->second;
+				// the cache's own root, shared (see m_shared): no copy
+				m_shared = CachedDataIt->second;
+				m_view.store(m_shared.get(), std::memory_order_release);
+				LiveAdd();
 				return;
 			}
 		}
@@ -223,10 +306,12 @@ CInifile::CInifile(LPCSTR szFileName,
 			FS.r_close(R);
 		}
 	}
+	LiveAdd();
 }
 
 CInifile::~CInifile()
 {
+	LiveRemove();
 	if (!m_flags.test(eReadOnly) && m_flags.test(eSaveAtEnd))
 	{
 		if (!save_as())
@@ -1379,7 +1464,16 @@ void CInifile::Load(IReader* F, LPCSTR path
         xr_string FileName(m_file_name);
         toLowerCase(FileName);
         xrCriticalSectionGuard g(CacheCS);
-        CachedData.emplace(std::move(FileName), DATA);
+		// The cache and this object share what was parsed (see m_shared): one copy, where each had its own. If another thread
+		// has cached this file meanwhile, the cache keeps that one and this object keeps its own data, as before.
+		if (m_view.load(std::memory_order_acquire) == &DATA && CachedData.find(FileName) == CachedData.end())
+		{
+			std::shared_ptr<Root> root = std::make_shared<Root>(std::move(DATA));
+			DATA = Root();
+			m_shared = root;
+			m_view.store(m_shared.get(), std::memory_order_release);
+			CachedData.emplace(std::move(FileName), m_shared);
+		}
     }
 
 	// Handle override warnings
@@ -1426,7 +1520,7 @@ void CInifile::DLTX_print(LPCSTR sec, LPCSTR line)
 {
 	Msg("%s", m_file_name);
 	if (!sec) {
-		for (const auto& d : DATA) {
+		for (const auto& d : data()) {
 			Msg("[%s]", d.Name.c_str());
 			for (const auto& s : d.Data) {
 				printIniItemLine(s);
@@ -1506,7 +1600,8 @@ bool CInifile::DLTX_isOverride(LPCSTR sec, LPCSTR line)
 void CInifile::save_as(IWriter& writer, bool bcheck) const
 {
 	string4096 temp, val;
-	for (RootCIt r_it = DATA.begin(); r_it != DATA.end(); ++r_it)
+	const Root& root = data();
+	for (RootCIt r_it = root.begin(); r_it != root.end(); ++r_it)
 	{
 		xr_sprintf(temp, sizeof(temp), "[%s]", (*r_it).Name.c_str());
 		writer.w_string(temp);
@@ -1565,8 +1660,9 @@ bool CInifile::save_as(LPCSTR new_fname)
 
 BOOL CInifile::section_exist(LPCSTR S) const
 {
-	RootCIt I = std::lower_bound(DATA.begin(), DATA.end(), S, sect_pred);
-	return (I != DATA.end() && xr_strcmp(*(*I).Name, S) == 0);
+	const Root& root = data();
+	RootCIt I = std::lower_bound(root.begin(), root.end(), S, sect_pred);
+	return (I != root.end() && xr_strcmp(*(*I).Name, S) == 0);
 }
 
 BOOL CInifile::line_exist(LPCSTR S, LPCSTR L) const
@@ -1589,7 +1685,7 @@ u32 CInifile::line_count(LPCSTR Sname) const
 
 u32 CInifile::section_count() const
 {
-	return DATA.size();
+	return data().size();
 }
 
 
@@ -1611,8 +1707,9 @@ CInifile::Sect& CInifile::r_section(LPCSTR S) const
 	char section[256];
 	xr_strcpy(section, sizeof(section), S);
 	strlwr(section);
-	RootCIt I = std::lower_bound(DATA.begin(), DATA.end(), section, sect_pred);
-	if (!(I != DATA.end() && xr_strcmp(*(*I).Name, section) == 0))
+	const Root& root = data();
+	RootCIt I = std::lower_bound(root.begin(), root.end(), section, sect_pred);
+	if (!(I != root.end() && xr_strcmp(*(*I).Name, section) == 0))
 	{
 		Debug.fatal(DEBUG_INFO, "Can't open section '%s'. Please attach [*.ini_log] file to your bug report", S);
 	}
@@ -1836,6 +1933,7 @@ BOOL CInifile::r_line(const shared_str& S, int L, const char** N, const char** V
 void CInifile::w_string(LPCSTR S, LPCSTR L, LPCSTR V, LPCSTR comment)
 {
 	R_ASSERT(!m_flags.test(eReadOnly));
+	Root& own = data_own(); // a write: the object's own copy, if it shared one (r_section below reads it)
 
 	// section
 	string256 sect;
@@ -1845,8 +1943,8 @@ void CInifile::w_string(LPCSTR S, LPCSTR L, LPCSTR V, LPCSTR comment)
 	if (!section_exist(sect))
 	{
 		// create _new_ section
-		RootIt I = std::lower_bound(DATA.begin(), DATA.end(), sect, sect_pred);
-		DATA.insert(I, Sect{ sect });
+		RootIt I = std::lower_bound(own.begin(), own.end(), sect, sect_pred);
+		own.insert(I, Sect{ sect });
 	}
 
 	// parse line/value
@@ -2022,6 +2120,7 @@ void CInifile::w_bool(LPCSTR S, LPCSTR L, BOOL V, LPCSTR comment)
 void CInifile::remove_line(LPCSTR S, LPCSTR L)
 {
 	R_ASSERT(!m_flags.test(eReadOnly));
+	data_own(); // a write: the object's own copy, if it shared one (r_section below reads it)
 
 	if (line_exist(S, L))
 	{

@@ -41,8 +41,12 @@ void XR_INIT()
 		return;
 	g_heap = NULL;
 	size_t size = CHUNK_SIZE * CHUNK_COUNT;
+	// RayLink 2026-11-13: the range is reserved here and a chunk is committed when LuaJIT takes it (XR_MMAP). It was committed
+	// whole: 512 MB of commit in every process of the game, the client, the world server and each map server, while its Lua
+	// uses 55 to 90 MB (the console's coop_memory_map shows the block). What LuaJIT needs is the low addresses, and the
+	// reservation keeps them. A chunk LuaJIT gives back stays committed and is handed out again as it is, as before.
 	long st = ntavm(INVALID_HANDLE_VALUE, &g_heap, NTAVM_ZEROBITS, &size,
-	                MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+	                MEM_RESERVE, PAGE_READWRITE);
 
 	for (int i = 0; i < CHUNK_COUNT; i++)
 		g_heapMap[i] = 'x';
@@ -63,10 +67,14 @@ void* XR_MMAP(size_t size)
 	OutputDebugString(buf);
 #endif
 	int chunks = CHUNKS_FROM_SIZE(size);
-	char* s = find_free(chunks);
+	char* s = g_heap ? find_free(chunks) : NULL; // no reservation: no memory, as when the range is used up
 	void* ptr = MFAIL;
 	if (s != NULL) {
 		ptr = (char*)g_heap + CHUNK_SIZE * (s - g_heapMap);
+		// commit what is handed out: nothing for a chunk that was committed before (its pages stay as they are), zero pages
+		// for one used for the first time. No commit left in the system: no memory, the chunks stay free.
+		if (!VirtualAlloc(ptr, (size_t)chunks * CHUNK_SIZE, MEM_COMMIT, PAGE_READWRITE))
+			return MFAIL;
 		for (int i = 0; i < chunks; i++)
 			s[i] = 'a';
 		if (s == g_firstFreeChunk)

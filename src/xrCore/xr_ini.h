@@ -2,6 +2,12 @@
 
 #include "xr_delegate.h"
 
+#include <atomic>
+#include <memory>
+
+#include <atomic>
+#include <memory>
+
 // refs
 class CInifile;
 struct xr_token;
@@ -91,7 +97,21 @@ public:
 
 private:
 	string_path m_file_name;
+	// Anomaly Coop 2026-11-13: the parsed data of a file is shared. Every CInifile had a copy of its own, and the cache of parsed
+	// files one more: with G.A.M.M.A. system.ltx (1.9 million items) was in memory four times, in pSettings, pSettingsAuth, an
+	// addon's ini_file("system.ltx") and the cache (the console's coop_ini_stats says who holds what). Now an object made from a
+	// file shares one read-only Root with the cache and with every other object of that file, and takes a copy of its own the first
+	// time it is written to (w_string, remove_line, the non-const sections()): what each object reads is what it read before.
+	//   m_shared  the root shared with the cache; kept for the object's whole life, so a reference a caller took before the
+	//             object's first write stays valid
+	//   DATA      the object's own data: an object read from a reader, a file the cache does not hold, or one written to
+	//   m_view    what the object reads now, &DATA or the shared root. One atomic pointer: another thread may read the object
+	//             while a caller takes its own copy only to iterate it
+	std::shared_ptr<const Root> m_shared;
 	Root DATA;
+	std::atomic<const Root*> m_view{ &DATA };
+	const Root& data() const { return *m_view.load(std::memory_order_acquire); }
+	Root& data_own();
 	void Load(IReader* F, LPCSTR path
 #ifndef _EDITOR
 	          , allow_include_func_t allow_include_func = NULL
@@ -127,8 +147,25 @@ public:
 	bool DLTX_isOverride(LPCSTR sec, LPCSTR line);
 	
 private:
-	static xr_unordered_flat_map<xr_string, Root> CachedData;
+	static xr_unordered_flat_map<xr_string, std::shared_ptr<const Root>> CachedData;
 	static xrCriticalSection CacheCS;
+
+public:
+	// Anomaly Coop, the memory report (console coop_ini_stats): the CInifile objects alive now by their file, the largest first.
+	// For finding where the items of the configs live; nothing reads it but that command.
+	struct LiveRow
+	{
+		xr_string file;
+		u32 instances = 0;
+		u64 sections = 0;
+		u64 items = 0;
+	};
+	// `items` counts every object's items; `distinct_items` counts the data once, however many objects share it (see m_shared).
+	static void LiveStats(xr_vector<LiveRow>& rows, u64& instances, u64& sections, u64& items, u64& distinct_items);
+
+private:
+	void LiveAdd();
+	void LiveRemove();
 
 public:
 	static void InvalidateCache(LPCSTR path = nullptr);
@@ -146,7 +183,7 @@ public:
 			total_bytes += file_pair.first.capacity();
 
 			// Inner map overhead
-			for (const auto& sect_pair : file_pair.second)
+			for (const auto& sect_pair : *file_pair.second)
 			{
 				section_count++;
 				// Each section name
@@ -272,8 +309,8 @@ public:
 	u32 section_count() const;
 	BOOL section_exist(LPCSTR S) const;
 	BOOL section_exist(const shared_str& S) const;
-	Root& sections() { return DATA; }
-	Root const& sections() const { return DATA; }
+	Root& sections() { return data_own(); } // the caller may write: the object's own copy
+	Root const& sections() const { return data(); }
 
 	CLASS_ID r_clsid(LPCSTR S, LPCSTR L) const;
 	CLASS_ID r_clsid(const shared_str& S, LPCSTR L) const { return r_clsid(*S, L); }

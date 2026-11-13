@@ -9,6 +9,7 @@
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
 #include "ai_space.h"
+#include "script_engine.h"
 #include "Level.h"
 #include "Actor.h"
 
@@ -419,6 +420,45 @@ void prune_surplus(const std::string& game, uint32_t written)
 	}
 }
 
+// coop_game_settings.on_autosave, or nil; run protected (the lookup of a script's table may load the script).
+int journal_lookup(lua_State* L)
+{
+	lua_getglobal(L, "coop_game_settings");
+	if (!lua_istable(L, -1))
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	lua_getfield(L, -1, "on_autosave");
+	return 1;
+}
+
+// The journal of the world's saves (gamedata\scripts\coop_saves_journal.script, the launcher's chronicle of a world): the script
+// could not name this save while it was written, it went through coop_auto_tmp, so the engine tells it the slot and why. A script
+// without on_autosave (a mod from before the journal) is told nothing; a Lua error is a line of the log. The save is on disk
+// whatever the journal says.
+void tell_script(const std::string& name, Reason why)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 8))
+		return;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &journal_lookup);
+	if (lua_pcall(L, 0, 1, 0) != 0 || !lua_isfunction(L, -1))
+	{
+		lua_settop(L, top);
+		return;
+	}
+	lua_pushlstring(L, name.data(), name.size());
+	lua_pushnumber(L, lua_Number(int(why)));
+	if (lua_pcall(L, 2, 0, 0) != 0)
+	{
+		const char* err = lua_tostring(L, -1);
+		::Msg("! [coop] autosave: lua error in coop_game_settings.on_autosave(%s): %s", name.c_str(), err ? err : "?");
+	}
+	lua_settop(L, top);
+}
+
 // One more save counted: the interval of the timer starts from here, and a request waiting for this save is served.
 void note_saved(Reason why, const std::string& name)
 {
@@ -430,6 +470,7 @@ void note_saved(Reason why, const std::string& name)
 	g_schedule.last_ms = now;
 	g_schedule.busy_since = 0;
 	g_pending = Pending();
+	tell_script(name, why);
 }
 
 // Writes a save now. The caller has chosen the moment; the level is checked here.

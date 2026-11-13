@@ -159,6 +159,7 @@ void str_container::dump_console()
 	u32 total_strings = 0;
 	float load_factor = 0.0f;
 	u32 max_collisions = 0;
+	u64 handles = 0; // RayLink: the handles of all strings (a handle holds no reference to the container any more)
 
 	xrSRWLockGuard guard(&rwlock, true);
 	for (const auto& list : buffer)
@@ -168,6 +169,7 @@ void str_container::dump_console()
 		{
 			Msg("ref[%d]-len[%d] : %s\n", s.intrusive_ref_count(), xr_strlen(s.value), s.value);
 			count++;
+			handles += s.intrusive_ref_count();
 			set.emplace(s.value);
 		}
 		if (count > max_collisions)
@@ -183,7 +185,7 @@ void str_container::dump_console()
 		set.size(),
 		load_factor,
 		max_collisions,
-		intrusive_ref_count() - 1
+		u32(handles)
 	);
 	if (total_strings != set.size())
 		Msg("! [x-ray]: shared strings, count != unique");
@@ -196,7 +198,10 @@ u32 str_container::stat_economy(u32& count, u32& unique)
 	count = 0;
 
 	xrSRWLockGuard guard(&rwlock, true);
-	u32 size = sizeof(*this) + sizeof(shared_str) * intrusive_ref_count() - 1;
+	// RayLink 2026-11-13: the handles are counted by the strings they point at (a handle holds no reference to the container any
+	// more), so the line still says how many shared_str objects the process keeps and what they cost.
+	u64 handles = 0;
+	u32 size = sizeof(*this);
 	size += buffer_size * sizeof(xr_forward_list<str_value>);
 	for (const auto& block : storage) {
 		size += block.capacity;
@@ -210,6 +215,7 @@ u32 str_container::stat_economy(u32& count, u32& unique)
 		{
 			c++;
 			size += sizeof(str_value) + sizeof(void*);
+			handles += s.intrusive_ref_count();
 			strings.emplace(s.value);
 		}
 		if (c > max_collisions)
@@ -218,13 +224,14 @@ u32 str_container::stat_economy(u32& count, u32& unique)
 	}
 	unique = strings.size();
 	load_factor = (float)count / (float)buffer_size;
+	size += u32(sizeof(shared_str) * handles);
 	Msg("* [x-ray]: shared strings: pool blocks[%lu], count[%lu], unique[%lu], load factor[%.2f], max_collisions[%lu], shared_str objects[%lu]",
 		storage.size(),
 		count,
 		unique,
 		load_factor,
 		max_collisions,
-		intrusive_ref_count() - 1
+		u32(handles)
 	);
 	return size;
 }
