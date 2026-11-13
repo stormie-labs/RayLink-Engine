@@ -100,7 +100,17 @@ bool IGame_Level::Load(u32 dwNum)
 	//SECUROM_MARKER_PERFORMANCE_ON(10)
 
 	// Initialize level data
-	pApp->Level_Set(dwNum);
+	// Anomaly Coop: whoever starts this load has set the level already, on the main thread (Level_ID(..., true):
+	// CALifeGraphRegistry::setup_current_level, CLevel::net_start_client3). The ALife runs this function in a task (level_load)
+	// while the main thread goes on, and Level_Set is not made for two threads: FS_Path::_set frees and replaces "$level$",
+	// the logo's name is built in a static buffer. The main thread set the level once more at the end of
+	// setup_current_level, and both threads were in Level_Set at once: "$level$" was freed twice. Under the checking heap
+	// of Windows that is "Invalid address specified to RtlFreeHeap" at the first load; in a release build the heap is
+	// corrupted (0xC0000374) and the process is gone without a word, its log cut in a line - about one load in five on the
+	// stand, a player's game and a map server alike (builds 46 to 48). Setting the current level again changed nothing
+	// (the same path, the same logo), so only a level that is not the current one is set here.
+	if (pApp->Level_Current != dwNum)
+		pApp->Level_Set(dwNum);
 	string_path temp;
 	if (!FS.exist(temp, "$level$", "level.ltx"))
 		Debug.fatal(DEBUG_INFO, "Can't find level configuration file '%s'.", temp);

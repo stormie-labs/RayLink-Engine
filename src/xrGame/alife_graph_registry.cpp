@@ -103,8 +103,11 @@ void CALifeGraphRegistry::setup_current_level()
 	}
 	R_ASSERT2(ai().game_graph().header().levels().end() != I, "Graph point level ID not found!");
 
-	int id = pApp->Level_ID(*(*I).second.name(), "1.0", true);
-	VERIFY3(id >= 0, "Level is corrupted or doesn't exist", *(*I).second.name());
+	// Anomaly Coop: the level was set at the top of this function, before level_load started; here stood a second
+	// Level_ID(..., true). It set the same level again on this thread while the task was loading it: Level_Set on two
+	// threads at once freed "$level$" twice (IGame_Level::Load has the whole story), and even alone it replaced the path
+	// the task was reading. The id is the one found above.
+	VERIFY3(levelid >= 0, "Level is corrupted or doesn't exist", *(*I).second.name());
 	ai().load(*(*I).second.name());
 }
 
