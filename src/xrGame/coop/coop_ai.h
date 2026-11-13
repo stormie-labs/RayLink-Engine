@@ -84,6 +84,16 @@ bool puppet_may_look_at_actor(CAI_Stalker* npc, float max_distance);
 // parked), so the objects around them are updated as often as the ones around the host's camera. Anywhere else (a client,
 // no session, a world that is not up) it empties the list, which is the stock behaviour.
 void viewers_frame();
+// A map server draws nothing. Stock advances a stalker's animation tracks in two places: the renderer does it for a visual it draws
+// (CalculateBones), and CStalkerAnimationManager::update_tracks while a callback is waited for (`waited`). The players' games
+// mirror the blends of the stalkers a map server leads (coop_entities.cpp capture_anims): between two callbacks they stood still
+// there - a motion just started kept no weight and its time did not move, so its puppets held the motion before or began the new
+// one again and again (owner, live build 46, 2026-11-13: "they walk slowly, they jerk, the animations are broken"). A monster
+// advances its own every frame (control_animation.cpp). True: advance them now. A game with a window answers `waited`: stock.
+// Console coop_headless_tracks 0 gives a map server the stock answer too, for a comparison.
+bool undrawn_tracks(bool waited);
+// "stalker tracks" of coop_mapserver_stats: what undrawn_tracks answered since the line before. A process without a window only.
+void print_tracks_status();
 // Audit A4 (2026-10-24): the nearest player a monster can go for within `max_dist` of `pos` - this machine's actor or (host)
 // the character of a player who is in the world and not down (player_down); nullptr when none. Engine code that only knew
 // Actor() (the poltergeist's senses) asks this.

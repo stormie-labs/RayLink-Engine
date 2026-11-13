@@ -47,6 +47,9 @@ namespace coop
 namespace money
 {
 void init(); // F3a T4: once per process (sync::init): the money settings and their console commands
+// Its console commands alone, with the others (coop_console.cpp): a process reads its user.ltx before sync::init, and every start
+// of a server wrote "Unknown command: coop_money_..." for the lines its own exit had saved there. Once per process.
+void register_commands();
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session ended, client's world replaced: nothing kept

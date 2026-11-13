@@ -760,6 +760,8 @@ void init()
 	register_console();
 }
 
+void register_commands() { register_console(); }
+
 void install_server(Session& s) { s.on(Msg::ReqMoney, &host_on_req); }
 
 void install_client(Endpoint& e) { e.on(Msg::MoneyBalance, &client_on_balance); }

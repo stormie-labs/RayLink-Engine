@@ -304,6 +304,14 @@ void watch_process(u16 level, Server& s)
 {
 	if (!s.process || WaitForSingleObject(s.process, 0) != WAIT_OBJECT_0)
 		return;
+	// What it ended with tells a fault from an order: 1 is the engine's own end after a fatal error, 3 its watchdog after one, and
+	// 0xC0000005 and the like a fault nobody caught. Live 2026-11-13: the first map server of a world vanished in its load, its log
+	// cut in the middle of a line, no dump and nothing in Windows' own log - and the world server did not say how it had ended.
+	DWORD code = 0;
+	if (GetExitCodeProcess(s.process, &code))
+		::Msg("[coop] map server %u: its process ended with code %lu (0x%08lX)", s.k, code, code);
+	else
+		::Msg("[coop] map server %u: its process ended, the code is not known (error %lu)", s.k, GetLastError());
 	CloseHandle(s.process);
 	s.process = nullptr;
 	on_lost(level, s);

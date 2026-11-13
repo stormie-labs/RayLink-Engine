@@ -85,6 +85,16 @@ u32 g_lit_next = 0, g_lit_list_ms = 0;
 float g_viewer_range = viewers::kDefaultRange;
 float g_viewer_frame_radius = viewers::kDefaultFrameRadius;
 
+// Console coop_headless_tracks: a process without a window advances the tracks of its stalkers every frame (undrawn_tracks).
+int g_headless_tracks = 1;
+// A stalker's animation update runs on the main thread (CCustomMonster::UpdateCL): plain counters.
+struct Tracks
+{
+	u64 asked = 0; // updates of a living stalker
+	u64 waited = 0; // ...where stock advances the tracks itself: a callback is waited for
+	u64 undrawn = 0; // ...where only this process's rule does
+} g_tracks;
+
 // Game rule coop_npc_finish_downed (host setting, off by default): on, a stalker goes on shooting a player who is down. Off, he leaves
 // him like a monster does.
 int g_finish_downed = 0;
@@ -595,8 +605,35 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 	return best;
 }
 
+bool undrawn_tracks(bool waited)
+{
+	if (!g_coop_headless)
+		return waited;
+	++g_tracks.asked;
+	if (waited)
+	{
+		++g_tracks.waited;
+		return true;
+	}
+	if (!g_headless_tracks)
+		return false;
+	++g_tracks.undrawn;
+	return true;
+}
+
+void print_tracks_status()
+{
+	if (!g_coop_headless)
+		return;
+	::Msg("[coop] coop_mapserver_stats: stalker tracks: %llu update(s), %llu advanced for a callback, %llu advanced undrawn, "
+	      "%llu stood still (console coop_headless_tracks %d)",
+	    g_tracks.asked, g_tracks.waited, g_tracks.undrawn, g_tracks.asked - g_tracks.waited - g_tracks.undrawn, g_headless_tracks);
+	g_tracks = Tracks();
+}
+
 void register_console()
 {
+	CMD4(CCC_Integer, "coop_headless_tracks", &g_headless_tracks, 0, 1); // 0: stock, for a comparison (undrawn_tracks)
 	CMD4(CCC_Float, "coop_viewer_range", &g_viewer_range, 0.f, viewers::kMaxRange); // host setting
 	CMD4(CCC_Float, "coop_viewer_frame_radius", &g_viewer_frame_radius, 0.f, viewers::kMaxFrameRadius); // host setting
 	CMD4(CCC_Integer, "coop_npc_finish_downed", &g_finish_downed, 0, 1); // game rule (coop_game_schema c|coop_npc_finish_downed)

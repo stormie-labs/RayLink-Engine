@@ -15,6 +15,7 @@
 #include "stalker_movement_manager_smart_cover.h"
 #include "Inventory.h"
 #include "coop/coop_remote.h" // Anomaly Coop
+#include "coop/coop_ai.h" // Anomaly Coop: undrawn_tracks
 
 void CStalkerAnimationManager::play_delayed_callbacks()
 {
@@ -52,7 +53,8 @@ IC bool CStalkerAnimationManager::need_update() const
 
 IC void CStalkerAnimationManager::update_tracks()
 {
-	if (!need_update())
+	// Anomaly Coop: stock is need_update() alone; a map server, which draws nothing, advances them every frame (undrawn_tracks)
+	if (!coop::npc_ai::undrawn_tracks(need_update()))
 		return;
 
 	m_skeleton_animated->UpdateTracks();

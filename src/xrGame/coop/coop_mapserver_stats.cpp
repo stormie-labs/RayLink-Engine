@@ -5,6 +5,7 @@
 // numbers, without a map server's sleep to its 30 frames a second: its budget is 33 ms.
 #include "coop_manager.h"
 #include "coop_levels.h"
+#include "coop_ai.h" // print_tracks_status
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
 
@@ -133,6 +134,7 @@ void log_stats()
 	    "frame avg %.1f ms, worst %u ms, %u frames",
 	    u64(memory.PrivateUsage) / (1024 * 1024), u64(memory.WorkingSetSize) / (1024 * 1024), lua_kb / 1024, alife_total,
 	    alife_online, average_ms, frames.worst_ms, frames.frames);
+	npc_ai::print_tracks_status(); // a process without a window: did the animations of its stalkers go on
 
 	// Where a frame goes, by the engine's own timers. They run only with "rs_stats on" (device.cpp: g_bEnableStatGather), and each
 	// is the engine's smoothed value of the last frames, in ms. For finding what to speed up: a measurement, not a setting.

@@ -18,6 +18,8 @@
 #include "coop_debug.h" // protocol 29
 #include "coop_items.h"
 #include "coop_lua_errors.h" // 2026-11: coop_lua_errors
+#include "coop_money.h" // its commands are registered here, before user.ltx is read
+#include "coop_story.h" // the same: coop_share_rewards, coop_tasks_resync
 #include "xrCoop/coop_limits.h"
 
 #include <cstdlib>
@@ -247,5 +249,8 @@ void register_console_commands()
 	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
 	debug::register_console(); // protocol 29: coop_debug, coop_dbg
 	lua_errors::register_console(); // 2026-11: coop_lua_errors (Lua errors survived in a session)
+	// Registered at sync::init until build 46: later than user.ltx is read, so each start said "Unknown command" for all eight.
+	money::register_commands(); // coop_money_*
+	story::init(); // coop_share_rewards, coop_tasks_resync: its init is the registration, once per process
 }
 } // namespace coop
