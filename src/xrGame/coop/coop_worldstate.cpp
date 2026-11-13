@@ -905,7 +905,11 @@ bool refuse_engine_time_factor(float factor)
 {
 	if (!mgr().active() || fsimilar(factor, 1.f))
 		return false;
-	::Msg("! [coop] time_factor %.3f refused: slow motion is off in a co-op session", factor);
+	// The refusal is the rule, not a fault: a mod that stops the clock while its window is open asks again every time (the owner's
+	// log of 2026-11-13 had twelve red lines of it). One plain line for the first of them, then one for every fiftieth.
+	static u32 s_refused = 0;
+	if (s_refused++ % 50 == 0)
+		::Msg("[coop] time_factor %.3f refused: slow motion is off in a co-op session (%u so far)", factor, s_refused);
 	return true;
 }
 } // namespace worldstate

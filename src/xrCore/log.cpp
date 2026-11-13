@@ -410,6 +410,32 @@ void xrLogger::InternalPrintRecord()
 	}
 
 	xr_vector<xr_string> LogLines = theRecord.Message.Split('\n');
+	// Anomaly Coop: xr_strconcat below ends the process when a line does not fit its string4096 - on this thread, the log's own, so
+	// nothing of it is written: the process is gone with its log cut in the middle of a line, no dump, no word. Log(const char*) (a
+	// script's printf) takes a line of any length. Live, 2026-11-13: coop_status with a player in the world printed the list of the
+	// wrapped functions, over 4 KB, and the world server died; a map server vanished the same way in its load. A line that long is
+	// written in pieces, each one a line of its own.
+	{
+		constexpr size_t kPiece = 3800; // room for whatever stands before the text in finalLine
+		bool long_one = false;
+		for (const xr_string& line : LogLines)
+			long_one = long_one || line.size() > kPiece;
+		if (long_one)
+		{
+			xr_vector<xr_string> pieces;
+			for (const xr_string& line : LogLines)
+			{
+				if (line.size() <= kPiece)
+				{
+					pieces.push_back(line);
+					continue;
+				}
+				for (size_t at = 0; at < line.size(); at += kPiece)
+					pieces.push_back(xr_string(line.c_str() + at, u32(_min(kPiece, line.size() - at))));
+			}
+			LogLines.swap(pieces);
+		}
+	}
 
 	string256 TimeOfDay = {};
 

@@ -282,6 +282,9 @@ inline bool rewrite_fsgame(const std::string& text, uint32_t k, std::string& out
 inline std::string map_server_user_ltx(const std::string& text)
 {
 	static const char* const kOwn[][2] = {{"rs_screenmode", "windowed"}, {"vid_mode", "640x480"}, {"g_always_active", "on"}};
+	// What only a game started with -dbg registers (console_commands.cpp) and saves: a server without the key said "Unknown command"
+	// for each of them at every start (the owner's map servers, 2026-11-13). No server needs them: they are left out.
+	static const char* const kDebugOnly[] = {"g_god", "g_unlimitedammo", "ph_gravity", "log_missing_ini", "g_end_modif"};
 	std::string out;
 	for (size_t line = 0; line < text.size();)
 	{
@@ -293,6 +296,11 @@ inline std::string map_server_user_ltx(const std::string& text)
 		{
 			const size_t n = std::strlen(kv[0]);
 			own = own || (text.compare(line, n, kv[0]) == 0 && (line + n >= text.size() || text[line + n] == ' '));
+		}
+		for (const char* key : kDebugOnly)
+		{
+			const size_t n = std::strlen(key);
+			own = own || (text.compare(line, n, key) == 0 && (line + n >= text.size() || text[line + n] == ' '));
 		}
 		if (!own && stop > line)
 			out.append(text, line, stop - line).append("\r\n");

@@ -151,8 +151,22 @@ struct Stats
 	u64 upgrades_sold = 0; // F2 T5 fix round 1: host, sold upgrades installed on its copy and sent to the others
 	u64 world_states = 0; // parity audit F1: host, states of world items a client asked for or opened
 	u64 take_kept = 0; // live report 2026-11-08: client, what its take callbacks changed kept over the host's push
+	u64 join_held = 0, join_taken = 0; // host: states of a player still joining, kept and taken when his join ended
 };
 Stats g_stats;
+
+// A player's game says the state of its own items once when it goes live (frame, g_resync). On a map server that batch came
+// before the word that he is in the world: all of it was refused as "no character" - 37 to 57 red lines at every entry of a level,
+// and the launcher made an error report of the session (the owner's logs, build 46, 2026-11-13). The states of a peer whose
+// character is known and whose join is not over are kept here, in the order they came, and taken when the join ends.
+struct HeldState
+{
+	u16 id = kNoId; // host numbering, as on the wire
+	std::string section;
+	Blob blob;
+};
+constexpr size_t kJoinHeldMax = 512; // an inventory is some tens of items; more than this is refused as before
+xr_map<PeerId, xr_vector<HeldState>> g_join_held;
 
 // ---------------------------------------------------------------- hook queues (any thread)
 
@@ -1894,6 +1908,29 @@ void host_enforce(u64 now)
 
 namespace
 {
+// A state of a peer whose character is known and whose join is not over: kept for host_on_peer_in_world (g_join_held). `at` is not
+// moved: a message that is not kept goes to host_on_state as it came, and that one says what is wrong with it.
+bool hold_state_of_joining(PeerId from, const Reader& at)
+{
+	if (join::proxy_of_peer(from) == kNoId || !sync::host_peer_joining(from))
+		return false;
+	Reader r = at;
+	HeldState h;
+	h.id = r.u16();
+	h.section = r.str();
+	r.u8(); // flags: only the host sets them
+	const u64 n = r.varu();
+	if (!r.ok() || n > kMaxBlob || n > r.remaining())
+		return false;
+	xr_vector<HeldState>& held = g_join_held[from];
+	if (held.size() >= kJoinHeldMax)
+		return false;
+	h.blob.assign(r.cursor(), r.cursor() + size_t(n));
+	held.push_back(std::move(h));
+	++g_stats.join_held;
+	return true;
+}
+
 // ItemState, in both tables (F3a T4: the lambda of the old install, unchanged)
 void on_item_state(PeerId from, Reader& r)
 {
@@ -1907,7 +1944,10 @@ void on_item_state(PeerId from, Reader& r)
 		if (!ai().get_alife() || Device.dwPrecacheFrame)
 			return;
 		if (op == Op::State)
-			host_on_state(from, r);
+		{
+			if (!hold_state_of_joining(from, r))
+				host_on_state(from, r);
+		}
 		else if (op == Op::SpawnAmmo && levels::on_host_level(from))
 			host_on_spawn_ammo(from, r); // this message reaches the world server and the map server of his level: the boxes are made at his body
 	}
@@ -1925,10 +1965,36 @@ void on_item_state(PeerId from, Reader& r)
 
 void install_server(Session& s) { s.on(Msg::ItemState, &on_item_state); }
 
+void host_on_peer_in_world(PeerId peer)
+{
+	const auto it = g_join_held.find(peer);
+	if (it == g_join_held.end())
+		return;
+	xr_vector<HeldState> held;
+	held.swap(it->second);
+	g_join_held.erase(it);
+	if (!is_map_authority() || !ai().get_alife() || Device.dwPrecacheFrame)
+		return; // another world meanwhile: what he said belongs to the one before (on_item_state drops the same)
+	for (const HeldState& h : held)
+	{
+		Writer w(h.blob.size() + h.section.size() + 16);
+		w.u16(h.id);
+		w.str(h.section.c_str());
+		w.u8(0);
+		w.varu(h.blob.size());
+		if (!h.blob.empty())
+			w.bytes(h.blob.data(), h.blob.size());
+		Reader r(w.ptr(), w.size());
+		host_on_state(peer, r);
+		++g_stats.join_taken;
+	}
+}
+
 void install_client(Endpoint& e) { e.on(Msg::ItemState, &on_item_state); }
 
 void reset()
 {
+	g_join_held.clear(); // a session that ended: nobody's join is waited for
 	{
 		std::lock_guard<std::mutex> lock(g_lock);
 		g_spawn_states.clear();
@@ -2066,6 +2132,9 @@ void print_status()
 	}
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
+	if (is_map_authority())
+		::Msg("[coop]   items of joining players: %llu state(s) kept, %llu taken when the join ended (%u peer(s) waiting)",
+		    s.join_held, s.join_taken, (u32)g_join_held.size());
 	if (mgr().is_client())
 		::Msg("[coop]   items in: %llu states dropped before live (R2 I2), %llu take changes kept over the host's push "
 		      "(%u waiting)",

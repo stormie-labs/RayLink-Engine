@@ -47,6 +47,9 @@ namespace coop
 namespace items
 {
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
+// Host (the world server, a map server): `peer`'s join is over (sync::host_end_join). The states of his items that came while he
+// was still joining are taken now, in the order they came.
+void host_on_peer_in_world(PeerId peer);
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void frame(); // main thread, from the coop pump: capture/send, host tracking, pending applies

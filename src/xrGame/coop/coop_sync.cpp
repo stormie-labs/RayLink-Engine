@@ -205,6 +205,7 @@ void host_end_join(PeerId id)
 	entities::host_end_join(id);
 	net::host_flush(id);
 	g_joining.erase(id);
+	items::host_on_peer_in_world(id); // what his game said of its items while he was joining (a map server: all of its first batch)
 	money::host_on_peer_in_world(id); // F2 T1 fix round 1: the balance after the queued changes, once he is live
 	debug::host_on_peer_in_world(id); // protocol 29: the server's debug, a map server's bridge too
 }
