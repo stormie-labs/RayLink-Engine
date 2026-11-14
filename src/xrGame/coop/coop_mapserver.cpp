@@ -63,7 +63,14 @@ struct Host
 	bool hold_launch = false; // the host's move: nothing starts until its save is written
 	HANDLE job = nullptr; // the processes end with this one, however it ends
 	u32 started = 0, crashed = 0;
+	// the memory guard (build 50): short of free physical memory, no empty map server lingers (levels::memory_low)
+	bool low_memory = false;
+	u64 memory_at = 0; // the next look
+	u64 free_mb = 0, total_mb = 0; // the last look
+	u32 made_room = 0; // servers stopped to make room for another level
 } g;
+
+constexpr u32 kMemoryEveryMs = 2000;
 
 // ---------------------------------------------------------------- a map server
 
@@ -150,6 +157,63 @@ u32 free_number()
 			return k;
 	}
 	return 0;
+}
+
+// A number for a new process: its own, or a free one. None while all kMaxBridges are taken (one is still on its way out after a stop
+// to make room): the start waits for it instead of failing, a failed start would count towards giving the level up.
+bool has_number(const Server& s) { return s.k != 0 || free_number() != 0; }
+
+const char* life_name(levels::ServerState state)
+{
+	switch (state)
+	{
+	case levels::ServerState::Off: return "off";
+	case levels::ServerState::Starting: return "starting";
+	case levels::ServerState::Ready: return "ready, empty";
+	case levels::ServerState::Serving: return "serving";
+	case levels::ServerState::Draining: return "empty";
+	case levels::ServerState::Stopping: return "stopping";
+	case levels::ServerState::Lost: return "lost";
+	}
+	return "?";
+}
+
+const char* name_of(u16 level)
+{
+	const char* name = levels::level_name(level);
+	return name ? name : "?";
+}
+
+// The memory guard: a look every kMemoryEveryMs, one line when it turns on and one when it is over.
+void check_memory(u64 now)
+{
+	if (now < g.memory_at)
+		return;
+	g.memory_at = now + kMemoryEveryMs;
+	MEMORYSTATUSEX m;
+	ZeroMemory(&m, sizeof(m));
+	m.dwLength = sizeof(m);
+	if (!GlobalMemoryStatusEx(&m))
+		return; // nothing known: the guard stays as it was
+	g.free_mb = m.ullAvailPhys / (1024 * 1024);
+	g.total_mb = m.ullTotalPhys / (1024 * 1024);
+	const bool low = levels::memory_low(g.low_memory, m.ullAvailPhys);
+	if (low && !g.low_memory)
+		::Msg("! [coop] map servers: this PC has %llu MB of %llu MB physical memory free (under %llu MB): an empty map server does not "
+		      "linger, it stops at once",
+		    g.free_mb, g.total_mb, levels::kLowMemoryBytes / (1024 * 1024));
+	else if (!low && g.low_memory)
+		::Msg("[coop] map servers: %llu MB of %llu MB physical memory free again (%llu MB and more): empty map servers linger again",
+		    g.free_mb, g.total_mb, levels::kMemoryBackBytes / (1024 * 1024));
+	g.low_memory = low;
+}
+
+std::vector<levels::MapSlot> slots_now()
+{
+	std::vector<levels::MapSlot> out;
+	for (const auto& it : g.servers)
+		out.push_back(levels::slot_of(it.first, it.second.life, levels::host_map_players(it.first), it.second.kept));
+	return out;
 }
 
 void list_bridges()
@@ -473,11 +537,18 @@ void host_frame()
 	const u64 now = mgr().now_ms();
 	for (const u16 level : levels::host_map_levels())
 		g.servers[level];
+	check_memory(now);
+	// Every count first: which map was emptied last (the warm one) is a question about all of them (levels::linger_of). players() is
+	// the same again in the loop below, a repeat changes nothing.
+	for (auto& it : g.servers)
+		it.second.life.players(levels::host_map_players(it.first), now);
+	const std::vector<levels::MapSlot> slots = slots_now();
+	const u32 linger = u32(_max(0, levels::g_coop_mapserver_linger)) * 1000;
 	for (auto it = g.servers.begin(); it != g.servers.end();)
 	{
 		const u16 level = it->first;
 		Server& s = it->second;
-		s.life.linger_ms = u32(levels::g_coop_mapserver_linger) * 1000;
+		s.life.linger_ms = levels::linger_of(slots, level, linger, g.low_memory);
 		s.life.players(levels::host_map_players(level), now);
 		watch_process(level, s);
 		if (s.life.gave_up())
@@ -492,7 +563,7 @@ void host_frame()
 		else if (s.life.want_start())
 		{
 			s.gave_up_told = false;
-			if (!g.hold_launch && !s.process && world_up())
+			if (!g.hold_launch && !s.process && world_up() && has_number(s))
 			{
 				autosave::request_before_transfer(); // requirement 8: written before it can take anything, it needs far longer to start
 				s.life.started(now);
@@ -513,10 +584,16 @@ void host_frame()
 				s.life.lost();
 				break;
 			default:
+			{
+				const u32 empty_s = u32((now - _min(now, s.life.idle_since())) / 1000);
+				const u32 pause_s = s.life.linger_ms / 1000;
 				send_order(s, level, wire::MapServerOrderMsg::Stop);
 				s.life.stopping(now);
-				::Msg("[coop] map server %u of level %u: nobody came back, it goes", s.k, u32(level));
+				::Msg("[coop] map server %u of level %u [%s]: nobody came back, it goes (empty %u s, its pause %u s%s)", s.k, u32(level),
+				    name_of(level), empty_s, pause_s,
+				    g.low_memory ? ": low memory" : (s.life.linger_ms < linger ? ": not the map emptied last" : ""));
 				break;
+			}
 			}
 		}
 		const bool over = s.life.state() == levels::ServerState::Off || s.life.state() == levels::ServerState::Lost;
@@ -547,12 +624,41 @@ bool host_ready(u16 level)
 	return s == levels::ServerState::Ready || s == levels::ServerState::Serving || s == levels::ServerState::Draining;
 }
 
-bool host_can_serve(u16 level)
+bool host_can_serve(u16 level, u32 cap, PeerId for_peer)
 {
 	const auto it = g.servers.find(level);
 	if (it != g.servers.end() && it->second.life.gave_up())
 		return false;
-	return host_serves(level) || host_running() < u32(levels::g_coop_max_map_servers);
+	if (host_serves(level))
+		return true;
+	std::vector<u16> stop;
+	if (!levels::room_for_one(slots_now(), cap, stop))
+		return false;
+	host_stop_for_room(stop, level, for_peer);
+	return true;
+}
+
+std::vector<levels::MapSlot> host_slots() { return slots_now(); }
+
+void host_stop_for_room(const std::vector<u16>& stop, u16 for_level, PeerId for_peer)
+{
+	const u64 now = mgr().now_ms();
+	for (const u16 level : stop)
+	{
+		const auto it = g.servers.find(level);
+		if (it == g.servers.end())
+			continue;
+		Server& s = it->second;
+		if (s.kept || !s.life.idle() || levels::host_map_players(level) != 0)
+			continue; // the rules chose an empty one: a server that is not (any more) is not stopped here
+		const u32 empty_s = u32((now - _min(now, s.life.idle_since())) / 1000);
+		send_order(s, level, wire::MapServerOrderMsg::Stop);
+		s.life.stopping(now);
+		++g.made_room;
+		::Msg("[coop] map server %u of level %u [%s], empty for %u s, stops to make room for level %u [%s], wanted by player #%u", s.k,
+		    u32(level), name_of(level), empty_s, u32(for_level), name_of(for_level), for_peer);
+	}
+	list_bridges();
 }
 
 u32 host_running()
@@ -690,7 +796,7 @@ void host_launch_now(u32 epoch)
 	{
 		Server& s = g.servers[level];
 		s.life.players(levels::host_map_players(level), now);
-		if (s.life.want_start() && !s.process) // one on its way out: host_frame starts this level when it is gone
+		if (s.life.want_start() && !s.process && has_number(s)) // one on its way out: host_frame starts this level when it is gone
 		{
 			s.life.started(now);
 			if (!launch(level, s, epoch))
@@ -814,14 +920,32 @@ void print_status()
 {
 	if (mgr().is_host())
 	{
+		const u64 now = mgr().now_ms();
 		for (const auto& it : g.servers)
 		{
 			const Server& s = it.second;
-			::Msg("[coop] map server %u, level %u: %u player(s), %u failure(s), frame %u/%u ms, %u object(s), %u MB", s.k, u32(it.first),
-			    s.life.count(), s.life.failures(), s.last.frame_avg_ms, s.last.frame_max_ms, s.last.online, s.last.mem_mb);
+			const u32 table = levels::host_map_players(it.first);
+			::Msg("[coop] map server %u, level %u [%s]: %s, %u player(s) (%u by the table, on their way included), %u failure(s), frame "
+			      "%u/%u ms, %u object(s), %u MB%s",
+			    s.k, u32(it.first), name_of(it.first), life_name(s.life.state()), s.life.count(), table, s.life.failures(),
+			    s.last.frame_avg_ms, s.last.frame_max_ms, s.last.online, s.last.mem_mb, s.kept ? ", kept through the host's move" : "");
+			if (s.life.idle())
+			{
+				const u64 since = s.life.idle_since();
+				const u64 empty_ms = now > since ? now - since : 0;
+				const u64 left_ms = s.life.linger_ms > empty_ms ? s.life.linger_ms - empty_ms : 0;
+				::Msg("[coop]   empty for %u s (since %llu ms of the session clock), its pause %u s%s: it leaves in %u s", u32(empty_ms / 1000),
+				    since, s.life.linger_ms / 1000,
+				    g.low_memory ? " (low memory)" :
+				                   (s.life.linger_ms < u32(_max(0, levels::g_coop_mapserver_linger)) * 1000 ? " (not the map emptied last)" :
+				                                                                                       " (the map emptied last)"),
+				    u32(left_ms / 1000));
+			}
 		}
-		::Msg("[coop] map servers: %u running of %d, %u started, %u crashed", host_running(), levels::g_coop_max_map_servers, g.started,
-		    g.crashed);
+		::Msg("[coop] map servers: %u running of a cap of %u (players %u + 1, coop_max_map_servers %d, at most %u), %u started, %u crashed, "
+		      "%u stopped to make room; memory %llu MB free of %llu MB%s",
+		    host_running(), levels::host_map_cap(), levels::host_map_players_now(), levels::g_coop_max_map_servers, kMaxBridges, g.started,
+		    g.crashed, g.made_room, g.free_mb, g.total_mb, g.low_memory ? ": LOW, empty map servers do not linger" : "");
 	}
 	else if (is_map_server())
 		::Msg("[coop] this process is the map server of level %u, %u player(s) on it", u32(me.args.level), u32(me.peers.on().size()));

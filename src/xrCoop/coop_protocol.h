@@ -87,7 +87,10 @@ namespace coop
 // 31 (docs/plans/2026-11-12-split-levels-native.md §1.3, §2): a world server's own seat plays no character and the creator's
 //    game holds the host's rights. Welcome ends with `u8 flags` (HostSeatPlays), a PeerList row ends with `u8 flags` (Operator),
 //    core Msg::OperatorCommand 0x000B (the operator -> the server: one console line, xrCoop/coop_operator.h).
-constexpr uint32_t kProtocolVersion = 31;
+// 32: nothing a reader of 31 would misread, the number keeps builds apart: NpcSound Stop (a voice the authority stopped; a 31
+//    reader rejects the entry and plays the line to its end), LevelEntity Item (the wear a map server gives loot; a 31 world
+//    server drops the op), and the Lua of build 50 expects both ends to speak them.
+constexpr uint32_t kProtocolVersion = 32;
 constexpr uint16_t kDefaultPort = 27960;
 // The seats that play: an ordinary host + 7 clients, or a world server's 8 clients (its own seat plays no character,
 // SessionConfig::host_plays; limits::client_capacity). Counts of players and SessionConfig/Welcome max_players.
@@ -537,6 +540,10 @@ struct CharChoiceMsg
 //       [vec3 offset]    if flags & Offset (position relative to the object's position when it started)
 //       [u8 volume]      if flags & Volume (volume * 100, 0..255)
 // path: file under $game_sounds$, lowercase, no extension ("characters_voice\\human_01\\...").
+// A stop (flags == Stop | Mask, empty path, delay 0, mask != 0): the authority's CSoundPlayer removed the object's sounds
+// whose synchro mask overlaps `mask` (set_sound_mask, remove_active_sounds, a death cry with mask -1); the client releases
+// what it plays of that object with an overlapping mask. A reader before this flag rejects the entry as an unknown flag:
+// the sender puts a stop last in its packet, so such a reader loses only the stop.
 struct NpcSound
 {
 	enum Flags : uint8_t
@@ -546,7 +553,8 @@ struct NpcSound
 		Offset = 4,
 		Volume = 8,
 		Follow = 16, // keep the sound on the object (bone) while it plays: AI voices; else stays where it started
-		Known = Bone | Mask | Offset | Volume | Follow,
+		Stop = 32,
+		Known = Bone | Mask | Offset | Volume | Follow | Stop,
 	};
 	static constexpr size_t kMaxPath = 200;
 
@@ -560,7 +568,7 @@ struct NpcSound
 	uint8_t volume = 100;
 
 	void write(Writer& w) const;
-	// False on overrun, unknown flags, an invalid path or a non-finite offset.
+	// False on overrun, unknown flags, an invalid path or a non-finite offset; for a stop, anything but the stop's form.
 	bool read(Reader& r);
 };
 

@@ -134,6 +134,7 @@ void CSoundPlayer::update(float time_delta)
 
 void CSoundPlayer::remove_inappropriate_sounds(u32 sound_mask)
 {
+	const bool coop_cut = sound_mask && coop::sound::player_stops_recorded() && std::any_of(m_playing_sounds.begin(), m_playing_sounds.end(), [sound_mask](const CSoundSingle& s) { return (s.m_synchro_mask & sound_mask) != 0; }); // Anomaly Coop
 	m_playing_sounds.erase(
 		std::remove_if(
 			m_playing_sounds.begin(),
@@ -142,6 +143,7 @@ void CSoundPlayer::remove_inappropriate_sounds(u32 sound_mask)
 		),
 		m_playing_sounds.end()
 	);
+	if (coop_cut) coop::sound::on_player_sound_stop(m_object, sound_mask, sound_mask == m_sound_mask); // Anomaly Coop: set_sound_mask path when the masks are equal
 }
 
 void CSoundPlayer::update_playing_sounds()

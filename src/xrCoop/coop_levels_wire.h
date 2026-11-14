@@ -454,7 +454,8 @@ struct LevelEntityHead
 		Parent = 1,
 		Died = 2,
 		State = 3,
-		Item = 4,
+		Item = 4, // the wear its level gave loot (ground, a body, a box): the layout of ItemState State after its op byte (u16 item, str
+		          // section, u8 flags 0, varu n, n bytes blob); the world server takes the condition alone (coop_levels_xfer.cpp client_loot)
 		Spawn = 5, // an object it made under its ids: the layout of EntitySpawn
 		Report = 6, // what it writes in the buckets LevelResync asked for: the layout of LevelReportBody
 		Money = 7, // a deal of a player of its level: u32 peer, u64 delta (two's complement), u8 1 for a trade

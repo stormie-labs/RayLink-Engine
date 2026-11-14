@@ -740,7 +740,11 @@ bool NpcSound::read(Reader& r)
 	else
 		offset[0] = offset[1] = offset[2] = 0.f;
 	volume = (flags & Volume) ? r.u8() : uint8_t(100);
-	if (!r.ok() || (flags & ~uint8_t(Known)) != 0 || !sound_path_valid(path))
+	if (!r.ok() || (flags & ~uint8_t(Known)) != 0)
+		return false;
+	if (flags & Stop)
+		return flags == uint8_t(Stop | Mask) && mask != 0 && path.empty() && delay_ms == 0;
+	if (!sound_path_valid(path))
 		return false;
 	for (const float v : offset)
 		if (!std::isfinite(v) || std::fabs(v) > 1000.f)

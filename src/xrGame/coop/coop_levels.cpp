@@ -36,9 +36,32 @@ namespace levels
 int g_coop_split_levels = 0;
 int g_coop_story_together = 1;
 int g_coop_world_server = 0; // owner 2026-11-13: the new mode is a choice of its own; Lua reads it, the engine keeps it
-int g_coop_max_map_servers = 3;
-int g_coop_mapserver_linger = 60;
+int g_coop_max_map_servers = int(kDefaultMaxMapServers); // build 50: the ceiling of the PC, the cap itself follows the players
+int g_coop_mapserver_linger = int(kDefaultLingerMs / 1000);
 int g_coop_soft_host_move = 1;
+// Both settings above are saved in user.ltx, so a new default in the code never reaches a machine that ran an earlier build: the
+// owner's own world server kept 3 servers and 60 s (seen 2026-11-14). The old defaults move to the new ones once a machine; this
+// number is saved with them, and a value somebody sets after that is his.
+int g_coop_map_servers_rev = 0;
+
+void settle_machine_settings()
+{
+	if (g_coop_map_servers_rev >= 1)
+		return;
+	g_coop_map_servers_rev = 1;
+	if (g_coop_max_map_servers == 3)
+	{
+		g_coop_max_map_servers = int(kDefaultMaxMapServers);
+		::Msg("[coop] levels: coop_max_map_servers was the old default 3: it is %d now (build 50, the cap follows the players)",
+		    g_coop_max_map_servers);
+	}
+	if (g_coop_mapserver_linger == 60)
+	{
+		g_coop_mapserver_linger = int(kDefaultLingerMs / 1000);
+		::Msg("[coop] levels: coop_mapserver_linger was the old default 60 s: it is %d s now (build 50, for the map emptied last)",
+		    g_coop_mapserver_linger);
+	}
+}
 
 namespace
 {
@@ -330,7 +353,7 @@ bool host_player_loads(PeerId peer, LevelId level)
 	if (!mgr().is_host() || !split() || level == wire::kNoLevel)
 		return false;
 	host_seat_self();
-	const bool stays = g.table.server_of(level) == Server::HostProcess || mapserver::host_can_serve(level);
+	const bool stays = g.table.server_of(level) == Server::HostProcess || mapserver::host_can_serve(level, host_map_cap(peer), peer);
 	if (stays)
 		host_seat(peer, level, false);
 	return stays;
@@ -352,7 +375,26 @@ MoveVerdict host_judge_move(PeerId peer, LevelId target)
 	if (gate == Gate::Together && g.table.all_on(target, peer))
 		gate = Gate::Free; // the others are in there already: nobody is left to wait for, he walks in
 	const bool new_server = g.table.server_of(target) != Server::HostProcess && !mapserver::host_serves(target);
-	return decide_move(gate, new_server, mapserver::host_running(), u32(g_coop_max_map_servers));
+	std::vector<uint16_t> stop;
+	const MoveVerdict verdict = decide_move(gate, new_server, mapserver::host_slots(), host_map_cap(peer), stop);
+	if (verdict == MoveVerdict::Go && !stop.empty())
+		mapserver::host_stop_for_room(stop, target, peer); // a Stopping server holds no place: the new one starts without waiting
+	return verdict;
+}
+
+u32 host_map_players_now() { return g.table.players(); }
+
+u32 host_map_cap(PeerId mover)
+{
+	u32 players = g.table.players();
+	const Seat* s = mover != kInvalidPeer ? g.table.find(mover) : nullptr;
+	if (mover != kInvalidPeer && (!s || !s->plays || s->level == kNoLevel))
+		++players; // a join: he is not in the table until he may stay (host_player_loads)
+	// "maps = players + 1" counts the map of a host who plays: this process leads it, no map server does
+	const Seat* host = g.table.find(kHostPeer);
+	if (host && host->plays && host->level != kNoLevel && players > 0)
+		--players;
+	return map_server_cap(players, u32(_max(0, g_coop_max_map_servers)));
 }
 
 void host_player_moves(PeerId peer, LevelId target)
@@ -501,6 +543,7 @@ void on_peer_left(PeerId id)
 
 void frame()
 {
+	settle_machine_settings(); // user.ltx is read by now
 	if (!split())
 		return;
 	if (mgr().is_host())
@@ -528,6 +571,11 @@ void print_status()
 		for (const Seat& s : g.table.seats())
 			::Msg("[coop] levels:   #%u on level %u [%s]%s%s", s.peer, u32(s.level), level_name_of(s.level) ? level_name_of(s.level) : "?",
 			    s.in_world ? "" : " loading", g.table.server_of(s.level) == Server::HostProcess ? ", the host's process leads it" : ", a map server leads it");
+	if (mgr().is_host() && split())
+		::Msg("[coop] levels: map servers cap %u = min(players %u + 1, coop_max_map_servers %d, %u), linger %d s for the map emptied last, "
+		      "at most %u s for the others",
+		    host_map_cap(), host_map_players_now(), g_coop_max_map_servers, u32(mapserver::kMaxBridges), g_coop_mapserver_linger,
+		    kColdLingerMs / 1000);
 	mapserver::print_status();
 	xfer_print_status();
 }
@@ -561,8 +609,11 @@ void register_console()
 	// game rule (xrCoop/coop_game_values.h): a new world with split levels runs as a world server and its creator's game joins it. The
 	// new game screen and Continue read it; nothing in the engine does (a world server is split by being one: game_split)
 	CMD4(CCC_Integer, "coop_world_server", &g_coop_world_server, 0, 1);
-	CMD4(CCC_Integer, "coop_max_map_servers", &g_coop_max_map_servers, 0, 7); // machine setting
-	CMD4(CCC_Integer, "coop_mapserver_linger", &g_coop_mapserver_linger, 0, 3600); // machine setting, seconds
+	// machine setting, default 6: the most map servers this PC can carry. The cap in force is min(players + 1, this, 7) (host_map_cap)
+	CMD4(CCC_Integer, "coop_max_map_servers", &g_coop_max_map_servers, 0, 7);
+	// machine setting, seconds, default 600: how long the map emptied last stays; every other empty map at most 60 s, none with < 2 GB free
+	CMD4(CCC_Integer, "coop_mapserver_linger", &g_coop_mapserver_linger, 0, 3600);
+	CMD4(CCC_Integer, "coop_map_servers_rev", &g_coop_map_servers_rev, 0, 1); // saved: the two above were moved to build 50's defaults
 	CMD4(CCC_Integer, "coop_soft_host_move", &g_coop_soft_host_move, 0, 1); // the way back for a live check: not a rule of the game
 	CMD1(CCC_CoopLevelsStatus, "coop_levels_status");
 	CMD1(CCC_CoopLevelsAudit, "coop_levels_audit");
@@ -811,6 +862,26 @@ int l_online_at_server(lua_State* L)
 	lua_pushboolean(L, arg_whole(L, 1, double(0xfffe), id) && online_at_server(u16(id)));
 	return 1;
 }
+// coop.levels.holder_of(id) -> the host's process: the bridge of the map server that holds the object or its squad, nil when none does
+int l_holder_of(lua_State* L)
+{
+	u32 id = 0;
+	const PeerId bridge = arg_whole(L, 1, double(0xfffe), id) ? holder_of(u16(id)) : kInvalidPeer;
+	if (bridge == kInvalidPeer)
+		lua_pushnil(L);
+	else
+		lua_pushnumber(L, lua_Number(bridge));
+	return 1;
+}
+// coop.levels.recall(squad id[, ms]) -> a map server: the world server recalled the squad (its Lua checked who said so): offline now and
+// home, pinned for ms (kRecallPinMs by default, at most kRecallPinMaxMs), 0 lifts the pin; false anywhere else
+int l_recall(lua_State* L)
+{
+	u32 id = 0, ms = kRecallPinMs;
+	const bool args = arg_whole(L, 1, double(0xfffe), id) && (lua_isnoneornil(L, 2) || arg_whole(L, 2, double(kRecallPinMaxMs), ms));
+	lua_pushboolean(L, args && recall(u16(id), ms));
+	return 1;
+}
 int l_logic_look(lua_State* L)
 {
 	lua_pushboolean(L, logic_looking());
@@ -901,6 +972,8 @@ void register_lua(lua_State* L)
 		{"players_on", &l_players_on},
 		{"led_by_host_process", &l_led_by_host_process},
 		{"online_at_server", &l_online_at_server},
+		{"holder_of", &l_holder_of},
+		{"recall", &l_recall},
 		{"far_place", &l_far_place},
 		{"body_stays", &l_body_stays},
 		{"level_name", &l_level_name},

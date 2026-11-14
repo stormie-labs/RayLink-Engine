@@ -16,6 +16,7 @@
 // The pure half is xrCoop/coop_mapserver_rules.h.
 #pragma once
 
+#include "xrCoop/coop_levels_dynamic.h" // the cap, the room, the lingers (build 50)
 #include "xrCoop/coop_levels_wire.h"
 #include "xrCoop/coop_mapserver_rules.h"
 #include "xrCoop/coop_session.h"
@@ -42,10 +43,16 @@ void host_frame(); // levels::frame
 bool host_serves(u16 level);
 // It loaded its world: a player may enter.
 bool host_ready(u16 level);
-// A player may stand on `level`: it has a server, or one can be started.
-bool host_can_serve(u16 level);
-// How many count against coop_max_map_servers (ServerLife::running).
+// A player may stand on `level`: it has a server, or one can be started under `cap` (levels::host_map_cap), if need be after the
+// server empty the longest is told to stop (host_stop_for_room, for `for_peer`).
+bool host_can_serve(u16 level, u32 cap, PeerId for_peer);
+// How many hold a place under the cap (ServerLife::running).
 u32 host_running();
+// Every map server as the dynamic rules see it (xrCoop/coop_levels_dynamic.h MapSlot): empty by the table, kept ones never.
+std::vector<levels::MapSlot> host_slots();
+// The servers of the levels in `stop` (empty ones, levels::decide_move chose them) are told to stop now so that `for_level` can start
+// for `for_peer`: one log line each.
+void host_stop_for_room(const std::vector<u16>& stop, u16 for_level, PeerId for_peer);
 // What LevelMap says of it.
 levels::wire::ServerState host_state_of(u16 level);
 // The bridges of the processes that run: connected, or on their way (a world change for them waits, sync::host_begin_join).

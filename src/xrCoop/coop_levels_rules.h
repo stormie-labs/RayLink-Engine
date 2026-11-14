@@ -159,6 +159,17 @@ public:
 		return n;
 	}
 
+	// The players of the session now: every seat that plays and is on a level or loading into one. The seat of a world server that
+	// plays no character is nobody, nor is one still choosing a character (the dynamic cap, coop_levels_dynamic.h).
+	uint32_t players() const
+	{
+		uint32_t n = 0;
+		for (const Seat& s : seats_)
+			if (s.plays && s.level != kNoLevel)
+				++n;
+		return n;
+	}
+
 	// Everybody who plays, `but` apart, stands on `level` already: nobody is left to wait for on the way in.
 	bool all_on(uint16_t level, uint32_t but) const
 	{
@@ -224,13 +235,14 @@ enum class MoveVerdict : uint8_t
 {
 	Go, // the player goes by himself, now
 	Board, // the move waits at the waiting point and goes with the group (wire: LevelMoveResult Together)
-	RefuseCap, // a new map server is needed and coop_max_map_servers are running already
+	RefuseCap, // a new map server is needed and the cap is taken (in the dynamic mode: by servers that all have players)
 	RefuseInvalid, // the gate is none of the three
 };
 
 // `effective` = effective_gate(...) of the level he goes to; `needs_new_server` = nobody leads that level yet and the
-// mover is not the host (the host's process would lead it); `running` = map servers running now; `max_servers` =
-// coop_max_map_servers. A Together move is the whole group going to one map: it starts no server of its own, no cap.
+// mover is not the host (the host's process would lead it); `running` = map servers running now; `max_servers` = the cap
+// (coop_levels_dynamic.h map_server_cap; its decide_move makes room before it refuses). A Together move is the whole group
+// going to one map: it starts no server of its own, no cap.
 inline MoveVerdict decide_move(Gate effective, bool needs_new_server, uint32_t running, uint32_t max_servers)
 {
 	switch (effective)
@@ -258,7 +270,9 @@ enum class ServerState : uint8_t
 
 constexpr uint32_t kStartTimeoutMs = 240000; // a process that is not Ready by then is given up on (a GAMMA load takes minutes)
 constexpr uint32_t kStopTimeoutMs = 15000; // a process that has not exited by then after Stop is killed
-constexpr uint32_t kDefaultLingerMs = 60000; // the pause: coop_mapserver_linger = 60 s
+// The pause: coop_mapserver_linger = 600 s (build 50, the dynamic mode). It is the pause of the map emptied last; every other empty
+// map has at most kColdLingerMs (coop_levels_dynamic.h linger_of).
+constexpr uint32_t kDefaultLingerMs = 600000;
 constexpr uint32_t kFlushTimeoutMs = 3000; // a map server that has not sent its snapshot by then is left to its stream
 // A process that dies again and again before it serves anybody must not be started for ever (the players would wait on the
 // loading screen for good): this many deaths in a row without a healthy run, and ServerLife gives up (gave_up()).
@@ -314,6 +328,10 @@ struct ServerLife
 		return state_ == ServerState::Starting || state_ == ServerState::Ready || state_ == ServerState::Serving ||
 		    state_ == ServerState::Draining;
 	}
+
+	// Loaded with nobody on it (Ready, Draining): its pause runs. idle_since(): since when, 0 for a server that is not idle.
+	bool idle() const { return state_ == ServerState::Ready || state_ == ServerState::Draining; }
+	uint64_t idle_since() const { return idle() ? since_ : 0; }
 
 	// The players of this server now (Table::map_players). Counts that come back to zero start the pause once; the same
 	// zero again does not restart it; a player in the pause cancels it. Does nothing to a process that is going down.

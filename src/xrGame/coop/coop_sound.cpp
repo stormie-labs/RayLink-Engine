@@ -32,6 +32,7 @@ namespace
 {
 constexpr u16 kNoId = 0xffff;
 constexpr size_t kMaxOutQueue = 256; // host: sounds recorded between two frames
+constexpr size_t kMaxOutStops = 64; // host: stops still queued past a full queue of starts (a squad dying at once)
 constexpr u64 kDedupMs = 150; // host: same object + same file again within this: dropped
 constexpr float kRatePerSec = 30.f; // host: per client
 constexpr float kBurst = 40.f;
@@ -103,6 +104,7 @@ enum class LuaKind : u8
 {
 	AvatarStep,
 	NpcSound,
+	NpcSoundStop,
 };
 struct LuaEvent
 {
@@ -119,7 +121,7 @@ struct Registered
 	u64 checked = 0;
 	bool valid = false;
 };
-Registered g_reg_step, g_reg_snd;
+Registered g_reg_step, g_reg_snd, g_reg_stop;
 
 // ---------------------------------------------------------------- footsteps
 struct Ground
@@ -134,8 +136,10 @@ struct Stats
 {
 	// host
 	u64 recorded = 0, deduped = 0, queue_full = 0, sent = 0, packets = 0, too_far = 0, rate_dropped = 0, firm = 0;
+	u64 stops = 0, stops_merged = 0, stops_sent = 0;
 	// client
 	u64 received = 0, played = 0, malformed = 0, no_object = 0, missing_files = 0, cut = 0, muted_local = 0;
+	u64 stops_in = 0, stopped = 0;
 	// footsteps and Lua
 	u64 ground_picks = 0, avatar_steps = 0, avatar_jumps = 0, lua_fired = 0, lua_unregistered = 0, lua_errors = 0;
 } g_st;
@@ -231,6 +235,43 @@ void record(CGameObject* go, NpcSound& s, float radius, bool firm, u16 skip = kN
 	++g_st.recorded;
 }
 
+// The authority's CSoundPlayer dropped `go`'s sounds overlapping `mask`. No dedup, no rate: a lost stop leaves a dead or
+// silenced creature talking on a client. Several stops of one object with no start between them make one.
+void record_stop(CGameObject* go, u32 mask)
+{
+	const u16 id = go->ID();
+	xrCriticalSectionGuard guard(&g_out_lock);
+	// the same line started again right after the stop is a new line, not a repeat to drop
+	for (Recent& r : g_recent)
+		if (r.id == id)
+			r = Recent();
+	for (auto it = g_out.rbegin(); it != g_out.rend(); ++it)
+		if (it->s.object == id)
+		{
+			if (it->s.flags & NpcSound::Stop)
+			{
+				it->s.mask |= mask;
+				++g_st.stops_merged;
+				return;
+			}
+			break;
+		}
+	if (g_out.size() >= kMaxOutQueue + kMaxOutStops)
+	{
+		++g_st.queue_full;
+		return;
+	}
+	Outgoing o;
+	o.s.object = id;
+	o.s.flags = u8(NpcSound::Stop | NpcSound::Mask);
+	o.s.mask = mask;
+	o.pos = go->Position();
+	o.radius = kMaxRadius;
+	o.matters = true;
+	g_out.push_back(std::move(o));
+	++g_st.stops;
+}
+
 // ---------------------------------------------------------------- host: sending
 
 void host_frame()
@@ -285,6 +326,18 @@ void host_frame()
 		};
 		for (const Outgoing& o : out)
 		{
+			if (o.s.flags & NpcSound::Stop)
+			{
+				// Sent after the starts recorded before it and before those after it, alone at the end of its packet (a reader
+				// without the flag rejects it and loses nothing else). To every client: the start may have reached one from
+				// farther than the creature is now, and a stop of nothing is a no-op there.
+				flush(0);
+				o.s.write(bodies[1]);
+				++counts[1];
+				++g_st.stops_sent;
+				flush(1);
+				continue;
+			}
 			if (o.skip == t.proxy)
 				continue;
 			if (o.pos.distance_to(t.pos) > o.radius)
@@ -393,11 +446,6 @@ void client_play(const NpcSound& s)
 		return;
 	}
 	const xr_string path = s.path.c_str();
-	if (!sound_exists(path))
-	{
-		++g_st.missing_files;
-		return;
-	}
 	xr_vector<Playing>& list = playing();
 	const u32 mask = (s.flags & NpcSound::Mask) ? s.mask : 0;
 	u32 of_object = 0;
@@ -415,6 +463,12 @@ void client_play(const NpcSound& s)
 		if (p.id == id)
 			++of_object;
 		++i;
+	}
+	// after the cut: the host ended the older line even when this file is not in our game
+	if (!sound_exists(path))
+	{
+		++g_st.missing_files;
+		return;
 	}
 	if (of_object >= kMaxPerObject || list.size() >= kMaxPlaying)
 	{
@@ -449,6 +503,38 @@ void client_play(const NpcSound& s)
 	queue_lua(std::move(e));
 }
 
+// The authority's CSoundPlayer dropped the creature's sounds overlapping s.mask: so do we, and Lua stops its own copy.
+void client_stop(const NpcSound& s)
+{
+	++g_st.stops_in;
+	const u16 id = join::to_local(s.object);
+	if (id == kNoId || id == 0)
+		return;
+	if (g_playing)
+	{
+		xr_vector<Playing>& list = *g_playing;
+		for (size_t i = 0; i < list.size();)
+		{
+			Playing& p = list[i];
+			if (p.id == id && (p.mask & s.mask))
+			{
+				release(p);
+				list.erase(list.begin() + i);
+				++g_st.stopped;
+				continue;
+			}
+			++i;
+		}
+	}
+	CGameObject* go = object_here(id);
+	if (!go || world::is_player_proxy(id) || !remote::is_remote_creature(go))
+		return;
+	LuaEvent e;
+	e.kind = LuaKind::NpcSoundStop;
+	e.id = id;
+	queue_lua(std::move(e));
+}
+
 void client_on_sound(PeerId, Reader& r)
 {
 	if (!is_live_mirror() || !g_pGameLevel || !g_npc_sounds)
@@ -463,7 +549,10 @@ void client_on_sound(PeerId, Reader& r)
 			return;
 		}
 		++g_st.received;
-		client_play(s);
+		if (s.flags & NpcSound::Stop)
+			client_stop(s);
+		else
+			client_play(s);
 	}
 }
 
@@ -618,8 +707,11 @@ bool registered(lua_State* L, Registered& r, const char* name)
 
 bool fire(lua_State* L, const LuaEvent& e)
 {
-	const char* name = e.kind == LuaKind::AvatarStep ? "coop_avatar_step" : "coop_npc_sound";
-	if (!registered(L, e.kind == LuaKind::AvatarStep ? g_reg_step : g_reg_snd, name))
+	const char* name = e.kind == LuaKind::AvatarStep ? "coop_avatar_step"
+	    : e.kind == LuaKind::NpcSoundStop            ? "coop_npc_sound_stop"
+	                                                 : "coop_npc_sound";
+	Registered& reg = e.kind == LuaKind::AvatarStep ? g_reg_step : e.kind == LuaKind::NpcSoundStop ? g_reg_stop : g_reg_snd;
+	if (!registered(L, reg, name))
 	{
 		++g_st.lua_unregistered;
 		return false;
@@ -635,8 +727,12 @@ bool fire(lua_State* L, const LuaEvent& e)
 	}
 	lua_pushstring(L, name);
 	lua_pushnumber(L, lua_Number(e.id));
-	lua_pushlstring(L, e.a.data(), e.a.size());
-	int nargs = 3;
+	int nargs = 2;
+	if (e.kind != LuaKind::NpcSoundStop)
+	{
+		lua_pushlstring(L, e.a.data(), e.a.size());
+		nargs = 3;
+	}
 	if (e.kind == LuaKind::AvatarStep)
 	{
 		lua_pushnumber(L, lua_Number(e.power));
@@ -709,6 +805,7 @@ void reset()
 	g_lua.clear();
 	g_reg_step = Registered();
 	g_reg_snd = Registered();
+	g_reg_stop = Registered();
 	g_ground.clear();
 	g_log_count = 0;
 }
@@ -737,15 +834,20 @@ void register_console()
 void print_status()
 {
 	if (is_map_authority())
+	{
 		::Msg("[coop]   npc sounds out (%s): %llu recorded, %llu deduped, %llu queue full; %llu sent (%llu reliable) in %llu "
 		      "packets, %llu out of range, %llu over the rate",
 		    g_npc_sounds ? "on" : "off", g_st.recorded, g_st.deduped, g_st.queue_full, g_st.sent, g_st.firm, g_st.packets,
 		    g_st.too_far, g_st.rate_dropped);
+		::Msg("[coop]   npc sound stops out: %llu recorded, %llu merged, %llu sent", g_st.stops, g_st.stops_merged,
+		    g_st.stops_sent);
+	}
 	else
 		::Msg("[coop]   npc sounds in (%s): %llu received, %llu played, %u playing, %llu cut, %llu no object, %llu "
-		      "missing files, %llu malformed, %llu local creature sounds muted",
+		      "missing files, %llu malformed, %llu local creature sounds muted; %llu stops in, %llu sounds stopped",
 		    g_npc_sounds ? "on" : "off", g_st.received, g_st.played, g_playing ? (u32)g_playing->size() : 0u,
-		    g_st.cut, g_st.no_object, g_st.missing_files, g_st.malformed, g_st.muted_local);
+		    g_st.cut, g_st.no_object, g_st.missing_files, g_st.malformed, g_st.muted_local, g_st.stops_in,
+		    g_st.stopped);
 	::Msg("[coop]   steps: %llu ground picks, avatar steps %llu, jumps/landings %llu; lua callbacks %llu fired, %llu "
 	      "not registered, %llu errors",
 	    g_st.ground_picks, g_st.avatar_steps, g_st.avatar_jumps, g_st.lua_fired, g_st.lua_unregistered,
@@ -790,6 +892,26 @@ void on_player_sound(CObject* owner, ref_sound& snd, u16 bone, u32 synchro_mask,
 	const u32 now = Device.dwTimeGlobal;
 	s.delay_ms = start_time > now ? u16(_min<u32>(start_time - now, 0xffff)) : u16(0);
 	record(go, s, radius_of(snd), matters(snd, go));
+}
+
+bool player_stops_recorded() { return host_recording(); }
+
+void on_player_sound_stop(CObject* owner, u32 mask, bool by_mask)
+{
+	if (!mask || !host_recording())
+		return;
+	CGameObject* go = relay_source(owner);
+	if (!go)
+		return;
+	if (!by_mask)
+	{
+		// CSoundPlayer::play made room: the new start's mask cuts the same sounds on the client. A dead creature's cry may
+		// not reach one (rate, range, a missing file), and the line it cut must end anyway.
+		CEntityAlive* alive = go->cast_entity_alive();
+		if (!alive || alive->g_Alive())
+			return;
+	}
+	record_stop(go, mask);
 }
 
 void on_script_sound(CObject* owner, ref_sound& snd, const Fvector* at, u32 flags, float delay, float volume)

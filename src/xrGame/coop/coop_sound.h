@@ -14,6 +14,11 @@
 // such as Die() or Lua relays); avatars keep their own sounds.
 // Wire: Msg::EntitySound, host -> one client: u8 count, count x NpcSound (xrCoop/coop_protocol.h). Lane::Unreliable, a long
 // line and a creature's last sound Lane::Reliable while a small bucket per client holds (audit M5, xrCoop/coop_relay_rules.h).
+// Stops: when the authority's CSoundPlayer drops a creature's sounds by mask (npc_sound:stop = set_sound_mask(-1), a scheme's
+// remove_active_sounds, a death cry), a stop entry (NpcSound::Stop) goes to every client of the process on Lane::Reliable,
+// sent after the starts recorded before it and before those after it; the client releases that creature's relayed sounds
+// with an overlapping mask (sounds without a mask, CScriptSound and abilities, are not CSoundPlayer's and stay, as on the host)
+// and raises SendScriptCallback("coop_npc_sound_stop", npc_id) so Lua stops its own copy (the PDA copy of a far voice).
 // Limits: per client a token bucket (30/s, burst 40), the sound's max distance (default coop_npc_sound_dist, cap
 // 300 m) from the client's character, one entry per object+file within 150 ms; on a client at most 48 relayed
 // sounds play at once, 4 per creature.
@@ -58,6 +63,15 @@ bool player_sound_blocked(CObject* owner);
 // CSoundPlayer::play after the sound was chosen and queued. Host: records it for the clients nearby.
 // start_time: Device.dwTimeGlobal at which the engine starts it (random start delay of the sound type).
 void on_player_sound(CObject* owner, ref_sound& sound, u16 bone, u32 synchro_mask, u32 start_time);
+// CSoundPlayer::remove_inappropriate_sounds, first line: true when a removal is worth looking at (the authority relays
+// to clients). Cheap: no per-sound work when false.
+bool player_stops_recorded();
+// CSoundPlayer::remove_inappropriate_sounds removed at least one sound of `owner` whose synchro mask overlaps `mask`.
+// `by_mask`: through set_sound_mask / remove_active_sounds (npc_sound:stop, a scheme's silence, net_Destroy). Otherwise
+// it was CSoundPlayer::play making room for a new sound, which the start's own mask already mirrors on the clients; then
+// only a dead creature's (its death cry, mask -1) is relayed as a stop, so the old line ends even when the cry does not
+// reach a client. Authority: records a stop for the clients (Lane::Reliable, no dedup, no rate bucket).
+void on_player_sound_stop(CObject* owner, u32 mask, bool by_mask);
 // CScriptSound play paths after the sound started. Host: records a 3D, non-looped sound on a creature.
 // `at` = nullptr: at the object's position.
 void on_script_sound(CObject* owner, ref_sound& sound, const Fvector* at, u32 flags, float delay, float volume);

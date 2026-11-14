@@ -415,6 +415,7 @@ void host_apply_release(u16 id, LevelId level)
 
 void host_reserve_leader_ids(bool say_so)
 {
+	settle_machine_settings(); // the ceiling counted below may still be an earlier build's default
 	xrServer& server = alife_rw().server();
 	const u32 slots = leader_slots_kept(u32(_max(0, g_coop_max_map_servers)), mapserver::host_highest_number());
 	u32 reserved = 0;

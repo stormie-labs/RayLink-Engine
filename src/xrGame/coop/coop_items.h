@@ -35,6 +35,7 @@
 #include "xrCoop/coop_session.h"
 #include "coop_money.h" // F2 T5: UpgradePurchase holds a money::ClientSpendScope
 
+#include <string>
 #include <vector>
 
 class CInventoryItem;
@@ -127,6 +128,16 @@ u32 state_digest(CSE_Abstract* e, bool with_uses);
 // window that opens (the client's copy keeps its spawn values, which GAMMA overwrites on the host right after).
 void host_send_state(PeerId to, u16 id);
 void host_send_contents(PeerId to, u16 holder);
+// Split levels (testers 2026-11-13: loot of a map server's NPCs was 100 % on the world server and in the players' hands). A map
+// server: its state of world item `id` (local numbering), the ItemState blob, for LevelEntity Item. False: no inventory item.
+bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob);
+// A map server: the same state to the players of its level (ItemState, no authority flag: their own items keep theirs), so that
+// their copy has the wear before a take or a tooltip rolls the parts of it.
+void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& blob);
+// The world server: the authority of a level says world item `id` (host numbering) is `blob`. Only the condition is taken, into
+// the entity (and the object, if there is one). The caller checked that the item lies on that level and no player holds it.
+// False: refused, `why` says why.
+bool host_take_level_state(u16 id, const char* section, const u8* data, size_t size, const char*& why);
 // Host (F2 T5 fix round 1): the host sold an upgrade of item `id` to player `owner` (ReqItemEvent accepted, the entity
 // holds it). The host's game object of the item takes the entity's list (a loading install: no event, no Lua price) and
 // the other players' copies get the host's state of it. The owner's own ItemState never adds an upgrade on the host.

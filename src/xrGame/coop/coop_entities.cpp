@@ -557,8 +557,10 @@ struct MirrorTrack
 	attachments::State attachments_shown;
 	bool attachments_pending = true;
 	u64 attachments_retry = 0, attachments_check = 0;
+	u64 anim_diag_after = 0; // a puppet with no base motion playing (a T-pose) is said again from this time
 };
 xr_map<u16, MirrorTrack> g_tracks;
+u32 g_anim_diag_lines = 0; // "[coop-anim]" lines of this session (the first ones, then every 50th)
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
@@ -1875,6 +1877,39 @@ bool drive_mirror(CGameObject* obj)
 				const float phase=clampr(float(s.anims.time_ms[part])/1000.f,0.f,_max(0.f,playing->timeTotal-.001f));
 				if (instrument::phase_needs_sync(phase,playing->timeCurrent)) playing->timeCurrent=phase;
 				it->second.applied[part]=value;
+			}
+		}
+		// A live stalker with no base motion on any part stands in its bind pose (the owner's screenshot, 2026-11-13, a game without
+		// split levels; the cause was not found by reading). The line says which of three it is: the host named no motion (src),
+		// this model has no such motion (valid: another visual or motion table here), or the motion would not start (live).
+		CAI_Stalker* puppet = obj->cast_stalker();
+		if (puppet && puppet->g_Alive() && now >= track.anim_diag_after)
+		{
+			u32 src = 0, valid = 0, live = 0;
+			for (u8 part = 0; part < s.anims.count && part < kMaxPartitions; ++part)
+			{
+				if (instrument::motion_present(s.anims.motion[part]))
+					src |= 1u << part;
+				if (motion_valid(ka, s.anims.motion[part]))
+					valid |= 1u << part;
+				for (u32 i = 0, n = ka->LL_PartBlendsCount(part); i < n; ++i)
+				{
+					CBlend* b = ka->LL_PartBlend(part, i);
+					if (b && instrument::mirrored_channel(b->channel))
+						live |= 1u << part;
+				}
+			}
+			if (live)
+				track.anim_diag_after = now + 1000;
+			else
+			{
+				track.anim_diag_after = now + 10000;
+				if (++g_anim_diag_lines <= 40 || g_anim_diag_lines % 50 == 0)
+					::Msg("! [coop-anim] %u [%s] visual [%s] plays no base motion: parts %u, named by the host %x, known to this model %x, "
+					      "motions %08x %08x %08x %08x (%u such line(s))",
+					    u32(obj->ID()), obj->cName().c_str(), obj->cNameVisual().c_str(), u32(s.anims.count), src, valid,
+					    s.anims.count > 0 ? s.anims.motion[0] : 0u, s.anims.count > 1 ? s.anims.motion[1] : 0u,
+					    s.anims.count > 2 ? s.anims.motion[2] : 0u, s.anims.count > 3 ? s.anims.motion[3] : 0u, g_anim_diag_lines);
 			}
 		}
 	}

@@ -12,7 +12,7 @@
 // everybody.
 //
 // Lua: coop.levels.split(), story_together(), my_level(), level_of_player(peer), players_on(level), led_by_host_process(level),
-// online_at_server(id); coop.is_world_server(), is_map_authority(), is_player(), is_mirror() (the host's process is the world server,
+// online_at_server(id), holder_of(id), recall(squad[, ms]); coop.is_world_server(), is_map_authority(), is_player(), is_mirror() (the host's process is the world server,
 // the authority of its map and a player; a client is a player and a mirror; a map server is the authority of its map).
 // Console: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status,
 // coop_levels_audit.
@@ -44,8 +44,14 @@ using LevelId = u16;
 // Game rules and machine settings (console variables; the rules are set per game by coop_game_schema, plan §3).
 extern int g_coop_split_levels; // 1 = every player on his own map, 0 = one map for the group, as in F3 (default)
 extern int g_coop_story_together; // 1 = the story levels are entered together (default), 0 = apart as any level
-extern int g_coop_max_map_servers; // 0..7, default 3: how many background map servers the host's PC may run
-extern int g_coop_mapserver_linger; // seconds a map server stays after its last player left, default 60
+// 0..7, default 6 (xrCoop/coop_levels_dynamic.h says why not 7): the most background map servers the host's PC may run (its ceiling);
+// the cap in force is host_map_cap
+extern int g_coop_max_map_servers;
+// seconds the map emptied last stays after its last player left, default 600; every other empty map at most 60 s
+// (xrCoop/coop_levels_dynamic.h linger_of)
+extern int g_coop_mapserver_linger;
+// The two settings above are saved: the old defaults (3 servers, 60 s) of a machine that ran an earlier build move to build 50's, once.
+void settle_machine_settings();
 extern int g_coop_soft_host_move; // 1 = the host's move reloads nobody on a map server's level (default), 0 = everybody, as before
 
 // Split levels are on: the host's rule; a client knows it from the host's LevelMap (off until one comes).
@@ -71,6 +77,14 @@ const char* level_name(LevelId level);
 u32 players_on(LevelId level);
 // Host: the object is online at a map server (the world server holds it online without a game object): coop_levels_xfer.cpp.
 bool online_at_server(u16 id);
+// Host: the bridge of the map server that holds the object, or the squad it is a member of; kInvalidPeer when none does.
+PeerId holder_of(u16 id);
+// A map server: the world server recalls a squad (coop_npc_companions.script on_recall, the world server's word only): it goes offline
+// here now whoever stands by it, goes home, and is not asked for again for `ms` (a pin, kept short so that nothing stays offline for
+// good). `ms` 0 lifts the pin. False anywhere else, or for an object that is no creature or squad. Main thread or the game thread.
+constexpr u32 kRecallPinMs = 10000;
+constexpr u32 kRecallPinMaxMs = 30000;
+bool recall(u16 local_id, u32 ms);
 
 // --- the registry, the host's side (no effect without split levels)
 // Host: the player stands on the host's level (also when he is not in the table: a joining player of a session without split
@@ -85,8 +99,13 @@ bool passes_to(Msg type, PeerId peer);
 bool host_player_loads(PeerId peer, LevelId level);
 // Host: he finished loading (WorldLoaded).
 void host_player_in_world(PeerId peer);
-// Host: the verdict on a move of `peer` to `target` (xrCoop/coop_levels_rules.h decide_move: a new map server, the cap).
+// Host: the verdict on a move of `peer` to `target` (xrCoop/coop_levels_dynamic.h decide_move: a new map server, the cap). At the cap
+// the map server empty the longest is told to stop now and the move goes; refused only when every map server has a player.
 MoveVerdict host_judge_move(PeerId peer, LevelId target);
+// Host: how many map servers may run now: min(players + 1, coop_max_map_servers, 7) (xrCoop/coop_levels_dynamic.h map_server_cap).
+// `mover`: a player who is not seated yet (a join) counts too. host_map_players_now: the players of that count, the mover apart.
+u32 host_map_cap(PeerId mover = kInvalidPeer);
+u32 host_map_players_now();
 // Host: his character goes to `target` now.
 void host_player_moves(PeerId peer, LevelId target);
 // Host: the host himself goes to `level`: his seat goes first, so that a level he goes to needs no map server, and stays there until the

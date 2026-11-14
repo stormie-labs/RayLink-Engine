@@ -542,6 +542,15 @@ CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 	case coop::calls::Gate::Refuse: return nullptr;
 	case coop::calls::Gate::Run: break;
 	}
+	// Anomaly Coop: an object the ALife holds already is registered. alife():create(..., false) hands a registered one back when
+	// its parent has no game object in this process (CALifeSimulator__spawn_item3 above: an offline parent, or one online at a
+	// map server), and the stock scripts call register on it all the same (dialogs_mlr.give_task_fanat_training_2: the
+	// artefact for Fanatic's stash). It was written to a packet and destroyed below while the ALife's registries still held
+	// it; the next walk over them called a method of the dead object: "pure virtual function call", and a world server was
+	// gone (report RL-58GQ-G96T, build 48). A single-player game has the same fault with an offline parent. There is nothing
+	// left to do for such an object.
+	if (object && static_cast<CSE_Abstract*>(ai().alife().objects().object(object->ID, true)) == object)
+		return object;
 	const u16 clone_id = object->ID;
 	if (!coop::requests::before_clone_register(object))
 	{

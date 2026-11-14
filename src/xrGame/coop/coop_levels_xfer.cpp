@@ -27,6 +27,7 @@
 #include "coop_checkpoint_sources.h"
 #include "coop_dialog.h"
 #include "coop_entities.h"
+#include "coop_items.h"
 #include "coop_join.h"
 #include "coop_manager.h"
 #include "xrCoop/coop_soft_move.h"
@@ -70,6 +71,11 @@ constexpr u32 kReserveEveryMs = 5000; // world server: the map servers' ids are 
 constexpr u32 kAuditEveryMs = 10000; // a map server's hash of what it holds, this often (plan §1.7)
 constexpr u32 kScheduledPerRound = 8; // a map server: offline objects it holds that get their stock update in one ALife update
 constexpr u32 kJournalChunk = 0xC0C0; // of the ALife save; the stock reader looks for its own chunks and never sees it
+constexpr u32 kLootWatchMs = 10000; // a map server: loot is looked at this long after it fell (GAMMA's ItemProcessor is done by then)
+constexpr u32 kLootLookMs = 500; // ... this often
+constexpr u32 kLootPerFrame = 16; // ... at most this many told in one frame (a body with a full backpack takes a few frames)
+constexpr size_t kLootWatchedMax = 2048; // ... and no more watched at once: a battle of a hundred bodies is not worth more
+constexpr size_t kPinnedMax = 64; // a map server: recalled squads pinned offline at once (a few companion squads in practice)
 
 struct State
 {
@@ -92,6 +98,7 @@ struct State
 	u32 spawns_refused = 0; // LevelEntity Spawn thrown away: those objects stand on their level alone
 	std::map<LevelId, u64> logic_at; // when each level last said what its objects keep
 	u32 logic_taken = 0, logic_refused = 0;
+	u32 items_taken = 0, items_refused = 0; // LevelEntity Item: the wear of loot on a map server's level
 	// map server
 	std::unique_ptr<xfer::Holder> holder;
 	xrCriticalSection lock; // the vote may run on the game thread's ALife update
@@ -109,6 +116,11 @@ struct State
 	u32 id_next = 0; // the next id of his slice to look at
 	bool ids_out = false; // his slice was empty once (logged once)
 	std::map<u16, u64> refused_until;
+	// Squads the world server recalled (recall): offline here until then, whoever stands by them. A friend of the leader who stays by
+	// his companions would keep them online for good, and they would never go after him (testers 2026-11-13).
+	std::map<u16, u64> pinned;
+	xr_vector<u16> recalls; // recalled since the last frame: offline and home at the next one
+	u32 recalled = 0, recall_sent = 0, recall_kept = 0; // recalls heard, gave back for one, votes a pin turned to offline
 	bool handing_back = false; // it stops: nothing comes online here any more
 	bool quiet = false; // the world server is away (the host's move)
 	std::set<u16> settling; // granted, its stock update has not run yet: that update says whether it may come online at all
@@ -124,6 +136,18 @@ struct State
 	u32 logic_told = 0;
 	u64 logic_told_bytes = 0;
 	u32 creates = 0, removes = 0, refusals = 0;
+	// Loot of its level whose state only it knows (testers 2026-11-13: a dead NPC's gun was 100 % on the world server and in the
+	// players' hands). death_manager wears it in the death callback, ItemProcessor a few frames later: each is looked at for a
+	// while and goes up, and to the players of this level, whenever its state differs from what was said of it.
+	struct Watch
+	{
+		u64 until = 0;
+		u64 next = 0;
+		u32 said = 0; // items::state_digest of what went up, 0: nothing yet
+		u16 dead = 0xffff; // the body it fell in (loot_root)
+	};
+	std::map<u16, Watch> watched; // local ids
+	u32 items_told = 0;
 	// since the last line in the log: what the switch manager asked here (coop_mapserver_stats says where a level stays empty)
 	struct Seen
 	{
@@ -279,6 +303,111 @@ void client_requests(u64 now)
 	g.gone.clear();
 }
 
+// The squads the world server recalled: offline now and home, as xfer_hand_back does for all of them, but with the switch said to the
+// players of this level (no ClientApply: host_records), so a friend standing by sees them go, as the stock's companions vanish when they
+// are teleported to their leader. One that is not its own or is on its way home already only keeps its pin.
+void client_recalls(u64 now)
+{
+	xr_vector<u16> due;
+	due.swap(g.recalls); // a switch runs Lua (the binders' net_destroy), which may recall again: that waits for the next frame
+	for (const u16 id : due)
+	{
+		CSE_ALifeDynamicObject* e = ai().alife().objects().object(join::to_local(id), true);
+		if (!e || !g.holder->authors(id) || g.holder->frozen(id))
+			continue;
+		if (e->m_bOnline)
+			alife_rw().switch_offline(e); // xfer_on_switched_offline queues it in `gives` too: the frozen check there skips it
+		send_up(g.holder->want_offline(id, state_with_logic(e), now));
+		++g.recall_sent;
+		::Msg("[coop] levels: squad %u recalled by the world server, it goes home", u32(id));
+	}
+}
+
+// A world item whose state nobody else says: on the ground, in a body, in a box. Its top holder, or nullptr: a player's item is his
+// (ItemState), a living holder's reaches a player's hands with the authority's push (items::host_push). Both ends ask it. `dead`: a
+// body whose death is being said now (its entity may not have the health of its object yet).
+CSE_ALifeDynamicObject* loot_root(CSE_ALifeDynamicObject* item, u16 dead = 0xffff)
+{
+	if (!item || !item->cast_inventory_item())
+		return nullptr;
+	CSE_ALifeDynamicObject* root = item;
+	for (int depth = 0; root->ID_Parent != 0xffff && depth < 8; ++depth)
+	{
+		CSE_ALifeDynamicObject* up = ai().alife().objects().object(root->ID_Parent, true);
+		if (!up)
+			return nullptr;
+		root = up;
+	}
+	if (root->ID_Parent != 0xffff || root->ID == 0 || world::is_player_character(root))
+		return nullptr;
+	CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(root);
+	return (c && root->ID != dead && c->g_Alive()) ? nullptr : root;
+}
+
+// A map server: loot of its level to look at for a while (State::Watch). Under g.lock.
+void watch_loot(u16 local_id, u64 now, u16 dead = 0xffff)
+{
+	if (!loot_root(ai().alife().objects().object(local_id, true), dead))
+		return;
+	auto it = g.watched.find(local_id);
+	if (it == g.watched.end())
+	{
+		if (g.watched.size() >= kLootWatchedMax)
+			return;
+		it = g.watched.emplace(local_id, State::Watch()).first;
+		it->second.next = now;
+	}
+	it->second.until = now + kLootWatchMs;
+	if (dead != 0xffff)
+		it->second.dead = dead;
+}
+
+// A map server: what changed of the loot it looks at goes up (LevelEntity Item, the layout of ItemState) and to its players. Under g.lock.
+void client_loot(u64 now)
+{
+	u32 told = 0;
+	for (auto it = g.watched.begin(); it != g.watched.end() && told < kLootPerFrame;)
+	{
+		State::Watch& watch = it->second;
+		if (now < watch.next)
+		{
+			++it;
+			continue;
+		}
+		CSE_ALifeDynamicObject* e = ai().alife().objects().object(it->first, true);
+		if (!e || now >= watch.until || !loot_root(e, watch.dead))
+		{
+			it = g.watched.erase(it);
+			continue;
+		}
+		watch.next = now + kLootLookMs;
+		const u32 digest = items::state_digest(e, false);
+		std::string section;
+		std::vector<u8> blob;
+		if (digest == watch.said || !items::level_item_state(it->first, section, blob))
+		{
+			++it;
+			continue;
+		}
+		Writer w(blob.size() + section.size() + 24);
+		wire::LevelEntityHead head;
+		head.op = wire::LevelEntityHead::Item;
+		head.write(w);
+		w.u16(join::to_host(it->first));
+		w.str(section.c_str());
+		w.u8(0); // flags: a level's word is no player's authority push
+		w.varu(blob.size());
+		if (!blob.empty())
+			w.bytes(blob.data(), blob.size());
+		net::client_send(Msg::LevelEntity, w);
+		items::level_item_tell(it->first, section, blob);
+		watch.said = digest;
+		++g.items_told;
+		++told;
+		++it;
+	}
+}
+
 // What happened on its level, on the one reliable lane, so that a spawn comes before what follows it.
 void client_flush_up()
 {
@@ -302,6 +431,7 @@ void client_flush_up()
 			const Fvector pos = e ? e->o_Position : Fvector().set(0.f, 0.f, 0.f);
 			float p[3] = {pos.x, pos.y, pos.z};
 			w.vec3(p);
+			watch_loot(u.a, mgr().now_ms()); // a gun a wounded NPC threw, what a player put down: its wear after the move
 			break;
 		}
 		case Head::Died:
@@ -313,6 +443,9 @@ void client_flush_up()
 			{
 				const std::vector<u8> st = state_of(e);
 				w.bytes(st.data(), st.size());
+				const u64 now = mgr().now_ms();
+				for (const u16 child : e->children)
+					watch_loot(child, now, u.a); // death_manager wears what the body keeps
 			}
 			break;
 		}
@@ -676,6 +809,32 @@ void host_on_level_entity(PeerId from, Reader& r)
 			++g.logic_refused;
 		return;
 	}
+	case Head::Item:
+	{
+		// The wear its level gave loot (client_loot). Only what lies on the sender's level and no player holds: a player's own
+		// item is his word (ItemState), and nothing here comes from a player (LevelEntity is the trunk's, coop_scope.h).
+		const u16 id = r.u16();
+		const std::string section = r.str();
+		r.u8(); // flags: none from a level
+		const u64 n = r.varu();
+		const char* why = nullptr;
+		CSE_ALifeDynamicObject* root = nullptr;
+		if (!r.ok() || n > r.remaining())
+			why = "malformed";
+		else if (!(root = loot_root(ai().alife().objects().object(id, true))))
+			why = "no loot here";
+		else if (level_of_vertex(root->m_tGraphID) != level)
+			why = "not on its level";
+		else if (items::host_take_level_state(id, section.c_str(), r.cursor(), size_t(n), why))
+		{
+			++g.items_taken;
+			return;
+		}
+		if (++g.items_refused <= 8 || g.items_refused % 100 == 0)
+			::Msg("! [coop] levels: the state of item %u from map server %u refused (%u so far): %s", u32(id), mapserver::bridge_index(from),
+			    g.items_refused, why ? why : "?");
+		return;
+	}
 	case Head::State: break;
 	default: return;
 	}
@@ -797,6 +956,9 @@ void xfer_reset()
 	g.logic_at.clear();
 	g.logic_taken = 0;
 	g.logic_refused = 0;
+	g.items_taken = 0;
+	g.items_refused = 0;
+	g.items_told = 0;
 	g.book.clear();
 	g.round = logic::Round();
 	g.logic_over = false;
@@ -808,9 +970,15 @@ void xfer_reset()
 	g.gives.clear();
 	g.gone.clear();
 	g.refused_until.clear();
+	g.pinned.clear();
+	g.recalls.clear();
+	g.recalled = 0;
+	g.recall_sent = 0;
+	g.recall_kept = 0;
 	g.handing_back = false;
 	g.quiet = false;
 	g.settling.clear();
+	g.watched.clear();
 	g.scheduled_at = 0;
 	g.up.clear();
 	g.id_next = 0;
@@ -921,13 +1089,18 @@ void xfer_client_frame()
 			g.up.clear();
 			g.refused_until.clear();
 			g.settling.clear();
+			g.watched.clear();
+			g.pinned.clear();
+			g.recalls.clear();
 		}
+		client_recalls(now);
 		client_requests(now);
 		client_flush_up();
 		send_up(g.holder->tick(now));
 		client_events(now);
 		if (g.quiet)
 			return; // it would all wait in the world server's inbox: a state that is old by then, in tens of thousands
+		client_loot(now);
 		client_stream(now);
 		client_body(now);
 		client_audit(now);
@@ -986,6 +1159,44 @@ bool online_at_server(u16 id)
 	return m && m->m_group_id != 0xffff && g.keeper.away(m->m_group_id);
 }
 
+PeerId holder_of(u16 id)
+{
+	if (!mgr().is_host() || !g.keeper.marked())
+		return kInvalidPeer;
+	u32 peer = g.keeper.holder_of(id);
+	if (peer == Keeper::kNoSession)
+	{
+		// a member goes with its squad, as in online_at_server
+		const CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(id, true) : nullptr;
+		const CSE_ALifeMonsterAbstract* m = e ? smart_cast<const CSE_ALifeMonsterAbstract*>(e) : nullptr;
+		if (m && m->m_group_id != 0xffff)
+			peer = g.keeper.holder_of(m->m_group_id);
+	}
+	return peer == Keeper::kNoSession ? kInvalidPeer : PeerId(peer);
+}
+
+bool recall(u16 local_id, u32 ms)
+{
+	if (!is_map_server() || !ai().get_alife())
+		return false;
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(local_id, true);
+	if (!e || !transfers(e))
+		return false;
+	const u16 id = join::to_host(unit_of(e)); // the key of the vote (xfer_stock_rules): a member goes with its squad
+	xrCriticalSectionGuard guard(g.lock);
+	if (ms == 0)
+	{
+		g.pinned.erase(id);
+		return true;
+	}
+	if (g.pinned.size() >= kPinnedMax && g.pinned.count(id) == 0)
+		return false;
+	g.pinned[id] = mgr().now_ms() + _min(ms, kRecallPinMaxMs);
+	g.recalls.push_back(id);
+	++g.recalled;
+	return true;
+}
+
 bool xfer_stock_rules(u16 local_id)
 {
 	CSE_ALifeDynamicObject* e = (ai().get_alife()) ? ai().alife().objects().object(local_id, true) : nullptr;
@@ -1003,6 +1214,19 @@ bool xfer_stock_rules(u16 local_id)
 	}
 	const bool held = g.holder->authors(id);
 	const bool frozen = held && (g.holder->frozen(id) || g.settling.count(id) != 0);
+	const auto pin = g.pinned.find(id);
+	if (pin != g.pinned.end())
+	{
+		if (mgr().now_ms() < pin->second)
+		{
+			// recalled: the players near it do not count, it is not asked for, and what it holds of it goes home
+			++g.recall_kept;
+			if (held && !frozen && !e->m_bOnline)
+				g.gives.push_back(id);
+			return false;
+		}
+		g.pinned.erase(pin); // the stock rules again: a pin never keeps anything offline for good
+	}
 	const float distance = observer_distance(e->o_Position);
 	const bool in_reach = distance <= ai().alife().online_distance() || !e->can_switch_offline();
 	const LeadAsk a = lead_vote(transfers(e), held, frozen, in_reach);
@@ -1197,13 +1421,17 @@ void xfer_print_status()
 		::Msg("[coop] levels: body reports %u, refused %u, %u bod(ies) known", g.body_reports, g.body_refused, u32(g.bodies.size()));
 		::Msg("[coop] levels: objects of map servers refused %u", g.spawns_refused);
 		::Msg("[coop] levels: what static objects keep: %u taken, %u refused", g.logic_taken, g.logic_refused);
+		::Msg("[coop] levels: the wear of loot on map servers' levels: %u taken, %u refused", g.items_taken, g.items_refused);
 		return;
 	}
 	::Msg("[coop] levels: what the objects of this level keep: %u said of %u watched, %llu bytes", g.logic_told, u32(g.book.watched()), g.logic_told_bytes);
 	xrCriticalSectionGuard guard(g.lock);
+	::Msg("[coop] levels: the wear of loot told %u, %u item(s) watched", g.items_told, u32(g.watched.size()));
 	if (g.holder)
 		::Msg("[coop] levels: holding %u object(s), %s, granted %u, taken back %u, refused %u, retries %llu",
 		    u32(g.holder->ids().size()), g.holder->idle() ? "idle" : "busy", g.creates, g.removes, g.refusals, g.holder->retries());
+	::Msg("[coop] levels: recalls heard %u, gave back %u, votes kept offline %u, %u squad(s) pinned", g.recalled, g.recall_sent,
+	    g.recall_kept, u32(g.pinned.size()));
 	const u16 proxy = join::proxy_of_peer(1);
 	const CSE_ALifeDynamicObject* player = (ai().get_alife() && proxy != 0xffff) ? ai().alife().objects().object(proxy, true) : nullptr;
 	::Msg("[coop] levels: switch votes %u, no holder %u, creatures %u, near %u, nearest %.0f m of %.0f, asked %u, sent %u, holder world %u of %u, "

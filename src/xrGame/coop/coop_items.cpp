@@ -2567,6 +2567,68 @@ void host_send_contents(PeerId to, u16 holder)
 		host_send_state(to, id);
 }
 
+bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob)
+{
+	CSE_Abstract* e = find_entity(id);
+	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
+		return false;
+	CInventoryItem* item = find_item(id);
+	ItemData d;
+	if (item)
+		capture_object(item, d);
+	else if (!capture_entity(e, d))
+		return false;
+	blob.clear();
+	write_data(d, blob);
+	section = e->s_name.c_str();
+	return true;
+}
+
+void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& blob)
+{
+	if (!is_map_server())
+		return;
+	Writer w(blob.size() + section.size() + 16);
+	write_state(w, id, section.c_str(), 0, blob); // the numbering of host_send_state: a map server's players read its ids
+	net::host_broadcast(Msg::ItemState, w);
+	++g_stats.world_states;
+}
+
+bool host_take_level_state(u16 id, const char* section, const u8* data, size_t size, const char*& why)
+{
+	why = nullptr;
+	CSE_Abstract* e = find_entity(id);
+	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
+	{
+		why = "no such item";
+		return false;
+	}
+	if (!same_str(e->s_name, section))
+	{
+		why = "another section";
+		return false;
+	}
+	if (g_owned.count(id))
+	{
+		why = "a player's item"; // its owner says its state (ItemState), nobody else
+		return false;
+	}
+	ItemData d;
+	if (size > kMaxBlob || !read_data(data, size, d) || !d.has_cond)
+	{
+		why = "malformed";
+		return false;
+	}
+	// The wear alone: the authority of a level sets it on loot (death_manager, ItemProcessor). Rounds, addons and upgrades of
+	// world items reach the world server with their own messages, as on the host's own level.
+	const ItemData cond = itemtags::only_tags(d, itemtags::Cond);
+	if (CInventoryItem* item = find_item(id))
+		apply_object(item, cond, false);
+	apply_entity(e, cond, false);
+	++g_stats.applied;
+	return true;
+}
+
 void host_upgrade_sold(u16 id, PeerId owner)
 {
 	CSE_Abstract* e = find_entity(id);
