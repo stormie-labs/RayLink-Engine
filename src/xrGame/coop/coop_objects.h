@@ -110,8 +110,23 @@ bool host_destroys(CGameObject* obj);
 bool zone_switch_blocked(CCustomZone* zone);
 // CCustomZone::OnStateSwitch: returns the time already spent in the new state (ms) to start from.
 int on_zone_state(CCustomZone* zone, u8 new_state);
+// CCustomZone::OnStateSwitch, a client's Blowout applied `elapsed` ms after the host started it: the state clock to start
+// at (its blast `blast_ms` when it is not long over, xrCoop/coop_hits.h zone_blowout_start).
+u32 zone_blowout_start(u32 elapsed, u32 blast_ms);
+// CCustomZone::UpdateBlowout, where it crosses m_dwBlowoutExplosionTime and AffectObjects runs: a client's state that came
+// after this Blowout and is held behind it may be applied now (client_apply_zones). Elsewhere a no-op.
+void zone_blast_passed(CCustomZone* zone);
 // CCustomZone::CreateHit: true = drop (client: anything but the local actor; host: player characters).
 bool zone_hit_blocked(CCustomZone* zone, u16 target_id);
+// CAI_Stalker::feel_touch_on_contact, CCustomZone::shedule_Update (build 51: no anomaly woke for a client's character):
+// true = `id` is a player's character on the authority of its level (a CAI_Stalker of section coop_player_avatar that
+// is not parked). A zone feels it as it feels the actor (CActor::feel_touch_on_contact), whatever ai_die_in_anomaly
+// and the NPC filters of mods say: the zone wakes and blows out for him, the hit itself is his own game's.
+// No for a character that is not alive (g_Alive) and for a player who is down by the survival rules (survival::life_of).
+bool zone_feels_player(u16 id);
+// CBaseGraviZone::AffectPull / AffectPullAlife, CMincer telekinesis: true = do not push or grab `target_id`. The same test
+// as zone_hit_blocked on the authority (a player's character, not the local actor): his own game pulls its own actor.
+bool zone_pull_blocked(u16 target_id);
 // CZoneCampfire::turn_on_script / turn_off_script: true = drop (client: the host decides).
 bool campfire_turn_blocked(CGameObject* campfire, bool on);
 // CTorridZone::UpdateWorkload (hook requested from the lead): step for the zone's path animator that keeps

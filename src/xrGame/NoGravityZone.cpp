@@ -5,6 +5,7 @@
 #include "PHMovementControl.h"
 //#include "PhWorld.h"
 #include "CharacterPhysicsSupport.h"
+#include "coop/coop_objects.h" // Anomaly Coop: zone_pull_blocked
 //extern CPHWorld	*ph_world;
 #include "../xrphysics/IPHWorld.h"
 
@@ -48,7 +49,8 @@ void CNoGravityZone::switchGravity(SZoneObjectInfo& io, bool val)
 		//shell->set_DynamicScales(1.f);
 		return;
 	}
-	if (!io.nonalive_object)
+	// Anomaly Coop: a player's character on the authority keeps its gravity; his own game floats its own actor
+	if (!io.nonalive_object && !coop::objects::zone_pull_blocked(io.object->ID()))
 	{
 		CEntityAlive* ea = smart_cast<CEntityAlive*>(io.object);
 		CPHMovementControl* mc = ea->character_physics_support()->movement();

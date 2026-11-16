@@ -16,6 +16,7 @@
 // demonized: add lua callback before hit but after calculations
 #include "script_hit.h"
 #include "script_game_object.h"
+#include "coop/coop_health_ledger.h" // Anomaly Coop (build 51): the parts of the own actor's condition update
 
 #define MAX_HEALTH 1.0f
 #define MIN_HEALTH -0.01f
@@ -640,6 +641,12 @@ void CEntityCondition::UpdateHealth()
 	m_bIsBleeding = fis_zero(bleeding_speed) ? false : true;
 	m_fDeltaHealth -= CanBeHarmed() ? bleeding_speed : 0;
 	m_fDeltaHealth += m_fDeltaTime * (change_v().m_fV_HealthRestore + m_health_restore_boost);
+	// Anomaly Coop (build 51, a diagnostic): the own actor's health ledger names these parts (any other entity: one compare)
+	if (coop::health_ledger::is_own_condition(this))
+	{
+		coop::health_ledger::condition_bleeding(*this, CanBeHarmed() ? -bleeding_speed : 0.f);
+		coop::health_ledger::condition_restore(*this, m_fDeltaTime * (change_v().m_fV_HealthRestore + m_health_restore_boost));
+	}
 
 	VERIFY(_valid(m_fDeltaHealth));
 	ChangeBleeding(change_v().m_fV_WoundIncarnation * m_fDeltaTime);
@@ -662,6 +669,9 @@ void CEntityCondition::UpdateRadiation()
 			m_fDeltaTime;
 
 		m_fDeltaHealth -= CanBeHarmed() ? change_v().m_fV_RadiationHealth * m_fRadiation * m_fDeltaTime : 0.0f;
+		if (coop::health_ledger::is_own_condition(this)) // Anomaly Coop (build 51): any other entity pays one compare
+			coop::health_ledger::condition_radiation(
+				*this, CanBeHarmed() ? -change_v().m_fV_RadiationHealth * m_fRadiation * m_fDeltaTime : 0.0f);
 	}
 }
 

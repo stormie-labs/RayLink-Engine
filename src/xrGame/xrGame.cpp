@@ -28,10 +28,15 @@ extern "C" {
 DLL_API DLL_Pure* __cdecl xrFactory_Create(CLASS_ID clsid)
 {
 	DLL_Pure* object = object_factory().client_object(clsid);
-#ifdef DEBUG
-		if (!object)
-			return			(0);
-#endif
+	// Anomaly Coop (2026-11, crash triage RL-K958-GVST): the null check was DEBUG only, a release build dereferenced it.
+	// Only a script class (object_item_script: its Lua creator failed) gives nothing; every caller gets nullptr and a line.
+	if (!object)
+	{
+		string16 name;
+		CLSID2TEXT(clsid, name);
+		Msg("! xrFactory_Create: the class [%s] gave no object (its Lua creator failed, see the Lua error above)", name);
+		return (nullptr);
+	}
 	object->CLS_ID = clsid;
 	return (object);
 }

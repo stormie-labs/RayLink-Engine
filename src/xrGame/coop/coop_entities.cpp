@@ -569,6 +569,7 @@ u64 g_unbound_dropped = 0; // member ids forgotten by squads from the wire (rele
 u64 g_mirror_with_holder = 0; // children the host had offline, brought online with their holder here (mirror::placement)
 u64 g_mirror_broken_holder = 0; // children left offline: their holder is online here without a server entity
 u64 g_mirror_stale = 0; // stale child ids of a gone entity taken out of a holder's list before an EntitySpawn
+u64 g_mirror_online_now = 0; // free entities online on the host without a game vertex (psy phantoms), brought online here
 u64 g_mirror_lost = 0; // child ids with no server entity met by a holder leaving the server (mirror_lost_child)
 u64 g_mirror_listed_destroys = 0; // entities that left the server while their holder still listed them
 // B2 review M2: two budgets. The routine "comes online in its holder" line fires for a whole inventory at a world's
@@ -1161,11 +1162,35 @@ void client_on_spawn(PeerId, Reader& r)
 	g_id_retry.done(id_host);
 	// B2: a child follows its holder HERE; the host's flag of a child is its holder's state there (xrCoop/coop_mirror.h).
 	// F3a: on the world server a holder that a map server took is online by its flag alone (host_mark): that is no holder online here.
+	// Build 51: without a valid game vertex register_object put it into no level registry (CALifeGraphRegistry::add), and
+	// update_switch walks that registry only: a phantom of level.spawn_item never came online here. The host's flag speaks
+	// of this level only on a mirror that stands on the host's level (not on the world server, not on a map server).
+	// Known limit (split levels): a player on a level that a MAP SERVER leads gets this message twice and cannot tell the
+	// two apart: the map server's own (host_records there, up the trunk in a Tunnel, its flag is about his level) and the
+	// world server's (host_records there too, reaches_every_level, its flag is the world server's mark of a level it does
+	// not run). trunk_host_on_tunnel re-sends both from kHostPeer with the same layout and no level, and their order is not
+	// fixed. So such a free entity without a game vertex stays on the vote there (the phantom may stay unseen); logged.
+	const bool in_level_registry = ai().game_graph().valid_vertex_id(e->m_tGraphID);
+	const bool flag_of_this_level =
+	    is_mirror() && (!levels::split() || levels::led_by_host_process(levels::my_level()));
 	switch (mirror::placement(parent != kNoId, online, holder && online_here(holder),
-	    holder && alife_rw().server().ID_to_entity(parent)))
+	    holder && alife_rw().server().ID_to_entity(parent), in_level_registry, flag_of_this_level))
 	{
 	case mirror::Placement::SwitchVote:
 		g_online.insert(id);
+		if (!in_level_registry && is_mirror() && !flag_of_this_level && log_allowed(g_mirror_log_info))
+			::Msg("[coop] mirror: %u [%s] online on the host, no game vertex, this level is not the host process's: left "
+			      "on the vote (no switch manager visits it; it may stay offline here)",
+			    id_host, section);
+		break;
+	case mirror::Placement::OnlineNow:
+		// as apply_switch does for an EntitySwitch online; the vote stays Online, and no switch manager visits it
+		g_online.insert(id);
+		++g_mirror_online_now;
+		if (log_allowed(g_mirror_log_info))
+			::Msg("[coop] mirror: %u [%s] comes online now: online on the host, no game vertex (no level registry here)",
+			    id_host, section);
+		alife_rw().switch_online(e);
 		break;
 	case mirror::Placement::WithHolder:
 		if (!online)
@@ -1978,6 +2003,8 @@ void print_status()
 		      "offline in a holder without a server entity, %llu stale ids taken out, %llu lost children met, %llu left "
 		      "the server still listed",
 		    g_mirror_with_holder, g_mirror_broken_holder, g_mirror_stale, g_mirror_lost, g_mirror_listed_destroys);
+		::Msg("[coop]   mirror without a game vertex: %llu brought online at their EntitySpawn (psy phantoms)",
+		    g_mirror_online_now);
 	}
 }
 } // namespace entities

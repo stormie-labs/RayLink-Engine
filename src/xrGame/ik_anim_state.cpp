@@ -47,6 +47,26 @@ bool blend_in(const CBlend& b, const motion_marks& marks)
 	return NULL != marks.pick_mark(blend_time(b));
 }
 
+// Anomaly Coop (RL-4BXZ-R24J, build 51: AV at ik_anim_state.cpp:80 after 151 stalker animation resets): current_blend is
+// a raw pointer into the blend pool kept across frames; a blend that was freed and taken again, or one started with a
+// MotionID this visual has not, indexed m_Motions[slot] and its defs out of range. Valid blends get the very same def.
+CMotionDef* checked_motion_def(IKinematicsAnimated* K, const MotionID& id)
+{
+	if (!K || !id.valid() || id.slot >= K->LL_MotionsSlotCount())
+		return NULL;
+	shared_motions& slot = const_cast<shared_motions&>(K->LL_MotionsSlot(id.slot));
+	if (slot == shared_motions() || id.idx >= slot.motion_defs()->size())
+		return NULL;
+	return K->LL_GetMotionDef(id);
+}
+
+CMotionDef* ik_blend_motion_def(IKinematicsAnimated* K, const CBlend* b)
+{
+	if (!b || b->blend_state() == CBlend::eFREE_SLOT)
+		return NULL;
+	return checked_motion_def(K, b->motionID);
+}
+
 IC bool b_is_blending(const CBlend* current_blend, const CBlend* b)
 {
 	return current_blend &&
@@ -68,15 +88,24 @@ void ik_anim_state::update(IKinematicsAnimated* K, const CBlend* b, u16 i)
 		current_blend = 0;
 		return;
 	}
-	CMotionDef& m_def_new = *K->LL_GetMotionDef(b->motionID);
+	CMotionDef* const def_new = ik_blend_motion_def(K, b); // Anomaly Coop: checked (RL-4BXZ-R24J)
+	if (!def_new)
+	{
+		current_blend = 0;
+		return;
+	}
+	CMotionDef& m_def_new = *def_new;
 
 	if (m_def_new.marks.size() <= i)
 		return;
 
-	if (b_is_blending(current_blend, b))
+	CMotionDef* const def_cur = b_is_blending(current_blend, b) ? ik_blend_motion_def(K, current_blend) : NULL;
+	if (b_is_blending(current_blend, b) && !def_cur)
+		current_blend = 0; // Anomaly Coop: a kept blend that names no def of this skeleton is dropped
+	if (def_cur)
 	{
 		is_blending = true;
-		CMotionDef& m_def_cur = *K->LL_GetMotionDef(current_blend->motionID);
+		CMotionDef& m_def_cur = *def_cur;
 		bool is_cur_step = (m_def_cur.marks.size() > i) && blend_in(*current_blend, m_def_cur.marks[i]);
 		is_idle = !!(m_def_new.flags & esmIdle) && !!(m_def_cur.flags & esmIdle);
 		bool any_idle = (m_def_cur.flags & esmIdle) ||
@@ -103,7 +132,10 @@ void ik_anim_state::update(IKinematicsAnimated* K, const CBlend* b, u16 i)
 bool ik_anim_state::time_step_begin(IKinematicsAnimated* K, const CBlend& B, u16 limb_id, float& time)
 {
 	time = 0;
-	CMotionDef& m_def_cur = *K->LL_GetMotionDef(B.motionID);
+	CMotionDef* const def_cur = ik_blend_motion_def(K, &B); // Anomaly Coop: checked (RL-4BXZ-R24J)
+	if (!def_cur)
+		return false;
+	CMotionDef& m_def_cur = *def_cur;
 	if (m_def_cur.marks.size() <= limb_id || !!(m_def_cur.flags & esmIdle))
 		return false;
 	motion_marks& marks = m_def_cur.marks[limb_id];

@@ -11,9 +11,11 @@
 #include "coop_alife.h"
 #include "coop_story.h"
 #include "coop_checkpoint_sources.h"
+#include "coop_survival.h" // build 51: life_of (zone_feels_player)
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_motion_rules.h"
+#include "xrCoop/coop_hits.h" // build 51: zone_blowout_start, zone_state_waits
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -175,6 +177,9 @@ struct Counters
 	    broken_sent = 0, explode_sent = 0, fragments_relayed = 0, uses = 0, pushes = 0, throws_ok = 0,
 	    throws_refused = 0, activations = 0, consumed = 0, zone_hits_dropped = 0, projectiles = 0,
 	    throws_malformed = 0, consume_forced = 0; // R3 В7
+	u64 zone_player_contacts = 0; // build 51: zone contact tests that took a player's character as the actor
+	u64 zone_blasts_caught = 0, zone_blasts_late = 0; // client: a Blowout applied past its blast: started at it / too late
+	u64 zone_states_held = 0; // client: a state that came in one frame after a Blowout waits for its blast (P4)
 	// client
 	u64 samples_in = 0, rests_in = 0, poses_applied = 0, rests_applied = 0, mismatch = 0, zones_applied = 0,
 	    explode_applied = 0, explode_fallback = 0, destroyed_applied = 0, broken_applied = 0, uses_sent = 0, sleeping_bags_used = 0, tents_used = 0,
@@ -544,7 +549,17 @@ struct PendingZone
 {
 	ZoneEntry e;
 	u64 received = 0;
+	// build 51 (P4): the state that came in the same frame after a Blowout not applied yet; it is applied once the zone has
+	// passed its blast (zone_blast_passed, from CCustomZone::UpdateBlowout where AffectObjects runs), or the Blowout came
+	// too late for one (zone_blowout_start), or after kZoneBlastHoldMaxMs at most
+	bool has_next = false;
+	ZoneEntry next;
+	u64 next_received = 0;
+	bool wait_blast = false; // `e` is that state, held behind the Blowout applied at hold_since
+	u64 hold_since = 0;
 };
+constexpr u64 kZoneBlastHoldMaxMs = 10000; // a zone that never blasts here (not updated, no fast mode) holds no longer
+u16 g_zone_blast_wait = kNoId; // the zone whose Blowout client_apply_zones is applying with a state held behind it
 xr_map<u16, PendingZone> g_zone_pending; // local ids
 struct ClientPhase
 {
@@ -894,9 +909,15 @@ void client_push_check()
 	for (const auto& it : g_fixed)
 	{
 		CGameObject* go = find_go(it.first);
-		if (!go || go->Position().distance_to(chest) > 6.f || smart_cast<CEntityAlive*>(go) ||
-			smart_cast<CInventoryItem*>(go))
-			continue; // corpses and loose items are not walked aside
+		if (!go || go->Position().distance_to(chest) > 6.f || smart_cast<CInventoryItem*>(go))
+			continue; // loose items are not walked aside
+		// Owner 2026-11-17 (build 51): only the host could push a corpse, a client walked into it as into a wall. A corpse's
+		// ragdoll is a body like a crate (kinematic here once the host's ragdoll is whole) and the host takes the push for
+		// it (host_on_push: ObjKind::Body); it was left out here since WP7. A living creature is never in g_fixed; the
+		// check stays for one that is on its way out of it.
+		CEntityAlive* creature = smart_cast<CEntityAlive*>(go);
+		if (creature && creature->g_Alive())
+			continue;
 		CPhysicsShellHolder* sh = go->cast_physics_shell_holder();
 		CPhysicsShell* shell = sh ? sh->PPhysicsShell() : nullptr;
 		if (!shell || !shell->isActive() || shell->getMass() > 400.f || shell->getMass() < 5.f)
@@ -992,13 +1013,34 @@ void client_apply_zones()
 	for (auto it = g_zone_pending.begin(); it != g_zone_pending.end();)
 	{
 		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(it->first));
-		if (zone)
+		if (zone && it->second.wait_blast && now - it->second.hold_since < kZoneBlastHoldMaxMs)
+			++it; // build 51 (P4): the zone has not passed the blast of the Blowout before it yet
+		else if (zone)
 		{
 			ZoneEntry e = it->second.e;
 			const u64 waited = now - it->second.received;
 			const bool still = e.state == u8(CCustomZone::eZoneStateIdle) || e.state == u8(CCustomZone::eZoneStateDisabled);
 			if (!still)
 				e.elapsed += u32(_min<u64>(waited, 600000));
+			if (it->second.has_next)
+			{
+				// build 51 (P4): the state that came after this Blowout waits until the zone has passed its blast (on
+				// the schedule a zone may skip frames: a fixed count of frames could still overwrite it before its blast)
+				PendingZone& p = it->second;
+				// already in it: no switch now, so no blast of ours to wait for (the next state goes on the next pass)
+				p.wait_blast = e.state == u8(CCustomZone::eZoneStateBlowout) && u8(zone->ZoneState()) != e.state;
+				p.hold_since = now;
+				g_zone_blast_wait = p.wait_blast ? it->first : kNoId; // zone_blowout_start: a late one never blasts
+				apply_zone(zone, e);
+				g_zone_blast_wait = kNoId;
+				if (p.wait_blast && u8(zone->ZoneState()) != e.state)
+					p.wait_blast = false; // refused (a radiation field, ...): nothing to wait for
+				p.e = p.next;
+				p.received = p.next_received;
+				p.has_next = false;
+				++it;
+				continue;
+			}
 			apply_zone(zone, e);
 			it = g_zone_pending.erase(it);
 		}
@@ -1455,9 +1497,23 @@ void client_on_zones(PeerId, Reader& r)
 		e.anim = r.f32();
 		if (!r.ok())
 			break;
+		const u8 blowout = u8(CCustomZone::eZoneStateBlowout);
+		auto found = g_zone_pending.find(e.id);
+		if (found != g_zone_pending.end() && coop::hits::zone_state_waits(found->second.e.state == blowout, e.state == blowout))
+		{
+			// build 51 (P4): a Blowout not applied yet is not replaced; the newer state follows it after its blast
+			PendingZone& p = found->second;
+			if (!p.has_next)
+				++g_c.zone_states_held;
+			p.has_next = true;
+			p.next = e;
+			p.next_received = now;
+			continue;
+		}
 		PendingZone& p = g_zone_pending[e.id]; // latest state wins
 		p.e = e;
 		p.received = now;
+		p.has_next = false;
 	}
 }
 
@@ -2253,6 +2309,7 @@ void print_status()
 		::Msg("[coop]   objects out: %llu explosions, %llu destroyed, %llu broken, %llu fragments relayed, "
 		    "%llu zone hits on players dropped",
 		    g_c.explode_sent, g_c.destroyed_sent, g_c.broken_sent, g_c.fragments_relayed, g_c.zone_hits_dropped);
+		::Msg("[coop]   zones: %llu contact tests took a player's character as the actor (build 51)", g_c.zone_player_contacts);
 		::Msg("[coop]   objects req: %llu uses, %llu pushes, %llu throws ok / %llu refused / %llu malformed, "
 		    "%llu projectiles, %llu consumed (%llu kept by the client), %llu artefact activations, %u throws pending",
 		    g_c.uses, g_c.pushes, g_c.throws_ok, g_c.throws_refused, g_c.throws_malformed, g_c.projectiles,
@@ -2275,6 +2332,9 @@ void print_status()
 		    g_c.uses_sent, g_c.uses_echo_dropped, g_c.pushes_sent, g_c.throws_sent, g_c.activations_sent,
 		    g_c.sleeping_bags_used, g_c.tents_used);
 		::Msg("[coop]   objects in: %llu state / zone messages dropped before live (R2 I2)", g_c.dropped_before_live);
+		::Msg("[coop]   zones in: %llu blowouts started at their blast (came late), %llu too late for it, %llu states held "
+		      "behind a blowout until its blast",
+		    g_c.zone_blasts_caught, g_c.zone_blasts_late, g_c.zone_states_held);
 		::Msg("[coop]   objects in: %llu script cycle words (%llu malformed), %llu played (%llu held again), %u objects held, "
 		    "%llu own play_cycle calls dropped",
 		    g_c.motions_in, g_c.motions_malformed, g_c.motions_played, g_c.motions_held, (u32)g_motion_words.size(),
@@ -2550,6 +2610,52 @@ bool zone_hit_blocked(CCustomZone* zone, u16 target_id)
 		return true;
 	}
 	return false;
+}
+
+u32 zone_blowout_start(u32 elapsed, u32 blast_ms)
+{
+	const u32 start = coop::hits::zone_blowout_start(elapsed, blast_ms);
+	if (elapsed > blast_ms)
+		++(start == blast_ms ? g_c.zone_blasts_caught : g_c.zone_blasts_late);
+	if (start > blast_ms && g_zone_blast_wait != kNoId)
+	{
+		// too late for its blast: UpdateBlowout never crosses it, the state held behind it need not wait
+		auto it = g_zone_pending.find(g_zone_blast_wait);
+		if (it != g_zone_pending.end())
+			it->second.wait_blast = false;
+	}
+	return start;
+}
+
+void zone_blast_passed(CCustomZone* zone)
+{
+	if (!zone || g_zone_pending.empty() || !is_mirror())
+		return;
+	auto it = g_zone_pending.find(zone->ID());
+	if (it != g_zone_pending.end())
+		it->second.wait_blast = false; // build 51 (P4): the state held behind this Blowout may follow now
+}
+
+bool zone_feels_player(u16 id)
+{
+	if (id == kNoId || !mgr().active() || !is_map_authority())
+		return false;
+	if (!world::is_player_proxy(id) || world::is_parked(id))
+		return false;
+	// a dead body, and a player who is down by the survival rules (wounded, bled out, spectating, respawning), wake nothing
+	const CEntityAlive* alive = smart_cast<CEntityAlive*>(find_go(id));
+	if (!alive || !alive->g_Alive() || survival::is_down(survival::life_of(id)))
+		return false;
+	++g_c.zone_player_contacts;
+	return true;
+}
+
+bool zone_pull_blocked(u16 target_id)
+{
+	// the same test as zone_hit_blocked on the authority: a player's character is pulled by his own game, to his own actor
+	if (target_id == kActor || !mgr().active() || is_mirror())
+		return false;
+	return world::is_player_proxy(target_id);
 }
 
 bool campfire_turn_blocked(CGameObject* campfire, bool on)

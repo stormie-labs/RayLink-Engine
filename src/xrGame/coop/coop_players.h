@@ -71,6 +71,10 @@ bool avatar_view(u16 avatar_id, float& yaw, float& pitch);
 // Host or map server: where a player's own machine last said he stands (his newest PlayerState) and how old that is. False
 // when he never reported here (live 2026-11-08: the hit journal compares it with his character here).
 bool reported_position(u16 avatar_id, Fvector& pos, u64& age_ms);
+// Host or map server: the speed (m/s) of the player's actor as his newest PlayerState says (|vel|). False when he never
+// reported here. Build 51: a burning fuzz / liana wakes by the speed of who walks in it, and a driven avatar's capsule
+// has none of its own (CHairsZone::CheckForAwaking).
+bool reported_speed(u16 avatar_id, float& speed);
 // coop_equip.cpp: safe mode (weapon lowered) of the player whose avatar is `avatar_id`, as last reported in
 // PlayerEquip; false if not known.
 bool avatar_safemode(u16 avatar_id, bool& lowered);

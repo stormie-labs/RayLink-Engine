@@ -30,6 +30,8 @@ void IGame_ObjectPool::prefetch()
 		CLASS_ID CLS = pSettings->r_clsid(item.first.c_str(), "class");
 		p_count++;
 		CObject* pObject = (CObject*)NEW_INSTANCE(CLS);
+		// Anomaly Coop: xrFactory_Create gives nullptr when a scripted class's Lua creator fails
+		if (!pObject) { Msg("! prefetch: [%s] gave no object", item.first.c_str()); continue; }
 		pObject->Load(item.first.c_str());
 		VERIFY2(pObject->cNameSect().c_str(), item.first.c_str());
 		m_PrefetchObjects.push_back(pObject);

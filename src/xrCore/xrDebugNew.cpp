@@ -86,13 +86,56 @@ namespace crash_saving
 #include <Windows.h>
 #include "mezz_stringbuffer.h"
 #include "../3rd party/stackwalker/include/StackWalker.h"
+#include <psapi.h> // Anomaly Coop: GetProcessMemoryInfo (K32GetProcessMemoryInfo in kernel32, _WIN32_WINNT is Windows 7)
+
+// Anomaly Coop (2026-11, crash triage): "<module file name>+0x<offset>" of an address, "0x<address>" outside any module.
+// Fixed buffers, no allocation: the unhandled exception filter calls it too. GetModuleFileNameA may wait for the loader lock
+// when another thread holds it (as the symbol engine of the stack trace below does anyway).
+static void describe_code_address(const void* address, LPSTR out, size_t out_size)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	char path[MAX_PATH];
+	if (address != nullptr && VirtualQuery(address, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Type == MEM_IMAGE &&
+		mbi.AllocationBase != nullptr)
+	{
+		const DWORD length = GetModuleFileNameA(static_cast<HMODULE>(mbi.AllocationBase), path, sizeof(path));
+		if (length != 0 && length < sizeof(path))
+		{
+			LPCSTR name = path;
+			for (LPCSTR c = path; *c; ++c)
+				if (*c == '\\' || *c == '/')
+					name = c + 1;
+			_snprintf_s(out, out_size, _TRUNCATE, "%s+0x%llX", name,
+				static_cast<unsigned long long>(static_cast<const char*>(address) - static_cast<const char*>(mbi.AllocationBase)));
+			return;
+		}
+	}
+	_snprintf_s(out, out_size, _TRUNCATE, "0x%p", address);
+}
+
 class xr_StackWalker : public StackWalker {
 public:
     xr_StackWalker() : StackWalker(StackWalker::StackWalkOptions::RetrieveSymbol
         | StackWalker::StackWalkOptions::RetrieveLine
         | StackWalker::StackWalkOptions::SymBuildPath
     ) {}
-protected:    
+protected:
+    // Anomaly Coop (2026-11, crash triage): the players have no PDB and OnOutput below drops every frame without a file and
+    // a line, so 29 reports said "stack trace:" and nothing more. Such a frame is printed as module+0xOFFSET, with the symbol
+    // when an export named it; a frame with a file and a line goes the stock way, unchanged.
+    virtual void OnCallstackEntry(CallstackEntryType eType, CallstackEntry& entry) {
+        if (eType != lastEntry && entry.offset != 0 && entry.lineFileName[0] == 0) {
+            char where[MAX_PATH + 32];
+            describe_code_address(reinterpret_cast<const void*>(entry.offset), where, sizeof(where));
+            LPCSTR name = entry.undFullName[0] ? entry.undFullName : (entry.undName[0] ? entry.undName : entry.name);
+            if (name[0])
+                Msg("%s (%.200s)", where, name);
+            else
+                Msg("%s", where);
+            return;
+        }
+        StackWalker::OnCallstackEntry(eType, entry);
+    }
     virtual void OnOutput(LPCSTR szText) {
         std::string s = szText;
         std::string sLowered = s;
@@ -856,6 +899,52 @@ void format_message(LPSTR buffer, const u32& buffer_size)
 #endif //-!_EDITOR
 
 #ifdef NO_BUG_TRAP
+// Anomaly Coop (2026-11, crash triage): the first lines of a crash: the exception's code and place (module+offset, the
+// players have no PDB), what an access violation touched, and the memory of that moment (the machines of the reports are
+// often at their commit limit). Fixed buffers, no Lua, no lock of ours; Msg itself (immediate mode) copies the line into a
+// string and takes the logger's critical sections, as every other line of this handler does.
+static void log_crash_header(const _EXCEPTION_POINTERS* pExceptionInfo)
+{
+	const EXCEPTION_RECORD* record = pExceptionInfo ? pExceptionInfo->ExceptionRecord : nullptr;
+	if (record)
+	{
+		char where[MAX_PATH + 32];
+		describe_code_address(record->ExceptionAddress, where, sizeof(where));
+		Msg("! crash: exception 0x%08X at %s", static_cast<unsigned>(record->ExceptionCode), where);
+		if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+			record->NumberParameters >= 2)
+		{
+			const ULONG_PTR kind = record->ExceptionInformation[0];
+			LPCSTR operation = kind == 0 ? "read" : (kind == 1 ? "write" : (kind == 8 ? "execute (DEP)" : "access"));
+			Msg("! crash: access violation: %s of the address 0x%p", operation,
+				reinterpret_cast<const void*>(record->ExceptionInformation[1]));
+		}
+	}
+
+	MEMORYSTATUSEX memory;
+	memory.dwLength = sizeof(memory);
+	if (GlobalMemoryStatusEx(&memory))
+	{
+		const unsigned long long mb = 1024ull * 1024ull;
+		Msg("! crash: system memory: commit %llu of %llu MB used, physical %llu of %llu MB free, load %u%%",
+			(memory.ullTotalPageFile - memory.ullAvailPageFile) / mb, memory.ullTotalPageFile / mb, memory.ullAvailPhys / mb,
+			memory.ullTotalPhys / mb, static_cast<unsigned>(memory.dwMemoryLoad));
+	}
+
+	PROCESS_MEMORY_COUNTERS_EX counters;
+	ZeroMemory(&counters, sizeof(counters));
+	counters.cb = sizeof(counters);
+	if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)))
+	{
+		const unsigned long long mb = 1024ull * 1024ull;
+		Msg("! crash: process memory: private %llu MB (peak %llu MB), working set %llu MB (peak %llu MB)",
+			static_cast<unsigned long long>(counters.PrivateUsage) / mb,
+			static_cast<unsigned long long>(counters.PeakPagefileUsage) / mb,
+			static_cast<unsigned long long>(counters.WorkingSetSize) / mb,
+			static_cast<unsigned long long>(counters.PeakWorkingSetSize) / mb);
+	}
+}
+
 //AVO: simplify function
 LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 {
@@ -863,6 +952,7 @@ LONG WINAPI UnhandledFilter(_EXCEPTION_POINTERS* pExceptionInfo)
     xrLogger::SetImmediateMode(true);
 	string256 error_message;
 	format_message(error_message, sizeof(error_message));
+	log_crash_header(pExceptionInfo); // Anomaly Coop: after format_message (it reads GetLastError), before anything else
 
 	CONTEXT save = *pExceptionInfo->ContextRecord;
 	//    BuildStackTrace(pExceptionInfo);

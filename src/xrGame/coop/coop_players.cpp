@@ -343,6 +343,18 @@ bool reported_position(u16 avatar_id, Fvector& pos, u64& age_ms)
 	return true;
 }
 
+bool reported_speed(u16 avatar_id, float& speed)
+{
+	auto it = g_tracks.find(avatar_id);
+	if (it == g_tracks.end() || it->second.samples.empty())
+		return false;
+	const float v = it->second.samples.back().s.vel.magnitude();
+	if (!_valid(v))
+		return false;
+	speed = v;
+	return true;
+}
+
 bool drive_avatar(CAI_Stalker* avatar)
 {
 	auto it = g_tracks.find(avatar->ID());

@@ -25,6 +25,7 @@
 #include <luabind/config.hpp>
 
 #include <typeinfo>
+#include <cstdlib> // Anomaly Coop (ours): std::abort in raylink_not_a_cpp_object
 
 #include <luabind/detail/class_rep.hpp>
 #include <luabind/object.hpp>
@@ -642,6 +643,21 @@ namespace luabind { namespace detail
 
 // ********** pointer converter ***********
 
+	// Anomaly Coop (ours, 2026-11, crash triage of builds 48-51): a release build defines LUABIND_NO_ERROR_CHECKING, so a
+	// function with one overload is called without its matchers and a script that passes a number, a string, a table
+	// or a boolean where a C++ object is expected reached obj->crep() with obj == nullptr (lua_touserdata of a non-userdata):
+	// an access violation with one [C] frame. It is a Lua error now, with the value's absolute stack index and Lua type
+	// (not always an argument: a converter also reads return values and table fields): the pcall around the script call
+	// handles it (co-op session: logged and survived; otherwise the stock "LUA error" fatal).
+	// Called before the bound C++ function is entered and while the converter has made nothing that needs a destructor.
+	// nil is not reported here: nil to a pointer is a null pointer, and nil to a non-const reference stays the null
+	// reference it always was (ref_converter below).
+	[[noreturn]] inline void raylink_not_a_cpp_object(lua_State* L, int index)
+	{
+		const int at = index < 0 && index > LUA_REGISTRYINDEX ? lua_gettop(L) + index + 1 : index;
+		luaL_error(L, "luabind: the value at stack #%d is a %s, a C++ object was expected", at, luaL_typename(L, index));
+		std::abort(); // not reached: luaL_error leaves by lua_error's long jump; this only tells the compiler so
+	}
 
 	template<Direction Dir> struct pointer_converter;
 
@@ -699,7 +715,7 @@ namespace luabind { namespace detail
 			if (lua_isnil(L, index)) return 0;
 			
 			object_rep* obj = static_cast<object_rep*>(lua_touserdata(L, index));
-			assert((obj != nullptr) && "internal error, please report"); // internal error
+			if (obj == nullptr) raylink_not_a_cpp_object(L, index); // Anomaly Coop (ours): see raylink_not_a_cpp_object
 			const class_rep* crep = obj->crep();
 
 			T* ptr = reinterpret_cast<T*>(crep->convert_to(LUABIND_TYPEID(T), obj, target));
@@ -832,6 +848,7 @@ namespace luabind { namespace detail
                 {
                     error_callback_fun e = get_error_callback_not_crash();
                     if (e) e(L);
+                    raylink_not_a_cpp_object(L, index); // Anomaly Coop (ours): was a null dereference on the next line
                 }
 
 				crep = obj->crep();
@@ -994,6 +1011,9 @@ namespace luabind { namespace detail
 		std::add_lvalue_reference_t<T> apply(lua_State* L, by_reference<T>, int index)
 		{
 			assert(!lua_isnil(L, index));
+			// Anomaly Coop (ours): nil is left as before (a null reference that faults only if the callee touches it): mods may
+			// rely on that by luck, and in single player a new Lua error is a FATAL. A non-nil value that is no C++ object
+			// is a Lua error in pointer_converter (raylink_not_a_cpp_object).
 			return *pointer_converter<Direction::lua_to_cpp>().apply(L, by_pointer<T>(), index);
 		}
 
@@ -1064,7 +1084,7 @@ namespace luabind { namespace detail
 			else
 			{
 				obj = static_cast<object_rep*>(lua_touserdata(L, index));
-				assert((obj != nullptr) && "internal error, please report"); // internal error
+				if (obj == nullptr) raylink_not_a_cpp_object(L, index); // Anomaly Coop (ours): see raylink_not_a_cpp_object
 				crep = obj->crep();
 			}
 			assert(crep);

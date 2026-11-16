@@ -15,6 +15,7 @@
 #include "../../stalker_movement_manager_smart_cover.h"
 #include "../../stalker_animation_manager.h"
 #include "CustomZone.h"
+#include "../../coop/coop_objects.h" // Anomaly Coop: zone_feels_player
 
 #ifdef DEBUG
 #	include "../../ai_debug.h"
@@ -88,6 +89,21 @@ bool CAI_Stalker::feel_touch_contact(CObject* O)
 bool CAI_Stalker::feel_touch_on_contact(CObject* O)
 {
 	VERIFY(O != this);
+
+	// Anomaly Coop (build 51): a player's character on the authority of its level is a CAI_Stalker, and with the stock
+	// ai_die_in_anomaly 0 no zone ever woke for it: an Electra, an acid field, a whirligig did nothing to a client. Zones
+	// feel it the way they feel the actor (CActor::feel_touch_on_contact); its hits are dropped here (zone_hit_blocked),
+	// the player's own game hurts and pulls him.
+	if (coop::objects::zone_feels_player(ID()))
+	{
+		if (CCustomZone* zone = smart_cast<CCustomZone*>(O))
+		{
+			Fsphere sphere;
+			Center(sphere.P);
+			sphere.R = 0.1f;
+			return (!!zone->inside(sphere));
+		}
+	}
 
 	if ((O->SpatialComponent->spatial.type | STYPE_VISIBLEFORAI) != O->SpatialComponent->spatial.type)
 		return (false);

@@ -21,14 +21,29 @@
 
 const u32 need_look_back_time_interval = 2000;
 
+// Anomaly Coop (RL-4BXZ-R24J, build 51): CAniVector::Load keeps only the motions the visual has, so A[i] of a missing one
+// (a shotgun's tri-state reload_1 / reload_2 on a visual with reload_0 only) read past the vector: a garbage MotionID that
+// faulted in PlayCycle (the stock catch(...) of CStalkerAnimationManager::update, 151 times) and then in the IK. A motion
+// that is not there is an invalid MotionID now; play_torso falls back to no_object_animation.
+IC MotionID motion_at(const ANIM_VECTOR& animations, u32 index)
+{
+	return index < animations.size() ? animations[index] : MotionID();
+}
+
+// The torso tables of a weapon's animation_slot (11 of them, weapon_names): an item's ltx may name any slot.
+IC bool torso_slot_known(const CStalkerAnimationData& data, const EBodyState& body_state, u32 slot)
+{
+	return u32(body_state) < data.m_part_animations.A.size() && slot < data.m_part_animations.A[body_state].m_torso.A.size();
+}
+
 MotionID CStalkerAnimationManager::aim_animation(const u32& slot, const xr_vector<CAniVector>& animation,
                                                  const u32& index) const
 {
 	if (!m_special_danger_move)
-		return (animation[6].A[index]);
+		return (motion_at(animation[6].A, index));
 
 	if (slot != 2)
-		return (animation[6].A[index]);
+		return (motion_at(animation[6].A, index));
 
 	if (animation[6].A.size() < 7)
 	{
@@ -40,14 +55,14 @@ MotionID CStalkerAnimationManager::aim_animation(const u32& slot, const xr_vecto
 		);
 #endif
 		//-Alundaio
-		return (animation[6].A[index]);
+		return (motion_at(animation[6].A, index));
 	}
 
 	switch (index)
 	{
-	case 0: return (animation[6].A[4]);
-	case 2: return (animation[6].A[5]);
-	case 3: return (animation[6].A[6]);
+	case 0: return (motion_at(animation[6].A, 4));
+	case 2: return (motion_at(animation[6].A, 5));
+	case 3: return (motion_at(animation[6].A, 6));
 	default: NODEFAULT;
 	}
 
@@ -87,9 +102,9 @@ MotionID CStalkerAnimationManager::no_object_animation(const EBodyState& body_st
 		);
 
 		if (standing())
-			return (animation[9].A[1]);
+			return (motion_at(animation[9].A, 1));
 
-		return (animation[7 + movement.movement_type()].A[1]);
+		return (motion_at(animation[7 + movement.movement_type()].A, 1));
 	}
 
 	if (standing())
@@ -106,6 +121,8 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 {
 	// animation shortcuts
 	typedef CStalkerAnimationState STATE;
+	if (!torso_slot_known(*m_data_storage, body_state, slot) || !torso_slot_known(*m_data_storage, eBodyStateStand, slot))
+		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
 	const xr_vector<STATE>& part_animations = m_data_storage->m_part_animations.A;
 	const xr_vector<CAniVector>& animation = part_animations[body_state].m_torso.A[slot].A;
 	const xr_vector<CAniVector>& animation_stand = part_animations[eBodyStateStand].m_torso.A[slot].A;
@@ -132,26 +149,26 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 			if (eMovementTypeWalk == movement.movement_type())
 			{
 				if ((body_state == eBodyStateStand) && (slot == 2) && need_look_back())
-					return (animation[13 + m_looking_back - 1].A[1]);
+					return (motion_at(animation[13 + m_looking_back - 1].A, 1));
 				else
 					return (aim_animation(slot, animation, 0));
 			}
 
 			if ((body_state == eBodyStateStand) && (slot == 2) && need_look_back())
-				return (animation[13 + m_looking_back - 1].A[0]);
+				return (motion_at(animation[13 + m_looking_back - 1].A, 0));
 
 			VERIFY(eMovementTypeRun == movement.movement_type());
 			return (aim_animation(slot, animation, 3));
 		}
 
 	case ObjectHandlerSpace::eWorldOperatorStrapping:
-		return (animation_stand[11].A[0]);
+		return (motion_at(animation_stand[11].A, 0));
 	case ObjectHandlerSpace::eWorldOperatorUnstrapping:
-		return (animation_stand[12].A[0]);
+		return (motion_at(animation_stand[12].A, 0));
 	case ObjectHandlerSpace::eWorldOperatorStrapping2Idle:
-		return (animation_stand[11].A[1]);
+		return (motion_at(animation_stand[11].A, 1));
 	case ObjectHandlerSpace::eWorldOperatorUnstrapping2Idle:
-		return (animation_stand[12].A[1]);
+		return (motion_at(animation_stand[12].A, 1));
 	}
 
 	if (eMentalStateFree == movement.mental_state())
@@ -163,9 +180,9 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 		);
 
 		if (standing())
-			return (animation[9].A[1]);
+			return (motion_at(animation[9].A, 1));
 
-		return (animation[7 + movement.movement_type()].A[1]);
+		return (motion_at(animation[7 + movement.movement_type()].A, 1));
 	}
 
 	if (standing())
@@ -184,6 +201,8 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 
 MotionID CStalkerAnimationManager::weapon_animation(u32 slot, const EBodyState& body_state)
 {
+	if (!torso_slot_known(*m_data_storage, body_state, slot))
+		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
 	const xr_vector<CAniVector>& animation = m_data_storage->m_part_animations.A[body_state].m_torso.A[slot].A;
 
 	//Alun: Fix stalker sprint
@@ -192,7 +211,7 @@ MotionID CStalkerAnimationManager::weapon_animation(u32 slot, const EBodyState& 
 		body_state == eBodyStateStand && !fis_zero(
 			object().movement().speed(object().character_physics_support()->movement())))
 	{
-		return (animation[15].A[0]);
+		return (motion_at(animation[15].A, 0));
 	}
 
 	switch (m_weapon->GetState())
@@ -202,16 +221,16 @@ MotionID CStalkerAnimationManager::weapon_animation(u32 slot, const EBodyState& 
 			switch (m_weapon->GetReloadState())
 			{
 			case CWeapon::eSubstateReloadBegin:
-				return (animation[4].A[0]);
+				return (motion_at(animation[4].A, 0));
 			case CWeapon::eSubstateReloadInProcess:
-				return (animation[4].A[1]);
+				return (motion_at(animation[4].A, 1));
 			case CWeapon::eSubstateReloadEnd:
-				return (animation[4].A[2]);
+				return (motion_at(animation[4].A, 2));
 
 			default: NODEFAULT;
 			}
 #ifdef DEBUG
-			return					(animation[4].A[0]);
+			return					(motion_at(animation[4].A, 0));
 #endif
 		}
 	case CWeapon::eShowing:
@@ -226,21 +245,21 @@ MotionID CStalkerAnimationManager::weapon_animation(u32 slot, const EBodyState& 
 			CAI_Stalker& stalker = object();
 			stalker_movement_manager_smart_cover& movement = stalker.movement();
 			if (standing())
-				return (animation[1].A[0]);
+				return (motion_at(animation[1].A, 0));
 
 			if (eMovementTypeWalk == movement.movement_type())
 			{
 				if ((body_state == eBodyStateStand) && (slot == 2) && need_look_back())
-					return (animation[13 + m_looking_back - 1].A[1/**1/**/]);
+					return (motion_at(animation[13 + m_looking_back - 1].A, 1/**1/**/));
 				else
-					return (animation[1].A[0/**2/**/]);
+					return (motion_at(animation[1].A, 0/**2/**/));
 			}
 
 			if ((body_state == eBodyStateStand) && (slot == 2) && need_look_back())
-				return (animation[13 + m_looking_back - 1].A[0]);
+				return (motion_at(animation[13 + m_looking_back - 1].A, 0));
 
 			VERIFY(eMovementTypeRun == movement.movement_type());
-			return (animation[1].A[3]);
+			return (motion_at(animation[1].A, 3));
 		}
 	}
 
@@ -254,6 +273,8 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 	//	if (body_state == eBodyStateCrouch)
 	//		slot						= 0;
 
+	if (!torso_slot_known(*m_data_storage, body_state, slot))
+		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
 	const xr_vector<CAniVector>& animation = m_data_storage->m_part_animations.A[body_state].m_torso.A[slot].A;
 	//	const xr_vector<CAniVector>		&animation = m_data_storage->m_part_animations.A[eBodyStateStand].m_torso.A[slot].A;
 
@@ -285,7 +306,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[1].A[0]);
+			return (motion_at(animation[1].A, 0));
 		}
 	case CMissile::eReady:
 		{
@@ -295,7 +316,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[1].A[1]);
+			return (motion_at(animation[1].A, 1));
 		}
 	case CMissile::eThrow:
 		{
@@ -305,7 +326,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[1].A[2]);
+			return (motion_at(animation[1].A, 2));
 		}
 	case CMissile::eThrowEnd:
 		{
@@ -315,7 +336,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 			}
 #endif // #ifdef DEBUG
 			//			Msg						("CMissile::eThrowEnd");
-			return (animation[6].A[0]);
+			return (motion_at(animation[6].A, 0));
 		}
 	case CMissile::eBore:
 		{
@@ -324,7 +345,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[1].A[1]);
+			return (motion_at(animation[1].A, 1));
 		}
 	case CMissile::eHidden:
 		{
@@ -333,7 +354,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[6].A[0]);
+			return (motion_at(animation[6].A, 0));
 		}
 	case CMissile::eIdle:
 	default:
@@ -347,7 +368,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 					Msg				("! visual %s", object().cNameVisual().c_str());
 				}
 #endif // #ifdef DEBUG
-				return (animation[6].A[0]);
+				return (motion_at(animation[6].A, 0));
 			}
 
 			if (eMovementTypeWalk == movement.movement_type())
@@ -357,7 +378,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 					Msg				("! visual %s", object().cNameVisual().c_str());
 				}
 #endif // #ifdef DEBUG
-				return (animation[6].A[2]);
+				return (motion_at(animation[6].A, 2));
 			}
 
 #ifdef DEBUG
@@ -365,7 +386,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 				Msg					("! visual %s", object().cNameVisual().c_str());
 			}
 #endif // #ifdef DEBUG
-			return (animation[6].A[3]);
+			return (motion_at(animation[6].A, 3));
 		}
 	}
 }

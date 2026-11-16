@@ -58,17 +58,23 @@ MotionID CStalkerAnimationManager::global_critical_hit()
 		)
 	);
 
-	u32 animation_slot = weapon->animation_slot();
-	VERIFY(animation_slot >= 1);
-	VERIFY(animation_slot <= 3);
+	// Anomaly Coop (RL-4BXZ-R24J): both were VERIFY only. A critical wound with no weapon in hands (a missile, nothing)
+	// dereferenced NULL; a slot outside 1..3 or a wound type outside the table indexed m_global past the critical hit
+	// tables; a visual without N_critical_hit_* motions has an empty table (select read its [0]). No critical hit motion:
+	// the critical wound ends at once, the way it ends when its motion ends (the global pair's end callbacks,
+	// CAI_Stalker::remove_critical_hit among them), and the stalker goes on with head, torso and legs.
+	const u32 animation_slot = weapon ? weapon->animation_slot() : 0;
+	const u32 table = object().critical_wound_type() + 6 * (animation_slot - 1);
+	const auto& tables = m_data_storage->m_part_animations.A[eBodyStateStand].m_global.A;
+	if (!weapon || animation_slot < 1 || animation_slot > 3 || table >= tables.size() || tables[table].A.empty())
+	{
+		global().on_animation_end();
+		return (MotionID());
+	}
 
 	return (
 		global().select(
-			m_data_storage->m_part_animations.A[
-				eBodyStateStand
-			].m_global.A[
-				object().critical_wound_type() + 6 * (animation_slot - 1)
-			].A,
+			tables[table].A,
 			&object().critical_wound_weights()
 		)
 	);

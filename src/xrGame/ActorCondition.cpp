@@ -512,6 +512,8 @@ void CActorCondition::UpdateSatiety()
 	{
 		float v_satiety_health = IsSleeping() ? m_fV_SatietyHealthSleep : m_fV_SatietyHealth;
 		m_fDeltaHealth += v_satiety_health * satiety_health_koef * m_fDeltaTime;
+		if (coop::health_ledger::is_own_condition(this)) // Anomaly Coop (build 51): another actor pays one compare
+			coop::health_ledger::condition_satiety(*this, v_satiety_health * satiety_health_koef * m_fDeltaTime);
 		m_fDeltaPower += v_satiety_power * m_fSatiety * m_fDeltaTime;
 	}
 }

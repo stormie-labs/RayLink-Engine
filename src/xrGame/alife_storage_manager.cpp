@@ -183,7 +183,13 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 bool CALifeStorageManager::load(LPCSTR save_name_no_check)
 {
 	// Anomaly Coop: a received snapshot can only be loaded by the active join pipeline.
-	if (coop::join::is_client_cache_save(save_name_no_check) && !coop::join::client_loading_world()) return false;
+	if (coop::join::is_client_cache_save(save_name_no_check) && !coop::join::client_loading_world())
+	{
+		// Crash triage RL-8VWD-XXXF (build 50): the refusal ended in a FATAL with no word of why; the phase names it
+		Msg("! [coop] the received world [%s] is not loaded: the join phase is %s, not loading-world", save_name_no_check,
+		    coop::phase_name(coop::mgr().phase()));
+		return false;
+	}
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
 
 	string_path save_name;

@@ -331,6 +331,13 @@ void CALifeUpdateManager::load(LPCSTR game_name, bool no_assert, bool new_only)
 
 	if (new_only || !CALifeStorageManager::load(game_name))
 	{
+		// Anomaly Coop (crash triage RL-8VWD-XXXF, build 50): the client's copy of the host's world was refused (the storage
+		// manager logged the join phase): the session moved on or ended between the load command and this load. A new game
+		// cannot be made of it and the server cannot be left without a world, so the level start is dropped before the server
+		// loads it (CLevel::net_start2); reaching this line means that check missed it, and the player is told why, not "cannot
+		// find the specified saved game"
+		if (!new_only && coop::join::is_client_cache_save(game_name))
+			Debug.fatal(DEBUG_INFO, "%s", "[coop] The host's world changed or the session ended while it was loading. Join again.");
 		R_ASSERT3(new_only || no_assert && xr_strlen(game_name), "Cannot find the specified saved game ", game_name);
 		new_game(game_name);
 	}

@@ -626,7 +626,10 @@ void CCustomZone::shedule_Update(u32 dt)
 			}
 
 			// Ignore object override script callback
-			if (pEntityAlive)
+			// Anomaly Coop (build 51): a player's character is the actor to a zone; the NPC filters of mods (GAMMA ignores a
+			// live stalker away from the centre) are not his. This wakes the host's zone only: the hit is his own copy's, and
+			// his own game runs this callback with its own actor there (zone_hit_blocked drops the host's hit on him)
+			if (pEntityAlive && !coop::objects::zone_feels_player(pObject->ID()))
 			{
 				::luabind::functor<bool> funct;
 				if (ai().script_engine().functor("_G.CCustomZone_BeforeActivateCallback", funct))
@@ -1218,7 +1221,8 @@ void CCustomZone::UpdateBlowout()
 		m_dwBlowoutExplosionTime < (u32)m_iStateTime)
 	{
 		AffectObjects();
-		
+		coop::objects::zone_blast_passed(this); // Anomaly Coop (build 51): a client's next state held behind this blast
+
 		if (m_BendGrass_Blowout)
 			g_pGamePersistent->GrassBendersAddExplosion(ID(), Position(), Fvector().set(0, -99, 0), 1.33f, m_BendGrass_Blowout_speed, 1.0f, m_BendGrass_Blowout_radius);
 	}
@@ -1302,6 +1306,10 @@ void CCustomZone::OnStateSwitch(EZoneState new_state)
 	m_eZoneState = new_state;
 	m_iPreviousStateTime = m_iStateTime = 0;
 	m_iPreviousStateTime = m_iStateTime = coop::objects::on_zone_state(this, u8(new_state)); // Anomaly Coop: host relays, client resumes the host's phase
+	// Anomaly Coop (build 51): a client's Blowout that came a little late starts at its blast, else UpdateBlowout never
+	// crosses m_dwBlowoutExplosionTime and the zone does not hit (single player and the host: m_iStateTime is 0 here)
+	if (new_state == eZoneStateBlowout && m_iStateTime > 0)
+		m_iPreviousStateTime = m_iStateTime = int(coop::objects::zone_blowout_start(u32(m_iStateTime), m_dwBlowoutExplosionTime));
 };
 
 void CCustomZone::SwitchZoneState(EZoneState new_state)

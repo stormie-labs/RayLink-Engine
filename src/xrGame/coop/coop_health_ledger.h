@@ -5,6 +5,8 @@
 // target is the own actor (a pointer compare), so every other object costs nothing.
 #pragma once
 
+#include <atomic>
+
 class CEntity;
 class CEntityAlive;
 class CEntityCondition;
@@ -25,6 +27,23 @@ void script_change(const CEntityAlive* who, float value);
 void coop_set_health(CEntityCondition& c, float value);
 // CActorCondition::UpdateCondition, right after CEntityCondition::UpdateCondition: `was` is the health before it.
 void condition_update(const CActorCondition& c, float was);
+// The own actor's condition as the last frame() saw it (null without one). A caller of the condition_* hooks below asks
+// is_own_condition(this) FIRST, before it computes the amount, so that every other entity's update pays one pointer
+// compare (review of build 51: CanBeHarmed() and change_v() ran for every NPC just to build the argument). The hooks check
+// again in full (a stale pointer only costs that check).
+extern std::atomic<const CEntityCondition*> g_own_condition;
+inline bool is_own_condition(const CEntityCondition* c)
+{
+	return c && c == g_own_condition.load(std::memory_order_relaxed);
+}
+// Build 51 (a slow drain no line could name): what the condition update queued into its health change, as the engine adds
+// it to m_fDeltaHealth. `c` is any entity's condition: only the own actor's is booked.
+void condition_bleeding(const CEntityCondition& c, float amount); // CEntityCondition::UpdateHealth
+void condition_restore(const CEntityCondition& c, float amount); // the same: m_fV_HealthRestore + the health_restore booster
+void condition_radiation(const CEntityCondition& c, float amount); // CEntityCondition::UpdateRadiation
+void condition_satiety(const CEntityCondition& c, float amount); // CActorCondition::UpdateSatiety
+// CActor::UpdateArtefactsOnBeltAndOutfit: a worn item's (`section`) health restore, `value` as given to ChangeHealth.
+void worn(const CActor* actor, const char* section, float value);
 
 // CActor::Hit, after co-op's own drop of the hit: the hit and its power as received (before scripts); while the scope lives,
 // the condition update inside the hit (CEntityAlive::Hit -> CalcCondition -> UpdateCondition) is the hit's.

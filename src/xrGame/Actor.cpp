@@ -2708,6 +2708,9 @@ void CActor::UpdateArtefactsOnBeltAndOutfit()
 			float art_cond = artefact->GetCondition();
 			conditions().ChangeBleeding((artefact->m_fBleedingRestoreSpeed * art_cond) * f_update_time);
 			conditions().ChangeHealth((artefact->m_fHealthRestoreSpeed * art_cond) * f_update_time);
+			if (this == g_actor) // Anomaly Coop (build 51): the own actor's health ledger; anyone else pays this compare
+				coop::health_ledger::worn(this, artefact->cNameSect().c_str(),
+				                          (artefact->m_fHealthRestoreSpeed * art_cond) * f_update_time);
 			conditions().ChangePower((artefact->m_fPowerRestoreSpeed * art_cond) * f_update_time);
 			conditions().ChangeSatiety((artefact->m_fSatietyRestoreSpeed * art_cond) * f_update_time);
 			if ((artefact->m_fRadiationRestoreSpeed * art_cond) > 0.0f)
@@ -2730,6 +2733,11 @@ void CActor::UpdateArtefactsOnBeltAndOutfit()
 		conditions().ChangeHealth(
 			((outfit ? outfit->m_fHealthRestoreSpeed : 0.f) + (pHelmet ? pHelmet->m_fHealthRestoreSpeed : 0.f)) *
 			f_update_time);
+		// Anomaly Coop (build 51, a diagnostic): the health ledger names the outfit and the helmet apart
+		if (outfit && this == g_actor)
+			coop::health_ledger::worn(this, outfit->cNameSect().c_str(), outfit->m_fHealthRestoreSpeed * f_update_time);
+		if (pHelmet && this == g_actor)
+			coop::health_ledger::worn(this, pHelmet->cNameSect().c_str(), pHelmet->m_fHealthRestoreSpeed * f_update_time);
 		conditions().ChangePower(
 			((outfit ? outfit->m_fPowerRestoreSpeed : 0.f) + (pHelmet ? pHelmet->m_fPowerRestoreSpeed : 0.f)) *
 			f_update_time);

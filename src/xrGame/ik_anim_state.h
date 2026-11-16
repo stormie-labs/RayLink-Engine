@@ -2,6 +2,14 @@
 class CBlend;
 class ENGINE_API motion_marks;
 class IKinematicsAnimated;
+class CMotionDef;
+struct MotionID;
+
+// Anomaly Coop (RL-4BXZ-R24J, build 51): the motion def of a MotionID, or NULL when it names no def of this skeleton
+// (LL_GetMotionDef / PlayCycle index the slots and the defs unchecked).
+CMotionDef* checked_motion_def(IKinematicsAnimated* K, const MotionID& id);
+// The same for a blend, NULL also when the blend is free.
+CMotionDef* ik_blend_motion_def(IKinematicsAnimated* K, const CBlend* b);
 
 class ik_anim_state
 {

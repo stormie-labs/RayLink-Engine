@@ -6,6 +6,8 @@
 #include "PHMovementControl.h"
 #include "CharacterPhysicsSupport.h"
 #include "../xrengine/xr_collide_form.h"
+#include "coop/coop_objects.h" // Anomaly Coop: zone_feels_player
+#include "coop/coop_players.h" // Anomaly Coop: reported_speed
 
 bool CHairsZone::BlowoutState()
 {
@@ -27,6 +29,12 @@ void CHairsZone::CheckForAwaking()
 		if (pEnt)
 		{
 			float sp = pEnt->character_physics_support()->movement()->GetVelocityActual();
+			// Anomaly Coop (build 51): a player's character is driven by his PlayerState, its capsule is only placed:
+			// the speed is the one his own game reported
+			float reported = 0.f;
+			if (coop::objects::zone_feels_player(pEnt->ID()) && coop::players::reported_speed(pEnt->ID(), reported) &&
+				reported > sp)
+				sp = reported;
 			if (sp > m_min_speed_to_react)
 			{
 				SwitchZoneState(eZoneStateAwaking);

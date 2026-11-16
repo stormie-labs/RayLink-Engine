@@ -146,5 +146,26 @@ inline JournalLine journal_note(Journal& j, uint64_t now, float power)
 	}
 	return out;
 }
+
+// --- anomaly zones on a client (build 51: "the Electra does not damage clients")
+// A client switches a zone only to the host's states, and learns of a Blowout late (the host's frame, the wire, its own
+// frame). CCustomZone::UpdateBlowout fires the blast only when the state clock crosses m_dwBlowoutExplosionTime (0 for an
+// Electra): started with any elapsed time, the Blowout never hit. One not long over starts at its blast.
+constexpr uint32_t kZoneBlastLateMs = 500;
+
+// elapsed: the time the host's Blowout has run (ms); blast_ms: the zone's m_dwBlowoutExplosionTime. The clock to start at.
+inline uint32_t zone_blowout_start(uint32_t elapsed, uint32_t blast_ms)
+{
+	if (elapsed <= blast_ms || elapsed - blast_ms > kZoneBlastLateMs)
+		return elapsed;
+	return blast_ms;
+}
+
+// Two states of one zone in one frame: a Blowout not applied yet is kept, the state after it waits for its blast (the latest
+// would have replaced it and the blast was lost). Anything else: the latest wins.
+inline bool zone_state_waits(bool pending_is_blowout, bool new_is_blowout)
+{
+	return pending_is_blowout && !new_is_blowout;
+}
 } // namespace hits
 } // namespace coop

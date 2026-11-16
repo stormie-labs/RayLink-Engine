@@ -654,8 +654,15 @@ void CAI_Bloodsucker::shedule_Update(u32 dt)
 void CAI_Bloodsucker::Die(CObject* who)
 {
 	inherited::Die(who);
+	// Anomaly Coop (build 51): renderable_Render draws nothing while m_visibility_state is no_visibility, and only
+	// update_invisibility sets it back, through the 1 s gate of set_visibility_state and only while the body updates: a
+	// client's puppet that died invisible could stay an invisible body. Only a creature the host drives here is made
+	// visible at once; single player and the host keep the stock timing (update_invisibility, !g_Alive()).
 	if (coop::remote::is_remote_creature(this))
+	{
 		force_visibility_state(unset); // Anomaly Coop (audit F5b): the look the host sent ends with the monster
+		m_visibility_state = full_visibility;
+	}
 	stop_invisible_predator();
 }
 

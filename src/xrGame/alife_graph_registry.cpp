@@ -180,7 +180,11 @@ void CALifeGraphRegistry::add(CSE_ALifeDynamicObject* object, GameGraph::_GRAPH_
 	if (!object->m_bOnline && object->used_ai_locations() /**&& object->interactive()/**/)
 	{
 		VERIFY(ai().game_graph().valid_vertex_id(game_vertex_id));
-		m_objects[game_vertex_id].objects().add(object->ID, object);
+		// Anomaly Coop: an entity with no game vertex (0xFFFF: e.g. level.spawn_item from a script) and used_ai_locations()
+		// indexed far outside m_objects here (register_object, and the coop switch_online / switch_offline of
+		// Placement::OnlineNow). It is not put on any graph point; for a valid vertex nothing changes.
+		if (ai().game_graph().valid_vertex_id(game_vertex_id))
+			m_objects[game_vertex_id].objects().add(object->ID, object);
 		object->m_tGraphID = game_vertex_id;
 	}
 	else if (!m_level && update)
@@ -202,8 +206,17 @@ void CALifeGraphRegistry::remove(CSE_ALifeDynamicObject* object, GameGraph::_GRA
 			Msg					("[LSS] removing object [%s][%d] from graph point %d",object->name_replace(),object->ID,game_vertex_id);
 		}
 #endif
-		m_objects[game_vertex_id].objects().remove(object->ID);
+		// Anomaly Coop: no game vertex -> it was never put on a graph point (see add); do not index outside m_objects.
+		if (ai().game_graph().valid_vertex_id(game_vertex_id))
+			m_objects[game_vertex_id].objects().remove(object->ID);
 	}
 	if (update && m_level)
-		level().remove(object, ai().game_graph().vertex(game_vertex_id)->level_id() != level().level_id());
+	{
+		// Anomaly Coop: vertex() of an invalid id reads outside the graph too; such an object is on no level by its
+		// vertex, so it is removed without the "must be here" assert. A valid vertex keeps the stock test.
+		if (ai().game_graph().valid_vertex_id(game_vertex_id))
+			level().remove(object, ai().game_graph().vertex(game_vertex_id)->level_id() != level().level_id());
+		else
+			level().remove(object, true);
+	}
 }

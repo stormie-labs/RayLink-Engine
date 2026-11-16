@@ -16,6 +16,7 @@
 #include "Inventory.h"
 #include "coop/coop_remote.h" // Anomaly Coop
 #include "coop/coop_ai.h" // Anomaly Coop: undrawn_tracks
+#include "ik_anim_state.h" // Anomaly Coop: checked_motion_def (RL-4BXZ-R24J)
 
 void CStalkerAnimationManager::play_delayed_callbacks()
 {
@@ -168,7 +169,8 @@ bool CStalkerAnimationManager::play_global()
 {
 	bool animation_movement_controller = false;
 	const MotionID& global_animation = assign_global_animation(animation_movement_controller);
-	if (!global_animation)
+	// Anomaly Coop (RL-4BXZ-R24J): a global motion that names no def of this visual is no global motion
+	if (!global_animation || !checked_motion_def(m_skeleton_animated, global_animation))
 	{
 		clear_unsafe_callbacks();
 		global().reset();
@@ -188,7 +190,26 @@ IC void CStalkerAnimationManager::play_head()
 
 IC void CStalkerAnimationManager::play_torso()
 {
-	torso().animation(assign_torso_animation());
+	// Anomaly Coop (RL-4BXZ-R24J, build 51): a torso motion the visual has not (a shotgun's tri-state reload_1 / reload_2,
+	// an empty table) came as an invalid or garbage MotionID and faulted in PlayCycle; the stock catch(...) reset the
+	// pairs every frame and the IK met the freed blends (AV at ik_anim_state.cpp:80). Such a motion is replaced with the
+	// one the stalker plays with nothing in hands; a visual without even that keeps its torso still this frame.
+	MotionID animation = assign_torso_animation();
+	if (!checked_motion_def(m_skeleton_animated, animation))
+	{
+		static u32 missing = 0;
+		if (++missing <= 20 || (missing % 100) == 0)
+			Msg("! [coop] stalker [%s] visual [%s]: the torso motion of its active item is not in the visual (%u so far), "
+			    "the no-item motion plays",
+			    object().cName().c_str(), object().cNameVisual().c_str(), missing);
+		animation = no_object_animation(body_state());
+		if (!checked_motion_def(m_skeleton_animated, animation))
+		{
+			torso().reset();
+			return;
+		}
+	}
+	torso().animation(animation);
 	torso().play(m_skeleton_animated, torso_play_callback, false, false);
 }
 

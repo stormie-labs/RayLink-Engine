@@ -510,6 +510,20 @@ ECamEffectorType eff_down() { return (ECamEffectorType)0x434F4F01; }
 ECamEffectorType eff_spectate() { return (ECamEffectorType)0x434F4F02; }
 ECamEffectorType eff_overhead() { return (ECamEffectorType)0x434F4F03; }
 
+// The camera manager puts a new effector on at the end of its update and takes one off only among those already on
+// (CCameraManager::AddCamEffector, RemoveCamEffector: the waiting list is not looked at). A camera set and taken back with
+// no update of the actor's camera in between (the level still starting, the actor not updated) came on afterwards and
+// stayed for good: nothing takes off a camera the state does not know of. Live 2026-11-17 (build 51): a player back on
+// his feet (health 100 %, the inventory open) went on looking from the ground. Each camera of ours ends itself when it
+// is not the one the state asks for; the line tells that it happened.
+bool cam_stale(u8 cam, LPCSTR name)
+{
+	if (g_me.cam == cam)
+		return false;
+	::Msg("[coop] camera: a left-over %s camera is taken off (the state asks for %u)", name, u32(g_me.cam));
+	return true;
+}
+
 // First-person camera of a player lying on the ground.
 class DownCam : public CEffectorCam
 {
@@ -517,6 +531,8 @@ public:
 	DownCam() : CEffectorCam(eff_down(), 100000.f) { SetHudAffect(false); }
 	BOOL ProcessCam(SCamEffectorInfo& info) override
 	{
+		if (cam_stale(1, "lying"))
+			return FALSE;
 		fLifeTime = 100000.f;
 		m_drop += (kCamDrop - m_drop) * _min(1.f, Device.fTimeDelta * 2.5f);
 		info.p.y -= m_drop;
@@ -538,6 +554,8 @@ public:
 	bool AbsolutePositioning() override { return true; }
 	BOOL ProcessCam(SCamEffectorInfo& info) override
 	{
+		if (cam_stale(2, "spectator"))
+			return FALSE;
 		fLifeTime = 100000.f;
 		if (!g_spec.valid)
 			return TRUE;
@@ -569,6 +587,8 @@ public:
 	bool AbsolutePositioning() override { return true; }
 	BOOL ProcessCam(SCamEffectorInfo& info) override
 	{
+		if (cam_stale(3, "overhead"))
+			return FALSE;
 		fLifeTime = 100000.f;
 		if (!g_over.valid)
 			return TRUE;

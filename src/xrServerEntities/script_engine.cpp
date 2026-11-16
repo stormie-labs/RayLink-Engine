@@ -252,7 +252,15 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
         return;
 
     ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
-    auto stack = get_lua_stack(ai().script_engine().lua());
+    // Anomaly Coop (2026-11, crash triage): the stack of L, the state the error is in (a coroutine is not the main state;
+    // the main state's stack was printed before), and what is on top of L; the text is an argument, never a format, and
+    // cut to 2000 characters (Msg drops a whole line longer than its 4096 buffer)
+    auto stack = get_lua_stack(L);
+    const int top_type = lua_type(L, -1);
+    if (top_type == LUA_TSTRING)
+        Msg("! LUA error [BusyHandsDebug] top of the stack: string: %.2000s", lua_tostring(L, -1));
+    else
+        Msg("! LUA error [BusyHandsDebug] top of the stack: %s", lua_typename(L, top_type));
 
     xr_string lua_error_line = "";
     for (auto const& s : stack)

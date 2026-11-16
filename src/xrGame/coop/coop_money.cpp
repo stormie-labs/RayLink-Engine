@@ -543,7 +543,23 @@ void client_on_balance(PeerId from, Reader& r)
 	{
 		++g_c.set_by_host;
 		if (log_allowed())
-			::Msg("[coop] money from the host: %u RU (shown %u RU, the host holds %u RU)", view, shown, m.balance);
+		{
+			// The host's reason is the note that came with the balance (the wire has no other): a gift from a player, a
+			// refusal of a change of ours. A change of the host's own (a trade, a grant, the death fee: host_adjust /
+			// host_set) comes with no note; its `why` stays on the host. Only a refusal (money of ours undone) has "!".
+			if (m.note.kind == ledger::NoteKind::Received)
+				::Msg("[coop] money from the host: %u RU (shown %u RU, the host holds %u RU; the host's reason: %d RU from "
+				      "player %u)",
+				    view, shown, m.balance, m.note.amount, m.note.peer);
+			else if (m.note.kind == ledger::NoteKind::Refused)
+				::Msg("! [coop] money from the host: %u RU (shown %u RU, the host holds %u RU; the host's reason: refused a "
+				      "%s change of %d RU, %s)",
+				    view, shown, m.balance, cause_name(m.note.cause), m.note.amount, verdict_name(m.note.verdict));
+			else
+				::Msg("[coop] money from the host: %u RU (shown %u RU, the host holds %u RU; the host's reason: its own "
+				      "change, no note: a trade, a grant or a fee)",
+				    view, shown, m.balance);
+		}
 		entities::ClientApply apply; // our own GE_MONEY below is not a change of ours
 		a->set_money(view, true);
 	}
