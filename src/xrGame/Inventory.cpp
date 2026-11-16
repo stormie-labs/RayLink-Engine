@@ -26,6 +26,7 @@
 #include "static_cast_checked.hpp"
 #include "player_hud.h"
 #include "PDA.h"
+#include "coop/coop_requests.h" // Anomaly Coop: lua_mirror (a client's hands after the destroy of what it held)
 
 using namespace InventoryUtilities;
 //Alundaio
@@ -285,7 +286,16 @@ bool CInventory::DropItem(CGameObject* pObj, bool just_before_destroy, bool dont
 #ifdef DEBUG
 						Msg("---DropItem activating slot [-1], forced, Frame[%d]", Device.dwFrame);
 #endif // #ifdef DEBUG
+						// Anomaly Coop: a client's script that releases the thing in its hands and then draws another slot
+						// (G.A.M.M.A.'s quick melee, quickdraw.script: release the hit's item, 20 ms later
+						// activate_slot(the weapon)) meets the destroy a round trip later than in single player, where it is
+						// done before that activate_slot. The forced "no slot" below then threw the slot it had asked for
+						// away and the hands stayed empty (live 2026-11-15: "the weapon does not come back after the quick
+						// knife"). On a client the slot asked for is drawn once the item is gone, as in single player.
+						const u16 asked = coop::requests::lua_mirror() ? GetNextActiveSlot() : NO_ACTIVE_SLOT;
 						Activate(NO_ACTIVE_SLOT, true);
+						if (asked != NO_ACTIVE_SLOT && asked != pIItem->CurrSlot())
+							Activate(asked);
 					}
 					else
 					{

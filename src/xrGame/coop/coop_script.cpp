@@ -25,6 +25,7 @@
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 #include "xrCoop/coop_roster.h" // plan 2026-11-12 stage 3: who is listed as a player, who has the host's badge
 #include "xrCoop/coop_operator.h" // op::kMaxLine: coop.operator_command
+#include "xrCoop/coop_task_audience.h" // task_audience::kMaxMembers: coop.story_task_audience
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -1568,6 +1569,77 @@ int l_story_local_task(lua_State* L)
 	return 1;
 }
 
+// Reads a Lua array of character ids (u16, not 0xffff) at `idx`: false if it has another key, a non-integer element or more
+// than task_audience::kMaxMembers elements.
+bool arg_characters(lua_State* L, int idx, u16 (&out)[task_audience::kMaxMembers], u32& n)
+{
+	n = 0;
+	const size_t len = lua_objlen(L, idx);
+	if (len > task_audience::kMaxMembers)
+		return false;
+	size_t keys = 0;
+	lua_pushnil(L);
+	while (lua_next(L, idx) != 0)
+	{
+		lua_pop(L, 1); // the value; the key stays for lua_next
+		if (++keys > len)
+		{
+			lua_pop(L, 1); // the key: the traversal ends here
+			return false; // a key that is no index 1..len
+		}
+	}
+	for (size_t i = 1; i <= len; ++i)
+	{
+		lua_rawgeti(L, idx, int(i));
+		const bool number = lua_type(L, -1) == LUA_TNUMBER;
+		const lua_Number v = number ? lua_tonumber(L, -1) : -1;
+		lua_pop(L, 1);
+		if (!number || !(v >= 0 && v < lua_Number(task_audience::kNoCharacter)) || v != lua_Number(u16(v))) // NaN: out
+			return false;
+		out[n++] = u16(v);
+	}
+	return true;
+}
+
+// coop.story_task_audience(id, { character, ... } | nil) -> bool. Host: task `id` goes only to the players whose character
+// (coop.avatar_of; 0 = the host's) is listed, and to every map server; {} = nobody but the map servers; nil = everybody again.
+// False and no change on a client or a map server, or for a malformed call (not a string id, an id longer than the engine's
+// task id limit, an element that is no character id, more than 64 of them).
+int l_story_task_audience(lua_State* L)
+{
+	bool ok = false;
+	const int t = lua_type(L, 2);
+	if (mgr().is_host() && lua_type(L, 1) == LUA_TSTRING)
+	{
+		size_t len = 0;
+		const char* id = lua_tolstring(L, 1, &len);
+		if (id && len == xr_strlen(id) && task_audience::id_ok(std::string_view(id, len))) // no NUL inside
+		{
+			if (t == LUA_TNIL || t == LUA_TNONE)
+				ok = story::clear_task_audience(id);
+			else if (t == LUA_TTABLE)
+			{
+				u16 members[task_audience::kMaxMembers];
+				u32 n = 0;
+				ok = arg_characters(L, 2, members, n) && story::set_task_audience(id, members, n);
+			}
+		}
+	}
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
+// coop.story_resend_tasks(peer) -> bool. Host: pending task changes go out, then joined player `peer` gets the full task list
+// as he may see it now (a task he lost is removed there, one he gained is added). False for peer 0, a map server, a peer that
+// is not joined, or off the host.
+int l_story_resend_tasks(lua_State* L)
+{
+	lua_Number v = 0;
+	const bool ok = mgr().is_host() && arg_id(L, 1, v) && v == lua_Number(u32(v)) && story::resend_tasks(u32(v));
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
 bool arg_local_id(lua_State* L, int idx, u16& out)
 {
 	lua_Number v = 0;
@@ -1844,6 +1916,8 @@ void register_raw(lua_State* L)
 		{"spot_is_local", &l_spot_is_local},
 		{"story_hold_infos", &l_story_hold_infos},
 		{"story_local_task", &l_story_local_task},
+		{"story_task_audience", &l_story_task_audience}, // plan 2026-11-16 task audience: who sees a task
+		{"story_resend_tasks", &l_story_resend_tasks},
 		{"life_of", &l_life_of},
 		{"out_of_run", &l_out_of_run},
 		{"steam_invite_ready", &l_steam_invite_ready},

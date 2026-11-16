@@ -61,6 +61,7 @@
 #include "Flashlight.h"
 #include "coop/coop_events.h" // Anomaly Coop
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_ai.h" // Anomaly Coop: get_luminocity of a player's character (the light estimate)
 
 namespace MemorySpace
 {
@@ -1948,6 +1949,15 @@ float CScriptGameObject::GetLuminocityHemi()
 
 float CScriptGameObject::GetLuminocity()
 {
+	// Anomaly Coop: the render's light of an object nobody draws here is stale, and on a map server it is 0 for ever
+	// (CROS_impl starts at 0 and is refreshed when the object is drawn). A script that judges vision by it - G.A.M.M.A.'s
+	// Stealth Overhaul reads who:get_luminocity() and ignores the luminocity the engine hands it - saw a player's
+	// character in pitch dark: live 2026-11-15, the arena's opponents turned on the fighter only once he shot. The
+	// estimate the engine's own vision takes (visual_memory_manager.cpp object_luminocity) answers here too: a remote
+	// player's character, and a creature near a player who is not the host.
+	float estimate = 0.f;
+	if (coop::npc_ai::player_luminocity(&object(), estimate) || coop::npc_ai::creature_luminocity(&object(), estimate))
+		return estimate;
 	CObject* e = smart_cast<CObject*>(&object());
 	if (!e || !e->renderable_ROS())
 	{

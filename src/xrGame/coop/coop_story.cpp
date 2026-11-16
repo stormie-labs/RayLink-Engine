@@ -4,7 +4,11 @@
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_alife.h"
+#include "coop_world.h" // world::avatar_of: a peer's character, for a task's audience
+#include "coop_levels.h" // levels::passes_to: a task sent by its audience goes where host_broadcast would send it
+#include "coop_mapserver.h" // mapserver::host_bridges, is_bridge, bridge_takes: a bridge gets every task
 #include "xrCoop/coop_rules.h"
+#include "xrCoop/coop_task_audience.h"
 #include "xrCoop/coop_limits.h" // F2 T14 fix 1: limits::Pacer
 #include "xrCoop/coop_ghost_rules.h"
 #include "xrCoop/coop_task_target.h"
@@ -444,6 +448,55 @@ u64 g_local_task_edits = 0; // engine task hooks that let a personal task throug
 
 bool is_local_task(const shared_str& id) { return id.size() && g_local_tasks.count(id) != 0; }
 
+// Who sees a task (docs/plans/2026-11-16-task-audience.md B, xrCoop/coop_task_audience.h). Host only: the host's Lua sets it
+// (coop.story_task_audience) in a split-levels world. A task without an entry, and every task while the table is empty, goes
+// to everybody exactly as before.
+task_audience::Table g_audience;
+u64 g_audience_refused = 0; // entries the table refused (full)
+
+// The character a peer plays on the host, as coop.avatar_of gives it to Lua: 0 for the host peer, else his proxy;
+// task_audience::kNoCharacter (0xffff) while he has none (such a peer is out of every task that has an audience).
+u16 character_of(PeerId peer) { return peer == kHostPeer ? u16(0) : world::avatar_of(peer); }
+
+// May task `id` be sent to `peer`? A bridge (a map server) gets every task: it runs the logic of every task.
+// The host player (peer 0 of a listen world server) is NOT filtered here, by design: he reads the authority's own task
+// manager, and TaskUpdate / TaskList / StoryHash do not go over his LocalLink, so nothing sent from here could hide a task
+// from him (plan "Known limits": phase 2, a filter in the PDA of the host process).
+bool may_see(PeerId peer, const shared_str& id)
+{
+	if (g_audience.empty() || peer == kHostPeer)
+		return true;
+	return g_audience.allowed(cs(id), character_of(peer), mapserver::is_bridge(peer));
+}
+
+// Task `id` has an audience: it goes per peer (send_by_audience), not by host_broadcast.
+bool has_audience(const shared_str& id) { return !g_audience.empty() && g_audience.find(cs(id)) != nullptr; }
+
+// The part of net::host_broadcast past the remote players, unfiltered: the host player over his LocalLink (his link gate
+// decides; not filtered, see may_see) and the bridges of a world server that bridge_takes admits (net's to_bridges: queued
+// for a bridge that loads its world).
+void send_to_host_player_and_bridges(Msg type, const Writer& w)
+{
+	Session& s = mgr().session();
+	if (s.local())
+		s.send(kHostPeer, Lane::Reliable, type, w);
+	if (is_world_server() && mapserver::bridge_takes(type))
+		for (const PeerId bridge : mapserver::host_bridges())
+			net::host_send(bridge, type, w);
+}
+
+// A task message by its task's audience: where host_broadcast would send it (joined players that passes_to admits, the host
+// player, the bridges), less the players who may not see it.
+void send_by_audience(Msg type, const Writer& w, const shared_str& id)
+{
+	if (!is_map_authority())
+		return;
+	for (const PeerInfo& p : mgr().session().peers())
+		if (p.state == PeerState::Joined && levels::passes_to(type, p.id) && may_see(p.id, id))
+			net::host_send(p.id, type, w); // queued for a peer that is still loading, as host_broadcast does
+	send_to_host_player_and_bridges(type, w);
+}
+
 void capture(const CGameTask* t, TaskRec& r)
 {
 	r.id = t->m_ID;
@@ -526,6 +579,18 @@ DomainHash hash_tasks()
 	return d;
 }
 
+// Host: the tasks domain as `peer` should have it, without the tasks he may not see (what send_task_list sends him).
+DomainHash hash_tasks_for(PeerId peer)
+{
+	DomainHash d;
+	if (!in_game())
+		return d;
+	for (const SGameTaskKey& k : tasks().GetGameTasks())
+		if (k.game_task && !is_local_task(k.task_id) && may_see(peer, k.task_id))
+			d.add(task_item_hash(k.game_task));
+	return d;
+}
+
 CGameTask* find_task(const TaskKey& key)
 {
 	for (const SGameTaskKey& k : tasks().GetGameTasks())
@@ -571,7 +636,10 @@ void host_scan_tasks()
 		Writer w(256);
 		w.u8(TaskUpsert);
 		write_task(w, cur);
-		net::host_broadcast(Msg::TaskUpdate, w);
+		if (has_audience(cur.id))
+			send_by_audience(Msg::TaskUpdate, w, cur.id); // only to those who may see it (and the bridges)
+		else
+			net::host_broadcast(Msg::TaskUpdate, w);
 		++g_stats.tasks_out;
 	}
 }
@@ -662,8 +730,9 @@ void send_targets(const xr_vector<TargetPlace>& list, Send send)
 
 bool spot_replicable(CMapLocation* ml, const shared_str& type); // map spots section below
 
-// The targets of the running tasks (with a spot): all of them for a resync, else those that moved.
-xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next)
+// The targets of the running tasks (with a spot): all of them for a resync, else those that moved. `for_peer`: only the targets
+// of the tasks that peer may see (a resync to him); kInvalidPeer: every task's.
+xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next, PeerId for_peer = kInvalidPeer)
 {
 	xr_vector<TargetPlace> out;
 	const u64 now = mgr().now_ms();
@@ -693,7 +762,8 @@ xr_vector<TargetPlace> collect_targets(bool all, xr_map<u16, SentTarget>* next)
 	{
 		const CGameTask* t = k.game_task;
 		if (!t || is_local_task(k.task_id) || t->GetTaskState() != eTaskStateInProgress || !t->m_map_location.size() ||
-			t->m_map_object_id == kNoId || !seen.insert(t->m_map_object_id).second)
+			t->m_map_object_id == kNoId || (for_peer != kInvalidPeer && !may_see(for_peer, k.task_id)) ||
+			!seen.insert(t->m_map_object_id).second)
 			continue;
 		consider(t->m_map_object_id);
 	}
@@ -727,7 +797,7 @@ void host_scan_targets()
 void send_targets_to(PeerId to)
 {
 	if (in_game())
-		send_targets(collect_targets(true, nullptr), [to](Writer& w) { net::host_send(to, Msg::TaskUpdate, w); });
+		send_targets(collect_targets(true, nullptr, to), [to](Writer& w) { net::host_send(to, Msg::TaskUpdate, w); });
 }
 
 // A target the host points at and this machine has no copy of: its spot has no place here. Once a minute per id.
@@ -867,6 +937,8 @@ void print_task_targets()
 
 void send_task_to(PeerId to, const CGameTask* t)
 {
+	if (!may_see(to, t->m_ID))
+		return; // not his task (its audience): he learns nothing of it
 	TaskRec r;
 	capture(t, r);
 	auto it = g_host_sent.find(r.key());
@@ -884,16 +956,17 @@ void send_task_list(PeerId to)
 	if (!in_game())
 		return;
 	const vGameTasks& v = tasks().GetGameTasks();
+	// A task he may not see is left out (its audience); one he holds here is then detached by client_on_task_list.
 	u32 n = 0;
 	for (const SGameTaskKey& k : v)
-		if (!is_local_task(k.task_id))
+		if (!is_local_task(k.task_id) && may_see(to, k.task_id))
 			++n;
 	Writer w(v.size() * 256 + 8);
 	w.u32(n);
 	for (const SGameTaskKey& k : v)
 	{
-		if (is_local_task(k.task_id))
-			continue; // the host's personal task
+		if (is_local_task(k.task_id) || !may_see(to, k.task_id))
+			continue; // the host's personal task, or not his to see
 		TaskRec r;
 		if (k.game_task)
 			capture(k.game_task, r);
@@ -1027,8 +1100,9 @@ void host_on_task_give(PeerId from, Reader& r)
 	CGameTaskManager& m = tasks();
 	if (CGameTask* t = m.HasGameTask(id, true))
 	{
-		send_task_to(from, t); // already running: the client just catches up
-		return;
+		if (may_see(from, id)) // `from` is the transport's sender
+			send_task_to(from, t); // already running: the client just catches up
+		return; // running and not his to see (its audience): nothing, he learns nothing of it
 	}
 	{
 		ExecFor ef(from);
@@ -1070,6 +1144,8 @@ void host_on_task_state(PeerId from, Reader& r)
 		t = tasks().HasGameTask(id, true);
 	if (!t)
 		return;
+	if (!may_see(from, t->m_ID))
+		return; // not his to see (its audience): he can neither finish it nor learn of it
 	if (t->GetTaskState() != eTaskStateInProgress)
 	{
 		send_task_to(from, t); // the client is behind
@@ -2412,14 +2488,41 @@ void host_hash_frame()
 	host_flush_all(); // the hash must describe what was sent before it
 	DomainHash h[kHashDomains];
 	hash_all(h);
-	Writer w(64);
-	w.u8(u8(kHashDomains));
-	for (const DomainHash& d : h)
+	const auto put = [](Writer& out, const DomainHash (&d)[kHashDomains])
 	{
-		w.u32(d.count);
-		w.u64(d.hash);
+		out.u8(u8(kHashDomains));
+		for (const DomainHash& x : d)
+		{
+			out.u32(x.count);
+			out.u64(x.hash);
+		}
+	};
+	Writer w(64);
+	put(w, h);
+	if (g_audience.empty())
+	{
+		net::host_broadcast(Msg::StoryHash, w);
+		++g_stats.hashes;
+		return;
 	}
-	net::host_broadcast(Msg::StoryHash, w);
+	// Tasks with an audience: one StoryHash per player, the same layout, only its tasks domain is his own (hash_tasks_for).
+	// The host player and the bridges get the unfiltered one, where host_broadcast would send it.
+	if (!is_map_authority())
+		return;
+	Session& s = mgr().session();
+	for (const PeerInfo& p : s.peers())
+	{
+		if (p.state != PeerState::Joined || !levels::passes_to(Msg::StoryHash, p.id))
+			continue;
+		DomainHash mine[kHashDomains];
+		for (u32 i = 0; i < kHashDomains; ++i)
+			mine[i] = h[i];
+		mine[1] = hash_tasks_for(p.id); // [1]: the tasks domain (hash_all's order)
+		Writer pw(64);
+		put(pw, mine);
+		net::host_send(p.id, Msg::StoryHash, pw);
+	}
+	send_to_host_player_and_bridges(Msg::StoryHash, w);
 	++g_stats.hashes;
 }
 
@@ -2837,6 +2940,7 @@ void reset()
 	g_target_unknown_logged.clear();
 	g_target_unknown = 0;
 	g_finisher.clear();
+	g_audience.clear(); // the host's Lua pushes the audiences of a loaded world again (plan A: on its first host tick)
 	g_client_recs.clear();
 	g_known.clear();
 	g_pending.clear(); // the objects stay alive: scripts may hold them
@@ -3317,6 +3421,47 @@ bool set_local_task(LPCSTR id, bool on)
 	// A host copy mirrored under this id is not ours to keep in step any more.
 	for (auto it = g_client_recs.begin(); it != g_client_recs.end();)
 		it = it->first.id == key ? g_client_recs.erase(it) : std::next(it);
+	return true;
+}
+
+bool set_task_audience(LPCSTR id, const u16* members, u32 count)
+{
+	if (!mgr().is_host() || !id || !task_audience::id_ok(id) || count > task_audience::kMaxMembers || (count && !members))
+		return false;
+	const u32 before = u32(g_audience.size());
+	switch (g_audience.set(id, std::vector<u16>(members, members + count)))
+	{
+	case task_audience::Table::Set::Unchanged: return true;
+	case task_audience::Table::Set::Refused:
+		if (g_audience.size() >= task_audience::kMaxEntries && ++g_audience_refused <= 10)
+			::Msg("! [coop] story: task audiences are full (%u), '%s' stays everybody's", before, id);
+		return false;
+	default: break;
+	}
+	const task_audience::Members* m = g_audience.find(id);
+	::Msg("[coop] story: task '%s' is seen by %u character(s) only (%u task(s) with an audience)", id, m ? u32(m->size()) : 0u,
+	    u32(g_audience.size()));
+	return true;
+}
+
+bool clear_task_audience(LPCSTR id)
+{
+	if (!mgr().is_host() || !id || !task_audience::id_ok(id))
+		return false;
+	if (g_audience.remove(id))
+		::Msg("[coop] story: task '%s' is seen by everybody again (%u task(s) with an audience)", id, u32(g_audience.size()));
+	return true;
+}
+
+bool resend_tasks(u32 peer)
+{
+	if (!mgr().is_host() || peer == kHostPeer || mapserver::is_bridge(PeerId(peer)) || !ready())
+		return false;
+	const PeerInfo* p = mgr().session().peer(PeerId(peer));
+	if (!p || p->state != PeerState::Joined)
+		return false;
+	host_flush_all(); // what is pending goes first: the list must not be followed by an older upsert
+	host_send_full(PeerId(peer), DomTasks); // the list by his audience (a task he lost is detached there) and its targets
 	return true;
 }
 } // namespace story

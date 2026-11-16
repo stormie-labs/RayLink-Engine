@@ -124,6 +124,17 @@ bool hold_infos(bool on);
 // coop.story_local_task: an engine task with this id is given / finished on this machine only, never
 // routed to the host, mirrored or hashed (addon personal tasks). Kept for the whole process.
 bool set_local_task(LPCSTR id, bool on);
+// coop.story_task_audience (host, docs/plans/2026-11-16-task-audience.md B): task `id` is sent, listed and hashed only for the
+// players whose character (0 = the host's, else a player's proxy, host numbering) is among `members` (`count` ids, at most
+// task_audience::kMaxMembers; 0 = nobody but the map servers), and for every map server. Replaces an earlier audience of `id`.
+// False and no change off the host or for a bad id / list. The new audience reaches a player who held the task or should now
+// hold it with resend_tasks (or with the next drift check).
+bool set_task_audience(LPCSTR id, const u16* members, u32 count);
+// Task `id` is everybody's again (no audience). False off the host or for a bad id.
+bool clear_task_audience(LPCSTR id);
+// coop.story_resend_tasks (host): pending task changes go out, then joined player `peer` gets the full tasks domain as he may
+// see it now. False off the host, for peer 0, a map server, or a peer that is not joined.
+bool resend_tasks(u32 peer);
 } // namespace story
 } // namespace coop
 
