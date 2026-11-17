@@ -402,6 +402,59 @@ VOID RtlUnwindEx_FIXED(PVOID,PVOID,PVOID,PVOID,PVOID,PVOID) asm("RtlUnwindEx");
 #define LJ_EXCODE_CHECK(cl)	(((cl) ^ LJ_EXCODE) <= 0xff)
 #define LJ_EXCODE_ERRCODE(cl)	((int)((cl) & 0xff))
 
+/* Anomaly Coop (2026-11-17, RL-K958-GVST): the one access violation a Lua pcall() does catch.
+** A script that calls a method of a destroyed game object gets a null reference from the engine (CScriptGameObject::object):
+** an access violation at a null address inside the C function the interpreter called. LuaJIT let it go on to the engine's
+** catch(...) around the binder call. That one swallowed it, dropped the binder (the actor's: no actor_on_update any more)
+** and left this state inside the pcall() it was unwound to, with L->cframe pointing into the dead C stack; the next
+** native exception in that state took the main menu with it. With a Lua pcall() as the innermost protected frame the
+** script asked for its errors: it gets this one as an error. Anything else is not caught, as before: another address,
+** an execute fault, a C API pcall (the engine's own calls), the JIT's code, a fast function, the collector stepped by
+** the interpreter. The function on top of this state must be a plain C function: BC_FUNCC put L->base and L->top in
+** sync for it, and a state that waits in coroutine.resume for the one the exception is in is passed by (its resume
+** frame does not take the exception, so its caller's pcall must not: resume would never return).
+** What it costs: the C++ frames between the fault and the interpreter are unwound with no destructors (the engine is
+** built without C++ exceptions), as they were when the engine's catch(...) took the exception.
+*/
+static int err_null_access(lua_State *L, void *cf2, EXCEPTION_RECORD *rec)
+{
+  return rec->ExceptionCode == (DWORD)0xc0000005 &&  /* EXCEPTION_ACCESS_VIOLATION */
+	 rec->NumberParameters >= 2 &&
+	 rec->ExceptionInformation[0] <= 1 &&  /* A read or a write. */
+	 rec->ExceptionInformation[1] < 0x10000 &&
+	 cframe_unwind_ff(cf2) && G(L)->vmstate == ~LJ_VMST_C &&
+	 iscfunc(curr_func(L));
+}
+
+/* The error's text names the instruction: "exe+0x<offset>" is found in the symbols of the build (the engine and
+** LuaJIT are one exe). The crash this used to be said where it was; a line in the log must not say less.
+*/
+static GCstr *err_null_msg(lua_State *L, EXCEPTION_RECORD *rec)
+{
+  static const char pre[] = "a native call used a null address (a destroyed or missing object?) at ";
+  static const char hex[] = "0123456789abcdef";
+  char buf[sizeof(pre) + 24];
+  uintptr_t a = (uintptr_t)rec->ExceptionAddress;
+  uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+  int n = (int)sizeof(pre) - 1, i, started = 0;
+  memcpy(buf, pre, (size_t)n);
+  if (base && a >= base && a - base < 0x20000000) {
+    a -= base;
+    memcpy(buf + n, "exe+", 4);
+    n += 4;
+  }
+  buf[n++] = '0';
+  buf[n++] = 'x';
+  for (i = (int)sizeof(a) * 2 - 1; i >= 0; i--) {
+    int d = (int)((a >> (i * 4)) & 15);
+    if (d || started || i == 0) {
+      buf[n++] = hex[d];
+      started = 1;
+    }
+  }
+  return lj_str_new(L, buf, (size_t)n);
+}
+
 /* Win64 exception handler for interpreter frame. */
 LJ_FUNCA EXCEPTION_DISPOSITION lj_err_unwind_win64(EXCEPTION_RECORD *rec,
   void *cf, CONTEXT *ctx, UndocumentedDispatcherContext *dispatch)
@@ -421,7 +474,11 @@ LJ_FUNCA EXCEPTION_DISPOSITION lj_err_unwind_win64(EXCEPTION_RECORD *rec,
 	setstrV(L, L->top++, lj_err_str(L, LJ_ERR_ERRCPP));
       } else if (!LJ_EXCODE_CHECK(rec->ExceptionCode)) {
 	/* Don't catch access violations etc. */
-	return ExceptionContinueSearch;
+	if (!err_null_access(L, cf2, rec))
+	  return ExceptionContinueSearch;
+	lj_trace_abort(G(L));  /* As lj_err_throw does. */
+	setgcrefnull(G(L)->jit_L);
+	setstrV(L, L->top++, err_null_msg(L, rec));
       }
       /* Unwind the stack and call all handlers for all lower C frames
       ** (including ourselves) again with EH_UNWINDING set. Then set

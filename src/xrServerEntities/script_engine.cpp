@@ -251,16 +251,10 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
     if (!lua_busy_hands_debug)
         return;
 
-    ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
     // Anomaly Coop (2026-11, crash triage): the stack of L, the state the error is in (a coroutine is not the main state;
     // the main state's stack was printed before), and what is on top of L; the text is an argument, never a format, and
     // cut to 2000 characters (Msg drops a whole line longer than its 4096 buffer)
     auto stack = get_lua_stack(L);
-    const int top_type = lua_type(L, -1);
-    if (top_type == LUA_TSTRING)
-        Msg("! LUA error [BusyHandsDebug] top of the stack: string: %.2000s", lua_tostring(L, -1));
-    else
-        Msg("! LUA error [BusyHandsDebug] top of the stack: %s", lua_typename(L, top_type));
 
     xr_string lua_error_line = "";
     for (auto const& s : stack)
@@ -271,6 +265,31 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
             break;
         }
     }
+
+    // Anomaly Coop (2026-11-17, RL-K958-GVST): the call after "Accessing destroyed object" used to be the last one (the
+    // game died, or the engine dropped the binder). Under a Lua pcall() it is an error now (lj_err.c) and the script goes
+    // on: one that keeps a destroyed object comes here on every frame. A Lua line says it 3 times and then every 1000th
+    // time; the scripts' own handler (_G.COnLuaBindFatalError) is called as often as the log is written. The line is
+    // counted without its depth in the stack; 512 different lines start the count again (a new one is never silent).
+    {
+        static std::unordered_map<std::string, u32> s_seen;
+        const size_t from = lua_error_line.find("[Lua]");
+        const std::string key(from == xr_string::npos ? lua_error_line.c_str() : lua_error_line.c_str() + from);
+        if (s_seen.size() >= 512 && s_seen.find(key) == s_seen.end())
+            s_seen.clear();
+        const u32 n = ++s_seen[key];
+        if (n > 3 && n % 1000 != 0)
+            return;
+        if (n > 3)
+            Msg("! LUA error [BusyHandsDebug]: the %u-th time at this line", n);
+    }
+
+    ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
+    const int top_type = lua_type(L, -1);
+    if (top_type == LUA_TSTRING)
+        Msg("! LUA error [BusyHandsDebug] top of the stack: string: %.2000s", lua_tostring(L, -1));
+    else
+        Msg("! LUA error [BusyHandsDebug] top of the stack: %s", lua_typename(L, top_type));
 
     // Anomaly Coop: in the log too: script_log goes nowhere in a release, the launcher's reports read "LUA error"
     Msg("! LUA error [BusyHandsDebug]: %s", lua_error_line.c_str());

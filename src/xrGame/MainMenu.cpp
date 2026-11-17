@@ -77,6 +77,8 @@ CMainMenu::CMainMenu()
 	g_btnHint = NULL;
 	g_statHint = NULL;
 	m_deactivated_frame = 0;
+	m_lua_retry = false; // Anomaly Coop
+	m_lua_retried = false; // Anomaly Coop
 
 	m_sPatchURL = "";
 	//m_pGameSpyFull					= NULL;
@@ -212,7 +214,21 @@ void CMainMenu::Activate(bool bActivate)
 
 		m_Flags.set(flRestoreCursor, GetUICursor().IsVisible());
 
-		if (!ReloadUI()) return;
+		if (!ReloadUI())
+		{
+			// Anomaly Coop (2026-11-17): no menu, nothing will take the pause above off: sounds stayed paused, and a second
+			// opening paused them twice
+			Device.Pause(FALSE, FALSE, TRUE, "mm_activate1_failed");
+			// Anomaly Coop (2026-11-17, RL-K958-GVST): with no world this is the end of the road, the player has a black
+			// window. The menu after a world runs in that world's Lua state (a new one is made only when a world starts),
+			// with all its scripts and whatever they left: db.actor of a destroyed actor, a state a swallowed exception
+			// left half unwound. OnFrame makes a new state, as a world's start does, and opens the menu as the game's start
+			// does. Not here: this may be a call from a script of the state to be closed. Only this opening asks for it
+			// (the reload on a changed screen ratio has the menu's frame and render handlers registered already).
+			if (!g_pGameLevel && !m_lua_retried && !Core.ParamsData.test(ECoreParams::keep_lua))
+				m_lua_retry = true;
+			return;
+		}
 
 		m_Flags.set(flRestoreConsole, Console->bVisible);
 
@@ -317,6 +333,7 @@ bool CMainMenu::ReloadUI()
 		m_Flags.set(flActive | flNeedChangeCapture,FALSE);
 		return false;
 	}
+	m_lua_retried = false; // Anomaly Coop
 	xr_delete(m_startDialog);
 	m_startDialog = smart_cast<CUIDialogWnd*>(dlg);
 	VERIFY(m_startDialog);
@@ -503,8 +520,23 @@ void CMainMenu::StartStopMenu(CUIDialogWnd* pDialog, bool bDoHideIndicators)
 }*/
 
 //pureFrame
+extern void restart_all(); // alife_simulator.cpp: what a world's start does to the Lua state
+
 void CMainMenu::OnFrame()
 {
+	// Anomaly Coop (2026-11-17, RL-K958-GVST): see Activate
+	if (m_lua_retry)
+	{
+		m_lua_retry = false;
+		if (!g_pGameLevel && !m_Flags.test(flActive) && !g_dedicated_server)
+		{
+			m_lua_retried = true;
+			Msg("! [menu] the main menu's script failed in the Lua state of the world that ended: a new Lua state is made and the menu is opened again");
+			restart_all();
+			Activate(true);
+			Msg("* [menu] the menu in the new Lua state: %s", m_Flags.test(flActive) ? "opened" : "FAILED again");
+		}
+	}
 	if (m_Flags.test(flNeedChangeCapture))
 	{
 		m_Flags.set(flNeedChangeCapture,FALSE);
