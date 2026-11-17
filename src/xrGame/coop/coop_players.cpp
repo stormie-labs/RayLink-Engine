@@ -306,6 +306,7 @@ void on_peer_left(PeerId id)
 
 void frame()
 {
+	equip_loading_frame(); // build 56: does nothing unless this is a client that is loading the world
 	const bool live = mgr().is_host() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;

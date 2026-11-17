@@ -15,6 +15,8 @@
 // A missing coop_main function or a Lua error is logged and counted, never fatal (R-11.4).
 //
 // Also (W3d):
+//   coop.world_epoch() -> number | nil          the world this machine is in (build 56; nil outside a session)
+//   coop.condition_carried() -> bool            client: the engine put this player's own condition back after the load
 //   coop.stash_set(key, value) / coop.stash_get(key)  strings kept for the whole session on this machine,
 //     across level loads and Lua state rebuilds (coop_settings keeps the host's settings there).
 //   on_rejected() -> coop_ui.on_rejected(info): the host's refusal (mod-list diff, duplicate key, ...)

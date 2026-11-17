@@ -1714,7 +1714,7 @@ bool host_finish_client(u16 character)
 	const PeerId peer = join::peer_of_proxy(character);
 	if (peer == kInvalidPeer)
 		::Msg("[coop] retired character %u: his player is away, his next join makes a new character", character);
-	else if (!join::host_rejoin_peer(peer, "new character"))
+	else if (!join::host_rejoin_peer(peer, join::kRejoinNewCharacter))
 	{
 		// cannot happen (a peer of a proxy is a connected player of this world); his machine still plays this
 		// character, so it stays in the world, keyless: his next join makes a new one

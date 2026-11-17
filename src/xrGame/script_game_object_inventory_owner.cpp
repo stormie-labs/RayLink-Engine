@@ -68,6 +68,8 @@
 #include "CharacterPhysicsSupport.h"
 #include "coop/coop_items.h" // Anomaly Coop (F2 T5): an upgrade bought at a mechanic
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12): the call gate of a client
+#include "coop/coop_manager.h" // Anomaly Coop (build 56): Weapon_AddonAttach
+#include "coop/coop_world.h" // Anomaly Coop (build 56): whose character holds the weapon
 
 bool CScriptGameObject::GiveInfoPortion(LPCSTR info_id)
 {
@@ -2337,6 +2339,21 @@ void CScriptGameObject::Weapon_AddonAttach(CScriptGameObject* item)
 	{
 		ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError,
 		                                "CWeaponMagazined : trying to attach non-CInventoryItem!");
+		return;
+	}
+	// Anomaly Coop (build 56; live, builds 54-55: "many silencers are not made"; found on the stand 2026-11-18). An NPC that
+	// takes an item tries to mount it on his best weapon (stock xr_gather_items.script, npc_on_item_take). Where a player's
+	// character is led it is such an NPC: a silencer, a scope or a launcher that came to a player holding the gun it fits
+	// was mounted on that machine's copy of the gun (the item is used up), and the gun's state from its player (no addon)
+	// took it off again: the addon was gone for good. A player's things are mounted by the player's own machine; the scripts
+	// of another machine leave them alone.
+	// (a character of section coop_player_avatar: another player's on any machine, never this machine's own actor)
+	if (coop::mgr().active() && coop::world::is_player_character(smart_cast<const CGameObject*>(weapon->H_Parent())))
+	{
+		static u32 told = 0;
+		if (told++ < 8)
+			Msg("[coop] a script here wanted to mount [%s] on [%s] of the character %u of another player: left to that player",
+			    item->object().cNameSect().c_str(), object().cNameSect().c_str(), u32(weapon->H_Parent()->ID()));
 		return;
 	}
 	if (weapon->CanAttach(pItm))

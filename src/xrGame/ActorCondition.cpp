@@ -22,6 +22,7 @@
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIStatic.h"
 #include "coop/coop_survival.h" // Anomaly Coop
+#include "coop/coop_players.h" // Anomaly Coop (build 56): own_condition_held
 #include "coop/coop_ai.h" // Anomaly Coop: player_down
 #include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the condition in the own actor's health ledger
 
@@ -198,6 +199,9 @@ float CActorCondition::GetZoneMaxPower(ALife::EHitType hit_type) const
 
 void CActorCondition::UpdateCondition()
 {
+	// Anomaly Coop (build 56): a client that is still loading the host's world (precache, the held screen)
+	if (coop::players::own_condition_held(this))
+		return;
 	coop::survival::actor_condition_hook(*this); // Anomaly Coop: in a session zero health means wounded, not dead
 	float v_alcohol = IsSleeping() ? m_fV_AlcoholSleep : m_fV_Alcohol;
 	
@@ -1066,6 +1070,24 @@ bool CActorCondition::ApplyBooster(const SBooster& B, const shared_str& sect)
 		BoostParameters(B);
 	}
 	return true;
+}
+
+// Anomaly Coop (build 56): see ActorCondition.h. The same two steps UpdateBoosters does for one booster that ran out.
+void CActorCondition::ClearBoosters()
+{
+	for (BOOSTER_MAP::const_iterator it = m_booster_influences.begin(); it != m_booster_influences.end(); ++it)
+		DisableBoostParameters(it->second);
+	m_booster_influences.clear();
+}
+
+// Anomaly Coop (build 56): see ActorCondition.h. The values a new game starts with (the constructor, reinit).
+void CActorCondition::DropLoadedExtras()
+{
+	ClearBoosters();
+	m_fAlcohol = 0.f;
+	m_condition_flags.zero();
+	m_curr_medicine_influence = SMedicineInfluenceValues();
+	m_fEntityMorale = m_fEntityMoraleMax;
 }
 
 void disable_input();

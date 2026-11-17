@@ -1112,6 +1112,30 @@ int l_stash_get(lua_State* L)
 	return 1;
 }
 
+// coop.world_epoch() -> number, or nil outside a session. Build 56: the number of the world this machine is in (a client:
+// the one its session told the host; the world server: the one it runs). A load that continues a world keeps what a script
+// stashed for it under this number (coop_mods_pdata), and the script reads it back only in that world.
+int l_world_epoch(lua_State* L)
+{
+	if (!mgr().active())
+	{
+		lua_pushnil(L);
+		return 1;
+	}
+	const u32 epoch = mgr().is_client() ? mgr().session().world_epoch() : join::host_world_epoch();
+	lua_pushnumber(L, lua_Number(epoch));
+	return 1;
+}
+
+// coop.condition_carried() -> bool. Build 56: true on a client whose condition in this world (wounds, alcohol, boosters
+// with their seconds ...) is the one this process held through the load (players::condition_carry_take). The scripts'
+// own booster list is then not applied on top (coop_core_player): the engine's is the exact one.
+int l_condition_carried(lua_State* L)
+{
+	lua_pushboolean(L, mgr().active() && players::condition_carried() ? 1 : 0);
+	return 1;
+}
+
 // A dialog can be opened: CurrentDialogHolder() is the main menu when it is active, else the game HUD.
 bool ui_ready()
 {
@@ -1908,6 +1932,8 @@ void register_raw(lua_State* L)
 		{"send_chat", &l_send_chat},
 		{"stash_set", &l_stash_set},
 		{"stash_get", &l_stash_get},
+		{"world_epoch", &l_world_epoch},
+		{"condition_carried", &l_condition_carried},
 		{"session_info", &l_session_info},
 		{"host", &l_host},
 		{"host_when_ready", &l_host_when_ready},

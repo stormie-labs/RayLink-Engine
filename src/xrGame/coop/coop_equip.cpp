@@ -868,6 +868,63 @@ float bleed_speed_k(CActorCondition& c)
 	return k;
 }
 
+// Build 56: the own actor's save kept across a world load (coop_players.h condition_carry_take).
+struct ConditionCarry
+{
+	bool have = false;
+	u32 epoch = 0; // the world it is for
+	float health = 1.f;
+	u16 stance = 0; // mcCrouch | mcAccel of his movement state
+	u16 lit_torch = 0xffff; // the id of his head torch if it was lit (ids of his things are the same in the next world)
+	u32 from_world = 0; // join::world_generation() of the world it was taken in: it is never put back into that one
+	xr_vector<u8> data; // CActor::save of the own actor: what a single player's save holds of him
+};
+ConditionCarry g_carry;
+u32 g_vitals_world = 0; // join::world_generation() of the world the own condition was put back in (0: none)
+u32 g_carried_world = 0; // ... and of the one where it came from g_carry
+
+// What this process held goes into the new actor through the engine's own CActor::load, the way a single player's save
+// does: the condition (wounds by bone and kind, alcohol, medicine at work, flags, boosters with their seconds and their
+// effect), the slot in his hands, the quick slots, the PDA map filters. The host's boosters leave first with their
+// effect (ClearBoosters): load would add the player's on top of them. `in_load`: called from CActor::load itself (the
+// right moment: before the items come and the first update); else the first frame the world is up (a late second try).
+bool restore_carried_actor(CActor& actor, bool in_load)
+{
+	// Blind review: the world it was taken in is still up for some frames after the load is issued (the engine defers the
+	// disconnect), with the new epoch already set: its actor must not take the state back
+	if (!g_carry.have || g_carry.from_world == join::world_generation())
+		return false;
+	ConditionCarry carry;
+	std::swap(carry, g_carry); // used once, and taken out before load: CActor::load asks for it again at its end
+	g_carried_world = 0;
+	if (carry.epoch != mgr().session().world_epoch() || carry.data.empty())
+	{
+		::Msg("[coop] my state kept for the world of epoch %u is not for this one (epoch %u): the host's record is used",
+		    carry.epoch, mgr().session().world_epoch());
+		return false;
+	}
+	CActorCondition& c = actor.conditions();
+	c.ClearBoosters();
+	IReader r(carry.data.data(), int(carry.data.size()));
+	actor.load(r);
+	if (!in_load)
+	{
+		// the role swap gave him this health already (condition_carry_health); a late try sets it again
+		const float was = c.GetHealth();
+		health_ledger::coop_set_health(c, clampr(carry.health, 0.05f, c.GetMaxHealth()));
+		join::arrival_apply("restore", was, c.GetHealth());
+	}
+	g_carried_world = join::world_generation();
+	g_vitals_world = g_carried_world;
+	g_vitals_restored = true;
+	::Msg("[coop] restored my state as I left with it (%s): health %.3f, satiety %.3f, radiation %.3f, psy %.3f, power %.3f, "
+	      "bleeding %.3f, alcohol %.3f, %u wound(s), %u booster(s)",
+	    in_load ? "in the load" : "first frame", in_load ? carry.health : c.GetHealth(), c.GetSatiety(), c.GetRadiation(),
+	    c.GetPsyHealth(), c.GetPower(), c.BleedingSpeed(), c.GetAlcohol(), u32(c.wounds().size()),
+	    u32(c.GetCurBoosterInfluences().size()));
+	return true;
+}
+
 // Client, once after join: our proxy (now the host avatar here) carries our saved vitals.
 void client_restore_vitals()
 {
@@ -875,9 +932,18 @@ void client_restore_vitals()
 	const u16 host_avatar = join::my_proxy();
 	if (!actor || host_avatar == 0xffff)
 		return;
+	if (!ai().get_alife())
+		return;
 	const CSE_ALifeDynamicObject* e = ai().alife().objects().object(host_avatar, true);
 	g_vitals_restored = true;
+	g_vitals_world = join::world_generation();
 	CActorCondition& c = actor->conditions();
+	if (restore_carried_actor(*actor, false))
+		return;
+	// Build 56: no condition of his own was held for this world (a join, a rejoin, a save the host loaded). What the
+	// host's client data put here and no report brings back goes: the host's boosters with their effect (the scripts put
+	// the player's own back from his record), his alcohol, his medicine at work, his once-per-game flags.
+	c.DropLoadedExtras();
 	// The actor's client data in the save is the host's: radiation, wounds and the rest of the
 	// host's condition came with it. Only health came from our character (role swap).
 	const char* at = e && e->m_ini_string.size() ? strstr(e->m_ini_string.c_str(), "vitals =") : nullptr;
@@ -1006,6 +1072,100 @@ bool avatar_headlamp(u16 avatar_id)
 	return it != g_applied.end() && it->second.torch;
 }
 
+void condition_carry_take(u32 to_epoch)
+{
+	CActor* actor = mgr().is_client() && !is_map_server() && g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity())
+	                                                                        : nullptr;
+	// His own state is in this actor when he plays in this world, or when he was still loading it and the load had put
+	// his held state into it already (blind review: a second reset during the load would lose it otherwise).
+	const bool own = actor && actor->ID() == 0 &&
+	                 (mgr().is_live_client() || (join::client_loading_world() && condition_carried()));
+	if (!own)
+	{
+		// not in a world of his own now (the load before this one never let him in): what he left with is still his
+		if (g_carry.have)
+			g_carry.epoch = to_epoch;
+		return;
+	}
+	CActorCondition& c = actor->conditions();
+	// Blind review: a player who is down, dead or watching has no standing character's state to take along. The engine's
+	// save of a dead condition holds no power, radiation or wounds (CEntityCondition::save), so the host's would stay on
+	// him; and a downed player's 0.01 health is not what he stands up with. He gets the host's record, as before build 56.
+	if (survival::life_of(0) != survival::Life::Alive || c.GetHealth() <= 0.f)
+	{
+		::Msg("[coop] my state is not kept for the world of epoch %u: I am %s (the host's record is used)", to_epoch,
+		    survival::life_name(survival::life_of(0)));
+		g_carry = ConditionCarry();
+		return;
+	}
+	NET_Packet P;
+	P.write_start();
+	actor->save(P); // CActor::save: what the engine writes of the actor into a single player's save
+	g_carry = ConditionCarry();
+	g_carry.have = true;
+	g_carry.epoch = to_epoch;
+	g_carry.from_world = join::world_generation();
+	g_carry.health = c.GetHealth();
+	g_carry.stance = u16(actor->MovingState() & (mcCrouch | mcAccel));
+	for (PIItem item : actor->inventory().m_all)
+	{
+		CTorch* torch = smart_cast<CTorch*>(item);
+		if (torch && torch->torch_active())
+		{
+			g_carry.lit_torch = item->object().ID();
+			break;
+		}
+	}
+	g_carry.data.assign(P.B.data, P.B.data + P.B.count);
+	::Msg("[coop] my state is kept for the world of epoch %u: health %.3f, %u wound(s), %u booster(s), stance %u, torch %s, "
+	      "%u byte(s)",
+	    to_epoch, g_carry.health, u32(c.wounds().size()), u32(c.GetCurBoosterInfluences().size()), u32(g_carry.stance),
+	    g_carry.lit_torch != 0xffff ? "lit" : "dark", u32(g_carry.data.size()));
+}
+
+bool condition_carry_extras(u32 epoch, u16& stance, u16& lit_torch)
+{
+	if (!g_carry.have || g_carry.epoch != epoch || g_carry.data.empty())
+		return false;
+	stance = g_carry.stance;
+	lit_torch = g_carry.lit_torch;
+	return true;
+}
+
+void own_actor_loaded(CActor& actor)
+{
+	if (!g_carry.have || !mgr().active() || !mgr().is_client() || is_map_server() || !join::client_loading_world() ||
+	    actor.ID() != 0)
+		return;
+	restore_carried_actor(actor, true);
+}
+
+void condition_carry_drop()
+{
+	g_carry = ConditionCarry();
+}
+
+bool condition_carry_health(u32 epoch, float& health)
+{
+	if (!g_carry.have || g_carry.epoch != epoch || g_carry.data.empty())
+		return false;
+	health = g_carry.health;
+	return true;
+}
+
+bool condition_carried()
+{
+	return g_carried_world != 0 && g_carried_world == join::world_generation();
+}
+
+bool own_condition_held(const CEntityCondition* condition)
+{
+	if (!mgr().active() || !mgr().is_client() || !join::client_loading_world() || !g_pGameLevel)
+		return false;
+	CActor* actor = smart_cast<CActor*>(Level().CurrentEntity());
+	return actor && static_cast<const CEntityCondition*>(&actor->conditions()) == condition;
+}
+
 void equip_reset()
 {
 	destroy_lights();
@@ -1013,13 +1173,26 @@ void equip_reset()
 	g_pending.clear();
 	g_applied.clear();
 	g_last_check = g_last_refresh = g_last_vitals = 0;
-	g_vitals_restored = false;
+	// build 56: a client going live resets this module too, and its condition is back by then (g_vitals_world): once a world
+	g_vitals_restored = g_vitals_world != 0 && g_vitals_world == join::world_generation();
 	g_gear_sent.clear(); // the next session reports the layout at once
 	g_gear_sent_at = 0;
 	g_gear_table.clear();
 	g_gear_table_built = false;
 	g_gear_logged = true;
 	// g_host_arrivals stays: players::reset runs on a client going live too, and on the host's own world change
+}
+
+// Build 56 (live 2026-11-18), a client that is still loading the world (players::frame, before its live gate): a player
+// without a held state (a join, a rejoin, a rolled back world) gets the condition of the host's record the first frame the
+// loaded world is up, not when the screen lets him in. Until then the condition was the host's, and it ran: the host's
+// medkit healed the client under the loading screen and the restore took it back in one frame ("coop -0.122" in the
+// arrival lines), which G.A.M.M.A. shows as a hit. The condition stands still while he loads (own_condition_held).
+void equip_loading_frame()
+{
+	if (g_pGameLevel && mgr().is_client() && !is_map_server() && join::client_loading_world() &&
+	    g_vitals_world != join::world_generation())
+		client_restore_vitals();
 }
 
 void equip_frame()

@@ -48,7 +48,39 @@ void equip_reset();
 void arrival_host_leaves(PeerId peer, u16 proxy, const char* nick, const char* level, float x, float y, float z);
 void arrival_host_entered(PeerId peer);
 void equip_frame();
+void equip_loading_frame(); // build 56: a client still loading the world gets its condition back at once (coop_equip.cpp)
 void equip_resend(); // force a full resend (after join)
+// Build 56 (live 2026-11-18, "everything a client has must come through a transition exactly as in a usual game"): a client's
+// new actor is built from the HOST's client data. Six numbers of the player's own condition came back from the host's
+// record (`vitals =`, up to kVitalsMs old); the rest (wounds by bone and kind, alcohol, the medicine at work, condition
+// flags, boosters with their seconds) was the host's, or was put back roughly by a script. In a load that continues the
+// same world this process lives on, so his actor's save (CActor::save: the condition, the slot in his hands, the quick
+// slots, the PDA map filters) is kept here the moment the load is announced (the old world and the own actor are still
+// up), and loaded into the new actor by CActor::load itself: what a single player's level change does.
+// Client: the load into the world of `to_epoch` is announced. Not live now (a second announcement before he was in): what
+// is held stays and goes to the new epoch.
+void condition_carry_take(u32 to_epoch);
+// What is held is void: the next world does not continue this one (the host loaded a save), or the session is another one.
+void condition_carry_drop();
+// CActor::load, at its end (the host's bytes are read, the save's stream is in step): on a client that loads a world for
+// which it holds its own actor's save, that save is loaded over the host's - the player's own condition, slot in hands,
+// quick slots and PDA map filters, before his items come and before the first update.
+void own_actor_loaded(class CActor& actor);
+// The health held for the world of `epoch`, for the role swap: the actor stands up with it (the host's record is up to
+// kVitalsMs older). False: nothing is held for that world.
+bool condition_carry_health(u32 epoch, float& health);
+// For the role swap, what the save's entities say and the actor's own save does not: the stance he left in (crouch, slow
+// walk: CActor::net_Spawn reads them from the actor entity's mstate, the host's actor's in his save) and his head torch
+// if it was lit (CTorch::net_Spawn reads the item entity's m_active; the host keeps every torch of a player's character
+// dark, so the save says off). False: nothing is held for the world of `epoch` (a join, a rejoin: he stands, light off).
+bool condition_carry_extras(u32 epoch, u16& stance, u16& lit_torch);
+// True on a client whose condition in this world came from what it held (not from the host's record): the scripts leave
+// his boosters alone then (coop.condition_carried, coop_core_player).
+bool condition_carried();
+// CActorCondition::UpdateCondition: the own actor of a client that is still loading the world (precache, the held screen).
+// Its condition does not run: a single player's does not either between his save and his first frame, and until the
+// restore (the first frame the world is up) it is the host's.
+bool own_condition_held(const class CEntityCondition* condition);
 void equip_print_status();
 // CInventoryItem::net_Spawn hook: while a client loads the world it came back to, the things of its own character
 // (children of its actor) get the place they had (slot, belt, backpack) from the layout the host kept

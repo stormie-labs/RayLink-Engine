@@ -120,6 +120,7 @@ void install_client(Endpoint& e)
 
 void on_session_started()
 {
+	players::condition_carry_drop(); // build 56: a condition kept for a load of another session is nobody's here
 	players::reset();
 	entities::reset();
 	worldstate::reset();

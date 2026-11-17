@@ -154,6 +154,10 @@ void register_lua(lua_State* L);
 // is void; the 5 s between two admissions hold (a JoinRequest within them waits, JoinGate::Later, and goes after).
 // False if he is not a player of this session in the world (no entry, the host itself).
 bool host_rejoin_peer(PeerId peer, const char* why);
+// The reason of a SessionReset that gives a player ANOTHER character in the same world (hardcore: his character was
+// retired). Build 56: every other reset with the client's current epoch brings the same character into the same world
+// again, and his state goes with him (coop_join.cpp client_on_session_reset); this one must take nothing along.
+constexpr const char* kRejoinNewCharacter = "new character";
 // Host, F3a: the map server of `level` is gone: every player there loads anew (`why`: a string id, shown to him): on the same level when
 // a new one is coming, on the host's when none can (levels::host_player_loads).
 void host_rejoin_level(u16 level, const char* why);

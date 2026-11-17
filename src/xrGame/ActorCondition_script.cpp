@@ -24,14 +24,8 @@ bool ApplyBooster_script(CActorCondition* cond, const SBooster& B, LPCSTR sect)
 
 void ClearAllBoosters(CActorCondition* conditions)
 {
-	CEntityCondition::BOOSTER_MAP& cur_booster_influences = conditions->GetCurBoosterInfluences();
-	CEntityCondition::BOOSTER_MAP::const_iterator it = cur_booster_influences.begin();
-	CEntityCondition::BOOSTER_MAP::const_iterator it_e = cur_booster_influences.end();
-	for (; it != it_e; ++it)
-	{
-		conditions->DisableBoostParameters((*it).second);
-	}
-	cur_booster_influences.clear();
+	// Anomaly Coop (build 56): the list itself is cleared, not a copy of it (CActorCondition::ClearBoosters)
+	conditions->ClearBoosters();
 }
 
 void WoundForEach(CActorCondition* conditions, const ::luabind::functor<bool> &funct)

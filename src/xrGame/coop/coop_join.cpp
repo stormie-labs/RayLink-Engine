@@ -336,6 +336,7 @@ u32 g_arrival_lines = 0; // the lines of this process (kArrivalLines at most)
 constexpr u32 kArrivalLines = 60;
 constexpr u64 kArrivalGiveUpMs = 300000; // a world that never came: the line says so after this long
 void arrival_begin(const char* kind, u16 level); // below, before on_alife_objects_loaded
+void world_leaving(u32 to_epoch); // below, before client_prepared (build 56)
 void arrival_step(u64 now);
 u32 g_mirror_generation = 0; // B2: g_world_generation of the world loaded from a host's save (0: none), outlives State
 
@@ -1606,6 +1607,16 @@ void client_on_session_reset(PeerId from, Reader& r)
 	if (!strncmp(why.c_str(), "st_", 3))
 		dialog::hud_message(why.c_str(), why.c_str()); // F3a: what happened to his map server
 	::Msg("[coop] host replaced the world (%s, epoch %u), rejoining", why.c_str(), epoch);
+	// Build 56: the epoch moves with every world the host makes (a level change, a loaded save). The same epoch: the
+	// world goes on and only this player comes into it anew (his own exit in split worlds, his map server came up again):
+	// his state goes with him, as in client_prepared. Another epoch: the world was replaced, maybe by a save the host
+	// loaded (a rollback): what he had in the world that went is not his state in it, the host's record in that save is.
+	// Blind review of build 56: one reset keeps the epoch and still is no continuation: his character was retired and he
+	// comes in as a new one (kRejoinNewCharacter): nothing of the old character goes into the new.
+	if (epoch == mgr().session().world_epoch() && why != kRejoinNewCharacter)
+		world_leaving(epoch);
+	else
+		players::condition_carry_drop();
 	g.my_proxy = kNoId;
 	g.load_issued = false;
 	g.swap_done = false;
@@ -3062,6 +3073,24 @@ void player_load_step(u64 now)
 	load_screen_input(g.screen.holds());
 }
 
+// Build 56. Client: the load that starts now continues the world this player is in (a transition's save). Called while he
+// is live in the old world: the engine keeps his condition (players::condition_carry_take), and coop_main.on_world_leaving
+// lets the scripts keep what they carry per player (coop_mods_pdata writes its keys into the session stash now).
+void world_leaving(u32 to_epoch)
+{
+	players::condition_carry_take(to_epoch);
+	const script::CallResult r = script::call_now("coop_main", "on_world_leaving",
+	    [](lua_State* L, const void* ctx) -> int
+	    {
+		    lua_pushnumber(L, lua_Number(*static_cast<const u32*>(ctx)));
+		    return 1;
+	    },
+	    &to_epoch);
+	if (r != script::CallResult::Done)
+		::Msg("[coop] load: the scripts did not keep their per-player state for this load (%s): the last report is used",
+		    r == script::CallResult::NotReady ? "Lua is not up" : "coop_main.on_world_leaving is missing or failed");
+}
+
 // Client: LoadWait Prepared: the group moves, the save of the transition follows as a blob. As a SessionReset, but the
 // world comes by itself: no JoinRequest.
 void client_prepared(const levels::wire::LoadWaitMsg& m, u64 now)
@@ -3081,6 +3110,10 @@ void client_prepared(const levels::wire::LoadWaitMsg& m, u64 now)
 	g.screen_level = m.level;
 	load_screen_reason(m);
 	arrival_begin(m.reason == levels::wire::LoadWaitMsg::HostAlone ? "reload (the host went alone)" : "group transition", m.level);
+	// Build 56: the save that follows continues this world, and this player's own state goes through the load with him, as a
+	// single player's does: the engine keeps his condition, the scripts keep theirs (the per-player keys go into the session
+	// stash as they are this moment, not as they were at the last 15 s report). Both while his world and his actor are up.
+	world_leaving(m.epoch);
 	if (m.reason == levels::wire::LoadWaitMsg::HostAlone)
 		::Msg("[coop] load: the host went to '%s' alone (epoch %u): the world starts over, this player stays on his level, the host's save comes now",
 		    level_name_by_id(m.level).c_str(), m.epoch);
@@ -4737,6 +4770,9 @@ void on_session_lost(const char*)
 		Console->Execute("disconnect"); // the engine defers it (KERNEL:disconnect): safe from a network callback
 	}
 	client_char_closed("session"); // protocol 8: a choice window of this session closes with it (none: nothing)
+	// Build 56 (blind review): a state held for a load of this session is nobody's in the next one (every host counts its
+	// epochs from 1: the number alone would let it into another session's world)
+	players::condition_carry_drop();
 	// W9, host: the session is over, nobody else is in the world. Clients take the avatars out through their own
 	// switch vote (coop::switch_vote: no session = no player in the world).
 	xr_vector<u16> proxies;
@@ -5213,7 +5249,12 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 		// stalker, 1.0) that coop_equip.cpp client_restore_vitals used to take down after going live, one frame's drop that
 		// GAMMA's Body Health System booked as a hit on a random body part. A new character has no report: the proxy's.
 		const float h = actor->get_health();
-		const float mine = arrival::spawn_health(proxy->m_ini_string.c_str(), proxy->get_health());
+		float mine = arrival::spawn_health(proxy->m_ini_string.c_str(), proxy->get_health());
+		// Build 56: in a load that continues his world he stands up with the health he left with (held by this process the
+		// moment the load was announced), not with his last report to the host (up to kVitalsMs older)
+		float held = mine;
+		if (players::condition_carry_health(mgr().session().world_epoch(), held))
+			mine = clampr(held, arrival::kMinSpawnHealth, 1.f);
 		g_arrival.apply("swap", proxy->get_health(), mine);
 		actor->set_health(mine);
 		proxy->set_health(h);
@@ -5267,6 +5308,23 @@ void on_alife_objects_loaded(CALifeObjectRegistry& objects)
 	}
 	actor->children.clear();
 	proxy->children.clear();
+
+	// Build 56 (review of 2026-11-18): two things of the player that live in the save's entities, not in his actor's save.
+	// The stance: CActor::net_Spawn takes crouch / slow walk from the actor entity's mstate, which is the host's actor's
+	// (the host crouched at the exit: every client came in crouched). The head torch: the host keeps the torches of the
+	// players' characters dark (a lit one shone from the wrong place), so its save says off for the player's own.
+	// In a load that continues his world both are what he left with; else he stands and the light is off.
+	{
+		u16 stance = 0, lit_torch = kNoId;
+		const bool held = players::condition_carry_extras(mgr().session().world_epoch(), stance, lit_torch);
+		actor->mstate = u16((actor->mstate & ~u16(mcCrouch | mcAccel)) | (held ? stance : 0));
+		if (held && lit_torch != kNoId)
+		{
+			CSE_ALifeItemTorch* torch = smart_cast<CSE_ALifeItemTorch*>(objects.object(lit_torch, true));
+			if (torch && torch->ID_Parent == 0) // his own, after the parents' swap above
+				torch->m_active = true;
+		}
+	}
 
 	g.swap_done = true;
 	::Msg("[coop] role swap done: actor <-> proxy %u (%u items to me, %u to the host avatar)", g.my_proxy, to_actor,
