@@ -82,6 +82,11 @@ namespace luabind
 	LUABIND_API void set_cast_failed_callback(cast_failed_callback_fun c);
     LUABIND_API error_callback_fun get_error_callback();
     LUABIND_API error_callback_fun get_error_callback_not_crash();
+	// Anomaly Coop (ours, 2026-11-18): asked by a converter that met a value which is not a C++ object. True = make it a
+	// Lua error (the caller survives a Lua error now: a co-op session). Unset or false = the stock path of build 51.
+	typedef bool(*not_object_policy_fun)();
+	LUABIND_API void set_not_object_is_error(not_object_policy_fun f);
+	LUABIND_API not_object_policy_fun get_not_object_is_error();
 	LUABIND_API cast_failed_callback_fun get_cast_failed_callback();
 
 	// Anomaly Coop (2026-11): asked by a call proxy after a failed pcall, before the error callback. True = the error (still on

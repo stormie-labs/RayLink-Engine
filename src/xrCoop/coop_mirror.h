@@ -20,7 +20,8 @@ enum class Placement : uint8_t
 	SwitchVote,   // free and online on the host: the host's online set takes it in, the local switch manager does the rest
 	WithHolder,   // its holder is online here: online now, as ALife brings every child of an online holder online
 	HolderBroken, // its holder is online here but has no server entity: left offline, logged (a desync of the holder)
-	OnlineNow     // free and online on the host, in no level registry here: the switch manager never visits it, online now
+	OnlineNow     // free and online on the host, in no level registry here, switches by itself and is still offline:
+	              // the switch manager never visits it, online now
 };
 
 // has_holder: it came with a parent; host_online: the host's flag; holder_online / holder_on_server: the holder here.
@@ -32,14 +33,18 @@ enum class Placement : uint8_t
 // level.spawn_item has no game vertex; it stayed offline here for ever, invisible, while the host's copy hit the player.
 // flag_of_this_level: the host's online flag is a word about the level this machine has loaded (false on a map server,
 // and for a player on another level than the host's under split levels: the flag is about the host's level there).
+// switches_alone: the entity goes online by its own switch_online and is still offline after register_object. False
+// for a squad (CSE_ALifeOnlineOfflineGroup): it comes online with its members, and here it has no game vertex as a
+// rule. Builds 52-54 live (issue 1293): OnlineNow took squads, their second switch_online failed
+// R_ASSERT(!m_bOnline) and every client of an ordinary session crashed. A squad stays on the vote, as in build 51.
 inline Placement placement(bool has_holder, bool host_online, bool holder_online, bool holder_on_server,
-                           bool in_level_registry = true, bool flag_of_this_level = true)
+                           bool in_level_registry = true, bool flag_of_this_level = true, bool switches_alone = true)
 {
 	if (!has_holder)
 	{
 		if (!host_online)
 			return Placement::Offline;
-		return !in_level_registry && flag_of_this_level ? Placement::OnlineNow : Placement::SwitchVote;
+		return !in_level_registry && flag_of_this_level && switches_alone ? Placement::OnlineNow : Placement::SwitchVote;
 	}
 	if (!holder_online)
 		return Placement::Offline;

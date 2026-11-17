@@ -1190,8 +1190,13 @@ void client_on_spawn(PeerId, Reader& r)
 	const bool in_level_registry = ai().game_graph().valid_vertex_id(e->m_tGraphID);
 	const bool flag_of_this_level =
 	    is_mirror() && (!levels::split() || levels::led_by_host_process(levels::my_level()));
+	// Builds 52-54 (issue 1293): OnlineNow ran for squads too. A squad of the host has no game vertex here as a rule,
+	// it comes online with its members (register_member, apply_group_switch), and a wire squad's members are ids
+	// with no object yet: its own switch_online either met R_ASSERT(!m_bOnline) or walked a null member. Only an
+	// entity that switches by itself and that register_object left offline comes online here (apply_switch's test).
+	const bool switches_alone = !smart_cast<CSE_ALifeOnlineOfflineGroup*>(e) && !e->m_bOnline;
 	switch (mirror::placement(parent != kNoId, online, holder && online_here(holder),
-	    holder && alife_rw().server().ID_to_entity(parent), in_level_registry, flag_of_this_level))
+	    holder && alife_rw().server().ID_to_entity(parent), in_level_registry, flag_of_this_level, switches_alone))
 	{
 	case mirror::Placement::SwitchVote:
 		g_online.insert(id);

@@ -245,6 +245,11 @@ void CScriptEngine::lua_error(lua_State* L)
 #endif
 }
 
+// Anomaly Coop: how many times lua_error_not_crash met each Lua line in this Lua state (the limiter of its log)
+static std::unordered_map<std::string, u32> s_not_crash_seen;
+// The scripts' handler is running (it may touch a destroyed object itself and come back: one call at a time)
+static thread_local bool s_in_not_crash_handler = false;
+
 extern BOOL lua_busy_hands_debug;
 void CScriptEngine::lua_error_not_crash(lua_State* L)
 {
@@ -268,22 +273,27 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
 
     // Anomaly Coop (2026-11-17, RL-K958-GVST): the call after "Accessing destroyed object" used to be the last one (the
     // game died, or the engine dropped the binder). Under a Lua pcall() it is an error now (lj_err.c) and the script goes
-    // on: one that keeps a destroyed object comes here on every frame. A Lua line says it 3 times and then every 1000th
-    // time; the scripts' own handler (_G.COnLuaBindFatalError) is called as often as the log is written. The line is
-    // counted without its depth in the stack; 512 different lines start the count again (a new one is never silent).
+    // on: one that keeps a destroyed object comes here on every frame. A Lua line is written 3 times and then every
+    // 1000th time. The line is counted without its depth in the stack; 512 different lines start the count again (a
+    // new one is never silent), and so does every new Lua state (CScriptEngine::init).
+    // Build 54 skipped the scripts' own handler (_G.COnLuaBindFatalError) together with the log. One failing call
+    // comes here three times (SafeWrap, luabind's catch, SafeWrap of the repeated call), so after a reload the next
+    // failure at that line gave no "Busy Hands" window and no temporary save on the host and in single player.
+    // The handler is called every time, as in build 51 (G.A.M.M.A.'s acts once per Lua state by itself).
+    bool quiet = false;
     {
-        static std::unordered_map<std::string, u32> s_seen;
         const size_t from = lua_error_line.find("[Lua]");
         const std::string key(from == xr_string::npos ? lua_error_line.c_str() : lua_error_line.c_str() + from);
-        if (s_seen.size() >= 512 && s_seen.find(key) == s_seen.end())
-            s_seen.clear();
-        const u32 n = ++s_seen[key];
-        if (n > 3 && n % 1000 != 0)
-            return;
-        if (n > 3)
+        if (s_not_crash_seen.size() >= 512 && s_not_crash_seen.find(key) == s_not_crash_seen.end())
+            s_not_crash_seen.clear();
+        const u32 n = ++s_not_crash_seen[key];
+        quiet = n > 3 && n % 1000 != 0;
+        if (n > 3 && !quiet)
             Msg("! LUA error [BusyHandsDebug]: the %u-th time at this line", n);
     }
 
+    if (!quiet)
+    {
     ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
     const int top_type = lua_type(L, -1);
     if (top_type == LUA_TSTRING)
@@ -295,10 +305,15 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
     Msg("! LUA error [BusyHandsDebug]: %s", lua_error_line.c_str());
     for (auto const& s : stack)
         Msg("!   %s", s.c_str());
+    }
 
+    if (s_in_not_crash_handler)
+        return;
+    s_in_not_crash_handler = true;
     ::luabind::functor<void> funct;
     if (ai().script_engine().functor("_G.COnLuaBindFatalError", funct))
         funct(lua_error_line.c_str());
+    s_in_not_crash_handler = false;
 }
 
 void printLuaStack()
@@ -364,6 +379,7 @@ void CScriptEngine::setup_callbacks()
 		::luabind::set_error_callback(CScriptEngine::lua_error);
         ::luabind::set_error_callback_not_crash(CScriptEngine::lua_error_not_crash);
 		::luabind::set_error_survive_callback(coop::lua_errors::take_token); // Anomaly Coop (2026-11)
+		::luabind::set_not_object_is_error(coop::lua_errors::survive_now); // Anomaly Coop (2026-11-18)
 #endif
 
 		::luabind::set_pcall_callback(CScriptEngine::lua_pcall_failed);
@@ -424,6 +440,9 @@ void CScriptEngine::init()
     if (lua_studio_connected)
         m_lua_studio_world->remove		(lua());
 #endif // #ifdef USE_LUA_STUDIO
+
+	s_not_crash_seen.clear(); // Anomaly Coop: the log limiter of lua_error_not_crash counts per Lua state
+	s_in_not_crash_handler = false; // and a handler call that was left by a fault does not block the new state
 
 	// Invalidate functor cache as the Lua state is being recreated
 #ifdef USE_LUA_FUNCTOR_CACHE

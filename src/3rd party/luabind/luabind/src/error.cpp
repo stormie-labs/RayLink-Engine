@@ -34,6 +34,7 @@ namespace luabind
         error_callback_fun error_callback_not_crash = 0;
 		cast_failed_callback_fun cast_failed_callback = 0;
 		error_survive_callback_fun error_survive_callback = 0; // Anomaly Coop (2026-11)
+		not_object_policy_fun not_object_is_error = 0; // Anomaly Coop (2026-11-18)
 #endif
 	}
 
@@ -67,6 +68,16 @@ namespace luabind
     {
         return error_callback_not_crash;
     }
+
+	void set_not_object_is_error(not_object_policy_fun f)
+	{
+		not_object_is_error = f;
+	}
+
+	not_object_policy_fun get_not_object_is_error()
+	{
+		return not_object_is_error;
+	}
 
 	cast_failed_callback_fun get_cast_failed_callback()
 	{

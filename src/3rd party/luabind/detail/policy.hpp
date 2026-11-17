@@ -25,7 +25,6 @@
 #include <luabind/config.hpp>
 
 #include <typeinfo>
-#include <cstdlib> // Anomaly Coop (ours): std::abort in raylink_not_a_cpp_object
 
 #include <luabind/detail/class_rep.hpp>
 #include <luabind/object.hpp>
@@ -648,15 +647,22 @@ namespace luabind { namespace detail
 	// or a boolean where a C++ object is expected reached obj->crep() with obj == nullptr (lua_touserdata of a non-userdata):
 	// an access violation with one [C] frame. It is a Lua error now, with the value's absolute stack index and Lua type
 	// (not always an argument: a converter also reads return values and table fields): the pcall around the script call
-	// handles it (co-op session: logged and survived; otherwise the stock "LUA error" fatal).
+	// handles it (co-op session: logged and survived).
+	// Build 55: only where the game says a Lua error is survived now (get_not_object_is_error: a co-op session).
+	// Elsewhere (single player, a client's world after its session) the Lua error ended in the stock "LUA error" fatal,
+	// while build 51 let the engine drop only the binder that made the call and the game went on (G.A.M.M.A.'s
+	// "Busy Hands" window and its temporary save count on that): there the function returns and its caller goes on to
+	// the null object exactly as build 51 did.
 	// Called before the bound C++ function is entered and while the converter has made nothing that needs a destructor.
 	// nil is not reported here: nil to a pointer is a null pointer, and nil to a non-const reference stays the null
 	// reference it always was (ref_converter below).
-	[[noreturn]] inline void raylink_not_a_cpp_object(lua_State* L, int index)
+	inline void raylink_not_a_cpp_object(lua_State* L, int index)
 	{
+		const not_object_policy_fun as_error = get_not_object_is_error();
+		if (!as_error || !as_error())
+			return;
 		const int at = index < 0 && index > LUA_REGISTRYINDEX ? lua_gettop(L) + index + 1 : index;
 		luaL_error(L, "luabind: the value at stack #%d is a %s, a C++ object was expected", at, luaL_typename(L, index));
-		std::abort(); // not reached: luaL_error leaves by lua_error's long jump; this only tells the compiler so
 	}
 
 	template<Direction Dir> struct pointer_converter;

@@ -26,7 +26,11 @@ inline bool is_machine_info(const char* id)
 		return false;
 	const std::string_view s(id);
 
-	constexpr std::string_view kExact[] = {"ui_pda", "actor_is_sleeping", "sleep_active"};
+	// force_slp2 / force_slp (G.A.M.M.A. actor_status_sleep / actor_status_thirst): given and taken away in one call
+	// when a player is too tired or too thirsty; while one is held, actor_on_sleep gives no rest. As a world info a
+	// client's give went to the host and to everybody, its take-away went nowhere (the client did not hold it yet):
+	// the whole group kept it and a sleep lowered nobody's need for sleep (live, build 54).
+	constexpr std::string_view kExact[] = {"ui_pda", "actor_is_sleeping", "sleep_active", "force_slp2", "force_slp"};
 	for (const std::string_view e : kExact)
 		if (s == e)
 			return true;
