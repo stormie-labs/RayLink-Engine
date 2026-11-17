@@ -97,9 +97,26 @@ bool read_packet(Reader& r, NET_Packet& p)
 	return r.bytes(p.B.data, n);
 }
 
+// Where the entity is. A psy phantom's server entity does not know: CPhantom::net_Export writes its update in a layout
+// CSE_ALifeCreatureAbstract::UPDATE_Read does not read (stock: a float and two u32 where the timestamp, the flags and the
+// position are read), so from its first export on its o_Position is zeros. Stand, build 52 (2026-11-17): a client's copy of
+// a phantom the host spawned 12 m from him came online 277.3 m away, at the origin of the level, and flew from there. A
+// phantom is placed by its game object here while it has one.
+Fvector placement_position(const CSE_ALifeDynamicObject* e)
+{
+	if (g_pGameLevel && smart_cast<const CSE_ALifeCreaturePhantom*>(e))
+	{
+		const CObject* o = Level().Objects.net_Find(e->ID);
+		if (o && !o->getDestroy())
+			return o->Position();
+	}
+	return e->o_Position;
+}
+
 void write_placement(Writer& w, const CSE_ALifeDynamicObject* e)
 {
-	float pos[3] = {e->o_Position.x, e->o_Position.y, e->o_Position.z};
+	const Fvector at = placement_position(e);
+	float pos[3] = {at.x, at.y, at.z};
 	w.vec3(pos);
 	float ang[3] = {e->o_Angle.x, e->o_Angle.y, e->o_Angle.z};
 	w.vec3(ang);
