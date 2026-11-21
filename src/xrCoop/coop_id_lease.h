@@ -30,7 +30,7 @@ namespace coop
 namespace lease
 {
 constexpr uint16_t kNoId = 0xffff;
-constexpr size_t kLeaseSize = 48; // ids a client holds: 7 clients x 48 = 336 of 65534
+constexpr size_t kLeaseSize = 48; // ids a client holds: 16 clients x 48 = 768 of 65534 (F5-SEAT-1)
 constexpr size_t kMaxIdsPerMsg = 64; // IdLease / IdLeaseAck carry at most this many
 constexpr uint32_t kMinFreeBlocks = 4; // the host leases nothing while its generator has fewer non-empty blocks
 constexpr size_t kMaxGivenBack = 4 * kLeaseSize; // per player and world: past this he gets no new ids (churn)

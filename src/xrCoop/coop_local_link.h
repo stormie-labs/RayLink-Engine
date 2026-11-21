@@ -44,22 +44,11 @@
 #include <vector>
 
 #include "coop_protocol.h"
+#include "coop_session.h" // Endpoint (Ядро: the client side of the protocol, both modes have it)
 #include "coop_wire.h"
 
 namespace coop
 {
-// The client side of the co-op protocol: where a process takes the world server's messages and runs its client-side
-// handlers (each module's install_client). A remote client's endpoint is its Session (connected to the host); the host's
-// process has the host player's end of its LocalLink.
-class Endpoint
-{
-public:
-	using Handler = std::function<void(PeerId from, Reader& payload)>;
-	virtual ~Endpoint() = default;
-	// Game message handlers (type >= Msg::GameBase): one per type, the last wins, an empty one removes it.
-	virtual void on(Msg type, Handler h) = 0;
-};
-
 // The messages moved onto the link, module by module, together with the removal of the host's direct path in that
 // module (F3a T7, T8). A type is in here for both ways at once (one gate for push_to_server and push_to_client). A list
 // whose length the compiler counts: every task adds its own lines.

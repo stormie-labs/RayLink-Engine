@@ -29,7 +29,7 @@ void CRenderDevice::Destroy(void)
 	Log("Destroying Direct3D...");
 
 	ShowCursor(TRUE);
-	if (!g_coop_headless) // Anomaly Coop: the desktop's clip, it may be the player's game's
+	if (!g_dedicated_server) // Anomaly Coop: the desktop's clip, it may be the player's game's
 		ClipCursor(NULL);
 	m_cursor_clipped = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): released on purpose, the cache must forget the clip
 	m_pRender->ValidateHW();
@@ -71,7 +71,7 @@ extern ENGINE_API u32 psCurrentVidMode[];
 void CRenderDevice::Reset(bool precache)
 {
 	PROF_EVENT("CRenderDevice::Reset");
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		return; // Anomaly Coop: a map server has no swap chain, nothing to resize, and a reset shows the window
 	if (g_pGamePersistent)
 		g_pGamePersistent->OnDeviceResetBegin(); // Anomaly Coop: the reset stalls the frame loop, keep the session alive
@@ -135,7 +135,7 @@ void CRenderDevice::Reset(bool precache)
 bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 {
 	static bool s_swap_in_progress = false;
-	if (!b_is_Ready || g_coop_headless) // Anomaly Coop: no output, no swap chain
+	if (!b_is_Ready || g_dedicated_server) // Anomaly Coop: no output, no swap chain
 		return false;
 	if (s_swap_in_progress)
 		return false;

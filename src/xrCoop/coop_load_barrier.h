@@ -27,7 +27,7 @@ class LoadBarrier
 {
 public:
 	// host_peer: the seat of the host's own player (0, kHostPeer); world_up() is his LoadReady.
-	explicit LoadBarrier(uint32_t host_peer = 0) : host_peer_(host_peer) {}
+	explicit LoadBarrier(uint32_t host_peer = 0) : host_peer_(host_peer), wait_server_(false), server_ready_(false) {}
 
 	// A new transition: `epoch` of the new world, `movers` = the peers that leave (the host's player too when his process
 	// reloads), `wait_server` = a new map server loads for it and must report Ready. Replaces the barrier that was.
@@ -150,8 +150,8 @@ private:
 	bool active_ = false;
 	uint32_t epoch_ = 0;
 	uint64_t started_ = 0;
-	bool wait_server_ = false;
-	bool server_ready_ = false;
+	bool wait_server_;
+	bool server_ready_;
 	std::vector<Mover> movers_;
 };
 } // namespace levels

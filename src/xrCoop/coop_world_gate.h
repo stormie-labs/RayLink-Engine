@@ -132,6 +132,8 @@ inline Need need_of(Msg type)
 	case Msg::LevelXferDown: // F3a: the world server repeats it until it is acknowledged
 	case Msg::LevelBrain: // 1 Hz, the next one replaces it
 	case Msg::LevelHash: // every 10 s
+	case Msg::VehicleInput: // F5: the driver sends his keys again at a change and every 200 ms
+	case Msg::VehicleState: // F5: the decider sends a car's state again; a car of a world that is gone is nobody's
 	case Msg::LevelResync: return Need::Drop;
 
 	// --- requests, reports of a change and the host's ordered deltas
@@ -174,6 +176,8 @@ inline Need need_of(Msg type)
 	case Msg::LevelEntity:
 	case Msg::LevelXferUp:
 	case Msg::LoadReady: // F3a: the same epoch is played after the world is up (plan §1.5 step 7)
+	case Msg::VehicleReq: // F5: a request for a seat, as ReqTake; the decider checks the body and the car when it runs
+	case Msg::VehicleSeat: // F5: the decider's ordered answer, as ReqResult (a player who comes to the map gets the seats again)
 	case Msg::StateDumpRequest: return Need::Hold;
 
 	default: break;

@@ -3,6 +3,7 @@
 // Exports the `coop` script namespace (registered from export_classes, script_engine_export.cpp)
 // and carries Lua RPC between machines as Msg::ScriptEvent:
 //   coop.send_event(name, payload, target)   target: -1 everyone else, 0 host, N peer N
+//   coop.reserve_world_event(name) -> bool  block relays that would rewrite this event's sender to peer 0
 //   -> coop_main.on_event(name, payload, from) on the receiving machine(s).
 // Clients talk only to the host; the host relays client -> client events (star topology).
 // F3a T7: in the host's process 0 is the world server and the host player at once (one Lua state): an event to 0 there
@@ -17,6 +18,8 @@
 // Also (W3d):
 //   coop.world_epoch() -> number | nil          the world this machine is in (build 56; nil outside a session)
 //   coop.condition_carried() -> bool            client: the engine put this player's own condition back after the load
+//   coop.event_tick() -> arrival, now           F4 G3-1c: the tick of the event being delivered (now outside one), the latest
+//   coop.released_after(local_id, tick) -> bool  this process released that entity after the tick (note_released)
 //   coop.stash_set(key, value) / coop.stash_get(key)  strings kept for the whole session on this machine,
 //     across level loads and Lua state rebuilds (coop_settings keeps the host's settings there).
 //   on_rejected() -> coop_ui.on_rejected(info): the host's refusal (mod-list diff, duplicate key, ...)
@@ -49,9 +52,12 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <mutex>
+#include <set>
 #include <string>
+#include <string_view>
 
-#include "script_export_space.h"
+#include "../../xrServerEntities/script_export_space.h"
 
 struct lua_State;
 
@@ -64,11 +70,71 @@ enum class RejectReason : uint8_t;
 
 namespace script
 {
+// Lua registration can run on the game thread, while relay admission runs in the network pump.
+class WorldEventReservations
+{
+public:
+	static constexpr size_t kMaxName = 64;
+
+	static bool valid_name(const char* name, size_t size)
+	{
+		if (!name || size == 0 || size > kMaxName)
+			return false;
+		for (size_t i = 0; i < size; ++i)
+		{
+			const auto c = static_cast<unsigned char>(name[i]);
+			if (c <= 0x20 || c >= 0x7f)
+				return false;
+		}
+		return true;
+	}
+
+	bool reserve(const char* name, size_t size)
+	{
+		if (!valid_name(name, size))
+			return false;
+		const std::string_view key(name, size);
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_names.find(key) != m_names.end())
+			return true;
+		if (m_names.size() >= kMaxReservations)
+			return false;
+		m_names.emplace(key);
+		return true;
+	}
+
+	bool blocks_relay(bool relays_as_host, std::string_view name) const
+	{
+		if (!relays_as_host)
+			return false;
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return m_names.find(name) != m_names.end();
+	}
+
+	void clear()
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_names.clear();
+	}
+
+private:
+	static constexpr size_t kMaxReservations = 64;
+	mutable std::mutex m_mutex;
+	std::set<std::string, std::less<>> m_names;
+};
+
 // The Msg::ScriptEvent handler, in both tables (F3a T4: installed by role when a session starts).
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 // Session ended: drops queued events and chat lines, clears counters.
 void reset();
+// F4 G3-1c (xrCoop/coop_item_rider_rules.h): the entity under local id `id` was released on this process
+// (coop_entities.cpp host_on_entity_released; any game thread). It takes the next tick of the counter that numbers the
+// inbox's arrivals: coop.released_after(id, tick) answers from it. Outside a session: nothing.
+void note_released(u16 id);
+// A refused upgrade rebuilds a local copy of the same instance. Skip its next release, or cancel the mark.
+void keep_instance(u16 id);
+void unkeep_instance(u16 id);
 // Main thread, once per frame after the network pump: sends queued events, delivers received ones.
 void frame();
 // coop_status section: counters, queues, then coop_main.print_status() (domains, emission mirror).

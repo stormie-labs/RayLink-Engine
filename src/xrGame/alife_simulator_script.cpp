@@ -24,7 +24,7 @@
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 #include "coop/coop_story.h" // Anomaly Coop (F2 T12 round 1): alife():give_info of our actor
 #include "coop/coop_manager.h" // Anomaly Coop (F2 T12 round 1)
-#include "coop/coop_levels.h" // Anomaly Coop: an object online at a client
+#include "xrCoop/coop_mode.h" // Anomaly Coop: an object online elsewhere
 #include "Actor.h" // Anomaly Coop (F2 T12 round 1): g_actor
 #include "InventoryOwner.h"
 
@@ -291,7 +291,7 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop: no game object here, the client who holds it gets it as any spawn
+	if (!object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop: no game object here, the client who holds it gets it as any spawn
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	NET_Packet packet;
@@ -334,7 +334,7 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
+	if (!object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent, false);
@@ -363,7 +363,7 @@ CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section,
 		}
 	}
 
-	if (!object || !object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
+	if (!object || !object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop
 	{
 		CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent);
 

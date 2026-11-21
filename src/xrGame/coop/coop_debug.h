@@ -49,8 +49,11 @@ void install_client(Endpoint& e);
 // The world server, Manager::start_host (sync::on_session_started): the state of a new session: on with the key -dbg, else off.
 void on_session_started();
 // Any process, the session ended or this client's world was replaced (sync::reset): the state goes, the flags this machine set on its
-// actor are taken back.
+// actor are taken back, unless keep_own_flags_through_next_reset was called right before (flags_taken_at_reset).
 void reset();
+// A player's machine, right before the sync::reset of a world replaced inside the session (coop_join.cpp: the host's SessionReset,
+// the group's load): that reset keeps the flags this machine set; the DebugState at the end of the join decides (b57i creator10_server).
+void keep_own_flags_through_next_reset();
 // The world server: a player left, his flags go.
 void on_peer_left(PeerId peer);
 // The world server: a player (or a map server's bridge) finished loading the world: the state now (sync::host_end_join).

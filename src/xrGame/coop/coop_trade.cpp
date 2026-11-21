@@ -4,6 +4,7 @@
 #include "coop_trade.h"
 #include "coop_dialog.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -15,6 +16,7 @@
 #include "xrCoop/coop_talks.h" // R4 2: may_trade_with
 #include "xrCoop/coop_search_view.h"
 #include "xrCoop/coop_reconcile.h"
+#include "xrCoop/coop_trade_permit.h" // G6-3: remote trade through a trading computer
 
 #include "Level.h"
 #include "Actor.h"
@@ -29,9 +31,11 @@
 #include "ai/trader/ai_trader.h"
 #include "ai/stalker/ai_stalker.h"
 #include "ai_space.h"
+#include "script_engine.h" // G6-3: the grants of coop_mods_trade_computer.script
 #include "alife_simulator.h"
 
 #include <atomic>
+#include <limits>
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife.h"
 #include "script_callback_ex.h"
@@ -239,6 +243,133 @@ xr_map<PeerId, OpenView> g_open; // host: containers open per player (the host i
 
 u64 g_host_deals = 0, g_host_ok = 0, g_host_rejected = 0, g_host_items = 0;
 
+// ---------------------------------------------------------------- G6-3: remote trade through a trading computer
+// Review m23:3 (Gadgets for Hideout Furniture): the computer lists traders up to 150 m away and opens the stock trade. The
+// decider's permits (xrCoop/coop_trade_permit.h), one per player, for the world they were issued in. Its Lua issues a grant
+// (coop_mods_trade_computer.script, request mods.tcomp_permit: a real computer, the player at it, a trader it lists); the
+// player's trade window with that trader opening here makes it his permit, its close or a new window drops it. Without one
+// a deal keeps the stock rules (the talk and kTradeReach): remote trade with any NPC stays impossible.
+trade_permit::Book g_permits;
+u32 g_permit_world = 0; // join::world_generation() of the permits
+u32 g_permit_errors = 0;
+u64 g_permits_issued = 0, g_permits_dropped = 0, g_permit_deals = 0;
+
+trade_permit::Book& permits()
+{
+	const u32 gen = join::world_generation();
+	if (gen != g_permit_world)
+	{
+		g_permit_world = gen; // a new world: the computers and the traders of the old one are gone
+		g_permits.clear();
+	}
+	return g_permits;
+}
+
+// Metres from a character (or the actor) to an object here; -1 when either is missing or going.
+float distance_to(CGameObject* who, CObject* what)
+{
+	if (!who || !what || what->getDestroy())
+		return -1.f;
+	return who->Position().distance_to(what->Position());
+}
+
+// Under lua_pcall: arg 1 the name of a function of coop_mods_trade_computer.script, the rest its arguments. Returns what it
+// returns (lua_pcall keeps three values); nothing when the script or the function is missing (no Gadgets: no grants).
+int lua_trade_computer(lua_State* L)
+{
+	const int args = lua_gettop(L) - 1;
+	lua_getglobal(L, "coop_mods_trade_computer"); // _G.__index loads the module if it was not yet
+	if (!lua_istable(L, -1))
+		return 0;
+	lua_pushvalue(L, 1);
+	lua_gettable(L, -2);
+	if (!lua_isfunction(L, -1))
+		return 0;
+	for (int i = 2; i <= args + 1; ++i)
+		lua_pushvalue(L, i);
+	lua_call(L, args, 3);
+	return 3;
+}
+
+// coop_mods_trade_computer.<fn>(a, b), protected. out: the three values it returned, NaN where it gave no number (the
+// caller bounds them with trade_permit::object_of / ttl_of / reach_of). False: no Lua here, or a Lua error (logged a few times).
+bool call_trade_computer(const char* fn, double a, double b, double out[3])
+{
+	out[0] = out[1] = out[2] = std::numeric_limits<double>::quiet_NaN();
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 12))
+		return false;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_trade_computer);
+	lua_pushstring(L, fn);
+	lua_pushnumber(L, lua_Number(a));
+	lua_pushnumber(L, lua_Number(b));
+	if (lua_pcall(L, 3, 3, 0) != 0)
+	{
+		if (g_permit_errors++ < 5)
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] coop_mods_trade_computer.%s failed (the stock rules stand): %s", fn, err ? err : "?");
+		}
+		lua_settop(L, top);
+		return false;
+	}
+	for (int i = 0; i < 3; ++i)
+		if (lua_type(L, top + 1 + i) == LUA_TNUMBER)
+			out[i] = double(lua_tonumber(L, top + 1 + i));
+	lua_settop(L, top);
+	return true;
+}
+
+// Player `from`'s trade window with `trader_id` opened here: the grant the decider's Lua kept for it (take_grant, taken once)
+// becomes his permit when the computer it names is here and his character stands at it. Any older permit of his goes: one
+// window, one permit.
+void host_take_permit(PeerId from, u16 trader_id)
+{
+	trade_permit::Book& book = permits();
+	book.revoke(from);
+	double g[3];
+	if (!call_trade_computer("take_grant", double(from), double(trader_id), g))
+		return;
+	const u16 computer = trade_permit::object_of(g[0]);
+	if (computer == trade_permit::kNoObject)
+		return; // no grant for this window: the stock rules
+	trade_permit::Facts f;
+	f.player = from;
+	f.trader = trader_id;
+	f.now = now_ms();
+	f.to_computer = distance_to(smart_cast<CGameObject*>(find_object(join::proxy_of_peer(from))), find_object(computer));
+	trade_permit::Verdict v = trade_permit::Verdict::None;
+	if (!world::is_player_proxy(computer) && !world::is_player_proxy(trader_id) &&
+	    book.issue(from, computer, trader_id, f.now, trade_permit::ttl_of(g[1]), trade_permit::reach_of(g[2])))
+		v = book.judge(f);
+	if (!trade_permit::granted(v))
+	{
+		book.revoke(from);
+		++g_permits_dropped;
+		::Msg("! [coop] trade: player #%u's computer grant for %u through %u is not kept (%s)", from, u32(trader_id),
+		    u32(computer), trade_permit::verdict_name(v));
+		return;
+	}
+	++g_permits_issued;
+	::Msg("[coop] trade: player #%u may trade with %u through computer %u", from, u32(trader_id), u32(computer));
+}
+
+// The deal of player `from` with `trader_id` through his permit: Granted, or why not (None: he holds none).
+trade_permit::Verdict permit_verdict(PeerId from, CInventoryOwner* proxy, u16 trader_id)
+{
+	trade_permit::Book& book = permits();
+	const trade_permit::Permit* p = book.find(from);
+	if (!p)
+		return trade_permit::Verdict::None;
+	trade_permit::Facts f;
+	f.player = from;
+	f.trader = trader_id;
+	f.now = now_ms();
+	f.to_computer = distance_to(smart_cast<CGameObject*>(proxy), find_object(p->computer));
+	return book.judge(f);
+}
+
 // ---------------------------------------------------------------- client state
 struct DealItem
 {
@@ -304,8 +435,24 @@ struct ViewState
 	u64 rebuild_at = 0; // rebuild the lists at this time (0: no)
 	u64 last_rebuild = 0;
 	xr_vector<PendingMove> moves;
+	trade_permit::Window remote; // G6-3: this machine's grant for the trader of this window through a trading computer
 };
 ViewState g_view;
+
+// G6-3: a trade window with `partner` opens on this machine: the grant its Lua got for that trader through a trading
+// computer (coop_mods_trade_computer.window_grant, taken once), else none (the stock window). The co-op host's own and a
+// single player's trade never ask, so there is none there.
+void client_take_window(CInventoryOwner* partner)
+{
+	g_view.remote = trade_permit::Window();
+	const u16 trader = id_of(partner);
+	if (trader == kNoId)
+		return;
+	double g[3];
+	if (call_trade_computer("window_grant", double(trader), 0.0, g))
+		g_view.remote = trade_permit::window_of(trader, g[0], g[1], now_ms());
+}
+
 std::atomic<u16> g_search_now{kNoId}; // what the Lua inventory searches, local numbering: Lua may run on the game worker thread
 u16 g_search_sent = kNoId;
 u8 g_search_kind = ContNone;
@@ -485,12 +632,21 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 	// R4 2: the counterparty is one the player trades with now (talks::may_trade_with): its stock trade flag is on, or,
 	// on Anomaly 1.5.3 where xr_meet keeps that flag off and trade opens from the dialog, the player talked to it; and it
 	// stands by the player's character.
+	// G6-3: or the player holds the decider's permit for this trader through a trading computer he stands at
+	// (xrCoop/coop_trade_permit.h): it stands for the talk and for the reach to the trader, nothing else.
+	const trade_permit::Verdict permit = permit_verdict(from, proxy, trader_id);
+	const bool remote = trade_permit::granted(permit);
+	if (permit != trade_permit::Verdict::None && !remote)
+		::Msg("[coop] trade #%u: the computer permit does not hold (%s), the stock rules apply", d.seq,
+		    trade_permit::verdict_name(permit));
 	const CAI_Stalker* stalker = smart_cast<const CAI_Stalker*>(trader);
 	if (!talks::may_trade_with(trader->IsTradeEnabled(),
-	        dialog::host_talked_recently(from, trader_id, u32(talks::kTradeAfterTalkMs)), stalker && stalker->wounded()))
+	        dialog::host_talked_recently(from, trader_id, u32(talks::kTradeAfterTalkMs)) || remote, stalker && stalker->wounded()))
 		return NoTrader;
-	if (!trader->NeedOsoznanieMode() && !within_reach(proxy, trader, kTradeReach))
+	if (!remote && !trader->NeedOsoznanieMode() && !within_reach(proxy, trader, kTradeReach))
 		return TooFar;
+	if (remote)
+		++g_permit_deals;
 	const size_t n = d.sell.size() + d.buy.size();
 	if (!n || n > kMaxDealItems)
 		return Malformed;
@@ -638,7 +794,8 @@ bool may_see_contents(PeerId from, u8 kind, u16 id)
 		return owner && !alive(owner);
 	}
 	return kind == ContTrader &&
-	    (dialog::host_lock_of(from) == id || dialog::host_talked_recently(from, id, u32(talks::kTradeAfterTalkMs)));
+	    (dialog::host_lock_of(from) == id || dialog::host_talked_recently(from, id, u32(talks::kTradeAfterTalkMs)) ||
+	        permits().covers(from, id, now_ms())); // G6-3: the trader of his computer permit
 }
 
 void host_on_container(PeerId from, Reader& r)
@@ -651,6 +808,7 @@ void host_on_container(PeerId from, Reader& r)
 	if (!open)
 	{
 		g_open.erase(from);
+		permits().revoke(from); // G6-3: any close clears the player's open view
 		return;
 	}
 	const auto was = g_open.find(from);
@@ -658,6 +816,14 @@ void host_on_container(PeerId from, Reader& r)
 	OpenView& v = g_open[from];
 	v.kind = kind;
 	v.id = id;
+	if (!same_view)
+	{
+		// G6-3: a new window: his computer permit follows it (the decider's grant for this trader, else none)
+		if (kind == ContTrader && !sync::host_peer_joining(from))
+			host_take_permit(from, id);
+		else
+			permits().revoke(from);
+	}
 	if (!same_view && !sync::host_peer_joining(from) && may_see_contents(from, kind, id))
 		items::host_send_contents(from, id); // F1: what his copy of it shows may be the spawn values
 	if (kind == ContBox || kind == ContCorpse)
@@ -822,7 +988,7 @@ void on_trade_op(PeerId from, Reader& r)
 	switch (op)
 	{
 	case Op::Deal:
-		if (is_map_authority() && from != kHostPeer)
+		if (mode().leads_level() && from != kHostPeer)
 			host_on_deal(from, r);
 		break;
 	case Op::Result:
@@ -840,7 +1006,7 @@ void on_trade_op(PeerId from, Reader& r)
 
 void send_container(bool open, u8 kind, u16 local_id)
 {
-	if (is_map_authority())
+	if (mode().leads_level())
 	{
 		if (open)
 		{
@@ -869,7 +1035,7 @@ void install_server(Session& s)
 	s.on(Msg::TradeOp, &on_trade_op);
 	s.on(Msg::ReqContainer, [](PeerId from, Reader& r)
 	{
-		if (is_map_authority())
+		if (mode().leads_level())
 			host_on_container(from, r);
 	});
 }
@@ -953,6 +1119,7 @@ void reset()
 {
 	g_peers.clear();
 	g_open.clear();
+	g_permits.clear(); // G6-3
 	g_search_now.store(kNoId);
 	g_search_sent = kNoId;
 	g_pending.clear();
@@ -966,6 +1133,7 @@ void on_peer_left(PeerId id)
 {
 	g_peers.erase(id); // his money stays on his character (P4, coop_money)
 	g_open.erase(id);
+	g_permits.revoke(id); // G6-3
 }
 
 bool client_transfer(CUIDragDropListEx* sell_list, CUIDragDropListEx* buy_list, CTrade* trade, bool trader_buys)
@@ -1052,7 +1220,7 @@ bool lua_trade_window_allowed() { return !is_mirror(); }
 
 void on_local_trade_done(CTrade* trade)
 {
-	if (!is_map_authority() || !trade || !trade->pThis.inv_owner)
+	if (!mode().leads_level() || !trade || !trade->pThis.inv_owner)
 		return;
 	host_broadcast_trader_money(trade->pThis.inv_owner, kInvalidPeer);
 }
@@ -1109,6 +1277,8 @@ void on_actor_menu_shown(CUIActorMenu& menu, bool shown)
 	case mmTrade:
 		g_view.kind = partner ? ContTrader : ContNone;
 		g_view.id = id_of(partner);
+		if (partner)
+			client_take_window(partner); // G6-3
 		break;
 	case mmDeadBodySearch:
 		g_view.kind = partner ? ContCorpse : (box ? ContBox : ContNone);
@@ -1226,7 +1396,7 @@ void invalidate_views()
 
 bool host_container_open(u16 id)
 {
-	if (!is_map_authority() || id == kNoId)
+	if (!mode().leads_level() || id == kNoId)
 		return false;
 	for (const auto& it : g_open)
 		if (it.second.kind != ContNone && it.second.id == id)
@@ -1236,12 +1406,26 @@ bool host_container_open(u16 id)
 
 bool trader_local_logic() { return !is_mirror(); }
 
+// G6-3 (review m23:3): for CUIActorMenu::CheckDistance (the stock window closes 3 m from the trader). True: the trade window
+// with `partner` stays open because this machine holds the grant for that trader through a trading computer, it has not run
+// out and the actor stands within the stock 3 m of the computer (xrCoop/coop_trade_permit.h window_keeps). False: the stock
+// rule. The hook in ui/UIActorMenu.cpp is the lead's (not this unit's file); without it the window keeps closing at 3 m.
+bool keeps_trade_window(CInventoryOwner* partner)
+{
+	if (!partner || !g_view.shown || g_view.kind != ContTrader || g_view.id != id_of(partner))
+		return false;
+	const float to_computer = distance_to(Actor(), find_object(g_view.remote.computer));
+	return trade_permit::window_keeps(g_view.remote, g_view.id, now_ms(), to_computer);
+}
+
 void print_status()
 {
-	if (is_map_authority())
+	if (mode().leads_level())
 	{
 		::Msg("[coop]   trade: %llu deals (%llu ok, %llu rejected), %llu items moved", g_host_deals, g_host_ok,
 		    g_host_rejected, g_host_items);
+		::Msg("[coop]   trade computer: %u permits held, %llu issued, %llu not kept, %llu deals let through", // G6-3
+		    (u32)g_permits.size(), g_permits_issued, g_permits_dropped, g_permit_deals);
 		for (const auto& it : g_open)
 		{
 			u32 sharing = 0;

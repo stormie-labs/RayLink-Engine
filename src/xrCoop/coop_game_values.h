@@ -1,6 +1,5 @@
 // Anomaly Coop — "Game settings", the part of the engine side that needs no engine (docs/GAME_SETTINGS.md §1.2, §3.4,
-// §3.5). A host's game carries its own values for the 20 console rules of the co-op (friendly fire, death, autosave,
-// split levels...).
+// §3.5). A host's game carries its own values for the 18 console rules of the co-op (friendly fire, death, autosave...).
 // They are set before the world starts and must not stay in the machine's console (user.ltx) when the level is left:
 //   - kGameCvars    the white list: the only console commands Lua may set for a game (coop.game.set_cvars);
 //   - CvarLayer     sets them, remembers the machine's value the first time and gives it back (coop.game.release_cvars,
@@ -24,12 +23,13 @@ namespace game
 {
 // ---------------------------------------------------------------- the white list
 
-// The game rules (§1.2, rows 1..20): the console commands of the co-op host. Everything else (coop_nick, fov, the money
+// The game rules (§1.2): the console commands of the co-op host. Everything else (coop_nick, fov, the money
 // limits, the sounds, coop_max_map_servers and coop_mapserver_linger of the host's PC) is the machine's own and stays out
-// of a game. coop_death_share is registered by the death build, coop_split_levels and coop_story_together (F3a, rows 18
-// and 19: "split levels" and "story maps together", both on by default) by the split-levels build, coop_npc_finish_downed (row 20:
-// stalkers finish a downed player, on by default) by the AI; a command the console
-// does not know is refused by CvarLayer::apply, so the list may run ahead of the console.
+// of a game. coop_death_share is registered by the death build, coop_npc_finish_downed (stalkers finish a downed player, on
+// by default) by the AI; a command the console does not know is refused by CvarLayer::apply, so the list may run ahead of
+// the console. Owner 2026-11-18: no hybrid, so "split levels", "story maps together" and "the world as a process of its
+// own" are no rules any more. Their keys stay in the records of old worlds (tools/persisted_keys.txt): they are refused
+// (NotAllowed), never fatal.
 inline constexpr std::string_view kGameCvars[] = {
 	"coop_friendly_fire",
 	"coop_max_new_characters",
@@ -48,16 +48,10 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_autosave_interval",
 	"coop_autosave_count",
 	"coop_death_share",
-	"coop_split_levels",
-	"coop_story_together",
 	"coop_npc_finish_downed",
-	// Owner 2026-11-13: the old split mode stays, the new one is a choice of its own. On: a new world with split levels runs as a
-	// world server, a process of its own on the creator's PC, and his game joins it. Only Lua reads it (the new game screen,
-	// Continue); the engine keeps the value in the game's record like any rule.
-	"coop_world_server",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
-static_assert(kGameCvarCount == 21, "docs/GAME_SETTINGS.md §1.2 lists 21 game rules");
+static_assert(kGameCvarCount == 18, "docs/GAME_SETTINGS.md §1.2: 18 game rules since build 57 (no hybrid)");
 
 // The longest value of a rule: a number or a token name (the longest of them, "checkpoint", has ten characters).
 constexpr size_t kMaxCvarValue = 64;

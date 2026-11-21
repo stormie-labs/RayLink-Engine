@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #include "coop_lamps.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_sync.h"
@@ -17,6 +18,9 @@ namespace lamps
 namespace
 {
 using relay::LampEntry;
+
+// Preserve lamp publication wherever the session already kept the authority's book.
+bool publishes_lamps() { return mgr().active() && (mode().decides_world() || mode().leads_level()); }
 
 xrCriticalSection g_lock; // on_changed may run on the game thread
 relay::LampBook g_book; // host, under g_lock
@@ -189,7 +193,7 @@ void reset()
 void frame()
 {
 	const u64 now = mgr().now_ms();
-	if (is_map_authority())
+	if (publishes_lamps())
 	{
 		tell_new_players();
 		send_changes(now);
@@ -205,7 +209,7 @@ void print_status()
 		xrCriticalSectionGuard guard(&g_lock);
 		book = u32(g_book.size());
 	}
-	if (is_map_authority())
+	if (publishes_lamps())
 		::Msg("[coop]   lamps: %u changed in this world, %llu entries sent", book, g_st.sent);
 	else
 		::Msg("[coop]   lamps: %llu words in, %llu applied, %u held, %llu malformed, %llu lamps never came", g_st.received,
@@ -214,7 +218,7 @@ void print_status()
 
 void on_changed(CHangingLamp* lamp, bool soft)
 {
-	if (!lamp || !is_map_authority())
+	if (!lamp || !publishes_lamps())
 		return;
 	const u8 state = state_of(lamp);
 	xrCriticalSectionGuard guard(&g_lock);

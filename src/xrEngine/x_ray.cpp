@@ -34,9 +34,9 @@
 #include "MonitorList.h"
 #include "renderdoc_integration.h"
 #include "../xrCore/raylink_version.h"
-#include "../xrCoop/coop_dedicated_rules.h" // Anomaly Coop
-#include "../xrCoop/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
-#include "coop_host_console.h" // Anomaly Coop
+#include "../xrCoop/srv/coop_dedicated_rules.h" // Anomaly Coop
+#include "../xrCoop/srv/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
+#include "../xrGame/coop/srv/coop_host_console.h" // Anomaly Coop
 
 extern "C" void XR_EARLY_INIT();
 
@@ -662,13 +662,13 @@ void Startup()
 	logoWindow = NULL;
 
 	//Discord Rich Presence - Rezy
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		use_discord = false; // Anomaly Coop: the player is the host's window, not this process
 	else
 		Init_Discord();
 
 	//Reshade
-	use_reshade = !g_coop_headless && init_reshade();
+	use_reshade = !g_dedicated_server && init_reshade();
 	if (use_reshade)
 		Msg("[ReShade]: Loaded compatibility addon");
 	else
@@ -844,7 +844,7 @@ struct damn_keys_filter
 		dwFilterKeysFlags = 0;
 		dwToggleKeysFlags = 0;
 
-		if (g_coop_headless)
+		if (g_dedicated_server)
 			return; // Anomaly Coop: these belong to the user's desktop, the host's window has them
 
 		// Saveing current state
@@ -1108,7 +1108,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 #ifdef NO_MULTI_INSTANCES
 #define STALKER_PRESENCE_MUTEX "Local\\STALKER-COP"
 	HANDLE hCheckPresenceMutex = NULL;
-	if (!g_coop_headless) // Anomaly Coop: a map server runs beside the host's window, out of the same folder
+	if (!g_dedicated_server) // Anomaly Coop: a map server runs beside the host's window, out of the same folder
 	{
 		char exePath[MAX_PATH] = {};
 		DWORD bytes = GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -1147,7 +1147,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 #endif // DEDICATED_SERVER
 
 	// Title window
-	if (!g_coop_headless) // Anomaly Coop: a map server shows nothing
+	if (!g_dedicated_server) // Anomaly Coop: a map server shows nothing
 	{
 		logoWindow = CreateDialog(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_STARTUP), 0, logDlgProc);
 
@@ -1211,7 +1211,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 	renderdoc_initialize();
 	if (g_coop_dedicated)
 		Core.ParamsData.set(ECoreParams::nosound); // Anomaly Coop: and no Steam, the host's process holds it for this PC
-	else if (g_coop_headless)
+	else if (g_dedicated_server)
 		psSoundSilent = true; // Anomaly Coop: the same, and the game of a level needs its sounds, nobody to hear them
 	else
 		coop_steam_overlay_start();
@@ -1307,7 +1307,7 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance,
 		};
 
 #ifndef DEDICATED_SERVER
-		if (g_coop_headless)
+		if (g_dedicated_server)
 			Console->Execute("renderer renderer_r4"); // Anomaly Coop: the only one of this exe, never user.ltx's
 		else if (Core.ParamsData.test(ECoreParams::r2a))
 			Console->Execute("renderer renderer_r2a");
@@ -1673,7 +1673,7 @@ void CApplication::LoadEnd()
 		Msg("* phase cmem: %lld K", Memory.mem_usage() / 1024);
 		Console->Execute("stat_memory");
 		g_appLoaded = TRUE;
-		if (g_coop_headless)
+		if (g_dedicated_server)
 			destroy_loading_shaders(); // Anomaly Coop: g_bootComplete, the load screen that does it is never up here
 		// DUMP_PHASE;
 	}

@@ -2,13 +2,44 @@
 // campfires and objects mods declare as camps (stood next to one for campfire_dwell_ms, not in a fight), a player's own
 // tent or sleeping bag (CheckpointClaim), the stock rest zones and surge covers; and who is in a fight. Driven by
 // coop_checkpoints: its install_server / install_client, reset and print_status call these, its frame calls host_frame
-// on the host. Settings: configs\mod_system_coop_checkpoints.ltx ([coop_checkpoints], [coop_rest_zones]; pure rules and bounds:
+// on the host. Settings: configs\mod_system_coop_checkpoints.ltx ([coop_checkpoints], [coop_rest_zones], [coop_bases]; pure rules and bounds:
 // xrCoop/coop_checkpoint_source_rules.h; the claim and its answer: xrCoop/coop_checkpoint_store.h).
 //
 // Campfires and mod objects: every 500 ms the host and every living player in the world (join::host_player_in_world)
 // is checked against the nearest lit CZoneCampfire within campfire_radius, or a registered mod object within its own
 // radius; checkpoint::dwell_update decides, the camp goes through checkpoints::host_set (kind Campfire / Mod, the
 // object as its source, the player's own position).
+//
+// Bases (Build 57, owner 2026-11-18: "on any base the respawn must be at the bed, not at the campfire, and no 'checkpoint
+// updated' every N-th time while we are on a base"; pure rules xrCoop/coop_checkpoint_base_rules.h): [coop_bases] names
+// the stock sleep zones that stand in a real base, the radius of its ground and its owner communities (round 2: up to 6;
+// round 3, review B1: the first owner is the holder, the faction whose guards hold the place; the base is hostile when the
+// holder is his enemy, or every known owner is; his community is his own actor_<f>, review S4). The zones are looked up in
+// ALife when the world is served (the log
+// names every row not found). In the same 500 ms tick, before the
+// campfires: a player on the ground of a base not hostile to him (the same level, within the radius and 10 m in
+// height; he leaves it beyond radius + base_leave_margin) has its bed as his checkpoint after base_dwell_ms there out of a
+// fight (kind Rest, the sleep zone as its object), once; nothing when it is his checkpoint already or his own tent stands
+// on that base. While he is on it, its campfires and mod objects are no sources. A lie-down on it writes the bed
+// (base_bed_record; who may lie down is rest_place's, unchanged). A respawn whose checkpoint is the bed of a base hostile
+// to him now takes the previous record on his level unless that one is a hostile base's too, without one he comes back where
+// a player without a checkpoint does (round 2/3; bed_hostile, checkpoint::base::skip_hostile_bed,
+// checkpoints::host_respawn_point). A story checkpoint of a living player on a friendly base writes the base's record (round 2;
+// checkpoints::host_story). A base's record written over an Arrival record on that base's ground takes its place and keeps
+// the record before it (round 3, review S3; base_ground, checkpoint::base::set_on_base in checkpoints' apply_set).
+// Build 57 (owner 2026-11-18: "for the bases that are not covered, just put the point at the place of the first spawn";
+// "in split maps in the console form this must be done too"): a start location named in [coop_start_bases] (round 2: opt-in,
+// only real bases without a sleep zone; owners from its row) whose ground no sleep zone base or earlier start base covers is
+// a base too (record kind Rest without an object at its point; the position from base_start_locations, GAMMA
+// plugins\new_game_start_locations.ltx). The list of a level is built with checkpoint::base::accept (overlapping rows are
+// dropped). Who decides, per mode (CLAUDE.md: two modes):
+//   Co-op (the host plays, everybody on its level): the host, base_tick, by his position on this level's list;
+//   Server (a world server and map servers): the world server, far_base_tick, by the footing the map server of his level
+//   reports in LevelBodyFacts (map_server_footing: geometry only), checked against the world server's own tables
+//   (host_footing: checkpoint::base::footing_check) and usable only while it is fresh and of his level now
+//   (levels::body_facts, checkpoint::base::footing_on_level) - the same pure rules, the hostility and the records are the
+//   world server's.
+// A map server decides nothing and writes no record; single player and clients run none of it.
 //
 // Tents and sleeping bags (a "tent" below is either: an object of tent_sections). A claim — CheckpointClaim of a player,
 // his character from his peer (survival::character_of_peer), never from the packet; F3a T7: the host player's too, from
@@ -51,6 +82,7 @@
 #pragma once
 
 #include "xrCoop/coop_checkpoint_store.h" // checkpoint::ClaimWhat
+#include "xrCoop/coop_checkpoint_base_rules.h" // Build 57 (owner 2026-11-18): checkpoint::base::Footing
 
 class CGameObject;
 
@@ -81,6 +113,7 @@ void map_server_scan(u64 now_ms); // a map server: its level's campfires and ten
 void player_frame(); // F3a T7, a player, main thread (checkpoints::frame): the host player's claim goes out
 void reset(); // checkpoints::reset
 void print_status(); // checkpoints::print_status
+void print_level_status(); // the local scan summary, after the common tent-claim summary
 
 // Host: an online CAI_Stalker or CBaseMonster within combat_radius whose selected enemy is `character` (players'
 // characters never count).
@@ -105,6 +138,36 @@ bool claim_tent(checkpoint::ClaimWhat what, const Fvector& pos);
 bool is_sleeping_bag(const shared_str& section);
 // Any machine: an object of this section is a tent players put up (tent_section).
 bool is_tent(const shared_str& section);
+// Build 57 (owner 2026-11-18): host (the world server): `character` stands on a friendly base: `out` is the record of that
+// base (what a lie-down there writes instead of the spot he lies at). Online here (co-op, the host's level): by his position
+// and this level's list of bases; on a map server's level (the Server mode): by the footing that
+// map server reported (host_footing). False: on none (or not the host, or a map server).
+bool base_bed_record(u16 character, checkpoint::Record& out);
+// Build 57: host: `r` is the record of a base (a sleep zone's, or a start base's: kind Rest without an object within
+// kSamePlaceM of its point) hostile to `character` now (round 3, review B1: its holder, the first owner of its row, is his
+// enemy, or every owner is; the respawn does not use it: skip_hostile_bed, for the current and the previous record). Needs no
+// level geometry: the owners come from this process's tables, in every mode.
+bool bed_hostile(u16 character, const checkpoint::Record& r);
+// Build 57 round 3 (review S3): host (the world server): `r` is the record of a base of this world (a [coop_bases] zone found
+// in it, or a start base that is not merged): `out` is that base's ground for checkpoint::base::set_on_base (its key, object,
+// level, its point - the record's own point for a zone, the start location's for a start base - and radius). False for any
+// other record, on a map server and without a world. Needs no level geometry: both modes.
+bool base_ground(const checkpoint::Record& r, checkpoint::base::Spot& out);
+// Build 57 round 3 (review S6): any machine that tells its Lua of a record (coop_checkpoint_changed): what the record is for
+// the text, checkpoint::base::mark_of -> "bed" (a sleep zone base's), "base" (a start base's), "none" (neither), nullptr (this
+// machine cannot tell). The host (world server) by its own tables; a client without ALife: a record without an object near
+// the ltx point of a [coop_start_bases] row is a base, a record with an object by that object on this machine
+// (`source_local`, its name a row of [coop_bases]); an object this machine does not hold gives nullptr.
+const char* record_base(const checkpoint::Record& r, u16 source_local);
+// Build 57: a map server (client_body): the base whose ground the body of `character` at `pos` stands on, by geometry only
+// (this level's list of bases, none hostile: hostility is the world server's), with the base's point; kind none otherwise.
+// Decides and writes nothing.
+void map_server_footing(u16 character, const Fvector& pos, checkpoint::base::Footing& out);
+// Build 57: the world server, a body report of the map server of `level` (coop_levels_xfer.cpp): `f` names a base of this
+// world on that level (a [coop_bases] zone of its ALife, or a start location that is not merged), its game vertex is on that
+// level and its point is on the base's ground. Round 3 (review S5): `body`, the body position of the same report, is on that
+// ground too (checkpoint::base::footing_check). False: nothing to keep (kind none), or refused (counted, the first few logged).
+bool host_footing(const checkpoint::base::Footing& f, u16 level, const float body[3]);
 } // namespace sources
 } // namespace checkpoints
 } // namespace coop

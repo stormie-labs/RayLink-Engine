@@ -33,6 +33,10 @@
 //   ZoneState host -> clients (reliable)
 //     1 Zones     u16 count, entries: u16 id, u8 state, u32 elapsed_ms, u8 campfire (0 off, 1 on, 0xff n/a),
 //                 f32 animator time (-1 if none)
+//     2 Paths     u16 count, entries: u16 id, u32 section hash, vec3 origin, u16 i0, u8 i_step, u8 j_step, f32 x_mod,
+//                 f32 z_mod, u32 phase_ms (F4 G11-2: the wander path of a moving zone, DAO's Ghost, as the process that leads
+//                 the map started it, with the time it has run; xrCoop/coop_zone_path_rules.h. Live, and to a player who
+//                 comes later. The players put their copy of the zone on it: the zone they see is the zone that hurts them.)
 //   EntityEvent client -> host (reliable)
 //     1 Use       u16 object
 //     2 Push      u16 object, u8 element, vec3 dir, f32 speed
@@ -56,6 +60,7 @@ class CBlend;
 class CSE_Abstract;
 struct SHit;
 struct SAnimParams;
+struct lua_State;
 
 namespace coop
 {
@@ -70,9 +75,13 @@ void install_client(Endpoint& e); // F3a T4: the client's (a remote client's ses
 void frame();
 void reset();
 void print_status();
+// F4 G11-2: coop.zone_path(zone_id, x, y, z, i0, i_step, j_step, x_mod, z_mod) -> bool, for scripts\coop_mods_dao_fx.script:
+// the process that leads its map starts the wander path of a moving zone (DAO's Ghost); the engine runs it there and on the
+// copies of every player of that map (ZoneState kind Paths). Called with the coop.* table (coop_script.cpp register_raw).
+void register_lua(lua_State* L);
 
-// Host: a client finished loading (JoinComplete). Pushes zone states and phases, the rest poses of
-// physics objects that moved since the level loaded, and the phases of animated physic objects (P5).
+// Host: a client finished loading (JoinComplete). Pushes zone states and phases, the wander paths of moving zones, the rest
+// poses of physics objects that moved since the level loaded, and the phases of animated physic objects (P5).
 void host_on_peer_ready(PeerId id);
 
 // Client: true if `obj` is a world physics object whose motion comes from the host here.

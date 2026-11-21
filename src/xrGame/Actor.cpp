@@ -11,6 +11,8 @@
 #include "coop/coop_objects.h" // Anomaly Coop: client_usable_tip
 #include "coop/coop_survival.h" // Anomaly Coop: camera_left_body
 #include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the hits in the own actor's health ledger
+#include "coop/coop_vehicles.h" // Anomaly Coop F5-VEH-2: the decider's own actor in the seat table
+#include "coop/coop_vehicles_ride.h" // Anomaly Coop F5-VEH-5: a passenger's ride (hooks below)
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -230,7 +232,7 @@ CActor::CActor() : CEntityAlive(), current_ik_cam_shift(0)
 	m_iLastHittingWeaponID = u16(-1);
 	m_statistic_manager = NULL;
 	//-----------------------------------------------------------------------------------
-	m_memory = (g_dedicated_server && !g_coop_headless) ? 0 : xr_new<CActorMemory>(this);
+	m_memory = xr_new<CActorMemory>(this);
 	m_bOutBorder = false;
 	m_hit_probability = 1.f;
 	m_feel_touch_characters = 0;
@@ -306,8 +308,7 @@ void CActor::reinit()
 	material().reinit();
 
 	m_pUsableObject = NULL;
-	if (!g_dedicated_server || g_coop_headless)
-		memory().reinit();
+	memory().reinit();
 
 	set_input_external_handler(0);
 	m_time_lock_accel = 0;
@@ -319,8 +320,7 @@ void CActor::reload(LPCSTR section)
 	CInventoryOwner::reload(section);
 	material().reload(section);
 	CStepManager::reload(section);
-	if (!g_dedicated_server || g_coop_headless)
-		memory().reload(section);
+	memory().reload(section);
 	m_location_manager->reload(section);
 }
 
@@ -873,6 +873,7 @@ void CActor::Die(CObject* who)
 #ifdef HOLDERCUSTOM_NEW
 	use_HolderEx(NULL, true);
 #endif
+	coop::vehicles::ride_actor_died(); // Anomaly Coop F5-VEH-5: a passenger leaves his seat here as the stock driver leaves his car
 
 #ifdef DEBUG
     Msg("--- Actor [%s] dies !", this->Name());
@@ -1134,7 +1135,7 @@ void CActor::UpdateCL()
 	PROF_EVENT("CActor UpdateCL");
 	if (g_Alive() && Level().CurrentViewEntity() == this)
 	{
-		if (CurrentGameUI() && (!CurrentGameUI()->TopInputReceiver() || (CurrentGameUI()->TopInputReceiver() && !CurrentGameUI()->TopInputReceiver()->StopAnyMove())) && !m_holder)
+		if (CurrentGameUI() && (!CurrentGameUI()->TopInputReceiver() || (CurrentGameUI()->TopInputReceiver() && !CurrentGameUI()->TopInputReceiver()->StopAnyMove())) && !m_holder && !coop::vehicles::riding()) // Anomaly Coop F5-VEH-5 (rv_F5-VEH-5): no pickup mode in a passenger's seat, as none in the driver's
 		{
 			const bool allowed = psActorFlags.test(AF_MULTI_ITEM_PICKUP);
 
@@ -1183,7 +1184,8 @@ void CActor::UpdateCL()
 	SetZoomAimingMode(false);
 	CWeapon* pWeapon = smart_cast<CWeapon*>(inventory().ActiveItem());
 
-	cam_Update(float(Device.dwTimeDelta) / 1000.0f, currentFOV());
+	if (!coop::vehicles::ride_camera(this, currentFOV())) // Anomaly Coop F5-VEH-5: a passenger looks from his seat (cam_Update returns for a holder too)
+		cam_Update(float(Device.dwTimeDelta) / 1000.0f, currentFOV());
     m_legs_controller.update(this);
 
 #ifdef STATIONARYMGUN_NEW
@@ -1508,6 +1510,7 @@ bool CActor::attach_Vehicle(CHolderCustom *object, bool bForce)
 
 			m_holder = object;
 			m_holderID = smart_cast<CObject *>(object)->ID();
+			coop::vehicles::own_actor_attached(smart_cast<CCar *>(object)); // Anomaly Coop F5-VEH-2: seat 0 in the seat table
 
 			if (pCamBobbing)
 			{
@@ -1603,6 +1606,7 @@ void CActor::detach_Vehicle(bool bForce)
 #endif
 
 		m_holder->detach_Actor();
+		coop::vehicles::own_actor_detached(car); // Anomaly Coop F5-VEH-2: out of the seat table
 		m_holder = NULL;
 		m_holderID = u16(-1);
 
@@ -1810,6 +1814,17 @@ void CActor::shedule_Update(u32 DT)
 		}
 	}
 
+	if (coop::vehicles::riding()) // Anomaly Coop F5-VEH-5: a passenger sits as the stock driver does (below): no controls, no physics of his own
+	{
+		if (pCamBobbing) // as CActor::attach_Vehicle: no walking sway in a seat
+		{
+			Cameras().RemoveCamEffector(eCEBobbing);
+			pCamBobbing = NULL;
+		}
+		m_sDefaultObjAction = NULL;
+		inherited::shedule_Update(DT);
+		return;
+	}
 	if (m_holder || !getEnabled() || !Ready())
 	{
 		m_sDefaultObjAction = NULL;
@@ -2252,7 +2267,8 @@ bool canRenderLegs(CActor* actor, CHolderCustom* m_holder) noexcept
         && (legs_in_demo_record || pDemoRecords.empty())
         && showActorBody == 0
         && !actor->m_FPCam
-        && !coop::survival::camera_left_body(); // Anomaly Coop: the legs hang on the camera, it may watch a teammate
+        && !coop::survival::camera_left_body() // Anomaly Coop: the legs hang on the camera, it may watch a teammate
+        && !coop::vehicles::riding(); // Anomaly Coop F5-VEH-5: none in a passenger's seat, as none for the stock driver (!m_holder)
 };
 
 void CActor::renderable_Render(IDSGraphManager* DM)

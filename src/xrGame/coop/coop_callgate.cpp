@@ -4,7 +4,7 @@
 #include "coop_manager.h"
 #include "coop_events.h"
 #include "coop_entities.h" // client_applying
-#include "coop_levels.h" // leads_my_level
+#include "xrCoop/coop_mode.h"
 #include "coop_requests.h" // lua_client
 #include "coop_story.h" // applying
 #include "xrCoop/coop_validate.h"
@@ -161,7 +161,7 @@ Gate decide(const char* name, bool own, u16 target, const Args& args)
 	xrCriticalSectionGuard guard(g_lock);
 	const CallClass cls = g.classes.class_of(name);
 	Gate gate = calls::decide(cls, true, applying, own, calls::has_request_path(name, own), !bad[0]);
-	if (levels::leads_my_level())
+	if (mode().leads_level())
 		gate = calls::decide_leading(name, gate, !bad[0]); // F3a: the objects of its level are its own
 	note(name, gate, gate != Gate::Refuse ? nullptr : (bad[0] ? bad : why_refused(cls, own)), target, args.what);
 	return gate;

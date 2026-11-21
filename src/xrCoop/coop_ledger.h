@@ -668,6 +668,82 @@ void settle_transfer(Balances& b, uint32_t giver, uint32_t giver_balance, uint32
 	b.add(receiver, credit);
 }
 
+// ---------------------------------------------------------------- a trade's shortfall (review A-REV-E-2 finding 2)
+// Server: a map server judges a deal by the balance its world server last named (LevelMap) and sends the deal's change up at once
+// (LevelEntity Money); a debit the world server made meanwhile (a transfer settled there, a world script's charge) can leave the deal's
+// charge larger than the balance the world holds when the change arrives. The goods have moved on the map server already, so the
+// world book does not floor that charge silently (capped_balance would take 0 of it): what the balance cannot pay is the character's
+// debt, and his next income pays it first. A co-op judges a deal and charges it in one process and one step: it never has a debt.
+// Kept for the session (not in the save); keyed by the character key the book knows him by (character_key).
+class TradeDebts
+{
+public:
+	static constexpr size_t kMax = 1024; // characters with a debt at once (a session has far fewer)
+
+	// A charge of `charge` RU on `balance` (a deal judged elsewhere): the new balance; `shortfall` is what the balance could not pay,
+	// added to the debt of `character` (an empty key or a full table keeps it nowhere: untracked()).
+	uint32_t debit(const std::string& character, uint32_t balance, uint32_t charge, uint32_t& shortfall)
+	{
+		shortfall = charge > balance ? charge - balance : 0u;
+		if (shortfall)
+			add(character, shortfall);
+		return charge > balance ? 0u : balance - charge;
+	}
+	// An income of `credit` RU of `character`: what is left for his balance after it paid his debt (`paid`).
+	uint32_t income(const std::string& character, uint32_t credit, uint32_t& paid)
+	{
+		paid = 0;
+		const auto it = m_debt.find(character);
+		if (it == m_debt.end() || !credit)
+			return credit;
+		paid = credit < it->second ? credit : it->second;
+		it->second -= paid;
+		if (!it->second)
+			m_debt.erase(it);
+		return credit - paid;
+	}
+	uint32_t debt_of(const std::string& character) const
+	{
+		const auto it = m_debt.find(character);
+		return it == m_debt.end() ? 0u : it->second;
+	}
+	uint64_t total() const
+	{
+		uint64_t s = 0;
+		for (const auto& it : m_debt)
+			s += it.second;
+		return s;
+	}
+	uint64_t untracked() const { return m_untracked; }
+	size_t size() const { return m_debt.size(); }
+	bool empty() const { return m_debt.empty(); }
+	void clear()
+	{
+		m_debt.clear();
+		m_untracked = 0;
+	}
+
+private:
+	void add(const std::string& character, uint32_t amount)
+	{
+		auto it = m_debt.find(character);
+		if (it == m_debt.end())
+		{
+			if (character.empty() || m_debt.size() >= kMax)
+			{
+				m_untracked += amount;
+				return;
+			}
+			it = m_debt.emplace(character, 0u).first;
+		}
+		const uint64_t sum = uint64_t(it->second) + amount;
+		it->second = sum > 0xffffffffull ? 0xffffffffu : uint32_t(sum);
+	}
+
+	std::map<std::string, uint32_t> m_debt; // character key -> RU he owes the book
+	uint64_t m_untracked = 0; // RU of shortfalls no entry could keep
+};
+
 // ---------------------------------------------------------------- upgrades at a mechanic (F2 T5)
 // A client installs an upgrade on its machine; the stock Lua effect pays for it there
 // (inventory_upgrades.effect_functor_a: give_money(-price), price = floor(cost x mech_discount x eco `upgrade`)). That

@@ -2,15 +2,12 @@
 #include "coop_manager.h"
 
 #include "coop_join.h"
-#include "coop_mapserver.h"
+#include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_script.h"
 #include "coop_autosave.h" // F3
-#include "coop_dedicated.h" // plan 12
-#include "coop_world_server.h" // plan 2026-11-12 stage 6a: the token of the world server this game started
-#include "../../xrEngine/coop_host_console.h" // plan 2026-11-12 stage 2: the @rl lines of the dedicated autostart
-#include "xrCoop/coop_world_server_rules.h"
-#include "xrCoop/coop_operator.h" // protocol 31: the operator's token
+#include "xrCoop/coop_mode.h" // S4: the session's mode, the switchboard of the two layers
+#include "xrCoop/srv/coop_operator.h" // protocol 31: the operator's token
 #include "coop_dialog.h" // hud_message_n: the host-silence line
 #include "coop_health_ledger.h" // live 2026-11-09: the own actor's health ledger
 #include "coop_lua_errors.h" // 2026-11: Lua errors survived in a session
@@ -21,7 +18,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include "xrCoop/coop_silence_pause.h"
-#include "xrCoop/coop_steam_join.h"
 
 string64 g_coop_nick = "";
 
@@ -125,37 +121,11 @@ struct AutoStart
 	u64 next_status = 0;
 	u32 shots_every_s = 0;
 	u64 next_shot = 0;
-	u64 next_steam_join = 0;
-	dedicated::HostAutostart dedicated_host; // plan 2026-11-12 stage 1: the dedicated host tries until its world is up
-	bool map_server = false; // F3a: the key -coop_mapserver
+	// S4: the world server's autostart (-coop_dedicated) and a map server's start (-coop_mapserver) are the server layer's boot
+	// (srv/coop_srv_mode.cpp, coop::boot_layers); when a layer owns this process's sessions, host and connect here stay off
+	bool layer_owns = false;
+	bool said = false; // the autostart line went to the log
 } g_auto;
-
-constexpr u32 kSteamJoinPollMs = 500;
-
-// The launcher's Steam mode: an invite accepted while the game runs leaves the tunnel's address in the file
-// RAYLINK_STEAM_JOIN names. False: nothing there.
-bool steam_join_waits(u16& port)
-{
-	wchar_t path[1024];
-	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_JOIN", path, 1024);
-	if (length == 0 || length >= 1024)
-		return false;
-	FILE* file = _wfopen(path, L"rb");
-	if (!file)
-		return false;
-	char text[32] = {};
-	fread(text, 1, sizeof(text) - 1, file);
-	fclose(file);
-	_wremove(path);
-	u16 tunnel = 0;
-	if (!steam_join::parse_tunnel(text, tunnel))
-	{
-		::Msg("! [coop] Steam invite: not an address");
-		return false;
-	}
-	port = tunnel;
-	return true;
-}
 
 u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
 {
@@ -201,17 +171,11 @@ const char* phase_name(Phase p)
 
 u8 roles_of(Phase p)
 {
-	switch (p)
-	{
-	case Phase::Off: return 0;
-	case Phase::Hosting: return dedicated::on() ? dedicated_roles() : host_roles();
-	case Phase::Connecting:
-	case Phase::Handshaked:
-	case Phase::ReceivingWorld:
-	case Phase::LoadingWorld:
-	case Phase::Live: return client_roles();
-	}
-	return 0;
+	if (p == Phase::Off)
+		return 0;
+	// S4: the session's mode says them; a client before its Welcome (no mode yet) is a client of the world whatever its mode
+	const u8 roles = mode().roles();
+	return roles ? roles : client_roles();
 }
 
 Manager& Manager::get()
@@ -253,9 +217,11 @@ void Manager::set_phase(Phase p)
 		return;
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
+	if (p == Phase::Live)
+		m_live_since_ms = now_ms(); // W9: the first stretch of play holds the link (link_hold::kSettleMs)
+	if (p == Phase::Off)
+		reset_mode(); // S4: the session's mode goes with it; none until the next start
 	m_roles = roles_of(p); // F3a T4
-	if (m_map_server && p != Phase::Off)
-		m_roles = map_server_roles();
 	set_crash_hook(p != Phase::Off); // R1 I2: a crash releases the link hold
 	if (p != Phase::Off && !g_crash_hook_exit_registered)
 	{
@@ -379,22 +345,20 @@ void Manager::install_session_callbacks()
 	m_session.on_peer_joined = [this](const PeerInfo& p)
 	{
 		::Msg("[coop] player joined: #%u '%s' %s", p.id, p.nick.c_str(), p.address.c_str());
-		if (is_host())
+		if (active() && mode().decides_world())
 			join::on_peer_joined(p);
 		sync::on_peer_joined(p);
 	};
-	m_session.on_peer_left = [this](PeerId id, const std::string& reason)
+	m_session.on_peer_left = [](PeerId id, const std::string& reason)
 	{
 		::Msg("[coop] player left: #%u (%s)", id, reason.c_str());
 		sync::on_peer_left(id);
-		if (is_map_authority())
+		if (net::host())
 			join::on_peer_left(id);
 		else
 			diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his avatar leaves this world too
 	};
-	// plan 2026-11-12 stage 3: a line of the world server's operator that passed the session's checks runs on this server's console
-	// (dedicated::run_for checks him and the line again; nothing on a host that is not a world server)
-	m_session.on_operator_command = [](PeerId from, const std::string& line) { dedicated::run_for(from, line); };
+	// The world server's operator lines go to its console from its mode's install (srv/coop_srv_mode.cpp, srv::SessionSrv).
 	install_world_callbacks(m_session);
 	install_world_callbacks(m_world);
 	m_world.on_peer_joined = nullptr; // a map server's players are its level's, from the host's table
@@ -403,15 +367,18 @@ void Manager::install_session_callbacks()
 	m_world.set_world_gate([this] { return world_state(); });
 
 	// F3a T4: what the modules set up once per process (settings, console commands, the route and call-gate tables); the
-	// handler tables are installed by role when a session starts (install_handlers).
+	// handler tables are installed by the session's mode when a session starts (enter_mode, S4).
 	sync::init();
 }
 
 void Manager::install_world_callbacks(Session& session)
 {
-	session.on_welcome = [this](const WelcomeMsg& w)
+	session.on_welcome = [this, &session](const WelcomeMsg& w)
 	{
-		::Msg("[coop] accepted by host '%s' as #%u", w.host_nick.c_str(), w.slot);
+		// protocol 33: the session's mode is known from here on (Session::session_mode; S4: start_client installs it)
+		::Msg("[coop] accepted by host '%s' as #%u, session %s", w.host_nick.c_str(), w.slot, session_mode_name(w.mode));
+		if (&session == &m_session) // the own session's Welcome starts a mode; a map server's bridge (m_world) does not
+			enter_mode_of_welcome(w.mode); // S4: before any game message of the session (a map server's mode came with its start)
 		set_phase(Phase::Handshaked);
 		join::on_welcome(w);
 	};
@@ -435,8 +402,9 @@ void Manager::install_world_callbacks(Session& session)
 		}
 		script::on_rejected(r.reason, r.text.c_str(), diff); // W3d: refusal window (R-1.3, R-1.4)
 		join::on_session_lost(r.text.c_str());
+		Mode& was = mode(); // S4: set_phase(Off) puts none back
 		set_phase(Phase::Off);
-		mapserver::server_session_over(); // F3a: a map server has no menu to go back to
+		was.session_over(); // F3a: a map server has no menu to go back to
 	};
 	session.on_disconnected = [this](const std::string& reason)
 	{
@@ -445,8 +413,9 @@ void Manager::install_world_callbacks(Session& session)
 		script::on_session_end(reason.c_str(), world_session().end_code().c_str()); // W4 menu: last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
+		Mode& was = mode(); // S4: set_phase(Off) puts none back
 		set_phase(Phase::Off);
-		mapserver::server_session_over(); // F3a: a map server without its host's process is nobody's
+		was.session_over(); // F3a: a map server without its host's process is nobody's
 	};
 	session.on_chat = [](PeerId from, const std::string& text)
 	{
@@ -465,36 +434,47 @@ void Manager::install_world_callbacks(Session& session)
 	};
 }
 
-void Manager::install_handlers(Tables tables)
+bool Manager::enter_mode(Mode* m)
+{
+	if (!m)
+	{
+		::Msg("! [coop] mode: no layer has a mode for this start");
+		return false;
+	}
+	if (!install_mode(*m))
+		return false;
+	::Msg("[coop] mode: %s", m->name());
+	m_session.clear_handlers();
+	m_world.clear_handlers();
+	m_link.clear_handlers();
+	ModeTables tables{m_session, m_world, m_link};
+	m->install(tables);
+	return true;
+}
+
+void Manager::install_client_tables()
 {
 	m_session.clear_handlers();
 	m_world.clear_handlers();
 	m_link.clear_handlers();
-	switch (tables)
+	// a remote client (player and mirror): the client's handlers on the session connected to the host
+	join::install_client(m_session);
+	sync::install_client(m_session);
+}
+
+void Manager::enter_mode_of_welcome(SessionMode said)
+{
+	Mode* m = mode_for(Entry::Client, said);
+	if (!m)
 	{
-	case Tables::Hosting:
-		// the world server: its handlers on the session; the host player, a client of it: his on the link
-		join::install_server(m_session);
-		sync::install_server(m_session);
-		mapserver::install_server(m_session);
-		if (dedicated::on())
-			break; // nobody plays in this process: no host player, no link (plan 12)
-		join::install_client(m_link);
-		sync::install_client(m_link);
-		break;
-	case Tables::Client:
-		// a remote client (player and mirror): the client's handlers on the session connected to the host
-		join::install_client(m_session);
-		sync::install_client(m_session);
-		break;
-	case Tables::MapServer:
-		// a map server: the host's handlers of a level for its virtual peers, the client's for the world on its bridge
-		sync::install_server(m_session);
-		join::install_client(m_world);
-		sync::install_client(m_world);
-		mapserver::install_client(m_world);
-		break;
+		::Msg("! [coop] mode: the Welcome's mode %s is no mode of this game", session_mode_name(said));
+		return;
 	}
+	if (!install_mode(*m))
+		return;
+	::Msg("[coop] mode: %s", m->name());
+	ModeTables tables{m_session, m_world, m_link};
+	m->install(tables); // a client's mode adds no table: the Core's are there from its start
 }
 
 bool Manager::start_host(u16 port)
@@ -507,22 +487,17 @@ bool Manager::start_host(u16 port)
 	if (!join::host_can_start())
 		return false;
 
-	install_handlers(Tables::Hosting); // F3a T4
-	if (dedicated::on())
-		m_session.attach_local(nullptr); // plan 12: peer 0 is nobody: players() has no such row, what is sent to it goes nowhere
+	// S4: the co-op host, or the world server (its own keys: the server layer takes the start); the mode installs its tables
+	Mode* m = mode_for(Entry::Host, SessionMode::None);
+	if (!enter_mode(m))
+		return false;
 	std::string err;
 	SessionConfig cfg = make_config(port);
-	cfg.host_plays = !dedicated::on(); // protocol 31: a world server's own seat plays no character (Welcome.flags)
-	op::Token operator_token;
-	if (dedicated::on() && op::find_token(Core.Params, operator_token))
-	{
-		// plan 2026-11-12 ง2.2: the game that presents this token from this PC holds the host's rights. The token is never logged.
-		cfg.operator_token = operator_token;
-		::Msg("[coop] dedicated: an operator token is set (-coop_operator)");
-	}
+	m->configure(cfg); // protocol 31 / 33: whether its seat plays, the Welcome's mode; the world server's operator token
 	if (!m_session.host(cfg, &err))
 	{
 		::Msg("! [coop] cannot host on port %u: %s", port, err.c_str());
+		reset_mode();
 		return false;
 	}
 	set_phase(Phase::Hosting);
@@ -538,7 +513,7 @@ bool Manager::start_client(const char* address, u16 port)
 		::Msg("! [coop] already in a session (%s), use coop_disconnect first", phase_name(m_phase));
 		return false;
 	}
-	install_handlers(Tables::Client); // F3a T4
+	install_client_tables(); // F3a T4; S4: its mode comes with the Welcome
 	std::string err;
 	SessionConfig cfg = make_config(port);
 	cfg.peer_timeout_ms = kHostSilenceLeaveMs; // the client waits for a silent host this long (frozen meanwhile)
@@ -546,11 +521,10 @@ bool Manager::start_client(const char* address, u16 port)
 	// is worth nothing anywhere else, and no other host has to see it.
 	op::Token operator_token;
 	// This PC is a literal 127.a.b.c and nothing else (op::loopback_literal: "127.0.0.1.evil.example" is another machine, security
-	// review 2026-11-12). The token is this process's own key -coop_operator (a launcher, a test), or the one of the world server
-	// this game started on that port (coop_world_server.h: it never leaves this process's memory).
-	// The token in memory goes only to 127.0.0.1 itself, and only once that server has said it listens on the port (operator_token_for).
+	// review 2026-11-12). The token is this process's own key -coop_operator (a launcher, a test): the game starts no world server
+	// of its own any more (owner 2026-11-18, the server only from the launcher).
 	const bool own_key = address && op::loopback_literal(address) && op::find_token(Core.Params, operator_token);
-	if (own_key || (address && !xr_strcmp(address, "127.0.0.1") && world_server::operator_token_for(port, operator_token)))
+	if (own_key)
 		cfg.hello_token = operator_token;
 	SecureZeroMemory(operator_token.data(), operator_token.size()); // the copy on this stack; the session keeps its own for the Hello
 	if (!m_session.connect(cfg, address, port, &err))
@@ -567,19 +541,22 @@ bool Manager::start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& 
 {
 	if (active())
 		return false;
+	Mode* m = mode_for(Entry::MapServer, SessionMode::Server); // S4: the server layer's map server
+	if (!enter_mode(m))
+		return false;
 	m_map_server = true;
-	install_handlers(Tables::MapServer);
 	std::string err;
 	SessionConfig cfg = make_config(port);
 	cfg.peer_timeout_ms = kHostSilenceLeaveMs;
-	// the host's process may be loading its own new world: it takes the Hello when it is up (plan ยง1.5 "the host's move")
-	cfg.connect_timeout_ms = mapserver::kConnectTimeoutMs;
+	m->configure(cfg); // the host's process may be loading its own new world: a long connect timeout
 	cfg.hello_role = kHelloRoleMapServer;
 	cfg.hello_token = token;
-	if (!m_world.connect(cfg, "127.0.0.1", port, &err) || !m_session.host_virtual(cfg, m_world, &err))
+	// The map server's mode made the next host() of m_session its level's, carried by m_world (its install: srv::SessionSrv).
+	if (!m_world.connect(cfg, "127.0.0.1", port, &err) || !m_session.host(cfg, &err))
 	{
 		::Msg("! [coop] map server: cannot connect to the host's process on port %u: %s", port, err.c_str());
 		m_map_server = false;
+		reset_mode();
 		return false;
 	}
 	set_phase(Phase::Connecting);
@@ -643,19 +620,17 @@ void Manager::autostart()
 			g_auto.status_every_s = (u32)atoi(v.c_str());
 		if (cmd_param("-coop_shots", v))
 			g_auto.shots_every_s = (u32)atoi(v.c_str());
-		if (dedicated::on())
-		{
-			g_auto.host = true; // when its world is up
-			g_auto.host_port = dedicated::args().port;
-		}
-		g_auto.map_server = mapserver::parsed_key();
-		if (g_auto.map_server)
-		{
-			g_auto.host = false;
-			g_auto.connect.clear();
-			if (!start_map_server(mapserver::key().port, mapserver::key().token))
-				mapserver::server_session_over();
-		}
+	}
+	// S4: the layers' boots (coop_mode.cpp): the server's reads -coop_dedicated / -coop_mapserver once and makes its own starts
+	if (boot_layers() && !g_auto.layer_owns)
+	{
+		g_auto.layer_owns = true;
+		g_auto.host = false;
+		g_auto.connect.clear();
+	}
+	if (!g_auto.said)
+	{
+		g_auto.said = true;
 		if (g_auto.host || !g_auto.connect.empty())
 			::Msg("[coop] autostart: host=%d port=%u connect='%s' status=%us shots=%us", g_auto.host, g_auto.host_port,
 			      g_auto.connect.c_str(), g_auto.status_every_s, g_auto.shots_every_s);
@@ -663,80 +638,29 @@ void Manager::autostart()
 	const u64 now = now_ms();
 	const bool level_ready = g_pGameLevel && g_actor && !Device.dwPrecacheFrame && ai().get_alife();
 
-	u16 steam_port = 0;
-	if (now >= g_auto.next_steam_join)
+	// INTEG-C (rv_A-S6-E-net fix 1): an address a layer was asked to join from outside the game (the co-op's invite,
+	// hostplay/coop_hostplay_steam.cpp), before a session as during one, into the retries below
+	std::string invite, via;
+	if (layer_join_request(invite, via))
 	{
-		g_auto.next_steam_join = now + kSteamJoinPollMs;
-		if (steam_join_waits(steam_port))
+		if (!active() || g_auto.connect != invite.c_str()) // the same invite again, while in that game, changes nothing
 		{
-			string64 address;
-			xr_sprintf(address, "%s:%u", steam_join::kLoopback, u32(steam_port));
-			if (!active() || g_auto.connect != address) // the same invite again, while in that game, changes nothing
+			::Msg("[coop] %s accepted: joining the host through it", via.c_str());
+			if (active())
 			{
-				::Msg("[coop] Steam invite accepted: joining the host through the tunnel");
-				if (active())
-				{
-					script::note_user_stop(); // the player's own choice, nothing to tell him in the main menu
-					stop("joined a friend through a Steam invite");
-				}
-				g_auto.host = false;
-				g_auto.connect = address;
-				g_auto.connect_tries = 0;
-				g_auto.next_connect = 0;
-				g_auto.welcomed = false;
+				script::note_user_stop(); // the player's own choice, nothing to tell him in the main menu
+				stop("joined a friend through an invite");
 			}
+			g_auto.host = false;
+			g_auto.connect = invite.c_str();
+			g_auto.connect_tries = 0;
+			g_auto.next_connect = 0;
+			g_auto.welcomed = false;
 		}
 	}
 
-	if (g_auto.host && !g_auto.host_done && !active() && dedicated::on() && dedicated::quitting())
-	{
-		// the level is going away with the process: "waiting for the world (no level yet)" after "the host goes down" was noise (live 2026-11-12)
-	}
-	else if (g_auto.host && !g_auto.host_done && !active() && dedicated::on())
-	{
-		// One try was all an ordinary host gets, and a dedicated host that is refused once (the world not quite up in the first frame of a new
-		// GAMMA world, a busy port) stayed without a session and said it once (2026-11-01). Its own window may be nobody's: it tries again.
-		const dedicated::WorldFacts facts = join::host_world_facts();
-		const dedicated::HostAutostart::Step step = g_auto.dedicated_host.tick(now, dedicated::world_wait(facts));
-		// plan 2026-11-12 stage 2: the same moments as @rl lines for the parent of a -coop_hidden server (nothing without its output)
-		static bool s_session_said = false;
-		if (step.act == dedicated::HostAutostart::Do::GiveUp)
-		{
-			g_auto.host_done = true;
-			::Msg("! [coop] dedicated: gave up waiting for the world after %llu s: %s. coop_host %u starts the session by hand", step.waited_ms / 1000,
-			    dedicated::wait_text(step.reason), u32(g_auto.host_port));
-			string256 why;
-			xr_sprintf(why, "gave up waiting for the world after %llu s: %s", step.waited_ms / 1000, dedicated::wait_text(step.reason));
-			coop_console::rl_line(world_server::format(world_server::Record::of_error("gave_up", why)).c_str());
-		}
-		else if (step.say)
-		{
-			::Msg("[coop] dedicated: waiting for the world (%s): level %d ready %d precache %d alife %d alife-actor %d g_actor %d alive %d, %llu s",
-			    dedicated::wait_text(step.reason), facts.level, facts.ready, facts.precache, facts.alife, facts.alife_actor, facts.client_actor,
-			    facts.alive, step.waited_ms / 1000);
-			coop_console::rl_line(
-			    world_server::format(world_server::Record::of_wait(dedicated::wait_code(step.reason), dedicated::wait_text(step.reason))).c_str());
-		}
-		if (step.act == dedicated::HostAutostart::Do::Try)
-		{
-			if (!s_session_said)
-			{
-				s_session_said = true;
-				coop_console::rl_line(world_server::format(world_server::Record::of_phase(world_server::Phase::Session)).c_str());
-			}
-			if (start_host(g_auto.host_port))
-			{
-				g_auto.host_done = true;
-				g_auto.dedicated_host.up();
-				::Msg("[coop] dedicated: the session is up on port %u, %llu s after the level came", u32(g_auto.host_port), step.waited_ms / 1000);
-				coop_console::rl_line(world_server::format(world_server::Record::of_ready(g_auto.host_port)).c_str());
-				coop_console::rl_line(world_server::format(world_server::Record::of_phase(world_server::Phase::Ready)).c_str());
-			}
-			else
-				g_auto.dedicated_host.refused(now);
-		}
-	}
-	else if (g_auto.host && !g_auto.host_done && !active() && level_ready)
+	// S4: the world server's autostart (it tries until its world is up) is the server layer's boot (srv/coop_srv_mode.cpp)
+	if (g_auto.host && !g_auto.host_done && !active() && level_ready)
 	{
 		g_auto.host_done = true;
 		start_host(g_auto.host_port);
@@ -791,7 +715,7 @@ void host_silence_off()
 
 void host_silence_step()
 {
-	if (is_map_server())
+	if (mode().leads_level() && !mode().decides_world())
 		return; // nobody plays here: it waits for the host's process until its link times out, then it exits
 	const u32 silent = mgr().is_live_client() && g_pGameLevel ? mgr().session().ms_since_host_heard() : 0;
 	if (silent < kHostSilenceFreezeMs)
@@ -822,8 +746,7 @@ void host_silence_step()
 
 void Manager::frame()
 {
-	dedicated::frame();
-	autostart();
+	autostart(); // the Core's keys, then the layers' boots (S4: the server's runs dedicated::frame, reads its keys, makes its starts)
 	if (m_phase == Phase::Off)
 		return;
 	// W9: the link stays held until this machine plays normally again, not just until its last load step: the first
@@ -837,6 +760,11 @@ void Manager::frame()
 	fs.precache_frames = g_pGameLevel && Device.dwPrecacheFrame != 0;
 	fs.joining_world = m_phase == Phase::LoadingWorld;
 	fs.crashed = g_crashed.load();
+	if (m_phase == Phase::Live && mode().actor_is_player()) // b57h: the level's online objects come after live
+	{
+		const u64 live_for = now_ms() - m_live_since_ms;
+		fs.live_ms = live_for < u64(link_hold::kNotLive) ? u32(live_for) : link_hold::kNotLive - 1;
+	}
 	m_session.hold_connection(link_hold::keep_held(fs) ? kLoadHoldMs : 0);
 	if (m_map_server)
 	{
@@ -856,6 +784,7 @@ void Manager::print_status() const
 {
 	::Msg("[coop] build '%s', protocol %u", build_id(), kProtocolVersion);
 	::Msg("[coop] phase %s, self #%u, nick '%s'", phase_name(m_phase), m_session.self(), nick());
+	::Msg("[coop] mode %s", mode().name()); // S4: the session's (xrCoop/coop_mode.h), none outside one
 	lua_errors::print_status(); // 2026-11: also outside a session (the switch, what was survived before)
 	if (!active())
 		return;
@@ -866,7 +795,7 @@ void Manager::print_status() const
 	const NetSim& sim = m_session.netsim();
 	if (sim.enabled())
 		::Msg("[coop] netsim: lag %u ms, jitter %u ms, loss %.1f%%", sim.lag_ms, sim.jitter_ms, sim.loss * 100.f);
-	if (is_host())
+	if (mode().decides_world())
 	{
 		// F3a T4: the host player's LocalLink; "refused" are the messages not moved onto it yet (the host's direct paths)
 		const LocalLink::Stats& ls = m_link.stats();
@@ -906,8 +835,7 @@ void Manager::print_status() const
 
 void on_frame()
 {
-	Manager::get().frame();
-	mapserver_stats_frame();
+	Manager::get().frame(); // a server's process: its stats line too, from the server's boot (S4, A-S4H)
 }
 
 void on_blocking_work()
@@ -917,41 +845,9 @@ void on_blocking_work()
 		m.world_session().hold_connection(kLoadHoldMs); // atomics only: fine from a loader thread; refused after a crash
 }
 
-bool steam_invite_ready()
-{
-	wchar_t lobby[32];
-	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_LOBBY", lobby, 32);
-	HMODULE api = GetModuleHandleW(L"steam_api64.dll");
-	if (length == 0 || length >= 32 || !api)
-		return false;
-	typedef void*(__cdecl * friends_of_steam)();
-	const friends_of_steam friends = reinterpret_cast<friends_of_steam>(GetProcAddress(api, "SteamAPI_SteamFriends_v018"));
-	return friends && friends();
-}
-
-bool steam_invite_window()
-{
-	wchar_t lobby[32];
-	const DWORD length = GetEnvironmentVariableW(L"RAYLINK_STEAM_LOBBY", lobby, 32);
-	HMODULE api = GetModuleHandleW(L"steam_api64.dll");
-	if (length == 0 || length >= 32 || !api)
-		return false;
-	typedef void*(__cdecl * friends_of_steam)();
-	typedef void(__cdecl * invite_dialog)(void*, unsigned long long);
-	const friends_of_steam friends = reinterpret_cast<friends_of_steam>(GetProcAddress(api, "SteamAPI_SteamFriends_v018"));
-	const invite_dialog dialog = reinterpret_cast<invite_dialog>(GetProcAddress(api, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog"));
-	if (!friends || !dialog)
-		return false;
-	void* steam_friends = friends(); // null when Steam refused this process (x_ray.cpp)
-	if (!steam_friends)
-		return false;
-	dialog(steam_friends, _wcstoui64(lobby, nullptr, 10));
-	return true;
-}
-
 bool skip_keypress_on_load()
 {
-	if (Manager::get().is_client())
+	if (net::client())
 		return true;
 	return Core.Params && (strstr(Core.Params, "-coop_host") || strstr(Core.Params, "-coop_connect"));
 }

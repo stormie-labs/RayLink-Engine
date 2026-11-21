@@ -296,8 +296,14 @@ void xrLogger::InternalCloseLog()
 	InternalPrintAllRecords();
 	InternalFlushLog();
 
-	IWriter* tempCopy = (IWriter*)logFile;
-	logFile = nullptr;
+	IWriter* tempCopy = nullptr;
+	{
+		// Anomaly Coop: the log thread flushes on its own now (LogThreadEntry, kTailFlushMs) and reads the file under this guard:
+		// a flush of it is over before the file goes, or sees none
+		xrCriticalSectionGuard g(logFlushGuard);
+		tempCopy = (IWriter*)logFile;
+		logFile = nullptr;
+	}
 
 	if (tempCopy != nullptr)
 		FS.w_close(tempCopy);
@@ -512,6 +518,15 @@ void xrLogger::LogThreadEntry()
 			}
 		};
 
+	// Anomaly Coop: the file is a CRT stream (4 KB buffer); without a flush it reaches the disk only in whole 4 KB blocks. A process
+	// that ends without the engine's own handler (0xC0000374 heap fail-fast, 0xC0000409, a kill) loses the rest: b57i feed_server, the
+	// first client's log stopped at "[co" exactly 4 x 4096 bytes after the last "flush" (14:06:17.699), while his game still respawned,
+	// went down and died until about 14:07:19 (the world server's lines). This thread writes what it printed to the file at most
+	// kTailFlushMs later: one WriteFile per kTailFlushMs at most, here, never on the game's threads. The event is reset before the
+	// queue drains: a record that comes meanwhile sets it again (reset after the drain, it waited for the next record).
+	constexpr DWORD kTailFlushMs = 250;
+	bool unflushed = false;
+	DWORD last_flush = GetTickCount();
 	while (true)
 	{
 		if (!bIsAlive)
@@ -520,12 +535,21 @@ void xrLogger::LogThreadEntry()
 			return;
 		}
 		
-		WaitForSingleObject(hLogThread, INFINITE);
+		const DWORD woke = WaitForSingleObject(hLogThread, unflushed ? kTailFlushMs : INFINITE);
 		{
 			PROF_EVENT("Log Frame");
-			InternalPrintAllRecords();
 			PauseLogging();
+			InternalPrintAllRecords();
 			FlushLogIfRequestedLambda();
+			if (woke == WAIT_OBJECT_0)
+				unflushed = true; // records came (or a flush request): the file may hold some of them only in the buffer
+			const DWORD now = GetTickCount();
+			if (unflushed && (woke == WAIT_TIMEOUT || now - last_flush >= kTailFlushMs))
+			{
+				InternalFlushLog();
+				unflushed = false;
+				last_flush = now;
+			}
 		}
 	}
 }

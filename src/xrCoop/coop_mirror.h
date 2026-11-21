@@ -38,7 +38,7 @@ enum class Placement : uint8_t
 // rule. Builds 52-54 live (issue 1293): OnlineNow took squads, their second switch_online failed
 // R_ASSERT(!m_bOnline) and every client of an ordinary session crashed. A squad stays on the vote, as in build 51.
 inline Placement placement(bool has_holder, bool host_online, bool holder_online, bool holder_on_server,
-                           bool in_level_registry = true, bool flag_of_this_level = true, bool switches_alone = true)
+                           bool in_level_registry, bool flag_of_this_level, bool switches_alone)
 {
 	if (!has_holder)
 	{

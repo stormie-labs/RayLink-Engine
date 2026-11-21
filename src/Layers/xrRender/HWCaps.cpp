@@ -3,6 +3,7 @@
 
 #include "hwcaps.h"
 #include "hw.h"
+#include "../../xrEngine/IGame_Persistent.h"
 
 #ifndef _EDITOR
 #include <nvapi.h>
@@ -213,7 +214,7 @@ void CHWCaps::Update()
 
 	// DEV INFO
 
-	iGPUNum = g_coop_headless ? 1 : GetGpuNum(); // Anomaly Coop: WARP, and NVAPI would load a part of the driver for nothing
+	iGPUNum = g_dedicated_server ? 1 : GetGpuNum(); // Anomaly Coop: WARP, and NVAPI would load a part of the driver for nothing
 }
 #else	//	USE_DX10
 void CHWCaps::Update()
@@ -272,6 +273,6 @@ void CHWCaps::Update()
 
 	// DEV INFO
 
-	iGPUNum = g_coop_headless ? 1 : GetGpuNum(); // Anomaly Coop: WARP, and NVAPI would load a part of the driver for nothing
+	iGPUNum = g_dedicated_server ? 1 : GetGpuNum(); // Anomaly Coop: WARP, and NVAPI would load a part of the driver for nothing
 }
 #endif	//	USE_DX10

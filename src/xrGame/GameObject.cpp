@@ -35,7 +35,7 @@
 #include "script_attachment_manager.h"
 #include "player_hud.h"
 #include "coop/coop_join.h" // Anomaly Coop
-#include "coop/coop_levels.h" // Anomaly Coop
+#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode answers the binder's hook (docs/MODES.md section 4)
 extern MagicBox3 MagicMinBox(int iQuantity, const Fvector* akPoint);
 
 #pragma warning(push)
@@ -60,7 +60,7 @@ CGameObject::CGameObject()
 	m_bCrPr_Activated = false;
 	m_dwCrPr_ActivationStep = 0;
 	m_spawn_time = 0;
-	m_ai_location = (!g_dedicated_server || g_coop_headless) ? xr_new<CAI_ObjectLocation>() : 0;
+	m_ai_location = xr_new<CAI_ObjectLocation>();
 	m_server_flags.one();
 
 	m_callbacks = xr_new<CALLBACK_MAP>();
@@ -96,8 +96,7 @@ void CGameObject::Load(LPCSTR section)
 void CGameObject::reinit()
 {
 	m_visual_callback.clear();
-	if (!g_dedicated_server || g_coop_headless)
-		ai_location().reinit();
+	ai_location().reinit();
 
 	// clear callbacks	
 	for (CALLBACK_MAP_IT it = m_callbacks->begin(); it != m_callbacks->end(); ++it) it->second.clear();
@@ -385,12 +384,10 @@ BOOL CGameObject::net_Spawn(CSE_Abstract* DC)
 	}
 
 	reload(*cNameSect());
-	if (!g_dedicated_server || g_coop_headless)
-		CScriptBinder::reload(*cNameSect());
+	CScriptBinder::reload(*cNameSect());
 
 	reinit();
-	if (!g_dedicated_server || g_coop_headless)
-		CScriptBinder::reinit();
+	CScriptBinder::reinit();
 #ifdef DEBUG
 	if(ph_dbg_draw_mask1.test(ph_m1_DbgTrackObject)&&stricmp(PH_DBG_ObjectTrackName(),*cName())==0)
 	{
@@ -1112,7 +1109,9 @@ void CGameObject::shedule_Update(u32 dt)
 	// Msg							("-SUB-:[%x][%s] CGameObject::shedule_Update",smart_cast<void*>(this),*cName());
 	inherited::shedule_Update(dt);
 
-	if ((!g_dedicated_server || g_coop_headless) && coop::levels::logic_may_update(this)) // Anomaly Coop: a map server looks first
+	// Anomaly Coop: a map server looks first (its mode's binder_may_update). g_dedicated_server is set only for a server's process of
+	// this game, with g_coop_headless (x_ray.cpp; tests/test_mode_hooks.cpp mode_hooks_dedicated_means_headless), whose binders run.
+	if (!g_dedicated_server || coop::mode().binder_may_update(this))
 		CScriptBinder::shedule_Update(dt);
 }
 

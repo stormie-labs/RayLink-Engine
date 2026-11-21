@@ -162,7 +162,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="coop_host_console.h">
+    <ClInclude Include="..\xrGame\coop\srv\coop_host_console.h">
       <Filter>main</Filter>
     </ClInclude>
     <ClInclude Include="_d3d_extensions.h">
@@ -513,7 +513,7 @@
     <ClInclude Include="EngineThreading.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="coop_host_console.cpp">
+    <ClCompile Include="..\xrGame\coop\srv\coop_host_console.cpp">
       <Filter>main</Filter>
     </ClCompile>
     <ClCompile Include="defines.cpp">

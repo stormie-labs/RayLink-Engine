@@ -43,11 +43,16 @@ inline bool due(const Place& sent, uint64_t sent_at, const Place& now, uint64_t 
 // What this machine has of the target.
 struct Here
 {
+	constexpr Here() : level_object(false), map_authority(false) {}
+	constexpr Here(bool exists, bool is_online, bool is_held, bool has_object, bool computes_place)
+	    : known(exists), online(is_online), held(is_held), level_object(has_object), map_authority(computes_place)
+	{}
+
 	bool known = false; // a server entity with that id
 	bool online = false; // its m_bOnline
 	bool held = false; // in a holder (ID_Parent): online it goes with its holder
-	bool level_object = false; // a game object with that id on this level (Level().Objects)
-	bool map_authority = false; // this process computes its level (a map server)
+	bool level_object; // a game object with that id on this level (Level().Objects)
+	bool map_authority; // this process computes the target's place itself
 };
 
 enum class Take : uint8_t

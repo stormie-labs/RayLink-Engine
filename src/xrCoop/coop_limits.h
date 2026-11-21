@@ -182,17 +182,33 @@ constexpr RateRule kClientRateRules[] = {
 	// button of the "Co-op" window: 4 in a row, then one per second. A core message: Session takes the token itself
 	// (host_operator_command), before the length and the list are checked.
 	{Msg::OperatorCommand, 4, 1000},
+
+	// F5 (docs/VEHICLES.md sections 3 and 7; F5-VEH-4): a player's car, each row at about twice the honest top rate of its sender
+	// (tests/test_vehicle_state.cpp vehicle_state_rate_rows_are_twice_the_honest_rate). Co-op: the host's session checks them. Server:
+	// the world server's session checks them on the player's connection, before it tunnels them to the map server of his level (the
+	// trunk is not limited again).
+	// A seat request goes one at a time: the next one waits for the answer (or kAnswerTimeoutMs) and for kRequestMinIntervalMs = 250
+	// after the last (RequestTrack, coop_vehicle_input_rules.h; F, coop.vehicle.exit, the stand's console all go through it), so 4 a
+	// second at the most. 8 in a row, then 8 a second; the decider's trust check veh_request_rate writes the faster ones it lets through.
+	{Msg::VehicleReq, 8, 125},
+	// The driver's input: at a change no sooner than kInputMinIntervalMs = 33 after the last, and every kInputRepeatMs = 200 while he
+	// drives (InputSender::due), so 30 a second at the most (a turret's aim that moves every frame), 5 while nothing changes. 62.5 a
+	// second here, above the decider's own gate (RateGate: 40 a second after kInputBurst = 12, the trust check veh_input_rate), so a
+	// client between the two is written by the trust check before the session drops anything; 24 in a row, twice the gate's burst
+	// (a lag spike of 0.8 s of the fastest stream arrives whole).
+	{Msg::VehicleInput, 24, 16},
 };
 
-// Protocol 31: the slot ids a client may hold, 1 .. kMaxClientSlots (= kMaxPlayers: a world server's 8 clients, owner
-// 2026-11-13). Every peer check of the wire layouts and of the game is `peer < kMaxPeerSlots` (AvatarList, LevelMap, LoadWait,
-// DebugState, TransitionState, coop_monster_fx.cpp arrays, the loops of coop_ai.cpp / coop_alife.cpp / coop_items.cpp).
+// Protocol 31: the slot ids a client may hold, 1 .. kMaxClientSlots (= kMaxPlayers: a server's 16 clients, F5-SEAT-1). Every
+// peer check of the wire layouts and of the game is `peer < kMaxPeerSlots` (AvatarList, LevelMap, LoadWait, DebugState,
+// TransitionState, coop_monster_fx.cpp arrays, the loops of coop_ai.cpp / coop_alife.cpp / coop_items.cpp).
 constexpr uint32_t kMaxClientSlots = kMaxPeerSlots - 1;
-static_assert(kMaxClientSlots == kMaxPlayers, "a world server's seats that play are all clients");
+static_assert(kMaxClientSlots == kMaxPlayers, "a server whose seat plays no character fills the wire's seats with clients");
 
-// How many clients a host takes: `max_players` counts the seats that play, and the host's own seat is one of them only when
-// it plays (an ordinary host: max_players - 1 = 7; a world server's seat, SessionConfig::host_plays false, is not: 8). Never
-// more than the client slot ids. The one place of the capacity rule: Session's join check and its transport size use it.
+// How many clients a host takes: `max_players` counts the seats that play (the mode's start says it: co-op 8, the server 16),
+// and the host's own seat is one of them only when it plays (co-op: 8 - 1 = 7; a server's seat, SessionConfig::host_plays
+// false, is not: 16). Never more than the client slot ids. The one place of the capacity rule: Session's join check and its
+// transport size use it.
 inline uint32_t client_capacity(uint32_t max_players, bool host_plays)
 {
 	const uint32_t seats = host_plays ? (max_players > 0 ? max_players - 1 : 0) : max_players;

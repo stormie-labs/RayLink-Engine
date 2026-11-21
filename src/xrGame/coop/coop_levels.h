@@ -1,25 +1,24 @@
 // Anomaly Coop — split levels, "multilevel" (F3a, docs/SPLIT_LEVELS.md): the registry of who stands on which level.
 //
-// Every player may be on another map. The host's process is the world server: it holds the world, offline for every map, and
-// computes the level the host stands on. Every other level with players is computed by a background map server on the host's PC
+// Every player may be on another map (the server mode only: owner 2026-11-18, no hybrid). The world server holds the world, offline
+// for every map, and leads no level itself: every level with players is computed by a background map server on the world server's PC
 // (coop_mapserver.h): a client never computes anything, he mirrors the authority of his level. This module answers "which level is
 // this?" and "who is on it?" for the rest of the coop layer; the roles of a process (who may act as the world server, as the
 // authority of a map, as a player, as a mirror) are in xrCoop/coop_roles.h.
 //
 // The host keeps the table (xrCoop/coop_levels_rules.h Table) and sends it to the players and the map servers (LevelMap) when it
-// changes and every 5 s. The marks "online at a map server" are coop_levels_alife.cpp, the transfers coop_levels_xfer.cpp. With
-// coop_split_levels off nothing here runs and no LevelMap goes out: every question has the answer of a session with one level for
-// everybody.
+// changes and every 5 s. The marks "online at a map server" are coop_levels_alife.cpp, the transfers coop_levels_xfer.cpp. In the
+// co-op (no world server: split levels off) nothing here runs and no LevelMap goes out: every question has the answer of a session
+// with one level for everybody.
 //
-// Lua: coop.levels.split(), story_together(), my_level(), level_of_player(peer), players_on(level), led_by_host_process(level),
-// online_at_server(id), holder_of(id), recall(squad[, ms]); coop.is_world_server(), is_map_authority(), is_player(), is_mirror() (the host's process is the world server,
-// the authority of its map and a player; a client is a player and a mirror; a map server is the authority of its map).
-// Console: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status,
-// coop_levels_audit.
+// Lua: coop.levels.split(), my_level(), level_of_player(peer), players_on(level), online_at_server(id), holder_of(id),
+// recall(squad[, ms]); coop.is_world_server(), is_map_authority(), is_player(), is_mirror() (the co-op host's process is the world
+// server, the authority of its map and a player; a client is a player and a mirror; a map server is the authority of its map).
+// Console: coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit.
 #pragma once
 
-#include "xrCoop/coop_levels_logic.h"
-#include "xrCoop/coop_levels_wire.h"
+#include "xrCoop/srv/coop_levels_logic.h"
+#include "xrCoop/srv/coop_levels_wire.h"
 #include "xrCoop/coop_protocol.h"
 
 #include <string>
@@ -41,9 +40,7 @@ namespace levels
 // not repeated here.
 using LevelId = u16;
 
-// Game rules and machine settings (console variables; the rules are set per game by coop_game_schema, plan §3).
-extern int g_coop_split_levels; // 1 = every player on his own map, 0 = one map for the group, as in F3 (default)
-extern int g_coop_story_together; // 1 = the story levels are entered together (default), 0 = apart as any level
+// Machine settings (console variables).
 // 0..7, default 6 (xrCoop/coop_levels_dynamic.h says why not 7): the most background map servers the host's PC may run (its ceiling);
 // the cap in force is host_map_cap
 extern int g_coop_max_map_servers;
@@ -52,11 +49,10 @@ extern int g_coop_max_map_servers;
 extern int g_coop_mapserver_linger;
 // The two settings above are saved: the old defaults (3 servers, 60 s) of a machine that ran an earlier build move to build 50's, once.
 void settle_machine_settings();
-extern int g_coop_soft_host_move; // 1 = the host's move reloads nobody on a map server's level (default), 0 = everybody, as before
 
-// Split levels are on: the host's rule; a client knows it from the host's LevelMap (off until one comes).
+// A client learns whether levels are split from the world's Welcome and answers false until then.
+// The dedicated process answers true even before its session starts.
 bool split();
-bool story_together(); // the story levels are entered together (meaningful with split())
 // This process is a map server (coop_manager.h is_map_server): it computes its level and asks the world server for the rest.
 bool leads_my_level();
 
@@ -69,8 +65,6 @@ LevelId level_of_player(PeerId peer);
 // wire::kNoLevel when unknown.
 LevelId level_of_vertex(u16 game_vertex);
 LevelId level_of_object(u16 id);
-// The host's process leads `level` (it is the level the host stands on).
-bool led_by_host_process(LevelId level);
 // The name of a level, nullptr when the game has none.
 const char* level_name(LevelId level);
 // How many players of the session stand on `level` (the host among them); 0 outside a session.
@@ -108,9 +102,6 @@ u32 host_map_cap(PeerId mover = kInvalidPeer);
 u32 host_map_players_now();
 // Host: his character goes to `target` now.
 void host_player_moves(PeerId peer, LevelId target);
-// Host: the host himself goes to `level`: his seat goes first, so that a level he goes to needs no map server, and stays there until the
-// new world is up. wire::kNoLevel: he stays after all.
-void host_going_to(LevelId level);
 // Host: the levels that need a map server now, its players there (xrCoop/coop_levels_rules.h Table).
 std::vector<LevelId> host_map_levels();
 u32 host_map_players(LevelId level);
@@ -118,12 +109,6 @@ u32 host_map_players(LevelId level);
 std::vector<u32> host_players_on(LevelId level);
 // Host: everybody who is on `level` or on his way to it, and has a session (host_rejoin_level).
 std::vector<u32> host_players_of(LevelId level);
-// Host: how many map servers the world needs when the host stands on `level`.
-u32 host_servers_if_host_on(LevelId level);
-// Host: the host may go away alone through an exit to `level`: split levels are on and that level is not entered together.
-bool host_goes_alone(LevelId level);
-// Host: a player's seat is on his own level again, he loads it.
-void host_player_reloads(PeerId peer);
 // Host: LevelMap goes out at the next frame.
 void host_map_changed();
 // Host: the broadcasts of what a map server reported: that level's players have heard it from their map server (LevelEntity).
@@ -132,6 +117,9 @@ struct EchoOf
 	explicit EchoOf(LevelId level);
 	~EchoOf();
 };
+// The level an EchoOf names now, wire::kNoLevel outside one. Build 57 (S3): a spawn the world server sends later (its events go out
+// at its frame, coop_entities.cpp) keeps the EchoOf it was made under.
+LevelId echo_now();
 // Host: a new world came up, every mark of the old one is gone with it.
 void host_world_replaced();
 // Host: the table goes out now: a player is on his way to a level, its map server takes him from the table.
@@ -146,8 +134,7 @@ void install_client(Endpoint& e); // F3a T4: the client's (a remote client's ses
 void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void on_peer_left(PeerId id); // sync::on_peer_left
 void frame(); // main thread, every frame (sync::frame)
-void print_status(); // coop_status section (sync::print_status), console coop_levels_status
-void register_console(); // from coop::register_console_commands
+void print_status(); // coop_status section (sync::print_status), console srv_levels_status (srv/coop_srv_console.cpp)
 // Fills coop.levels and the role functions of coop.*; called by script::register_raw once the `coop` table exists.
 void register_lua(lua_State* L);
 
@@ -159,18 +146,19 @@ void xfer_host_frame();
 void xfer_client_frame();
 void xfer_host_connect(PeerId bridge); // a map server leads its level from now on
 void xfer_host_disconnect(PeerId bridge); // it does not: what it held comes home at its last state
-// The host's move (xrCoop/coop_soft_move.h, coop_xfer.h R13): a new simulator under the book that stays. End of its constructor: what the
-// map servers hold is marked away before its first update, and the journal of its save is not read.
-void xfer_host_carry_over();
-// A map server: the world server is away: nothing about the objects goes up but what has to (the stream, the bodies, the audit).
-void xfer_quiet(bool quiet);
 // The world server: what the map server of his level saw of a player's body, the last few seconds. False: nothing of late.
 struct BodyFacts
 {
 	bool fight = false;
 	bool talking = false;
+	// Build 57 (protocol 33): the NPC he talks to there, the world server's numbering; 0xffff when he talks to nobody (Lua
+	// coop.levels.talk_partner)
+	u16 partner = 0xffff;
 	u8 place = 0; // checkpoints::sources::Place
 	u16 source = 0xffff;
+	// Build 57 (owner 2026-11-18): the base whose ground he stands on, as the map server's geometry says, checked by the world
+	// server against its own tables when it came (checkpoints::sources::host_footing); kind none when nothing or refused.
+	checkpoint::base::Footing footing;
 };
 bool body_facts(u16 proxy, BodyFacts& out);
 void xfer_print_status();
@@ -208,7 +196,6 @@ void up_money(PeerId peer, s64 delta, bool trade); // a deal of a player of its 
 void up_tent(u16 tent, u16 character); // a tent it put up for a player of its level: after the tent's own spawn, in that order
 void up_stash(u16 character, bool things_stay); // his retirement here is over: after what became of his things, in that order
 // xrServer::PerformIDgen: this process takes new ids from its own slice (xrCoop/coop_levels_keeper.h leader_ids_of).
-bool leader_takes_ids();
 u16 leader_free_id();
 
 // --- coop_levels_alife.cpp, "online at a map server" on the host's ALife and the state of a transferred object
@@ -225,7 +212,6 @@ std::vector<u16> squads_at(PeerId bridge); // the world server: the squads that 
 // Host. May the map server of `level` take it now? It is a top-level object offline here, on that level.
 bool host_may_give(const CSE_ALifeDynamicObject* e, LevelId level);
 void host_mark(u16 id); // it leaves the host's offline simulation, no game object
-void host_mark_in_new_world(u16 id); // the same from the end of a simulator's constructor: no level is up yet (world_up), the registries are
 void host_unmark(u16 id, const std::vector<u8>& state); // it comes home with this state
 void host_bind_squads(u16 id); // an object of a map server came: a squad's members are bound as they come
 void host_apply_state(u16 id, const std::vector<u8>& state); // a state from its map server while it stays its

@@ -2505,6 +2505,27 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\xrCoop\coop_fight_fact.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\hostplay\coop_hostplay_steam.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_vehicles_ride.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_vehicles_state.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_progress.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_vehicles_client.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
+    <ClInclude Include="coop\coop_vehicles.h">
+      <Filter>Coop</Filter>
+    </ClInclude>
     <ClInclude Include="coop\coop_health_ledger.h">
       <Filter>Coop</Filter>
     </ClInclude>
@@ -2514,7 +2535,7 @@
     <ClInclude Include="coop\coop_debug.h">
       <Filter>Coop</Filter>
     </ClInclude>
-    <ClInclude Include="coop\coop_dedicated.h">
+    <ClInclude Include="coop\srv\coop_dedicated.h">
       <Filter>coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_monster_fx.h">
@@ -2523,7 +2544,7 @@
     <ClInclude Include="coop\coop_levels.h">
       <Filter>Coop</Filter>
     </ClInclude>
-    <ClInclude Include="coop\coop_levels_map.h">
+    <ClInclude Include="coop\srv\coop_levels_map.h">
       <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_game_settings.h">
@@ -2617,9 +2638,6 @@
       <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_world.h">
-      <Filter>Coop</Filter>
-    </ClInclude>
-    <ClInclude Include="coop\coop_world_server.h">
       <Filter>Coop</Filter>
     </ClInclude>
     <ClInclude Include="coop\coop_join.h">
@@ -7517,6 +7535,33 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\hostplay\coop_hostplay_steam.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_vehicles_ride.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_vehicles_state.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\srv\coop_srv_join.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_progress.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_vehicles_client.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\coop_vehicles_seat.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\srv\coop_srv_script.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\srv\coop_srv_console.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_health_ledger.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
@@ -7526,25 +7571,25 @@
     <ClCompile Include="coop\coop_debug.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_dedicated.cpp">
+    <ClCompile Include="coop\srv\coop_dedicated.cpp">
       <Filter>coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_monster_fx.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_trunk.cpp">
+    <ClCompile Include="coop\srv\coop_trunk.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_mapserver.cpp">
+    <ClCompile Include="coop\srv\coop_mapserver.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_mapserver_stats.cpp">
+    <ClCompile Include="coop\srv\coop_mapserver_stats.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_levels_xfer.cpp">
+    <ClCompile Include="coop\srv\coop_levels_xfer.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
-    <ClCompile Include="coop\coop_levels_alife.cpp">
+    <ClCompile Include="coop\srv\coop_levels_alife.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_levels.cpp">
@@ -7607,6 +7652,15 @@
     <ClCompile Include="coop\coop_requests.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
+    <ClCompile Include="coop\coop_mode.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\hostplay\coop_hostplay_mode.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
+    <ClCompile Include="coop\srv\coop_srv_mode.cpp">
+      <Filter>Coop</Filter>
+    </ClCompile>
     <ClCompile Include="coop\coop_events.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
@@ -7647,9 +7701,6 @@
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_world.cpp">
-      <Filter>Coop</Filter>
-    </ClCompile>
-    <ClCompile Include="coop\coop_world_server.cpp">
       <Filter>Coop</Filter>
     </ClCompile>
     <ClCompile Include="coop\coop_join.cpp">

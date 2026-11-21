@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "coop_alife.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_world.h"
 #include "coop_entities.h"
 #include "coop_join.h"
@@ -20,13 +21,17 @@ float observer_distance(const Fvector& pos)
 	const CSE_ALifeCreatureActor* actor = ai().alife().graph().actor();
 	// a map server's actor is a ghost: it watches nothing (plan §1.6), the players of its level do
 	float best = (actor && !ghost_actor()) ? actor->o_Position.distance_to(pos) : flt_max;
-	if (!is_map_authority())
+	const Mode& current = mode();
+	if (!mgr().active() || (!current.decides_world() && !current.leads_level()))
 		return best;
+
+	// A process that leads this level already has only its own peers in the proxy table.
+	const bool check_remote_seats = !current.leads_level();
 
 	for (u32 peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		const u16 proxy = join::proxy_of_peer(peer);
-		if (proxy == 0xffff || !levels::on_host_level(peer))
+		if (proxy == 0xffff || (check_remote_seats && current.where(peer) == Where::Away))
 			continue; // F3a multilevel: a player on another level watches nothing here, whatever his coordinates say
 		const CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
 		if (!e)
@@ -40,18 +45,18 @@ float observer_distance(const Fvector& pos)
 
 SwitchVote client_switch_vote(u16 id)
 {
-	if (!mgr().is_client())
+	if (!mgr().active() || mode().decides_world())
 		return SwitchVote::Default;
 	if (id == 0)
 		return SwitchVote::Online; // our actor
-	if (levels::leads_my_level())
+	if (mode().leads_level())
 		return levels::xfer_stock_rules(id) ? SwitchVote::Default : SwitchVote::Offline; // F3a: a map server's level is its own
 	return entities::client_wants_online(id) ? SwitchVote::Online : SwitchVote::Offline;
 }
 
 SwitchVote switch_vote(const CSE_ALifeDynamicObject* e)
 {
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 		return client_switch_vote(e->ID);
 	// The dedicated host's actor is a ghost (ghost_actor): it watches nothing, so observer_distance is flt_max for every object, the
 	// ghost itself included, and nothing brought it online. Without its object on the client of this process there is no g_actor,
@@ -60,7 +65,7 @@ SwitchVote switch_vote(const CSE_ALifeDynamicObject* e)
 	// (client_switch_vote); this one has nobody to vote for it.
 	if (g_coop_dedicated && e == ai().alife().graph().actor())
 		return SwitchVote::Online;
-	if (world::is_player_character(e) && !(is_map_authority() && join::host_player_in_world(e->ID)))
+	if (world::is_player_character(e) && !(mgr().active() && mode().decides_world() && join::host_player_in_world(e->ID)))
 		return SwitchVote::Offline; // W9: his player is not in the session (or still loading)
 	return SwitchVote::Default;
 }

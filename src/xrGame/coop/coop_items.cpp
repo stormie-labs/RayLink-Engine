@@ -1,9 +1,9 @@
 #include "stdafx.h"
 #include "coop_items.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
-#include "coop_levels.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_trade.h"
@@ -904,7 +904,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 			ii->m_fCondition = dequant(d.cond);
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
-		if (d.has_upgrades && !is_map_authority())
+		if (d.has_upgrades && !(mode().decides_world() || mode().leads_level()))
 			ii->m_upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
@@ -966,7 +966,7 @@ void send_state(CInventoryItem* item, const Blob& blob)
 {
 	Writer w(blob.size() + 48);
 	write_state(w, join::to_host(item->object_id()), item->object().cNameSect().c_str(), 0, blob);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		net::host_broadcast(Msg::ItemState, w);
 	else
 		net::client_send(Msg::ItemState, w);
@@ -1051,7 +1051,7 @@ void scan_local(bool send_all)
 	CActor* actor = Actor();
 	if (!actor || actor->getDestroy())
 		return;
-	const bool host = is_map_authority();
+	const bool host = mode().decides_world() || mode().leads_level();
 	xr_set<u16> present;
 	Blob blob;
 	for (PIItem item : actor->inventory().m_all)
@@ -1937,7 +1937,7 @@ void on_item_state(PeerId from, Reader& r)
 	const Op op = Op(r.u8());
 	if (!r.ok())
 		return;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		// Precaching a freshly loaded world: states and unloads made in the old one are dropped
 		// (the pump runs before join::frame() marks the peers as joining).
@@ -1948,10 +1948,10 @@ void on_item_state(PeerId from, Reader& r)
 			if (!hold_state_of_joining(from, r))
 				host_on_state(from, r);
 		}
-		else if (op == Op::SpawnAmmo && levels::on_host_level(from))
+		else if (op == Op::SpawnAmmo && mode().where(from) != Where::Away)
 			host_on_spawn_ammo(from, r); // this message reaches the world server and the map server of his level: the boxes are made at his body
 	}
-	else if (mgr().is_client() && op == Op::State)
+	else if (!mode().decides_world() && op == Op::State)
 	{
 		// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
 		// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
@@ -1973,7 +1973,7 @@ void host_on_peer_in_world(PeerId peer)
 	xr_vector<HeldState> held;
 	held.swap(it->second);
 	g_join_held.erase(it);
-	if (!is_map_authority() || !ai().get_alife() || Device.dwPrecacheFrame)
+	if (!(mode().decides_world() || mode().leads_level()) || !ai().get_alife() || Device.dwPrecacheFrame)
 		return; // another world meanwhile: what he said belongs to the one before (on_item_state drops the same)
 	for (const HeldState& h : held)
 	{
@@ -2037,7 +2037,7 @@ void frame()
 		scan_now = g_scan_now;
 		g_scan_now = false;
 	}
-	const bool host = is_map_authority();
+	const bool host = mode().decides_world() || mode().leads_level();
 	const bool live_client = mgr().is_live_client();
 	if ((!host && !live_client) || !g_pGameLevel || !ai().get_alife())
 	{
@@ -2113,7 +2113,7 @@ void print_status()
 	      "%llu authority (%llu kept ours), %llu ignored, %u pending (%llu dropped)",
 	    s.sent, s.foreign_sent, s.spawns_sent, s.received, s.applied, s.authority_applied, s.authority_skipped,
 	    s.ignored, (u32)g_pending.size(), s.pending_dropped);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		u32 stuck = 0;
 		for (const auto& it : g_owned)
@@ -2132,10 +2132,10 @@ void print_status()
 	}
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		::Msg("[coop]   items of joining players: %llu state(s) kept, %llu taken when the join ended (%u peer(s) waiting)",
 		    s.join_held, s.join_taken, (u32)g_join_held.size());
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 		::Msg("[coop]   items in: %llu states dropped before live (R2 I2), %llu take changes kept over the host's push "
 		      "(%u waiting)",
 		    s.dropped_before_live, s.take_kept, (u32)g_take_base.size());
@@ -2584,10 +2584,9 @@ bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob)
 	return true;
 }
 
+// The map server's ItemState callback, also called by its loot watcher.
 void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& blob)
 {
-	if (!is_map_server())
-		return;
 	Writer w(blob.size() + section.size() + 16);
 	write_state(w, id, section.c_str(), 0, blob); // the numbering of host_send_state: a map server's players read its ids
 	net::host_broadcast(Msg::ItemState, w);
@@ -2608,9 +2607,14 @@ bool host_take_level_state(u16 id, const char* section, const u8* data, size_t s
 		why = "another section";
 		return false;
 	}
-	if (g_owned.count(id))
+	// A player's item is his word (ItemState), nobody else's: one a player of this world holds now, as host_access says. Not
+	// g_owned: it learns a move a frame late (host_track_proxies), and a map server tells the wear of what a player put down
+	// (a death stash, a drop) in the frame of the move, right behind its Parent: the entry of an item that has just left his
+	// character is still there (stand b57g feed_server: a death stash on a map server's level, 8 refusals).
+	const u16 root = entity_root(e);
+	if (root == 0 || join::is_proxy(root))
 	{
-		why = "a player's item"; // its owner says its state (ItemState), nobody else
+		why = "a player's item";
 		return false;
 	}
 	ItemData d;

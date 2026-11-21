@@ -17,6 +17,7 @@
 #include "level.h"
 #include "CarWeapon.h"
 #include "HUDManager.h"
+#include "coop/coop_vehicles_client.h" // Anomaly Coop (F5-VEH-3): a player's copy of a car sends its keys to the decider
 
 void CCar::OnMouseMove(int dx, int dy)
 {
@@ -34,6 +35,7 @@ void CCar::OnMouseMove(int dx, int dy)
 		float d = ((psMouseInvert.test(1)) ? -1 : 1) * float(dy) * scale * psMouseSensVerticalK * 3.f / 4.f;
 		C->Move((d > 0) ? kUP : kDOWN, _abs(d));
 	}
+	coop::vehicles::client_mouse_aim(this); // Anomaly Coop (F5-VEH-3): a player's copy: the aim goes to the decider
 	if (m_car_weapon && m_car_weapon->IsActive())
 	{
 		Fvector pos = active_camera->Position();
@@ -154,6 +156,7 @@ void CCar::vfProcessInputKey(int iCommand, bool bPressed)
 void CCar::OnKeyboardPress(int cmd)
 {
 	if (Remote()) return;
+	if (coop::vehicles::client_key(this, cmd, true)) return; // Anomaly Coop (F5-VEH-3): a player's copy: the drive keys go to the decider
 
 #ifdef CAR_NEW
     switch (cmd)
@@ -217,6 +220,7 @@ void CCar::OnKeyboardPress(int cmd)
 void CCar::OnKeyboardRelease(int cmd)
 {
 	if (Remote()) return;
+	if (coop::vehicles::client_key(this, cmd, false)) return; // Anomaly Coop (F5-VEH-3): a player's copy: the drive keys go to the decider
 
 #ifdef CAR_NEW
     switch (cmd)

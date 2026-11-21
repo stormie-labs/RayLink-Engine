@@ -786,7 +786,7 @@ private:
 };
 
 // Host runs only on the world server, level also on a map server; owner and view run everywhere; none runs nowhere.
-inline bool runs_here(Domain d, bool is_host, bool leads_level = false)
+inline bool runs_here(Domain d, bool is_host, bool leads_level)
 {
 	switch (d)
 	{
