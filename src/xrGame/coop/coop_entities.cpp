@@ -3,6 +3,7 @@
 #include "coop_instrument.h"
 #include "attachable_item.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
@@ -10,6 +11,7 @@
 #include "coop_sync.h"
 #include "coop_remote.h"
 #include "coop_requests.h"
+#include "coop_script.h" // F4 G3-1c: script::note_released
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
@@ -71,6 +73,8 @@ struct HostEvent
 	HostEventKind kind;
 	u16 id;
 	bool online;
+	// Build 57 (S3): a spawn of what a map server reported goes out under its EchoOf (host_spawn_from_leader); none for the rest
+	u16 echo = levels::wire::kNoLevel;
 };
 // Filled from ALife/server hooks (game thread or main thread, never concurrently with frame()).
 xr_vector<HostEvent> g_host_events;
@@ -79,7 +83,7 @@ u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_s
 u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
 
 // F3a multilevel: online here, or "online at a client" (coop_levels_alife.cpp): a player of the host's level hears the first only.
-bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !levels::online_at_server(e->ID); }
+bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !mode().online_elsewhere(e->ID); }
 
 void write_packet(Writer& w, const NET_Packet& p)
 {
@@ -188,7 +192,15 @@ void host_process_events()
 		{
 		case HostEventKind::Registered:
 			if (CSE_ALifeDynamicObject* e = ai().alife().objects().object(ev.id, true))
-				host_send_spawn(e);
+			{
+				if (ev.echo == levels::wire::kNoLevel)
+					host_send_spawn(e);
+				else
+				{
+					const levels::EchoOf echo(ev.echo); // that level's players have it from their map server
+					host_send_spawn(e);
+				}
+			}
 			break;
 		case HostEventKind::Released:
 		{
@@ -751,7 +763,7 @@ void host_reconcile()
 	reconcile::write(w, reconcile::hash_bucket(bucket, rows));
 	for (const PeerInfo& p : peers)
 		if (peer_is_in_world(p))
-			if (levels::passes_to(Msg::EntityHash, p.id)) // F3a multilevel: a digest of the host's level's stream
+			if (mode().reaches(p.id, Msg::EntityHash)) // F3a multilevel: a digest of the host's level's stream
 				net::host_send(p.id, Msg::EntityHash, w);
 	++g_rc.digests;
 }
@@ -759,7 +771,7 @@ void host_reconcile()
 void host_on_resync(PeerId from, Reader& r)
 {
 	const u8 bucket = r.u8();
-	if (!is_map_authority() || !r.ok() || bucket >= xfer::kBuckets)
+	if (!(mode().decides_world() || mode().leads_level()) || !r.ok() || bucket >= xfer::kBuckets)
 		return;
 	for (const RosterAsk& ask : g_rc_asked)
 		if (ask.peer == from && ask.bucket == bucket)
@@ -1074,7 +1086,11 @@ void client_on_spawn(PeerId, Reader& r)
 	const u16 id = join::to_local(id_host);
 	const u16 parent_host = r.u16();
 	const u16 parent = parent_host == kNoId ? kNoId : join::to_local(parent_host);
-	const bool online = r.boolean();
+	// 0 offline, any other byte online at the sender (as Reader::boolean read it); build 57 (protocol 33): 2 = online at the
+	// authority of the level I stand on, which the world server's trunk writes into a spawn of my level's map server
+	// (xrCoop/coop_levels_wire.h mark_spawn_of_your_level). A co-op host writes 0 or 1.
+	const u8 online_word = r.u8();
+	const bool online = online_word != 0;
 	Fvector pos, ang;
 	u32 node;
 	u16 graph_id;
@@ -1181,15 +1197,16 @@ void client_on_spawn(PeerId, Reader& r)
 	// F3a: on the world server a holder that a map server took is online by its flag alone (host_mark): that is no holder online here.
 	// Build 51: without a valid game vertex register_object put it into no level registry (CALifeGraphRegistry::add), and
 	// update_switch walks that registry only: a phantom of level.spawn_item never came online here. The host's flag speaks
-	// of this level only on a mirror that stands on the host's level (not on the world server, not on a map server).
-	// Known limit (split levels): a player on a level that a MAP SERVER leads gets this message twice and cannot tell the
-	// two apart: the map server's own (host_records there, up the trunk in a Tunnel, its flag is about his level) and the
-	// world server's (host_records there too, reaches_every_level, its flag is the world server's mark of a level it does
-	// not run). trunk_host_on_tunnel re-sends both from kHostPeer with the same layout and no level, and their order is not
-	// fixed. So such a free entity without a game vertex stays on the vote there (the phantom may stay unseen); logged.
+	// of this level only on a mirror that stands on the level of player 0, the co-op host (not on the world server, which plays
+	// nobody and is on no map of LevelMap, not on a map server), or when the byte says so.
+	// Build 57, S3 (TZ 6.3, the psy phantoms of a bloodsucker unseen on a map server's level): a player on a level that a map
+	// server leads got this message twice and could not tell the two apart: the map server's own (up the trunk in a Tunnel, its
+	// flag about his level) and the world server's copy (its flag offline there), both from kHostPeer in no fixed order, so a
+	// free entity without a game vertex stayed on the vote, unseen. Now the world server passes the map server's on marked
+	// (online_word 2, coop_trunk.cpp) and sends that level's players no copy of its own (host_spawn_from_leader).
 	const bool in_level_registry = ai().game_graph().valid_vertex_id(e->m_tGraphID);
-	const bool flag_of_this_level =
-	    is_mirror() && (!levels::split() || levels::led_by_host_process(levels::my_level()));
+	const bool flag_of_this_level = is_mirror() &&
+	    (online_word == levels::wire::kSpawnOnlineAtYourLevel || mode().where(kHostPeer) == Where::Here);
 	// Builds 52-54 (issue 1293): OnlineNow ran for squads too. A squad of the host has no game vertex here as a rule,
 	// it comes online with its members (register_member, apply_group_switch), and a wire squad's members are ids
 	// with no object yet: its own switch_online either met R_ASSERT(!m_bOnline) or walked a null member. Only an
@@ -1562,7 +1579,10 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 
 void install_server(Session& s)
 {
-	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (is_map_authority()) host_on_entity_request(from, r); });
+	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) {
+		if (mode().decides_world() || mode().leads_level())
+			host_on_entity_request(from, r);
+	});
 	s.on(Msg::EntityResync, &host_on_resync);
 }
 
@@ -1648,8 +1668,20 @@ bool write_entity(Writer& w, CSE_ALifeDynamicObject* e)
 
 void host_spawn_from_leader(Reader& r)
 {
-	ApplyGuard guard;
-	client_on_spawn(kHostPeer, r);
+	Reader look(r.cursor(), r.remaining());
+	const u16 id = join::to_local(look.u16());
+	const size_t before = g_host_events.size();
+	{
+		ApplyGuard guard;
+		client_on_spawn(kHostPeer, r);
+	}
+	// Build 57, S3 (TZ 6.3, the psy phantoms): the players of the level of that map server have its own spawn (up the trunk, marked
+	// online at their level: coop_trunk.cpp). This world's copy goes out at the frame, after the EchoOf of the report is over: it
+	// keeps it, so they do not get the copy too (it said offline here, and coming first it left a phantom offline for good).
+	const u16 echo = levels::echo_now();
+	for (size_t i = before; i < g_host_events.size(); ++i)
+		if (g_host_events[i].kind == HostEventKind::Registered && g_host_events[i].id == id)
+			g_host_events[i].echo = echo;
 }
 
 void host_send_place(PeerId to, CSE_ALifeDynamicObject* e)
@@ -1677,23 +1709,31 @@ void host_collect_online(xr_vector<u16>& out)
 	}
 }
 
-bool host_records() { return is_map_authority() && !(is_map_server() && g_applying); }
+bool host_records()
+{
+	return mgr().active() && (mode().decides_world() || (mode().leads_level() && !g_applying));
+}
 
 void host_on_entity_registered(CSE_ALifeDynamicObject* e)
 {
 	if (host_records() && e)
 		g_host_events.push_back({HostEventKind::Registered, e->ID, false});
 	if (e)
-		levels::up_spawned(e->ID); // F3a: a map server tells the world server
+	{
+		if (LevelSide* side = mode().level())
+			side->level_entity_up(EntityUp::Spawned, e->ID, kNoId);
+	}
 }
 
 void host_on_entity_released(u16 id)
 {
+	script::note_released(id); // F4 G3-1c: a weapon rider that came before this release never reaches a same-name replacement
 	items::forget_item(id);
 	syncapi::on_entity_destroyed(id); // F2 T14: its coop.sync scope goes (host, single player; any game thread)
 	if (host_records())
 		g_host_events.push_back({HostEventKind::Released, id, false});
-	levels::xfer_on_released(id); // F3a: a map server tells the world server
+	if (LevelSide* side = mode().level())
+		side->level_entity_up(EntityUp::Released, id, kNoId);
 }
 
 void host_on_switch(CSE_ALifeDynamicObject* e, bool online)
@@ -1738,7 +1778,7 @@ void on_client_live()
 
 void reconcile_frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		host_reconcile();
 	else if (mgr().is_live_client())
 		client_reconcile();
@@ -1965,7 +2005,7 @@ bool drive_mirror(CGameObject* obj)
 
 void frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		// Level-change review: what the engine recorded while the world was not up belongs to a world that is gone, or is
 		// being built (every client rejoins from the new world's save): an id of the old one names another object in the
@@ -1985,7 +2025,7 @@ void print_status()
 {
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);

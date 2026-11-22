@@ -14,13 +14,15 @@
 #include "coop_autosave.h"
 #include "coop_ai.h" // scheduler viewers
 #include "coop_levels.h" // F3a
-#include "coop_dedicated.h" // plan 12
+#include "srv/coop_dedicated.h" // plan 12
 #include "coop_debug.h" // protocol 29
 #include "coop_items.h"
 #include "coop_lua_errors.h" // 2026-11: coop_lua_errors
 #include "coop_money.h" // its commands are registered here, before user.ltx is read
 #include "coop_story.h" // the same: coop_share_rewards, coop_tasks_resync
+#include "coop_vehicles.h" // F5: the stand's vehicle commands
 #include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_mode.h" // S4: the layers' own commands
 
 #include <cstdlib>
 
@@ -244,11 +246,13 @@ void register_console_commands()
 	autosave::register_console();
 	presence::register_console();
 	npc_ai::register_console(); // scheduler viewers: coop_viewer_range, coop_viewer_frame_radius
-	levels::register_console(); // F3a: coop_split_levels, coop_story_together, coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit
+	register_layers_console(); // S4 (A-S4H): the layers' own: the server's srv_max_map_servers, srv_mapserver_linger, srv_map_servers_rev,
+	                           // srv_levels_status, srv_levels_audit and their old coop_* names (srv/coop_srv_console.cpp)
 	mapserver_stats_register_console(); // F3a: coop_mapserver_stats
 	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
 	debug::register_console(); // protocol 29: coop_debug, coop_dbg
 	lua_errors::register_console(); // 2026-11: coop_lua_errors (Lua errors survived in a session)
+	vehicles::register_console(); // F5: coop_vehicle_enter, coop_vehicle_drive, coop_vehicle_exit, coop_vehicle_status
 	// Registered at sync::init until build 46: later than user.ltx is read, so each start said "Unknown command" for all eight.
 	money::register_commands(); // coop_money_*
 	story::init(); // coop_share_rewards, coop_tasks_resync: its init is the registration, once per process

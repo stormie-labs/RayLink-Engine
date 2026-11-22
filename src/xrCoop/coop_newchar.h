@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "coop_protocol.h"
-#include "coop_world_stage.h"
+#include "srv/coop_world_stage.h"
 
 namespace coop
 {
@@ -163,7 +163,9 @@ static_assert(world_stage::kMaxLoadout == CharChoiceMsg::kMaxBuy, "a loadout of 
 
 struct CreatorFacts
 {
-	bool host_rights = false; // PeerInfo::host_rights: the operator's token, loopback only (coop_operator.h)
+	constexpr CreatorFacts() : host_rights(false) {}
+
+	bool host_rights; // PeerInfo::host_rights: the operator's token, loopback only (coop_operator.h)
 	bool has_proxy = false; // his key has a character in this world already: he returns, found by key
 	bool creator = false; // the world's record has a `creator`
 	bool used = false; // ... and it was made into a character once already

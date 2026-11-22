@@ -946,11 +946,13 @@ public:
 		HMONITOR h = ResolveSelectedMonitor();
 		if (!h)
 		{
-			POINT p;
+			POINT p{};
 			GetCursorPos(&p);
 			h = MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY);
 		}
 
+		LPCSTR caller = Console->ScriptCaller();
+		Msg("* vid_monitor: live request %s from %s", args, caller[0] ? caller : "engine/console");
 		if (!Device.ChangeOutputMonitor(h))
 			Msg("! vid_monitor: live switch unavailable; restart to apply '%s'", args);
 	}

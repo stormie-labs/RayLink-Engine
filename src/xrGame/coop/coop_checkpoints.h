@@ -21,7 +21,8 @@
 //                    {u8 what, u8 reason} follow; it goes to the claimant only and the mirror does not change: his
 //                    engine calls coop_checkpoint_refused (coop_checkpoint_sources.h).
 // Callback (owner, and everyone with the group view on; the host too):
-//   coop_checkpoint_changed(local_id, kind, source_local_id or -1, rollback, level or nil). Kind "none" (source -1,
+//   coop_checkpoint_changed(local_id, kind, source_local_id or -1, rollback, level or nil, base: "bed" | "base" | "none" | nil
+//   (Build 57: which base a Rest record is, sources::record_base)). Kind "none" (source -1,
 //   level nil) means the player has no checkpoint any more for this machine: rolled back to nothing, his character
 //   gone, or no longer shared (the group view turned off). The callback queue is shared and bounded, a dropped
 //   callback is not sent again: Lua re-reads coop.checkpoint.get.
@@ -61,7 +62,7 @@ void register_lua(lua_State* L);
 // A new camp for a character: he is a player's (or the host), alive, the record is valid, on this level and on a
 // vertex of its AI map. Written through to the character's custom data.
 // `elsewhere`: a record from the authority of another level; this process has not the AI map to check it against.
-bool host_set(u16 character, const checkpoint::Record& r, bool elsewhere = false);
+bool host_set(u16 character, const checkpoint::Record& r, bool elsewhere);
 // The object `source` is gone: every slot with a record from it rolls back (owner / group told, rollback = true).
 void host_source_lost(u16 source);
 // The arrival point of a level change (kind Arrival, no source; no level check: it is on the next level). The host's

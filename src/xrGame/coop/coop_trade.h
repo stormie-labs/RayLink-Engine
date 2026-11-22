@@ -101,6 +101,8 @@ int lua_search_window(lua_State* L);
 // container changed elsewhere, a trade answer arrived or a container move was not applied.
 // True: the caller refreshes prices, weights and money labels (UpdateItemsPlace).
 bool refresh_actor_menu(CUIActorMenu& menu);
+// G6-3, CUIActorMenu::CheckDistance: true keeps the trade window of a trading computer's permit open beyond 3 m.
+bool keeps_trade_window(CInventoryOwner* partner);
 // Client: the host's state of a world item came (F1): a window open on `holder` (local numbering, the item's top holder)
 // shows its bars and prices again. Teammates' items change with every shot: the rest is no business of a window.
 void client_on_item_state(u16 holder);

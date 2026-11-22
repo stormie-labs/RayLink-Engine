@@ -141,11 +141,18 @@ const char* msg_name(Msg type)
 	case Msg::MapServerOrder: return "MapServerOrder";
 	case Msg::LoadWait: return "LoadWait";
 	case Msg::LoadReady: return "LoadReady";
+	case Msg::LevelJournal: return "LevelJournal"; // R32, protocol 34
+	case Msg::LevelJournalAck: return "LevelJournalAck";
 
 	case Msg::ScriptEvent: return "ScriptEvent";
 	case Msg::DebugState: return "DebugState";
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
+
+	case Msg::VehicleReq: return "VehicleReq"; // F5
+	case Msg::VehicleSeat: return "VehicleSeat";
+	case Msg::VehicleInput: return "VehicleInput";
+	case Msg::VehicleState: return "VehicleState";
 	}
 
 	// Unknown value: format into a small rotating buffer so several calls can live in one log line.
@@ -222,8 +229,11 @@ MsgSender msg_sender(Msg type)
 	case Msg::LevelBrain:
 	case Msg::LevelResync:
 	case Msg::MapServerOrder:
+	case Msg::LevelJournalAck: // R32: the world server's answer to one bridge's journal
 	case Msg::LoadWait: // F3a: the barrier of a simultaneous load, the world server's word
 	case Msg::DebugState: // protocol 29: only the world server holds the debug state
+	case Msg::VehicleSeat: // F5: the decider of the level seats, releases and refuses
+	case Msg::VehicleState: // F5: the decider's car state to every copy
 	case Msg::StateDump: return MsgSender::HostOnly;
 
 	// a client's requests and reports
@@ -256,6 +266,8 @@ MsgSender msg_sender(Msg type)
 	case Msg::LevelMove: // F3a: a player asks to leave his level
 	case Msg::LoadReady: // F3a: a player's loading screen is up
 	case Msg::EntityResync: // a client's digest of a bucket differs
+	case Msg::VehicleReq: // F5: a player asks for a seat or out
+	case Msg::VehicleInput: // F5: the driver's keys, the decider applies them
 	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
 
 	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender
@@ -284,6 +296,7 @@ MsgSender msg_sender(Msg type)
 	case Msg::LevelEntity:
 	case Msg::LevelXferUp:
 	case Msg::LevelHash:
+	case Msg::LevelJournal: // R32: the map server's facts, in order
 	case Msg::MapServerState: return MsgSender::TrunkOnly;
 
 	// core messages: the Session's own dispatch checks them
@@ -321,6 +334,17 @@ const char* reject_reason_name(RejectReason r)
 	case RejectReason::Malformed: return "Malformed";
 	}
 	return "Unknown";
+}
+
+const char* session_mode_name(SessionMode mode)
+{
+	switch (mode)
+	{
+	case SessionMode::Coop: return "coop";
+	case SessionMode::Server: return "server";
+	case SessionMode::None: break;
+	}
+	return "none";
 }
 
 // ---------------------------------------------------------------- manifest
@@ -513,6 +537,7 @@ void WelcomeMsg::write(Writer& w) const
 	w.u32(max_players);
 	w.u32(world_epoch);
 	w.u8(flags); // protocol 31
+	w.u8(static_cast<uint8_t>(mode)); // protocol 33
 }
 
 bool WelcomeMsg::read(Reader& r)
@@ -523,7 +548,17 @@ bool WelcomeMsg::read(Reader& r)
 	max_players = r.u32();
 	world_epoch = r.u32();
 	flags = r.u8();
-	return r.ok() && (flags & ~uint8_t(Known)) == 0;
+	const uint8_t raw_mode = r.u8(); // protocol 33: the host's word, checked before it becomes an enum
+	mode = SessionMode::None;
+	if (!r.ok() || (flags & ~uint8_t(Known)) != 0)
+		return false;
+	if (raw_mode != static_cast<uint8_t>(SessionMode::Coop) && raw_mode != static_cast<uint8_t>(SessionMode::Server))
+		return false;
+	const SessionMode said = static_cast<SessionMode>(raw_mode);
+	if (said != session_mode_of_seat((flags & HostSeatPlays) != 0))
+		return false;
+	mode = said;
+	return true;
 }
 
 void PeerListEntry::write(Writer& w) const

@@ -564,6 +564,10 @@ public:
 	virtual void on_before_register();
 	void on_after_game_load();
 	bool coop_bind_members(bool forget);
+	// Anomaly Coop (R32 W3): the world server applies a map server's Joined / Left of a squad it writes: what register_member and
+	// unregister_member do, without switching anything online in the world. False: nothing changed (no such living member).
+	bool coop_join_member(ALife::_OBJECT_ID member_id);
+	bool coop_leave_member(ALife::_OBJECT_ID member_id);
 	virtual bool synchronize_location();
 	virtual void try_switch_online();
 	virtual void try_switch_offline();

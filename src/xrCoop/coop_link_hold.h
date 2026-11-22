@@ -17,6 +17,16 @@ namespace link_hold
 // last arm at most; a crash releases the hold at once (coop_manager.cpp on_crash).
 constexpr uint32_t kLoadHoldMs = 120000;
 
+// A player's machine that has just gone live (kSettleMs): the level's online objects come to it only now (Server: the map
+// server's, through the world server; Co-op: the host's), and one frame of them (their visuals and weapon textures, the
+// net_spawn of their scripts, on the worker thread the main thread joins before its network pump) can stall past the
+// silence timeout. b57h Server stand 2026-11-21 (feed_server): a GAMMA client, live on l05_bar at 10:53:15, ran one frame
+// from about 10:53:26.5 to 10:53:46; its hold had gone with the precache and the world server dropped it after its 10 s.
+// A hang in this stretch goes silent kLoadHoldMs after its last frame, as in a load; a crash at once (the sealed hold).
+constexpr uint32_t kSettleMs = 60000;
+// FrameState::live_ms of a machine that is no live player (not live yet, a host, a server's ghost).
+constexpr uint32_t kNotLive = UINT32_MAX;
+
 // What the frame pump (Manager::frame, once per frame) sees.
 struct FrameState
 {
@@ -27,7 +37,12 @@ struct FrameState
 	// stage before the crash dialog stops it; a hold armed there kept the crashed player "connected" for kLoadHoldMs
 	// (review of the live fixes, 2026-10-23). For good: nothing holds the link after a crash.
 	bool crashed = false;
+	// How long this machine has played live in the session (kNotLive: not live, or no player plays here).
+	uint32_t live_ms = kNotLive;
 };
+
+// The first stretch of play after going live: the link stays held (kSettleMs).
+constexpr bool settling(uint32_t live_ms) { return live_ms < kSettleMs; }
 
 // A load stage (on_blocking_work) may arm the hold: not after a crash.
 constexpr bool may_arm(bool crashed) { return !crashed; }
@@ -36,10 +51,11 @@ constexpr bool may_arm(bool crashed) { return !crashed; }
 // network, and from now on a stall (a hang, a crash) must look like silence to the peers.
 // The last load step is not the end of a load: the first frames after it (precache, the first update of every
 // script, a client's role swap until it is live) can each stall longer than the silence timeout. Live check
-// 2026-10-23: a GAMMA client was dropped by the host there, after its hold was released by its first frame.
+// 2026-10-23: a GAMMA client was dropped by the host there, after its hold was released by its first frame. Nor is
+// going live: the first frames of play bring the level's online objects (settling, kSettleMs).
 inline bool keep_held(const FrameState& s)
 {
-	return may_arm(s.crashed) && (s.load_steps_queued || s.precache_frames || s.joining_world);
+	return may_arm(s.crashed) && (s.load_steps_queued || s.precache_frames || s.joining_world || settling(s.live_ms));
 }
 
 // The hold of one transport (net::Transport) as one atomic word: 0 = released, kSealed = released for good (this

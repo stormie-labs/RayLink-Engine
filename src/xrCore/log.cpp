@@ -8,6 +8,7 @@
 #include "string_concatenations.h"
 
 #include "../xrCoop/coop_log_keep.h" // Anomaly Coop: the logs of the last runs (pure rules, tests/test_log_keep.cpp)
+#include "../xrCoop/coop_log_close.h" // Anomaly Coop (TZ R38): the close of the log (pure rules, tests/test_log_close.cpp)
 
 static xrLogger* theLogger = nullptr;
 XRCORE_API xr_queue <xrLogger::LogRecord>* xrLogger::logData;
@@ -184,8 +185,16 @@ void xrLogger::SimpleMessage(LPCSTR Message, u32 MessageSize /*= 0*/)
 	default:		break;
 	}
 
+	// Anomaly Coop (TZ R38): the log is closed: the line goes straight into the file, with no time stamp (coop_log_close.h). Before,
+	// it was dropped, and a failure in the end of the process told nobody why it ended with exit code 1.
+	if (coop::log_close::route(bIsAlive) == coop::log_close::Route::Late)
+	{
+		InternalWriteLate(Message);
+		return;
+	}
+
 	xr_string msgToLog = Message;
-	if (logTimestamps)
+	if (coop::log_close::stamp(logTimestamps != FALSE, bIsAlive))
 	{
 		xr_string t = msgToLog;
 		xr_string c = "";
@@ -198,13 +207,20 @@ void xrLogger::SimpleMessage(LPCSTR Message, u32 MessageSize /*= 0*/)
 		msgToLog = c + "[" + timeInHMSMMM() + "] " + t;
 	}
 
-	xrCriticalSectionGuard guard(&logDataGuard);
-	if (bIsAlive)
+	bool queued = false;
 	{
-		logData->emplace(LogRecord(msgToLog.c_str(), (u32)msgToLog.size()));
-		UnpauseLogging();
+		xrCriticalSectionGuard guard(&logDataGuard);
+		if (bIsAlive)
+		{
+			logData->emplace(LogRecord(msgToLog.c_str(), (u32)msgToLog.size()));
+			queued = true;
+		}
 	}
-	
+	// Anomaly Coop (TZ R38): out of logDataGuard: in immediate mode this thread prints now, and a printer takes logPrintGuard first
+	if (queued)
+		UnpauseLogging();
+	else
+		InternalWriteLate(msgToLog.c_str()); // the log closed meanwhile
 }
 
 void xrLogger::OpenLogFile()
@@ -291,18 +307,60 @@ void xrLogger::RemoveLogCallback(LogCallback logCb)
 void xrLogger::InternalCloseLog()
 {
 	SimpleMessage("[xrLogger] InternalCloseLog called, terminating thread");
-	bIsAlive = false;
 
-	InternalPrintAllRecords();
-	InternalFlushLog();
+	IWriter* tempCopy = nullptr;
+	{
+		// Anomaly Coop (TZ R38): the log thread prints under logPrintGuard. Before, both threads drained the queue at once: the later
+		// one could pop an empty queue, and the file could be closed under a record the log thread was writing
+		xrCriticalSectionGuard print(&logPrintGuard);
+		bIsAlive = false; // from here a line goes straight into the file (InternalWriteLate, it waits for this guard)
 
-	IWriter* tempCopy = (IWriter*)logFile;
-	logFile = nullptr;
+		InternalPrintAllRecords();
+		InternalFlushLog();
+
+		// Anomaly Coop: the log thread flushes on its own now (LogThreadEntry, kTailFlushMs) and reads the file under this guard:
+		// a flush of it is over before the file goes, or sees none
+		xrCriticalSectionGuard g(logFlushGuard);
+		tempCopy = (IWriter*)logFile;
+		logFile = nullptr;
+	}
 
 	if (tempCopy != nullptr)
 		FS.w_close(tempCopy);
 
 	UnpauseLogging();
+}
+
+// Anomaly Coop (TZ R38): a line after the close, at the end of the file. Win32 calls and nothing of the engine: it runs in the CRT's
+// exit and the DLLs' detach, after the FS, the memory manager and the C++ locale are gone. One line at a time (logPrintGuard: also
+// after the close's own flush, so the order in the file holds).
+void xrLogger::InternalWriteLate(LPCSTR text)
+{
+	if (!text || !bFileOpened || !logFileName[0])
+		return;
+	try
+	{
+		xrCriticalSectionGuard print(&logPrintGuard);
+		if (IWriter* open = (IWriter*)logFile)
+		{
+			// the close is on this very thread (a log callback of its last drain): the file is still the writer's, its buffer first
+			const std::string bytes = coop::log_close::late_text(text, false);
+			open->w(bytes.data(), u32(bytes.size()));
+			return;
+		}
+		const std::string bytes = coop::log_close::late_text(text, !bLateWritten);
+		const HANDLE file = CreateFileA(logFileName, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE)
+			return;
+		DWORD written = 0;
+		if (WriteFile(file, bytes.data(), DWORD(bytes.size()), &written, nullptr))
+			bLateWritten = true;
+		CloseHandle(file);
+	}
+	catch (...)
+	{
+	}
 }
 
 xrLogger::xrLogger()
@@ -397,18 +455,19 @@ void xrLogger::InternalOpenLogFile()
 	}
 	logFile = FS.w_open(logFileName);
 	CHECK_OR_EXIT(logFile, "Can't create log file");
+	bFileOpened = true; // Anomaly Coop (TZ R38)
 }
 
-void xrLogger::InternalPrintRecord()
+// Anomaly Coop (TZ R38): the test for an empty queue and the pop in one hold (coop_log_close.h)
+bool xrLogger::InternalTakeRecord(LogRecord& record)
 {
-	LogRecord theRecord;
+	xrCriticalSectionGuard g(&logDataGuard);
+	return coop::log_close::take_front(*logData, record);
+}
 
-	{
-		xrCriticalSectionGuard g(&logDataGuard);
-		theRecord = logData->front();
-		logData->pop();
-	}
-
+// Under logPrintGuard (InternalPrintAllRecords)
+void xrLogger::InternalPrintRecord(const LogRecord& theRecord)
+{
 	xr_vector<xr_string> LogLines = theRecord.Message.Split('\n');
 	// Anomaly Coop: xr_strconcat below ends the process when a line does not fit its string4096 - on this thread, the log's own, so
 	// nothing of it is written: the process is gone with its log cut in the middle of a line, no dump, no word. Log(const char*) (a
@@ -490,15 +549,11 @@ void xrLogger::InternalPrintRecord()
 
 void xrLogger::InternalPrintAllRecords()
 {
-	while (true)
-	{
-		{
-			xrCriticalSectionGuard g(&logDataGuard);
-			if (logData->empty())
-				break;
-		}
-		InternalPrintRecord();
-	}
+	// Anomaly Coop (TZ R38): one printer at a time (the log thread, InternalCloseLog, a thread in immediate mode), each record taken once
+	xrCriticalSectionGuard print(&logPrintGuard);
+	LogRecord record;
+	while (InternalTakeRecord(record))
+		InternalPrintRecord(record);
 }
 
 void xrLogger::LogThreadEntry()
@@ -512,20 +567,39 @@ void xrLogger::LogThreadEntry()
 			}
 		};
 
+	// Anomaly Coop: the file is a CRT stream (4 KB buffer); without a flush it reaches the disk only in whole 4 KB blocks. A process
+	// that ends without the engine's own handler (0xC0000374 heap fail-fast, 0xC0000409, a kill) loses the rest: b57i feed_server, the
+	// first client's log stopped at "[co" exactly 4 x 4096 bytes after the last "flush" (14:06:17.699), while his game still respawned,
+	// went down and died until about 14:07:19 (the world server's lines). This thread writes what it printed to the file at most
+	// kTailFlushMs later: one WriteFile per kTailFlushMs at most, here, never on the game's threads. The event is reset before the
+	// queue drains: a record that comes meanwhile sets it again (reset after the drain, it waited for the next record).
+	constexpr DWORD kTailFlushMs = 250;
+	bool unflushed = false;
+	DWORD last_flush = GetTickCount();
 	while (true)
 	{
 		if (!bIsAlive)
 		{
-			CloseHandle(hLogThread);
+			// Anomaly Coop (TZ R38): the event stays open: FlushLog and UnpauseLogging still set it after the close (a crash handler, the
+			// freeze thread), and a closed handle's number may be another object's by then
 			return;
 		}
 		
-		WaitForSingleObject(hLogThread, INFINITE);
+		const DWORD woke = WaitForSingleObject(hLogThread, unflushed ? kTailFlushMs : INFINITE);
 		{
 			PROF_EVENT("Log Frame");
-			InternalPrintAllRecords();
 			PauseLogging();
+			InternalPrintAllRecords();
 			FlushLogIfRequestedLambda();
+			if (woke == WAIT_OBJECT_0)
+				unflushed = true; // records came (or a flush request): the file may hold some of them only in the buffer
+			const DWORD now = GetTickCount();
+			if (unflushed && (woke == WAIT_TIMEOUT || now - last_flush >= kTailFlushMs))
+			{
+				InternalFlushLog();
+				unflushed = false;
+				last_flush = now;
+			}
 		}
 	}
 }

@@ -37,7 +37,7 @@
 #include <map>
 #include <vector>
 
-#include "coop_level_hash.h"
+#include "srv/coop_level_hash.h"
 #include "coop_wire.h"
 
 namespace coop

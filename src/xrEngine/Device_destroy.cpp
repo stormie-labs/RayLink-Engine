@@ -5,6 +5,7 @@
 #include "IGame_Persistent.h"
 #include "xr_IOConsole.h"
 #include "MonitorList.h"
+#include "../xrCoop/coop_device_rules.h"
 
 void CRenderDevice::_Destroy(BOOL bKeepTextures)
 {
@@ -29,7 +30,7 @@ void CRenderDevice::Destroy(void)
 	Log("Destroying Direct3D...");
 
 	ShowCursor(TRUE);
-	if (!g_coop_headless) // Anomaly Coop: the desktop's clip, it may be the player's game's
+	if (!g_dedicated_server) // Anomaly Coop: the desktop's clip, it may be the player's game's
 		ClipCursor(NULL);
 	m_cursor_clipped = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): released on purpose, the cache must forget the clip
 	m_pRender->ValidateHW();
@@ -71,7 +72,7 @@ extern ENGINE_API u32 psCurrentVidMode[];
 void CRenderDevice::Reset(bool precache)
 {
 	PROF_EVENT("CRenderDevice::Reset");
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		return; // Anomaly Coop: a map server has no swap chain, nothing to resize, and a reset shows the window
 	if (g_pGamePersistent)
 		g_pGamePersistent->OnDeviceResetBegin(); // Anomaly Coop: the reset stalls the frame loop, keep the session alive
@@ -135,7 +136,7 @@ void CRenderDevice::Reset(bool precache)
 bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 {
 	static bool s_swap_in_progress = false;
-	if (!b_is_Ready || g_coop_headless) // Anomaly Coop: no output, no swap chain
+	if (!b_is_Ready || g_dedicated_server) // Anomaly Coop: no output, no swap chain
 		return false;
 	if (s_swap_in_progress)
 		return false;
@@ -149,6 +150,16 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 	{
 		Msg("* vid_monitor: already on target monitor, no-op");
 		return true;
+	}
+
+	// A monitor swap can rebuild the HUD while Lua still holds its windows.
+	// Keep the stored preference for restart when the game layer says this level cannot pause.
+	const bool level_present = g_pGameLevel != nullptr;
+	const bool level_can_pause = level_present && g_pGamePersistent && g_pGamePersistent->CanBePaused();
+	if (coop::device::defer_monitor_change(level_present, level_can_pause))
+	{
+		Msg("* vid_monitor: switch deferred while a non-pausable level is loaded");
+		return false;
 	}
 
 	struct SwapGuard

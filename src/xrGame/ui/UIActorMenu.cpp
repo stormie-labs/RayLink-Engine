@@ -280,7 +280,8 @@ void CUIActorMenu::CheckDistance()
 	if (pPartnerGO)
 	{
 		if ((pActorGO->Position().distance_to(pPartnerGO->Position()) > 3.0f) &&
-			!m_pPartnerInvOwner->NeedOsoznanieMode())
+			!m_pPartnerInvOwner->NeedOsoznanieMode() &&
+			!coop::trade::keeps_trade_window(m_pPartnerInvOwner)) // Anomaly Coop G6-3: a trading computer's permit
 		{
 			g_btnHint->Discard();
 			HideDialog();

@@ -97,7 +97,12 @@ bool CUISequenceItem::Stop(bool bForce)
 	return true;
 }
 
-CUISequencer::CUISequencer()
+namespace
+{
+u32 last_tutorial_id = 0;
+}
+
+CUISequencer::CUISequencer() : m_id(coop::ui_rules::next_tutorial_id(last_tutorial_id))
 {
 	m_flags.zero();
 	m_name = "invalid";

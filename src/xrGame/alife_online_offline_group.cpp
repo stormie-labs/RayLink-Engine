@@ -448,6 +448,58 @@ bool CSE_ALifeOnlineOfflineGroup::coop_bind_members(bool forget)
 	return forget || gone.empty();
 }
 
+// Anomaly Coop (R32 W3, world-view D3): a member joined this squad on the map server that writes it. A creature of another squad
+// leaves that one first, as the stock re-registration does; then it is bound as coop_bind_members binds a member, its m_bOnline that
+// of the squad: a squad held by a map server is online there, never here (register_member would switch it online in this world).
+bool CSE_ALifeOnlineOfflineGroup::coop_join_member(ALife::_OBJECT_ID member_id)
+{
+	const MEMBERS::iterator known = m_members.find(member_id);
+	if (known != m_members.end())
+		return (*known).second != nullptr; // a repeat
+	CSE_ALifeMonsterAbstract* monster = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(member_id, true));
+	if (!monster || !monster->g_Alive() || monster->ID_Parent != 0xffff || monster->ID == ID)
+		return false;
+	if (monster->m_group_id != 0xffff && monster->m_group_id != ID)
+	{
+		CSE_ALifeOnlineOfflineGroup* old = smart_cast<CSE_ALifeOnlineOfflineGroup*>(ai().alife().objects().object(monster->m_group_id, true));
+		if (old)
+			old->coop_leave_member(member_id);
+		else
+			monster->m_group_id = 0xffff;
+	}
+	m_members.insert(std::make_pair(member_id, static_cast<MEMBER*>(nullptr)));
+	coop_bind_members(false);
+	const MEMBERS::iterator bound = m_members.find(member_id);
+	return bound != m_members.end() && (*bound).second != nullptr;
+}
+
+// Anomaly Coop (R32 W3): a member left this squad on the map server that writes it, alive. It is a creature of its own at home in this
+// world (unregister_member puts it in the graph and the scheduler), not online anywhere here; a map server that keeps it near a
+// player asks the world for it as for any creature. False: it was no member.
+bool CSE_ALifeOnlineOfflineGroup::coop_leave_member(ALife::_OBJECT_ID member_id)
+{
+	const MEMBERS::iterator I = m_members.find(member_id);
+	if (I == m_members.end())
+		return false;
+	if (MEMBER* m = (*I).second)
+	{
+		m->m_bOnline = false;
+		if (!ai().game_graph().valid_vertex_id(m->m_tGraphID) && ai().game_graph().valid_vertex_id(m_tGraphID))
+			m->m_tGraphID = m_tGraphID; // the graph registry takes it at a vertex: its squad's
+		if (!ai().game_graph().valid_vertex_id(m->m_tGraphID))
+		{
+			// no vertex to put it at (a squad that came as a packet and never stood anywhere): it leaves the squad and nothing else
+			m->m_group_id = 0xffff;
+			m_members.erase(I);
+			if (m_members.empty())
+				m_flags.set(flUsedAI_Locations, FALSE);
+			return true;
+		}
+	}
+	unregister_member(member_id);
+	return true;
+}
+
 ALife::_OBJECT_ID CSE_ALifeOnlineOfflineGroup::commander_id()
 {
 	if (!m_members.empty())

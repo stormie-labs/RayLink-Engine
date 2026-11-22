@@ -3,7 +3,7 @@
 #include "coop_survival.h"
 #include "coop_requests.h"
 #include "coop_manager.h"
-#include "coop_levels.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -16,6 +16,8 @@
 #include "coop_callgate.h" // F2 T12
 #include "coop_monster_fx.h" // audit A5
 #include "coop_items.h" // live report 2026-11-08: the owner's copy before a take
+#include "coop_vehicles.h" // F5-VEH-3: F at a car asks its decider for a seat
+#include "coop_vehicles_client.h" // F5-VEH-3: a script's attach that the call gate lets run asks the same
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_reconcile.h"
 #include "xrCoop/coop_object_identity.h" // live RL-UGYE-3WGE: one id, one object on a mirror
@@ -93,6 +95,7 @@ struct Counters
 	u64 spawns_forwarded = 0, spawns_refused = 0, destroys_forwarded = 0, destroys_blocked = 0;
 	u64 moves_forwarded = 0, moves_blocked = 0, hits_forwarded = 0, hits_blocked = 0, actor_hits_blocked = 0, ability_hits = 0;
 	u64 deaths_blocked = 0, other_blocked = 0, level_changes = 0, saves_blocked = 0, vehicles_blocked = 0;
+	u64 vehicles_asked = 0; // F5-VEH-3: F at / in a car and a script's attach turned into a VehicleReq (coop_vehicles_client.cpp)
 	u64 launches_forwarded = 0, launches_dropped = 0; // W3a: own rockets (ReqLaunch / old drop fallback)
 	u64 echo_dropped = 0; // R4 4: spawns and world-object requests not made from reactions to the host's story
 	// client apply
@@ -116,7 +119,7 @@ struct IdentityCounters
 
 u32 g_log_count = 0;
 bool log_allowed() { return ++g_log_count <= kLogBurst || (g_log_count % 100) == 0; }
-bool g_vehicle_note = false; // client: tell the player once per refused attempt (HUD from frame())
+bool g_vehicle_note = false; // client: tell the player once per refused attempt (HUD from frame()); F5: a refused script attach
 
 bool router_on()
 {
@@ -352,7 +355,7 @@ bool filter_event(NET_Packet& P)
 		return false;
 	// F3a: the objects of a map server's level are its own: their events run here as on the host, and what the world must know goes
 	// up afterwards (the hooks below, coop_levels_xfer.cpp). Money stays the world server's.
-	if (levels::leads_my_level() && type != GE_MONEY)
+	if (mode().leads_level() && type != GE_MONEY)
 		return false;
 
 	switch (type)
@@ -442,13 +445,27 @@ bool filter_event(NET_Packet& P)
 		return is_mirrored_creature(dest) ? swallow(g_c.other_blocked) : false; // AI of host creatures
 	case GEG_PLAYER_ATTACH_HOLDER:
 	{
-		// Client cars are kinematic copies driven by host snapshots (WP7): nobody drives them here.
+		// Client cars are kinematic copies driven by the decider's snapshots (WP7). F5-VEH-3: F at one asks the decider of his level
+		// for a seat (VehicleReq); its VehicleSeat seats him in the copy (coop_vehicles_client.cpp).
 		u16 holder = kNoId;
 		P.r_u16(holder);
-		if (dest != kActor || !smart_cast<CCar*>(find_go(holder)))
+		CGameObject* car = find_go(holder);
+		if (dest != kActor || !smart_cast<CCar*>(car))
 			return false; // mounted guns and other holders stay local
+		if (vehicles::client_on_use(car))
+			return swallow(g_c.vehicles_asked);
 		g_vehicle_note = true;
 		return swallow(g_c.vehicles_blocked);
+	}
+	case GEG_PLAYER_DETACH_HOLDER:
+	{
+		// F5-VEH-3: F in the copy of a car asks its decider out; its VehicleSeat released says where he stands
+		u16 holder = kNoId;
+		P.r_u16(holder);
+		CGameObject* car = find_go(holder);
+		if (dest != kActor || !smart_cast<CCar*>(car))
+			return false; // mounted guns and other holders stay local
+		return vehicles::client_on_use(car) ? swallow(g_c.vehicles_asked) : false;
 	}
 	case GE_TRANSFER_AMMO: // multiplayer only: destroys an entity on the local server
 	case GE_RESPAWN: // multiplayer phantoms
@@ -508,7 +525,7 @@ bool filter_message(NET_Packet& P)
 	{
 	case M_SPAWN:
 		P.r_pos = 0;
-		return levels::leads_my_level() ? false : filter_spawn(P); // F3a: a map server spawns under its own ids (coop_levels_keeper.h)
+		return mode().leads_level() ? false : filter_spawn(P); // F3a: a map server spawns under its own ids (coop_levels_keeper.h)
 	case M_EVENT:
 		P.r_pos = 0;
 		return filter_event(P);
@@ -946,7 +963,7 @@ void on_player_died(PeerId from, Reader& r)
 	const u16 killer = r.u16();
 	if (!r.ok())
 		return;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		character = join::proxy_of_peer(from);
 		if (character == kNoId || sync::host_peer_joining(from))
@@ -1102,10 +1119,22 @@ void install_server(Session& s) { s.on(Msg::PlayerDied, &on_player_died); }
 void install_client(Endpoint& e)
 {
 	// Client handlers drop these world messages until we are live (R2 I2, before_live).
-	e.on(Msg::EntityParent, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_parent(from, r); });
-	e.on(Msg::EntityDied, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_died(from, r); });
-	e.on(Msg::EntityLocal, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_local(from, r); });
-	e.on(Msg::EntityVisual, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_entity_visual(from, r); });
+	e.on(Msg::EntityParent, [](PeerId from, Reader& r) {
+		if (mgr().active() && !mode().decides_world())
+			client_on_entity_parent(from, r);
+	});
+	e.on(Msg::EntityDied, [](PeerId from, Reader& r) {
+		if (mgr().active() && !mode().decides_world())
+			client_on_entity_died(from, r);
+	});
+	e.on(Msg::EntityLocal, [](PeerId from, Reader& r) {
+		if (mgr().active() && !mode().decides_world())
+			client_on_entity_local(from, r);
+	});
+	e.on(Msg::EntityVisual, [](PeerId from, Reader& r) {
+		if (mgr().active() && !mode().decides_world())
+			client_on_entity_visual(from, r);
+	});
 	e.on(Msg::PlayerDied, &on_player_died);
 }
 
@@ -1148,7 +1177,7 @@ void reset()
 
 void frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		if (world_up())
 			host_flush();
@@ -1163,14 +1192,14 @@ void frame()
 		if (g_vehicle_note)
 		{
 			g_vehicle_note = false;
-			dialog::hud_message("st_coop_vehicle_host", "Vehicles are driven by the host in co-op");
+			dialog::hud_message("st_coop_f5_vehicles_refused", "Cannot get into the vehicle now"); // F5-VEH-3
 		}
 	}
 }
 
 void print_status()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   events out: %llu parent changes, %llu deaths, %llu player deaths, local %llu spawns / %llu "
 		      "destroys (%u relayed alive), %llu player rocket launches, %llu creature visuals",
@@ -1183,10 +1212,10 @@ void print_status()
 	    g_c.launches_forwarded, g_c.launches_dropped, g_c.launches_applied, g_c.launches_missed);
 	::Msg("[coop]   router: spawns %llu fwd / %llu refused, destroys %llu fwd / %llu blocked, moves %llu fwd / %llu "
 	      "blocked, hits %llu fwd / %llu blocked (+%llu direct on actor, %llu monster ability strikes taken), deaths blocked %llu, other blocked %llu, "
-	      "level exits %llu, save/load blocked %llu, vehicles refused %llu",
+	      "level exits %llu, save/load blocked %llu, vehicles refused %llu / asked %llu",
 	    g_c.spawns_forwarded, g_c.spawns_refused, g_c.destroys_forwarded, g_c.destroys_blocked, g_c.moves_forwarded,
 	    g_c.moves_blocked, g_c.hits_forwarded, g_c.hits_blocked, g_c.actor_hits_blocked, g_c.ability_hits, g_c.deaths_blocked,
-	    g_c.other_blocked, g_c.level_changes, g_c.saves_blocked, g_c.vehicles_blocked);
+	    g_c.other_blocked, g_c.level_changes, g_c.saves_blocked, g_c.vehicles_blocked, g_c.vehicles_asked);
 	::Msg("[coop]   events in: parents %llu applied / %llu failed / %llu timed out (%u pending), deaths %llu (%u "
 	      "pending, %llu expired), local %llu spawns / %llu destroys / %llu errors, creature visuals %llu online / %llu offline",
 	    g_c.parent_applied, g_c.parent_failed, g_c.parent_timeouts, (u32)g_parent_targets.size(), g_c.deaths_applied,
@@ -1203,7 +1232,7 @@ void print_status()
 
 bool client_filter(NET_Packet& P)
 {
-	if (!mgr().is_client() || !router_on())
+	if (!mgr().active() || mode().decides_world() || !router_on())
 		return false;
 	const u32 saved = P.r_pos;
 	const bool swallowed = filter_message(P);
@@ -1223,9 +1252,10 @@ bool note_actor_hit(const CActor* actor, const SHit* hit, bool blocked)
 bool actor_hit_blocked(const CActor* actor, const SHit* hit)
 {
 	if (survival::ignores_hits()) return true;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
-	if (!hit || !mgr().is_client() || !router_on() || entities::client_applying() || monster_fx::client_playing())
+	if (!hit || !mgr().active() || mode().decides_world() || !router_on() || entities::client_applying() ||
+	    monster_fx::client_playing())
 		return false; // audit A5: a host monster's ability played here on the host's word hurts us directly
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
 	if (!who || who == actor || !sync::is_remote_driven(who))
@@ -1243,7 +1273,8 @@ bool client_block_actor_hit(const CActor* actor, const SHit* hit)
 
 void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent)
 {
-	levels::up_parent(item, new_parent); // F3a: a map server tells the world server
+	if (LevelSide* side = mode().level())
+		side->level_entity_up(EntityUp::Parent, item, new_parent);
 	if (!entities::host_records())
 		return;
 	u16 holder = kNoId;
@@ -1263,7 +1294,8 @@ void host_on_parent_changed(u16 item, u16 old_parent, u16 new_parent)
 
 void host_on_death(u16 victim, u16 killer)
 {
-	levels::up_died(victim, killer); // F3a: a map server tells the world server
+	if (LevelSide* side = mode().level())
+		side->level_entity_up(EntityUp::Died, victim, killer);
 	if (!entities::host_records())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
@@ -1303,7 +1335,7 @@ bool client_parent_pending(u16 item) { return g_parent_targets.count(item) != 0;
 
 void host_on_visual(u16 id)
 {
-	if (!is_map_authority() || id == kActor)
+	if (!(mode().decides_world() || mode().leads_level()) || id == kActor)
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_visuals.insert(id);
@@ -1311,7 +1343,7 @@ void host_on_visual(u16 id)
 
 void host_on_destroy(const CSE_Abstract* entity)
 {
-	if (!entity || !is_map_authority())
+	if (!entity || !(mode().decides_world() || mode().leads_level()))
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_last_holder.erase(entity->ID);
@@ -1321,7 +1353,7 @@ void host_on_destroy(const CSE_Abstract* entity)
 
 void host_relay_local_spawn(CSE_Abstract* entity)
 {
-	if (!entity || !is_map_authority())
+	if (!entity || !(mode().decides_world() || mode().leads_level()))
 		return;
 	NET_Packet spawn;
 	entity->Spawn_Write(spawn, FALSE);
@@ -1348,7 +1380,7 @@ void host_set_drop_position(u16 item, const Fvector& pos)
 void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvector& dir, const Fvector& vel,
     const Fvector& angular_vel, PeerId requester)
 {
-	if (!is_map_authority())
+	if (!(mode().decides_world() || mode().leads_level()))
 		return;
 	Writer w(64);
 	w.u8(2);
@@ -1368,12 +1400,17 @@ bool client_refuse_vehicle(CGameObject* holder)
 {
 	if (!holder || !is_mirror() || !router_on() || entities::client_applying() || !smart_cast<CCar*>(holder))
 		return false;
-	// F2 T12: the call gate decides and logs (world, no request path: the host drives cars); round 1: refused while the
-	// host's story is applied too, as before T12 (an engine apply scope returned above)
+	// F2 T12: the call gate decides and logs (world); round 1: refused while the host's story is applied too, as before T12 (an
+	// engine apply scope returned above)
 	callgate::Args args;
 	args.runs_while_applying = false;
-	if (callgate::client_gate("game_object:attach_vehicle", holder, args) == calls::Gate::Run)
-		return false; // an ltx override lets this client drive
+	// F5-VEH-3: an ltx override lets the script seat him: the same request as F, to the decider of his level; the stock attach never
+	// runs on the copy
+	if (callgate::client_gate("game_object:attach_vehicle", holder, args) == calls::Gate::Run && vehicles::client_request_enter(holder))
+	{
+		++g_c.vehicles_asked;
+		return true;
+	}
 	g_vehicle_note = true; // the HUD note goes out from frame()
 	++g_c.vehicles_blocked;
 	return true;

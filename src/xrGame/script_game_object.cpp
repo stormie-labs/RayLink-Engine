@@ -49,6 +49,7 @@
 #include "player_hud.h"
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
 #include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): who changed the own actor's health
+#include "coop/coop_items.h" // Anomaly Coop: TZ R32 W8.1, a setter on the decider is the item's new baseline
 #include "script_attachment_manager.h"
 #include "CustomDevice.h"
 
@@ -1035,6 +1036,7 @@ void CScriptGameObject::SetCondition(float val)
 	}
 	val -= inventory_item->GetCondition();
 	inventory_item->ChangeCondition(val);
+	coop::items::decider_wrote(inventory_item, coop::owner::Setter::Condition); // Anomaly Coop: TZ R32 W8.1, the decider's write
 }
 
 float CScriptGameObject::GetPowerCritical() const

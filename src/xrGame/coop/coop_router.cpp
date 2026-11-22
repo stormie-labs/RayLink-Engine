@@ -3,9 +3,8 @@
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_router.h"
-#include "coop_levels.h"
 #include "coop_manager.h"
-#include "xrCoop/coop_routes.h"
+#include "coop_net.h"
 
 #include <algorithm>
 #include <string>
@@ -204,7 +203,7 @@ Domain route_of(std::string_view callback, const std::string& script)
 bool runs_now(Domain d)
 {
 	const Manager& m = mgr();
-	return !m.active() || routes::runs_here(d, m.is_host(), levels::leads_my_level());
+	return net::route_runs_here(d, m.active(), mode());
 }
 
 bool arg_string(lua_State* L, int idx, std::string_view& out)

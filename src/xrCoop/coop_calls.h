@@ -990,7 +990,8 @@ inline constexpr Call kCalls[] = {
 	{"debug_render:get_object", CallClass::Read},
 	{"debug_render:remove_object", CallClass::View},
 	{"debug_render:set_flags", CallClass::View},
-	// --- module game (level_script.cpp): 36
+	// --- module game (level_script.cpp): 38
+	{"game:active_tutorial_id", CallClass::Read},
 	{"game:active_tutorial_name", CallClass::Read},
 	{"game:actor_lower_weapon", CallClass::Owner},
 	{"game:actor_weapon_lowered", CallClass::Read},
@@ -1008,6 +1009,7 @@ inline constexpr Call kCalls[] = {
 	{"game:open_originals_link", CallClass::View},
 	{"game:play_hud_anm", CallClass::View},
 	{"game:play_hud_motion", CallClass::View},
+	{"game:player_hud_ready", CallClass::Read},
 	{"game:prefetch_model", CallClass::View},
 	{"game:prefetch_texture", CallClass::View},
 	{"game:reload_language", CallClass::View},

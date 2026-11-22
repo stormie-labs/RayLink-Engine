@@ -11,6 +11,7 @@
 #include "coop_sync.h"
 #include "coop_debug.h" // protocol 29: the gate of coop.dbg.* requests
 #include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_syncnet.h"
 #include "xrCoop/coop_lua_fn.h" // kept Lua functions in a table of their own (luabind shares the registry's slots)
 
@@ -159,7 +160,8 @@ u64 g_not_called[luafn::kFailKinds] = {};
 
 // --- roles and players ----------------------------------------------------------------------------
 
-bool client() { return mgr().is_client(); }
+bool decides_sync_store() { return mgr().active() && mode().decides_world(); }
+bool client() { return net::client(); }
 PeerId self_peer() { return client() ? mgr().self() : kHostPeer; }
 u16 host_id_of(u16 local) { return client() ? join::to_host(local) : local; }
 u16 local_id_of(u32 host) { return client() ? join::to_local(u16(host)) : u16(host); }
@@ -221,7 +223,7 @@ bool peer_digest(PeerId peer, std::string& out)
 		out = own_digest();
 		return !out.empty();
 	}
-	if (!mgr().is_host())
+	if (!decides_sync_store())
 		return false;
 	const auto it = g_peer_digest.find(peer);
 	if (it != g_peer_digest.end())
@@ -240,7 +242,7 @@ bool peer_digest(PeerId peer, std::string& out)
 // Player scope).
 PeerId player_peer_of(const ScopeId& s)
 {
-	if (s.kind != ScopeId::Player || !mgr().is_host())
+	if (s.kind != ScopeId::Player || !decides_sync_store())
 		return kInvalidPeer;
 	for (const PeerInfo& p : mgr().session().peers())
 	{
@@ -256,7 +258,7 @@ PeerId player_peer_of(const ScopeId& s)
 bool in_world(PeerId peer)
 {
 	if (peer == kHostPeer)
-		return mgr().is_host() && mgr().session().local() && g_pGameLevel && g_actor;
+		return decides_sync_store() && mgr().session().local() && g_pGameLevel && g_actor;
 	const PeerInfo* p = mgr().session().peer(peer);
 	return p && p->state == PeerState::Joined && !sync::host_peer_joining(peer);
 }
@@ -745,7 +747,7 @@ void out_to(PeerId peer, Msg type, Writer&& w)
 // A cast to a player of this process's level, sent by frame(): Lua may run on the game thread. A map server's goes down the tunnel.
 void cast_to(PeerId peer, Writer&& w)
 {
-	if (!is_map_server())
+	if (!client() || !mode().leads_level())
 	{
 		out_to(peer, Msg::SyncCast, std::move(w));
 		return;
@@ -791,7 +793,7 @@ void queue_delivery(const sn::Delivery& d)
 
 void queue_deliveries(const std::vector<sn::Delivery>& out)
 {
-	if (!mgr().is_host())
+	if (!decides_sync_store())
 		return; // single player: nobody to tell
 	for (const sn::Delivery& d : out)
 		queue_delivery(d);
@@ -844,7 +846,7 @@ void bad_message(PeerId from, const char* what)
 // Host: everything queued goes out, in order (a player loading the world gets it after his WorldLoaded).
 void host_flush()
 {
-	if (!mgr().is_host())
+	if (!decides_sync_store())
 	{
 		g_out.clear();
 		return;
@@ -977,7 +979,7 @@ void host_on_set(PeerId from, Reader& r)
 void on_set(PeerId from, Reader& r)
 {
 	follow_role();
-	if (mgr().is_host())
+	if (decides_sync_store())
 	{
 		host_on_set(from, r);
 		return;
@@ -1007,7 +1009,7 @@ void on_full(PeerId from, Reader& r)
 void on_request(PeerId from, Reader& r)
 {
 	follow_role();
-	if (!mgr().is_host())
+	if (!decides_sync_store())
 		return;
 	Reader peek = r;
 	const u32 id = peek.u32();
@@ -1061,7 +1063,7 @@ void on_request(PeerId from, Reader& r)
 void on_result(PeerId from, Reader& r)
 {
 	follow_role();
-	if (!(client() || mgr().is_host()) || from != kHostPeer)
+	if (!(client() || decides_sync_store()) || from != kHostPeer)
 		return;
 	sn::Result m;
 	if (!sn::read_result(r, m))
@@ -1572,7 +1574,7 @@ int l_request(lua_State* L)
 		return fail(L, "bad arguments");
 	// A player asks the world server: a client over the net, F3a T7 the host player over the internal channel (sent by
 	// frame()); its handler, its limits and its answer are the same. Outside a session the machine runs its own handler.
-	const bool player = client() || mgr().is_host();
+	const bool player = client() || decides_sync_store();
 	if (player)
 	{
 		if (g_requests.full())
@@ -1623,7 +1625,7 @@ int l_broadcast(lua_State* L)
 		return fail(L, "bad name");
 	if (!to_value(L, 2, args, why))
 		return fail(L, why);
-	if (!sn::may_broadcast(client(), is_map_authority()))
+	if (!sn::may_broadcast(client(), net::host()))
 		return fail(L, "host only");
 	enum
 	{
@@ -1679,12 +1681,12 @@ int l_broadcast(lua_State* L)
 	m.args = args;
 	Writer w(32 + m.name.size() + ss::encoded_size(m.args));
 	sn::write_cast(w, m);
-	const bool map_server = is_map_server(); // the peers of its session are the players of its level; its actor is nobody's
-	const bool session = mgr().is_host() || map_server;
+	const bool leads_remote_level = client() && coop::mode().leads_level();
+	const bool session = net::host();
 	if (mode == To)
 	{
 		const PeerId peer = PeerId(to);
-		if (peer == kHostPeer && !map_server)
+		if (peer == kHostPeer && !leads_remote_level)
 			here = true;
 		else if (!session || !in_world(peer))
 			return fail(L, "no such player");
@@ -1699,7 +1701,7 @@ int l_broadcast(lua_State* L)
 		const u16 level = u16(named);
 		const bool bound = mode == Radius || level != sn::kNoCastLevel;
 		Fvector at;
-		if (!map_server && (level == sn::kNoCastLevel || level == levels::my_level()))
+		if (!leads_remote_level && (level == sn::kNoCastLevel || level == levels::my_level()))
 			here = mode == All || (position_of(0, at) && at.distance_to(pos) <= float(radius));
 		if (session)
 			for (const PeerInfo& p : mgr().session().peers())
@@ -1894,7 +1896,7 @@ void replace_saved(const std::string_view* data)
 	}
 	if (data)
 		decode_saved(store, *data); // checked on a copy before: it cannot fail here
-	g_resync = mgr().is_host();
+	g_resync = decides_sync_store();
 }
 
 // coop.sync.import(t | nil) -> true | false, why            host: m_data.coop_sync at load; nil: nothing saved
@@ -2037,10 +2039,10 @@ void frame()
 	else
 	{
 		host_flush();
-		if (g_resync && mgr().is_host())
+		if (g_resync && decides_sync_store())
 			resync_all();
 		g_resync = false;
-		if (mgr().is_host())
+		if (decides_sync_store())
 			host_player_frame(now);
 	}
 	if (lua_ready())
@@ -2122,7 +2124,7 @@ void print_status()
 void host_send_full(PeerId peer)
 {
 	follow_role();
-	if (!mgr().is_host() || peer == kHostPeer)
+	if (!decides_sync_store() || peer == kHostPeer)
 		return;
 	// What changed before the copy goes out first: to a player still loading an older world it is queued with his world
 	// changes, which his join drops right after this (the copy holds it all).

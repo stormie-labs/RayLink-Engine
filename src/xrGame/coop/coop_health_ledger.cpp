@@ -6,6 +6,7 @@
 #include "pch_script.h"
 #include "coop_health_ledger.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_health_ledger.h"
 
 #include "ai_space.h"
@@ -28,7 +29,7 @@ namespace
 xrCriticalSection g_lock;
 Ledger g_ledger;
 
-bool on() { return mgr().active() && !ghost_actor(); }
+bool on() { return mgr().active() && mode().actor_is_player(); }
 
 bool own(const CEntity* who) { return who && g_actor && who == static_cast<const CEntity*>(g_actor) && on(); }
 
@@ -171,7 +172,7 @@ HitScope::~HitScope()
 
 void frame()
 {
-	if (ghost_actor())
+	if (!mode().actor_is_player())
 	{
 		g_own_condition.store(nullptr, std::memory_order_relaxed);
 		return;

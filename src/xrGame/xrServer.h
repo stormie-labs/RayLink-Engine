@@ -14,6 +14,7 @@
 #include "secure_messaging.h"
 #include "xrServer_updates_compressor.h"
 #include "xrClientsPool.h"
+#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode numbers a map server's objects (PerformIDgen)
 
 #ifdef DEBUG
 //. #define SLOW_VERIFY_ENTITIES
@@ -85,15 +86,6 @@ namespace file_transfer
 
 class clientdata_proxy;
 class server_info_uploader;
-
-namespace coop
-{
-namespace levels
-{
-bool leader_takes_ids(); // Anomaly Coop: coop_levels.h
-u16 leader_free_id();
-} // namespace levels
-} // namespace coop
 
 class xrServer : public IPureServer
 {
@@ -185,8 +177,8 @@ public:
 
 	IC u16 PerformIDgen(u16 ID)
 	{
-		if (ID == 0xffff && coop::levels::leader_takes_ids()) // Anomaly Coop: a map server takes ids of its own
-			ID = coop::levels::leader_free_id();
+		if (ID == 0xffff && coop::mode().takes_own_ids()) // Anomaly Coop: a map server takes ids of its own
+			ID = coop::mode().own_free_id();
 		return (m_tID_Generator.tfGetID(ID));
 	}
 

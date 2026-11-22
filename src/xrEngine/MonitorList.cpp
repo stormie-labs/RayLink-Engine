@@ -11,6 +11,7 @@
 
 #include "stdafx.h"
 #include "MonitorList.h"
+#include "../xrCoop/coop_device_rules.h"
 
 #pragma comment(lib, "cfgmgr32.lib")
 #include <cfgmgr32.h>
@@ -415,6 +416,65 @@ HMONITOR ResolveSelectedMonitor()
 
     Msg("! vid_monitor: '%s' not found on this system, using Auto", name.c_str());
     return NULL;
+}
+
+namespace
+{
+    // The display's own mode list in its current orientation (EnumDisplaySettings): does it have width x height?
+    bool display_lists_mode(const char* device, u32 width, u32 height)
+    {
+        for (DWORD i = 0;; ++i)
+        {
+            DEVMODEA dm{};
+            dm.dmSize = sizeof(dm);
+            if (!EnumDisplaySettingsA(device, i, &dm))
+                return false;
+            if (dm.dmPelsWidth == width && dm.dmPelsHeight == height)
+                return true;
+        }
+    }
+
+    coop::device::startup_display read_startup_display(HMONITOR monitor, u32 width, u32 height, bool read_modes)
+    {
+        coop::device::startup_display d{0, 0, false};
+        MONITORINFOEXA mi{};
+        mi.cbSize = sizeof(mi);
+        if (!monitor || !GetMonitorInfoA(monitor, &mi))
+            return d;
+        d.desktop_width  = static_cast<unsigned>(mi.rcMonitor.right - mi.rcMonitor.left);
+        d.desktop_height = static_cast<unsigned>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        const bool desktop_fits = d.desktop_width == width && d.desktop_height == height;
+        d.lists_mode = read_modes && !desktop_fits && display_lists_mode(mi.szDevice, width, height);
+        return d;
+    }
+}
+
+HMONITOR ResolveAutoStartupMonitor(bool exclusive_fullscreen, u32 width, u32 height)
+{
+    POINT cursor_pos{};
+    GetCursorPos(&cursor_pos);
+    const HMONITOR cursor_monitor = MonitorFromPoint(cursor_pos, MONITOR_DEFAULTTOPRIMARY);
+    if (!exclusive_fullscreen || width == 0 || height == 0)
+        return cursor_monitor;
+
+    xr_vector<HMONITOR> handles;
+    xr_vector<coop::device::startup_display> displays;
+    for (HMONITOR monitor : s_monitor_handles)
+    {
+        if (!monitor)
+            continue; // the Auto row
+        handles.push_back(monitor);
+        displays.push_back(read_startup_display(monitor, width, height, false));
+    }
+
+    const coop::device::startup_display cursor = read_startup_display(cursor_monitor, width, height, true);
+    const int chosen = coop::device::auto_startup_display(exclusive_fullscreen, width, height, cursor,
+        displays.empty() ? nullptr : displays.data(), static_cast<unsigned>(displays.size()));
+    if (chosen < 0)
+        return cursor_monitor;
+
+    Msg("* vid_monitor: Auto selected the only display matching %ux%u (the cursor's display has no such mode)", width, height);
+    return handles[static_cast<size_t>(chosen)];
 }
 
 void refresh_vid_monitor_list()

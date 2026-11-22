@@ -376,6 +376,40 @@ private:
 	int64_t m_start = 0;
 };
 
+// ---------------------------------------------------------------- the wounded's time while he is raised
+
+// Build 57 (owner 2026-11-18): "when another player raises somebody, his time must stop running for as long as he is being
+// raised". The wounded's owner keeps the end of his bleed-out on his own clock (coop_survival.cpp g_me.bleed_end), in the
+// co-op and in the server mode alike: the host only relays the hold. Every frame a teammate's hold is on him
+// (LiftView::active) the end moves on by the time that passed since the last such frame, so what is left stays what it
+// was. One frame gives back at most kMaxPauseStepMs (a hitch, a clock that jumped); the first frame of a hold gives
+// nothing. Damage and giving up are applied after it and still end his time.
+constexpr uint32_t kMaxPauseStepMs = 1000;
+
+class BleedPause
+{
+public:
+	// The end of the bleed-out after this frame. `raised`: a teammate's hold is on him now.
+	uint64_t step(uint64_t now, bool raised, uint64_t bleed_end)
+	{
+		if (!raised)
+		{
+			m_last = 0;
+			return bleed_end;
+		}
+		uint64_t add = 0;
+		if (m_last && now > m_last)
+			add = now - m_last > kMaxPauseStepMs ? uint64_t(kMaxPauseStepMs) : now - m_last;
+		m_last = now;
+		return bleed_end + add;
+	}
+	bool on() const { return m_last != 0; }
+	void clear() { m_last = 0; }
+
+private:
+	uint64_t m_last = 0; // the last frame he was raised (0: he is not)
+};
+
 // ---------------------------------------------------------------- the reviver's announcing machine
 
 // Decides when the reviver's machine sends Begin and Cancel (see the rate paragraph of the header). It sends nothing itself.

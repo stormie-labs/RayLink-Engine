@@ -436,13 +436,21 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\xrCoop\coop_fight_fact.h" />
+    <ClInclude Include="coop\hostplay\coop_hostplay_steam.h" />
+    <ClInclude Include="coop\coop_vehicles_ride.h" />
+    <ClInclude Include="coop\coop_vehicles_state.h" />
+    <ClInclude Include="coop\coop_progress.h" />
+    <ClInclude Include="coop\coop_vehicles_client.h" />
+    <ClInclude Include="coop\coop_vehicles.h" />
     <ClInclude Include="coop\coop_health_ledger.h" />
     <ClInclude Include="coop\coop_lua_errors.h" />
     <ClInclude Include="coop\coop_debug.h" />
-    <ClInclude Include="coop\coop_dedicated.h" />
+    <ClInclude Include="coop\srv\coop_dedicated.h" />
     <ClInclude Include="coop\coop_monster_fx.h" />
     <ClInclude Include="coop\coop_levels.h" />
-    <ClInclude Include="coop\coop_levels_map.h" />
+    <ClInclude Include="coop\srv\coop_levels_map.h" />
+    <ClInclude Include="coop\srv\coop_levels_alife.h" />
     <ClInclude Include="coop\coop_game_settings.h" />
     <ClInclude Include="coop\coop_callgate.h" />
     <ClInclude Include="coop\coop_sync_api.h" />
@@ -456,10 +464,12 @@
     <ClInclude Include="coop\coop_ai.h" />
     <ClInclude Include="coop\coop_sound.h" />
     <ClInclude Include="coop\coop_objects.h" />
+    <ClInclude Include="coop\coop_writer.h" />
     <ClInclude Include="coop\coop_presence.h" />
     <ClInclude Include="coop\coop_lamps.h" />
     <ClInclude Include="coop\coop_survival.h" />
     <ClInclude Include="coop\coop_items.h" />
+    <ClInclude Include="coop\coop_initial_state.h" />
     <ClInclude Include="coop\coop_requests.h" />
     <ClInclude Include="coop\coop_events.h" />
     <ClInclude Include="coop\coop_trade.h" />
@@ -474,7 +484,6 @@
     <ClInclude Include="coop\coop_sync.h" />
     <ClInclude Include="coop\coop_players.h" />
     <ClInclude Include="coop\coop_world.h" />
-    <ClInclude Include="coop\coop_world_server.h" />
     <ClInclude Include="coop\coop_join.h" />
     <ClInclude Include="coop\coop_manager.h" />
     <ClInclude Include="..\3rd party\fastdelegate\fastdelegate.h" />
@@ -2120,16 +2129,25 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\hostplay\coop_hostplay_steam.cpp" />
+    <ClCompile Include="coop\coop_vehicles_ride.cpp" />
+    <ClCompile Include="coop\coop_vehicles_state.cpp" />
+    <ClCompile Include="coop\srv\coop_srv_join.cpp" />
+    <ClCompile Include="coop\coop_progress.cpp" />
+    <ClCompile Include="coop\coop_vehicles_client.cpp" />
+    <ClCompile Include="coop\coop_vehicles_seat.cpp" />
+    <ClCompile Include="coop\srv\coop_srv_script.cpp" />
+    <ClCompile Include="coop\srv\coop_srv_console.cpp" />
     <ClCompile Include="coop\coop_health_ledger.cpp" />
     <ClCompile Include="coop\coop_lua_errors.cpp" />
     <ClCompile Include="coop\coop_debug.cpp" />
-    <ClCompile Include="coop\coop_dedicated.cpp" />
+    <ClCompile Include="coop\srv\coop_dedicated.cpp" />
     <ClCompile Include="coop\coop_monster_fx.cpp" />
-    <ClCompile Include="coop\coop_trunk.cpp" />
-    <ClCompile Include="coop\coop_mapserver.cpp" />
-    <ClCompile Include="coop\coop_mapserver_stats.cpp" />
-    <ClCompile Include="coop\coop_levels_xfer.cpp" />
-    <ClCompile Include="coop\coop_levels_alife.cpp" />
+    <ClCompile Include="coop\srv\coop_trunk.cpp" />
+    <ClCompile Include="coop\srv\coop_mapserver.cpp" />
+    <ClCompile Include="coop\srv\coop_mapserver_stats.cpp" />
+    <ClCompile Include="coop\srv\coop_levels_xfer.cpp" />
+    <ClCompile Include="coop\srv\coop_levels_alife.cpp" />
     <ClCompile Include="coop\coop_levels.cpp" />
     <ClCompile Include="coop\coop_game_settings.cpp" />
     <ClCompile Include="coop\coop_callgate.cpp" />
@@ -2145,11 +2163,16 @@
     <ClCompile Include="coop\coop_ai.cpp" />
     <ClCompile Include="coop\coop_sound.cpp" />
     <ClCompile Include="coop\coop_objects.cpp" />
+    <ClCompile Include="coop\coop_writer.cpp" />
     <ClCompile Include="coop\coop_presence.cpp" />
     <ClCompile Include="coop\coop_lamps.cpp" />
     <ClCompile Include="coop\coop_survival.cpp" />
     <ClCompile Include="coop\coop_items.cpp" />
+    <ClCompile Include="coop\coop_initial_state.cpp" />
     <ClCompile Include="coop\coop_requests.cpp" />
+    <ClCompile Include="coop\coop_mode.cpp" />
+    <ClCompile Include="coop\hostplay\coop_hostplay_mode.cpp" />
+    <ClCompile Include="coop\srv\coop_srv_mode.cpp" />
     <ClCompile Include="coop\coop_events.cpp" />
     <ClCompile Include="coop\coop_trade.cpp" />
     <ClCompile Include="coop\coop_dialog.cpp" />
@@ -2165,7 +2188,6 @@
     <ClCompile Include="coop\coop_players.cpp" />
     <ClCompile Include="coop\coop_instrument.cpp" />
     <ClCompile Include="coop\coop_world.cpp" />
-    <ClCompile Include="coop\coop_world_server.cpp" />
     <ClCompile Include="coop\coop_join.cpp" />
     <ClCompile Include="coop\coop_console.cpp" />
     <ClCompile Include="coop\coop_manager.cpp" />

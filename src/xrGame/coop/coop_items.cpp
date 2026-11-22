@@ -1,13 +1,14 @@
 #include "stdafx.h"
 #include "coop_items.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
-#include "coop_levels.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_trade.h"
 #include "coop_requests.h"
+#include "coop_writer.h" // R32 W1: writing::writes (only the item's writer pushes its own value back)
 
 #include <algorithm>
 #include <mutex>
@@ -35,6 +36,8 @@
 #include "../xrServerEntities/xrServer_Objects.h"
 #include "../xrServerEntities/xrMessages.h"
 #include "xrCoop/coop_item_tags.h"
+#include "xrCoop/coop_initial_rules.h" // TZ R32 W8.3: uses in the stock client_data of an entity
+#include "xrCoop/coop_owner_rules.h" // TZ R32 W8.1/W8.2: the decider's deliberate write, the owner's report field by field
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_spawn.h"
@@ -65,6 +68,9 @@ enum class Op : u8
 	SpawnAmmo = 2,
 };
 constexpr u8 kFlagAuthority = 1; // host truth for an item that just entered a player's inventory
+// TZ R32 W8.1: the decider's deliberate write (a script's setter on its copy) or its own value of a field the owner reported on an
+// older version. The owner applies the tags whose version he has not applied yet, whatever else he changed (coop_owner_rules.h).
+constexpr u8 kFlagDecider = 2;
 
 enum Tag : u8
 {
@@ -111,6 +117,19 @@ struct ItemData
 	u8 fire_mode = 0;
 	bool has_cartridges = false;
 	std::vector<u8> cartridges;
+	// TZ R32 W8.2 (blob tag 12, coop_item_tags.h): the decider's field versions this state was made on. Not compared, not applied:
+	// the owner's report carries the versions he has applied, the decider's push its latest ones.
+	bool has_versions = false;
+	itemtags::FieldVersions versions;
+	u32 versions_mask = 0;
+	// WP6 fix round (blob tag 13): a decider's push of its latest version of the uses carries the change that made it; the owner
+	// applies it onto his own value when he has applied the version before (coop_owner_rules.h owner_takes_uses).
+	bool has_uses_delta = false;
+	s16 uses_delta = 0;
+	// WP6 fix round (blob tag 14): a map server's ItemFacts of a held eatable carry its object's own client_data (binder bytes
+	// included), which the world stores when it has no object (coop_initial_rules.h uses_store).
+	bool has_client_data = false;
+	std::vector<u8> client_data;
 };
 
 enum class Reason : u8
@@ -152,6 +171,12 @@ struct Stats
 	u64 world_states = 0; // parity audit F1: host, states of world items a client asked for or opened
 	u64 take_kept = 0; // live report 2026-11-08: client, what its take callbacks changed kept over the host's push
 	u64 join_held = 0, join_taken = 0; // host: states of a player still joining, kept and taken when his join ended
+	u64 deliberate = 0, decider_pushed = 0, stale_refused = 0; // TZ R32 W8: decider writes adopted, pushes, stale owner fields
+	u64 decider_applied = 0; // TZ R32 W8: owner, decider pushes applied
+	// WP6 fix round: stale uses reports rebased (decider); pushes taken as a change that kept the owner's own doses (owner)
+	u64 uses_rebased = 0, uses_delta_applied = 0;
+	u64 facts_refused = 0; // WP6 fix round: the world, ItemFacts refused (nothing applied)
+	u64 facts_taken = 0; // TZ R32 W8.3: the world, ItemFacts of a decider or an owner written into the entity
 };
 Stats g_stats;
 
@@ -247,6 +272,34 @@ xr_map<PeerId, Stream> g_streams;
 xr_set<u16> g_releasing; // emptied boxes the host is destroying
 u64 g_last_enforce = 0;
 bool g_host_precaching = false; // host: a freshly loaded world is being precached
+
+// TZ R32 W8.2: the decider's latest field versions of an item (this process's numbering), kept while the item exists here, whoever
+// holds it: they go out with a take's push, with ItemFacts and with the spawn's initial state (§8a A12).
+xr_map<u16, itemtags::FieldVersions> g_versions;
+// WP6 fix round (finding 4): the decider's change of the uses at each of its recent deliberate writes, by version (this process's
+// numbering): a stale owner report of the uses is rebased over them, a push carries the change of its version. Forgotten with
+// g_versions, and when versions of another numbering arrive (§8a A12).
+xr_map<u16, owner::CounterHistory> g_uses_history;
+// WP6 fix round (finding 1): uses set for an item with no game object here that its entity cannot keep (a scripted section with no
+// client_data: the binder's bytes would be missing). The item's next game object here takes them (apply_staged_uses, the first frame
+// it exists); a spawn's initial state carries them meanwhile (coop_initial_state.cpp state_of). In memory only: a save before the
+// object exists keeps the stock uses (the same as the stock ItemProcessor, which also waits for the object).
+xr_map<u16, u8> g_staged_uses;
+// Owner: the decider's versions of our item (local id) we have applied; our reports carry them.
+xr_map<u16, itemtags::FieldVersions> g_applied;
+// The decider applies an owner's state or its own baseline: a script setter run inside it is no deliberate write.
+int g_applying = 0;
+struct Applying
+{
+	Applying() { ++g_applying; }
+	~Applying() { --g_applying; }
+	Applying(const Applying&) = delete;
+	Applying& operator=(const Applying&) = delete;
+};
+// A map server: what changed the facts of an item since the journal last read them (W8.3 ItemFacts source): 1 Decider, 2 Owner.
+constexpr u8 kFactsDecider = 1;
+constexpr u8 kFactsOwner = 2;
+xr_map<u16, u8> g_facts_source;
 
 // ---------------------------------------------------------------- helpers
 
@@ -476,6 +529,28 @@ void write_data(const ItemData& d, Blob& out)
 			p.u8(type);
 		put(w, TagCartridges, p);
 	}
+	if (d.has_versions && (d.versions_mask & itemtags::kAll))
+	{
+		p.clear();
+		itemtags::write_versions(p, d.versions, d.versions_mask);
+		w.u8(itemtags::kVersionsTag);
+		w.varu(p.size());
+		w.bytes(p.ptr(), p.size());
+	}
+	if (d.has_uses_delta)
+	{
+		p.clear();
+		p.u16(u16(d.uses_delta));
+		w.u8(itemtags::kUsesDeltaTag);
+		w.varu(p.size());
+		w.bytes(p.ptr(), p.size());
+	}
+	if (d.has_client_data && !d.client_data.empty() && d.client_data.size() <= initial::kMaxClientData)
+	{
+		w.u8(itemtags::kClientDataTag);
+		w.varu(d.client_data.size());
+		w.bytes(d.client_data.data(), d.client_data.size());
+	}
 	out = w.data();
 }
 
@@ -558,6 +633,23 @@ bool read_data(const u8* data, size_t size, ItemData& d)
 			d.has_cartridges = true;
 			d.cartridges.assign(p.cursor(), p.cursor() + size_t(len));
 			break;
+		case itemtags::kVersionsTag:
+			if (!itemtags::read_versions(p, d.versions, d.versions_mask) || p.remaining())
+				return false;
+			d.has_versions = d.versions_mask != 0;
+			break;
+		case itemtags::kUsesDeltaTag:
+			d.uses_delta = s16(p.u16());
+			if (!p.ok() || p.remaining())
+				return false;
+			d.has_uses_delta = true;
+			break;
+		case itemtags::kClientDataTag:
+			if (len == 0 || len > initial::kMaxClientData)
+				return false;
+			d.has_client_data = true;
+			d.client_data.assign(p.cursor(), p.cursor() + size_t(len));
+			break;
 		default:
 			break; // newer field: skipped by length
 		}
@@ -578,6 +670,14 @@ bool same_upgrades(const UpgradeList& a, const UpgradeList& b)
 // R3 В1: tags (itemtags::Bit) of the host copy `cur` that differ from the owner's state. Semantic comparison (upgrade
 // order does not matter). Only the tags the owner carries count: the old symmetric comparison made every weapon
 // without scopes "stuck" over a scope tag the owner never sent.
+u32 carried_tags(const ItemData& d)
+{
+	return (d.has_cond ? u32(itemtags::Cond) : 0u) | (d.has_upgrades ? u32(itemtags::Upgrades) : 0u) |
+	    (d.has_box ? u32(itemtags::Box) : 0u) | (d.has_addons ? u32(itemtags::Addons) : 0u) |
+	    (d.has_scope ? u32(itemtags::Scope) : 0u) | (d.has_main ? u32(itemtags::Main) : 0u) |
+	    (d.has_launcher ? u32(itemtags::Launcher) : 0u) | (d.has_uses ? u32(itemtags::Uses) : 0u);
+}
+
 u32 diverged_tags(const ItemData& cur, const ItemData& owner)
 {
 	return itemtags::diverged(cur, owner, same_upgrades);
@@ -780,6 +880,61 @@ void capture_blob(CInventoryItem* item, Blob& out)
 	write_data(d, out);
 }
 
+// TZ R32 W8.2: the versions `v` ride the state `d` (only the tags written on purpose at least once: an untouched item carries none).
+void attach_versions(ItemData& d, const itemtags::FieldVersions& v)
+{
+	d.versions = v;
+	d.versions_mask = owner::versions_mask(v);
+	d.has_versions = d.versions_mask != 0;
+}
+
+// WP6 fix round (finding 1): the object's own client_data, when it is a held eatable whose uses the state `d` carries: what its stock
+// save leaves (CGameObject::net_Save: the item's save() and its script binder's, the chunk CSE_Abstract::load keeps), not built by us.
+// A map server's ItemFacts carry it so that the world, which has no object, stores the binder's bytes as well (coop_initial_rules.h).
+void attach_client_data(CInventoryItem* item, ItemData& d)
+{
+	if (!item || !d.has_uses || !item->cast_eatable_item() || !item->object().H_Parent())
+		return;
+	NET_Packet p;
+	p.write_start();
+	item->object().CGameObject::net_Save(p);
+	std::vector<u8> cd;
+	if (!initial::client_data_of_save(p.B.data, p.B.count, cd) || !initial::is_held_eatable(cd) || cd[initial::kUsesAt] != d.uses)
+		return; // not the layout of a held eatable: nothing rides, the world keeps its own rules
+	d.has_client_data = true;
+	d.client_data.swap(cd);
+}
+
+itemtags::FieldVersions versions_in(const xr_map<u16, itemtags::FieldVersions>& m, u16 id)
+{
+	auto it = m.find(id);
+	return it != m.end() ? it->second : itemtags::FieldVersions();
+}
+
+owner::CounterHistory uses_history_in(u16 id)
+{
+	auto it = g_uses_history.find(id);
+	return it != g_uses_history.end() ? it->second : owner::CounterHistory();
+}
+
+// The most portions item `e` can have here: its object's, else its section's (CEatableItem::Load).
+int max_uses_here(CSE_Abstract* e, CInventoryItem* item)
+{
+	if (CEatableItem* eat = item ? item->cast_eatable_item() : nullptr)
+		return int(eat->GetMaxUses());
+	return int(section_max_uses(e->s_name));
+}
+
+// Owner: our report of our item `id`: its state and the decider's versions we have applied. Every report and every g_sent entry of an
+// own item is made here, so that a version taken from a push counts as a change to report.
+void capture_report(u16 id, CInventoryItem* item, Blob& out)
+{
+	ItemData d;
+	capture_object(item, d);
+	attach_versions(d, versions_in(g_applied, id));
+	write_data(d, out);
+}
+
 // ---------------------------------------------------------------- apply
 
 void install_upgrades(CInventoryItem* item, const UpgradeList& list)
@@ -904,7 +1059,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 			ii->m_fCondition = dequant(d.cond);
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
-		if (d.has_upgrades && !is_map_authority())
+		if (d.has_upgrades && !(mode().decides_world() || mode().leads_level()))
 			ii->m_upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
@@ -966,7 +1121,7 @@ void send_state(CInventoryItem* item, const Blob& blob)
 {
 	Writer w(blob.size() + 48);
 	write_state(w, join::to_host(item->object_id()), item->object().cNameSect().c_str(), 0, blob);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		net::host_broadcast(Msg::ItemState, w);
 	else
 		net::client_send(Msg::ItemState, w);
@@ -1004,6 +1159,11 @@ void drain_forgotten()
 		g_left.erase(id);
 		g_unload_used.erase(id);
 		g_releasing.erase(id);
+		g_versions.erase(id);
+		g_uses_history.erase(id);
+		g_staged_uses.erase(id);
+		g_applied.erase(id);
+		g_facts_source.erase(id);
 		for (auto& proxy : g_proxy_items)
 			proxy.second.erase(std::remove(proxy.second.begin(), proxy.second.end(), id), proxy.second.end());
 		for (auto it = g_logged_tags.begin(); it != g_logged_tags.end();)
@@ -1051,7 +1211,7 @@ void scan_local(bool send_all)
 	CActor* actor = Actor();
 	if (!actor || actor->getDestroy())
 		return;
-	const bool host = is_map_authority();
+	const bool host = mode().decides_world() || mode().leads_level();
 	xr_set<u16> present;
 	Blob blob;
 	for (PIItem item : actor->inventory().m_all)
@@ -1062,7 +1222,7 @@ void scan_local(bool send_all)
 		present.insert(id);
 		if (!host && requests::client_lease_waiting(id))
 			continue;
-		capture_blob(item, blob);
+		capture_report(id, item, blob);
 		auto it = g_sent.find(id);
 		if (it == g_sent.end())
 		{
@@ -1083,7 +1243,9 @@ void scan_local(bool send_all)
 				if (const u32 mine = take_changes(id, now))
 				{
 					Blob part;
-					write_data(itemtags::only_tags(now, mine), part);
+					ItemData kept = itemtags::only_tags(now, mine);
+					attach_versions(kept, versions_in(g_applied, id));
+					write_data(kept, part);
 					send_state(item, part);
 					++g_stats.sent;
 					++g_stats.take_kept;
@@ -1108,7 +1270,7 @@ void scan_local(bool send_all)
 		}
 		if (CInventoryItem* item = find_item(it->first))
 		{
-			capture_blob(item, blob);
+			capture_report(it->first, item, blob);
 			if (blob != it->second)
 			{
 				send_state(item, blob);
@@ -1116,6 +1278,7 @@ void scan_local(bool send_all)
 			}
 		}
 		g_take_base.erase(it->first);
+		g_applied.erase(it->first); // a take's push brings the versions again if it comes back
 		it = g_sent.erase(it);
 	}
 }
@@ -1180,6 +1343,43 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 	CInventoryItem* item = find_item(id);
 	if (entity_root(e) == 0)
 	{
+		// TZ R32 W8.1: the decider's deliberate write of our item (a script's setter on its copy), or its own value of a field we
+		// reported on an older version. The tags whose version we have not applied yet are taken whatever else we changed (our
+		// own change on top of an applied version stays); our next report carries the new versions.
+		if (flags & kFlagDecider)
+		{
+			itemtags::FieldVersions& applied = g_applied[id];
+			const u32 takes = owner::push_applies(applied, d.versions, carried_tags(d));
+			if (!takes)
+			{
+				++g_stats.ignored; // a repeated or late push of a version we have applied
+				return true;
+			}
+			ItemData part = itemtags::only_tags(d, takes);
+			if (part.has_uses)
+			{
+				// The uses are a counter (WP6 fix round, finding 4): the push of the version right after ours is its change onto our
+				// own value, so a dose we ate inside its round trip stays spent; any other push is its value.
+				CEatableItem* eat = item ? item->cast_eatable_item() : nullptr;
+				const int mine = eat ? int(eat->GetRemainingUses()) : 0;
+				const int max_uses = eat ? int(eat->GetMaxUses()) : int(section_max_uses(e->s_name));
+				const int taken = owner::owner_takes_uses(applied.get(itemtags::Uses), d.versions.get(itemtags::Uses),
+				    d.has_uses_delta, int(d.uses_delta), int(part.uses), eat != nullptr, mine, max_uses);
+				if (d.has_uses_delta && taken != int(part.uses))
+					++g_stats.uses_delta_applied;
+				part.uses = u8(taken);
+			}
+			if (item)
+				apply_object(item, part, false);
+			apply_entity(e, part, false);
+			itemtags::take(applied, d.versions, takes);
+			{
+				std::lock_guard<std::mutex> lock(g_lock);
+				g_scan_now = true;
+			}
+			++g_stats.decider_applied;
+			return true;
+		}
 		// Our own item: we are the owner. Only the host's state for an item that just came into
 		// our hands is taken, and only if we have not changed it since (else ours goes out).
 		if (!(flags & kFlagAuthority))
@@ -1207,8 +1407,9 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 			const ItemData merged = itemtags::take_push(d, now, mine);
 			apply_object(item, merged, false);
 			apply_entity(e, merged, false);
+			owner::arrive(g_applied[id], d.versions, d.versions_mask); // W8.2: the push was made on the decider's latest versions
 			Blob cur;
-			capture_blob(item, cur);
+			capture_report(id, item, cur);
 			if (mine)
 			{
 				send_state(item, cur); // the host's copy takes ours (it may have pushed before our first scan's part came)
@@ -1230,16 +1431,19 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 		if (item)
 		{
 			Blob cur;
-			capture_blob(item, cur);
+			capture_report(id, item, cur);
 			if (it != g_sent.end() && it->second != cur)
 			{
 				++g_stats.authority_skipped;
 				return true;
 			}
 			apply_object(item, d, false);
-			capture_blob(item, cur);
+			owner::arrive(g_applied[id], d.versions, d.versions_mask);
+			capture_report(id, item, cur);
 			g_sent[id] = cur;
 		}
+		else
+			owner::arrive(g_applied[id], d.versions, d.versions_mask);
 		apply_entity(e, d, false);
 		++g_stats.authority_applied;
 		return true;
@@ -1465,17 +1669,79 @@ void host_send_view(u16 id, CSE_Abstract* e, CInventoryItem* item, const Blob* f
 	if (item)
 	{
 		capture_object(item, d);
+		if (flags & kFlagAuthority)
+			attach_versions(d, versions_in(g_versions, id)); // W8.2: the new owner's reports count from these versions on
 		write_data(d, blob);
 	}
 	else if (fallback)
 		blob = *fallback;
 	else if (capture_entity(e, d))
+	{
+		if (flags & kFlagAuthority)
+			attach_versions(d, versions_in(g_versions, id));
 		write_data(d, blob);
+	}
 	else
 		return;
 	Writer w(blob.size() + 48);
 	write_state(w, id, e->s_name.c_str(), flags, blob);
 	net::host_broadcast(Msg::ItemState, w, Lane::Reliable, except);
+}
+
+// TZ R32 W8.3: a map server tells the world that the facts of item `id` changed (its journal reads them from the object when it writes
+// the ItemFacts entry). No level side here (the co-op host, the world server, a client): nothing.
+void note_facts(u16 id, u8 source)
+{
+	LevelSide* side = mode().level();
+	if (!side)
+		return;
+	u8& pending = g_facts_source[id];
+	if (pending != kFactsDecider)
+		pending = source; // a decider's word since the last read wins: the world takes its upgrades
+	side->level_item_facts_up(id);
+}
+
+// TZ R32 W8.1: the decider's own value of the tags `mask` of player `peer`'s item `id` (its baseline) with its latest versions, to
+// the owner alone. The owner applies the tags whose version he has not applied yet (coop_owner_rules.h push_applies).
+void host_push_decider(u16 id, PeerId peer, u32 mask)
+{
+	CSE_Abstract* e = find_entity(id);
+	auto ow = g_owned.find(id);
+	if (!e || ow == g_owned.end() || peer == kInvalidPeer)
+		return;
+	// A tag the baseline does not have yet (a report refused before any baseline): the decider's copy as it is now, kept as baseline.
+	if (const u32 missing = mask & itemtags::kOwnerTakeTags & ~carried_tags(ow->second.data))
+	{
+		ItemData cur;
+		CInventoryItem* item = find_item(id);
+		if (item)
+			capture_object(item, cur, false);
+		else
+			capture_entity(e, cur, false);
+		ow->second.data = itemtags::take_push(ow->second.data, cur, missing);
+	}
+	ItemData d = itemtags::only_tags(ow->second.data, mask);
+	attach_versions(d, versions_in(g_versions, id));
+	if (!d.has_versions)
+	{
+		// Version 0 everywhere (this decider never wrote the item; A12 heal after a decider change): say it with the mask.
+		d.has_versions = true;
+		d.versions_mask = mask & itemtags::kAll;
+	}
+	// The uses travel as the change of their latest version too (finding 4): the owner who has applied the version before takes it
+	// onto his own value (coop_owner_rules.h owner_takes_uses), anyone else the value.
+	int delta = 0;
+	if (d.has_uses && uses_history_in(id).delta_of(d.versions.get(itemtags::Uses), delta))
+	{
+		d.has_uses_delta = true;
+		d.uses_delta = s16(delta);
+	}
+	Blob blob;
+	write_data(d, blob);
+	Writer w(blob.size() + 48);
+	write_state(w, id, e->s_name.c_str(), u8(kFlagAuthority | kFlagDecider), blob);
+	net::host_send(peer, Msg::ItemState, w);
+	++g_stats.decider_pushed;
 }
 
 // The owner emptied this box (reload). The standard destroy chain removes it everywhere.
@@ -1576,20 +1842,62 @@ void host_on_state(PeerId from, Reader& r)
 	}
 	host_sanitize(e, item, d);
 	filter_detached_silencer(id, from, d);
+	// TZ R32 W8.2: a field of the owner's report counts only when he made it on the decider's latest version of it: his own use on
+	// top of the decider's last write is his, a report from before that write never undoes it (gap-g4 F1, F3). The uses are a
+	// counter: a stale report of them is rebased over the decider's changes since (his own doses stay spent too). The same check
+	// for the report of an item that has just left his hands (Late: dropped or stashed inside the round trip of a debit), else that
+	// report would put the debited charge back (WP6 fix round, finding 3); no push then, he holds it no more.
+	u32 refused = 0;
+	bool rebased = false;
+	if (access == Access::Owned || access == Access::Late)
+	{
+		const owner::ReportVerdict verdict = owner::judge_report(versions_in(g_versions, id), d.versions, carried_tags(d),
+		    uses_history_in(id), int(d.uses), max_uses_here(e, item));
+		if (verdict.rebased)
+		{
+			d.uses = u8(verdict.uses);
+			rebased = true;
+			++g_stats.uses_rebased;
+		}
+		refused = verdict.refused;
+		if (refused)
+		{
+			d = itemtags::only_tags(d, itemtags::kAll & ~refused);
+			++g_stats.stale_refused;
+		}
+	}
+	d.has_versions = false; // the decider's business: never relayed, never applied
+	d.versions_mask = 0;
 	Blob clean;
 	write_data(d, clean);
-	if (item)
-		apply_object(item, d, ammo_only);
-	apply_entity(e, d, ammo_only);
+	{
+		const Applying applying; // a setter run by a callback inside this apply is no deliberate write
+		if (item)
+			apply_object(item, d, ammo_only);
+		apply_entity(e, d, ammo_only);
+	}
 	++g_stats.applied;
 	g_unload_used.erase(id);
 
 	if (access == Access::Owned)
 	{
+		auto known = g_owned.find(id);
+		const bool had = known != g_owned.end();
+		const ItemData before = had ? known->second.data : ItemData();
 		Owned& o = g_owned[id];
 		o.peer = from;
-		o.data = d;
+		o.data = refused && had ? itemtags::take_push(d, before, refused) : d; // a refused tag keeps the decider's baseline
 		o.stuck = false;
+		// The writer alone pushes (a process that keeps a copy, the world, never does): the refused tags, and rebased uses too. Their
+		// own push is usually in flight and comes first (he then takes this one as a repeat); when it never went (staged uses set
+		// before his join made him the owner) this one brings him onto the latest version.
+		const u32 push = refused | (rebased ? u32(itemtags::Uses) : 0u);
+		if (push && writing::writes(id))
+			host_push_decider(id, from, push);
+		// W8.3: the world's entity keeps what the owner did to the item himself (his eating, an addon), not every round he fires.
+		const u32 facts = u32(itemtags::Cond | itemtags::Uses | itemtags::Addons | itemtags::Scope);
+		if (!had || (itemtags::changed_since(o.data, before, same_upgrades) & facts))
+			note_facts(id, kFactsOwner);
 	}
 	if (d.has_box && d.box == 0 && !ammo_only && smart_cast<CSE_ALifeItemAmmo*>(e))
 	{
@@ -1881,6 +2189,7 @@ void host_enforce(u64 now)
 			capture_object(item, cur);
 			if (diverged_tags(cur, it->second.data))
 			{
+				const Applying applying;
 				apply_object(item, it->second.data, false);
 				if (CSE_Abstract* e = find_entity(it->first))
 					apply_entity(e, it->second.data, false);
@@ -1937,7 +2246,7 @@ void on_item_state(PeerId from, Reader& r)
 	const Op op = Op(r.u8());
 	if (!r.ok())
 		return;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		// Precaching a freshly loaded world: states and unloads made in the old one are dropped
 		// (the pump runs before join::frame() marks the peers as joining).
@@ -1948,10 +2257,10 @@ void on_item_state(PeerId from, Reader& r)
 			if (!hold_state_of_joining(from, r))
 				host_on_state(from, r);
 		}
-		else if (op == Op::SpawnAmmo && levels::on_host_level(from))
+		else if (op == Op::SpawnAmmo && mode().where(from) != Where::Away)
 			host_on_spawn_ammo(from, r); // this message reaches the world server and the map server of his level: the boxes are made at his body
 	}
-	else if (mgr().is_client() && op == Op::State)
+	else if (!mode().decides_world() && op == Op::State)
 	{
 		// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
 		// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
@@ -1973,7 +2282,7 @@ void host_on_peer_in_world(PeerId peer)
 	xr_vector<HeldState> held;
 	held.swap(it->second);
 	g_join_held.erase(it);
-	if (!is_map_authority() || !ai().get_alife() || Device.dwPrecacheFrame)
+	if (!(mode().decides_world() || mode().leads_level()) || !ai().get_alife() || Device.dwPrecacheFrame)
 		return; // another world meanwhile: what he said belongs to the one before (on_item_state drops the same)
 	for (const HeldState& h : held)
 	{
@@ -2016,6 +2325,11 @@ void reset()
 	g_unload_used.clear();
 	g_streams.clear();
 	g_releasing.clear();
+	g_versions.clear();
+	g_uses_history.clear();
+	g_staged_uses.clear();
+	g_applied.clear();
+	g_facts_source.clear();
 	g_was_live = false;
 	g_resync = false;
 	g_host_precaching = false;
@@ -2023,6 +2337,59 @@ void reset()
 	g_last_modify = 0;
 	g_seq = 0;
 }
+
+namespace
+{
+// The writer set uses staged for its object (`before`: what the object read from the stock bytes). A remote player's item it already
+// tracks: his deliberate write (decider_wrote: baseline, version, push, the world told). One whose owner is not known yet (a player
+// still joining, whose copy comes from the same save): the version of the uses moves on with this change all the same, so that his
+// first report, made on that save, is rebased onto it and pushed to him (host_on_state); a map server tells the world.
+void writer_set_staged(CInventoryItem* item, u8 before, u8 uses)
+{
+	const u16 id = item->object_id();
+	auto ow = g_owned.find(id);
+	if (ow != g_owned.end() && ow->second.peer != kInvalidPeer)
+	{
+		decider_wrote(item, owner::Setter::Uses);
+		return;
+	}
+	if (!(mode().decides_world() || mode().leads_level()) || !writing::writes(id))
+		return; // a copy sets its own object only
+	itemtags::FieldVersions& latest = g_versions[id];
+	itemtags::bump(latest, itemtags::Uses);
+	g_uses_history[id].record(latest.get(itemtags::Uses), int(uses) - int(before));
+	note_facts(id, kFactsDecider);
+}
+
+// WP6 fix round (finding 1): uses staged for an item whose entity could not keep them (g_staged_uses) go into its game object the
+// first frame it exists here, after its net_Spawn read the stock client_data. The writer's set is its deliberate write (W8.1: the
+// owner gets it, a map server tells the world, whose entity then keeps the object's own bytes); a copy only sets its own object.
+void apply_staged_uses()
+{
+	if (g_staged_uses.empty())
+		return;
+	for (auto it = g_staged_uses.begin(); it != g_staged_uses.end();)
+	{
+		CInventoryItem* item = find_item(it->first);
+		if (!item)
+		{
+			++it;
+			continue;
+		}
+		const u16 id = it->first;
+		const u8 uses = it->second;
+		it = g_staged_uses.erase(it);
+		CEatableItem* eat = item->cast_eatable_item();
+		if (!eat || uses > eat->GetMaxUses())
+			continue;
+		const u8 before = eat->GetRemainingUses();
+		eat->SetRemainingUses(uses);
+		writer_set_staged(item, before, uses);
+		touch(item);
+		::Msg("* [coop] items: staged uses %u of %u [%s] set on its object", u32(uses), u32(id), item->object().cNameSect().c_str());
+	}
+}
+} // namespace
 
 void frame()
 {
@@ -2037,7 +2404,7 @@ void frame()
 		scan_now = g_scan_now;
 		g_scan_now = false;
 	}
-	const bool host = is_map_authority();
+	const bool host = mode().decides_world() || mode().leads_level();
 	const bool live_client = mgr().is_live_client();
 	if ((!host && !live_client) || !g_pGameLevel || !ai().get_alife())
 	{
@@ -2057,12 +2424,17 @@ void frame()
 			g_proxy_items.clear();
 			g_unload_used.clear();
 			g_releasing.clear();
+			g_versions.clear(); // the save is the truth: the players' copies are built again from it (and reset their versions)
+			g_uses_history.clear();
+			g_staged_uses.clear();
+			g_facts_source.clear();
 		}
 		g_host_precaching = true;
 		return;
 	}
 	g_host_precaching = false;
 	const u64 now = mgr().now_ms();
+	apply_staged_uses();
 	if (live_client && !g_was_live)
 	{
 		// Entered the host's world: start a new spawn stream and tell the host our state once.
@@ -2113,7 +2485,7 @@ void print_status()
 	      "%llu authority (%llu kept ours), %llu ignored, %u pending (%llu dropped)",
 	    s.sent, s.foreign_sent, s.spawns_sent, s.received, s.applied, s.authority_applied, s.authority_skipped,
 	    s.ignored, (u32)g_pending.size(), s.pending_dropped);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		u32 stuck = 0;
 		for (const auto& it : g_owned)
@@ -2132,10 +2504,15 @@ void print_status()
 	}
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		::Msg("[coop]   items of joining players: %llu state(s) kept, %llu taken when the join ended (%u peer(s) waiting)",
 		    s.join_held, s.join_taken, (u32)g_join_held.size());
-	if (mgr().is_client())
+	// TZ R32 W8 (WP6): the decider's writes and the owners' reports field by field, the world's facts.
+	::Msg("[coop]   items W8: %llu deliberate writes, %llu decider pushes, %llu stale fields refused, %llu stale uses rebased; "
+	      "owner: %llu pushes applied (%llu kept doses of his own); world facts: %llu taken, %llu refused; %u uses staged",
+	    s.deliberate, s.decider_pushed, s.stale_refused, s.uses_rebased, s.decider_applied, s.uses_delta_applied, s.facts_taken,
+	    s.facts_refused, (u32)g_staged_uses.size());
+	if (mgr().active() && !mode().decides_world())
 		::Msg("[coop]   items in: %llu states dropped before live (R2 I2), %llu take changes kept over the host's push "
 		      "(%u waiting)",
 		    s.dropped_before_live, s.take_kept, (u32)g_take_base.size());
@@ -2497,6 +2874,23 @@ bool section_defaults_ok(const shared_str& section)
 	return upgrades::defaults_ok(defaults);
 }
 
+bool is_eatable_section(const shared_str& section)
+{
+	static xr_map<shared_str, bool> s_known; // main thread (the item engine's callers)
+	auto it = s_known.find(section);
+	if (it != s_known.end())
+		return it->second;
+	const bool eatable = section.size() && pSettings->section_exist(section) && pSettings->line_exist(section, "class") &&
+	    initial::is_eatable_class(pSettings->r_string(section, "class"));
+	s_known.emplace(section, eatable);
+	return eatable;
+}
+
+u32 section_max_uses(const shared_str& section)
+{
+	return pSettings->line_exist(section, "max_uses") ? u32(pSettings->r_u8(section, "max_uses")) : 1u; // CEatableItem::Load
+}
+
 AddedUpgrade host_check_added_upgrade(CSE_Abstract* entity, const shared_str& upgrade, const char*& why)
 {
 	why = nullptr;
@@ -2575,19 +2969,32 @@ bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob)
 	CInventoryItem* item = find_item(id);
 	ItemData d;
 	if (item)
+	{
 		capture_object(item, d);
+		attach_client_data(item, d); // W8.3: a held eatable's own bytes, which the world stores when it has no object
+	}
 	else if (!capture_entity(e, d))
 		return false;
+	attach_versions(d, versions_in(g_versions, id)); // §8a A12: the decider's versions travel with the facts
 	blob.clear();
 	write_data(d, blob);
 	section = e->s_name.c_str();
 	return true;
 }
 
+u8 level_facts_source(u16 id)
+{
+	auto it = g_facts_source.find(id);
+	if (it == g_facts_source.end())
+		return 0; // Loot: nobody wrote it on purpose since the last read
+	const u8 source = it->second;
+	g_facts_source.erase(it);
+	return source;
+}
+
+// The map server's ItemState callback, also called by its loot watcher.
 void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& blob)
 {
-	if (!is_map_server())
-		return;
 	Writer w(blob.size() + section.size() + 16);
 	write_state(w, id, section.c_str(), 0, blob); // the numbering of host_send_state: a map server's players read its ids
 	net::host_broadcast(Msg::ItemState, w);
@@ -2608,9 +3015,14 @@ bool host_take_level_state(u16 id, const char* section, const u8* data, size_t s
 		why = "another section";
 		return false;
 	}
-	if (g_owned.count(id))
+	// A player's item is his word (ItemState), nobody else's: one a player of this world holds now, as host_access says. Not
+	// g_owned: it learns a move a frame late (host_track_proxies), and a map server tells the wear of what a player put down
+	// (a death stash, a drop) in the frame of the move, right behind its Parent: the entry of an item that has just left his
+	// character is still there (stand b57g feed_server: a death stash on a map server's level, 8 refusals).
+	const u16 root = entity_root(e);
+	if (root == 0 || join::is_proxy(root))
 	{
-		why = "a player's item"; // its owner says its state (ItemState), nobody else
+		why = "a player's item";
 		return false;
 	}
 	ItemData d;
@@ -2629,6 +3041,195 @@ bool host_take_level_state(u16 id, const char* section, const u8* data, size_t s
 	return true;
 }
 
+namespace
+{
+// A section with a script binding: its binder writes after the uses, and a process with no object cannot make those bytes.
+bool may_make_client_data(const shared_str& section)
+{
+	return !pSettings->line_exist(section, "script_binding");
+}
+} // namespace
+
+bool entity_write_uses(CSE_Abstract* e, u8 uses)
+{
+	CSE_ALifeInventoryItem* ii = e ? smart_cast<CSE_ALifeInventoryItem*>(e) : nullptr;
+	if (!ii || !is_eatable_section(e->s_name) || !initial::uses_ok(uses, section_max_uses(e->s_name)))
+		return false; // only an eatable has uses (finding 5: a weapon's client_data has the same first bytes)
+	const float cond = ii->m_fCondition;
+	std::vector<u8> cd(e->client_data.begin(), e->client_data.end());
+	const initial::UsesStore how =
+	    initial::uses_store(cd, nullptr, uses, e->ID_Parent != 0xffff, may_make_client_data(e->s_name));
+	if (!initial::store_uses(cd, how, nullptr, uses, &cond, may_make_client_data(e->s_name)))
+		return false;
+	e->client_data.assign(cd.begin(), cd.end());
+	g_staged_uses.erase(e->ID); // the entity keeps the newest value now
+	return true;
+}
+
+void stage_uses(u16 id, u8 uses)
+{
+	g_staged_uses[id] = uses;
+}
+
+void discard_staged_uses(u16 id)
+{
+	g_staged_uses.erase(id);
+}
+
+bool staged_uses(u16 id, u8& uses)
+{
+	auto it = g_staged_uses.find(id);
+	if (it == g_staged_uses.end())
+		return false;
+	uses = it->second;
+	return true;
+}
+
+bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t size, const char*& why)
+{
+	why = nullptr;
+	CSE_Abstract* e = find_entity(id);
+	CSE_ALifeInventoryItem* ii = e ? smart_cast<CSE_ALifeInventoryItem*>(e) : nullptr;
+	if (!ii)
+	{
+		why = "no such item";
+		return false;
+	}
+	if (!same_str(e->s_name, section))
+	{
+		why = "another section";
+		return false;
+	}
+	ItemData d;
+	if (size > kMaxBlob || !read_data(data, size, d))
+	{
+		why = "malformed";
+		return false;
+	}
+	// The facts, not the rounds: magazines and boxes reach the world with their own messages, as on the host's own level. The upgrade
+	// list is the writer's whatever made it send the facts (finding 2): the blob is the map server's capture of its own copy
+	// (level_item_state), whose list only its own sale installs (host_upgrade_sold; host_on_state never takes a player's claim).
+	ItemData facts = itemtags::only_tags(
+	    d, u32(itemtags::Cond | itemtags::Addons | itemtags::Scope | itemtags::Uses | itemtags::Upgrades));
+	facts.has_mode = facts.has_fire_mode = facts.has_cartridges = false;
+	CInventoryItem* item = find_item(id);
+	if (!host_validate_kind(e, facts, why) || !host_validate_counts(e, item, facts, why))
+	{
+		++g_stats.facts_refused;
+		return false;
+	}
+	host_sanitize(e, item, facts); // the upgrade list in an order the engine takes, a scope index in range
+	// W8.3: the uses of an item with no object here go into its client_data, decided before anything is written: what cannot be
+	// stored refuses the whole entry (an honest Refused, nothing half applied; finding 1). The writer's own bytes of its object come
+	// first: they carry the binder's bytes a scripted section needs (G.A.M.M.A.'s multi-use kits and drinks, [booster_multi]).
+	std::vector<u8> cd;
+	const bool store = facts.has_uses && !item;
+	if (store)
+	{
+		if (!is_eatable_section(e->s_name) || !initial::uses_ok(facts.uses, section_max_uses(e->s_name)))
+		{
+			why = "uses for a non-eatable, or more than the section has";
+			++g_stats.facts_refused;
+			return false;
+		}
+		cd.assign(e->client_data.begin(), e->client_data.end());
+		const float cond = facts.has_cond ? dequant(facts.cond) : ii->m_fCondition;
+		const std::vector<u8>* stock = d.has_client_data ? &d.client_data : nullptr;
+		const bool may_make = may_make_client_data(e->s_name);
+		const initial::UsesStore how = initial::uses_store(cd, stock, facts.uses, e->ID_Parent != 0xffff, may_make);
+		if (!initial::store_uses(cd, how, stock, facts.uses, &cond, may_make))
+		{
+			why = "the uses cannot be stored (a scripted section and no bytes of the writer's object, or an item on the ground)";
+			++g_stats.facts_refused;
+			return false;
+		}
+	}
+	// §8a A12: the writer's versions of the item are the world's now (they go out with its next spawn's initial state).
+	if (d.has_versions)
+	{
+		owner::arrive(g_versions[id], d.versions, d.versions_mask);
+		g_uses_history.erase(id); // changes of this process's numbering are no changes of the arrived one
+	}
+	const bool upgrades = facts.has_upgrades;
+	facts.has_upgrades = false; // set below, never through apply_object (an object takes them from GE_INSTALL_UPGRADE)
+	{
+		const Applying applying;
+		if (item)
+			apply_object(item, facts, false);
+		apply_entity(e, facts, false);
+	}
+	if (store)
+	{
+		e->client_data.assign(cd.begin(), cd.end());
+		g_staged_uses.erase(id);
+	}
+	// The writer's upgrades: a world with no object of the item sets the list its next net_Spawn installs (CSE add_upgrade is
+	// FATAL on a duplicate, so an object here keeps its own path).
+	if (upgrades && !item)
+		ii->m_upgrades = facts.upgrades;
+	++g_stats.facts_taken;
+	return true;
+}
+
+void decider_wrote(CInventoryItem* item, owner::Setter what)
+{
+	if (!item || item->object().getDestroy())
+		return;
+	if (!(mode().decides_world() || mode().leads_level()))
+		return; // a mirror's setter changes its own copy (the writer gate, W2)
+	if (g_applying > 0)
+		return; // inside the apply of an owner's state or of the decider's baseline
+	const u16 id = item->object_id();
+	if (!writing::writes(id))
+		return; // a copy of an item another process writes: not its word (R32 W1)
+	const u32 mask = owner::tags_of(what);
+	auto ow = g_owned.find(id);
+	const bool owned = ow != g_owned.end() && ow->second.peer != kInvalidPeer;
+	if (owner::deliberate(true, owned, false))
+	{
+		ItemData now;
+		capture_object(item, now, false);
+		const ItemData before = ow->second.data;
+		ow->second.data = owner::adopt(ow->second.data, now, mask);
+		ow->second.stuck = false;
+		itemtags::FieldVersions& latest = g_versions[id];
+		itemtags::bump(latest, mask);
+		// The uses are a counter (WP6 fix round, finding 4): the change this write made rides its push and rebases an owner's
+		// report made before it. With no baseline of them yet the change is unknown: the push is a value then.
+		if ((mask & itemtags::Uses) && before.has_uses && now.has_uses)
+			g_uses_history[id].record(latest.get(itemtags::Uses), int(now.uses) - int(before.uses));
+		++g_stats.deliberate;
+		const PeerId peer = ow->second.peer;
+		host_push_decider(id, peer, mask); // the owner, in this frame
+		if (CSE_Abstract* e = find_entity(id))
+		{
+			apply_entity(e, itemtags::only_tags(now, mask), false);
+			host_send_view(id, e, item, nullptr, 0, peer); // the other players' copies
+		}
+	}
+	// W8.3: the world keeps a player's item's facts; a world item's wear goes as loot already, its uses do not.
+	if (owned || (mask & itemtags::Uses))
+		note_facts(id, kFactsDecider);
+}
+
+itemtags::FieldVersions item_versions(u16 id)
+{
+	if (mode().decides_world() || mode().leads_level())
+		return versions_in(g_versions, id);
+	return versions_in(g_applied, id);
+}
+
+void item_versions_arrive(u16 id, const itemtags::FieldVersions& v, u32 mask)
+{
+	if (mode().decides_world() || mode().leads_level())
+	{
+		owner::arrive(g_versions[id], v, mask);
+		g_uses_history.erase(id); // changes of this process's numbering are no changes of the arrived one
+	}
+	else
+		owner::arrive(g_applied[id], v, mask); // our copy is built from that state: we have applied exactly these
+}
+
 void host_upgrade_sold(u16 id, PeerId owner)
 {
 	CSE_Abstract* e = find_entity(id);
@@ -2639,6 +3240,10 @@ void host_upgrade_sold(u16 id, PeerId owner)
 	if (item)
 		install_upgrades(item, ii->m_upgrades); // a loading install: no event, no Lua price
 	host_send_view(id, e, item, nullptr, 0, owner); // the owner has it already
+	// W8.3 (finding 2): a map server's sale is the writer's own change of the item: the world takes the list from its ItemFacts (no
+	// owner report follows, his own state strips upgrades). Nothing on a process with no level side (the co-op host: its entity
+	// has the upgrade already).
+	note_facts(id, kFactsDecider);
 	++g_stats.upgrades_sold;
 }
 

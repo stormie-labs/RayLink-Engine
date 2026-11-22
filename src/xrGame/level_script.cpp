@@ -33,6 +33,7 @@
 #include "alife_time_manager.h"
 #include "coop/coop_worldstate.h" // Anomaly Coop: host-owned clock and weather
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_join.h"
 #include "UI/UIGameTutorial.h"
 #include "string_table.h"
 #include "ui/UIInventoryUtilities.h"
@@ -1306,6 +1307,19 @@ LPCSTR tutorial_name()
 	if (g_tutorial)
 		return g_tutorial->m_name;
 	return "invalid";
+}
+
+u32 active_tutorial_id()
+{
+	return g_tutorial && g_tutorial->IsActive() ? g_tutorial->Id() : 0;
+}
+
+bool player_hud_ready()
+{
+	if (!g_pGameLevel || !g_actor || Device.dwPrecacheFrame || coop::hold_loading_screen())
+		return false;
+	const auto* ui = CurrentGameUI();
+	return ui && ui->UIMainIngameWnd;
 }
 
 LPCSTR translate_string(LPCSTR str)
@@ -2899,6 +2913,8 @@ void CLevel::script_register(lua_State* L)
 		def("stop_tutorial", &stop_tutorial),
 		def("has_active_tutorial", &has_active_tutotial),
 		def("active_tutorial_name", &tutorial_name),
+		def("active_tutorial_id", &active_tutorial_id),
+		def("player_hud_ready", &player_hud_ready),
 		def("translate_string", &translate_string),
 		def("reload_language", &reload_language),
 		def("get_resolutions", &vid_modes_string),

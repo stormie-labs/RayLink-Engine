@@ -4,14 +4,15 @@
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_alife.h"
+#include "coop_progress.h" // F5-PRG-2: progress::host_check, the keeper's check of a Progress report
 #include "coop_world.h" // world::avatar_of: a peer's character, for a task's audience
-#include "coop_levels.h" // levels::passes_to: a task sent by its audience goes where host_broadcast would send it
-#include "coop_mapserver.h" // mapserver::host_bridges, is_bridge, bridge_takes: a bridge gets every task
+#include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_task_audience.h"
 #include "xrCoop/coop_limits.h" // F2 T14 fix 1: limits::Pacer
-#include "xrCoop/coop_ghost_rules.h"
+#include "xrCoop/srv/coop_ghost_rules.h" // ghost::Said and the queued relation log
 #include "xrCoop/coop_task_target.h"
+#include "xrCoop/coop_fight_fact.h" // INTEG-C (F5-PRG-4): a map server's fight fact to the keeper
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -102,7 +103,9 @@ enum : u8
 	RelReqCommunitySet = 14, // {i32 community, u16 to, i32 value}
 	RelReqCommunityChange = 15, // {i32 community, u16 to, i32 delta}
 	RelReqCommRelation = 16, // {i32 from, i32 to, i32 value}
+	RelUpFightFact = 17, // a map server -> the world server: a fight's reputation of a player (xrCoop/coop_fight_fact.h, INTEG-C)
 };
+static_assert(RelUpFightFact == fight::kRelOp, "the op of a fight fact is the one its wire writes");
 
 const char* cs(const shared_str& s) { return s.c_str() ? s.c_str() : ""; }
 shared_str to_shared(const std::string& s) { return s.empty() ? shared_str() : shared_str(s.c_str()); }
@@ -186,6 +189,7 @@ struct Stats
 	u64 deferred = 0;
 	u64 proxy_actions = 0; // host: RELATION_REGISTRY::Action calls with a player proxy as the actor (R-3.4)
 	u64 rep_deltas_out = 0, rep_deltas_in = 0; // reputation from host-side combat bookkeeping
+	u64 rep_facts_up = 0, rep_facts_in = 0, rep_facts_refused = 0; // INTEG-C: fight facts of a map server, the keeper's verdicts
 } g_stats;
 
 // ------------------------------------------------------------------ applying guard
@@ -288,7 +292,7 @@ void push_out(Msg type, Writer&& w, const limits::CommunityPair* pair = nullptr)
 
 void send_out(Msg type, const Writer& w)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 		net::host_broadcast(type, w);
 	else
 		net::client_send(type, w);
@@ -458,7 +462,18 @@ u64 g_audience_refused = 0; // entries the table refused (full)
 // task_audience::kNoCharacter (0xffff) while he has none (such a peer is out of every task that has an audience).
 u16 character_of(PeerId peer) { return peer == kHostPeer ? u16(0) : world::avatar_of(peer); }
 
-// May task `id` be sent to `peer`? A bridge (a map server) gets every task: it runs the logic of every task.
+// A connection of this session that is none of its players (Session: joined, yet in no peers()). A co-op session has none; in a
+// server world it is a map server's connection, and it runs the logic of every task for its map. A player who left is neither.
+// A-S5S: what the story asked mapserver::is_bridge before (docs/MODES.md section 3: the Core names no server function); the session
+// says it (tests/test_story_bridges.cpp).
+bool no_player_connection(PeerId peer)
+{
+	const Session& s = mgr().session();
+	return peer != kHostPeer && s.joined(peer) && !s.peer(peer);
+}
+
+// May task `id` be sent to `peer`? A connection that is no player (a map server's) gets every task: it runs the logic of every task,
+// and an audience names players' characters.
 // The host player (peer 0 of a listen world server) is NOT filtered here, by design: he reads the authority's own task
 // manager, and TaskUpdate / TaskList / StoryHash do not go over his LocalLink, so nothing sent from here could hide a task
 // from him (plan "Known limits": phase 2, a filter in the PDA of the host process).
@@ -466,35 +481,22 @@ bool may_see(PeerId peer, const shared_str& id)
 {
 	if (g_audience.empty() || peer == kHostPeer)
 		return true;
-	return g_audience.allowed(cs(id), character_of(peer), mapserver::is_bridge(peer));
+	return g_audience.allowed(cs(id), character_of(peer), no_player_connection(peer));
 }
 
 // Task `id` has an audience: it goes per peer (send_by_audience), not by host_broadcast.
 bool has_audience(const shared_str& id) { return !g_audience.empty() && g_audience.find(cs(id)) != nullptr; }
 
-// The part of net::host_broadcast past the remote players, unfiltered: the host player over his LocalLink (his link gate
-// decides; not filtered, see may_see) and the bridges of a world server that bridge_takes admits (net's to_bridges: queued
-// for a bridge that loads its world).
-void send_to_host_player_and_bridges(Msg type, const Writer& w)
-{
-	Session& s = mgr().session();
-	if (s.local())
-		s.send(kHostPeer, Lane::Reliable, type, w);
-	if (is_world_server() && mapserver::bridge_takes(type))
-		for (const PeerId bridge : mapserver::host_bridges())
-			net::host_send(bridge, type, w);
-}
-
-// A task message by its task's audience: where host_broadcast would send it (joined players that passes_to admits, the host
-// player, the bridges), less the players who may not see it.
+// A task message by its audience: filter joined players by reach and membership,
+// then send to the mode's other links with their usual delivery rules.
 void send_by_audience(Msg type, const Writer& w, const shared_str& id)
 {
-	if (!is_map_authority())
+	if (!mode().decides_world() && !mode().leads_level())
 		return;
 	for (const PeerInfo& p : mgr().session().peers())
-		if (p.state == PeerState::Joined && levels::passes_to(type, p.id) && may_see(p.id, id))
+		if (p.state == PeerState::Joined && mode().reaches(p.id, type) && may_see(p.id, id))
 			net::host_send(p.id, type, w); // queued for a peer that is still loading, as host_broadcast does
-	send_to_host_player_and_bridges(type, w);
+	mode().deliver_links(type, w, Lane::Reliable);
 }
 
 void capture(const CGameTask* t, TaskRec& r)
@@ -854,7 +856,7 @@ void client_on_task_targets(Reader& r)
 		here.online = e && e->m_bOnline;
 		here.held = e && e->ID_Parent != kNoId;
 		here.level_object = in_game() && Level().Objects.net_Find(local) != nullptr;
-		here.map_authority = is_map_authority();
+		here.map_authority = mode().decides_world() || mode().leads_level();
 		const task_target::Take take = task_target::take(here);
 		note_target_rx(id, take, now);
 		if (take == task_target::Take::Unknown)
@@ -885,7 +887,7 @@ void print_task_targets()
 {
 	if (!in_game())
 		return;
-	const bool host = mgr().is_host();
+	const bool host = mode().decides_world();
 	const u64 now = mgr().now_ms();
 	u32 n = 0;
 	for (const SGameTaskKey& k : tasks().GetGameTasks())
@@ -1034,6 +1036,52 @@ void lua_note(LPCSTR kind, const shared_str& task_id, PeerId peer)
 	lua_settop(L, top);
 }
 
+// TZ 6.4 #1 (owner 2026-11-18): the host's checks of a client's TaskReqState live in coop_tasks.host_state_verdict: a turn-in
+// passes the checks of the Lua request (ops.complete: money, items), a fail comes from the player who took the task. Whether a
+// failed check refuses or is only logged is coop_trust's setting. No script or function, a Lua error: true, as before.
+// Round 2 (F2): the verdict also gets whether the request is explicit (a script's set_task_state) for its log line; a turn-in
+// needs the host's own check of the task to say it is done, explicit or not.
+constexpr LPCSTR kLuaStateVerdict = "local id, st, peer, bridge, timed_out, explicit = ...\n"
+									"local ok, m = pcall(function() return coop_tasks end)\n"
+									"if not ok or type(m) ~= 'table' or type(m.host_state_verdict) ~= 'function' then return 'ok' end\n"
+									"local good, v = pcall(m.host_state_verdict, id, st, peer, bridge, timed_out, explicit)\n"
+									"if good and v == false then return 'refuse' end\n"
+									"return 'ok'\n";
+
+bool lua_task_state_ok(const shared_str& task_id, u8 state, PeerId peer, bool bridge, bool timed_out, bool explicit_call)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !task_id.size())
+		return true;
+	const int top = lua_gettop(L);
+	bool ok = true;
+	if (luaL_loadbuffer(L, kLuaStateVerdict, xr_strlen(kLuaStateVerdict), "@coop_story_state_verdict") == 0)
+	{
+		lua_pushstring(L, cs(task_id));
+		lua_pushinteger(L, int(state));
+		lua_pushnumber(L, lua_Number(peer));
+		lua_pushboolean(L, bridge ? 1 : 0);
+		lua_pushboolean(L, timed_out ? 1 : 0);
+		lua_pushboolean(L, explicit_call ? 1 : 0);
+		if (lua_pcall(L, 6, 1, 0))
+			::Msg("! [coop] story: task state verdict failed: %s", lua_tostring(L, -1));
+		else if (lua_isstring(L, -1) && xr_strcmp(lua_tostring(L, -1), "refuse") == 0)
+			ok = false;
+	}
+	lua_settop(L, top);
+	return ok;
+}
+
+// The engine's own fail of a task with a time limit (CGameTask::UpdateState) as this host's clock sees it. A client's clock may
+// run a little ahead of the host's: a fail asked up to kTaskTimeSlack game ms before the host's limit counts as run out.
+constexpr ALife::_TIME_ID kTaskTimeSlack = 5 * 60 * 1000; // five game minutes
+bool task_time_ran_out(const CGameTask* t)
+{
+	if (t->m_ReceiveTime == t->m_TimeToComplete)
+		return false; // no time limit
+	return Level().GetGameTime() + kTaskTimeSlack > t->m_TimeToComplete;
+}
+
 // The host runs Anomaly's own task manager for a client's request, so its scripts track the task
 // (texts, targets, completion) exactly as if the host had taken it.
 constexpr LPCSTR kLuaGiveTask = "local id, giver = ...\n"
@@ -1153,6 +1201,13 @@ void host_on_task_state(PeerId from, Reader& r)
 	}
 	if (state != eTaskStateCompleted && state != eTaskStateFail)
 		return;
+	// TZ 6.4 #1: the host's checks (coop_trust: "log" lets it through), before anything of the request is done, explicit or not.
+	// `bridge`: the word of a connection that is no player (a map server's logic), not a player's (A-S5S: asked of the session)
+	if (!lua_task_state_ok(t->m_ID, state, from, no_player_connection(from), state == eTaskStateFail && task_time_ran_out(t), explicit_call))
+	{
+		send_task_to(from, t); // refused: his view back
+		return;
+	}
 	g_finisher[id] = from;
 	lua_note("finisher", id, from); // the reward goes to this player (R-7.6)
 	const PeerInfo* p = mgr().session().peer(from);
@@ -1455,6 +1510,9 @@ void host_add_reported_reputation(PeerId peer, int delta); // progress section
 
 // Host: the engine changed a player's reputation on its proxy (Action: attack, fight help). The player's
 // machine owns its reputation (the proxy's value is put back from its reports), so the change goes to it.
+// INTEG-C (F5-PRG-4, rv_F5-PRG-4 blocker 2): where the fight is, its record is not always: a process that leads a level apart from its
+// world (mode().level(): a map server) tells the world the fact (LevelSide::level_fight_reputation) and the world applies it and tells
+// him (coop_srv_progress.script checks it, then progress::host_apply_fight); a process that keeps the record applies it here.
 void host_flush_rep_deltas()
 {
 	if (g_rep_delta.empty())
@@ -1463,16 +1521,17 @@ void host_flush_rep_deltas()
 	list.swap(g_rep_delta);
 	for (const auto& it : list)
 	{
-		const PeerId peer = join::peer_of_proxy(it.first);
-		if (peer == kInvalidPeer || peer == kHostPeer || !it.second)
+		if (!it.second)
 			continue;
-		host_add_reported_reputation(peer, it.second);
-		Writer w(16);
-		w.u8(RelReputationDelta);
-		w.u16(it.first);
-		w.i32(it.second);
-		net::host_send(peer, Msg::Relation, w);
-		++g_stats.rep_deltas_out;
+		if (LevelSide* l = mode().level())
+		{
+			l->level_fight_reputation(it.first, it.second);
+			++g_stats.rep_facts_up;
+			continue;
+		}
+		const PeerId peer = join::peer_of_proxy(it.first);
+		if (progress::host_apply_fight(peer, it.first, it.second))
+			++g_stats.rep_deltas_out;
 	}
 }
 
@@ -1833,7 +1892,7 @@ bool client_relation_request(u8 op, int a, int b, int v)
 {
 	// A mirror's fight is the host's to count. A map server is the authority of the fights on its level: what they do to goodwill it asks the
 	// world server for like any other relation, and hears it back.
-	if (g_action_depth > 0 && !is_map_server())
+	if (g_action_depth > 0 && !mode().leads_level())
 	{
 		++g_stats.action_dropped;
 		return true;
@@ -1904,6 +1963,18 @@ void host_on_relation_request(PeerId from, u8 op, Reader& r)
 		if (!r.ok() || !community_ok(a) || !community_ok(b))
 			return;
 		RELATION_REGISTRY().SetCommunityRelation(a, b, v);
+		break;
+	}
+	case RelUpFightFact:
+	{
+		// INTEG-C (F5-PRG-4): a map server's fight fact. The keeper's script checks the transport's sender (a map server's bridge), his
+		// route and the order through coop_trust before it applies it (coop_srv_progress.script); a fact that does not read, or a process
+		// whose script has no keeper entry (the co-op: no map server ever sends one), drops it here.
+		fight::FactMsg f;
+		if (f.read(r) && progress::host_fight_fact(from, f.epoch, f.fact, f.character, f.delta))
+			++g_stats.rep_facts_in;
+		else
+			++g_stats.rep_facts_refused;
 		break;
 	}
 	default: break;
@@ -2073,7 +2144,7 @@ void flush_outbox()
 {
 	if (g_outbox.empty())
 		return;
-	const bool host = mgr().is_host();
+	const bool host = mode().decides_world();
 	const u64 now = mgr().now_ms();
 	// F2 T14 fix 1: what the client pacer holds waits for a later frame, in order. F2 T3c: per lane, so the relations
 	// held by their pacer hold back no info, spot or task (limits::Outbox::drain).
@@ -2305,7 +2376,11 @@ void host_add_reported_reputation(PeerId peer, int delta)
 {
 	auto it = g_reported.find(peer);
 	if (it != g_reported.end())
-		it->second.reputation += delta;
+	{
+		// F5-REV-1 note 4: he may have told any number ("log" stores it as told): the sum is made wide and kept in the int range
+		const s64 sum = s64(it->second.reputation) + s64(delta);
+		it->second.reputation = int(sum > s64(INT_MAX) ? INT_MAX : (sum < s64(INT_MIN) ? INT_MIN : sum));
+	}
 }
 
 Progress own_progress()
@@ -2369,7 +2444,7 @@ void progress_frame()
 		g_own_sent = mine;
 		++g_stats.progress_out;
 	}
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return;
 	// The host's own engine may change a proxy's rank/reputation (combat bookkeeping): the player's
 	// machine owns them, so the reported values are put back. Slots of players who left are reused.
@@ -2381,6 +2456,7 @@ void progress_frame()
 			it = g_reported.erase(it);
 			continue;
 		}
+		progress::host_check(it->first, proxy, it->second.rank, it->second.reputation, it->second.community); // F5-PRG-2
 		apply_progress(proxy, it->second);
 		++it;
 	}
@@ -2446,7 +2522,7 @@ void host_flush_all()
 
 void request_resync(u8 mask, const char* why)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		host_flush_all();
 		u32 n = 0;
@@ -2507,12 +2583,12 @@ void host_hash_frame()
 	}
 	// Tasks with an audience: one StoryHash per player, the same layout, only its tasks domain is his own (hash_tasks_for).
 	// The host player and the bridges get the unfiltered one, where host_broadcast would send it.
-	if (!is_map_authority())
+	if (!mode().decides_world() && !mode().leads_level())
 		return;
 	Session& s = mgr().session();
 	for (const PeerInfo& p : s.peers())
 	{
-		if (p.state != PeerState::Joined || !levels::passes_to(Msg::StoryHash, p.id))
+		if (p.state != PeerState::Joined || !mode().reaches(p.id, Msg::StoryHash))
 			continue;
 		DomainHash mine[kHashDomains];
 		for (u32 i = 0; i < kHashDomains; ++i)
@@ -2522,7 +2598,7 @@ void host_hash_frame()
 		put(pw, mine);
 		net::host_send(p.id, Msg::StoryHash, pw);
 	}
-	send_to_host_player_and_bridges(Msg::StoryHash, w);
+	mode().deliver_links(Msg::StoryHash, w, Lane::Reliable);
 	++g_stats.hashes;
 }
 
@@ -2591,7 +2667,7 @@ void ensure_client_init()
 
 bool ready()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		if (!in_game())
 			return false;
@@ -2662,6 +2738,7 @@ void handle_host(Msg type, PeerId from, Reader& r)
 		const u16 proxy = join::proxy_of_peer(from);
 		if (!r.ok() || proxy == kNoId)
 			return;
+		progress::host_check(from, proxy, p.rank, p.reputation, p.community); // F5-PRG-2: "refuse" stores, applies, sends clamped
 		g_reported[from] = p;
 		apply_progress(proxy, p);
 		Writer w(16);
@@ -2814,7 +2891,7 @@ void handle_client(Msg type, Reader& r)
 
 void handle(Msg type, PeerId from, Reader& r)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 		handle_host(type, from, r);
 	else
 		handle_client(type, r);
@@ -2825,7 +2902,7 @@ void dispatch(Msg type, PeerId from, Reader& r)
 	if (!mgr().active())
 		return;
 	// Clients talk only to the host; the host only takes requests from clients.
-	if (mgr().is_host() ? from == kHostPeer : from != kHostPeer)
+	if (mode().decides_world() ? from == kHostPeer : from != kHostPeer)
 		return;
 	if (!ready())
 	{
@@ -2977,7 +3054,7 @@ void frame()
 	}
 	if (!mgr().active())
 		return;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		if (!ready())
 			return;
@@ -3000,11 +3077,14 @@ void frame()
 	}
 	ensure_client_init();
 	replay_deferred();
-	if (is_map_server())
+	// A-S5S: a process that does not decide the world and leads its map is a map server (mode(): the co-op client and a server's
+	// player lead none); its ghost's words and the reputation of the fights on its map are its own steps (tests/test_story_bridges.cpp)
+	const bool leads_its_map = mode().leads_level();
+	if (leads_its_map)
 		ghost_frame();
 	flush_outbox();
-	if (is_map_server())
-		host_flush_rep_deltas(); // a fight on its level: the player's machine owns his reputation, his next Progress tells the world server
+	if (leads_its_map)
+		host_flush_rep_deltas(); // a fight on its level: its fact goes up, the world server applies it and tells him (H-FIGHTREP)
 	if (mgr().now_ms() - g_last_reconcile >= kReconcileIntervalMs)
 		client_reconcile(false);
 	progress_frame();
@@ -3036,6 +3116,8 @@ void print_status()
 	    g_stats.mismatches, g_stats.resyncs_out, g_stats.resyncs_in, g_stats.deferred);
 	::Msg("[coop] story: player proxies in combat bookkeeping %llu, reputation deltas out %llu in %llu, share rewards %d",
 	    g_stats.proxy_actions, g_stats.rep_deltas_out, g_stats.rep_deltas_in, g_coop_share_rewards);
+	::Msg("[coop] story: fight facts up %llu, taken %llu, refused %llu", g_stats.rep_facts_up, g_stats.rep_facts_in,
+	    g_stats.rep_facts_refused);
 	::Msg("[coop] story: held infos %llu (kept here %u, holds left on %llu) | personal tasks %u, local task edits %llu",
 	    g_infos_held, (u32)g_local_infos.size(), g_holds_leaked, (u32)g_local_tasks.size(), g_local_task_edits);
 	::Msg("[coop] story: outbox %u (relations %u), held for the host's rate %llu frames, dropped (queue full) %llu infos / "
@@ -3066,7 +3148,7 @@ bool on_info(const CInventoryOwner* owner, const shared_str& info_id, bool give)
 	if (owner->HasInfo(info_id) == give)
 		return false; // nothing changes: let the engine run its no-op path
 	const u8 op = give ? InfoGive : InfoDisable;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		Writer w(64);
 		w.u8(op);
@@ -3185,7 +3267,7 @@ bool on_task_state(CGameTask* t, int state, bool explicit_call)
 
 bool skip_task_check(CGameTask* t)
 {
-	if (!t || !mgr().is_client())
+	if (!t || !mgr().active() || mode().decides_world())
 		return false;
 	if (!mgr().is_live_client())
 		return true; // still loading the host's world
@@ -3226,7 +3308,8 @@ RelationActionScope::RelationActionScope(CEntityAlive* from, int action)
 {
 	// Only the outermost call (ATTACK may call itself for FIGHT_HELP) measures the whole change. A kill is
 	// counted by the killer's own machine (its CEntityAlive::Die runs Action for its actor).
-	if (g_action_depth++ != 0 || action == RELATION_REGISTRY::KILL || !is_map_authority() || !acts_as_actor(from))
+	if (g_action_depth++ != 0 || action == RELATION_REGISTRY::KILL ||
+	    (!mode().decides_world() && !mode().leads_level()) || !acts_as_actor(from))
 		return;
 	m_owner = smart_cast<CInventoryOwner*>(from);
 	if (!m_owner)
@@ -3250,7 +3333,7 @@ RelationActionScope::~RelationActionScope()
 // never goes up as it is. Said while the level loads it waits for them as well.
 static bool ghost_said(const ghost::Said& s)
 {
-	if (!is_map_server() || !ghost::about_actor(s))
+	if (!mode().ghost_said(s))
 		return false;
 	if (applying_any())
 		++g_stats.derived_dropped;
@@ -3263,7 +3346,7 @@ bool on_personal_goodwill(u16 from, u16 to, int value, GoodwillOp op)
 {
 	if (!mgr().active() || !ai().get_alife() || !(is_player(from) || is_player(to)))
 		return false;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		g_rel_dirty.insert(RelKey{RelPersonal, from, to});
 		return false;
@@ -3280,7 +3363,7 @@ bool on_community_goodwill(int community, u16 to, int value, GoodwillOp op)
 {
 	if (!mgr().active() || !ai().get_alife() || !is_player(to))
 		return false;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		g_rel_dirty.insert(RelKey{RelCommunity, community, to});
 		return false;
@@ -3297,7 +3380,7 @@ bool on_community_relation(int community_from, int community_to, int value)
 {
 	if (!mgr().active())
 		return false;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		g_rel_dirty.insert(RelKey{RelCommRelation, community_from, community_to});
 		return false;
@@ -3313,7 +3396,7 @@ void on_spot_added(const shared_str& spot_type, u16 id)
 {
 	if (!mgr().active() || spot_type_local(cs(spot_type)))
 		return;
-	if (mgr().is_host())
+	if (mode().decides_world())
 		g_spot_authors.erase(SpotKey{spot_type, id}); // R4 3: a new spot has no author until a client's request sets it
 	else
 	{
@@ -3338,7 +3421,7 @@ void on_spot_remove(const shared_str& spot_type, u16 id)
 {
 	if (!mgr().active() || !g_pGameLevel || spot_type_local(cs(spot_type)))
 		return;
-	if (!mgr().is_host() && (!client_live() || applying_any()))
+	if (!mode().decides_world() && (!client_live() || applying_any()))
 		return;
 	CMapLocation* ml = spots().GetMapLocation(spot_type, id);
 	if (!spot_replicable(ml, spot_type))
@@ -3347,7 +3430,7 @@ void on_spot_remove(const shared_str& spot_type, u16 id)
 	w.u8(SpotRemove);
 	w.str(cs(spot_type));
 	w.u16(host_id_of(id));
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		g_spot_authors.erase(SpotKey{spot_type, id});
 		++g_stats.spots_out;
@@ -3361,13 +3444,13 @@ void on_spots_remove_all(u16 id)
 {
 	if (!mgr().active() || !g_pGameLevel)
 		return;
-	if (!mgr().is_host() && (!client_live() || applying_any()))
+	if (!mode().decides_world() && (!client_live() || applying_any()))
 		return;
 	Writer w(8);
 	w.u8(SpotRemoveAll);
 	w.u16(host_id_of(id));
 	push_out(Msg::MapSpot, std::move(w));
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		for (auto it = g_spot_authors.begin(); it != g_spot_authors.end();) // R4 3: authors go with the spots
 			it = it->first.id == id ? g_spot_authors.erase(it) : std::next(it);
@@ -3426,7 +3509,7 @@ bool set_local_task(LPCSTR id, bool on)
 
 bool set_task_audience(LPCSTR id, const u16* members, u32 count)
 {
-	if (!mgr().is_host() || !id || !task_audience::id_ok(id) || count > task_audience::kMaxMembers || (count && !members))
+	if (!mode().decides_world() || !id || !task_audience::id_ok(id) || count > task_audience::kMaxMembers || (count && !members))
 		return false;
 	const u32 before = u32(g_audience.size());
 	switch (g_audience.set(id, std::vector<u16>(members, members + count)))
@@ -3446,7 +3529,7 @@ bool set_task_audience(LPCSTR id, const u16* members, u32 count)
 
 bool clear_task_audience(LPCSTR id)
 {
-	if (!mgr().is_host() || !id || !task_audience::id_ok(id))
+	if (!mode().decides_world() || !id || !task_audience::id_ok(id))
 		return false;
 	if (g_audience.remove(id))
 		::Msg("[coop] story: task '%s' is seen by everybody again (%u task(s) with an audience)", id, u32(g_audience.size()));
@@ -3455,8 +3538,9 @@ bool clear_task_audience(LPCSTR id)
 
 bool resend_tasks(u32 peer)
 {
-	if (!mgr().is_host() || peer == kHostPeer || mapserver::is_bridge(PeerId(peer)) || !ready())
+	if (!mode().decides_world() || peer == kHostPeer || !ready())
 		return false;
+	// one of the session's players only: a map server's connection is in no peers() (A-S5S: no bridge test of its own)
 	const PeerInfo* p = mgr().session().peer(PeerId(peer));
 	if (!p || p->state != PeerState::Joined)
 		return false;
@@ -3465,4 +3549,23 @@ bool resend_tasks(u32 peer)
 	return true;
 }
 } // namespace story
+
+namespace progress
+{
+// coop_progress.h (INTEG-C, F5-PRG-4): the keeper puts a fight's reputation into the base of the player's stored report (his next Progress
+// carries it, so the check sees no rise beyond his budget), then tells his machine. Before INTEG-C this was the body of
+// host_flush_rep_deltas; the world server now also gets here through coop.progress.apply_verified_fight.
+bool host_apply_fight(PeerId peer, u16 character, int delta)
+{
+	if (peer == kInvalidPeer || peer == kHostPeer || !delta || character == 0xffff)
+		return false;
+	story::host_add_reported_reputation(peer, delta);
+	Writer w(16);
+	w.u8(story::RelReputationDelta);
+	w.u16(character);
+	w.i32(delta);
+	net::host_send(peer, Msg::Relation, w);
+	return true;
+}
+} // namespace progress
 } // namespace coop
