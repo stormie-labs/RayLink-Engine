@@ -10,6 +10,7 @@
 #include "uigamecustom.h"
 #include "inventory_item.h"
 #include "coop/coop_trade.h"
+#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
 
 CInventoryBox::CInventoryBox()
 {
@@ -59,15 +60,25 @@ void CInventoryBox::OnEvent(NET_Packet& P, u16 type)
 			u16 id;
 			P.r_u16(id);
 			CObject* itm = Level().Objects.net_Find(id);
-			VERIFY(itm);
 			xr_vector<u16>::iterator it;
 			it = std::find(m_items.begin(), m_items.end(), id);
-			VERIFY(it!=m_items.end());
-			m_items.erase(it);
+			// Anomaly Coop (O1-container, b56 RL-QHQ3-2TUG): erase only an id the box lists, detach only its own child. On a
+			// co-op client "taken out" may come for an item the box never took or that is no game object here: the stock
+			// erase(end()) (VERIFY is debug-only) memmoved -2 bytes, and H_SetParent(NULL) took another holder's item
+			const coop::container::BoxStep step =
+				coop::container::box_reject(itm != nullptr, it != m_items.end(), itm && itm->H_Parent() == this);
+			if (step.unlist)
+				m_items.erase(it);
 
 			bool just_before_destroy = !P.r_eof() && P.r_u8();
 			bool dont_create_shell = (type == GE_TRADE_SELL) || just_before_destroy;
 
+			if (step.note)
+				Msg("[coop] box %u [%s]: item %u taken out, but %s (listed: %s)", u32(ID()), cName().c_str(), u32(id),
+				    !itm ? "it is no game object here" : itm->H_Parent() != this ? "the box does not hold it" : "it was not listed",
+				    step.unlist ? "yes" : "no");
+			if (!step.detach)
+				break;
 			itm->H_SetParent(NULL, dont_create_shell);
 
 			if (m_in_use)

@@ -33,6 +33,7 @@
 #pragma once
 
 #include "xrCoop/coop_session.h"
+#include "xrCoop/coop_owner_rules.h" // TZ R32 W8: owner::Setter, itemtags::FieldVersions
 #include "coop_money.h" // F2 T5: UpgradePurchase holds a money::ClientSpendScope
 
 #include <string>
@@ -135,9 +136,46 @@ bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob);
 // their copy has the wear before a take or a tooltip rolls the parts of it.
 void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& blob);
 // The world server: the authority of a level says world item `id` (host numbering) is `blob`. Only the condition is taken, into
-// the entity (and the object, if there is one). The caller checked that the item lies on that level and no player holds it.
-// False: refused, `why` says why.
+// the entity (and the object, if there is one). The caller checked that the item lies on that level and no player holds it;
+// this checks the holder again by the world's tree, not by the owner table (it lags a frame behind the move). False:
+// refused, `why` says why.
 bool host_take_level_state(u16 id, const char* section, const u8* data, size_t size, const char*& why);
+
+// --- TZ R32 W8: one value of an item's state, which travels with the item ---
+// The decider (this process writes the item: the co-op host, a map server) ran a script setter on its copy (script_game_object.cpp
+// SetCondition, script_game_object3.cpp SetRemainingUses). Outside the apply of an owner's state, on a remote player's item, it is
+// the new baseline (host_enforce keeps it), its field versions move on and the owner gets it in this frame; the other players' copies
+// get the decider's view. A map server also tells the world (LevelSide::level_item_facts_up, source Decider). Main thread.
+void decider_wrote(CInventoryItem* item, owner::Setter what);
+// A map server's journal, writing the ItemFacts of `id` (level_item_state gives the blob, with the decider's versions and, for a held
+// eatable, its object's own client_data): the source of the change since the last read (journal::ItemFactsBody: 0 Loot, 1 Decider,
+// 2 Owner), then forgotten. The world treats Decider and Owner alike (host_take_item_facts); only Loot takes the wear-only path.
+u8 level_facts_source(u16 id);
+// The world server: a map server's ItemFacts of item `id` from its writer (source Decider or Owner; the world's acceptance checked
+// the writer). The condition, the addon flags and the scope go into the entity (and the object, if there is one), the uses into
+// client_data (with no object here: the writer's own bytes of its object when they came, else the stock format patched or made,
+// coop_initial_rules.h uses_store), the decider's versions into this process's table, the upgrade list (the writer's own copy's: the
+// blob is its capture, a player's claim never reaches it). False: refused, `why` says why, and nothing was changed (uses that cannot
+// be stored refuse the whole entry: no Applied for a half-applied fact).
+bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t size, const char*& why);
+// The uses of an eatable with no game object here, into its entity's client_data in exactly the stock CEatableItem::save format
+// (xrCoop/coop_initial_rules.h). False: not an eatable section (is_eatable_section), more than its max_uses, an item on the ground
+// (physics state in its client_data) or a section with a script binding and no client_data yet (stage_uses keeps them then).
+bool entity_write_uses(CSE_Abstract* e, u8 uses);
+// WP6 fix round (finding 1): uses an entity cannot keep, staged for the item's next game object here (set the first frame it exists:
+// a deliberate write on its writer). staged_uses: the staged value, for a spawn's initial state. Main thread.
+// discard_staged_uses: a newer value went into the object itself (set_initial's object path).
+void stage_uses(u16 id, u8 uses);
+bool staged_uses(u16 id, u8& uses);
+void discard_staged_uses(u16 id);
+// WP6 fix round (finding 5): the items of `section` have portions (its class is an eatable's, coop_initial_rules.h
+// is_eatable_class; cached), and the most they have (CEatableItem::Load: max_uses, 1 when missing). Main thread.
+bool is_eatable_section(const shared_str& section);
+u32 section_max_uses(const shared_str& section);
+// §8a A12: the decider's versions of item `id` as this process knows them (a decider: its latest; an owner: those he has applied),
+// and their arrival with the item's state (a spawn's initial state): the decider takes them as its latest, the owner as applied.
+itemtags::FieldVersions item_versions(u16 id);
+void item_versions_arrive(u16 id, const itemtags::FieldVersions& v, u32 mask);
 // Host (F2 T5 fix round 1): the host sold an upgrade of item `id` to player `owner` (ReqItemEvent accepted, the entity
 // holds it). The host's game object of the item takes the entity's list (a loading install: no event, no Lua price) and
 // the other players' copies get the host's state of it. The owner's own ItemState never adds an upgrade on the host.

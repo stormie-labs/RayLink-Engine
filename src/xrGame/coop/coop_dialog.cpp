@@ -3,12 +3,14 @@
 #include "pch_script.h" // B8: the host asks coop_npc_meet.talk_verdict
 #include "coop_dialog.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_sync.h"
 #include "coop_money.h"
 #include "coop_requests.h"
+#include "coop_trade.h" // O2-partner: a revoked lock closes a trade or upgrade window opened from the talk
 #include "xrCoop/coop_talks.h" // Ruling F2-34 (F2 T12 round 2)
 
 #include "Level.h"
@@ -41,6 +43,9 @@ constexpr float kTalkReach = 6.f;
 
 // B8: the results and the reason bytes are in xrCoop/coop_talks.h (shared with the unit tests).
 using namespace talks::lock; // Granted, Busy, Gone, Refused, TooFar, NotWilling
+
+// The world also keeps locks for its story's recent-talk checks.
+bool keeps_talk_locks() { return mgr().active() && (mode().decides_world() || mode().leads_level()); }
 
 // ---------------------------------------------------------------- host state
 struct HostLock
@@ -260,7 +265,7 @@ u8 host_try_lock(u16 npc, PeerId who, talks::Reason* why = nullptr)
 
 void host_on_lock(PeerId from, Reader& r)
 {
-	if (!is_map_authority() || from == kHostPeer)
+	if (!keeps_talk_locks() || from == kHostPeer)
 		return;
 	const u16 npc = r.u16();
 	const bool keepalive = r.u8() != 0;
@@ -293,7 +298,7 @@ void host_on_lock(PeerId from, Reader& r)
 
 void host_on_unlock(PeerId from, Reader& r)
 {
-	if (!is_map_authority() || from == kHostPeer)
+	if (!keeps_talk_locks() || from == kHostPeer)
 		return;
 	const u16 npc = r.u16();
 	if (!r.ok())
@@ -431,12 +436,11 @@ void client_on_revoke(PeerId, Reader& r)
 		return;
 	g_cl.granted = kNoId;
 	g_cl.start = kNoId;
-	const u16 local = join::to_local(npc);
-	if (actor_talks_to(local))
-	{
-		Actor()->StopTalk(); // the talk window closes itself on its next update
+	// O2-partner: the talk stops (the talk window closes itself on its next update) and a trade or an upgrade window with that NPC,
+	// opened from the talk, closes with it (coop_trade.cpp, xrCoop/coop_partner_rules.h on_lock_revoked)
+	CInventoryOwner* io = find_owner(join::to_local(npc));
+	if (io && trade::on_talk_lock_revoked(*io))
 		hud_message("st_coop_talk_revoked", "The conversation was interrupted by the host");
-	}
 }
 
 // B8: one line in the log when a talk the host allowed did not start here, with the cause (talks::start_block). Read
@@ -543,7 +547,7 @@ void install_client(Endpoint& e)
 
 void frame()
 {
-	if (is_map_authority())
+	if (keeps_talk_locks())
 		host_frame();
 	else if (is_live_mirror())
 		client_frame();
@@ -559,7 +563,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
-	if (!is_map_authority())
+	if (!keeps_talk_locks())
 		return;
 	u32 n = 0;
 	for (auto it = g_locks.begin(); it != g_locks.end();)
@@ -590,7 +594,7 @@ bool may_start_talk(CInventoryOwner* partner, bool disable_break)
 		return true;
 	if (world::is_player_proxy(local))
 		return false; // (a registered avatar is a player character: caught above)
-	if (is_map_authority())
+	if (keeps_talk_locks())
 	{
 		const u8 result = host_try_lock(local, kHostPeer);
 		if (result == Granted)
@@ -646,7 +650,7 @@ void on_talk_window_closed()
 	}
 	if (!net::live())
 		return;
-	if (is_map_authority())
+	if (keeps_talk_locks())
 	{
 		if (g_host_talk != kNoId)
 		{
@@ -693,7 +697,7 @@ void hud_message_n(const char* string_id, const char* fallback, u32 n)
 
 PeerId host_talk_holder(u16 npc) // W11
 {
-	if (!is_map_authority())
+	if (!keeps_talk_locks())
 		return kInvalidPeer;
 	auto it = g_locks.find(npc);
 	return it == g_locks.end() ? kInvalidPeer : it->second.holder;
@@ -703,7 +707,7 @@ u16 client_partner() { return is_mirror() ? g_cl.granted : kNoId; } // F2 T1
 
 bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms) // Ruling F2-34
 {
-	if (!is_map_authority() || peer == kInvalidPeer)
+	if (!keeps_talk_locks() || peer == kInvalidPeer)
 		return false;
 	const auto it = g_recent.find(peer);
 	static const talks::Recent kNone;
@@ -712,7 +716,7 @@ bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms) // Ruling F2-34
 
 u16 host_lock_of(PeerId peer) // F2 T1
 {
-	if (!is_map_authority())
+	if (!keeps_talk_locks())
 		return kNoId;
 	for (const auto& it : g_locks)
 		if (it.second.holder == peer)
@@ -722,7 +726,7 @@ u16 host_lock_of(PeerId peer) // F2 T1
 
 void print_status()
 {
-	if (is_map_authority())
+	if (keeps_talk_locks())
 	{
 		const u64 now = now_ms();
 		::Msg("[coop]   talk locks: %u held; %llu requests, %llu granted, %llu denied (%llu the NPC would not talk), "

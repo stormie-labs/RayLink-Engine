@@ -115,7 +115,8 @@ bool player_god(const CObject* who);
 // view of it. A phantom has no snapshot, every machine's copy picks by itself. Stock (no session, nobody): this machine's entity.
 CObject* phantom_target(const Fvector& pos);
 // Audit A6: every such player within `max_dist` of `pos` (this machine's actor first); returns how many were written.
-constexpr u32 kMaxNearPlayers = 8;
+// F5-SEAT-1: room for every seat that plays (kMaxPlayers 16: a map server's 16 clients; coop_ai.cpp asserts it).
+constexpr u32 kMaxNearPlayers = 16;
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers]);
 // Does `player` (this machine's actor or a remote player's character) see `monster` now? The actor: its visual memory;
 // a remote player: his reported view and a static ray from his head (audit F1). Unlike player_sees it does not ask what

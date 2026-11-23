@@ -73,6 +73,11 @@ bool is_mirrored(u16 id);
 // F3a: the host half of a level hears of a change here. Not on a map server while it applies what the world server told it: the players
 // have that from the world server themselves.
 bool host_records();
+// R32 §8a A21 E-2: is `id` this process's own create whose EntitySpawn has not left it yet? A Registered event of it is still in the
+// queue that the next frame() sends (host_process_events), recorded while this process applied nobody's word (not a map server's spawn
+// the world takes into its world, host_spawn_from_leader). items::set_initial asks it for an item this process does not write. The
+// same threads as the hooks that fill the queue, never concurrently with frame().
+bool host_own_spawn_unsent(u16 id);
 // Local spawn attempt on a client (see sync::intercept_local_spawn).
 bool intercept_local_spawn(CSE_Abstract* entity);
 // True while the client applies a host command itself (spawn/release/switch must go through).

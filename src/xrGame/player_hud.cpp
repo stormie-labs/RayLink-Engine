@@ -1625,10 +1625,12 @@ u32 player_hud::script_anim_play(u8 hand, LPCSTR section, LPCSTR anm_name, bool 
 	Fvector offs = READ_IF_EXISTS(pSettings, r_fvector3, section, pos.c_str(), def);
 	Fvector rrot = READ_IF_EXISTS(pSettings, r_fvector3, section, rot.c_str(), def);
 
+	const char* item_visual = nullptr;
 	if (pSettings->line_exist(section, "item_visual"))
 	{
 		::Render->hud_loading = true;
-		script_anim_item_model = ::Render->model_Create(pSettings->r_string(section, "item_visual"))->dcast_PKinematicsAnimated();
+		item_visual = pSettings->r_string(section, "item_visual");
+		script_anim_item_model = ::Render->model_Create(item_visual)->dcast_PKinematicsAnimated();
 		::Render->hud_loading = false;
 		item_pos[0] = READ_IF_EXISTS(pSettings, r_fvector3, section, "item_position", def);
 		item_pos[1] = READ_IF_EXISTS(pSettings, r_fvector3, section, "item_orientation", def);
@@ -1677,7 +1679,7 @@ u32 player_hud::script_anim_play(u8 hand, LPCSTR section, LPCSTR anm_name, bool 
 		if (!M2.valid())
 			M2 = script_anim_item_model->ID_Cycle_Safe("idle");
 
-		R_ASSERT3(M2.valid(), "model %s has no motion [idle] ", pSettings->r_string(m_sect_name, "item_visual"));
+		R_ASSERT4(M2.valid(), "Script animation item model has no motion [idle]", section, item_visual ? item_visual : "<unknown>");
 
 		u16 root_id = script_anim_item_model->dcast_PKinematics()->LL_GetBoneRoot();
 		CBoneInstance& root_binst = script_anim_item_model->dcast_PKinematics()->LL_GetBoneInstance(root_id);

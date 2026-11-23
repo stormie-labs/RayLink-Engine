@@ -14,6 +14,7 @@
 #include "secure_messaging.h"
 #include "xrServer_updates_compressor.h"
 #include "xrClientsPool.h"
+#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode numbers a map server's objects (PerformIDgen)
 
 #ifdef DEBUG
 //. #define SLOW_VERIFY_ENTITIES
@@ -85,15 +86,6 @@ namespace file_transfer
 
 class clientdata_proxy;
 class server_info_uploader;
-
-namespace coop
-{
-namespace levels
-{
-bool leader_takes_ids(); // Anomaly Coop: coop_levels.h
-u16 leader_free_id();
-} // namespace levels
-} // namespace coop
 
 class xrServer : public IPureServer
 {
@@ -185,10 +177,31 @@ public:
 
 	IC u16 PerformIDgen(u16 ID)
 	{
-		if (ID == 0xffff && coop::levels::leader_takes_ids()) // Anomaly Coop: a map server takes ids of its own
-			ID = coop::levels::leader_free_id();
+		if (ID == 0xffff && coop::mode().takes_own_ids()) // Anomaly Coop (R32 W9): a map server takes the ids of its own pool
+		{
+			ID = coop::mode().own_free_id();
+			if (ID == 0xffff)
+			{
+				// None left. The start of a create asked CoopMayCreate first (refused there under coop_writer_gate = enforce); what still
+				// gets here is a create that did not ask (a stock chain that already runs, an object's supplies: its callers dereference
+				// the result, so no refusal is possible; or a create of coop's own C++) or, under log, any create: the stock generator's
+				// id, outside the pool, never silently (CoopTookStockId).
+				ID = m_tID_Generator.tfGetID(0xffff);
+				CoopTookStockId(ID);
+				return ID;
+			}
+		}
 		return (m_tID_Generator.tfGetID(ID));
 	}
+
+	// Anomaly Coop (R32 W9, xrCoop/coop_calls.h no_id): may a create start here (a script create before its stock code, a new entity of a
+	// spawn packet)? False only on a map server whose own pool has no id left under coop_writer_gate = enforce: the caller refuses it
+	// with the stock "nothing" (nil to Lua, NULL from Process_spawn). Under log it is logged and goes on. The empty pool asks the world
+	// for a block at once (Mode::own_free_id). True everywhere else.
+	bool CoopMayCreate(const char* what);
+	// Anomaly Coop (R32 W9): PerformIDgen found the pool empty and took the stock generator's `id`: logged loudly (the first lines, then
+	// every 100th), with the setting.
+	void CoopTookStockId(u16 id);
 
 	IC void FreeID(u16 ID, u32 time)
 	{

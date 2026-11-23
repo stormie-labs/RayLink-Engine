@@ -35,12 +35,12 @@ extern int g_coop_max_new_characters;
 extern int g_coop_diag_stacks;
 extern int g_coop_diag_fail_swap; // console coop_diag_fail_swap 1: the next load of this client ends as a world with no character for him
 
+class CObject;
+class CSE_ALifeSpaceRestrictor;
+class CSE_ALifeLevelChanger;
+
 namespace coop
 {
-namespace dedicated
-{
-struct WorldFacts; // xrCoop/coop_dedicated_rules.h
-}
 // F0 final review (task 14 diagnostics): CGameObject::lua_game_object prints a C++ stack for the first
 // kDestroyedObjectStacks accesses to a destroyed object after a player left a co-op session, not since the process
 // started (single player and loads spent them, and every stack stalls the thread that prints it).
@@ -65,14 +65,45 @@ enum BlobKind : u32
 	BlobPreparedSave = 2,
 };
 
-// F3a T4: the world server's handlers (the joins, choices and votes of the players; the session's rate limits) and
-// the client's (the world server's answers and its board), installed by role (Manager::install_handlers).
+// F3a T4: the decider's handlers (the joins, choices and votes of the players; the session's rate limits) and the client's
+// (the decider's answers and its board), installed by each mode (Mode::install). A-S6J: a player's LevelMove (he leaves his
+// level alone) is no handler of these: the server's own (srv/coop_srv_join.cpp); the co-op never installs it.
 void install_server(Session& s);
 void install_client(Endpoint& e);
 
+// --- the Core's parts of the server's join (S6 pattern P-G, A-S6J: srv/coop_srv_join.cpp is made of them; nothing here asks a mode)
+// The decider's handlers of a player's JoinRequest and WorldLoaded: the server's own handlers answer a map server's bridge, then call
+// these for a player (as install_server installs them on every decider).
+void player_join_request(PeerId from, Reader& r);
+void player_world_loaded(PeerId from, Reader& r);
+// A fresh save of the world served now under the file name `name`, read back, its files gone. False: it failed.
+bool world_save(const char* name, std::vector<u8>& engine_part, std::vector<u8>& script_part);
+// The world may be saved for a newcomer now: it is up with its actor, no group's load is handing out its saves, the level does not
+// precache (a join waits for all of that).
+bool world_save_ready();
+// The save the last player held on his loading screen loaded (host_send_save: his map is led by another process, Mode::join_save, and
+// that process is not up, Mode::level_ready): the process that comes up for his map loads the same world. Of the world served now and
+// younger than five minutes; `engine` and `script` nullptr when there is none. Main thread, valid until the next frame.
+struct HeldSave
+{
+	u64 at = 0; // mgr().now_ms() when it was written
+	const std::vector<u8>* engine = nullptr;
+	const std::vector<u8>* script = nullptr;
+};
+HeldSave held_save();
+// AvatarList (R3 В3): who plays each character of the world, to everybody (the decider makes it, a map server takes it).
+void host_send_owners();
+// A move of the group is under way: its simultaneous load, or the go of its waiting point (nobody else leaves meanwhile).
+bool group_moves();
+// The body of player `id` in the world served now; nullptr when he is not in it (the host player's is this process's actor).
+CObject* player_body_here(PeerId id);
+// Metres from `p` to the nearest shape of `restrictor` (a level exit is one).
+float exit_distance(const CSE_ALifeSpaceRestrictor& restrictor, const Fvector& p);
+// The enabled level exit `id` of the level this process has loaded; nullptr when it is none.
+CSE_ALifeLevelChanger* exit_here(u16 id);
+
 // --- host ---
 bool host_can_start(); // in a level with ALife and a living actor
-dedicated::WorldFacts host_world_facts(); // what host_can_start asks, member by member, quietly (the dedicated host's autostart)
 void on_host_started();
 void on_peer_joined(const PeerInfo& p);
 void on_peer_left(PeerId id); // parks the player's proxy and takes it out of the world
@@ -106,11 +137,9 @@ u32 host_world_epoch();
 void on_world_created();
 // Number of worlds created in this process (any role).
 u32 world_generation();
-// Host: the host's move that nobody notices is on (xrCoop/coop_soft_move.h): from before its save until the world it brings is served.
-bool host_soft_window();
-// ... and this player stays in his world through it.
+// The host's move that nobody noticed was the hybrid's (removed in build 57, owner 2026-11-18): nobody stays in his world through a
+// move of the host, both are false. Kept until coop_checkpoints.cpp and coop_survival.cpp drop their calls.
 bool host_soft_stays(PeerId peer);
-// He stayed in his world through the move that made this world: what a new world wipes of everybody is still true of him.
 bool host_stayed_in_world(PeerId peer);
 // Host: move the group at once through the exit somebody waits at (console coop_accept_transition, the chat's /go),
 // whoever is missing. The level change is built from the host's own level changer (R2 I3).
@@ -126,10 +155,10 @@ bool accept_transition();
 // simultaneous load (LoadWait / LoadReady: every client in the world loads the transition's save with the host, the loading
 // screens come off together, hold_loading_screen below).
 // Hook of CLevelChanger (the stock "go?" dialog and the silent change of its zone): true = the group waits here, the
-// stock reaction stays off. False for a disabled exit (its own message stays), outside a session, for a host nobody
-// has joined and, with split levels on, for the host at an exit that takes him alone (`next_vertex`: where it leads).
+// stock reaction stays off. False for a disabled exit (its own message stays), outside a session and for a host nobody
+// has joined. `next_vertex` (where it leads) is not read since the hybrid is gone (build 57): the stock hook passes it.
 bool transition_owns_exit(bool exit_enabled, u16 next_vertex);
-// A host alone in his session, or one who goes alone: the exit takes him at once, the stock "go?" dialog stays off too. False for a
+// A host alone in his session: the exit takes him at once, the stock "go?" dialog stays off too. False for a
 // disabled exit (its own message stays) and outside a session.
 bool exit_without_dialog(bool exit_enabled, u16 next_vertex);
 // Hook of game_sv_Single::change_level, the one place every level change of the host goes through (the zone, the

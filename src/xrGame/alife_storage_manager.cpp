@@ -18,6 +18,7 @@
 #include "coop/coop_join.h"
 #include "coop/coop_manager.h" // Anomaly Coop
 #include "coop/coop_levels.h"
+#include "coop/coop_objects.h" // Anomaly Coop (R32 PJ3): host_flush_consumes
 #include "xrserver.h"
 #include "level.h"
 #include "../xrEngine/x_ray.h"
@@ -56,6 +57,7 @@ void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 	}
 	PROF_EVENT();
 	coop::on_blocking_work(); // Anomaly Coop: writing a big save blocks the frame, keep the session link alive
+	coop::objects::host_flush_consumes(); // Anomaly Coop (R32 PJ3): a thrown hand item is never kept by the save
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
 
 	string_path save_name;

@@ -1,13 +1,17 @@
 #include "stdafx.h"
 #include "coop_net.h"
+#include "coop_manager.h"
 #include "coop_sync.h"
-#include "coop_levels.h"
-#include "coop_mapserver.h"
+#include "xrCoop/coop_mode.h"
 
 namespace coop
 {
 namespace net
 {
+bool live() { return (mgr().active() && mode().decides_world()) || mgr().is_live_client(); }
+bool host() { return mgr().active() && (mode().decides_world() || mode().leads_level()); }
+bool client() { return client(mgr().active(), mode()); }
+
 namespace
 {
 struct Queued
@@ -38,85 +42,30 @@ void queue(PeerId to, Msg type, const Writer& payload, Lane lane)
 	queue_of_peer.push_back(std::move(q));
 	++g_queued_total;
 }
-
-// F3a: the map servers are clients of the world: what reaches every level reaches them, a bridge that loads its world gets it after.
-void to_bridges(Msg type, const Writer& payload, Lane lane, PeerId except)
-{
-	if (!mapserver::bridge_takes(type))
-		return;
-	for (const PeerId bridge : mapserver::host_bridges())
-	{
-		if (bridge == except)
-			continue;
-		if (sync::host_peer_joining(bridge))
-			queue(bridge, type, payload, lane);
-		else
-			mgr().session().send(bridge, lane, type, payload);
-	}
-}
 } // namespace
 
-void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except)
-{
-	if (!is_map_authority())
-		return;
-	Session& s = mgr().session();
-	for (const PeerInfo& p : s.peers())
-	{
-		if (p.id == except || p.state != PeerState::Joined)
-			continue;
-		if (!levels::passes_to(type, p.id))
-			continue; // F3a multilevel: the stream of the host's level to a player on another one
-		if (sync::host_peer_joining(p.id))
-			queue(p.id, type, payload, lane);
-		else
-			s.send(p.id, lane, type, payload);
-	}
-	// F3a T4: the host player too, over the LocalLink (its gate decides; R1 5: no players() vector per message)
-	if (except != kHostPeer && s.local())
-		s.send(kHostPeer, lane, type, payload);
-	if (is_world_server())
-		to_bridges(type, payload, lane, except);
-}
+// S4 (docs/MODES.md section 4, P-B): who a world change reaches is the mode's (xrCoop/coop_mode.h): the co-op host's session and its
+// LocalLink, the world server's players and bridges, a map server's players. The callers do not change.
+void host_broadcast(Msg type, const Writer& payload, Lane lane, PeerId except) { mode().deliver(type, payload, lane, except); }
 
-void host_stream(Msg type, const Writer& payload, PeerId except)
-{
-	if (!is_map_authority())
-		return;
-	Session& s = mgr().session();
-	if (!levels::split())
-	{
-		s.broadcast(Lane::Unreliable, type, payload, except);
-		return;
-	}
-	for (const PeerInfo& p : s.peers())
-		if (p.id != except && p.state == PeerState::Joined && levels::passes_to(type, p.id))
-			s.send(p.id, Lane::Unreliable, type, payload);
-}
+void host_stream(Msg type, const Writer& payload, PeerId except) { mode().stream(type, payload, except); }
 
 void host_send(PeerId to, Msg type, const Writer& payload, Lane lane)
 {
-	if (!is_map_authority())
-		return;
+	if (!mode().decides_world() && !mode().leads_level())
+		return; // the world's or a map's decider only (the old is_map_authority)
+	to_peer(to, type, payload, lane);
+}
+
+void to_peer(PeerId to, Msg type, const Writer& payload, Lane lane)
+{
 	if (sync::host_peer_joining(to))
 		queue(to, type, payload, lane);
 	else
 		mgr().session().send(to, lane, type, payload);
 }
 
-void client_send(Msg type, const Writer& payload, Lane lane)
-{
-	if (is_map_server() && !mapserver::map_server_sends(type))
-		return; // its actor is a ghost: nobody's body, nobody's hands
-	if (mgr().is_client())
-	{
-		mgr().session().send(kHostPeer, lane, type, payload);
-		return;
-	}
-	// F3a T4: the host player -> his own world server, over the LocalLink (only the messages moved onto it pass)
-	if (mgr().is_host() && mgr().session().local())
-		mgr().local_link().push_to_server(type, lane, payload);
-}
+void client_send(Msg type, const Writer& payload, Lane lane) { mode().up(type, payload, lane); }
 
 void host_flush(PeerId to)
 {

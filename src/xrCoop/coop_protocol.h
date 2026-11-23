@@ -90,18 +90,36 @@ namespace coop
 // 32: nothing a reader of 31 would misread, the number keeps builds apart: NpcSound Stop (a voice the authority stopped; a 31
 //    reader rejects the entry and plays the line to its end), LevelEntity Item (the wear a map server gives loot; a 31 world
 //    server drops the op), and the Lua of build 50 expects both ends to speak them.
-constexpr uint32_t kProtocolVersion = 32;
+// 33 (docs/plans/2026-11-18-two-modes.md S3, owner 2026-11-18: two modes, co-op and server; Dev build 57): Welcome ends with
+//    `u8 mode` (SessionMode: 1 co-op, 2 server; it must agree with HostSeatPlays), so that a client knows the mode of its session
+//    from the Welcome on instead of from the first LevelMap. The only bump of the build: every other wire change of it joins
+//    33 without another one - the partner of a talk in LevelBodyFacts and what the trunk says of a spawn for the psi phantoms of a
+//    map server's level (step S3, coop_levels_wire.h), the messages of F5 and kMaxPlayers 16 (docs/plans/2026-11-18-build-57.md
+//    section 3), and the optional u32 audit round in LevelResync and LevelEntity Report (A-S7N), which older readers ignore.
+//    Dev (33) and Stable (32) never meet in one session: Hello refuses the other number.
+// 34 (TZ R32, one writer per object; temp/r30/design/R32-final.md section 5): a map server's registry facts go up in one ordered
+//    batch that the world server answers. Msg::LevelJournal 0x01E0 (map server -> world server, TrunkOnly) and Msg::LevelJournalAck
+//    0x01E1 (world server -> that map server), layouts in srv/coop_levels_wire.h: the journal ops after LevelEntity Logic (Joined ..
+//    Flushed), a per-object head (u16 id, u16 section crc, u32 keeper generation) before today's LevelEntity layout, ItemFacts =
+//    the ItemState layout plus a source byte. LevelFlush is now sent, its answer is the journal's Flushed entry. Scope rules with no
+//    layout change (srv/coop_mapserver_rules.h): a map server may ask its world StateDumpRequest and EntityResync, EntityDied and
+//    EntityHash reach the map servers. The ItemState blob carries a u16 version per tagged field (coop_item_tags.h, blob tag 12),
+//    the EntitySpawn tail the initial state of an item (coop_initial_rules.h). Dev 57 (33) and 34 never meet: Hello refuses it.
+constexpr uint32_t kProtocolVersion = 34;
 constexpr uint16_t kDefaultPort = 27960;
-// The seats that play: an ordinary host + 7 clients, or a world server's 8 clients (its own seat plays no character,
-// SessionConfig::host_plays; limits::client_capacity). Counts of players and SessionConfig/Welcome max_players.
-constexpr uint32_t kMaxPlayers = 8;
-// The slot ids: seat 0 (the host) and the client slots 1 .. kMaxPlayers (owner 2026-11-13: a world server takes 8 clients).
-// Every check of a player's peer id (`peer < kMaxPeerSlots`), every array indexed by one and every list that may have a row
-// per slot uses this, not kMaxPlayers. Protocol 31 (unreleased) widened the accepted ranges of AvatarList, DebugState, LevelMap,
-// LoadWait, TransitionState and the level Packet's peer from 0..7 / 8 rows to 0..8 / 9 rows; no field changed its width.
+// The most seats that play the wire carries (F5-SEAT-1, TZ 6.7 and R19, Dev build 58): a server's 16 clients (its own seat plays
+// no character, SessionConfig::host_plays; limits::client_capacity). How many a session has is its mode's: the start says
+// SessionConfig::max_players (no default: co-op 8, the host + 7 with the Steam lobby unchanged; the server 16) and the Welcome
+// tells a client (Session::max_players). Counts of players, the cap of SessionConfig/Welcome max_players and of the lists by seat.
+constexpr uint32_t kMaxPlayers = 16;
+// The slot ids: seat 0 (the host) and the client slots 1 .. kMaxPlayers (F5-SEAT-1: a server takes 16 clients; owner 2026-11-13
+// gave a world server 8). Every check of a player's peer id (`peer < kMaxPeerSlots`), every array indexed by one and every list that
+// may have a row per slot uses this, not kMaxPlayers. Protocol 31 widened the accepted ranges of AvatarList, DebugState, LevelMap,
+// LoadWait, TransitionState and the level Packet's peer from 0..7 / 8 rows to 0..8 / 9 rows, protocol 33 (F5-SEAT-1) to 0..16 /
+// 17 rows; no field changed its width (the counts are u8 or varu).
 constexpr uint32_t kMaxPeerSlots = kMaxPlayers + 1;
 
-// Transport peer slot: the host is always 0, clients get 1..kMaxPeerSlots-1 (an ordinary host gives at most 1..7).
+// Transport peer slot: the host is always 0, clients get 1..kMaxPeerSlots-1 (a co-op host gives at most 1..7, a server 1..16).
 using PeerId = uint32_t;
 constexpr PeerId kHostPeer = 0;
 constexpr PeerId kInvalidPeer = 0xFFFFFFFFu;
@@ -266,6 +284,13 @@ enum class Msg : uint16_t
 	LoadWait = 0x01DE, // world server -> player on the loading screen: prepared / waiting / enter / cancel, who is ready
 	LoadReady = 0x01DF, // player -> world server: my loading screen is up for this epoch (simultaneous load)
 
+	// TZ R32 W3 (protocol 34, 0x01E0-0x01EF; layouts: srv/coop_levels_wire.h, scopes: coop_scope.h): one journal up. Every fact of a
+	// map server's frame (a create, a release, a death, a parent, a membership, an info, an item's state, a module's carry, a numbered
+	// op done, an ask, the answer to a flush) goes up in order on the reliable lane; the world server reads the batch whole before it
+	// applies any entry, and answers it.
+	LevelJournal = 0x01E0, // map server -> world server: u32 seq, u16 n, n x {u8 op, varu len, body}
+	LevelJournalAck = 0x01E1, // world server -> that map server: u32 upto, the refused entries, an id block
+
 	// scripting and diagnostics
 	ScriptEvent = 0x01A0, // Lua RPC
 	// protocol 29 (docs/DEBUG_DESIGN.md §B.3): the server's debug, its state and the players' personal flags; layout and rules:
@@ -286,6 +311,17 @@ enum class Msg : uint16_t
 
 	// a bolt of lightning (parity audit W5, xrCoop/coop_relay_rules.h)
 	Thunderbolt = 0x0139, // host -> clients: str collection, f32 period, f32 duration, u32 seed
+
+	// F5 vehicles for players (0x01F0-0x01FF; build 57, protocol 33 without a bump of its own; docs/VEHICLES.md). Layouts and
+	// bounds: xrCoop/coop_vehicle_rules.h (ReqMsg, SeatMsg, InputMsg, StateMsg); the module: xrGame/coop/coop_vehicles.h. Scope::Map
+	// (coop_scope.h): the decider of the sender's level handles them, the co-op host or the map server of that level (the world
+	// server tunnels them). Car and character ids in host numbering.
+	VehicleReq = 0x01F0, // player -> decider: u8 op (enter / exit / switch seat), u16 car, u8 seat (Reliable)
+	VehicleSeat = 0x01F1, // decider -> the players of the level (refused: to the asker only): u16 car, u8 seat, u16 character,
+	                      // u8 op (granted / released / refused), u8 reason, [3 x f32 exit position] when released (Reliable)
+	VehicleInput = 0x01F2, // driver -> decider: u16 car, u8 seq, u16 held, u8 edges, [i16 yaw, i16 pitch] (Unreliable, sequenced)
+	VehicleState = 0x01F3, // decider -> the players of the level: u16 car, u8 flags, u8 rpm, i8 gear, u8 health, u8 fuel, u8 damage
+	                       // (Reliable)
 };
 
 // Human-readable name for logs and stats ("Hello", "PlayerState", ...).
@@ -387,8 +423,28 @@ struct HelloMsg
 	bool read(Reader& r);
 };
 
+// Protocol 33 (docs/plans/2026-11-18-two-modes.md S3, docs/MODES.md section 4): what a session is, said once by its host in the
+// Welcome. A client keeps it with the host's row (Session::session_mode) from the Welcome on, before any game message of the
+// session runs, so that its start installs the mode of its process by it (S4) instead of guessing it from the first LevelMap.
+// The values are the wire's: append only.
+enum class SessionMode : uint8_t
+{
+	None = 0, // never on the wire: no session, or a Welcome nobody filled (a client refuses it)
+	Coop = 1, // the co-op: the host plays, everybody is on its map
+	Server = 2, // the server: a world server, whose own seat plays no character, and the map servers it bridges
+};
+// "coop", "server"; "none" for None and for a value no protocol has.
+const char* session_mode_name(SessionMode mode);
+// The rule a Welcome is held to: a co-op host's seat plays, a world server's never does (WelcomeMsg::HostSeatPlays,
+// SessionConfig::host_plays). Session::host holds a listening host to it and refuses a host that names no mode (SESSION-MODE).
+inline SessionMode session_mode_of_seat(bool host_seat_plays)
+{
+	return host_seat_plays ? SessionMode::Coop : SessionMode::Server;
+}
+
 // Host -> client on acceptance.
-// Wire: u32 slot, u64 session_token, str host_nick, u32 max_players, u32 world_epoch, u8 flags (protocol 31).
+// Wire: u32 slot, u64 session_token, str host_nick, u32 max_players, u32 world_epoch, u8 flags (protocol 31), u8 mode (protocol 33,
+// SessionMode).
 struct WelcomeMsg
 {
 	enum Flags : uint8_t
@@ -403,9 +459,11 @@ struct WelcomeMsg
 	uint32_t max_players = kMaxPlayers;
 	uint32_t world_epoch = 0; // the world the host serves now (Session::set_world_epoch)
 	uint8_t flags = HostSeatPlays;
+	SessionMode mode = SessionMode::None; // protocol 33: the session's (Session fills it); None is never sent and never read
 
 	void write(Writer& w) const;
-	// False on overrun or an unknown flag.
+	// False on overrun, an unknown flag, a mode that is not Coop or Server, or a mode the seat contradicts
+	// (session_mode_of_seat of HostSeatPlays).
 	bool read(Reader& r);
 };
 

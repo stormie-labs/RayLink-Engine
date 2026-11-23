@@ -13,6 +13,7 @@
 #include "coop_instrument.h"
 #include "coop_dialog.h" // W11: dialog::host_talk_holder
 #include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
+#include "coop_writer.h" // R32 W1: writing::lua_writes
 #include "coop_trade.h" // trade::lua_search_window
 #include "coop_money.h" // F2 T1: money::register_lua
 #include "coop_router.h" // F2 T10: router::register_lua (coop.route)
@@ -20,12 +21,18 @@
 #include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
 #include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
 #include "coop_debug.h" // protocol 29: debug::register_lua (coop.debug)
-#include "coop_world_server.h" // plan 2026-11-12 stage 6a: world_server::register_lua (coop.world_server, coop.machine_memory)
-#include "xrCoop/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
+#include "coop_objects.h" // G11-2: objects::register_lua (coop.zone_path)
+#include "xrCoop/coop_mode.h" // S4: register_layers_lua (the server's srv.*)
+#include "coop_vehicles.h" // F5: vehicles::register_lua (coop.vehicle)
+#include "coop_progress.h" // F5: progress::register_lua (coop.progress)
+#include "coop_initial_state.h" // TZ R32 W8.4: items::register_lua (coop.items.set_initial)
+#include "coop_player_touch.h" // TZ P50: player_touch::register_lua (coop.player_touch_zones)
+#include "xrCoop/srv/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
 #include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
 #include "xrCoop/coop_roster.h" // plan 2026-11-12 stage 3: who is listed as a player, who has the host's badge
-#include "xrCoop/coop_operator.h" // op::kMaxLine: coop.operator_command
+#include "xrCoop/srv/coop_operator.h" // op::kMaxLine, op::allowed: coop.operator_command
 #include "xrCoop/coop_task_audience.h" // task_audience::kMaxMembers: coop.story_task_audience
+#include "xrCoop/coop_item_rider_rules.h" // F4 G3-1c: riders::ReleaseBook behind coop.event_tick / coop.released_after
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -34,8 +41,12 @@
 #include "MainMenu.h"
 #include "UIGameCustom.h"
 
+#include <atomic>
+#include <cmath>
 #include <deque>
+#include <limits>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -47,7 +58,7 @@ namespace script
 {
 namespace
 {
-constexpr size_t kMaxName = 64; // event name: printable ASCII, no spaces
+constexpr size_t kMaxName = WorldEventReservations::kMaxName;
 constexpr size_t kMaxPayload = 16 * 1024;
 constexpr size_t kMaxOutbox = 512; // events queued by Lua, sent in frame()
 constexpr size_t kMaxInbox = 4096; // events waiting for Lua (P6): a level's load fills them, 512 lost the oldest
@@ -72,6 +83,7 @@ struct Incoming
 	PeerId from = kInvalidPeer;
 	std::string name, payload;
 	u64 t_ms = 0;
+	u64 tick = 0; // F4 G3-1c: its place among the arrivals and the releases of entities here (g_tick)
 };
 
 struct ChatLine
@@ -112,6 +124,7 @@ struct Stats
 	u64 send_held = 0; // F2 T14 (Ruling F2-14): frames a client held events back for the host's rate limit
 	u64 drop_invalid = 0; // malformed / bad name / payload too big / bad target
 	u64 drop_not_ready = 0; // host: sender is still loading the world (P6)
+	u64 drop_world_only = 0; // reserved events refused before a relay rewrites their sender
 	u64 drop_overflow = 0; // inbox or chat queue full
 	u64 drop_stale = 0; // waited too long for Lua
 	u64 lua_errors = 0; // Lua error inside coop_main.on_event / on_chat / print_status
@@ -176,11 +189,19 @@ struct EndNotice
 EndNotice g_end;
 
 Stats g_stats;
+WorldEventReservations g_world_events;
 std::deque<Outgoing> g_outbox;
 std::deque<Incoming> g_inbox;
 size_t g_inbox_bytes = 0;
 u64 g_lua_back_ms = 0; // the last frame Lua was not ready (a load)
 u32 g_lost_events = 0; // dropped since Lua was last told (coop_events_lost)
+// F4 G3-1c (xrCoop/coop_item_rider_rules.h): one counter orders the events reaching the inbox and the releases of entities
+// on this process, so Lua can tell a rider that waited while its weapon was released and replaced under the same name.
+// Never reset: a tick only orders. Releases come on any game thread (coop_entities.cpp host_on_entity_released).
+std::atomic<u64> g_tick{0};
+std::atomic<u64> g_delivering{0}; // the tick of the event coop_main.on_event has now, 0 between events
+std::mutex g_release_lock;
+riders::ReleaseBook g_releases; // under g_release_lock
 std::deque<ChatLine> g_chat;
 std::deque<EngineEvent> g_engine;
 Rejection g_reject;
@@ -191,24 +212,15 @@ size_t g_stash_bytes = 0;
 // First lines in full, then every 100th, so a broken addon cannot flood the log.
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
 
-bool valid_name(const char* s, size_t n)
-{
-	if (!s || n == 0 || n > kMaxName)
-		return false;
-	for (size_t i = 0; i < n; ++i)
-	{
-		const unsigned char c = static_cast<unsigned char>(s[i]);
-		if (c <= 0x20 || c >= 0x7f)
-			return false;
-	}
-	return true;
-}
+bool valid_name(const char* s, size_t n) { return WorldEventReservations::valid_name(s, n); }
+
+bool decides_world() { return mgr().active() && mode().decides_world(); }
 
 bool lua_ready()
 {
 	if (!g_pGameLevel || !g_actor)
 		return false;
-	return mgr().is_host() || mgr().is_live_client();
+	return net::live();
 }
 
 void write_event(Writer& w, PeerId origin, s32 target, const std::string& name, const std::string& payload)
@@ -368,6 +380,7 @@ void deliver_later(PeerId from, std::string&& name, std::string&& payload)
 	e.name = std::move(name);
 	e.payload = std::move(payload);
 	e.t_ms = mgr().now_ms();
+	e.tick = ++g_tick;
 	g_inbox.push_back(std::move(e));
 }
 
@@ -388,7 +401,7 @@ bool read_event(PeerId from, Reader& r, PeerId& wire_origin, s32& target, std::s
 	target = r.i32();
 	name = r.str();
 	payload = r.str();
-	if (r.ok() && valid_name(name.data(), name.size()) && payload.size() <= kMaxPayload)
+	if (r.ok() && r.remaining() == 0 && valid_name(name.data(), name.size()) && payload.size() <= kMaxPayload)
 		return true;
 	++g_stats.drop_invalid;
 	if (log_allowed(g_stats.drop_invalid))
@@ -404,12 +417,14 @@ void server_on_script_event(PeerId from, Reader& r)
 	PeerId wire_origin = kInvalidPeer;
 	s32 target = kTargetAll;
 	std::string name, payload;
-	if (!read_event(from, r, wire_origin, target, name, payload) || !mgr().is_host())
+	if (!read_event(from, r, wire_origin, target, name, payload) || !decides_world())
 		return;
-	// P6: the sender must be in the world; a loading client has no business sending game events. A map server is a process of this PC.
-	const bool bridge = mapserver::is_bridge(from);
-	const bool ready = from == kHostPeer ? mgr().session().local() != nullptr :
-	    bridge || (mgr().session().peer(from) != nullptr && !sync::host_peer_joining(from));
+	// P6: players can send after loading. A joined connection without a player can report immediately.
+	const Session& session = mgr().session();
+	const bool player = session.peer(from) != nullptr;
+	const bool bridge = from != kHostPeer && !player && session.joined(from);
+	const bool ready = from == kHostPeer ? session.local() != nullptr :
+	    bridge || (player && !sync::host_peer_joining(from));
 	if (!ready)
 	{
 		++g_stats.drop_not_ready;
@@ -417,12 +432,27 @@ void server_on_script_event(PeerId from, Reader& r)
 			::Msg("! [coop] script event '%s' from #%u dropped: sender is not in the world yet", name.c_str(), from);
 		return;
 	}
+	if (g_world_events.blocks_relay(bridge, name))
+	{
+		++g_stats.drop_world_only;
+		if (log_allowed(g_stats.drop_world_only))
+			::Msg("! [coop] world-only script event '%s' from #%u dropped", name.c_str(), from);
+		return;
+	}
 	// the wire origin of a client is never trusted. What a map server tells a player, the world tells him: he knows no other process.
 	const PeerId origin = bridge ? kHostPeer : from;
 	++g_stats.received;
 	if (target == kTargetAll)
 	{
-		host_relay(origin, target, name, payload, from);
+		if (bridge)
+		{
+			// B-REV F7: a map server's "everybody" is the players (its flush_outbox never sends -1: it gives each player his
+			// own copy). Never the other map servers: they would take the copy, origin 0, as the world's word.
+			for (const PeerInfo& p : session.peers())
+				host_relay(origin, s32(p.id), name, payload, from);
+		}
+		else
+			host_relay(origin, target, name, payload, from);
 		if (from != kHostPeer) // the host player's own event to everybody else: not back to the Lua that sent it
 			deliver_later(from, std::move(name), std::move(payload));
 	}
@@ -446,7 +476,7 @@ void client_on_script_event(PeerId from, Reader& r)
 	PeerId wire_origin = kInvalidPeer;
 	s32 target = kTargetAll;
 	std::string name, payload;
-	if (!read_event(from, r, wire_origin, target, name, payload) || !mgr().is_client())
+	if (!read_event(from, r, wire_origin, target, name, payload) || !net::client())
 		return;
 	if (from != kHostPeer)
 		return; // star topology: everything comes through the host
@@ -463,7 +493,7 @@ void flush_outbox()
 {
 	if (g_outbox.empty())
 		return;
-	const bool host = mgr().is_host();
+	const bool host = decides_world();
 	const bool client = mgr().is_live_client();
 	while (!g_outbox.empty())
 	{
@@ -497,7 +527,7 @@ void flush_outbox()
 				continue;
 			}
 		}
-		else if (is_map_server() && o.target == kTargetAll)
+		else if (o.target == kTargetAll && net::client() && mode().leads_level())
 		{
 			// "everybody" of a map server is the players of its level; the world relays each, it has no path of its own to them
 			for (const PeerInfo& p : mgr().session().peers())
@@ -530,6 +560,7 @@ void deliver_inbox()
 				::Msg("! [coop] script event '%s' from #%u is too old, dropped", e.name.c_str(), e.from);
 			continue;
 		}
+		g_delivering = e.tick; // F4 G3-1c: coop.event_tick() names this event's arrival while Lua handles it
 		const bool ok = call_lua("on_event", [&e](lua_State* L)
 		{
 			lua_pushlstring(L, e.name.data(), e.name.size());
@@ -537,6 +568,7 @@ void deliver_inbox()
 			lua_pushnumber(L, lua_Number(e.from));
 			return 3;
 		});
+		g_delivering = 0;
 		if (ok)
 			++g_stats.delivered;
 	}
@@ -678,7 +710,7 @@ bool l_is_active() { return mgr().active(); }
 bool l_is_host() { return mgr().is_host(); }
 bool l_is_client() { return mgr().is_client(); }
 // Host, or client that finished loading the host's world.
-bool l_is_live() { return mgr().is_host() || mgr().is_live_client(); }
+bool l_is_live() { return net::live(); }
 
 int l_self_id()
 {
@@ -700,8 +732,8 @@ bool arg_id(lua_State* L, int idx, lua_Number& out)
 // client from peer 0's row (Welcome flags HostSeatPlays); a session with no row 0 (a map server's) counts as an ordinary host.
 bool host_seat_plays()
 {
-	if (mgr().is_host())
-		return !g_coop_dedicated;
+	if (decides_world())
+		return mode().actor_is_player();
 	return roster::host_plays_in(mgr().session().peers(), true);
 }
 
@@ -712,15 +744,37 @@ PeerInfo self_row(PeerId self)
 	PeerInfo me;
 	me.id = self;
 	me.state = PeerState::Joined;
-	me.plays = !(mgr().is_host() && g_coop_dedicated);
+	me.plays = !decides_world() || mode().actor_is_player();
 	me.host_rights = mgr().session().self_host_rights();
 	return me;
 }
 
+// F5-SEAT-1: the `mstate` of a row of coop.players(): the movement flags (actor EMoveCommand: crouch, slow walk, sprint, jump, fall ...;
+// the 16 bits a PlayerState carries) of that player's latest snapshot, on a machine that holds his body: our own actor while it is a
+// player (mode().actor_is_player()), another player's character once a state of his drove it here (players::avatar_view; the state
+// it was last driven with, players::avatar_mstate). False elsewhere (a server's world has no body of his, a body never driven): the row
+// has no mstate. F5-COV-1 and F5-PRG-3 read it for the stance and the jumps.
+bool row_mstate(bool own, u16 avatar, u32& out)
+{
+	if (own)
+	{
+		const CActor* a = g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity()) : nullptr;
+		if (!a || !mode().actor_is_player())
+			return false;
+		out = a->MovingState() & 0xffff;
+		return true;
+	}
+	float yaw = 0.f, pitch = 0.f;
+	if (avatar == 0xffff || !players::avatar_view(avatar, yaw, pitch))
+		return false;
+	out = players::avatar_mstate(avatar);
+	return true;
+}
+
 // coop.players() -> { {id=, nick=, avatar_id= (local numbering, nil if unknown), rtt=, loss= (0..1, the transport's
 // smoothed packet loss; 0 for ourselves), is_self=, is_host= (the host's badge: the playing host's row, or the operator's when the
-// host's seat plays no character)}, ... } (loss: scripts\coop_hud_netgraph). A seat that plays no character (a world server's own) is
-// in no row (coop_roster.h).
+// host's seat plays no character), mstate= (F5-SEAT-1, row_mstate; nil where his body is not here)}, ... } (loss:
+// scripts\coop_hud_netgraph). A seat that plays no character (a world server's own) is in no row (coop_roster.h).
 int l_players(lua_State* L)
 {
 	lua_newtable(L);
@@ -741,6 +795,12 @@ int l_players(lua_State* L)
 		{
 			lua_pushnumber(L, lua_Number(avatar));
 			lua_setfield(L, -2, "avatar_id");
+		}
+		u32 mstate = 0;
+		if (row_mstate(id == self, avatar, mstate)) // F5-SEAT-1
+		{
+			lua_pushnumber(L, lua_Number(mstate));
+			lua_setfield(L, -2, "mstate");
 		}
 		lua_pushnumber(L, lua_Number(rtt));
 		lua_setfield(L, -2, "rtt");
@@ -780,7 +840,7 @@ int l_players(lua_State* L)
 int l_server_link(lua_State* L)
 {
 	const Manager& m = mgr();
-	const PeerInfo* h = m.active() && m.is_client() && m.session().role() == Role::Client ? m.session().peer(kHostPeer) : nullptr;
+	const PeerInfo* h = net::client() && m.session().role() == Role::Client ? m.session().peer(kHostPeer) : nullptr;
 	if (!h)
 	{
 		lua_pushnil(L);
@@ -805,7 +865,7 @@ int l_server_link(lua_State* L)
 // coop.has_host_rights() -> bool: this process is the host (coop.is_host()), or a client the world server made its operator.
 int l_has_host_rights(lua_State* L)
 {
-	lua_pushboolean(L, mgr().is_host() || mgr().session().self_host_rights());
+	lua_pushboolean(L, decides_world() || mgr().session().self_host_rights());
 	return 1;
 }
 
@@ -820,12 +880,11 @@ int l_operator_command(lua_State* L)
 	if (!s || n == 0 || n > op::kMaxLine)
 		return fail2(L, "bad_line");
 	const Manager& m = mgr();
-	if (!m.active() || !m.is_client() || m.session().role() != Role::Client)
+	if (!net::client() || m.session().role() != Role::Client)
 		return fail2(L, "not_joined");
 	if (!m.session().self_host_rights())
 		return fail2(L, "not_operator");
-	// A line the server would refuse (op::allowed) gets no answer from it: say so here (live 2026-11-13: "coop_dbg lua x=1" was
-	// "sent" and nothing came back).
+	// A line the server would refuse gets no answer. Report that refusal before attempting delivery.
 	const std::string line(s, n);
 	if (!op::allowed(line))
 		return fail2(L, "bad_line");
@@ -911,7 +970,7 @@ int l_to_host_id(lua_State* L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushnumber(L, lua_Number(mgr().is_client() ? join::to_host(u16(v)) : u16(v)));
+	lua_pushnumber(L, lua_Number(net::client() ? join::to_host(u16(v)) : u16(v)));
 	return 1;
 }
 
@@ -923,7 +982,7 @@ int l_to_local_id(lua_State* L)
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushnumber(L, lua_Number(mgr().is_client() ? join::to_local(u16(v)) : u16(v)));
+	lua_pushnumber(L, lua_Number(net::client() ? join::to_local(u16(v)) : u16(v)));
 	return 1;
 }
 
@@ -935,6 +994,28 @@ int send_fail(lua_State* L, const char* why)
 	lua_pushboolean(L, 0);
 	lua_pushstring(L, why);
 	return 2;
+}
+
+// coop.reserve_world_event(name) -> bool. Reservations can be made before a session starts.
+int l_reserve_world_event(lua_State* L)
+{
+	size_t size = 0;
+	const char* name = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &size) : nullptr;
+	lua_pushboolean(L, g_world_events.reserve(name, size) ? 1 : 0);
+	return 1;
+}
+
+// coop.my_level() -> the game graph id of the level this process has loaded; nil while its world is built or torn down (the
+// guarded levels::my_level, the same answer as coop.levels.my_level). S6 (A-S6-L-worldb): the Core's flare cast asks it without
+// the server's table coop.levels.
+int l_own_level(lua_State* L)
+{
+	const levels::LevelId level = levels::my_level();
+	if (level == levels::wire::kNoLevel)
+		lua_pushnil(L);
+	else
+		lua_pushnumber(L, lua_Number(level));
+	return 1;
 }
 
 // coop.send_event(name, payload, target) -> true | false, reason
@@ -968,12 +1049,14 @@ int l_send_event(lua_State* L)
 		if (lua_type(L, 3) != LUA_TNUMBER)
 			return send_fail(L, "target must be a number");
 		const lua_Number t = lua_tonumber(L, 3);
+		if (!std::isfinite(t) || t > (std::numeric_limits<s32>::max)() || std::trunc(t) != t)
+			return send_fail(L, "bad target");
 		if (t < -1 || (t > lua_Number(kMaxPlayers) && !mapserver::is_bridge(PeerId(t))))
 			return send_fail(L, "bad target");
 		target = s32(t);
 	}
 
-	const bool host = mgr().is_host();
+	const bool host = decides_world();
 	if (!host && !mgr().is_live_client())
 		return send_fail(L, "not in a co-op world"); // P6: sender must be ready
 	// F3a T7: in the host's process 0 is the world server and the host player at once (one Lua): an event to 0 goes over
@@ -983,7 +1066,8 @@ int l_send_event(lua_State* L)
 	if (target != kTargetAll && PeerId(target) == self && !to_own_world)
 		return send_fail(L, "target is this machine");
 	const bool to_map_server = host && target > 0 && mapserver::is_bridge(PeerId(target));
-	const bool to_the_world = is_map_server() && target == s32(kHostPeer); // the session of its level does not list the host
+	// A session that leads a level for the world does not list the world's decider.
+	const bool to_the_world = target == s32(kHostPeer) && net::client() && mode().leads_level();
 	if (target != kTargetAll && !to_own_world && !to_map_server && !to_the_world && !mgr().session().peer(PeerId(target)))
 		return send_fail(L, "no such player");
 	if (g_outbox.size() >= kMaxOutbox)
@@ -1122,7 +1206,7 @@ int l_world_epoch(lua_State* L)
 		lua_pushnil(L);
 		return 1;
 	}
-	const u32 epoch = mgr().is_client() ? mgr().session().world_epoch() : join::host_world_epoch();
+	const u32 epoch = net::client() ? mgr().session().world_epoch() : join::host_world_epoch();
 	lua_pushnumber(L, lua_Number(epoch));
 	return 1;
 }
@@ -1133,6 +1217,36 @@ int l_world_epoch(lua_State* L)
 int l_condition_carried(lua_State* L)
 {
 	lua_pushboolean(L, mgr().active() && players::condition_carried() ? 1 : 0);
+	return 1;
+}
+
+// coop.event_tick() -> arrival, now. F4 G3-1c (xrCoop/coop_item_rider_rules.h): `arrival` is the tick of the event
+// coop_main.on_event is delivering (now, outside one), `now` the latest tick. They only order: coop.released_after
+// compares them with the releases of entities here (scripts\coop_mods_item_state).
+int l_event_tick(lua_State* L)
+{
+	const u64 now = g_tick.load();
+	const u64 at = g_delivering.load();
+	lua_pushnumber(L, lua_Number(at ? at : now));
+	lua_pushnumber(L, lua_Number(now));
+	return 2;
+}
+
+// coop.released_after(local_id, tick) -> bool: this process released the entity under that id after `tick` (a tick of
+// coop.event_tick). Bad arguments: false.
+int l_released_after(lua_State* L)
+{
+	bool after = false;
+	if (lua_type(L, 1) == LUA_TNUMBER && lua_type(L, 2) == LUA_TNUMBER)
+	{
+		const double id = lua_tonumber(L, 1), tick = lua_tonumber(L, 2);
+		if (riders::valid_id(id) && riders::valid_tick(tick))
+		{
+			std::lock_guard<std::mutex> lock(g_release_lock);
+			after = g_releases.released_after(u16(id), u64(tick));
+		}
+	}
+	lua_pushboolean(L, after ? 1 : 0);
 	return 1;
 }
 
@@ -1406,16 +1520,19 @@ int l_session_info(lua_State* L)
 	lua_newtable(L);
 	set_field(L, "phase", std::string(phase_name(m.phase())));
 	set_bool(L, "active", m.active());
-	set_bool(L, "host", m.is_host());
-	set_bool(L, "client", m.is_client());
-	set_bool(L, "live", m.is_host() || m.is_live_client());
+	set_bool(L, "host", decides_world());
+	set_bool(L, "client", net::client());
+	set_bool(L, "live", net::live());
 	set_field(L, "self_id", m.active() && m.self() != kInvalidPeer ? lua_Number(m.self()) : lua_Number(-1));
 	set_field(L, "nick", std::string(m.nick()));
-	set_field(L, "max_players", lua_Number(kMaxPlayers));
+	// F5-SEAT-1: the session's seats, the mode's number (co-op 8, the server 16): a host's own config, a client's Welcome. Nil outside a
+	// session and before the Welcome: the scripts say their own then (coop_menu.max_players)
+	if (const u32 seats = m.active() ? m.session().max_players() : 0)
+		set_field(L, "max_players", lua_Number(seats));
 	set_field(L, "default_port", lua_Number(kDefaultPort));
 	if (m.active() && g_menu.port)
 		set_field(L, "port", lua_Number(g_menu.port));
-	if (m.is_client() && !g_menu.address.empty())
+	if (net::client() && !g_menu.address.empty())
 		set_field(L, "address", g_menu.address);
 	if (!g_menu.last_error.empty())
 	{
@@ -1461,7 +1578,7 @@ int l_session_info(lua_State* L)
 			if (p.id == self || !roster::listed(p))
 				continue;
 			push_player(p, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
-			    m.is_host() ? p.address.c_str() : nullptr);
+			    decides_world() ? p.address.c_str() : nullptr);
 		}
 	}
 	lua_setfield(L, -2, "players");
@@ -1633,7 +1750,7 @@ int l_story_task_audience(lua_State* L)
 {
 	bool ok = false;
 	const int t = lua_type(L, 2);
-	if (mgr().is_host() && lua_type(L, 1) == LUA_TSTRING)
+	if (decides_world() && lua_type(L, 1) == LUA_TSTRING)
 	{
 		size_t len = 0;
 		const char* id = lua_tolstring(L, 1, &len);
@@ -1659,7 +1776,7 @@ int l_story_task_audience(lua_State* L)
 int l_story_resend_tasks(lua_State* L)
 {
 	lua_Number v = 0;
-	const bool ok = mgr().is_host() && arg_id(L, 1, v) && v == lua_Number(u32(v)) && story::resend_tasks(u32(v));
+	const bool ok = decides_world() && arg_id(L, 1, v) && v == lua_Number(u32(v)) && story::resend_tasks(u32(v));
 	lua_pushboolean(L, ok ? 1 : 0);
 	return 1;
 }
@@ -1690,7 +1807,7 @@ int l_life_of(lua_State* L)
 int l_out_of_run(lua_State* L)
 {
 	u16 id = 0;
-	lua_pushboolean(L, mgr().is_host() && arg_local_id(L, 1, id) && survival::out_of_run(id));
+	lua_pushboolean(L, decides_world() && arg_local_id(L, 1, id) && survival::out_of_run(id));
 	return 1;
 }
 
@@ -1702,20 +1819,6 @@ int l_rollback_failed(lua_State* L)
 	if (arg_local_id(L, 1, id) && arg_local_id(L, 2, seq))
 		survival::rollback_failed(id, seq);
 	return 0;
-}
-
-// coop.steam_invite_ready() -> true when the launcher's Steam mode started this game with a lobby
-int l_steam_invite_ready(lua_State* L)
-{
-	lua_pushboolean(L, steam_invite_ready() ? 1 : 0);
-	return 1;
-}
-
-// coop.steam_invite() -> bool: Steam's "invite a friend" window over the game
-int l_steam_invite(lua_State* L)
-{
-	lua_pushboolean(L, steam_invite_window() ? 1 : 0);
-	return 1;
 }
 
 // coop.rollback_pending() -> true while the group waits for the host's load
@@ -1880,7 +1983,7 @@ int l_avatar_headlamp(lua_State* L)
 int l_talk_holder(lua_State* L)
 {
 	lua_Number v = 0;
-	if (!is_map_authority() || !arg_id(L, 1, v) || v >= lua_Number(0xffff))
+	if (!net::host() || !arg_id(L, 1, v) || v >= lua_Number(0xffff))
 	{
 		lua_pushnil(L);
 		return 1;
@@ -1899,7 +2002,7 @@ int l_talk_holder(lua_State* L)
 int l_talk_recent(lua_State* L)
 {
 	lua_Number peer = 0, npc = 0, ms = 0;
-	const bool ok = is_map_authority() && arg_id(L, 1, peer) && arg_id(L, 2, npc) && npc < lua_Number(0xffff) &&
+	const bool ok = net::host() && arg_id(L, 1, peer) && arg_id(L, 2, npc) && npc < lua_Number(0xffff) &&
 	    lua_type(L, 3) == LUA_TNUMBER;
 	if (ok)
 		ms = lua_tonumber(L, 3);
@@ -1929,11 +2032,15 @@ void register_raw(lua_State* L)
 		{"to_host_id", &l_to_host_id},
 		{"to_local_id", &l_to_local_id},
 		{"send_event", &l_send_event},
+		{"reserve_world_event", &l_reserve_world_event},
+		{"my_level", &l_own_level}, // S6: the guarded level of this process (coop_world_fx)
 		{"send_chat", &l_send_chat},
 		{"stash_set", &l_stash_set},
 		{"stash_get", &l_stash_get},
 		{"world_epoch", &l_world_epoch},
 		{"condition_carried", &l_condition_carried},
+		{"event_tick", &l_event_tick}, // F4 G3-1c: weapon riders bound to the instance (scripts\coop_mods_item_state)
+		{"released_after", &l_released_after},
 		{"session_info", &l_session_info},
 		{"host", &l_host},
 		{"host_when_ready", &l_host_when_ready},
@@ -1946,8 +2053,6 @@ void register_raw(lua_State* L)
 		{"story_resend_tasks", &l_story_resend_tasks},
 		{"life_of", &l_life_of},
 		{"out_of_run", &l_out_of_run},
-		{"steam_invite_ready", &l_steam_invite_ready},
-		{"steam_invite", &l_steam_invite},
 		{"rollback_failed", &l_rollback_failed},
 		{"rollback_pending", &l_rollback_pending},
 		{"saves_open", &l_saves_open},
@@ -1962,6 +2067,7 @@ void register_raw(lua_State* L)
 		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter
 		{"lease_ids", &coop::requests::lua_lease_ids}, // F2 T12b: ids this client can create its own items with now
 		{"lease_waiting", &coop::requests::lua_lease_waiting}, // F2 T12b round 1: an item that waits for the host
+		{"writes", &coop::writing::lua_writes}, // R32 W1: this process writes the object (coop_mode.writes)
 		{"search_window", &coop::trade::lua_search_window}, // what Anomaly's Lua inventory searches now (scripts\coop_mods_items)
 		{nullptr, nullptr},
 	};
@@ -1985,14 +2091,25 @@ void register_raw(lua_State* L)
 	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
 	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
 	levels::register_lua(L); // F3a: coop.levels.*, coop.is_world_server / is_map_authority / is_player / is_mirror (coop_levels.cpp)
+	register_layers_lua(L); // S4 (A-S4H): the layers' own tables: the server's srv.* (srv/coop_srv_script.cpp)
 	debug::register_lua(L); // protocol 29: coop.debug.* (coop_debug.h)
-	world_server::register_lua(L); // plan 2026-11-12 stage 6a: coop.world_server.*, coop.machine_memory (coop_world_server.h)
+	objects::register_lua(L); // G11-2: coop.zone_path (coop_objects.h)
+	vehicles::register_lua(L); // F5: coop.vehicle.status / exit (coop_vehicles.h)
+	progress::register_lua(L); // F5: coop.progress.budget / community_ok (coop_progress.h)
+	items::register_lua(L); // TZ R32 W8.4: coop.items.set_initial(id, t) (coop_initial_state.h)
+	player_touch::register_lua(L); // TZ P50: coop.player_touch_zones({id, ...}) (scripts\coop_transition_route.script)
 }
 } // namespace
 
 // F3a T7: ScriptEvent goes both ways (Either): each side has its own function, so that the host player's copy on the
 // internal channel never runs the world server's part.
-void install_server(Session& s) { s.on(Msg::ScriptEvent, &server_on_script_event); }
+void install_server(Session& s)
+{
+	// Hosting again in the same Lua state does not run axr_main's on_game_start a second time.
+	if (g_ai_space)
+		call_module("coop_world_events", "on_game_start", [](lua_State*) { return 0; });
+	s.on(Msg::ScriptEvent, &server_on_script_event);
+}
 
 void install_client(Endpoint& e) { e.on(Msg::ScriptEvent, &client_on_script_event); }
 
@@ -2006,6 +2123,33 @@ void reset()
 	g_engine.clear();
 	g_stats = Stats();
 	g_pacer.reset(); // F2 T14
+	std::lock_guard<std::mutex> lock(g_release_lock);
+	g_releases.clear_kept();
+}
+
+void note_released(u16 id)
+{
+	if (!mgr().active())
+		return; // single player: no rider waits, nothing asks
+	const u64 tick = ++g_tick;
+	std::lock_guard<std::mutex> lock(g_release_lock);
+	g_releases.note(id, tick);
+}
+
+void keep_instance(u16 id)
+{
+	if (!mgr().active())
+		return;
+	std::lock_guard<std::mutex> lock(g_release_lock);
+	g_releases.keep_next(id);
+}
+
+void unkeep_instance(u16 id)
+{
+	if (!mgr().active())
+		return;
+	std::lock_guard<std::mutex> lock(g_release_lock);
+	g_releases.unkeep(id);
 }
 
 void frame()
@@ -2158,6 +2302,7 @@ void note_user_stop() { g_menu.user_stop = true; }
 
 void on_session_end(const char* reason, const char* code)
 {
+	g_world_events.clear();
 	const bool by_user = g_menu.user_stop;
 	g_menu.user_stop = false;
 	g_menu.port = 0;
@@ -2166,7 +2311,7 @@ void on_session_end(const char* reason, const char* code)
 	if (!by_user && g_menu.rejected_ms && mgr().now_ms() - g_menu.rejected_ms < kRejectShadowMs)
 		return;
 	menu_error(by_user ? "left" : code ? code : "failed", reason && *reason ? reason : "the session ended", by_user);
-	if (!by_user && mgr().is_client() && g_pGameLevel) // the same test as join::on_session_lost, which leaves the world
+	if (!by_user && net::client() && g_pGameLevel) // the same test as join::on_session_lost, which leaves the world
 	{
 		g_end.pending = true;
 		g_end.code = g_menu.last_code;
@@ -2202,8 +2347,8 @@ void print_status()
 	::Msg("[coop-lua] events: sent %llu, received %llu, relayed %llu, delivered %llu", s.sent, s.received, s.relayed,
 	    s.delivered);
 	::Msg("[coop-lua] refused sends %llu, held for the host's rate %llu frames | dropped: invalid %llu, sender not ready "
-	      "%llu, overflow %llu, stale %llu",
-	    s.send_rejected, s.send_held, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale); // F2 T14
+	      "%llu, overflow %llu, stale %llu, world-only %llu",
+	    s.send_rejected, s.send_held, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale, s.drop_world_only); // F2 T14
 	::Msg("[coop-lua] lua errors %llu, missing handlers %llu, chat lines shown %llu | queued: out %u, in %u, chat %u",
 	    s.lua_errors, s.lua_missing, s.chat_delivered, (u32)g_outbox.size(), (u32)g_inbox.size(), (u32)g_chat.size());
 	::Msg("[coop-lua] stash %u keys / %u bytes (dropped at session end %llu) | refusals %llu: shown %llu, failed %llu, "

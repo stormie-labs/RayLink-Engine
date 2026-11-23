@@ -44,11 +44,8 @@
 //  - the host player is a client of his own world server over the local link: he is peer 0 of the server's players(), a
 //    member like any other, and his claim comes as a TransitionVote that goes through the same rule as a remote client's
 //    (apply_vote); his placard reads the TransitionState of the link;
-//  - the together entry of split levels: a member who stands on the level the exit leads to is not waited for (on_target).
-//    Owner 2026-11-02: one on another map (other_map) is waited for as long as it takes and cannot say yes from there, nor can
-//    anybody else come along from afar until everybody stands on one map; his row says so and the Lua placard says where he is.
-//    Nothing lets the group go past him: no timer, no /go. The one who started it withdraws (leaves the exit, or a trip's point,
-//    or cancels), and a trip ends with him;
+//  - (the together entry of split levels, members on another map, is gone with the hybrid: owner 2026-11-18. The board is the
+//    co-op's, everybody stands on the host's map; the high bit of a row's mark byte stays reserved);
 //  - the simultaneous load of a group transition: on "go" the world server writes the shared save of the transition, gives
 //    it the next world epoch and sends every moving client LoadWait {Prepared} and the save BEFORE its own reload; all load
 //    at once, each loading screen stays (LoadScreen) until the server says Enter (PreparedLoad over levels::LoadBarrier):
@@ -136,13 +133,10 @@ struct Member
 	bool in_world = true; // connected and has finished loading (join::host_player_in_world)
 	bool alive = true; // survival::Life::Alive
 	bool remote = true; // a client: his claim lapses without a refresh (the host player's, over the local link, never does)
-	bool on_target = false; // F3a §1.10: he stands on the level the exit leads to: neither waited for nor listed
-	bool other_map = false; // F3a §1.10: he is on another map: his yes is a remote one (no distance), his row says so
 };
 
-// The high bits of a row's mark byte on the wire: the row's player is on another map (F3a), he comes along from afar
-// ("go with the group", 2026-10-24). The layout stays 7 bytes a row.
-constexpr uint8_t kRowOtherMap = 0x80;
+// A high bit of a row's mark byte on the wire: he comes along from afar ("go with the group", 2026-10-24). The layout stays
+// 7 bytes a row. 0x80 is reserved (the player on another map of the hybrid, build 57 and before): a row with it is refused.
 constexpr uint8_t kRowConsent = 0x40;
 
 struct Row
@@ -150,7 +144,6 @@ struct Row
 	uint32_t id = 0;
 	Mark mark = Mark::Away;
 	uint16_t dist_m = kUnknownDist; // metres to the leading exit, as the host sees him
-	bool other_map = false; // F3a: on another map (Member::other_map)
 	bool consent = false; // ready from afar: he comes along (a claim without a place)
 };
 
@@ -267,14 +260,13 @@ public:
 		for (auto it = m_claims.begin(); it != m_claims.end();)
 		{
 			const Member* m = member_of(it->first);
-			// F3a: one who stands on the level the exit leads to does not go
-			bool drop = !m || !m->in_world || !m->alive || m->on_target;
+			bool drop = !m || !m->in_world || !m->alive;
 			if (!drop && m->remote && now > it->second.seen && now - it->second.seen > kClaimLapseMs)
 				drop = true;
-			// who is on another map is no nearer to it than that: his place says nothing; "go with the group" has none, the yes of a
-			// trip neither, but the one who asked for a trip that waits stands at his point (kTripPlace)
+			// "go with the group" has no place, the yes of a trip neither, but the one who asked for a trip that waits stands at his
+			// point (kTripPlace)
 			const uint32_t place = it->second.place;
-			if (!drop && !m->other_map && (!is_guide(it->second.goal) || place == kTripPlace) && place != kNoPlace && dist)
+			if (!drop && (!is_guide(it->second.goal) || place == kTripPlace) && place != kNoPlace && dist)
 			{
 				const float d = dist(it->first, it->second.place);
 				if (d >= 0.f && d > kLeaveM)
@@ -334,28 +326,12 @@ public:
 		std::vector<Member> sorted(members);
 		std::sort(sorted.begin(), sorted.end(), [](const Member& a, const Member& b) { return a.id < b.id; });
 		uint32_t blockers = 0, loaders = 0;
-		bool everyone_here = true; // nobody who counts stands on another map
 		for (const Member& m : sorted)
 		{
-			if (m.on_target)
-				continue; // F3a: already where the exit leads: neither waited for nor listed
 			Row r;
 			r.id = m.id;
-			r.other_map = m.other_map;
-			auto c = m_claims.find(m.id);
-			if (m.other_map && c != m_claims.end() && c->second.goal == lead)
-			{
-				m_claims.erase(c); // he left that map, or his yes was given from another: it does not hold there
-				c = m_claims.end();
-			}
-			if (m.other_map && m.alive)
-			{
-				// owner 2026-11-02: he is waited for as long as it takes, wherever he stands and whatever he does there
-				r.mark = c != m_claims.end() ? Mark::Elsewhere : Mark::Away;
-				++blockers;
-				everyone_here = false;
-			}
-			else if (c != m_claims.end())
+			const auto c = m_claims.find(m.id);
+			if (c != m_claims.end())
 			{
 				r.mark = c->second.goal == lead ? Mark::Ready : Mark::Elsewhere;
 				r.consent = c->second.place == kNoPlace;
@@ -373,7 +349,7 @@ public:
 				r.mark = Mark::Away;
 				++blockers;
 			}
-			if (m.in_world && !m.other_map && dist)
+			if (m.in_world && dist)
 			{
 				const float d = dist(m.id, lead);
 				if (d >= 0.f)
@@ -382,8 +358,8 @@ public:
 			st.rows.push_back(r);
 		}
 		st.total = st.ready + blockers + loaders;
-		// 5. the chat's /go: not past a player on another map
-		if (forced && everyone_here && std::any_of(m_claims.begin(), m_claims.end(),
+		// 5. the chat's /go
+		if (forced && std::any_of(m_claims.begin(), m_claims.end(),
 		                         [forced_goal](const auto& c) { return c.second.goal == forced_goal; }))
 		{
 			st.goal = forced_goal;
@@ -507,9 +483,6 @@ struct VoteFacts
 	bool in_world = false; // his character is in the world the server serves now
 	bool exit_known = false; // the exit he names is a level changer of the server's level
 	float dist = -1.f; // metres from his character to that exit, < 0 unknown
-	bool other_map = false; // he is on another map than the exit (or the trip): no yes counts from there
-	bool others_away = false; // somebody else who counts stands on another map: no yes from afar yet
-	bool far_place = false; // the exit is on his map, a map server leads it: the host has his record, a second old, near the exit
 	bool guide_running = false; // a guide trip runs and its starter still says yes
 	bool route_known = false; // VoteRoute: the restrictor he names is a space restrictor of the server's level
 	float route_dist = -1.f; // VoteRoute: metres from his character to that restrictor, < 0 unknown
@@ -524,12 +497,10 @@ enum class Verdict : uint8_t
 	Nothing, // a cancel of one who had no claim
 	NotInWorld, // a ready from one who is not in the world
 	NoExit, // a ready at an exit the server's level does not have
-	TooFar, // a ready from further than kReachM of the exit (or its route restrictor), or from an unknown distance, on the
-	        // exit's map
+	TooFar, // a ready from further than kReachM of the exit (or its route restrictor), or from an unknown distance
 	NoGuide, // a yes to a guide trip that does not run
 	NotWaited, // "go with the group" to an exit nobody else stands at
 	NoRoute, // a route restrictor the server's level does not have
-	OtherMap, // a yes from another map, or a yes from afar while somebody is on another map (owner 2026-11-02)
 };
 
 // The server's rule for a TransitionVote of player `from` (VoteMsg read and checked by the caller).
@@ -541,30 +512,21 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 		return Verdict::NotInWorld;
 	uint32_t goal = kGuideGoal;
 	uint32_t place = kGuideGoal;
-	uint32_t had = 0;
-	const bool has_yes = b.claimed(from, &had);
 	if (v.changer == kNoChanger)
 	{
 		if (!f.guide_running)
 			return Verdict::NoGuide;
-		// owner 2026-11-02: a yes only with everybody on one map; a yes he gave before somebody walked off stays (his refresh)
-		if (f.other_map || (f.others_away && !(has_yes && had == goal)))
-			return Verdict::OtherMap;
 	}
 	else
 	{
 		if (!f.exit_known)
 			return Verdict::NoExit;
-		if (f.other_map)
-			return Verdict::OtherMap;
 		goal = goal_of_exit(v.changer);
 		if (v.op == VoteConsent)
 		{
 			// 2026-10-24: one who is not at the exit comes along, from anywhere; to an exit somebody else stands at
 			if (!b.anchored(goal, from))
 				return Verdict::NotWaited;
-			if (f.others_away && !(has_yes && had == goal))
-				return Verdict::OtherMap;
 			place = kNoPlace;
 		}
 		else if (v.op == VoteRoute)
@@ -573,14 +535,14 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 			// is measured against the restrictor, as against the zone of the changer itself
 			if (!f.route_known)
 				return Verdict::NoRoute;
-			if (!f.far_place && !(f.route_dist >= 0.f && f.route_dist <= kReachM))
+			if (!(f.route_dist >= 0.f && f.route_dist <= kReachM))
 				return Verdict::TooFar;
 			place = place_of_route(v.route);
 		}
 		else
 		{
-			// T12 review (Ruling 18): on the exit's map only within kReachM of it (an unknown distance is no claim)
-			if (!f.far_place && !(f.dist >= 0.f && f.dist <= kReachM))
+			// T12 review (Ruling 18): only within kReachM of the exit (an unknown distance is no claim)
+			if (!(f.dist >= 0.f && f.dist <= kReachM))
 				return Verdict::TooFar;
 			place = goal;
 		}
@@ -600,7 +562,7 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 // the leading exit leads to ("l01_escape"; the Lua side translates it), empty when the exit has none (read: unknown).
 //   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms (always 0 since the
 //   countdown is gone, 2026-10-24: the layout of protocol 11 stays), u32 load_ms,
-//   u8 n, n x { u32 player, u8 mark (| kRowOtherMap: on another map, F3a; | kRowConsent: comes along), u16 dist_m }
+//   u8 n, n x { u32 player, u8 mark (| kRowConsent: comes along; 0x80 reserved), u16 dist_m }
 struct StateMsg
 {
 	State state = State::Idle;
@@ -627,7 +589,7 @@ struct StateMsg
 		for (size_t i = 0; i < n; ++i)
 		{
 			w.u32(rows[i].id);
-			w.u8(uint8_t(uint8_t(rows[i].mark) | (rows[i].other_map ? kRowOtherMap : 0u) | (rows[i].consent ? kRowConsent : 0u)));
+			w.u8(uint8_t(uint8_t(rows[i].mark) | (rows[i].consent ? kRowConsent : 0u)));
 			w.u16(rows[i].dist_m);
 		}
 	}
@@ -652,11 +614,10 @@ struct StateMsg
 			row.id = r.u32();
 			const uint8_t byte = r.u8();
 			row.dist_m = r.u16();
-			const uint8_t m = uint8_t(byte & ~(kRowOtherMap | kRowConsent));
+			const uint8_t m = uint8_t(byte & ~kRowConsent); // the reserved 0x80 stays in it: no mark that large
 			if (!r.ok() || m > uint8_t(Mark::Elsewhere))
 				return false;
 			row.mark = Mark(m);
-			row.other_map = (byte & kRowOtherMap) != 0;
 			row.consent = (byte & kRowConsent) != 0;
 			rows.push_back(row);
 		}
@@ -742,25 +703,18 @@ inline TripAsk ask_trip(bool running, uint16_t running_to, uint16_t to)
 struct MoverFacts
 {
 	bool joined = false; // in the session
-	bool known = false; // the world server has his entry
+	bool known; // the world server has his entry
 	bool loading = false;
 	bool proxy = false; // his character is known
 	bool joining = false; // his world is on its way
 	bool choosing = false; // choosing a character
-	bool on_host_level = false;
 };
 
-// In the world, his character known: the others rejoin after the host's load as before. `every_level`: split levels, wherever he stands.
-inline bool goes_with_the_group(const MoverFacts& f, bool every_level)
+// In the world, his character known: the others rejoin after the host's load as before (the co-op: everybody stands on the host's
+// map).
+inline bool goes_with_the_group(const MoverFacts& f)
 {
-	return f.joined && f.known && !f.loading && f.proxy && !f.joining && !f.choosing && (every_level || f.on_host_level);
-}
-
-// The mover's character goes to the new level, unless he stands on it already (split levels: he reloads there where he is). A seat
-// nobody knows is no reason to leave him behind. 0xffff: levels::kNoLevel, this header does not know the rules of the levels.
-inline bool mover_is_placed(bool split, uint16_t stands, uint16_t arrival)
-{
-	return !(split && stands != 0xffffu && stands == arrival);
+	return f.joined && f.known && !f.loading && f.proxy && !f.joining && !f.choosing;
 }
 
 // ---------------------------------------------------------------- what a client wants against what the host says
@@ -983,22 +937,6 @@ public:
 			}
 		return out;
 	}
-	// F3a, the host went alone and everybody loads where he stands (plan §1.5 "the host's move"): there is no group to wait for. A mover
-	// enters when he is ready and `map_ready(peer)` says the level he stands on is led, whatever the others do.
-	template <class MapReady>
-	std::vector<uint32_t> take_entering_by_map(const MapReady& map_ready)
-	{
-		std::vector<uint32_t> out;
-		if (!m_active || !m_world_up)
-			return out;
-		for (uint32_t p : m_movers)
-			if (m_barrier.is_ready(p) && !entered(p) && map_ready(p))
-			{
-				m_entered.push_back(p);
-				out.push_back(p);
-			}
-		return out;
-	}
 	// Every mover entered (or was dropped).
 	bool finished() const
 	{
@@ -1165,6 +1103,58 @@ struct LoadScreen
 	// The loading screen stays (CGamePersistent::game_loaded, coop::hold_loading_screen).
 	bool holds() const { return stage == Load::Loading || stage == Load::Holding; }
 	void reset() { *this = LoadScreen(); }
+};
+
+// ---------------------------------------------------------------- F5-VEH-6 (rv_F5-VEH-6 blocker 2): the seat goes before the world
+
+// A player's machine leaves its world only after its own actor is out of a managed seat (coop_join.cpp, tests/
+// test_vehicle_travel_order.cpp). Co-op: the host released every seat before LoadWait Prepared, but the release and the save of the
+// transition can both come before the frame that detaches him: the save waits. Server: his own ask to leave his level (LevelMove)
+// waits, so that the map server of this level releases his seat while he is still its player and the release reaches him. In both
+// the normal driver's or passenger's detach runs here first (the exit sound, the exit point of the decider). kSeatDetachHoldMs at
+// most: an exit the stock box test keeps refusing, or a release that never comes, must not hold the travel for ever; it then goes
+// as it went before (late).
+constexpr uint64_t kSeatDetachHoldMs = 3000;
+
+enum class TravelStep : uint8_t
+{
+	Go, // nobody sits (any more): what was held goes now
+	Wait, // he still sits: hold it, the vehicle steps detach him
+	GoLate, // he still sits after kSeatDetachHoldMs: it goes anyway
+};
+
+class SeatHold
+{
+public:
+	// `seated`: this machine's actor still sits in a managed seat (vehicles::local_seat_attached). The first Wait starts the clock;
+	// Go and GoLate end the hold (the next travel gets a clock of its own).
+	TravelStep step(bool seated, uint64_t now)
+	{
+		if (!seated)
+		{
+			clear();
+			return TravelStep::Go;
+		}
+		if (!m_active)
+		{
+			m_active = true;
+			m_since = now;
+		}
+		if (now - m_since < kSeatDetachHoldMs)
+			return TravelStep::Wait;
+		clear();
+		return TravelStep::GoLate;
+	}
+	bool active() const { return m_active; }
+	void clear()
+	{
+		m_active = false;
+		m_since = 0;
+	}
+
+private:
+	bool m_active = false;
+	uint64_t m_since = 0;
 };
 } // namespace transition
 } // namespace coop

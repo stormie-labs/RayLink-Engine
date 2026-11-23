@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #include "coop_death.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_alife.h"
@@ -462,9 +463,6 @@ void fire_marker_callback(u16 player_local, u16 object_local, Drop drop)
 	    {script::cb_int(player_local), script::cb_int(object_local), script::cb_str(marker_kind(drop))});
 }
 
-// A map server's broadcast goes to its players only and nothing brings it back: its own Lua sets the spot, coop_story takes it to the world.
-void map_server_marker(const Marker& q) { fire_marker_callback(q.character, q.object, q.drop); }
-
 // The items' EntityParent / the stash's EntitySpawn go out in this frame's events / entities pass, after this module:
 // a marker waits one frame so that every client has its object before the marker names it. F3a T7: the host player gets
 // it as a client does, over the internal channel (on_marker_msg fires his callback at the next pump).
@@ -481,8 +479,8 @@ void send_markers()
 		Writer w(kMarkerSize);
 		write(w, m);
 		net::host_broadcast(Msg::DeathMarker, w);
-		if (is_map_server())
-			map_server_marker(m);
+		if (LevelSide* level = mode().level())
+			level->level_marker(m);
 		++g_st.markers_sent;
 		g_markers.erase(g_markers.begin() + i);
 	}
@@ -685,22 +683,15 @@ void give_up(PendingStash& p, bool owner_same, Presence character)
 // Review minor 5 (T9): stashes still waiting for their items when the session ends or the world is replaced are empty
 // entities nobody will fill. They are released while the world still has them. After a load the id may name something
 // else, so the entity under it must still be a coop_death_stash with nothing in it; without a world they are forgotten.
-// `stayed`: a new world, the stashes of the players who stayed in theirs through the host's move stand as they stood.
-void abandon_stashes(const char* why, bool stayed = false)
+void abandon_stashes(const char* why)
 {
 	if (g_stashes.empty())
 		return;
-	const bool world = is_map_authority() && g_pGameLevel && ai().get_alife();
+	const bool world = (mode().decides_world() || mode().leads_level()) && g_pGameLevel && ai().get_alife();
 	u32 released = 0;
-	xr_vector<PendingStash> kept;
 	const size_t had = g_stashes.size();
-	for (PendingStash& p : g_stashes)
+	for (const PendingStash& p : g_stashes)
 	{
-		if (stayed && join::host_stayed_in_world(PeerId(p.owner.peer)))
-		{
-			kept.push_back(std::move(p));
-			continue;
-		}
 		if (!world)
 			continue;
 		const CSE_Abstract* e = events::find_entity(p.stash);
@@ -712,8 +703,8 @@ void abandon_stashes(const char* why, bool stayed = false)
 	g_st.stash_abandoned += released;
 	::Msg("[coop] death: %s, %u stashes were waiting: %u released empty, %u forgotten (the items stay with their "
 	      "characters)",
-	    why, u32(had - kept.size()), released, u32(had - kept.size()) - released);
-	g_stashes.swap(kept);
+	    why, u32(had), released, u32(had) - released);
+	g_stashes.clear();
 }
 
 bool stash_waiting(u16 stash)
@@ -776,7 +767,7 @@ void host_frame()
 		if (g_epoch != 0xffffffff && !g_markers.empty())
 			::Msg("[coop] death: a new world, %u markers of the old one dropped", u32(g_markers.size()));
 		g_epoch = epoch;
-		abandon_stashes("a new world", true);
+		abandon_stashes("a new world");
 		g_markers.clear();
 		g_gave_up.clear();
 	}
@@ -809,7 +800,7 @@ void host_frame()
 
 void on_marker_msg(PeerId from, Reader& r)
 {
-	if (!(mgr().is_host() || mgr().is_live_client()) || from != kHostPeer)
+	if (!(mode().decides_world() || mgr().is_live_client()) || from != kHostPeer)
 	{
 		++g_st.markers_refused;
 		return;
@@ -873,7 +864,7 @@ public:
 
 u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 {
-	if (!is_map_authority())
+	if (!coop::mode().decides_world() && !coop::mode().leads_level())
 		return 0;
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
@@ -935,7 +926,7 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 
 u16 host_move_to_stash(u16 character, bool everything, u16 seq)
 {
-	if (!is_map_authority())
+	if (!mode().decides_world() && !mode().leads_level())
 		return kNoId;
 	CGameObject* body = nullptr;
 	CInventoryOwner* io = nullptr;
@@ -979,7 +970,7 @@ u32 host_items_on(u16 character)
 
 bool host_release_character(u16 character)
 {
-	if (!mgr().is_host() || character == 0 || !ai().get_alife() || !g_pGameLevel)
+	if (!mode().decides_world() || character == 0 || !ai().get_alife() || !g_pGameLevel)
 		return false;
 	CSE_ALifeDynamicObject* d = ai().alife().objects().object(character, true);
 	if (!d || !world::is_player_character(d) || !d->m_ini_string.size() || !is_retired(d->m_ini_string.c_str()))
@@ -1015,7 +1006,7 @@ bool host_new_kit()
 
 u32 host_take_money(u16 character, u8 pct)
 {
-	if (!mgr().is_host() || pct == 0)
+	if (!mode().decides_world() || pct == 0)
 		return 0;
 	const PeerId peer = survival::peer_of_character(character); // F3a T7: the host player's balance goes over the link
 	if (peer == kInvalidPeer)
@@ -1036,7 +1027,7 @@ u32 host_take_money(u16 character, u8 pct)
 
 void host_preview(u16 character, u16 seq)
 {
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 	{
 		::Msg("! [coop] coop_death_preview: the host decides deaths, run it there");
 		return;
@@ -1131,13 +1122,13 @@ void reset()
 
 void frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		host_frame();
 }
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		::Msg("[coop]   death: %llu deaths charged; items %llu dropped, %llu destroyed, %llu into stashes; %llu stashes "
 		      "(%llu fell back to dropping, %llu given up: items stayed, %llu released empty on a new world, %llu "
@@ -1149,7 +1140,7 @@ void print_status()
 			::Msg("[coop]     stash %u of %s: %u items, %lld ms left", p.stash, nick(p.character).c_str(),
 			    u32(p.items.size()), s64(p.deadline) - s64(now_ms()));
 	}
-	if (mgr().is_host() || mgr().is_client()) // F3a T7: the host player takes them too
+	if (mgr().active()) // F3a T7: the host player takes them too
 		::Msg("[coop]   death: %llu markers from the host, %llu refused", g_st.markers_in, g_st.markers_refused);
 }
 

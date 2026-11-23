@@ -51,8 +51,9 @@ private:
 
 	void InternalOpenLogFile();
 
-	void InternalPrintRecord();
 	void InternalPrintAllRecords();
+	// Anomaly Coop (TZ R38): a line after the close goes straight to the end of the file (coop::log_close::late_text)
+	void InternalWriteLate(LPCSTR text);
 
 	void InternalFlushLog();
 
@@ -66,10 +67,19 @@ private:
 		xr_string Message;
 		Time time;
 	};
+	// Anomaly Coop (TZ R38): a record is taken from the queue in one hold of logDataGuard (coop::log_close::take_front), and printed
+	// under logPrintGuard: one printer at a time, and none while the file goes (InternalCloseLog)
+	bool InternalTakeRecord(LogRecord& record);
+	void InternalPrintRecord(const LogRecord& record);
 
 	xrCriticalSection logDataGuard;
 	xrCriticalSection logCallbackGuard;
 	xrCriticalSection logFlushGuard;
+	// Anomaly Coop (TZ R38): held by whoever prints records or writes a late line, and by InternalCloseLog until the file is taken
+	// away. Order: logPrintGuard, then logDataGuard / logFlushGuard / logCallbackGuard; never the other way.
+	xrCriticalSection logPrintGuard;
+	bool bFileOpened = false; // Anomaly Coop (TZ R38): the file was created: a late line has a file to go to
+	bool bLateWritten = false; // Anomaly Coop (TZ R38): the late header is in the file
 	bool bFastDebugLog;
 
 	std::atomic_bool bFlushRequested;

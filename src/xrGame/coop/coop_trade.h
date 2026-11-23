@@ -101,6 +101,8 @@ int lua_search_window(lua_State* L);
 // container changed elsewhere, a trade answer arrived or a container move was not applied.
 // True: the caller refreshes prices, weights and money labels (UpdateItemsPlace).
 bool refresh_actor_menu(CUIActorMenu& menu);
+// G6-3, CUIActorMenu::CheckDistance: true keeps the trade window of a trading computer's permit open beyond 3 m.
+bool keeps_trade_window(CInventoryOwner* partner);
 // Client: the host's state of a world item came (F1): a window open on `holder` (local numbering, the item's top holder)
 // shows its bars and prices again. Teammates' items change with every shot: the rest is no business of a window.
 void client_on_item_state(u16 holder);
@@ -112,6 +114,17 @@ void on_container_move(u16 from_id, u16 to_id, u16 item_id);
 // the window and Lua's hide hook, as the stock item_backpack does before its release; Show(false) runs at once), and the
 // menu forgets the box. A menu closed already (the stock path) only forgets it: no second close.
 void on_inv_box_destroy(CInventoryBox& box);
+// CGameObject::net_Destroy of an inventory owner (an NPC, a trader, a corpse, the actor), its first line, on every machine and in
+// single player (O2-partner; crash reports RL-8CGN-EU7U and RL-AYXZ-JTV4 of build 56). The talk window, the actor menu and the
+// actor's talk keep raw pointers to their partner and read them every frame and on their close (CUITalkWnd::StopSnd hands it to
+// CActor::OnDialogSoundHandlerStop, whose smart_cast is a dynamic_cast; CUIActorMenu::Update reads the trader's inventory). If
+// `owner` is that partner, a shown menu closes now (HideActorMenu, as on_inv_box_destroy) and forgets it, the actor stops talking to
+// it and a shown talk window with it hides (its Show(false) runs at once): all while the owner is still whole
+// (xrCoop/coop_partner_rules.h on_destroy). A process without windows (a world server, a map server) only stops its actor's talk.
+void on_inv_owner_destroy(CInventoryOwner& owner);
+// coop_dialog client_on_revoke: the decider took back the talk lock on `partner` (the local object). The talk stops, and a trade or
+// an upgrade window with it, opened from that talk, closes (xrCoop/coop_partner_rules.h on_lock_revoked). True if either happened.
+bool on_talk_lock_revoked(CInventoryOwner& partner);
 
 // For the item layer (WP2): a take/put request was rejected by the host; rebuild the open window.
 void invalidate_views();

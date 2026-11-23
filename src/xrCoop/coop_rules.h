@@ -16,7 +16,7 @@ namespace rules
 // they are never sent, never applied when received and never counted in the info hash. Otherwise one
 // player opening the PDA closes the inventory / trade / loot windows of everybody, and a client's
 // `actor_is_sleeping` puts the host's story to sleep.
-//   exact:  ui_pda, actor_is_sleeping, sleep_active
+//   exact:  ui_pda, ui_pda_hide, actor_is_sleeping, sleep_active
 //   prefix: ui_talk*
 //   suffix: *_wnd_open
 // Case-sensitive, like the engine's shared strings. No id (nullptr or empty) is not a machine info.
@@ -30,7 +30,7 @@ inline bool is_machine_info(const char* id)
 	// when a player is too tired or too thirsty; while one is held, actor_on_sleep gives no rest. As a world info a
 	// client's give went to the host and to everybody, its take-away went nowhere (the client did not hold it yet):
 	// the whole group kept it and a sleep lowered nobody's need for sleep (live, build 54).
-	constexpr std::string_view kExact[] = {"ui_pda", "actor_is_sleeping", "sleep_active", "force_slp2", "force_slp"};
+	constexpr std::string_view kExact[] = {"ui_pda", "ui_pda_hide", "actor_is_sleeping", "sleep_active", "force_slp2", "force_slp"};
 	for (const std::string_view e : kExact)
 		if (s == e)
 			return true;

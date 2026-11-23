@@ -97,6 +97,7 @@ inline Need need_of(Msg type)
 	case Msg::LevelMap: // the newest table is kept; a loading client applies it when its world is there
 	case Msg::LevelMoveResult: // the answer to a request of a player who is in a world
 	case Msg::LevelFlush: // a map server answers from its own world; a hole there means it is loading
+	case Msg::LevelJournalAck: // R32 W3: the world's answer to a journal batch, applied by the map server in order
 	case Msg::Tunnel: // the inner packet passes its own need_of when it is taken out
 	case Msg::MapServerState:
 	case Msg::MapServerOrder:
@@ -132,6 +133,8 @@ inline Need need_of(Msg type)
 	case Msg::LevelXferDown: // F3a: the world server repeats it until it is acknowledged
 	case Msg::LevelBrain: // 1 Hz, the next one replaces it
 	case Msg::LevelHash: // every 10 s
+	case Msg::VehicleInput: // F5: the driver sends his keys again at a change and every 200 ms
+	case Msg::VehicleState: // F5: the decider sends a car's state again; a car of a world that is gone is nobody's
 	case Msg::LevelResync: return Need::Drop;
 
 	// --- requests, reports of a change and the host's ordered deltas
@@ -172,8 +175,11 @@ inline Need need_of(Msg type)
 	case Msg::LevelMove: // F3a: a player's leave is a request that changes the world; it waits in a hole, not dropped
 	case Msg::LevelSnapshot: // F3a: a map server's state and its halves of a transfer are deltas, in order
 	case Msg::LevelEntity:
+	case Msg::LevelJournal: // R32 W3: a map server's ordered journal batch, held in a hole like LevelEntity
 	case Msg::LevelXferUp:
 	case Msg::LoadReady: // F3a: the same epoch is played after the world is up (plan §1.5 step 7)
+	case Msg::VehicleReq: // F5: a request for a seat, as ReqTake; the decider checks the body and the car when it runs
+	case Msg::VehicleSeat: // F5: the decider's ordered answer, as ReqResult (a player who comes to the map gets the seats again)
 	case Msg::StateDumpRequest: return Need::Hold;
 
 	default: break;

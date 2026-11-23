@@ -10,6 +10,7 @@
 //#include "PHWorld.h"
 //extern CPHWorld*	ph_world;
 #include "../xrphysics/IPHWorld.h"
+#include "coop/coop_vehicles_state.h" // Anomaly Coop (F5-VEH-4): a player's copy sounds at its decider's rpm
 
 CCar::SCarSound::SCarSound(CCar* car)
 {
@@ -115,6 +116,7 @@ void CCar::SCarSound::UpdateDrive()
 	}
 #endif
 	float scale = 0.5f + 0.5f * pcar->m_current_rpm / pcar->m_torque_rpm;
+	coop::vehicles::copy_sound_scale(pcar, scale); // Anomaly Coop (F5-VEH-4): a player's copy: the pitch of the decider's rpm
 	clamp(scale, 0.5f, 1.25f);
 	snd_engine.set_frequency(scale);
 	SetSoundPosition(snd_engine);

@@ -3,6 +3,7 @@
 #include "pch_script.h"
 #include "coop_sound.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -178,7 +179,10 @@ CGameObject* relay_source(CObject* owner)
 	return go;
 }
 
-bool host_recording() { return g_npc_sounds && g_have_clients && g_pGameLevel && is_map_authority(); }
+// Preserve the world decider's existing sound path on its own level.
+bool owns_sound_sync() { return mgr().active() && (mode().decides_world() || mode().leads_level()); }
+
+bool host_recording() { return g_npc_sounds && g_have_clients && g_pGameLevel && owns_sound_sync(); }
 
 float radius_of(ref_sound& snd)
 {
@@ -657,7 +661,7 @@ void queue_step(CGameObject* avatar, SGameMtlPair* pair, float power, LPCSTR sta
 
 // ---------------------------------------------------------------- Lua
 
-bool lua_ready() { return g_pGameLevel && g_actor && (is_map_authority() || is_live_mirror()); }
+bool lua_ready() { return g_pGameLevel && g_actor && (owns_sound_sync() || is_live_mirror()); }
 
 // True if a script did AddScriptCallback(name): axr_main keeps the names in its local `intercepts` table (an
 // upvalue of make_callback); calling SendScriptCallback for an unknown name prints an error with a call stack.
@@ -812,7 +816,7 @@ void reset()
 
 void frame()
 {
-	if (is_map_authority())
+	if (owns_sound_sync())
 		host_frame();
 	else
 		g_have_clients = false;
@@ -833,7 +837,7 @@ void register_console()
 
 void print_status()
 {
-	if (is_map_authority())
+	if (owns_sound_sync())
 	{
 		::Msg("[coop]   npc sounds out (%s): %llu recorded, %llu deduped, %llu queue full; %llu sent (%llu reliable) in %llu "
 		      "packets, %llu out of range, %llu over the rate",

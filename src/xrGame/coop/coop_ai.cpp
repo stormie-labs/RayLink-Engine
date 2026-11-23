@@ -2,6 +2,7 @@
 #include "pch_script.h"
 #include "coop_ai.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_world.h"
 #include "coop_players.h"
 #include "coop_join.h"
@@ -168,7 +169,7 @@ debug::Body body_of(const CObject* obj, PeerId& peer)
 		return debug::Body::Other;
 	if (obj == static_cast<const CObject*>(g_actor))
 	{
-		if (ghost_actor() || !coop::is_player()) // the process's role Player (npc_ai::is_player asks about an object)
+		if (!mode().actor_is_player() || !coop::is_player()) // the process's role Player (npc_ai::is_player asks about an object)
 			return debug::Body::Ghost;
 		peer = mgr().self();
 		return debug::Body::OwnPlayer;
@@ -211,7 +212,7 @@ bool player_out_for(const CObject* obj, bool stalker)
 
 bool debug_unseen(const CObject* obj)
 {
-	if (!obj || !mgr().active() || !is_map_authority() || !debug::anyone_has(debug::kFlagInvisible))
+	if (!obj || !mgr().active() || !(mode().decides_world() || mode().leads_level()) || !debug::anyone_has(debug::kFlagInvisible))
 		return false;
 	PeerId peer = kInvalidPeer;
 	const debug::Body body = body_of(obj, peer);
@@ -252,7 +253,7 @@ bool is_remote_player(const CObject* obj)
 
 void on_proxy_frame(CGameObject* proxy)
 {
-	if (!proxy || !is_map_authority() || !is_remote_player(proxy))
+	if (!proxy || !(mode().decides_world() || mode().leads_level()) || !is_remote_player(proxy))
 		return;
 	const u32 now = Device.dwTimeGlobal;
 	Proxy& p = g_proxies[proxy->ID()];
@@ -292,7 +293,7 @@ bool player_luminocity(const CGameObject* obj, float& lum)
 
 bool creature_luminocity(const CGameObject* obj, float& lum)
 {
-	if (!obj || !is_map_authority())
+	if (!obj || !(mode().decides_world() || mode().leads_level()))
 		return false;
 	auto it = g_lit.find(obj->ID());
 	if (it == g_lit.end() || Device.dwTimeGlobal - it->second.ms > kLitFreshMs)
@@ -331,7 +332,7 @@ bool player_sees(const CEntityAlive* player, const CCustomMonster* observer, boo
 
 bool player_on_the_path(CAI_Stalker* npc)
 {
-	if (!npc || g_proxies.empty() || !is_map_authority() || !g_pGameLevel)
+	if (!npc || g_proxies.empty() || !(mode().decides_world() || mode().leads_level()) || !g_pGameLevel)
 		return false;
 	const u32 now = Device.dwTimeGlobal;
 	for (const auto& it : g_proxies)
@@ -407,7 +408,7 @@ CObject* viewer_body(u32 peer)
 
 void viewers_frame()
 {
-	if (!is_map_authority() || !world_up())
+	if (!(mode().decides_world() || mode().leads_level()) || !world_up())
 	{
 		shedule_viewers::clear();
 		return;
@@ -458,13 +459,14 @@ void viewers_frame()
 	}
 }
 
+static_assert(kMaxNearPlayers >= kMaxPlayers, "players_near has room for every seat that plays (F5-SEAT-1)");
 u32 players_near(const Fvector& pos, float max_dist, CEntityAlive* out[kMaxNearPlayers])
 {
 	u32 n = 0;
 	if (!ghost_actor() && g_actor && g_actor->g_Alive() && !g_actor->getDestroy() && !player_down(g_actor) &&
 		g_actor->Position().distance_to(pos) <= max_dist)
 		out[n++] = g_actor;
-	if (!is_map_authority() || !world_up())
+	if (!(mode().decides_world() || mode().leads_level()) || !world_up())
 		return n;
 	for (u32 peer = 1; peer < kMaxPeerSlots && n < kMaxNearPlayers; ++peer)
 	{
@@ -480,7 +482,7 @@ CObject* phantom_target(const Fvector& pos)
 	if (!mgr().active())
 		return Level().CurrentEntity();
 	CObject* best = nearest_player(pos, flt_max);
-	if (mgr().is_client())
+	if (!mode().decides_world())
 	{
 		// nearest_player knows only this machine's actor here
 		float best_d = best ? best->Position().distance_to(pos) : flt_max;
@@ -551,7 +553,7 @@ bool player_sees_now(const CEntityAlive* player, const CCustomMonster* monster)
 
 void on_player_reload(u16 player)
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		g_proxies[player].reload_ms = Device.dwTimeGlobal;
 }
 
@@ -588,7 +590,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 			best_d = d;
 		}
 	}
-	if (!is_map_authority() || !world_up())
+	if (!(mode().decides_world() || mode().leads_level()) || !world_up())
 		return best;
 	for (u32 peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
@@ -607,7 +609,7 @@ CEntityAlive* nearest_player(const Fvector& pos, float max_dist)
 
 bool undrawn_tracks(bool waited)
 {
-	if (!g_coop_headless)
+	if (!g_dedicated_server)
 		return waited;
 	++g_tracks.asked;
 	if (waited)
@@ -623,7 +625,7 @@ bool undrawn_tracks(bool waited)
 
 void print_tracks_status()
 {
-	if (!g_coop_headless)
+	if (!g_dedicated_server)
 		return;
 	::Msg("[coop] coop_mapserver_stats: stalker tracks: %llu update(s), %llu advanced for a callback, %llu advanced undrawn, "
 	      "%llu stood still (console coop_headless_tracks %d)",

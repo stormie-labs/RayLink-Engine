@@ -1,8 +1,7 @@
 // Anomaly Coop — split levels, the rules (docs/plans/2026-10-24-f3a-split-levels.md §1.1, §1.5, §1.10, §3). Each player
-// may be on a different level. The host's PC leads them all: the host's process leads its own level, a background map
-// server (Mk) leads every other level that has players. This header is the pure part of that, with no engine in it:
-//   - Gate / effective_gate   how a level is entered (free, better together, together) and how the two game rules
-//                             coop_split_levels and coop_story_together fold into it;
+// may be on a different level. The world server's PC leads them all: a background map server (Mk) leads every level that has
+// players (owner 2026-11-18: the server mode only, no hybrid). This header is the pure part of that, with no engine in it:
+//   - Gate / effective_gate   how a level is entered (free, better together, together) and how split levels fold into it;
 //   - Table                   who sits on which level: which process leads a level, whom its messages reach, who sees what;
 //   - decide_move             the verdict on a player's move: go, wait at the board, refused (the map-server cap);
 //   - ServerLife              the life of one map server: when to launch it, when to stop it (the pause, "linger");
@@ -14,7 +13,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include "coop_protocol.h"
 
 namespace coop
 {
@@ -22,6 +24,48 @@ namespace levels
 {
 // A seat that is on no level (choosing a character, joining) and the level id nobody has.
 constexpr uint16_t kNoLevel = 0xffff;
+
+// The wire uses u16, but GameGraph::_LEVEL_ID is u8. Only a player who is off-map may use kNoLevel.
+constexpr uint16_t kMaxLevelId = 0xff;
+
+enum class LevelMapCheck
+{
+	Sender,
+	Phase,
+	Payload,
+	LevelIds,
+};
+
+// The concrete map type is defined in coop_levels_wire.h, which already includes these rules.
+// Take the whole payload and account for each refusal before returning. Keep the current view on failure.
+template <class LevelMap, class Account>
+bool receive_level_map(PeerId from, bool world_client, bool welcomed, Reader& r, LevelMap& view, Account account)
+{
+	const auto refuse = [&](LevelMapCheck check) {
+		account(check, false);
+		return false;
+	};
+	if (from != kHostPeer)
+		return refuse(LevelMapCheck::Sender);
+	if (!world_client || !welcomed)
+		return refuse(LevelMapCheck::Phase);
+
+	LevelMap map;
+	if (!map.read(r) || r.remaining() != 0)
+		return refuse(LevelMapCheck::Payload);
+
+	const auto real_level = [](const auto& row) { return row.level <= kMaxLevelId; };
+	const bool level_ids_ok = std::all_of(map.players.begin(), map.players.end(), [&](const auto& p) {
+		return real_level(p) || (p.level == kNoLevel && !p.in_world);
+	}) && std::all_of(map.servers.begin(), map.servers.end(), real_level) &&
+	    std::all_of(map.gates.begin(), map.gates.end(), real_level);
+	account(LevelMapCheck::LevelIds, level_ids_ok);
+	if (!level_ids_ok)
+		return false;
+
+	view = std::move(map);
+	return true;
+}
 
 // ---------------------------------------------------------------- gates
 
@@ -57,16 +101,17 @@ inline bool parse_gate(std::string_view word, Gate& out)
 	return false;
 }
 
-// The gate that rules a move once the two game rules are known:
-//   split levels off     the group moves as one through the waiting point at every exit (Phase 3 behaviour): Together;
-//   story maps together off  a Together level is only a suggestion: BetterTogether;
-//   otherwise            the gate stands. With split levels on, a value that is none of the three passes through and
-//                        decide_move refuses it; with split levels off every value, valid or not, becomes Together.
-inline Gate effective_gate(Gate g, bool split, bool story_together)
+// The gate that rules a move:
+//   split levels off     the group moves as one through the waiting point at every exit (the co-op): Together;
+//   split levels on      nobody is waited for, each player moves alone (owner 2026-11-18: no "story maps together"): a
+//                        Together level is only a suggestion, BetterTogether. Any other gate stands; a value that is none of
+//                        the three passes through and decide_move refuses it. With split levels off every value, valid or
+//                        not, becomes Together.
+inline Gate effective_gate(Gate g, bool split)
 {
 	if (!split)
 		return Gate::Together;
-	if (g == Gate::Together && !story_together)
+	if (g == Gate::Together)
 		return Gate::BetterTogether;
 	return g;
 }
@@ -77,26 +122,28 @@ inline Gate effective_gate(Gate g, bool split, bool story_together)
 // a map server, a future console host that has no actor - it leads nothing, receives nothing, keeps no level served.
 struct Seat
 {
+	constexpr Seat() : plays(true) {}
+	constexpr Seat(uint32_t peer_id, uint16_t level_id, bool placed, bool playing)
+	    : peer(peer_id), level(level_id), in_world(placed), plays(playing)
+	{}
+
 	uint32_t peer = 0;
 	uint16_t level = kNoLevel; // the level he is on, or the one he is loading into
 	bool in_world = false; // false while he loads (the level is already his, map messages are not yet)
-	bool plays = true;
+	bool plays;
 };
 
 // What leads a level.
 enum class Server : uint8_t
 {
 	None, // no player is on it: it is not loaded anywhere (the world server holds it offline)
-	HostProcess, // the host plays on it: the host's own process is its online
-	MapServer, // players are on it and the host is not: a background map server must lead it
+	MapServer, // players are on it: a background map server must lead it (the world server leads no level)
 };
 
-// The seats of the session, in the order they came. The host's seat is the one whose peer is `host_peer` (0, kHostPeer).
+// The seats of the session, in the order they came.
 class Table
 {
 public:
-	explicit Table(uint32_t host_peer = 0) : host_peer_(host_peer) {}
-
 	// Adds a seat, or replaces the one of the same peer (its place in the order stays).
 	void set(const Seat& s)
 	{
@@ -126,26 +173,10 @@ public:
 	}
 
 	const std::vector<Seat>& seats() const { return seats_; }
-	uint32_t host_peer() const { return host_peer_; }
 
-	// Who leads `level`: the host's process when the host plays on it (even if a client came to it first), else a map
-	// server when any other player is on it or loading into it, else nobody. The host that is still loading his level
-	// leads it already: the level is his process's.
-	Server server_of(uint16_t level) const
-	{
-		if (level == kNoLevel)
-			return Server::None;
-		bool other = false;
-		for (const Seat& s : seats_)
-		{
-			if (!s.plays || s.level != level)
-				continue;
-			if (s.peer == host_peer_)
-				return Server::HostProcess;
-			other = true;
-		}
-		return other ? Server::MapServer : Server::None;
-	}
+	// Who leads `level`: a map server when a player is on it or loading into it, else nobody. A seat that plays nobody (the
+	// world server's own) keeps no level served.
+	Server server_of(uint16_t level) const { return population(level) > 0 ? Server::MapServer : Server::None; }
 
 	// Players who are on `level` or loading into it (a player on his way already needs the level's server).
 	uint32_t population(uint16_t level) const
@@ -179,8 +210,7 @@ public:
 		return true;
 	}
 
-	// The count a map server of `level` is told with ServerLife::players: its players, 0 when the level has no map server
-	// (the host's process leads it, or nobody does).
+	// The count a map server of `level` is told with ServerLife::players: its players, 0 when the level has no map server.
 	uint32_t map_players(uint16_t level) const { return server_of(level) == Server::MapServer ? population(level) : 0; }
 
 	// Every level that needs a map server now, ascending.
@@ -225,7 +255,6 @@ public:
 	}
 
 private:
-	uint32_t host_peer_;
 	std::vector<Seat> seats_;
 };
 
@@ -239,8 +268,8 @@ enum class MoveVerdict : uint8_t
 	RefuseInvalid, // the gate is none of the three
 };
 
-// `effective` = effective_gate(...) of the level he goes to; `needs_new_server` = nobody leads that level yet and the
-// mover is not the host (the host's process would lead it); `running` = map servers running now; `max_servers` = the cap
+// `effective` = effective_gate(...) of the level he goes to; `needs_new_server` = nobody leads that level yet;
+// `running` = map servers running now; `max_servers` = the cap
 // (coop_levels_dynamic.h map_server_cap; its decide_move makes room before it refuses). A Together move is the whole group
 // going to one map: it starts no server of its own, no cap.
 inline MoveVerdict decide_move(Gate effective, bool needs_new_server, uint32_t running, uint32_t max_servers)

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "coop/coop_survival.h"
 #include "coop/coop_world.h" // Anomaly Coop
+#include "coop/coop_vehicles_ride.h" // Anomaly Coop F5-VEH-5: a passenger's keys
 #include <dinput.h>
 #include "Actor.h"
 #include "Torch.h"
@@ -84,6 +85,8 @@ void CActor::IR_OnKeyboardPress(int cmd)
 	}
 
 	if (!g_Alive()) return;
+
+	if (coop::vehicles::ride_key(cmd)) return; // Anomaly Coop F5-VEH-5: a passenger: the use key asks out, nothing else moves him
 
 	if (m_holder && kUSE != cmd)
 	{
@@ -329,6 +332,8 @@ void CActor::IR_OnKeyboardRelease(int cmd)
 		if (cmd == kUSE && !psActorFlags.test(AF_MULTI_ITEM_PICKUP))
 			m_bPickupMode = false;
 
+		if (coop::vehicles::riding()) return; // Anomaly Coop F5-VEH-5: as the stock driver's releases go to his car alone
+
 		if (m_holder)
 		{
 			m_holder->OnKeyboardRelease(cmd);
@@ -357,6 +362,8 @@ void CActor::IR_OnKeyboardHold(int cmd)
 	if (Remote() || !g_Alive()) return;
 	if (m_input_external_handler && !m_input_external_handler->authorized(cmd)) return;
 	if (IsTalking()) return;
+
+	if (coop::vehicles::ride_hold(cmd)) return; // Anomaly Coop F5-VEH-5: a passenger only looks around (the look keys)
 
 	if (m_holder)
 	{

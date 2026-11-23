@@ -33,6 +33,8 @@
 #include "alife_time_manager.h"
 #include "coop/coop_worldstate.h" // Anomaly Coop: host-owned clock and weather
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_join.h"
+#include "coop/coop_levels.h" // Anomaly Coop (R32 W2a): the loaded map of a spawn with no parent
 #include "UI/UIGameTutorial.h"
 #include "string_table.h"
 #include "ui/UIInventoryUtilities.h"
@@ -1308,6 +1310,19 @@ LPCSTR tutorial_name()
 	return "invalid";
 }
 
+u32 active_tutorial_id()
+{
+	return g_tutorial && g_tutorial->IsActive() ? g_tutorial->Id() : 0;
+}
+
+bool player_hud_ready()
+{
+	if (!g_pGameLevel || !g_actor || Device.dwPrecacheFrame || coop::hold_loading_screen())
+		return false;
+	const auto* ui = CurrentGameUI();
+	return ui && ui->UIMainIngameWnd;
+}
+
 LPCSTR translate_string(LPCSTR str)
 {
 	return *CStringTable().translate(str);
@@ -2003,6 +2018,17 @@ void g_send(NET_Packet& P, bool bReliable = 0, bool bSequential = 1, bool bHighP
 	Level().Send(P, net_flags(bReliable, bSequential, bHighPriority, bSendImmediately));
 }
 
+// Anomaly Coop (R32 W2a, temp/r30/design/R32-final.md): the writer gate of a script write, defined in coop/coop_router.cpp (declared
+// here until coop_router.h gets it): census under coop_writer_gate log, a refusal under enforce; on the world server and a map server
+// only.
+namespace coop
+{
+namespace router
+{
+bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarget& target);
+} // namespace router
+} // namespace coop
+
 //can spawn entities like bolts, phantoms, ammo, etc. which normally crash when using alife():create()
 void spawn_section(LPCSTR sSection, Fvector3 vPosition, u32 LevelVertexID, u16 ParentID, bool bReturnItem = false)
 {
@@ -2012,6 +2038,19 @@ void spawn_section(LPCSTR sSection, Fvector3 vPosition, u32 LevelVertexID, u16 P
 	coop_args.pos = &vPosition;
 	coop_args.what = sSection;
 	if (coop::callgate::client_gate_own("level:spawn_item", coop::calls::own_spawn(true, coop::callgate::is_own(ParentID)), coop_args) == coop::calls::Gate::Refuse)
+		return;
+	// Anomaly Coop (R32 W2a): the writer of the parent's root; no parent: a new root of the section's kind on the loaded map. The id is
+	// taken by xrServer::Process_spawn, which asks the own pool (W9).
+	coop::calls::WriteTarget coop_target;
+	coop_target.what = sSection;
+	if (ParentID != u16(-1))
+		coop_target.id = ParentID;
+	else
+	{
+		coop_target.kind = coop::calls::Target::NewOfSection;
+		coop_target.level = coop::levels::my_level();
+	}
+	if (coop::router::writer_refuses("level:spawn_item", coop::writer::WriteOp::Create, coop_target))
 		return;
 	Level().spawn_item(sSection, vPosition, LevelVertexID, ParentID, bReturnItem);
 }
@@ -2899,6 +2938,8 @@ void CLevel::script_register(lua_State* L)
 		def("stop_tutorial", &stop_tutorial),
 		def("has_active_tutorial", &has_active_tutotial),
 		def("active_tutorial_name", &tutorial_name),
+		def("active_tutorial_id", &active_tutorial_id),
+		def("player_hud_ready", &player_hud_ready),
 		def("translate_string", &translate_string),
 		def("reload_language", &reload_language),
 		def("get_resolutions", &vid_modes_string),

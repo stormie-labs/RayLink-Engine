@@ -12,9 +12,10 @@ void CPHCollideValidator::Init()
 	freeGroupID = 0;
 	NonTypeFlags.set(cbNCGroupObject,TRUE);
 
-	ClassFlags.set(cbClassDynamic | cbClassCharacter | cbClassSmall | cbClassRagDoll | cbClassAnimated,TRUE);
-	ClassNCFlags.set(cbNCClassCharacter | cbNCClassSmall | cbNCClassDynamic | cbNCClassRagDoll | cbNCClassAnimated,
-	                 TRUE);
+	// Anomaly Coop (TZ P50): cbClassPlayer / cbNCClassPlayer, the players' own pair (coop_player_touch.cpp)
+	ClassFlags.set(cbClassDynamic | cbClassCharacter | cbClassSmall | cbClassRagDoll | cbClassAnimated | cbClassPlayer,TRUE);
+	ClassNCFlags.set(cbNCClassCharacter | cbNCClassSmall | cbNCClassDynamic | cbNCClassRagDoll | cbNCClassAnimated |
+	                 cbNCClassPlayer, TRUE);
 }
 
 CGID CPHCollideValidator::RegisterGroup()
