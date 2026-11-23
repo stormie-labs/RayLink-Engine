@@ -45,7 +45,8 @@ CUIPdaWnd* GetPDAMenu()
 
 CUIMainIngameWnd* GetMainGameMenu()
 {
-	return CurrentGameUI()->UIMainIngameWnd;
+	const auto* ui = CurrentGameUI();
+	return ui ? ui->UIMainIngameWnd : nullptr;
 }
 
 CUIMessagesWindow* GetMessagesMenu()

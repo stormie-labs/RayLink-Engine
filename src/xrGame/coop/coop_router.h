@@ -56,6 +56,8 @@ void print_status();
 void load_overrides();
 // Adds the `route` table to the `coop` namespace of this Lua state (coop_script.cpp register_raw).
 void register_lua(lua_State* L);
+// R32 W2a: the console command coop_writer_gate = log | enforce (coop_console.cpp register_console_commands, before user.ltx is read).
+void register_console();
 
 // --- F2 T11: engine-invoked binder methods ---
 

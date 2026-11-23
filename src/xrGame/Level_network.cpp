@@ -84,14 +84,12 @@ void CLevel::remove_objects()
 	ph_commander().clear();
 	ph_commander_scripts().clear();
 
-	if (!g_dedicated_server || g_coop_headless)
-		space_restriction_manager().clear();
+	space_restriction_manager().clear();
 
 	psDeviceFlags.set(rsDisableObjectsAsCrows, b_stored);
 	g_b_ClearGameCaptions = true;
 
-	if (!g_dedicated_server || g_coop_headless)
-		ai().script_engine().collect_all_garbage();
+	ai().script_engine().collect_all_garbage();
 
 	stalker_animation_data_storage().clear();
 
@@ -105,13 +103,10 @@ void CLevel::remove_objects()
 		if (!client_spawn_manager().registry().empty())
 			client_spawn_manager().dump				();
 #endif // DEBUG
-	if (!g_dedicated_server || g_coop_headless)
-	{
 #ifdef DEBUG
-		VERIFY(client_spawn_manager().registry().empty());
+	VERIFY(client_spawn_manager().registry().empty());
 #endif
-		client_spawn_manager().clear();
-	}
+	client_spawn_manager().clear();
 
 	g_pGamePersistent->destroy_particles(false);
 
@@ -183,8 +178,7 @@ void CLevel::net_Stop()
     Device.LuaGC.clear();
     Device.LuaGCDebug.clear();
 
-	if (!g_dedicated_server || g_coop_headless)
-		ai().script_engine().collect_all_garbage();
+	ai().script_engine().collect_all_garbage();
 
 #ifdef DEBUG
 	show_animation_stats		();

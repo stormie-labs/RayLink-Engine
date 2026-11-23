@@ -12,8 +12,6 @@
 
 #include "coop_session.h"
 #include "coop_limits.h"
-#include "coop_mapserver_rules.h"
-#include "coop_operator.h"
 #include "coop_transport.h"
 
 #include <algorithm>
@@ -195,26 +193,8 @@ struct Conn
 	net::ByteCounterPtr bulk = std::make_shared<net::ByteCounter>();
 	uint64_t out_due[size_t(Lane::Count)] = {}; // NetSim: keeps per-lane order under jitter
 	uint64_t in_due[size_t(Lane::Count)] = {};
-	bool bridge = false; // host: the connection of a map server (Session::issue_bridge)
-	bool virt = false; // a map server: a player of its level, no transport of his own (Session::host_virtual)
-	// host, the host's move (Session::soft_park)
-	bool park_in = false; // what it sends waits in in_parked; stays on until that is empty
-	bool park_out = false; // what goes to it is held (out_parked) or dropped
-	struct ParkedIn
-	{
-		Lane lane = Lane::Reliable;
-		bool relayed = false; // the road sent it on: what is left is the world's copy
-		std::vector<uint8_t> bytes;
-	};
-	std::deque<ParkedIn> in_parked;
-	struct ParkedOut
-	{
-		Lane lane = Lane::Reliable;
-		uint16_t type = 0;
-		std::vector<uint8_t> payload;
-	};
-	std::deque<ParkedOut> out_parked;
-	size_t out_parked_bytes = 0;
+	bool trunk = false; // host: a connection of another Hello role than a player's, admitted by the part (SessionPart::admit)
+	bool carried = false; // a carried host: its peer, no transport of his own (SessionPart::carry, Owner::carried_join)
 };
 
 struct PeerListNotice
@@ -226,11 +206,15 @@ struct PeerListNotice
 
 // ============================================================================ Impl
 
-struct Session::Impl
+struct Session::Impl final : SessionPart::Owner
 {
 	explicit Impl(Session& s) : m_self(s) {}
 
 	Session& m_self;
+	// H10 (A-S4Sb): the part one mode's layer added (Session::part), kept for the life of the Session. Declared before the
+	// connections: it outlives them.
+	std::unique_ptr<SessionPart> m_part;
+	const void* m_part_kind = nullptr;
 	Role m_role = Role::None;
 	SessionConfig m_cfg;
 	net::Transport m_tp;
@@ -242,22 +226,17 @@ struct Session::Impl
 	std::vector<std::unique_ptr<Conn>> m_conns;
 	uint64_t m_next_serial = 1;
 	std::map<PeerId, Conn*> m_joined; // host: slot -> connection
-	std::map<PeerId, Conn*> m_bridges; // host: the map servers' connections (bridge_peer(k)), no slots
-	std::map<mapserver::Token, uint32_t> m_bridge_tokens; // host: token -> k, given out and not used yet
-	Session* m_upstream = nullptr; // a map server: its connection to the world server (Session::host_virtual)
+	std::map<PeerId, Conn*> m_trunks; // host: the joined connections of another role (SessionPart::admit), no slots
+	Session* m_carrier = nullptr; // a carried host: the session that carries it (SessionPart::carrier)
 	Session::InFilter m_in_filter = nullptr; // Session::set_in_filter
 	Conn* m_server = nullptr; // client: connection to the host
 
 	// host
 	uint64_t m_host_fp = 0;
 	uint64_t m_session_token = 0;
-	uint32_t m_max_players = kMaxPlayers;
-	// host, protocol 31 (coop_operator.h): the player key the operator token is bound to, for the life of this Session (a new token
-	// in a later host() unbinds it), and the OperatorCommands refused after the rate limit
-	bool m_operator_bound = false;
-	PlayerKey m_operator_key{};
-	std::array<uint8_t, kHelloTokenSize> m_operator_bound_token{};
-	uint64_t m_operator_refused = 0;
+	uint32_t m_max_players = 0; // host(): its config's (F5-SEAT-1: the mode says it); Session::max_players
+	// host without a part: the console lines refused after the rate limit, for the life of this Session (the throttle of their log)
+	uint64_t m_lines_refused = 0;
 	// host, set by the game once, kept across sessions like the handlers
 	std::set<uint32_t> m_client_blob_kinds; // R1 I3
 	struct RateRule
@@ -280,6 +259,8 @@ struct Session::Impl
 	CState m_cstate = CState::Idle;
 	PeerId m_self_id = kInvalidPeer;
 	PeerInfo m_host_info;
+	SessionMode m_host_mode = SessionMode::None; // protocol 33: the session's mode from the host's Welcome (Session::session_mode)
+	uint32_t m_host_max_players = 0; // F5-SEAT-1: the seats the host's Welcome said, cut to kMaxPlayers (Session::max_players)
 	std::map<PeerId, PeerInfo> m_remote; // other players, from PeerList
 	bool m_self_host_rights = false; // protocol 31: the PeerList flag Operator on this client's own row
 	std::string m_server_text;
@@ -308,14 +289,6 @@ struct Session::Impl
 	};
 	std::multimap<uint64_t, OutItem> m_out_q;
 	std::multimap<uint64_t, InItem> m_in_q;
-
-	// the host's move (Session::soft_park)
-	static constexpr size_t kParkedOutBytes = size_t(8) * 1024 * 1024; // per connection: what the first frames of a world say
-	static constexpr uint32_t kReplayPerUpdate = 1024; // what the parked said runs in slices, a level just came up
-	bool m_soft_keep_out = false;
-	bool m_soft_replay = false;
-	int m_events_per_update = kMaxEventsPerUpdate;
-	Session::SoftStats m_soft;
 
 	std::deque<std::function<void()>> m_pending;
 	bool m_running_pending = false;
@@ -358,7 +331,79 @@ struct Session::Impl
 
 	bool first_time(const std::string& key) { return m_logged_once.insert(key).second; }
 
-	void emit(std::function<void()> fn) { m_pending.push_back(std::move(fn)); }
+	void emit(std::function<void()> fn) override { m_pending.push_back(std::move(fn)); }
+
+	// ------------------------------------------------------------------ what the part may do (SessionPart::Owner)
+
+	Session& session() override { return m_self; }
+	void log(const char* line) override { logf("%s", line ? line : ""); }
+	std::vector<PeerId> trunks() const override
+	{
+		std::vector<PeerId> out;
+		for (const auto& kv : m_trunks)
+			out.push_back(kv.first);
+		return out;
+	}
+	bool trunk(PeerId id) const override { return m_trunks.count(id) != 0; }
+
+	void carried_join(PeerId id, const std::string& nick) override
+	{
+		if (!m_carrier || m_role != Role::Host || m_joined.count(id))
+			return;
+		Conn* c = add_conn(nullptr);
+		c->carried = true;
+		c->info.id = id;
+		c->info.state = PeerState::Joined;
+		c->info.nick = nick;
+		c->info.address = "through the host";
+		c->epoch = m_epoch;
+		m_joined[id] = c;
+		logf("map server: peer %u '%s' is on this level", unsigned(id), nick.c_str());
+		emit_peer_joined(c->info);
+	}
+
+	void carried_leave(PeerId id, const std::string& reason) override
+	{
+		const auto it = m_joined.find(id);
+		if (!m_carrier || it == m_joined.end())
+			return;
+		Conn* c = it->second;
+		remove_joined(*c, reason);
+		drop_conn(c);
+	}
+
+	void carried_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size) override
+	{
+		try
+		{
+			const auto it = m_joined.find(from);
+			if (!m_carrier || it == m_joined.end() || size < 2)
+			{
+				if (first_time("virt-nopeer" + std::to_string(from)))
+					logf("a Tunnel of peer %u, who is no player of this level: dropped", unsigned(from));
+				return;
+			}
+			dispatch(*it->second, lane, std::vector<uint8_t>(packet, packet + size));
+		}
+		catch (...)
+		{
+			logf("internal exception in virtual_receive() was suppressed");
+		}
+	}
+
+	// Session::host of a host the part has `carrier` carry: no transport, no host player, the carrier's world epoch.
+	bool host_carried(const SessionConfig& cfg, Session& carrier)
+	{
+		m_cfg = cfg;
+		m_cfg.nick = sanitize_nick(cfg.nick, "Host");
+		m_max_players = kMaxPlayers;
+		m_carrier = &carrier;
+		m_role = Role::Host;
+		m_local = nullptr; // no host player here
+		set_epoch(carrier.world_epoch());
+		m_part->host_starts(&carrier); // it says what this host is
+		return true;
+	}
 
 	void run_pending()
 	{
@@ -575,8 +620,8 @@ struct Session::Impl
 			net::Transport::set_user(c->peer, nullptr);
 		for (auto it = m_joined.begin(); it != m_joined.end();)
 			it = (it->second == c) ? m_joined.erase(it) : std::next(it);
-		for (auto it = m_bridges.begin(); it != m_bridges.end();)
-			it = (it->second == c) ? m_bridges.erase(it) : std::next(it);
+		for (auto it = m_trunks.begin(); it != m_trunks.end();)
+			it = (it->second == c) ? m_trunks.erase(it) : std::next(it);
 		if (m_server == c)
 			m_server = nullptr;
 		for (auto it = m_conns.begin(); it != m_conns.end(); ++it)
@@ -588,15 +633,15 @@ struct Session::Impl
 	}
 
 	// Host: connection for a joined slot. Client: the host connection once joined.
-	Conn* joined_conn(PeerId id)
+	Conn* joined_conn(PeerId id) const
 	{
 		if (m_role == Role::Host)
 		{
 			auto it = m_joined.find(id);
 			if (it != m_joined.end())
 				return it->second;
-			auto bridge = m_bridges.find(id);
-			return bridge == m_bridges.end() ? nullptr : bridge->second;
+			auto trunk = m_trunks.find(id);
+			return trunk == m_trunks.end() ? nullptr : trunk->second;
 		}
 		if (m_role == Role::Client && m_cstate == CState::Joined && id == kHostPeer)
 			return m_server;
@@ -617,9 +662,9 @@ struct Session::Impl
 	void send_packet(Conn& c, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb,
 		bool bypass_sim)
 	{
-		if (c.virt)
+		if (c.carried)
 		{
-			tunnel_up(c, lane, type, a, na, b, nb);
+			carry_up(c, lane, type, a, na, b, nb);
 			return;
 		}
 		if (!c.peer)
@@ -650,30 +695,15 @@ struct Session::Impl
 				static_cast<unsigned long long>(c.serial));
 	}
 
-	// A map server: a message to a player of its level, through the host's process (Session::host_virtual).
-	void tunnel_up(Conn& c, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb)
+	// A carried host: a game message to one of its peers goes through the carrier, as its part wraps it (SessionPart::carry). Core
+	// messages are the session's own: a carried peer gets none.
+	void carry_up(Conn& c, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb)
 	{
-		if (!m_upstream || type < uint16_t(Msg::GameBase))
+		if (!m_carrier || !m_part || type < uint16_t(Msg::GameBase))
 			return;
-		levels::wire::TunnelMsg t;
-		t.peer = c.info.id;
-		t.flags = mapserver::tunnel_lane_flags(lane);
-		t.packet.reserve(2 + na + nb);
-		t.packet.push_back(uint8_t(type & 0xFF));
-		t.packet.push_back(uint8_t(type >> 8));
-		if (na)
-			t.packet.insert(t.packet.end(), a, a + na);
-		if (nb)
-			t.packet.insert(t.packet.end(), b, b + nb);
-		Writer w(t.packet.size() + 8);
-		if (!t.write(w))
-		{
-			if (first_time("tunnel-size" + std::to_string(type)))
-				logf("%s of %zu bytes is over what a Tunnel carries: dropped", msg_name(type), t.packet.size());
-			return;
-		}
-		count_sent(type, t.packet.size());
-		m_upstream->send(kHostPeer, lane, Msg::Tunnel, w);
+		const size_t sent = m_part->carry(c.info.id, lane, type, a, na, b, nb);
+		if (sent)
+			count_sent(type, sent);
 	}
 
 	void send_core(Conn& c, Msg type, const Writer& w, Lane lane = Lane::Reliable, bool bypass_sim = false)
@@ -695,15 +725,9 @@ struct Session::Impl
 
 	// ------------------------------------------------------------------ receive path
 
-	void on_receive(Conn& c, uint8_t channel, std::vector<uint8_t>&& bytes, bool relayed)
+	void on_receive(Conn& c, uint8_t channel, std::vector<uint8_t>&& bytes)
 	{
 		const Lane lane = channel < uint8_t(Lane::Count) ? Lane(channel) : Lane::Reliable;
-		if (c.park_in)
-		{
-			c.in_parked.push_back(Conn::ParkedIn{lane, relayed, std::move(bytes)});
-			++m_soft.parked;
-			return;
-		}
 		const bool sim_on = m_sim.enabled();
 		if (sim_on || !m_in_q.empty())
 		{
@@ -732,44 +756,8 @@ struct Session::Impl
 		}
 	}
 
-	// What a parked connection said, in slices, after the host's move. It keeps the order: what comes meanwhile goes behind it.
-	void soft_replay()
-	{
-		if (!m_soft_replay)
-			return;
-		std::vector<uint64_t> serials;
-		for (const auto& c : m_conns)
-			if (c->park_in)
-				serials.push_back(c->serial);
-		uint32_t budget = kReplayPerUpdate;
-		const bool in_transport = !m_tp.inbox_empty(); // what the helper took out of ENet may be theirs: it counts as parked too
-		for (const uint64_t serial : serials)
-			for (;;)
-			{
-				Conn* c = find_serial(serial);
-				if (!c)
-					break; // it went, and what it said with it
-				if (c->in_parked.empty())
-				{
-					if (in_transport)
-						return;
-					c->park_in = false;
-					break;
-				}
-				if (!budget)
-					return;
-				--budget;
-				Conn::ParkedIn item = std::move(c->in_parked.front());
-				c->in_parked.pop_front();
-				dispatch(*c, item.lane, std::move(item.bytes), item.relayed, true);
-				run_pending();
-			}
-		m_soft_replay = false;
-	}
-
-	// `c` must not be used by the caller after dispatch(): handlers may drop it. `relayed`: the host's move, the road sent this on already;
-	// `replay`: it waited for the main thread, the time it arrived at was not now.
-	void dispatch(Conn& c, Lane lane, std::vector<uint8_t>&& bytes, bool relayed = false, bool replay = false)
+	// `c` must not be used by the caller after dispatch(): handlers may drop it.
+	void dispatch(Conn& c, Lane lane, std::vector<uint8_t>&& bytes)
 	{
 		if (bytes.size() < 2)
 		{
@@ -781,7 +769,7 @@ struct Session::Impl
 
 		if (type >= uint16_t(Msg::GameBase))
 		{
-			game_message(c, lane, type, std::move(bytes), relayed, replay);
+			game_message(c, lane, type, std::move(bytes));
 			return;
 		}
 
@@ -856,7 +844,7 @@ struct Session::Impl
 
 	PeerId peer_id_of(const Conn& c) const { return m_role == Role::Host ? c.info.id : kHostPeer; }
 
-	void game_message(Conn& c, Lane lane, uint16_t type, std::vector<uint8_t>&& bytes, bool relayed = false, bool replay = false)
+	void game_message(Conn& c, Lane lane, uint16_t type, std::vector<uint8_t>&& bytes)
 	{
 		if (!is_joined(c))
 		{
@@ -869,10 +857,10 @@ struct Session::Impl
 		// logs and ignores it (malformed).
 		const bool host = m_role == Role::Host;
 		const MsgSender sender = msg_sender(static_cast<Msg>(type));
-		// Protocol 11: MsgSender::TrunkOnly is what a map server sends the world server: refused from everybody else, on both
-		// roles, so that it can never pass as a message of either side. A Tunnel is the trunk's too, both ways (Either), and on the
-		// host's side it comes from a bridge alone.
-		const bool trunk = host && c.bridge;
+		// Protocol 11: MsgSender::TrunkOnly is what a trunk sends the host (a map server, the world server): refused from everybody
+		// else, on both roles, so that it can never pass as a message of either side. A Tunnel is the trunk's too, both ways (Either),
+		// and on the host's side it comes from a trunk alone.
+		const bool trunk = host && c.trunk;
 		if ((sender == MsgSender::TrunkOnly && !trunk) || (host && !trunk && static_cast<Msg>(type) == Msg::Tunnel) ||
 			sender == (host ? MsgSender::HostOnly : MsgSender::ClientOnly))
 		{
@@ -891,12 +879,11 @@ struct Session::Impl
 						msg_name(type), unsigned(c.info.id), unsigned(c.epoch), unsigned(m_epoch));
 				return;
 			}
-			if (!c.bridge)
+			if (!c.trunk)
 			{
-				// the buckets know one arrival time: the world's messages of a whole load, paced by the client, come at once here
-				if (!replay && !within_rate(c, type))
+				if (!within_rate(c, type))
 					return;
-				if (!relayed && m_in_filter && !m_in_filter(c.info.id, static_cast<Msg>(type), lane, bytes.data(), bytes.size()))
+				if (m_in_filter && !m_in_filter(c.info.id, static_cast<Msg>(type), lane, bytes.data(), bytes.size()))
 					return;
 			}
 		}
@@ -1018,23 +1005,6 @@ struct Session::Impl
 		return false;
 	}
 
-	// The host's move: true when this message is the parking's (Session::soft_park): it waits for the end of the move, or it was of the
-	// world that went.
-	bool soft_out(Conn& c, Lane lane, uint16_t type, const Writer& payload)
-	{
-		if (!c.park_out)
-			return false;
-		if (!m_soft_keep_out || c.out_parked_bytes + payload.size() > kParkedOutBytes)
-		{
-			++m_soft.dropped_out;
-			return true;
-		}
-		c.out_parked_bytes += payload.size();
-		c.out_parked.push_back(Conn::ParkedOut{lane, type, payload.data()});
-		++m_soft.held_out;
-		return true;
-	}
-
 	// R2 I1, host: a game message goes to a client only in the world epoch it is in; SessionReset tells it the new
 	// one. A client still in the old world must not apply the new world's changes to it.
 	bool may_send(const Conn& c, Msg type)
@@ -1105,7 +1075,7 @@ struct Session::Impl
 	// Malformed message. Host: kick the sender. Client: log and ignore.
 	void malformed(Conn& c, const char* what)
 	{
-		if (c.virt)
+		if (c.carried)
 		{
 			// a map server kicks nobody: the host's process checked him at receipt, this is a message of a bug
 			if (first_time(std::string("virt-malformed:") + what))
@@ -1140,7 +1110,7 @@ struct Session::Impl
 		{
 			Conn* c = conn_of(ev.peer);
 			if (c)
-				on_receive(*c, ev.channel, std::move(ev.bytes), ev.relayed);
+				on_receive(*c, ev.channel, std::move(ev.bytes));
 			break;
 		}
 		default:
@@ -1275,9 +1245,9 @@ struct Session::Impl
 				&m_cfg.manifest);
 			return;
 		}
-		if (h.role == kHelloRoleMapServer)
+		if (h.role != kHelloRolePlayer)
 		{
-			host_bridge_hello(c, h);
+			host_trunk_hello(c, h);
 			return;
 		}
 		// R1 I2: DuplicateKey = the host's own key (a game folder copied from the host) or a joined player's key whose
@@ -1316,9 +1286,9 @@ struct Session::Impl
 			kick_conn(*previous, RejectReason::Kicked, "connection replaced: the same player key reconnected");
 		}
 		// protocol 31: max_players counts the seats that play; a world server's own seat is not one (limits::client_capacity).
-		// While an operator token is set and its holder is not in, the last place is his: a session filled by other players
-		// would have nobody who may kick or restore (security review 2026-11-12).
-		const bool place_held = operator_configured() && !operator_joined() && !would_be_operator(c, h);
+		// The part may keep the last place for a holder of the host's rights who is not in: a session filled by other players
+		// would have nobody who may kick or restore (security review 2026-11-12; SessionPart::holds_place).
+		const bool place_held = m_part && m_part->holds_place(c.info.address, h, rights_joined());
 		if (m_joined.size() + (place_held ? 1 : 0) >= limits::client_capacity(m_max_players, m_cfg.host_plays))
 		{
 			reject_conn(c, RejectReason::SessionFull,
@@ -1333,7 +1303,7 @@ struct Session::Impl
 		c.info.state = PeerState::Joined;
 		c.info.key = h.key;
 		c.info.nick = sanitize_nick(h.nick, ("Player" + std::to_string(slot)).c_str());
-		c.info.host_rights = operator_of(c, h); // protocol 31; the Welcome is the same whatever it says
+		c.info.host_rights = m_part && m_part->rights_of(c.info, h); // protocol 31; the Welcome is the same whatever it says
 		c.epoch = m_epoch; // R2 I1: a newcomer is in the world the host serves now
 		m_joined[slot] = &c;
 
@@ -1344,6 +1314,7 @@ struct Session::Impl
 		w.max_players = m_max_players;
 		w.world_epoch = m_epoch;
 		w.flags = welcome_flags();
+		w.mode = welcome_mode(); // protocol 33
 		Writer ww;
 		w.write(ww);
 		send_core(c, Msg::Welcome, ww);
@@ -1353,35 +1324,40 @@ struct Session::Impl
 		broadcast_peer_list({});
 	}
 
-	// F3a: a map server of this PC. It takes the place of an old connection of the same number: a new process started for it.
-	void host_bridge_hello(Conn& c, const HelloMsg& h)
+	// A Hello of another role than a player's: the part says whether it comes and under which id (SessionPart::admit). It takes the
+	// place of a joined trunk with that id (a new process started for it). Without a part nobody of another role comes in: no token
+	// was issued by this session.
+	void host_trunk_hello(Conn& c, const HelloMsg& h)
 	{
-		mapserver::Token token{};
-		std::memcpy(token.data(), h.token, token.size());
-		const auto issued = m_bridge_tokens.find(token);
-		switch (mapserver::hello_verdict(mapserver::loopback_address(c.info.address), issued != m_bridge_tokens.end()))
+		if (!m_part)
 		{
-		case mapserver::HelloVerdict::Accept: break;
-		case mapserver::HelloVerdict::NotLoopback:
-			reject_conn(c, RejectReason::Kicked, "A map server connects from the host's own PC.", nullptr);
-			return;
-		case mapserver::HelloVerdict::BadToken:
 			reject_conn(c, RejectReason::Kicked, "This token was not issued by this session.", nullptr);
 			return;
 		}
-		const uint32_t k = issued->second;
-		m_bridge_tokens.erase(issued); // one process, one use
-		const PeerId id = mapserver::bridge_peer(k);
-		const auto old = m_bridges.find(id);
-		if (old != m_bridges.end())
-			kick_conn(*old->second, RejectReason::Kicked, "a new map server took its place");
+		const SessionPart::Admission a = m_part->admit(c.info.address, h);
+		if (!a.accept)
+		{
+			reject_conn(c, a.reason, a.text, nullptr);
+			return;
+		}
+		if (a.id == kInvalidPeer || a.id < kMaxPeerSlots)
+		{
+			// an id of the players' numbering is no trunk's: a bug of the part, never a place
+			logf("! host: the part admitted a trunk as peer %u, an id of the players: refused", unsigned(a.id));
+			reject_conn(c, RejectReason::Kicked, "This session cannot take this connection.", nullptr);
+			return;
+		}
+		const PeerId id = a.id;
+		const auto old = m_trunks.find(id);
+		if (old != m_trunks.end())
+			kick_conn(*old->second, RejectReason::Kicked, a.replaced);
 		c.info.id = id;
 		c.info.state = PeerState::Joined;
 		c.info.key = h.key;
-		c.info.nick = sanitize_nick(h.nick, ("ms" + std::to_string(k)).c_str());
+		c.info.nick = sanitize_nick(h.nick, a.nick.c_str());
 		c.epoch = m_epoch;
-		c.bridge = true;
-		m_bridges[id] = &c;
+		c.trunk = true;
+		m_trunks[id] = &c;
 
 		WelcomeMsg w;
 		w.slot = id;
@@ -1390,81 +1366,32 @@ struct Session::Impl
 		w.max_players = m_max_players;
 		w.world_epoch = m_epoch;
 		w.flags = welcome_flags();
+		w.mode = welcome_mode(); // protocol 33: a trunk is of this session
 		Writer ww;
 		w.write(ww);
 		send_core(c, Msg::Welcome, ww);
-		logf("host: map server %u connected from %s", unsigned(k), c.info.address.c_str());
-		emit([this, id] {
-			if (m_self.on_bridge_joined)
-				m_self.on_bridge_joined(id);
-		});
+		m_part->trunk_joined(id, c.info.address);
 		broadcast_peer_list({});
 	}
 
 	// Protocol 31: what the Welcome says of the host's own seat.
 	uint8_t welcome_flags() const { return m_cfg.host_plays ? uint8_t(WelcomeMsg::HostSeatPlays) : uint8_t(0); }
+	// Protocol 33: the mode explicitly configured by the host that sends this Welcome.
+	SessionMode welcome_mode() const { return m_cfg.mode; }
 
-	bool operator_configured() const { return !op::token_none(m_cfg.operator_token.data(), kHelloTokenSize); }
-	bool operator_joined() const
+	// Protocol 31: a joined player holds the host's rights (PeerInfo::host_rights).
+	bool rights_joined() const
 	{
 		for (const auto& kv : m_joined)
 			if (kv.second->info.host_rights)
 				return true;
 		return false;
 	}
-	// What operator_of would answer, with nothing bound and nothing logged: asked before the place is given.
-	bool would_be_operator(const Conn& c, const HelloMsg& h) const
-	{
-		const bool presented = !op::token_none(h.token, kHelloTokenSize);
-		const bool bound = m_operator_bound && op::token_equal(m_operator_bound_token.data(), m_cfg.operator_token.data(), kHelloTokenSize);
-		const bool matches = op::token_equal(h.token, m_cfg.operator_token.data(), kHelloTokenSize) && presented && operator_configured();
-		return op::operator_verdict(mapserver::loopback_address(c.info.address), matches, bound ? &m_operator_key : nullptr, h.key) ==
-			op::Verdict::Operator;
-	}
 
-	// Protocol 31 (coop_operator.h, plan §2.2): does this player's Hello make him the operator? Every answer lets him in the same
-	// way; only the server's log tells the verdicts apart, and never with the token.
-	bool operator_of(const Conn& c, const HelloMsg& h)
-	{
-		const bool presented = !op::token_none(h.token, kHelloTokenSize);
-		const bool configured = !op::token_none(m_cfg.operator_token.data(), kHelloTokenSize);
-		if (m_operator_bound && !op::token_equal(m_operator_bound_token.data(), m_cfg.operator_token.data(), kHelloTokenSize))
-			m_operator_bound = false; // another token now: its binding starts anew
-		const bool matches = op::token_equal(h.token, m_cfg.operator_token.data(), kHelloTokenSize) && presented && configured;
-		const op::Verdict v = op::operator_verdict(
-			mapserver::loopback_address(c.info.address), matches, m_operator_bound ? &m_operator_key : nullptr, h.key);
-		switch (v)
-		{
-		case op::Verdict::Operator:
-			if (!m_operator_bound)
-			{
-				m_operator_bound = true;
-				m_operator_key = h.key;
-				m_operator_bound_token = m_cfg.operator_token;
-			}
-			logf("host: operator: peer %u '%s' holds the host's rights", unsigned(c.info.id), c.info.nick.c_str());
-			return true;
-		case op::Verdict::OtherKey:
-			logf("! host: peer %u '%s' presented the operator token with another player key: an ordinary player",
-				unsigned(c.info.id), c.info.nick.c_str());
-			return false;
-		case op::Verdict::NoMatch:
-			if (presented)
-				logf("host: peer %u '%s' presented a token that is not the operator's: an ordinary player", unsigned(c.info.id),
-					c.info.nick.c_str());
-			return false;
-		case op::Verdict::NotLoopback:
-			if (presented)
-				logf("host: peer %u '%s' presented a token from another PC: not looked at, an ordinary player",
-					unsigned(c.info.id), c.info.nick.c_str());
-			return false;
-		}
-		return false;
-	}
-
-	// Protocol 31, host: one console line of the operator (plan §2.3). The rate first (a token of the row OperatorCommand), then
-	// the sender, the length and the list (op::command_verdict). A refusal is counted and logged, the sender is not kicked and
-	// gets no answer. What passes goes to on_operator_command: stage 3 runs it.
+	// Protocol 31, host: one console line of a player (plan §2.3). The rate first (a token of the row OperatorCommand), then the
+	// part judges the sender, the length and the list (SessionPart::console_line). Without a part nobody holds the host's rights:
+	// every line is refused as a line of a player without them, counted, the first and every 100th logged; the sender is not kicked
+	// and gets no answer.
 	void host_operator_command(Conn& c, Reader& r)
 	{
 		OperatorCommandMsg msg;
@@ -1475,25 +1402,18 @@ struct Session::Impl
 		}
 		if (!within_rate(c, uint16_t(Msg::OperatorCommand)))
 			return;
-		const op::Command v = op::command_verdict(c.info.host_rights && !c.bridge && !c.virt, msg.line);
-		if (v != op::Command::Run)
+		if (m_part)
 		{
-			++m_operator_refused;
-			if (m_operator_refused != 1 && m_operator_refused % 100 != 0)
-				return; // one line for the first refusal and for every 100th: a player cannot fill the log with them
-			std::string shown = msg.line.substr(0, 64);
-			sanitize_chat(shown);
-			logf("host: operator command from peer %u '%s' refused (%s): '%s'%s", unsigned(c.info.id), c.info.nick.c_str(),
-				op::command_name(v), shown.c_str(), msg.line.size() > 64 ? "..." : "");
+			m_part->console_line(c.info, c.info.host_rights && !c.trunk && !c.carried, msg.line);
 			return;
 		}
-		const PeerId from = c.info.id;
-		const std::string line = msg.line;
-		logf("host: operator command from peer %u: %s", unsigned(from), line.c_str());
-		emit([this, from, line] {
-			if (m_self.on_operator_command)
-				m_self.on_operator_command(from, line);
-		});
+		++m_lines_refused;
+		if (m_lines_refused != 1 && m_lines_refused % 100 != 0)
+			return; // one line for the first refusal and for every 100th: a player cannot fill the log with them
+		std::string shown = msg.line.substr(0, 64);
+		sanitize_chat(shown);
+		logf("host: operator command from peer %u '%s' refused (not_operator): '%s'%s", unsigned(c.info.id), c.info.nick.c_str(),
+			shown.c_str(), msg.line.size() > 64 ? "..." : "");
 	}
 
 	void broadcast_peer_list(const std::vector<PeerListNotice>& departed)
@@ -1517,8 +1437,8 @@ struct Session::Impl
 		}
 		for (const auto& kv : m_joined)
 			send_core(*kv.second, Msg::PeerList, w);
-		for (const auto& kv : m_bridges)
-			send_core(*kv.second, Msg::PeerList, w); // a map server names the players of its level by it
+		for (const auto& kv : m_trunks)
+			send_core(*kv.second, Msg::PeerList, w); // a trunk knows the players by it (a map server names those of its level)
 	}
 
 	// Host: a joined client is gone (Bye, kick or transport loss).
@@ -1528,20 +1448,17 @@ struct Session::Impl
 			return;
 		const PeerId id = c.info.id;
 		c.info.state = PeerState::Leaving;
-		if (c.bridge)
+		if (c.trunk)
 		{
-			m_bridges.erase(id);
-			logf("host: map server %u left: %s", unsigned(mapserver::bridge_index(id)), reason.c_str());
-			emit([this, id, reason] {
-				if (m_self.on_bridge_left)
-					m_self.on_bridge_left(id, reason);
-			});
+			m_trunks.erase(id);
+			if (m_part)
+				m_part->trunk_left(id, reason);
 			return;
 		}
 		m_joined.erase(id);
 		logf("host: peer %u '%s' left: %s", unsigned(id), c.info.nick.c_str(), reason.c_str());
 		emit_peer_left(id, reason);
-		if (!c.virt)
+		if (!c.carried)
 			broadcast_peer_list({PeerListNotice{id, reason}});
 	}
 
@@ -1549,7 +1466,7 @@ struct Session::Impl
 	{
 		if (c.info.state != PeerState::Joined)
 			return;
-		if (c.virt)
+		if (c.carried)
 		{
 			// he is the world server's to kick: a map server has no way to him but the message it was going to refuse
 			logf("virtual peer %u is not kicked here: %s", unsigned(c.info.id), text.c_str());
@@ -1610,9 +1527,12 @@ struct Session::Impl
 		m_host_info.nick = w.host_nick;
 		m_host_info.address = m_server_text;
 		m_host_info.plays = (w.flags & WelcomeMsg::HostSeatPlays) != 0; // protocol 31
+		m_host_mode = w.mode; // protocol 33 (WelcomeMsg::read took Coop or Server only): before any game message runs
+		m_host_max_players = std::min<uint32_t>(w.max_players, kMaxPlayers); // F5-SEAT-1: the host's number, never past the wire's
 		m_self_host_rights = false; // the PeerList says
 		c.info = m_host_info;
-		logf("client: welcome from '%s', my slot is %u", w.host_nick.c_str(), unsigned(w.slot));
+		logf("client: welcome from '%s', my slot is %u, session %s", w.host_nick.c_str(), unsigned(w.slot),
+			session_mode_name(m_host_mode));
 		emit([this, w] {
 			if (m_self.on_welcome)
 				m_self.on_welcome(w);
@@ -2009,7 +1929,7 @@ struct Session::Impl
 	void pump()
 	{
 		net::Event ev;
-		for (int i = 0; i < m_events_per_update && m_tp.active(); ++i)
+		for (int i = 0; i < kMaxEventsPerUpdate && m_tp.active(); ++i)
 		{
 			const int rc = m_tp.service(ev);
 			if (rc < 0)
@@ -2042,7 +1962,6 @@ struct Session::Impl
 		flush_out_q();
 		pump();
 		pop_in_q();
-		soft_replay();
 		if (!m_tp.active())
 		{
 			run_pending();
@@ -2081,9 +2000,10 @@ struct Session::Impl
 				net::Transport::set_user(c->peer, nullptr);
 		m_conns.clear();
 		m_joined.clear();
-		m_bridges.clear();
-		m_bridge_tokens.clear();
-		m_upstream = nullptr;
+		m_trunks.clear();
+		m_carrier = nullptr;
+		if (m_part)
+			m_part->ended(); // what it gave out for this session goes (SessionPart::ended)
 		m_remote.clear();
 		m_server = nullptr;
 		m_tp.destroy();
@@ -2091,6 +2011,8 @@ struct Session::Impl
 		m_cstate = CState::Idle;
 		m_self_id = kInvalidPeer;
 		m_host_info = PeerInfo();
+		m_host_mode = SessionMode::None; // protocol 33: the next session says its own
+		m_host_max_players = 0; // F5-SEAT-1: so do its seats
 		m_self_host_rights = false;
 		m_deadline_set = false;
 		m_transport_up = false;
@@ -2104,7 +2026,7 @@ struct Session::Impl
 		for (auto& cp : m_conns)
 		{
 			Conn& c = *cp;
-			if (c.virt)
+			if (c.carried)
 				continue;
 			if (is_joined(c))
 			{
@@ -2159,19 +2081,54 @@ bool Session::host(const SessionConfig& cfg, std::string* err)
 				*err = "session is already active";
 			return false;
 		}
+		// SESSION-MODE (rv_SESSION-MODE blocker): every start says its mode, a carried one too (a map server: MapServerMode::configure)
+		if (cfg.mode == SessionMode::None)
+		{
+			const char* e = "the session's mode was not configured";
+			s.logf("host: not hosting: %s", e);
+			if (err)
+				*err = e;
+			return false;
+		}
+		// H10: a host its part has another session carry (a map server's level, srv::SessionSrv): no transport of its own, its
+		// peers are the part's (SessionPart::Owner::carried_join), what goes to one the part carries. Its mode is the carrier's (its
+		// world's Welcome), and the seat rule below is a listening host's.
+		if (Session* carrier = s.m_part ? s.m_part->carrier() : nullptr)
+			return s.host_carried(cfg, *carrier);
+		// protocol 33: the mode its Welcome says goes with its seat (a client refuses a Welcome where they disagree)
+		if (cfg.mode != session_mode_of_seat(cfg.host_plays))
+		{
+			const std::string e = "the session's mode (" + std::to_string(unsigned(cfg.mode)) +
+				") is not the one of its seat: a co-op host plays, a world server's seat does not";
+			s.logf("host: not hosting: %s", e.c_str());
+			if (err)
+				*err = e;
+			return false;
+		}
+		// F5-SEAT-1: how many seats play is the mode's to say (SessionConfig::max_players has no default): a start that said none hosts
+		// nothing, rather than a number of another mode
+		if (cfg.max_players == 0)
+		{
+			const std::string e = "the session's seats (max_players) were not said by its mode";
+			s.logf("host: not hosting: %s", e.c_str());
+			if (err)
+				*err = e;
+			return false;
+		}
 		s.m_cfg = cfg;
 		s.m_cfg.nick = sanitize_nick(cfg.nick, "Host");
 		if (!s.m_cfg.connect_timeout_ms)
 			s.m_cfg.connect_timeout_ms = kDefaultConnectTimeoutMs;
 		if (!s.m_cfg.peer_timeout_ms)
 			s.m_cfg.peer_timeout_ms = kDefaultPeerTimeoutMs;
-		s.m_max_players = std::max<uint32_t>(1, std::min<uint32_t>(cfg.max_players, kMaxPlayers));
+		s.m_max_players = std::min<uint32_t>(cfg.max_players, kMaxPlayers); // 1 .. the wire's seats (0 was refused above)
 		s.m_rng.seed(0x5EEDC00Full ^ (uint64_t(player_key_hash(cfg.key)) << 20));
+		if (s.m_part)
+			s.m_part->host_starts(nullptr); // its own transport: the part takes what it needs of this host (SessionPart)
 
 		std::string e;
-		// F3a: the players, the bridges of the map servers, and room for the refusals of whoever else knocks
-		if (!s.m_tp.listen(cfg.port,
-				limits::client_capacity(s.m_max_players, cfg.host_plays) + mapserver::kMaxBridges + kPendingPeerSlots, &e))
+		// F3a: the players, the trunks (a world server's map servers), and room for the refusals of whoever else knocks
+		if (!s.m_tp.listen(cfg.port, limits::client_capacity(s.m_max_players, cfg.host_plays) + kTrunkSlots + kPendingPeerSlots, &e))
 		{
 			s.logf("host: cannot listen on port %u: %s", unsigned(cfg.port), e.c_str());
 			if (err)
@@ -2247,74 +2204,25 @@ bool Session::connect(const SessionConfig& cfg, const std::string& address, uint
 	}
 }
 
-bool Session::host_virtual(const SessionConfig& cfg, Session& world, std::string* err)
+SessionPart* Session::part(const void* kind, std::unique_ptr<SessionPart> (*make)())
 {
 	Impl& s = *m;
-	if (s.m_role != Role::None)
-	{
-		if (err)
-			*err = "session is already active";
-		return false;
-	}
-	s.m_cfg = cfg;
-	s.m_cfg.nick = sanitize_nick(cfg.nick, "Map server");
-	s.m_max_players = kMaxPlayers;
-	s.m_upstream = &world;
-	s.m_role = Role::Host;
-	s.m_local = nullptr; // no host player here
-	s.set_epoch(world.world_epoch());
-	s.logf("map server: the host of its level, through the host's process");
-	return true;
+	if (s.m_part)
+		return s.m_part_kind == kind ? s.m_part.get() : nullptr;
+	if (!kind || !make)
+		return nullptr;
+	std::unique_ptr<SessionPart> made = make();
+	if (!made)
+		return nullptr;
+	s.m_part = std::move(made);
+	s.m_part_kind = kind;
+	s.m_part->attached(s);
+	return s.m_part.get();
 }
 
-bool Session::is_virtual() const { return m->m_upstream != nullptr; }
-
-void Session::virtual_join(PeerId id, const std::string& nick)
+bool Session::joined(PeerId id) const
 {
-	Impl& s = *m;
-	if (!s.m_upstream || s.m_role != Role::Host || s.m_joined.count(id))
-		return;
-	Conn* c = s.add_conn(nullptr);
-	c->virt = true;
-	c->info.id = id;
-	c->info.state = PeerState::Joined;
-	c->info.nick = nick;
-	c->info.address = "through the host";
-	c->epoch = s.m_epoch;
-	s.m_joined[id] = c;
-	s.logf("map server: peer %u '%s' is on this level", unsigned(id), nick.c_str());
-	s.emit_peer_joined(c->info);
-}
-
-void Session::virtual_leave(PeerId id, const std::string& reason)
-{
-	Impl& s = *m;
-	const auto it = s.m_joined.find(id);
-	if (!s.m_upstream || it == s.m_joined.end())
-		return;
-	Conn* c = it->second;
-	s.remove_joined(*c, reason);
-	s.drop_conn(c);
-}
-
-void Session::virtual_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size)
-{
-	Impl& s = *m;
-	try
-	{
-		const auto it = s.m_joined.find(from);
-		if (!s.m_upstream || it == s.m_joined.end() || size < 2)
-		{
-			if (s.first_time("virt-nopeer" + std::to_string(from)))
-				s.logf("a Tunnel of peer %u, who is no player of this level: dropped", unsigned(from));
-			return;
-		}
-		s.dispatch(*it->second, lane, std::vector<uint8_t>(packet, packet + size));
-	}
-	catch (...)
-	{
-		s.logf("internal exception in virtual_receive() was suppressed");
-	}
+	return m->joined_conn(id) != nullptr;
 }
 
 void Session::shutdown(const char* reason)
@@ -2355,6 +2263,30 @@ Role Session::role() const
 	return m->m_role;
 }
 
+SessionMode Session::session_mode() const
+{
+	const Impl& s = *m;
+	switch (s.m_role)
+	{
+	case Role::Host: return s.m_carrier ? s.m_carrier->session_mode() : s.welcome_mode();
+	case Role::Client: return s.m_cstate == Impl::CState::Joined ? s.m_host_mode : SessionMode::None;
+	case Role::None: break;
+	}
+	return SessionMode::None;
+}
+
+uint32_t Session::max_players() const
+{
+	const Impl& s = *m;
+	switch (s.m_role)
+	{
+	case Role::Host: return s.m_carrier ? s.m_carrier->max_players() : s.m_max_players;
+	case Role::Client: return s.m_cstate == Impl::CState::Joined ? s.m_host_max_players : 0;
+	case Role::None: break;
+	}
+	return 0;
+}
+
 uint16_t Session::listen_port() const
 {
 	return m->m_cfg.port;
@@ -2364,7 +2296,7 @@ PeerId Session::self() const
 {
 	switch (m->m_role)
 	{
-	case Role::Host: return m->m_upstream ? m->m_upstream->self() : kHostPeer;
+	case Role::Host: return m->m_carrier ? m->m_carrier->self() : kHostPeer;
 	case Role::Client: return m->m_cstate == Impl::CState::Joined ? m->m_self_id : kInvalidPeer;
 	default: return kInvalidPeer;
 	}
@@ -2374,7 +2306,7 @@ bool Session::is_active() const
 {
 	switch (m->m_role)
 	{
-	case Role::Host: return m->m_upstream ? m->m_upstream->is_active() : m->m_tp.active();
+	case Role::Host: return m->m_carrier ? m->m_carrier->is_active() : m->m_tp.active();
 	case Role::Client: return m->m_cstate == Impl::CState::Joined;
 	default: return false;
 	}
@@ -2467,97 +2399,6 @@ std::vector<PeerInfo> Session::players() const
 
 void Session::set_in_filter(InFilter filter) { m->m_in_filter = filter; }
 
-void Session::soft_park(const std::vector<SoftPlayer>& players, const std::vector<SoftServer>& servers)
-{
-	Impl& s = *m;
-	if (s.m_role != Role::Host || s.m_upstream)
-		return;
-	s.m_soft = SoftStats();
-	s.m_soft_keep_out = false;
-	s.m_soft_replay = false;
-	auto relay = std::make_shared<softmove::Relay>();
-	for (const SoftServer& row : servers)
-		if (Conn* c = s.joined_conn(row.bridge))
-		{
-			c->park_in = c->park_out = true;
-			relay->add_bridge(c->peer, net::Transport::link_of(c->peer), row.bridge, row.level);
-		}
-	for (const SoftPlayer& row : players)
-		if (Conn* c = s.joined_conn(row.peer))
-		{
-			c->park_in = c->park_out = true;
-			relay->add_client(c->peer, net::Transport::link_of(c->peer), row.peer, row.level);
-		}
-	s.m_tp.relay_start(relay);
-}
-
-void Session::soft_keep_out() { m->m_soft_keep_out = true; }
-
-bool Session::soft_replaying() const { return m->m_soft_replay; }
-
-void Session::limit_events_per_update(int events) { m->m_events_per_update = events; }
-
-void Session::soft_release()
-{
-	Impl& s = *m;
-	s.m_tp.relay_stop();
-	s.m_soft_keep_out = false;
-	s.m_soft_replay = true;
-	for (auto& c : s.m_conns)
-	{
-		if (!c->park_out)
-			continue;
-		c->park_out = false;
-		for (Conn::ParkedOut& out : c->out_parked)
-			s.send_packet(*c, out.lane, out.type, out.payload.data(), out.payload.size(), nullptr, 0, false);
-		c->out_parked.clear();
-		c->out_parked_bytes = 0;
-	}
-}
-
-bool Session::soft_parked(PeerId id) const
-{
-	Conn* c = m->joined_conn(id);
-	return c && c->park_out;
-}
-
-Session::SoftStats Session::soft_stats() const
-{
-	SoftStats out = m->m_soft;
-	const net::RelayStats road = m->m_tp.relay_stats();
-	out.to_servers = road.to_servers;
-	out.to_players = road.to_players;
-	out.road_dropped = road.dropped;
-	out.inbox_max = road.inbox_max;
-	out.inbox_bytes_max = road.inbox_bytes_max;
-	out.road_overflowed = road.overflowed;
-	return out;
-}
-
-void Session::issue_bridge(uint32_t k, const std::array<uint8_t, kHelloTokenSize>& token)
-{
-	if (m->m_role != Role::Host || k == 0 || k > mapserver::kMaxBridges)
-		return;
-	revoke_bridge(k);
-	m->m_bridge_tokens[token] = k;
-}
-
-void Session::revoke_bridge(uint32_t k)
-{
-	for (auto it = m->m_bridge_tokens.begin(); it != m->m_bridge_tokens.end();)
-		it = it->second == k ? m->m_bridge_tokens.erase(it) : std::next(it);
-}
-
-std::vector<PeerId> Session::bridges() const
-{
-	std::vector<PeerId> out;
-	for (const auto& kv : m->m_bridges)
-		out.push_back(kv.first);
-	return out;
-}
-
-bool Session::bridge_connected(PeerId id) const { return m->m_bridges.count(id) != 0; }
-
 void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 {
 	Impl& s = *m;
@@ -2571,9 +2412,9 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 				s.logf("send(%s): clients can only send to the host (peer 0), ignored", msg_name(type));
 			return;
 		}
-		if (s.m_upstream && to == kHostPeer)
+		if (s.m_carrier && to == kHostPeer)
 		{
-			s.m_upstream->send(kHostPeer, lane, type, payload); // a map server, as a client of the world
+			s.m_carrier->send(kHostPeer, lane, type, payload); // a carried host, as a client of its carrier's host
 			return;
 		}
 		if (s.m_role == Role::Host && to == kHostPeer && s.m_local)
@@ -2599,7 +2440,7 @@ void Session::send(PeerId to, Lane lane, Msg type, const Writer& payload)
 			s.logf("send(%s): payload of %zu bytes is too large, dropped", msg_name(type), payload.size());
 			return;
 		}
-		if (s.soft_out(*c, lane, uint16_t(type), payload) || !s.may_send(*c, type))
+		if (!s.may_send(*c, type))
 			return;
 		s.send_packet(*c, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 	}
@@ -2628,11 +2469,11 @@ void Session::broadcast(Lane lane, Msg type, const Writer& payload, PeerId excep
 			return;
 		}
 		for (const auto& kv : s.m_joined)
-			if (kv.first != except && !s.soft_out(*kv.second, lane, uint16_t(type), payload) && s.may_send(*kv.second, type))
+			if (kv.first != except && s.may_send(*kv.second, type))
 				s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
-		if (mapserver::bridge_takes(type)) // F3a: a map server is a client of the world
-			for (const auto& kv : s.m_bridges)
-				if (kv.first != except && !s.soft_out(*kv.second, lane, uint16_t(type), payload) && s.may_send(*kv.second, type))
+		if (s.m_part && !s.m_trunks.empty() && s.m_part->trunk_takes(type)) // F3a: a map server is a client of the world
+			for (const auto& kv : s.m_trunks)
+				if (kv.first != except && s.may_send(*kv.second, type))
 					s.send_packet(*kv.second, lane, uint16_t(type), payload.ptr(), payload.size(), nullptr, 0, false);
 		if (s.m_local && except != kHostPeer)
 			s.m_local->push_to_client(type, lane, payload); // F3a T4: the host player (the link's gate decides)
@@ -2674,7 +2515,7 @@ uint32_t Session::send_blob(PeerId to, uint32_t kind, std::vector<uint8_t> data)
 			c = s.joined_conn(to);
 		else if (s.m_role == Role::Client && to == kHostPeer)
 			c = s.joined_conn(kHostPeer);
-		if (!c || c->virt)
+		if (!c || c->carried)
 		{
 			s.logf("send_blob: peer %u is not joined, blob dropped", unsigned(to));
 			return 0;
@@ -2736,10 +2577,10 @@ void Session::set_world_epoch(uint32_t epoch)
 		s.set_epoch(epoch); // R1 1: the LocalLink too
 		if (s.m_role == Role::None)
 			return;
-		if (s.m_upstream)
+		if (s.m_carrier)
 		{
-			// a map server: the world's epoch is its connection's, its players are in it by definition
-			s.m_upstream->set_world_epoch(epoch);
+			// a carried host (a map server): the world's epoch is its carrier's, its peers are in it by definition
+			s.m_carrier->set_world_epoch(epoch);
 			for (auto& c : s.m_conns)
 				c->epoch = epoch;
 		}
@@ -2748,10 +2589,6 @@ void Session::set_world_epoch(uint32_t epoch)
 			s.logf("%u waiting game message(s) made in world epoch %u are void: the world is epoch %u now", unsigned(voided),
 				unsigned(old), unsigned(epoch));
 		s.logf("world epoch %u (was %u)", unsigned(epoch), unsigned(old));
-		// the host's move: they stay in their world, and it is this one from now on. They hear nothing of it.
-		for (auto& c : s.m_conns)
-			if (c->park_in || c->park_out)
-				c->epoch = epoch;
 		// The world those blobs carry is gone: not a byte more of them.
 		for (auto& c : s.m_conns)
 			s.cancel_blobs(*c, [epoch](const OutBlob& b) { return b.epoch != epoch; }, "its world is gone");
@@ -2815,8 +2652,6 @@ bool Session::self_host_rights() const
 	return m->m_role == Role::Client && m->m_cstate == Impl::CState::Joined && m->m_self_host_rights;
 }
 
-uint64_t Session::operator_refused() const { return m->m_operator_refused; }
-
 void Session::send_chat(const std::string& text)
 {
 	Impl& s = *m;
@@ -2847,7 +2682,7 @@ void Session::send_chat(const std::string& text)
 
 void Session::hold_connection(uint32_t ms)
 {
-	if (Session* world = m->m_upstream)
+	if (Session* world = m->m_carrier)
 		world->hold_connection(ms);
 	else
 		m->m_tp.hold(ms);
@@ -2855,7 +2690,7 @@ void Session::hold_connection(uint32_t ms)
 
 void Session::seal_connection_hold()
 {
-	if (Session* world = m->m_upstream)
+	if (Session* world = m->m_carrier)
 		world->seal_connection_hold();
 	else
 		m->m_tp.seal_hold();
@@ -2863,13 +2698,13 @@ void Session::seal_connection_hold()
 
 uint64_t Session::keepalive_services() const
 {
-	return m->m_upstream ? m->m_upstream->keepalive_services() : m->m_tp.keepalive_services();
+	return m->m_carrier ? m->m_carrier->keepalive_services() : m->m_tp.keepalive_services();
 }
 
 uint32_t Session::ms_since_host_heard() const
 {
-	if (m->m_upstream)
-		return m->m_upstream->ms_since_host_heard();
+	if (m->m_carrier)
+		return m->m_carrier->ms_since_host_heard();
 	if (m->m_role != Role::Client || !m->m_server)
 		return 0;
 	const uint32_t ms = net::Transport::ms_since_receive(m->m_server->peer);
@@ -2881,9 +2716,9 @@ void Session::drop_silent_host()
 	Impl& s = *m;
 	try
 	{
-		if (s.m_upstream)
+		if (s.m_carrier)
 		{
-			s.m_upstream->drop_silent_host();
+			s.m_carrier->drop_silent_host();
 			return;
 		}
 		if (s.m_role != Role::Client)
@@ -2915,6 +2750,33 @@ void Session::set_netsim(const NetSim& sim)
 const NetSim& Session::netsim() const
 {
 	return m->m_sim;
+}
+
+std::vector<PeerTraffic> Session::peer_traffic() const
+{
+	std::vector<PeerId> ids;
+	std::vector<net::PeerHandle> handles;
+	const auto append = [&](PeerId id, const Conn* conn) {
+		if (!conn || !conn->peer)
+			return;
+		ids.push_back(id);
+		handles.push_back(conn->peer);
+	};
+	for (const auto& peer : m->m_joined)
+		append(peer.first, peer.second);
+	for (const auto& peer : m->m_trunks)
+		append(peer.first, peer.second);
+	if (m->m_role == Role::Client)
+		append(kHostPeer, m->joined_conn(kHostPeer));
+	const auto traffic = m->m_tp.traffic(handles);
+	std::vector<PeerTraffic> out;
+	out.reserve(traffic.size());
+	for (size_t i = 0; i < traffic.size(); ++i)
+	{
+		const auto& bytes = traffic[i];
+		out.push_back({ids[i], bytes.out_bytes, bytes.in_bytes, bytes.out_5s, bytes.in_5s});
+	}
+	return out;
 }
 
 const MsgStats& Session::stats(uint16_t type) const

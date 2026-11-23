@@ -18,6 +18,7 @@
 #include "stdafx.h"
 #include "coop_players.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_entities.h"
@@ -595,7 +596,7 @@ void on_equip(PeerId from, Reader& r)
 		return;
 	++g_equip_in;
 	u16 local_id;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		local_id = join::proxy_of_peer(from); // never trust the id a client claims
 		if (local_id == 0xffff)
@@ -620,9 +621,9 @@ void on_equip(PeerId from, Reader& r)
 void send_equip(const Equip& e)
 {
 	Writer w(128);
-	w.u16(mgr().is_host() ? u16(0) : join::my_proxy());
+	w.u16(mode().decides_world() ? u16(0) : join::my_proxy());
 	e.write(w);
-	if (mgr().is_host())
+	if (mode().decides_world())
 		net::host_broadcast(Msg::PlayerEquip, w);
 	else
 		net::client_send(Msg::PlayerEquip, w);
@@ -707,7 +708,7 @@ void store_gear(u16 proxy, const std::vector<gear::Entry>& layout)
 void host_on_vitals(PeerId from, Reader& r)
 {
 	Vitals v;
-	if (!is_map_authority() || !read_vitals(r, v))
+	if (!(mode().decides_world() || mode().leads_level()) || !read_vitals(r, v))
 		return;
 	const u16 proxy = join::proxy_of_peer(from);
 	if (proxy == 0xffff)
@@ -989,7 +990,7 @@ namespace
 // PlayerEquip, in both tables (F3a T4: the lambda of the old install, unchanged)
 void on_equip_msg(PeerId from, Reader& r)
 {
-	if (mgr().is_host() || mgr().is_live_client())
+	if (mode().decides_world() || mgr().is_live_client())
 		on_equip(from, r);
 }
 } // namespace
@@ -1007,7 +1008,7 @@ void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
 	// Live 2026-11-08 (G.A.M.M.A.): our clone of a weapon (a scope, a kit, a detach) takes the slot its old weapon had, as
 	// in single player, where the old one is released before the clone is registered (xrCoop/coop_clone_slot.h)
 	u16 clone_slot = NO_ACTIVE_SLOT;
-	if (e.ID_Parent == 0 && mgr().is_client() && requests::clone_spawn_slot(e.ID, clone_slot))
+	if (e.ID_Parent == 0 && mgr().active() && !mode().decides_world() && requests::clone_spawn_slot(e.ID, clone_slot))
 	{
 		place.type = eItemPlaceSlot;
 		place.slot_id = clone_slot;
@@ -1015,7 +1016,7 @@ void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
 	}
 	// Only the things of a client's own character in the world it came back to: they spawn as children of its actor
 	// (parent 0 after the role swap, coop_join on_alife_objects_loaded). Everything else keeps what the engine gave it.
-	if (e.ID_Parent != 0 || !mgr().is_client() || !join::client_loading_world())
+	if (e.ID_Parent != 0 || mode().decides_world() || !join::client_loading_world())
 		return;
 	if (!g_gear_table_built)
 	{
@@ -1074,8 +1075,7 @@ bool avatar_headlamp(u16 avatar_id)
 
 void condition_carry_take(u32 to_epoch)
 {
-	CActor* actor = mgr().is_client() && !is_map_server() && g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity())
-	                                                                        : nullptr;
+	CActor* actor = is_mirror() && g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity()) : nullptr;
 	// His own state is in this actor when he plays in this world, or when he was still loading it and the load had put
 	// his held state into it already (blind review: a second reset during the load would lose it otherwise).
 	const bool own = actor && actor->ID() == 0 &&
@@ -1134,8 +1134,7 @@ bool condition_carry_extras(u32 epoch, u16& stance, u16& lit_torch)
 
 void own_actor_loaded(CActor& actor)
 {
-	if (!g_carry.have || !mgr().active() || !mgr().is_client() || is_map_server() || !join::client_loading_world() ||
-	    actor.ID() != 0)
+	if (!g_carry.have || !mgr().active() || !is_mirror() || !join::client_loading_world() || actor.ID() != 0)
 		return;
 	restore_carried_actor(actor, true);
 }
@@ -1160,7 +1159,7 @@ bool condition_carried()
 
 bool own_condition_held(const CEntityCondition* condition)
 {
-	if (!mgr().active() || !mgr().is_client() || !join::client_loading_world() || !g_pGameLevel)
+	if (!mgr().active() || mode().decides_world() || !join::client_loading_world() || !g_pGameLevel)
 		return false;
 	CActor* actor = smart_cast<CActor*>(Level().CurrentEntity());
 	return actor && static_cast<const CEntityCondition*>(&actor->conditions()) == condition;
@@ -1190,14 +1189,13 @@ void equip_reset()
 // arrival lines), which G.A.M.M.A. shows as a hit. The condition stands still while he loads (own_condition_held).
 void equip_loading_frame()
 {
-	if (g_pGameLevel && mgr().is_client() && !is_map_server() && join::client_loading_world() &&
-	    g_vitals_world != join::world_generation())
+	if (g_pGameLevel && is_mirror() && join::client_loading_world() && g_vitals_world != join::world_generation())
 		client_restore_vitals();
 }
 
 void equip_frame()
 {
-	const bool live = mgr().is_host() || mgr().is_live_client();
+	const bool live = mode().decides_world() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;
 	const u64 now = mgr().now_ms();

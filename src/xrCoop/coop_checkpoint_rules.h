@@ -243,19 +243,63 @@ struct Slot
 	Record cur, prev;
 };
 
-// A new camp. Visiting the same source again (same kind, same source) only refreshes the current record; anything
-// else pushes the current record down to `prev`. A record that is not valid is ignored.
-inline void set(Slot& s, const Record& r)
+// Build 57 (owner 2026-11-18): "checkpoint updated" came again and again at one and the same campfire: every new visit
+// (he stepped out of its 3 m, it went out for a moment, he lay down at it) wrote the record again and announced it. A
+// record without an object (arrival, story) is the same place within this distance on the same level.
+constexpr float kSamePlaceM = 10.0f;
+
+// What set() did. Same: nothing was changed, nothing is to be written or announced (the caller still answers "set": a
+// sleep at the same campfire must not be refused).
+enum class SetOutcome : uint8_t
+{
+	Ignored, // the record is not valid
+	Same, // the same place as the current record: the slot is left as it is
+	Moved, // an arrival / story record somewhere else after one of its kind: it moves, the previous one stays
+	New // another place: the current record goes down to `prev`
+};
+
+// The slot changed: it is to be written and announced.
+inline bool changes_slot(SetOutcome o) { return o == SetOutcome::Moved || o == SetOutcome::New; }
+
+// The same place: the same kind and the same object; for a record without an object, the same level and not farther than
+// kSamePlaceM (in 3D). Records that are not valid are never the same place.
+inline bool same_place(const Record& a, const Record& b)
+{
+	if (!a.valid() || !b.valid() || a.kind != b.kind)
+		return false;
+	if (a.source != kNoSource || b.source != kNoSource)
+		return a.source == b.source;
+	if (a.level != b.level)
+		return false;
+	double d2 = 0;
+	for (int i = 0; i < 3; ++i)
+	{
+		const double d = double(a.pos[i]) - double(b.pos[i]);
+		d2 += d * d;
+	}
+	return d2 <= double(kSamePlaceM) * double(kSamePlaceM);
+}
+
+// A new camp. The same place again (same_place) changes nothing; an arrival or story record elsewhere (another level, or
+// farther than kSamePlaceM) only moves the current one of its kind; anything else pushes the current record down to
+// `prev`. Build 57 round 2 (lead 2026-11-18, reviews S1/S2): only arrival and story move; any other record without an object
+// (a start base's: kind Rest, no object) somewhere else is New, so the base before it stays as `prev`. A record that is not
+// valid is ignored.
+inline SetOutcome set(Slot& s, const Record& r)
 {
 	if (!r.valid())
-		return;
-	if (s.cur.valid() && s.cur.kind == r.kind && s.cur.source == r.source)
+		return SetOutcome::Ignored;
+	if (same_place(s.cur, r))
+		return SetOutcome::Same;
+	if (s.cur.valid() && s.cur.kind == r.kind && s.cur.source == r.source &&
+		(r.kind == Kind::Arrival || r.kind == Kind::Story))
 	{
 		s.cur = r;
-		return;
+		return SetOutcome::Moved;
 	}
 	s.prev = s.cur;
 	s.cur = r;
+	return SetOutcome::New;
 }
 
 // The object behind a camp is gone (burnt out, packed up, removed). The record it made is dropped; if that was the

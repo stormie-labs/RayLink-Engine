@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <utility>
@@ -30,7 +32,7 @@ namespace coop
 namespace lease
 {
 constexpr uint16_t kNoId = 0xffff;
-constexpr size_t kLeaseSize = 48; // ids a client holds: 7 clients x 48 = 336 of 65534
+constexpr size_t kLeaseSize = 48; // ids a client holds: 16 clients x 48 = 768 of 65534 (F5-SEAT-1)
 constexpr size_t kMaxIdsPerMsg = 64; // IdLease / IdLeaseAck carry at most this many
 constexpr uint32_t kMinFreeBlocks = 4; // the host leases nothing while its generator has fewer non-empty blocks
 constexpr size_t kMaxGivenBack = 4 * kLeaseSize; // per player and world: past this he gets no new ids (churn)
@@ -48,6 +50,9 @@ constexpr uint32_t kMaxResends = 3;
 // burst in a row, one per kSpawnPaceMs after (a little slower than its 50 ms: the network bunches messages up).
 constexpr uint32_t kSpawnPaceBurst = 20;
 constexpr uint32_t kSpawnPaceMs = 60;
+// ReqDestroy and ReqUse share the authority's CatDestroy bucket (60 burst, 30/s).
+constexpr uint32_t kDestroyPaceBurst = 30;
+constexpr uint32_t kDestroyPaceMs = 40;
 
 // 0 is the actor of every machine, 0xffff no id: neither is ever leased.
 inline bool leasable(uint16_t id) { return id != 0 && id != kNoId; }
@@ -106,8 +111,9 @@ inline bool addon_variant(std::string_view source, std::string_view source_paren
 	return false;
 }
 
-// Round 2 (review N1): the client's ReqSpawn pace (kSpawnPaceBurst in a row, then one per kSpawnPaceMs); a token bucket.
-class SpawnPacer
+// A client request bucket with headroom for packets arriving together.
+template <uint32_t Burst, uint32_t IntervalMs>
+class Pacer
 {
 public:
 	bool take(uint64_t now)
@@ -115,14 +121,14 @@ public:
 		if (!m_started)
 		{
 			m_started = true;
-			m_tokens = double(kSpawnPaceBurst);
+			m_tokens = double(Burst);
 			m_at = now;
 		}
 		else if (now > m_at)
 		{
-			m_tokens += double(now - m_at) / double(kSpawnPaceMs);
-			if (m_tokens > double(kSpawnPaceBurst))
-				m_tokens = double(kSpawnPaceBurst);
+			m_tokens += double(now - m_at) / double(IntervalMs);
+			if (m_tokens > double(Burst))
+				m_tokens = double(Burst);
 			m_at = now;
 		}
 		if (m_tokens < 1.)
@@ -137,6 +143,8 @@ private:
 	double m_tokens = 0.;
 	uint64_t m_at = 0;
 };
+using SpawnPacer = Pacer<kSpawnPaceBurst, kSpawnPaceMs>;
+using DestroyPacer = Pacer<kDestroyPaceBurst, kDestroyPaceMs>;
 
 // Msg::IdLease (host -> client: ids added to his lease) and Msg::IdLeaseAck (client -> host: ids he gives back).
 // Wire: u32 epoch (the host world, join::host_world_epoch), varu n (<= kMaxIdsPerMsg), n x u16 id.
@@ -555,9 +563,13 @@ public:
 				return id;
 		return kNoId;
 	}
-	// Round 1 (review C1): a clone of `id` now would be refused or take a source another clone took: the host has not
-	// created it yet, or a pending clone replaces it.
-	bool waiting(uint16_t id) const { return pending(id) || is_source(id); }
+	// Guards for consuming/replacing an item also wait for a pending removal (R32 W7).
+	bool waiting(uint16_t id, bool removing = false) const { return removing || pending(id) || is_source(id); }
+	bool can_queue_mutation(uint16_t id, bool mirror_live, bool fenced) const
+	{
+		// A speculative create is a dependency the outbox can wait for. A clone source is already being replaced.
+		return mirror_live && !fenced && !is_source(id);
+	}
 	// A pending clone replaces item `id`: a release of it is the host's part of the clone.
 	bool is_source(uint16_t id) const
 	{
@@ -621,6 +633,26 @@ public:
 			drop(item);
 		return gone.size();
 	}
+	// A request can name multiple ids. Losing one also cancels requests currently held under a different id.
+	template <class Mentions, class Drop>
+	size_t drop_matching(uint16_t id, Mentions&& mentions, Drop&& drop)
+	{
+		size_t count = 0;
+		for (auto it = m_held.begin(); it != m_held.end();)
+		{
+			auto& actions = it->second;
+			actions.erase(std::remove_if(actions.begin(), actions.end(), [&](T& item)
+			{
+				if (it->first != id && !mentions(item))
+					return false;
+				drop(item);
+				++count;
+				return true;
+			}), actions.end());
+			it = actions.empty() ? m_held.erase(it) : std::next(it);
+		}
+		return count;
+	}
 	template <class Drop>
 	void clear(Drop&& drop)
 	{
@@ -639,6 +671,82 @@ public:
 
 private:
 	std::map<uint16_t, std::vector<T>> m_held;
+};
+
+// The same local entity remains pending from the first request until refusal or removal of its replica.
+template <class Identity>
+class RemovalBook
+{
+public:
+	struct Request
+	{
+		uint16_t item;
+		Msg type;
+		Identity identity;
+	};
+
+	bool begin(uint16_t item, Msg type, Identity identity)
+	{
+		if (pending(item, identity))
+			return false;
+		m_pending.insert_or_assign(item, Entry{{item, type, identity}});
+		return true;
+	}
+	bool pending(uint16_t item, Identity identity) const
+	{
+		const auto it = m_pending.find(item);
+		return it != m_pending.end() && it->second.request.identity == identity;
+	}
+	bool ready(uint16_t item, Identity identity, uint64_t now) const
+	{
+		const auto it = m_pending.find(item);
+		return it != m_pending.end() && it->second.request.identity == identity && !it->second.seq && !it->second.confirmed &&
+		    now >= it->second.retry_at;
+	}
+	void sent(uint16_t item, uint32_t seq) { m_pending.at(item).seq = seq; }
+	std::optional<Request> answer(uint16_t item, uint32_t seq, bool accepted, bool rate_limited, uint64_t now)
+	{
+		const auto it = m_pending.find(item);
+		if (!seq || it == m_pending.end() || it->second.seq != seq)
+			return std::nullopt;
+		Entry& entry = it->second;
+		entry.seq = 0;
+		if (accepted)
+			entry.confirmed = true; // the local replica can outlive the authority's Ok
+		else if (rate_limited)
+		{
+			entry.retry_at = now + kRetryFirstMs;
+			return entry.request;
+		}
+		else
+			m_pending.erase(it);
+		return std::nullopt;
+	}
+	void forget(uint16_t item, Identity identity)
+	{
+		if (pending(item, identity))
+			m_pending.erase(item);
+	}
+	template <class Find>
+	void discard_gone(Find&& find)
+	{
+		for (auto it = m_pending.begin(); it != m_pending.end();)
+			if (find(it->first) != it->second.request.identity)
+				it = m_pending.erase(it);
+			else
+				++it;
+	}
+	void clear() { m_pending.clear(); }
+
+private:
+	struct Entry
+	{
+		Request request;
+		uint32_t seq = 0;
+		uint64_t retry_at = 0;
+		bool confirmed = false;
+	};
+	std::map<uint16_t, Entry> m_pending;
 };
 
 // Round 1 (review I2): rolled-back entities kept a while after their release (a script may still hold one) and freed

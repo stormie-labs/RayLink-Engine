@@ -2,13 +2,13 @@
 #include "stdafx.h"
 #include "coop_worldstate.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
 #include "coop_callgate.h" // F2 T12
 #include "xrCoop/coop_relay_rules.h"
 #include "xrCoop/coop_sky_jump.h"
-#include "xrCoop/coop_soft_move.h"
 
 #include "Level.h"
 #include "ai_space.h"
@@ -182,6 +182,19 @@ struct State
 };
 State g;
 sky::JumpNote g_sky_jumps; // outside State (an atomic): noted on any thread, taken by frame() on the main thread
+
+// S4 (docs/MODES.md section 4, P-E): the sky of a map that a process leads while another one decides the world (a map server): its
+// own step, level_sky_frame, apart from the co-op host's host_weather_frame. The same fingerprint, period and joiners as there.
+struct LevelSky
+{
+	bool raw_valid = false;
+	RawWeather raw;
+	bool dirty = false;
+	u64 next_send = 0;
+	xr_set<PeerId> joining; // the players of the map seen loading it: they get the sky when they finish
+	u32 sent = 0;
+};
+LevelSky g_level_sky;
 
 const char* str_of(const shared_str& s) { return s.c_str() ? s.c_str() : ""; }
 
@@ -452,25 +465,55 @@ void host_frame(u64 now)
 	host_weather_frame(now);
 }
 
-void host_clock_ahead_now(u64 saved_clock, u64 real_ms)
+// ---------------------------------------------------------------- the sky of a led map (level_sky_frame)
+
+void level_send_weather(CEnvironment& e, PeerId to, Lane lane)
 {
-	if (!alife_ready())
+	WeatherState w;
+	capture(e, w);
+	Writer wr(160);
+	w.write(wr);
+	++g_level_sky.sent;
+	if (to != kInvalidPeer)
+	{
+		net::host_send(to, Msg::WeatherSync, wr, lane);
 		return;
-	CALifeTimeManager& tm = alife_rw().time_manager();
-	const u64 delta = softmove::clock_behind(saved_clock, real_ms, tm.time_factor(), tm.game_time());
-	if (!delta)
-		return;
-	// as client_apply_time: the sky clock first, a step of a whole day ends a running weather fx
-	g_pGamePersistent->Environment().ChangeGameTime(float(delta % kDayMs) / 1000.f);
-	tm.coop_set_game_time(tm.game_time() + delta, tm.time_factor());
-	g_sky_jumps.note(s64(delta));
-	g.time_dirty = true;
-	::Msg("[coop] soft move: the world's clock goes on by %.1f game min", float(delta) / 60000.f);
+	}
+	net::host_broadcast(Msg::WeatherSync, wr, lane);
+	g_level_sky.dirty = false;
+	g_level_sky.next_send = w.host_clock + kWeatherPeriodMs;
+}
+
+// The sky to every player of the map who just finished loading it (the time is not this process's: the world server sends it).
+void level_join_frame()
+{
+	const std::vector<PeerInfo> peers = mgr().session().peers();
+	for (auto it = g_level_sky.joining.begin(); it != g_level_sky.joining.end();)
+	{
+		bool present = false;
+		for (const PeerInfo& p : peers)
+			present = present || (p.id == *it && p.state == PeerState::Joined);
+		it = present ? std::next(it) : g_level_sky.joining.erase(it);
+	}
+	for (const PeerInfo& p : peers)
+	{
+		if (p.state != PeerState::Joined)
+			continue;
+		if (sync::host_peer_joining(p.id))
+		{
+			g_level_sky.joining.insert(p.id);
+			continue;
+		}
+		if (!g_level_sky.joining.erase(p.id))
+			continue;
+		if (CEnvironment* e = env_ready())
+			level_send_weather(*e, p.id, Lane::Reliable);
+	}
 }
 
 void host_on_time_request(PeerId from, Reader& r)
 {
-	if (!mgr().is_host())
+	if (!mgr().active() || !mode().decides_world())
 		return;
 	const u32 minutes = r.u32();
 	if (!r.ok())
@@ -667,7 +710,7 @@ void client_frame(u64 now)
 
 void client_on_time_sync(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !mgr().active() || mode().decides_world())
 		return;
 	TimeState t;
 	if (!t.read(r))
@@ -685,7 +728,7 @@ void client_on_time_sync(PeerId from, Reader& r)
 
 void client_on_weather_sync(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !mgr().active() || mode().decides_world())
 		return;
 	WeatherState w;
 	if (!w.read(r))
@@ -705,7 +748,7 @@ void client_on_weather_sync(PeerId from, Reader& r)
 
 void client_on_thunderbolt(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || !mgr().active() || mode().decides_world())
 		return;
 	relay::BoltMsg b;
 	if (!relay::read_bolt(r, b))
@@ -746,6 +789,7 @@ void install_client(Endpoint& e)
 void reset()
 {
 	g = State();
+	g_level_sky = LevelSky();
 	g_sky_jumps.clear();
 }
 
@@ -755,26 +799,39 @@ void note_time_jump(s64 delta_ms)
 		g_sky_jumps.note(delta_ms);
 }
 
-void host_clock_ahead(u64 saved_clock, u64 real_ms) { host_clock_ahead_now(saved_clock, real_ms); }
-u64 host_clock() { return alife_ready() ? u64(alife_rw().time_manager().game_time()) : 0; }
-
 void frame()
 {
 	if (!mgr().active())
 		return;
 	enforce_device_time_factor();
 	const u64 now = mgr().now_ms();
-	if (mgr().is_host())
+	if (mode().decides_world())
 		host_frame(now);
 	else
 		client_frame(now);
 	sky_frame(); // after client_frame (its clock correction); the host's jumps came before (rest::frame, scripts, console)
-	if (is_map_server() && world_up())
+	// a map server's sky: its mode's frame runs level_sky_frame (S4, srv/coop_srv_mode.cpp)
+}
+
+// F3a: time is the world server's, the sky of a map is its authority's: one cycle, the section of this map. A map server's mode
+// calls it every frame of its session while its world is up (S4: its own step, not the co-op host's host_weather_frame).
+void level_sky_frame(u64 now)
+{
+	level_join_frame();
+	CEnvironment* e = env_ready();
+	if (!e)
+		return;
+	const RawWeather r = snapshot(*e);
+	if (!g_level_sky.raw_valid || !r.same(g_level_sky.raw))
 	{
-		// F3a: time is the world server's, the sky of a level is its authority's: one cycle, the section of this level
-		host_join_frame(false);
-		host_weather_frame(now);
+		g_level_sky.raw = r;
+		g_level_sky.raw_valid = true;
+		g_level_sky.dirty = true;
 	}
+	if (!g_level_sky.dirty && now < g_level_sky.next_send)
+		return;
+	// a change goes reliable (state, queued for loading players); the refresh goes unreliable
+	level_send_weather(*e, kInvalidPeer, g_level_sky.dirty ? Lane::Reliable : Lane::Unreliable);
 }
 
 void print_status()
@@ -784,7 +841,7 @@ void print_status()
 	string64 local_s = "-";
 	if (alife_ready())
 		format_time(ai().alife().time_manager().game_time(), local_s, sizeof(local_s));
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		::Msg("[coop]   time: host %s (this machine), factor %.2f%s, %u syncs sent, %u sleep requests", local_s,
 		    alife_ready() ? ai().alife().time_manager().time_factor() : 0.f, Device.Paused() ? ", paused" : "",
@@ -806,7 +863,7 @@ void print_status()
 		::Msg("[coop]   weather: not in a level");
 		return;
 	}
-	const bool host = mgr().is_host();
+	const bool host = mode().decides_world();
 	string32 host_blend = "";
 	if (!host && g.have_weather)
 		xr_sprintf(host_blend, " (host %.2f)", g.rx_weather.blend);
@@ -820,12 +877,12 @@ void print_status()
 
 bool allow_time_factor_change(float factor)
 {
-	if (mgr().is_host())
+	if (mgr().active() && mode().decides_world())
 	{
 		g.time_dirty = true;
 		return true;
 	}
-	if (!mgr().is_client())
+	if (!mgr().active())
 		return true;
 	++g.refused_time;
 	if (refuse_log_allowed())
@@ -835,12 +892,12 @@ bool allow_time_factor_change(float factor)
 
 bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 {
-	if (mgr().is_host())
+	if (mgr().active() && mode().decides_world())
 	{
 		g.time_dirty = true;
 		return false;
 	}
-	if (!mgr().is_client())
+	if (!mgr().active())
 		return false;
 	// F2 T12: the call gate decides (world with the TimeRequest path; an ltx override may run it here). Round 1: a host
 	// command being applied changes nothing here, as before T12.
@@ -868,12 +925,13 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 
 bool refuse_script_weather(const char* name)
 {
-	if (is_map_authority())
+	if (mgr().active() && (mode().decides_world() || mode().leads_level()))
 	{
 		g.weather_dirty = true;
+		g_level_sky.dirty = true; // the sky step of a led map (level_sky_frame) sends it at once too
 		return false;
 	}
-	if (!mgr().is_client())
+	if (!mgr().active())
 		return false;
 	// F2 T12: the call gate decides and logs (world, no request path: the host decides the weather). Round 1: a host
 	// command being applied changes nothing here, as before T12.
@@ -889,7 +947,7 @@ bool bolts_follow() { return is_mirror(); }
 
 void host_on_bolt(const char* id, float period, float duration, u32 seed)
 {
-	if (!is_map_authority())
+	if (!mgr().active() || (!mode().decides_world() && !mode().leads_level()))
 		return;
 	relay::BoltMsg b;
 	b.id = id;

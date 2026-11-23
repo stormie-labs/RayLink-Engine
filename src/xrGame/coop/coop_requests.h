@@ -22,6 +22,11 @@
 //   ReqTransfer   u32 seq, u16 item, u16 from, u16 to, vec3 pos, u8 flags
 //                 flags: 1 = already applied locally (thrown missile, launched rocket), 2 = trade, 4 = exact drop
 //                 position; the host checks the reach whatever the flags say (R3 В8)
+//                 F4 G3-1c: then optionally str riders (Drop / Transfer of a weapon leaving the client's character, at most
+//                 riders::kMaxCarry bytes, xrCoop/coop_item_rider_rules.h): coop_mods_item_state.carry's text, which the
+//                 process that applies the move hands to coop_mods_item_state.carried before apply_move when the
+//                 requester's character holds the item. A host without it reads up to the flags; a client without it
+//                 sends none.
 //   ReqHit        u32 seq, u16 target, vec3 shooter_pos, hit   (power etc. after the client's before-hit Lua, W5)
 //   ReqMoney      a change of the actor's money with a cause, not an amount: coop_money.h (F2 T1, R4 7)
 //   ReqItemEvent  u32 seq, u16 item, u16 ge_type, u16 size, bytes after the GE header, u16 mechanic, u32 paid

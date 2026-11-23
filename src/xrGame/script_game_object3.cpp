@@ -61,6 +61,7 @@
 #include "Flashlight.h"
 #include "coop/coop_events.h" // Anomaly Coop
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_items.h" // Anomaly Coop: TZ R32 W8.1, a setter on the decider is the item's new baseline
 #include "coop/coop_ai.h" // Anomaly Coop: get_luminocity of a player's character (the light estimate)
 
 namespace MemorySpace
@@ -2058,6 +2059,7 @@ void CScriptGameObject::SetRemainingUses(u8 value)
 		return;
 
 	eItm->SetRemainingUses(value);
+	coop::items::decider_wrote(IItm, coop::owner::Setter::Uses); // Anomaly Coop: TZ R32 W8.1, the decider's write
 }
 
 u8 CScriptGameObject::GetRemainingUses()

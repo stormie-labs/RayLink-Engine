@@ -38,9 +38,16 @@ namespace game
 // CALifeSimulator::CALifeSimulator, after the Lua state is rebuilt and before the stock start_game_callback (the first
 // on_game_start of every script). Reads the start mode of g_pGamePersistent->m_game_params, settles the world's group and
 // the staged game (on_world_start), then calls coop_game_settings.before_world_start(mode, save) in a protected call
-// ("save" is m_game_or_spawn: the save's name for a load, the spawn name for a new game). A missing script or function is
-// a no-op, an error is logged and not fatal: a single-player game without the co-op scripts is not changed.
+// ("save" is m_game_or_spawn: the save's name for a load, the spawn name for a new game). A start without the engine's
+// word whose save is the one remember_next_load named is a load of that save (xrCoop/coop_game_values.h world_start): a
+// level change, a load from a running game. A missing script or function is a no-op, an error is logged and not fatal: a
+// single-player game without the co-op scripts is not changed.
 void before_world_start();
+
+// CALifeUpdateManager::change_level and load_game, once the alife command line names the save the next world loads
+// ("<save>/single/alife": no "load" in it). Remembers that save as the next world will read it; the next world start takes
+// it, whatever start that is (NextLoad).
+void remember_next_load(const char* command_line);
 
 // CLevel::net_Stop: the machine's console values come back. Does nothing when no game value is set.
 void on_level_exit();

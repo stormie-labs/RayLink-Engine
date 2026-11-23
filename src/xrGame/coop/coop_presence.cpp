@@ -3,6 +3,7 @@
 #include "coop_presence.h"
 #include "coop_survival.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_join.h"
 #include "coop_net.h"
 #include "coop_sync.h"
@@ -193,7 +194,7 @@ xr_map<u16, Sight> g_sight; // by local id of the player character
 constexpr u32 kTagDefaultRgb = 0xc8f0c8;
 constexpr u32 kTagDownRgb = 0xff9a3c;
 constexpr u32 kTagDeadRgb = 0xa0a0a0;
-constexpr u32 kPaletteSize = 8;
+constexpr u32 kPaletteSize = kMaxPeerSlots; // F5-SEAT-2: color_0..color_16, a colour for every peer id of the wire (0..16)
 struct Palette
 {
 	bool loaded = false;
@@ -222,7 +223,7 @@ xr_map<PeerId, ClientBudget> g_budgets;
 xr_map<u16, u64> g_last_shot;
 xr_map<u16, relay::HeliReport> g_heli; // under g_lock
 
-bool live() { return mgr().is_host() || mgr().is_live_client(); }
+bool live() { return mode().decides_world() || mgr().is_live_client(); }
 
 CGameObject* object_here(u16 local_id)
 {
@@ -476,13 +477,13 @@ void to_players(const Writer& w, Lane lane, PeerId except = kInvalidPeer)
 
 void send(ShotEvent& e)
 {
-	e.shooter = mgr().is_host() ? u16(0) : join::my_proxy();
+	e.shooter = mode().decides_world() ? u16(0) : join::my_proxy();
 	if (e.shooter == 0xffff)
 		return;
 	Writer w(40);
 	e.write(w);
 	const Lane lane = firm(e, e.shooter) ? Lane::Reliable : Lane::Unreliable;
-	if (mgr().is_host())
+	if (mode().decides_world())
 		to_players(w, lane);
 	else
 		net::client_send(Msg::PlayerShot, w, lane);
@@ -495,7 +496,7 @@ void on_shot_msg(PeerId from, Reader& r)
 		return;
 	++g_stat.events_in;
 	u16 avatar;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		avatar = join::proxy_of_peer(from); // never trust the shooter a client claims
 		if (avatar == 0xffff || sync::host_peer_joining(from) || e.kind > KindLauncher)
@@ -818,7 +819,7 @@ void on_weapon_shot(CWeapon* w)
 		// Live 2026-10-29 (b28): "the client does not hear NPCs shoot". A puppet never fires (no brain, its object handler
 		// held at idle / strapped), so the host relays its own NPCs' shots. Avatars and proxies belong to their players.
 		CGameObject* npc = smart_cast<CGameObject*>(parent);
-		if (!is_map_authority() || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
+		if (!(mode().decides_world() || mode().leads_level()) || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
 		    world::is_player_character(npc))
 			return;
 		e.shooter = npc->ID();
@@ -847,7 +848,7 @@ void on_weapon_shot(CWeapon* w)
 
 namespace
 {
-bool host_records() { return g_pGameLevel && is_map_authority(); }
+bool host_records() { return g_pGameLevel && (mode().decides_world() || mode().leads_level()); }
 
 // A creature whose doings the clients are told: an NPC or a monster, never a player's character.
 bool host_creature(CGameObject* go)
@@ -1026,7 +1027,7 @@ void print_status()
 	      "bullets; no avatar %llu, no weapon %llu, missing sounds %llu; name tags %s (v2.1: %u drawn)",
 	    g_stat.shots_out, g_stat.reloads_out, g_stat.events_in, g_stat.shots_in, g_stat.reloads_in, g_stat.bullets,
 	    g_stat.no_avatar, g_stat.no_weapon, g_stat.sounds_missing, g_nametags ? "on" : "off", u32(g_tags.size()));
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		::Msg("[coop]   presence: npc shots out %llu (%llu with bullets), %llu events out of range or budget, %llu on the "
 		      "reliable lane; weapon sounds %llu, flinches %llu",
 		    g_stat.npc_shots_out, g_stat.npc_bullets_out, g_stat.npc_shots_far, g_stat.firm_out, g_stat.npc_sounds_out,

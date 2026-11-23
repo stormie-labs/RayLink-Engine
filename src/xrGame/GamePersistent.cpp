@@ -170,6 +170,7 @@ void CGamePersistent::OnAppStart()
 
 void CGamePersistent::OnAppEnd()
 {
+	coop::on_app_end(); // Anomaly Coop (TZ R38): a session ends here, the engine and the log up, not in a static destructor after the log
 	if (m_pMainMenu->IsActive())
 		m_pMainMenu->Activate(false);
 

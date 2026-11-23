@@ -1018,9 +1018,16 @@ LUA_API const char *lua_setupvalue(lua_State *L, int idx, int n)
   api_checknelems(L, 1);
   name = lj_debug_uvnamev(f, (uint32_t)(n-1), &val);
   if (name) {
+    /* RayLink: the barrier goes on the object that holds the value, as in LuaJIT 2.1. A Lua closure keeps it in a
+    ** GCupval, which the collector blackens on its own once closed (lj_gc.c gc_mark), whatever the closure's colour:
+    ** a barrier on the closure let a fresh object in a black upvalue stay white and be swept while still referenced
+    ** (build 57: debug.setupvalue from the mod's adapters, gc_traverse_trace / lj_alloc_free crashes).
+    ** tests\luajit\test_setupvalue_barrier.c */
+    GCfunc *fn = funcV(f);
+    GCobj *o = isluafunc(fn) ? gcref(fn->l.uvptr[n-1]) : obj2gco(fn);
     L->top--;
     copyTV(L, val, L->top);
-    lj_gc_barrier(L, funcV(f), L->top);
+    lj_gc_barrier(L, o, L->top);
   }
   return name;
 }

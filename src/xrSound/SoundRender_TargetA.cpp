@@ -4,6 +4,7 @@
 #include "soundrender_TargetA.h"
 #include "soundrender_emitter.h"
 #include "soundrender_source.h"
+#include "SoundRender_downmix.h" // Anomaly Coop: sm_Mono3D
 
 xr_vector<u8> g_target_temp_data;
 xr_vector<u8> g_target_temp_data_16;
@@ -209,6 +210,18 @@ void CSoundRender_TargetA::fill_parameters()
 void CSoundRender_TargetA::fill_block(ALuint BufferID)
 {
 	R_ASSERT(m_pEmitter);
+	// Anomaly Coop: sm_Mono3D (TZ R59). A stereo source mixed down: the emitter gives whole stereo frames in its own bytes (its
+	// cursor, end of sound and loop are as in stock), OpenAL gets one mono sample per frame at the same rate, so the same frames
+	// last the same time and the source can be placed in 3D. g_target_temp_data_16 is twice g_target_temp_data, as in stock.
+	if (m_pEmitter->bMono3D && m_pEmitter->source()->m_wformat.nChannels == 2)
+	{
+		// never the stereo path below for this emitter: OpenAL keeps one format per queue
+		const sound_downmix::Block b = sound_downmix::plan_block(u32(g_target_temp_data_16.size()), u32(g_target_temp_data.size()));
+		m_pEmitter->fill_block(&g_target_temp_data_16.front(), b.source_bytes);
+		sound_downmix::stereo_to_mono_s16le(&g_target_temp_data_16.front(), b.source_bytes, &g_target_temp_data.front());
+		A_CHK(alBufferData(BufferID, AL_FORMAT_MONO16, &g_target_temp_data.front(), b.mono_bytes, m_pEmitter->source()->m_wformat.nSamplesPerSec));
+		return;
+	}
 	ALuint format = (m_pEmitter->source()->m_wformat.nChannels == 1) ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
 	if (format == AL_FORMAT_MONO16)
 	{

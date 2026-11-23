@@ -24,7 +24,8 @@
 #include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
 #include "coop/coop_story.h" // Anomaly Coop (F2 T12 round 1): alife():give_info of our actor
 #include "coop/coop_manager.h" // Anomaly Coop (F2 T12 round 1)
-#include "coop/coop_levels.h" // Anomaly Coop: an object online at a client
+#include "xrCoop/coop_mode.h" // Anomaly Coop: an object online elsewhere
+#include "coop/coop_levels.h" // Anomaly Coop (R32 W2a): the map of a create's new root
 #include "Actor.h" // Anomaly Coop (F2 T12 round 1): g_actor
 #include "InventoryOwner.h"
 
@@ -88,6 +89,60 @@ static bool coop_alife_info(const char* name, ALife::_OBJECT_ID id, LPCSTR info_
 		return false;
 	coop::callgate::note_refused(name, "our actor has no game object: the story path cannot be asked");
 	return true;
+}
+
+// Anomaly Coop (R32 W2a, temp/r30/design/R32-final.md): the writer gate of a script write, after today's call gate above. Defined in
+// coop/coop_router.cpp (declared here until coop_router.h gets it): on the world server and a map server it counts what it would refuse,
+// ask or order (coop_writer_gate log, the census in coop_status) and refuses under enforce; the co-op host, a player's machine and
+// single player never.
+namespace coop
+{
+namespace router
+{
+bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarget& target);
+} // namespace router
+} // namespace coop
+
+// A release or an info: the object it changes.
+static bool coop_writer_refuses(const char* call, coop::writer::WriteOp op, ALife::_OBJECT_ID id, LPCSTR what)
+{
+	coop::calls::WriteTarget target;
+	target.id = id;
+	target.what = what;
+	return coop::router::writer_refuses(call, op, target);
+}
+
+// A create: under its parent, else a new root of `kind` standing on the map of `game_vertex`.
+static bool coop_writer_refuses(const char* call, coop::writer::WriteOp op, ALife::_OBJECT_ID parent, LPCSTR section,
+                                coop::calls::Target kind, GameGraph::_GRAPH_ID game_vertex)
+{
+	coop::calls::WriteTarget target;
+	target.what = section;
+	if (parent != ALife::_OBJECT_ID(-1))
+		target.id = parent;
+	else
+	{
+		target.kind = kind;
+		target.level = coop::levels::level_of_vertex(game_vertex);
+	}
+	return coop::router::writer_refuses(call, op, target);
+}
+
+// The kind of a new root that is an object already (a spawn-graph object, a temporary one being registered): a unit as the writer rule
+// names one (writer::is_unit: a squad or a living monster, W1.2), anything else a resident of its map.
+static coop::calls::Target coop_new_root_kind(CSE_Abstract* object)
+{
+	const CSE_ALifeCreatureAbstract* creature = smart_cast<CSE_ALifeCreatureAbstract*>(object);
+	const bool unit = coop::writer::is_unit(smart_cast<CSE_ALifeOnlineOfflineGroup*>(object) != nullptr,
+	    smart_cast<CSE_ALifeMonsterAbstract*>(object) != nullptr, creature != nullptr && creature->g_Alive());
+	return unit ? coop::calls::Target::NewUnit : coop::calls::Target::NewResident;
+}
+
+// The game vertex of an object (0xffff: none, its map unknown).
+static GameGraph::_GRAPH_ID coop_vertex_of(CSE_Abstract* object)
+{
+	CSE_ALifeObject* o = smart_cast<CSE_ALifeObject*>(object);
+	return o ? o->m_tGraphID : GameGraph::_GRAPH_ID(-1);
 }
 
 CSE_ALifeDynamicObject* alife_object(const CALifeSimulator* self, ALife::_OBJECT_ID object_id)
@@ -255,6 +310,12 @@ CSE_ALifeDynamicObject* CALifeSimulator__create(CALifeSimulator* self, ALife::_S
 	CSE_ALifeDynamicObject* spawn = smart_cast<CSE_ALifeDynamicObject*>(&vertex->data()->object());
 	THROW(spawn);
 
+	// Anomaly Coop (R32 W2a, W9): the writer of the spawn-graph object's new root; an id of this process's own pool
+	if (coop_writer_refuses("alife:create", coop::writer::WriteOp::Create, spawn->ID_Parent, spawn->s_name.c_str(), coop_new_root_kind(spawn),
+	        spawn->m_tGraphID))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:create"))
+		return nullptr;
 	CSE_ALifeDynamicObject* object;
 	self->create(object, spawn, spawn_id);
 
@@ -270,6 +331,12 @@ CSE_Abstract* CALifeSimulator__spawn_item(CALifeSimulator* self, LPCSTR section,
 	case coop::calls::Gate::Run: break;
 	}
 	THROW(self);
+	// Anomaly Coop (R32 W2a, W9): a new root of the section's kind on the map of the vertex; an id of this process's own pool
+	if (coop_writer_refuses("alife:create", coop::writer::WriteOp::Create, ALife::_OBJECT_ID(-1), section, coop::calls::Target::NewOfSection,
+	        game_vertex_id))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:create"))
+		return nullptr;
 	return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, ALife::_OBJECT_ID(-1)));
 }
 
@@ -281,6 +348,12 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 	case coop::calls::Gate::Refuse: return nullptr;
 	case coop::calls::Gate::Run: break;
 	}
+	// Anomaly Coop (R32 W2a, W9): the writer of the parent's root (no parent: a new root on the map of the vertex); an id of the own pool
+	if (coop_writer_refuses("alife:create", coop::writer::WriteOp::Create, id_parent, section, coop::calls::Target::NewOfSection,
+	        game_vertex_id))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:create"))
+		return nullptr;
 	if (id_parent == ALife::_OBJECT_ID(-1))
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
@@ -291,7 +364,7 @@ CSE_Abstract* CALifeSimulator__spawn_item2(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop: no game object here, the client who holds it gets it as any spawn
+	if (!object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop: no game object here, the client who holds it gets it as any spawn
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	NET_Packet packet;
@@ -324,6 +397,12 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 	if (reg == true)
 		return CALifeSimulator__spawn_item2(self, section, position, level_vertex_id, game_vertex_id, id_parent);
 
+	// Anomaly Coop (R32 W2a, W9): a temporary object takes its id now (its alife():register is asked again)
+	if (coop_writer_refuses("alife:create", coop::writer::WriteOp::Create, id_parent, section, coop::calls::Target::NewOfSection,
+	        game_vertex_id))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:create"))
+		return nullptr;
 	if (id_parent == ALife::_OBJECT_ID(-1))
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
@@ -334,7 +413,7 @@ CSE_Abstract* CALifeSimulator__spawn_item3(CALifeSimulator* self, LPCSTR section
 		return (0);
 	}
 
-	if (!object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
+	if (!object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop
 		return (self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent));
 
 	CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent, false);
@@ -350,6 +429,12 @@ CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section,
 	case coop::calls::Gate::Refuse: return nullptr;
 	case coop::calls::Gate::Run: break;
 	}
+	// Anomaly Coop (R32 W2a, W9): the writer of the parent's root (no parent: a box of ammo on the map of the vertex); an id of the own pool
+	if (coop_writer_refuses("alife:create_ammo", coop::writer::WriteOp::Create, id_parent, section, coop::calls::Target::NewResident,
+	        game_vertex_id))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:create_ammo"))
+		return nullptr;
 	//	if (id_parent == ALife::_OBJECT_ID(-1))
 	//		return							(self->spawn_item(section,position,level_vertex_id,game_vertex_id,id_parent));
 	CSE_ALifeDynamicObject* object = 0;
@@ -363,7 +448,7 @@ CSE_Abstract* CALifeSimulator__spawn_ammo(CALifeSimulator* self, LPCSTR section,
 		}
 	}
 
-	if (!object || !object->m_bOnline || coop::levels::online_at_server(object->ID)) // Anomaly Coop
+	if (!object || !object->m_bOnline || coop::mode().online_elsewhere(object->ID)) // Anomaly Coop
 	{
 		CSE_Abstract* item = self->spawn_item(section, position, level_vertex_id, game_vertex_id, id_parent);
 
@@ -421,6 +506,7 @@ void CALifeSimulator__release(CALifeSimulator* self, CSE_Abstract* object, bool)
 	CSE_ALifeObject* alife_object = smart_cast<CSE_ALifeObject*>(object);
 	THROW(alife_object);
 	if (!alife_object) return;
+	if (coop_writer_refuses("alife:release", coop::writer::WriteOp::Release, object->ID, object->s_name.c_str())) return; // Anomaly Coop (R32 W2a)
 	if (coop::requests::held_by_a_client("alife:release", object->ID)) return; // Anomaly Coop
 	if (!alife_object->m_bOnline)
 	{
@@ -485,6 +571,7 @@ bool dont_has_info(const CALifeSimulator* self, const ALife::_OBJECT_ID& id, LPC
 
 void AlifeGiveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LPCSTR info_id)
 {
+	if (coop_writer_refuses("alife:give_info", coop::writer::WriteOp::Info, id, info_id)) return; // Anomaly Coop (R32 W2a; A9: the ghost)
 	if (coop_alife_info("alife:give_info", id, info_id, true)) return; // Anomaly Coop (F2 T12 round 1 gate)
 	KNOWN_INFO_VECTOR *known_info = alife->registry().get<CInfoPortionRegistry>().object(id, true);
 	if (!known_info)
@@ -503,6 +590,7 @@ void AlifeGiveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LP
 
 void AlifeRemoveInfo(const CALifeSimulator *alife, const ALife::_OBJECT_ID &id, LPCSTR info_id)
 {
+	if (coop_writer_refuses("alife:disable_info", coop::writer::WriteOp::Info, id, info_id)) return; // Anomaly Coop (R32 W2a; A9: the ghost)
 	if (coop_alife_info("alife:disable_info", id, info_id, false)) return; // Anomaly Coop (F2 T12 round 1 gate)
 	KNOWN_INFO_VECTOR	*known_info = alife->registry().get<CInfoPortionRegistry>().object(id, true);
 	if (!known_info)
@@ -536,6 +624,11 @@ void IterateInfo(const CALifeSimulator* alife, const ALife::_OBJECT_ID& id, cons
 
 CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 {
+	// Anomaly Coop (R32 W2a, W9): alife():register(nil) is the stock "nothing" back. alife():create(..., false) returns nil when the
+	// writer gate or an empty id pool refuses it (coop_writer_gate enforce), and a script that hands that straight to register would
+	// otherwise have its id read below: an access violation no pcall catches.
+	if (!object)
+		return nullptr;
 	switch (coop_spawn_gate("alife:register", object && coop::callgate::is_own(object->ID_Parent), nullptr, object ? object->s_name.c_str() : nullptr)) // Anomaly Coop (F2 T12 gate)
 	{
 	case coop::calls::Gate::Request: return coop::requests::lua_register_spawn(object);
@@ -552,6 +645,16 @@ CSE_Abstract* reprocess_spawn(CALifeSimulator* self, CSE_Abstract* object)
 	if (object && static_cast<CSE_Abstract*>(ai().alife().objects().object(object->ID, true)) == object)
 		return object;
 	const u16 clone_id = object->ID;
+	// Anomaly Coop (R32 W2a): the writer of the parent's root (no parent: a new root of the object's kind); its id was taken by
+	// create(..., false), which asked for it. A refusal ends the temporary object as a failed register does below.
+	if (coop_writer_refuses("alife:register", coop::writer::WriteOp::Create, object->ID_Parent, object->s_name.c_str(),
+	        coop_new_root_kind(object), coop_vertex_of(object)))
+	{
+		coop::requests::after_clone_register(clone_id, false);
+		self->server().FreeID(clone_id, 0);
+		F_entity_Destroy(object);
+		return nullptr;
+	}
 	if (!coop::requests::before_clone_register(object))
 	{
 		coop::requests::after_clone_register(clone_id, false);
@@ -592,6 +695,12 @@ CSE_Abstract* try_to_clone_object(CALifeSimulator* self, CSE_Abstract* object, L
 	case coop::calls::Gate::Refuse: return nullptr;
 	case coop::calls::Gate::Run: break;
 	}
+	// Anomaly Coop (R32 W2a, W9): the writer of the parent's root (no parent: a weapon on the map of the vertex); an id of the own pool
+	if (coop_writer_refuses("alife:clone_weapon", coop::writer::WriteOp::Create, id_parent, section, coop::calls::Target::NewResident,
+	        game_vertex_id))
+		return nullptr;
+	if (!self->server().CoopMayCreate("alife:clone_weapon"))
+		return nullptr;
 	CSE_ALifeItemWeaponMagazined* wpnmag = smart_cast<CSE_ALifeItemWeaponMagazined*>(object);
 	if (wpnmag)
 	{

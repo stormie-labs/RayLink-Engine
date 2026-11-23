@@ -9,9 +9,10 @@
 #include "stdafx.h"
 #include "coop/coop_join.h" // Anomaly Coop: the private join cache is not the player's last save
 #include "coop/coop_sync.h"
-#include "coop/coop_levels.h" // F3a multilevel: an object online at a client
+#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode answers the hooks below (docs/MODES.md section 4)
 #include "coop/coop_checkpoints.h" // F3: arrival checkpoints on a level change
 #include "coop/coop_autosave.h" // F3: the host's autosave name on a level change
+#include "coop/coop_game_settings.h" // report #5: the next world starts as a load of the save named here
 #include "alife_update_manager.h"
 #include "alife_simulator_header.h"
 #include "alife_time_manager.h"
@@ -110,7 +111,7 @@ void CALifeUpdateManager::update_scheduled(bool init_ef)
 	// commander's binder updates; everything else offline is the world server's.
 	if (coop::sync::alife_frozen())
 	{
-		coop::levels::xfer_scheduled();
+		coop::mode().held_update();
 		return;
 	}
 
@@ -262,6 +263,8 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	}
 	else
 		save(autoave_name);
+	// Anomaly Coop: the line names the save the next world loads, without "load": its game settings start as a load of it
+	coop::game::remember_next_load(**m_server_command_line);
 
 	graph().actor()->m_tGraphID = safe_graph_vertex_id;
 	graph().actor()->m_tNodeID = safe_level_vertex_id;
@@ -378,6 +381,7 @@ bool CALifeUpdateManager::load_game(LPCSTR game_name, bool no_assert)
 	R_ASSERT2(temp, "Invalid server options!");
 	strconcat(sizeof(S1), S1, game_name, temp);
 	*m_server_command_line = S1;
+	coop::game::remember_next_load(S1); // Anomaly Coop: the next world loads this save without "load" in its line
 	return (true);
 }
 
@@ -472,7 +476,7 @@ void CALifeUpdateManager::teleport_object(ALife::_OBJECT_ID id, GameGraph::_GRAP
 	}
 #endif
 
-	if (coop::levels::online_at_server(id)) return; // Anomaly Coop: a client computes it; a story teleport waits until it comes home
+	if (coop::mode().online_elsewhere(id)) return; // Anomaly Coop: a map server computes it; a story teleport waits until it comes home
 	if (object->m_bOnline)
 		switch_offline(object);
 	graph().change(object, object->m_tGraphID, game_vertex_id);

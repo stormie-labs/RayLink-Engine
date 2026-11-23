@@ -19,6 +19,7 @@
 #include "CaptureBoneCallback.h"
 #include "Level.h"
 #include "physicsshellholder.h"
+#include "coop/coop_player_touch.h" // Anomaly Coop (TZ P50): a player's body gets its collide marks when it is built
 #ifdef DEBUG
 #include "phdebug.h"
 #endif
@@ -1104,6 +1105,7 @@ void CPHMovementControl::CreateCharacter()
 	trying_poses[1].set(vPosition);
 	trying_poses[2].set(vPosition);
 	trying_poses[3].set(vPosition);
+	coop::player_touch::on_body(smart_cast<CGameObject*>(pObject)); // Anomaly Coop (TZ P50): before the next physics step
 }
 
 CPHSynchronize* CPHMovementControl::GetSyncItem()

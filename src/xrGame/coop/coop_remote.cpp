@@ -1,11 +1,14 @@
 #include "stdafx.h"
 #include "coop_remote.h"
+#include "coop_net.h"
 #include "coop_manager.h"
 #include "coop_sync.h"
 #include "coop_world.h"
 #include "coop_entities.h"
 #include "coop_players.h"
+#include "coop_player_touch.h" // TZ P50: players who appear on one spot pass through each other
 #include "coop_ai.h"
+#include "coop_vehicles.h" // F5-VEH-2: save_position
 #include "xrCoop/coop_rules.h"
 
 #include "Level.h"
@@ -206,6 +209,7 @@ void sync_server_entity(CGameObject* obj)
 	if (!e)
 		return;
 	e->o_Position = obj->Position();
+	vehicles::save_position(obj->ID(), e->o_Position); // F5-VEH-2: a seated player is saved standing at his exit point
 	const u32 node = obj->ai_location().level_vertex_id();
 	if (ai().get_level_graph() && ai().level_graph().valid_vertex_id(node))
 		e->m_tNodeID = node;
@@ -248,6 +252,8 @@ void on_net_spawn(CObject* o)
 	mute_player_character(obj);
 	if (is_remote_creature(obj))
 		make_remote(obj);
+	players::on_object_spawn(obj->ID()); // TZ P50: an avatar stands where it spawned until its player's snapshots place it
+	player_touch::on_spawn(obj); // TZ P50: the actor or a player's character came into this world: its pairs start off
 }
 
 bool update_cl(CGameObject* obj)
@@ -285,7 +291,7 @@ bool apply(CGameObject* obj)
 		if (CAI_Stalker* avatar = obj->cast_stalker())
 			driven = players::drive_avatar(avatar);
 	}
-	else if (mgr().is_client())
+	else if (net::client())
 		driven = entities::drive_mirror(obj);
 	if (!driven)
 		return false;
@@ -301,7 +307,7 @@ bool apply(CGameObject* obj)
 		if (it != g_puppets.end())
 			track_legs(obj, ka, it->second);
 	}
-	if (is_map_authority() && world::is_player_proxy(obj->ID()))
+	if (net::host() && world::is_player_proxy(obj->ID()))
 	{
 		sync_server_entity(obj);
 		npc_ai::on_proxy_frame(obj); // W11: light and view for the NPCs that look at this player
@@ -349,7 +355,7 @@ void on_host_death(CGameObject* obj, u16 killer_local_id)
 // ragdoll is built; a drop from the host takes it out of there.
 void on_puppet_die(CGameObject* obj)
 {
-	if (!obj || !mgr().is_client() || world::is_player_proxy(obj->ID()) || !is_remote_creature(obj))
+	if (!obj || !net::client() || world::is_player_proxy(obj->ID()) || !is_remote_creature(obj))
 		return;
 	CInventoryOwner* owner = obj->cast_inventory_owner();
 	PIItem item = owner ? owner->inventory().ActiveItem() : nullptr;

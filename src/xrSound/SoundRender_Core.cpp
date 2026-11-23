@@ -6,6 +6,7 @@
 #include "SoundRender_Core.h"
 #include "SoundRender_Source.h"
 #include "SoundRender_Emitter.h"
+#include "SoundRender_downmix.h" // Anomaly Coop: sm_Mono3D
 
 #include "NotificationClient.h"
 
@@ -342,14 +343,28 @@ void CSoundRender_Core::clone(ref_sound& S, const ref_sound& from, esound_type s
 }
 
 
+// Anomaly Coop: sm_Mono3D (TZ R59), the same in play, play_no_feedback and play_at_pos. A new emitter latches whether its
+// stereo source is mixed down to mono; a replay of a running one keeps its mode. Flat as in stock (sm_2D, or a stereo source)
+// unless the emitter mixes down. Without sm_Mono3D both answers are the stock ones.
+static void latch_mono3d(CSoundRender_Emitter* E, const ref_sound& S, u32 flags)
+{
+	E->bMono3D = sound_downmix::starts_downmixed(!!(flags & sm_2D), !!(flags & sm_Mono3D), S._handle()->channels_num());
+}
+
+static bool plays_flat(ref_sound& S, u32 flags)
+{
+	return sound_downmix::plays_flat(!!(flags & sm_2D), S._handle()->channels_num(),
+	                                 ((CSoundRender_Emitter*)S._feedback())->bMono3D);
+}
+
 void CSoundRender_Core::play(ref_sound& S, CObject* O, u32 flags, float delay)
 {
 	if (!bPresent || (0==S._handle())) return;
 	S._p->g_object = O;
 	if (S._feedback()) ((CSoundRender_Emitter*)S._feedback())->rewind();
-	else i_play(&S, flags & sm_Looped, delay);
+	else latch_mono3d(i_play(&S, flags & sm_Looped, delay), S, flags); // Anomaly Coop: sm_Mono3D
 
-	if ((flags & sm_2D) || (S._handle()->channels_num() == 2))
+	if (plays_flat(S, flags)) // Anomaly Coop: stock (flags & sm_2D) || channels_num() == 2, unless mixed down (sm_Mono3D)
 		S._feedback()->switch_to_2D();
 
 	if (flags & sm_Intro)
@@ -371,9 +386,9 @@ void CSoundRender_Core::play_no_feedback(ref_sound& S, CObject* O, u32 flags, fl
 	S._p->fn_attached[0] = orig->fn_attached[0];
 	S._p->fn_attached[1] = orig->fn_attached[1];
 
-	i_play(&S, flags & sm_Looped, delay);
+	latch_mono3d(i_play(&S, flags & sm_Looped, delay), S, flags); // Anomaly Coop: sm_Mono3D
 
-	if (flags & sm_2D || S._handle()->channels_num() == 2)
+	if (plays_flat(S, flags)) // Anomaly Coop: stock flags & sm_2D || channels_num() == 2, unless mixed down (sm_Mono3D)
 		S._feedback()->switch_to_2D();
 
 	if (flags & sm_Intro)
@@ -393,10 +408,10 @@ void CSoundRender_Core::play_at_pos(ref_sound& S, CObject* O, const Fvector &pos
 	if (!bPresent || (0 == S._handle())) return;
 	S._p->g_object = O;
 	if (S._feedback()) ((CSoundRender_Emitter*)S._feedback())->rewind();
-	else i_play(&S, flags & sm_Looped, delay);
+	else latch_mono3d(i_play(&S, flags & sm_Looped, delay), S, flags); // Anomaly Coop: sm_Mono3D, before set_position
 
 	S._feedback()->set_position(pos);
-	if ((flags & sm_2D) || (S._handle()->channels_num() == 2))
+	if (plays_flat(S, flags)) // Anomaly Coop: stock (flags & sm_2D) || channels_num() == 2, unless mixed down (sm_Mono3D)
 		S._feedback()->switch_to_2D();
 
 	if (flags & sm_Intro)

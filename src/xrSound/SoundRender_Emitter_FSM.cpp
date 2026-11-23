@@ -57,7 +57,8 @@ void CSoundRender_Emitter::update(float dt)
 	// Don't apply delay to already delayed sounds, they are most likely already handled in respective parts of code and scripts
 	if (need_preplay_update && m_current_state < stPlaying && starting_delay == 0.f)
 	{
-		if (_valid(p_source.position) && !p_source.position.similar(Fvector().set(0.f, 0.f, 0.f)) && owner_data && source() && source()->channels_num() == 1)
+		// Anomaly Coop: positional_source() = stock channels_num() == 1, plus a stereo source mixed down (sm_Mono3D)
+		if (_valid(p_source.position) && !p_source.position.similar(Fvector().set(0.f, 0.f, 0.f)) && owner_data && source() && positional_source())
 		{
 			//Smooth Ramp Using Hermite(Smootherstep)
 			static auto CalculateSmoothSoundDelay = [](float distance, float speedOfSound, float rampStart, float rampRange)

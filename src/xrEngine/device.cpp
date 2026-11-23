@@ -39,7 +39,10 @@
 #include "EngineThreading.h"
 #include "cursor_policy.h" // Anomaly Coop: free cursor in windowed menus
 #include "../xrCoop/coop_continual_clock.h" // Anomaly Coop
+#include "../xrCoop/coop_device_rules.h" // Anomaly Coop: the pause at the start honours g_always_active
 #include "IGame_Level.h"
+
+extern u32 g_screenmode; // Anomaly Coop: used by the pause at the start (End), declared again below
 
 #include "Rain.h"
 
@@ -77,7 +80,7 @@ BOOL CRenderDevice::Begin()
 	PROF_EVENT("Render: Begin");
 
 #ifndef DEDICATED_SERVER
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		return FALSE; // Anomaly Coop: a map server draws nothing: no seqRender, no End, no Present, no device state to ask
 
 	switch (m_pRender->GetDeviceState())
@@ -163,7 +166,9 @@ void CRenderDevice::End(void)
 			{
 				WINDOWINFO wi;
 				GetWindowInfo(m_hWnd, &wi);
-				if (wi.dwWindowStatus != WS_ACTIVECAPTION)
+				// Anomaly Coop: g_always_active keeps it running here as in OnWM_Activate (b57j sp_smoke, coop_device_rules.h)
+				if (coop::device::pauses_at_start(true, wi.dwWindowStatus == WS_ACTIVECAPTION, psDeviceFlags2.test(rsAlwaysActive) != 0,
+				        static_cast<int>(g_screenmode)))
 					Pause(TRUE, TRUE, TRUE, "application start");
 			}
 		}
@@ -188,7 +193,7 @@ void CRenderDevice::PreCache(u32 amount, bool b_draw_loadscreen, bool b_wait_use
 #ifdef DEDICATED_SERVER
     amount = 0;
 #else
-	if (m_pRender->GetForceGPU_REF() || g_coop_headless) // Anomaly Coop: End() counts these frames down, a map server has no End()
+	if (m_pRender->GetForceGPU_REF() || g_dedicated_server) // Anomaly Coop: End() counts these frames down, a map server has no End()
 		amount = 0;
 #endif
 
@@ -237,9 +242,7 @@ static void InitMonitor()
 		Msg("! vid_monitor: resolved handle is invalid, using Auto");
 	}
 
-	POINT cursorPos;
-	GetCursorPos(&cursorPos);
-	g_StartupMonitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTOPRIMARY);
+	g_StartupMonitor = ResolveAutoStartupMonitor(g_screenmode == 2, psCurrentVidMode[0], psCurrentVidMode[1]);
 }
 
 ENGINE_API void ResetStartupMonitor()
@@ -502,7 +505,7 @@ void CRenderDevice::on_idle()
 	secondary_tasks.run(&XRay::Engine::GameThread);
 	
 #ifdef ECO_RENDER // ECO_RENDER START
-	if (!g_coop_headless && (Device.Paused() || IsMainMenuActive() || ps_framelimiter)) // Anomaly Coop: this one spins, a map server sleeps below
+	if (!g_dedicated_server && (Device.Paused() || IsMainMenuActive() || ps_framelimiter)) // Anomaly Coop: this one spins, a map server sleeps below
 	{
 		PROF_EVENT("Eco Render");
 
@@ -560,7 +563,7 @@ void CRenderDevice::on_idle()
 	// Anomaly Coop: the work of the frame without the sleep, for coop_mapserver_stats. A map server keeps to 30 frames a second.
 	const u32 FrameTime = timeGetTime() - FrameStartTime;
 	frame_work.add(FrameTime);
-	if (g_coop_headless)
+	if (g_dedicated_server)
 	{
 		const u32 DSUpdateDelta = 1000 / g_svDedicateServerUpdateReate;
 		if (FrameTime < DSUpdateDelta)
@@ -659,7 +662,7 @@ void CRenderDevice::Run()
 	seqAppStart.Process(rp_AppStart);
 
 	//m_pRender->ClearTarget();
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		b_is_Active = TRUE; // Anomaly Coop: the hidden window is never activated, and the clocks of an inactive game stand still
 	else
 		SetForegroundWindow(m_hWnd);
@@ -748,7 +751,7 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 
 	static int snd_emitters_ = -1;
 
-	if (g_bBenchmark || g_coop_headless) // Anomaly Coop: a map server serves players, it never stops the clock
+	if (g_bBenchmark || g_dedicated_server) // Anomaly Coop: a map server serves players, it never stops the clock
 		return;
 #ifndef DEDICATED_SERVER
 	if (bOn)
@@ -824,7 +827,7 @@ bool CRenderDevice::Paused()
 // rectangle may have moved). Main thread only. ShowCursor is not touched here.
 void CRenderDevice::UpdateCursorClip(bool force)
 {
-	if (!m_hWnd || g_coop_headless) // Anomaly Coop: ClipCursor is the desktop's, it would catch the player's cursor
+	if (!m_hWnd || g_dedicated_server) // Anomaly Coop: ClipCursor is the desktop's, it would catch the player's cursor
 		return;
 
 	const bool want_clip = cursor_should_clip(m_window_focused, g_screenmode, m_ui_cursor_visible.load(),
@@ -849,7 +852,7 @@ void CRenderDevice::UpdateCursorClip(bool force)
 
 void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 {
-	if (g_coop_headless)
+	if (g_dedicated_server)
 		return; // Anomaly Coop: active from Run() on, whatever the desktop does
 
 	u16 fActive = LOWORD(wParam);

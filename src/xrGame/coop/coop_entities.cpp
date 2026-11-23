@@ -3,6 +3,7 @@
 #include "coop_instrument.h"
 #include "attachable_item.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
@@ -10,6 +11,7 @@
 #include "coop_sync.h"
 #include "coop_remote.h"
 #include "coop_requests.h"
+#include "coop_script.h" // F4 G3-1c: script::note_released
 #include "coop_sync_api.h" // F2 T14
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
@@ -18,6 +20,8 @@
 #include "xrCoop/coop_reconcile.h"
 #include "coop_events.h"
 #include "coop_items.h"
+#include "coop_initial_state.h" // R32 W8.4: the item's initial state rides the EntitySpawn tail
+#include "coop_writer.h" // R32 W3/W5: a copy repairs towards the writer of an object
 
 #include "Level.h"
 #include "GameObject.h"
@@ -48,6 +52,11 @@
 
 namespace coop
 {
+namespace events
+{
+void client_forget(u16 local_id);
+}
+
 namespace entities
 {
 namespace
@@ -71,6 +80,10 @@ struct HostEvent
 	HostEventKind kind;
 	u16 id;
 	bool online;
+	// Build 57 (S3): a spawn of what a map server reported goes out under its EchoOf (host_spawn_from_leader); none for the rest
+	u16 echo = levels::wire::kNoLevel;
+	// R32 §8a A21 E-2: Registered while this process applied another's word (ApplyGuard, ClientApply): not its own create
+	bool applied = false;
 };
 // Filled from ALife/server hooks (game thread or main thread, never concurrently with frame()).
 xr_vector<HostEvent> g_host_events;
@@ -79,7 +92,16 @@ u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_s
 u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
 
 // F3a multilevel: online here, or "online at a client" (coop_levels_alife.cpp): a player of the host's level hears the first only.
-bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !levels::online_at_server(e->ID); }
+bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !mode().online_elsewhere(e->ID); }
+
+// A game object of `id` here that is not on its way out (as coop_initial_state.cpp object_of sees an item's).
+bool game_object_here(u16 id)
+{
+	if (!g_pGameLevel)
+		return false;
+	const CObject* o = Level().Objects.net_Find(id);
+	return o && !o->getDestroy();
+}
 
 void write_packet(Writer& w, const NET_Packet& p)
 {
@@ -132,7 +154,8 @@ bool write_spawn(Writer& w, CSE_ALifeDynamicObject* e, NET_Packet& spawn, NET_Pa
 	write_placement(w, e);
 	write_packet(w, spawn);
 	write_packet(w, update);
-	return requests::write_clone_initial(w, e);
+	// R32 W8.4 (§8a A12): after the clone's replacement state, the item's uses, condition, rounds and the decider's field versions
+	return requests::write_clone_initial(w, e) && items::write_initial(w, e);
 }
 
 void host_send_spawn(CSE_ALifeDynamicObject* e)
@@ -188,7 +211,15 @@ void host_process_events()
 		{
 		case HostEventKind::Registered:
 			if (CSE_ALifeDynamicObject* e = ai().alife().objects().object(ev.id, true))
-				host_send_spawn(e);
+			{
+				if (ev.echo == levels::wire::kNoLevel)
+					host_send_spawn(e);
+				else
+				{
+					const levels::EchoOf echo(ev.echo); // that level's players have it from their map server
+					host_send_spawn(e);
+				}
+			}
 			break;
 		case HostEventKind::Released:
 		{
@@ -581,6 +612,9 @@ u32 g_anim_diag_lines = 0; // "[coop-anim]" lines of this session (the first one
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
+u64 g_replaced = 0; // R32 W3 (npc-cleanup F5): spawns that found another object under their id here, which went
+u64 g_squads_whole = 0; // R32 W3 (npc-alife F4): coop_squad_complete raised
+u64 g_stale_spawns = 0; // R32 W3 (verify-D finding 7): spawns of another object under an id this process writes, which went nowhere
 u64 g_unbound_dropped = 0; // member ids forgotten by squads from the wire (released, dead, switched alone, disbanded)
 // B2 (live 2026-10-23, FATAL "child registered but not found" at a client's exit): the mirror's holder/child books.
 u64 g_mirror_with_holder = 0; // children the host had offline, brought online with their holder here (mirror::placement)
@@ -701,17 +735,40 @@ bool row_of(CSE_ALifeDynamicObject* e, reconcile::Row& r)
 	return true;
 }
 
-void collect_rows(u8 bucket, std::vector<reconcile::Row>& rows)
+// R32 W5.1 (verify-D finding 3): the row of `e` as a copy that leads a map of its own sees it when it compares its world (a map
+// server): no online flag (reconcile::mapless) and an item's state without the uses, which row_of reads only from a game object here
+// (state_digest with_uses = its top holder online here). Online on a map and the uses of what is online there are no facts its world
+// has: with them every bucket that held anything online on that map differed for ever.
+reconcile::Row mapless_row(CSE_ALifeDynamicObject* e, const reconcile::Row& here)
+{
+	reconcile::Row r = reconcile::mapless(here);
+	bool root_online = false;
+	if (r.state && e->cast_inventory_item() && !held_by_the_living(e, root_online) && root_online)
+		r.state = items::state_digest(e, false);
+	return r;
+}
+
+// The rows of one bucket; `mapless` (when given) gets the same rows as a copy that leads a map of its own compares them (mapless_row).
+void collect_rows(u8 bucket, std::vector<reconcile::Row>& rows, std::vector<reconcile::Row>* mapless = nullptr)
 {
 	rows.clear();
+	if (mapless)
+		mapless->clear();
 	for (u32 id = bucket; id < kNoId; id += xfer::kBuckets)
 	{
 		CSE_ALifeDynamicObject* e = ai().alife().objects().object(join::to_local(u16(id)), true);
 		reconcile::Row r;
-		if (e && row_of(e, r))
-			rows.push_back(r);
+		if (!e || !row_of(e, r))
+			continue;
+		rows.push_back(r);
+		if (mapless)
+			mapless->push_back(mapless_row(e, r));
 	}
 }
+
+// R32 W5.1 (verify-D finding 3): a copy with a map of its own (Mode::leads_level: a map server, a client of its world) decides what is
+// online there; it compares its world's digest and roster mapless. A mirror shares its host's map: every fact counts, as before.
+bool compares_mapless() { return mode().leads_level(); }
 
 bool peer_is_in_world(const PeerInfo& p) { return p.state == PeerState::Joined && !sync::host_peer_joining(p.id); }
 
@@ -745,21 +802,27 @@ void host_reconcile()
 		return; // nobody to compare with: no walk at all
 	const u8 bucket = g_rc_bucket;
 	g_rc_bucket = u8((g_rc_bucket + 1) % xfer::kBuckets);
-	std::vector<reconcile::Row> rows;
-	collect_rows(bucket, rows);
+	std::vector<reconcile::Row> rows, mapless;
+	collect_rows(bucket, rows, &mapless);
 	Writer w(8);
 	reconcile::write(w, reconcile::hash_bucket(bucket, rows));
 	for (const PeerInfo& p : peers)
 		if (peer_is_in_world(p))
-			if (levels::passes_to(Msg::EntityHash, p.id)) // F3a multilevel: a digest of the host's level's stream
+			if (mode().reaches(p.id, Msg::EntityHash)) // F3a multilevel: a digest of the host's level's stream
 				net::host_send(p.id, Msg::EntityHash, w);
+	// R32 W5.1: and to the mode's links, as StoryHash goes: a map server is a client of its world (bridge_takes(EntityHash)) and leads
+	// a map of its own, so its digest is the mapless one it compares (verify-D finding 3). The co-op host player's link does not take
+	// it (no link message: he is in the host's world itself), a map server has no link.
+	Writer links(8);
+	reconcile::write(links, reconcile::hash_bucket(bucket, mapless));
+	mode().deliver_links(Msg::EntityHash, links, Lane::Reliable);
 	++g_rc.digests;
 }
 
 void host_on_resync(PeerId from, Reader& r)
 {
 	const u8 bucket = r.u8();
-	if (!is_map_authority() || !r.ok() || bucket >= xfer::kBuckets)
+	if (!(mode().decides_world() || mode().leads_level()) || !r.ok() || bucket >= xfer::kBuckets)
 		return;
 	for (const RosterAsk& ask : g_rc_asked)
 		if (ask.peer == from && ask.bucket == bucket)
@@ -772,9 +835,10 @@ void client_on_hash(PeerId, Reader& r)
 	reconcile::BucketHash host;
 	if (!reconcile::read(r, host) || !g_coop_reconcile || !world_up() || Device.dwPrecacheFrame)
 		return;
-	std::vector<reconcile::Row> rows;
-	collect_rows(host.bucket, rows);
-	const bool same = reconcile::hash_bucket(host.bucket, rows) == host;
+	std::vector<reconcile::Row> rows, mapless;
+	const bool own_map = compares_mapless();
+	collect_rows(host.bucket, rows, own_map ? &mapless : nullptr);
+	const bool same = reconcile::hash_bucket(host.bucket, own_map ? mapless : rows) == host;
 	++g_rc.compared;
 	g_rc.differed += same ? 0 : 1;
 	if (g_rc_watch.on_hash(host.bucket, same, mgr().now_ms()))
@@ -789,15 +853,22 @@ void client_on_hash(PeerId, Reader& r)
 void client_on_roster(PeerId, Reader& r)
 {
 	u8 bucket = 0;
-	std::vector<reconcile::Row> host, local;
+	std::vector<reconcile::Row> host, local, mapless;
 	if (!reconcile::read_roster(r, bucket, host) || !g_coop_reconcile || !world_up())
 		return;
 	++g_rc.rosters_in;
-	collect_rows(bucket, local);
+	// R32 W5.1 (verify-D finding 3): a copy with a map of its own compares its world's rows as its digest did: mapless at both ends
+	const bool own_map = compares_mapless();
+	collect_rows(bucket, local, own_map ? &mapless : nullptr);
+	if (own_map)
+		for (reconcile::Row& h : host)
+			h = reconcile::mapless(h);
 	const u64 now = mgr().now_ms();
-	for (const reconcile::Action& a : reconcile::diff(host, local))
+	for (const reconcile::Action& a : reconcile::diff(host, own_map ? mapless : local))
 	{
 		const u16 id = join::to_local(a.id);
+		if (writing::writes(id))
+			continue; // R32 W5.1: the writer is the truth of its object (a map server's own); a mirror writes nothing, repairs all
 		if ((a.what & (reconcile::Gone | reconcile::Replace)) && requests::client_lease_waiting(id))
 			continue; // our own create waits for the host
 		if ((a.what & reconcile::Parent) && events::client_parent_pending(id))
@@ -1066,7 +1137,85 @@ void bring_child_online(CSE_ALifeDynamicObject* e)
 	e->m_bOnline = true;
 }
 
-void client_on_destroy(PeerId, Reader& r);
+// A copy's object `id` (local numbering) goes: the writer released it (EntityDestroy), or another object has its id now (R32 W3:
+// client_on_spawn's Replace), or a clone the writer refused.
+void client_remove(u16 id)
+{
+	g_online.erase(id);
+	g_tracks.erase(id);
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
+	if (!e)
+		return;
+	ApplyGuard guard;
+	leave_group(e); // on the host scripts unregister a member before releasing it
+	if (CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e))
+	{
+		disband(*g);
+		if (!g->m_bOnline && !ai().game_graph().valid_vertex_id(g->m_tGraphID))
+			g->m_tGraphID = ai().alife().graph().actor()->m_tGraphID; // never placed: unregister reads its vertex
+		alife_rw().release(e, true); // a squad has no game object, even when online
+	}
+	else if (e->m_bOnline)
+	{
+		// Online: the standard event chain destroys the game object and then the entity (E3).
+		NET_Packet packet;
+		packet.w_begin(M_EVENT);
+		packet.w_u32(Level().timeServer());
+		packet.w_u16(GE_DESTROY);
+		packet.w_u16(id);
+		Level().Send(packet, net_flags(TRUE, TRUE));
+	}
+	else
+		alife_rw().release(e, true);
+	++g_client_releases;
+}
+
+// R32 W3 receive (npc-alife F4; verify-D finding 4): putting a squad in its smart writes the smart. That is done where the smart is
+// written: by the process that leads the squad's map apart from its world (Mode::level(): a map server), for a squad on that map
+// (reconcile::squad_complete_here). The world server takes a map server's squads whole from its journal and runs no level logic; a map
+// server hears of squads of every map, and the server of a squad's own map writes that smart; a mirror writes nothing.
+bool squad_complete_here(const CSE_ALifeOnlineOfflineGroup& g)
+{
+	return reconcile::squad_complete_here(mode().level() != nullptr, levels::level_of_vertex(g.m_tGraphID), levels::my_level());
+}
+
+// R32 W3 receive (npc-alife F4, design R32-final.md §1 W3): a squad from the wire lists its members by id, and they come after it (a
+// smart's respawn makes the squad first). The process that writes its smart (squad_complete_here) hears coop_squad_complete(squad)
+// once, when the squad is whole here: at its own spawn when its members came first, else at its last missing member's
+// (reconcile::squad_whole). Its srv Lua (coop_srv_levels_brain.script, when_srv) puts the squad in its smart with the stock
+// assign_squad_to_smart. A squad from a save is bound, whole already.
+void squads_made_whole(const CSE_ALifeDynamicObject* e)
+{
+	const auto here = [](u16 id) { return ai().alife().objects().object(id, true) != nullptr; };
+	const auto members_of = [](const CSE_ALifeOnlineOfflineGroup& g) {
+		std::vector<u16> ids;
+		for (const auto& m : g.squad_members())
+			ids.push_back(m.first);
+		return ids;
+	};
+	const auto raise = [&](const CSE_ALifeOnlineOfflineGroup& g) {
+		if (!squad_complete_here(g))
+			return; // another map's squad: its own map server puts it in its smart
+		if (!reconcile::squad_whole(members_of(g), here))
+			return;
+		script::queue_callback("coop_squad_complete", {script::cb_int(g.ID)});
+		++g_squads_whole;
+	};
+	if (const CSE_ALifeOnlineOfflineGroup* g = smart_cast<const CSE_ALifeOnlineOfflineGroup*>(e))
+	{
+		raise(*g);
+		return;
+	}
+	if (!smart_cast<const CSE_ALifeMonsterAbstract*>(e))
+		return; // only a creature is a member
+	for (const auto& it : ai().alife().groups().objects())
+	{
+		const CSE_ALifeOnlineOfflineGroup* g = it.second;
+		const auto listed = g->squad_members().find(e->ID);
+		if (listed != g->squad_members().end() && !listed->second)
+			raise(*g);
+	}
+}
 
 void client_on_spawn(PeerId, Reader& r)
 {
@@ -1074,7 +1223,11 @@ void client_on_spawn(PeerId, Reader& r)
 	const u16 id = join::to_local(id_host);
 	const u16 parent_host = r.u16();
 	const u16 parent = parent_host == kNoId ? kNoId : join::to_local(parent_host);
-	const bool online = r.boolean();
+	// 0 offline, any other byte online at the sender (as Reader::boolean read it); build 57 (protocol 33): 2 = online at the
+	// authority of the level I stand on, which the world server's trunk writes into a spawn of my level's map server
+	// (xrCoop/coop_levels_wire.h mark_spawn_of_your_level). A co-op host writes 0 or 1.
+	const u8 online_word = r.u8();
+	const bool online = online_word != 0;
 	Fvector pos, ang;
 	u32 node;
 	u16 graph_id;
@@ -1085,15 +1238,58 @@ void client_on_spawn(PeerId, Reader& r)
 	std::vector<u8> initial;
 	if (!requests::read_clone_initial(r, id, initial))
 		return;
-	if (ai().alife().objects().object(id, true))
+	// R32 W8.4 (§8a A12): the item's initial state rides after the clone's (write_spawn); read whole here, applied below
+	const Reader initial_state(r.cursor(), r.remaining());
+	if (!items::read_initial(r, nullptr))
+		return;
+	u16 type;
+	spawn.r_begin(type);
+	string64 section;
+	spawn.r_stringZ(section);
+	spawn.r_pos = 0;
+	if (CSE_ALifeDynamicObject* known = ai().alife().objects().object(id, true))
 	{
-		if (!initial.empty() && !requests::stage_clone_initial(ai().alife().objects().object(id, true), initial, true))
+		// R32 W3 receive (npc-cleanup F5): the same kind is a repeat; another kind is another object under this id now (this copy
+		// missed a release, the id was given again): ours goes, the writer's comes. A player's character is kind 0, never replaced.
+		// Unless this process writes its object (verify-D finding 7): then the spawn is a stale word of its world (the echo of its own
+		// spawn from before it released that object and made another under the id), and the writer's object stands.
+		const u16 kind_here = id == 0 || world::is_player_character(known) ? u16(0) : reconcile::kind_of(known->s_name.c_str());
+		switch (reconcile::spawn_of_known(kind_here, reconcile::kind_of(section), writing::writes(id)))
 		{
-			g_id_retry.add(id_host, mgr().now_ms());
+		case reconcile::Known::Repeat:
+		{
+			if (!initial.empty() && !requests::stage_clone_initial(known, initial, true))
+			{
+				g_id_retry.add(id_host, mgr().now_ms());
+				return;
+			}
+			// W8.4 (verify-D finding 6): the state and the decider's versions together, into an offline copy's entity only; the writer's
+			// own object and a game object here keep their own
+			Reader state = initial_state;
+			const bool takes = reconcile::repeat_takes_state(writing::writes(id), game_object_here(id));
+			items::read_initial(state, takes ? known : nullptr);
+			g_id_retry.done(id_host);
+			return; // already have it (P6: repeat is harmless)
+		}
+		case reconcile::Known::Keep:
+			++g_stale_spawns;
+			if (mirror_log_allowed())
+				::Msg("[coop] id %u is [%s] here, written here, and [%s] in a word of the world: a stale spawn, ours stands (R32 W3)",
+				    id_host, known->s_name.c_str(), section);
+			g_id_retry.done(id_host);
+			return;
+		case reconcile::Known::Replace:
+			break;
+		}
+		++g_replaced;
+		if (mirror_log_allowed())
+			::Msg("[coop] id %u is [%s] here and [%s] at its writer: replaced (R32 W3)", id_host, known->s_name.c_str(), section);
+		client_remove(id);
+		if (ai().alife().objects().object(id, true))
+		{
+			g_id_retry.add(id_host, mgr().now_ms()); // its game object goes through the event chain first: asked for again
 			return;
 		}
-		g_id_retry.done(id_host);
-		return; // already have it (P6: repeat is harmless)
 	}
 	if (alife_rw().server().ID_to_entity(id))
 	{
@@ -1128,10 +1324,6 @@ void client_on_spawn(PeerId, Reader& r)
 		return;
 	}
 
-	u16 type;
-	spawn.r_begin(type);
-	string64 section;
-	spawn.r_stringZ(section);
 	CSE_Abstract* abstract = F_entity_Create(section);
 	CSE_ALifeDynamicObject* e = smart_cast<CSE_ALifeDynamicObject*>(abstract);
 	if (!e)
@@ -1159,6 +1351,12 @@ void client_on_spawn(PeerId, Reader& r)
 	e->m_tNodeID = node;
 	e->m_tGraphID = graph_id;
 	e->m_bOnline = false;
+	{
+		// R32 W8.4: the item's uses, condition, rounds and the decider's versions, into the entity before its object can come online
+		// (net_Spawn reads the stock bytes); a non-item carries an empty state
+		Reader state = initial_state;
+		items::read_initial(state, e);
+	}
 	CSE_ALifeDynamicObject* holder = parent == kNoId ? nullptr : ai().alife().objects().object(parent, true);
 	if (holder)
 	{
@@ -1181,15 +1379,16 @@ void client_on_spawn(PeerId, Reader& r)
 	// F3a: on the world server a holder that a map server took is online by its flag alone (host_mark): that is no holder online here.
 	// Build 51: without a valid game vertex register_object put it into no level registry (CALifeGraphRegistry::add), and
 	// update_switch walks that registry only: a phantom of level.spawn_item never came online here. The host's flag speaks
-	// of this level only on a mirror that stands on the host's level (not on the world server, not on a map server).
-	// Known limit (split levels): a player on a level that a MAP SERVER leads gets this message twice and cannot tell the
-	// two apart: the map server's own (host_records there, up the trunk in a Tunnel, its flag is about his level) and the
-	// world server's (host_records there too, reaches_every_level, its flag is the world server's mark of a level it does
-	// not run). trunk_host_on_tunnel re-sends both from kHostPeer with the same layout and no level, and their order is not
-	// fixed. So such a free entity without a game vertex stays on the vote there (the phantom may stay unseen); logged.
+	// of this level only on a mirror that stands on the level of player 0, the co-op host (not on the world server, which plays
+	// nobody and is on no map of LevelMap, not on a map server), or when the byte says so.
+	// Build 57, S3 (TZ 6.3, the psy phantoms of a bloodsucker unseen on a map server's level): a player on a level that a map
+	// server leads got this message twice and could not tell the two apart: the map server's own (up the trunk in a Tunnel, its
+	// flag about his level) and the world server's copy (its flag offline there), both from kHostPeer in no fixed order, so a
+	// free entity without a game vertex stayed on the vote, unseen. Now the world server passes the map server's on marked
+	// (online_word 2, coop_trunk.cpp) and sends that level's players no copy of its own (host_spawn_from_leader).
 	const bool in_level_registry = ai().game_graph().valid_vertex_id(e->m_tGraphID);
-	const bool flag_of_this_level =
-	    is_mirror() && (!levels::split() || levels::led_by_host_process(levels::my_level()));
+	const bool flag_of_this_level = is_mirror() &&
+	    (online_word == levels::wire::kSpawnOnlineAtYourLevel || mode().where(kHostPeer) == Where::Here);
 	// Builds 52-54 (issue 1293): OnlineNow ran for squads too. A squad of the host has no game vertex here as a rule,
 	// it comes online with its members (register_member, apply_group_switch), and a wire squad's members are ids
 	// with no object yet: its own switch_online either met R_ASSERT(!m_bOnline) or walked a null member. Only an
@@ -1240,48 +1439,23 @@ void client_on_spawn(PeerId, Reader& r)
 		requests::clone_finish(id, activated);
 		if (!activated)
 		{
-			Writer gone;
-			gone.u16(id_host);
-			Reader removal(gone.data().data(), gone.data().size());
-			client_on_destroy(kHostPeer, removal);
+			client_remove(id);
 			return;
 		}
 	}
+	if (mode().level())
+		squads_made_whole(e); // only a process that leads a map apart from its world writes a smart (squad_complete_here)
 	++g_client_spawns;
 }
 
 void client_on_destroy(PeerId, Reader& r)
 {
 	const u16 id = join::to_local(r.u16());
-	if (id == 0 || !ai().get_alife())
+	if (!r.ok() || id == 0)
 		return;
-	g_online.erase(id);
-	g_tracks.erase(id);
-	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
-	if (!e)
-		return;
-	ApplyGuard guard;
-	leave_group(e); // on the host scripts unregister a member before releasing it
-	if (CSE_ALifeOnlineOfflineGroup* g = smart_cast<CSE_ALifeOnlineOfflineGroup*>(e))
-	{
-		disband(*g);
-		if (!g->m_bOnline && !ai().game_graph().valid_vertex_id(g->m_tGraphID))
-			g->m_tGraphID = ai().alife().graph().actor()->m_tGraphID; // never placed: unregister reads its vertex
-		alife_rw().release(e, true); // a squad has no game object, even when online
-	}
-	else if (e->m_bOnline)
-	{
-		// Online: the standard event chain destroys the game object and then the entity (E3).
-		NET_Packet packet;
-		packet.w_begin(M_EVENT);
-		packet.w_u32(Level().timeServer());
-		packet.w_u16(GE_DESTROY);
-		packet.w_u16(id);
-		Level().Send(packet, net_flags(TRUE, TRUE));
-	}
-	else
-		alife_rw().release(e, true);
-	++g_client_releases;
+	events::client_forget(id);
+	if (ai().get_alife())
+		client_remove(id);
 }
 
 void client_on_switch(PeerId, Reader& r)
@@ -1430,12 +1604,23 @@ void client_on_squad(PeerId, Reader& r)
 		g->unregister_member(id);
 		++g_rc.squad_members_out;
 	}
+	const u64 now = mgr().now_ms();
 	for (u16 id : wanted)
 	{
 		if (g->squad_members().find(id) != g->squad_members().end())
 			continue;
 		CSE_ALifeMonsterAbstract* c = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(id, true));
-		if (!c || !c->g_Alive() || c->ID_Parent != kNoId || (bound && c->m_bOnline != g->m_bOnline))
+		if (!c)
+		{
+			// R32 W5: a listed member that is not here (or another object holds its id) is asked for, as a repair of the roster: the
+			// answer makes it, or replaces what holds its id (client_on_spawn), and the next EntitySquad takes it in
+			const u16 member_host = join::to_host(id);
+			if (g_rc_watch.allow(member_host, now))
+				g_rc_repairs.push(member_host, reconcile::kAskMissing);
+			++g_rc.squad_waits;
+			continue;
+		}
+		if (!c->g_Alive() || c->ID_Parent != kNoId || (bound && c->m_bOnline != g->m_bOnline))
 		{
 			++g_rc.squad_waits;
 			continue;
@@ -1447,6 +1632,53 @@ void client_on_squad(PeerId, Reader& r)
 			const_cast<CSE_ALifeOnlineOfflineGroup::MEMBERS&>(g->squad_members())[id] = nullptr; // as its STATE_Read
 		++g_rc.squad_members_in;
 	}
+}
+
+// The world's word on one entity to one copy (EntitySpawn: an answer, a repair). False: it could not be written.
+bool host_send_spawn_to(PeerId to, CSE_ALifeDynamicObject* e)
+{
+	NET_Packet spawn, update;
+	e->Spawn_Write(spawn, FALSE);
+	update.w_begin(M_UPDATE);
+	e->UPDATE_Write(update);
+	Writer w(spawn.B.count + update.B.count + 32);
+	if (!write_spawn(w, e, spawn, update))
+		return false;
+	net::host_send(to, Msg::EntitySpawn, w);
+	return true;
+}
+
+// R32 W5 (design R32-final.md §1 W5.1): what is below an object goes with its spawn: a squad's members and a holder's children, each
+// with what is below it, a holder before what it holds (client_on_spawn needs the holder first). A copy that misses a holder misses
+// what it holds, and a squad's members came after it; what the copy has already is a repeat there (P6). As deep as root_of walks.
+constexpr u32 kSubtreeDepth = 8;
+
+void send_below(PeerId to, const CSE_ALifeDynamicObject* e, u32 depth)
+{
+	if (depth >= kSubtreeDepth)
+		return;
+	xr_vector<u16> below;
+	below.assign(e->children.begin(), e->children.end());
+	if (const CSE_ALifeOnlineOfflineGroup* g = smart_cast<const CSE_ALifeOnlineOfflineGroup*>(e))
+		for (const auto& m : g->squad_members())
+			below.push_back(m.first);
+	for (const u16 id : below)
+	{
+		CSE_ALifeDynamicObject* c = id ? ai().alife().objects().object(id, true) : nullptr;
+		if (!c || world::is_player_character(c) || !host_send_spawn_to(to, c))
+			continue;
+		send_below(to, c, depth + 1);
+	}
+}
+
+// `root` and everything below it to one copy (§8 host_send_subtree, below, is its public face). False: the root's own spawn could not
+// be written (nothing went).
+bool send_subtree(PeerId to, CSE_ALifeDynamicObject* root)
+{
+	if (!root || !host_send_spawn_to(to, root))
+		return false;
+	send_below(to, root, 0);
+	return true;
 }
 
 // Host: a client asks about an entity. Without `what`: one of its handlers misses it; with it: a repair of the roster
@@ -1469,7 +1701,8 @@ void host_on_entity_request(PeerId from, Reader& r)
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	if (!e)
 	{
-		if (what & (reconcile::Gone | reconcile::Replace))
+		// A transient EntityLocal can still be in the online entity table outside ALife.
+		if ((what & reconcile::Replace) || ((what & reconcile::Gone) && !events::find_entity(id)))
 			send_destroy();
 		return;
 	}
@@ -1477,17 +1710,9 @@ void host_on_entity_request(PeerId from, Reader& r)
 		what &= reconcile::Spawn; // a player's character is nobody's to replace, and has no switches here
 	if (what & reconcile::Replace)
 		send_destroy();
-	if (what & (reconcile::Spawn | reconcile::Replace))
-	{
-		NET_Packet spawn, update;
-		e->Spawn_Write(spawn, FALSE);
-		update.w_begin(M_UPDATE);
-		e->UPDATE_Write(update);
-		Writer w(spawn.B.count + update.B.count + 32);
-		if (!write_spawn(w, e, spawn, update))
-			return;
-		net::host_send(from, Msg::EntitySpawn, w);
-	}
+	// R32 W5: a squad with its members, a holder with what it holds (a Coop client's squad repair, a map server's missing squad)
+	if ((what & (reconcile::Spawn | reconcile::Replace)) && !send_subtree(from, e))
+		return;
 	if ((what & reconcile::Switch) && e->ID_Parent == kNoId)
 	{
 		// A member goes with its squad: an EntitySwitch of its own tells a client that it left the squad (client_on_switch).
@@ -1560,9 +1785,21 @@ bool interpolate(MirrorTrack& t, u64 render_time, MirrorSample& out)
 
 // ---------------------------------------------------------------- API
 
+// §8 (R32 W4.6, W5.1; verify-D finding 5): `root` and everything below it (a squad's members, a holder's children, as deep as root_of
+// walks) to one copy, each holder before what it holds; a nested player's character is not sent. W4.6 calls it (a player who arrives
+// at a running map server gets his character's whole subtree there); its declaration goes into coop_entities.h with that caller
+// (the header is not WP5's). A repair's answer is host_on_entity_request's, the same send.
+void host_send_subtree(PeerId to, CSE_ALifeDynamicObject* root)
+{
+	send_subtree(to, root);
+}
+
 void install_server(Session& s)
 {
-	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) { if (is_map_authority()) host_on_entity_request(from, r); });
+	s.on(Msg::StateDumpRequest, [](PeerId from, Reader& r) {
+		if (mode().decides_world() || mode().leads_level())
+			host_on_entity_request(from, r);
+	});
 	s.on(Msg::EntityResync, &host_on_resync);
 }
 
@@ -1643,13 +1880,25 @@ bool write_entity(Writer& w, CSE_ALifeDynamicObject* e)
 	write_placement(w, e);
 	write_packet(w, spawn);
 	write_packet(w, update);
-	return requests::write_clone_initial(w, e);
+	return requests::write_clone_initial(w, e) && items::write_initial(w, e); // R32 W8.4: the layout of write_spawn
 }
 
 void host_spawn_from_leader(Reader& r)
 {
-	ApplyGuard guard;
-	client_on_spawn(kHostPeer, r);
+	Reader look(r.cursor(), r.remaining());
+	const u16 id = join::to_local(look.u16());
+	const size_t before = g_host_events.size();
+	{
+		ApplyGuard guard;
+		client_on_spawn(kHostPeer, r);
+	}
+	// Build 57, S3 (TZ 6.3, the psy phantoms): the players of the level of that map server have its own spawn (up the trunk, marked
+	// online at their level: coop_trunk.cpp). This world's copy goes out at the frame, after the EchoOf of the report is over: it
+	// keeps it, so they do not get the copy too (it said offline here, and coming first it left a phantom offline for good).
+	const u16 echo = levels::echo_now();
+	for (size_t i = before; i < g_host_events.size(); ++i)
+		if (g_host_events[i].kind == HostEventKind::Registered && g_host_events[i].id == id)
+			g_host_events[i].echo = echo;
 }
 
 void host_send_place(PeerId to, CSE_ALifeDynamicObject* e)
@@ -1677,23 +1926,43 @@ void host_collect_online(xr_vector<u16>& out)
 	}
 }
 
-bool host_records() { return is_map_authority() && !(is_map_server() && g_applying); }
+bool host_records()
+{
+	return mgr().active() && (mode().decides_world() || (mode().leads_level() && !g_applying));
+}
+
+bool host_own_spawn_unsent(u16 id)
+{
+	for (const HostEvent& ev : g_host_events)
+		if (ev.kind == HostEventKind::Registered && ev.id == id && !ev.applied)
+			return true;
+	return false;
+}
 
 void host_on_entity_registered(CSE_ALifeDynamicObject* e)
 {
 	if (host_records() && e)
-		g_host_events.push_back({HostEventKind::Registered, e->ID, false});
+	{
+		HostEvent ev{HostEventKind::Registered, e->ID, false};
+		ev.applied = g_applying > 0; // E-2: a map server's spawn the world takes (host_spawn_from_leader) is no create of its own
+		g_host_events.push_back(ev);
+	}
 	if (e)
-		levels::up_spawned(e->ID); // F3a: a map server tells the world server
+	{
+		if (LevelSide* side = mode().level())
+			side->level_entity_up(EntityUp::Spawned, e->ID, kNoId);
+	}
 }
 
 void host_on_entity_released(u16 id)
 {
+	script::note_released(id); // F4 G3-1c: a weapon rider that came before this release never reaches a same-name replacement
 	items::forget_item(id);
 	syncapi::on_entity_destroyed(id); // F2 T14: its coop.sync scope goes (host, single player; any game thread)
 	if (host_records())
 		g_host_events.push_back({HostEventKind::Released, id, false});
-	levels::xfer_on_released(id); // F3a: a map server tells the world server
+	if (LevelSide* side = mode().level())
+		side->level_entity_up(EntityUp::Released, id, kNoId);
 }
 
 void host_on_switch(CSE_ALifeDynamicObject* e, bool online)
@@ -1738,10 +2007,14 @@ void on_client_live()
 
 void reconcile_frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		host_reconcile();
-	else if (mgr().is_live_client())
+	// R32 W5.1: every copy of a world repairs towards its writer: a client, and a map server (the host of its level, a live client of
+	// its world) for what its world writes (client_on_roster skips what this process writes). The co-op host and the world server
+	// are hosts only (Phase::Hosting): no client part runs there
+	if (mgr().is_live_client())
 		client_reconcile();
+	mode().reconcile_world(); // the mode's own part (none has one now: the Core's client part covers a map server)
 }
 
 int& reconcile_switch() { return g_coop_reconcile; }
@@ -1965,7 +2238,7 @@ bool drive_mirror(CGameObject* obj)
 
 void frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		// Level-change review: what the engine recorded while the world was not up belongs to a world that is gone, or is
 		// being built (every client rejoins from the new world's save): an id of the old one names another object in the
@@ -1985,13 +2258,19 @@ void print_status()
 {
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);
 		::Msg("[coop]   roster: %s, %llu digests, %llu rosters (%llu rows, %u waiting), %llu entity requests, %llu destroys "
 		      "of ids that are gone", g_coop_reconcile ? "on" : "off", g_rc.digests, g_rc.rosters, g_rc.rows,
 		    (u32)g_rc_asked.size(), g_rc.repairs_in, g_rc.repairs_gone);
+		if (mgr().is_live_client()) // R32 W5.1: a map server is a client of its world too
+			::Msg("[coop]   roster of the world: %llu digests compared, %llu differed, %llu rosters asked / %llu came, %llu repairs "
+			      "asked (%u waiting), %llu spawns replaced another object under their id, %llu stale spawns of an object written "
+			      "here (ours stood), %llu squads made whole",
+			    g_rc.compared, g_rc.differed, g_rc.rosters_asked, g_rc.rosters_in, g_rc.repairs_asked, (u32)g_rc_repairs.size(),
+			    g_replaced, g_stale_spawns, g_squads_whole);
 	}
 	else
 	{
@@ -2005,9 +2284,9 @@ void print_status()
 		::Msg("[coop]   roster applied: %llu traits, squad members %llu out / %llu in (%llu waited)", g_rc.traits_applied,
 		    g_rc.squad_members_out, g_rc.squad_members_in, g_rc.squad_waits);
 		::Msg("[coop]   world in: %u online, %u tracked, %llu spawns, %llu releases, %llu switches, %llu missing, "
-		    "local spawns %llu forwarded / %llu blocked",
+		    "local spawns %llu forwarded / %llu blocked, %llu spawns replaced another object under their id (R32 W3)",
 		    (u32)g_online.size(), (u32)g_tracks.size(), g_client_spawns, g_client_releases, g_client_switches,
-		    g_missing, g_forwarded_spawns, g_blocked_spawns);
+		    g_missing, g_forwarded_spawns, g_blocked_spawns, g_replaced);
 		u32 wire_squads = 0, wire_ids = 0;
 		if (ai().get_alife())
 			for (const auto& it : ai().alife().groups().objects())

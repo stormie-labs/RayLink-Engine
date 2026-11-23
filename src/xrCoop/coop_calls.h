@@ -33,10 +33,16 @@
 // the others run as in single player whatever their row says. The gate never decides how often: the host limits what
 // a request path sends (coop_requests.cpp buckets, the session limits, coop.sync.limit).
 //
+// R32 (temp/r30/design/R32-final.md §1 W2a, W9): the writer gate after the call gate, at the end of this file. The script writes
+// that create, release or give an info ask the writer rule (coop_writer_rules.h gate) as well: decide_writer_gate.
+//
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
+#include "coop_writer_rules.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -990,7 +996,8 @@ inline constexpr Call kCalls[] = {
 	{"debug_render:get_object", CallClass::Read},
 	{"debug_render:remove_object", CallClass::View},
 	{"debug_render:set_flags", CallClass::View},
-	// --- module game (level_script.cpp): 36
+	// --- module game (level_script.cpp): 38
+	{"game:active_tutorial_id", CallClass::Read},
 	{"game:active_tutorial_name", CallClass::Read},
 	{"game:actor_lower_weapon", CallClass::Owner},
 	{"game:actor_weapon_lowered", CallClass::Read},
@@ -1008,6 +1015,7 @@ inline constexpr Call kCalls[] = {
 	{"game:open_originals_link", CallClass::View},
 	{"game:play_hud_anm", CallClass::View},
 	{"game:play_hud_motion", CallClass::View},
+	{"game:player_hud_ready", CallClass::Read},
 	{"game:prefetch_model", CallClass::View},
 	{"game:prefetch_texture", CallClass::View},
 	{"game:reload_language", CallClass::View},
@@ -1784,5 +1792,360 @@ private:
 	std::map<std::string, Name, std::less<>> m_refused; // std::less<>: find() by string_view
 	uint64_t m_dropped = 0;
 };
+
+// ===================================================================================================================== R32 W2a
+// The writer gate (temp/r30/design/R32-final.md §1 W2a, §8, §8a A8, A9). After today's call gate (decide above) the engine asks
+// the writer rule (writer::gate, coop_writer_rules.h) about the script writes that create under an object, release it or give it
+// an info: alife():create (every form), create_ammo, register, clone_weapon, release, give_info, disable_info and level.spawn_item
+// (alife_simulator_script.cpp, level_script.cpp; the engine half is coop_router.cpp writer_refuses). The co-op host and single
+// player write everything (Run) and a player's machine keeps today's verdict (Mirror): for them the call site does what it does
+// today, in both settings (tests/test_writer_gate.cpp, the golden table). The world server and a map server get the writer's verdict.
+
+// The machine setting coop_writer_gate (W2 Rollout):
+//   Log      the first build: counts per call and script what the gate would refuse, ask or order, one log line each, and changes
+//            nothing;
+//   Enforce  acts on it.
+// It is a rollout switch, not a special case: the rule is the same in both settings.
+enum class WriterGate : uint8_t
+{
+	Log,
+	Enforce,
+};
+
+inline const char* writer_gate_name(WriterGate g)
+{
+	switch (g)
+	{
+	case WriterGate::Log: return "log";
+	case WriterGate::Enforce: return "enforce";
+	}
+	return "log";
+}
+
+// "log" or "enforce" (letter case and surrounding blanks ignored); false (out unchanged) for anything else.
+inline bool parse_writer_gate(std::string_view text, WriterGate& out)
+{
+	const std::string_view t = detail::trimmed(text);
+	if (detail::iequals(t, "log"))
+		out = WriterGate::Log;
+	else if (detail::iequals(t, "enforce"))
+		out = WriterGate::Enforce;
+	else
+		return false;
+	return true;
+}
+
+// This process's setting: Log until the console command coop_writer_gate says otherwise (coop_router.cpp). Read by the script gate and
+// by the id steps of xrServer (W9 below); written from the console.
+inline std::atomic<WriterGate>& writer_gate_setting()
+{
+	static std::atomic<WriterGate> setting{WriterGate::Log};
+	return setting;
+}
+
+// What one gated write does once the writer gate has looked at it:
+//   Today   today's call gate decides (Run, Request, Refuse): the writer lets it run here, it is a player's machine's, or the setting
+//           is Log;
+//   Refuse  nothing: the stock "nothing" (nil, false), counted, one log line per call and script;
+//   Ask     a map server: its journal's Ask entry to its world, which executes it if it writes the object; not applied here first;
+//   Order   the world server: the numbered far order to the map server that writes it, held until answered.
+// The engine has no path for Ask and Order yet (an Ask entry needs a LevelSide up, an order the mode's far order: proposed as an
+// amendment of §8a): a call site keeps today's code for them, and the census counts them in both settings.
+enum class WriteAct : uint8_t
+{
+	Today,
+	Refuse,
+	Ask,
+	Order,
+};
+
+inline WriteAct write_act(writer::GateVerdict v, WriterGate setting)
+{
+	if (setting == WriterGate::Log)
+		return WriteAct::Today;
+	switch (v)
+	{
+	case writer::GateVerdict::Refuse: return WriteAct::Refuse;
+	case writer::GateVerdict::Ask: return WriteAct::Ask;
+	case writer::GateVerdict::Order: return WriteAct::Order;
+	case writer::GateVerdict::Run:
+	case writer::GateVerdict::Mirror: break;
+	}
+	return WriteAct::Today;
+}
+
+// The census counts what the gate does not run here (or would not, under Log): Refuse, Ask, Order.
+inline bool census_counts(writer::GateVerdict v)
+{
+	return v == writer::GateVerdict::Refuse || v == writer::GateVerdict::Ask || v == writer::GateVerdict::Order;
+}
+
+// The gate the call site acts on: today's, unless the writer gate refuses it.
+inline Gate decide_write(Gate today, WriteAct act)
+{
+	return act == WriteAct::Refuse ? Gate::Refuse : today;
+}
+
+// The scope of the code a write comes from, from the router domain of the innermost wrapper of coop_route.script on the Lua stack
+// (coop.route.scoped): host -> Decision; level, owner, view -> LevelCode (it runs on the map server of the map as well); none,
+// kUnknownScope (a time event or unique call set by code of no known scope) or no wrapper at all -> Unknown, which the world server
+// counts as a decision (smart respawns, death consequences, C++ to Lua paths).
+constexpr std::string_view kUnknownScope = "?";
+
+inline writer::CodeScope scope_of_domain(std::string_view domain)
+{
+	if (detail::iequals(domain, "host"))
+		return writer::CodeScope::Decision;
+	if (detail::iequals(domain, "level") || detail::iequals(domain, "owner") || detail::iequals(domain, "view"))
+		return writer::CodeScope::LevelCode;
+	return writer::CodeScope::Unknown;
+}
+
+inline const char* scope_name(writer::CodeScope s)
+{
+	switch (s)
+	{
+	case writer::CodeScope::LevelCode: return "level code";
+	case writer::CodeScope::Decision: return "decision";
+	case writer::CodeScope::Unknown: return "unknown";
+	}
+	return "unknown";
+}
+
+// What a gated write names:
+//   Object        an object of this world: what a release or an info changes, or the parent a create puts the new object under; its
+//                 root is writer::root_of's;
+//   NewResident   a create with no parent of a thing that is no unit (an item, a box, a zone): the new object is its own root, a
+//                 resident of the map it stands on;
+//   NewUnit       a create with no parent of a squad or a creature;
+//   NewOfSection  a create with no parent whose kind the engine reads from the section only where it changes the answer.
+enum class Target : uint8_t
+{
+	Object,
+	NewResident,
+	NewUnit,
+	NewOfSection,
+};
+
+struct WriteTarget
+{
+	Target kind = Target::Object;
+	uint16_t id = writer::kNoId; // Object: the object, or the parent of a create
+	uint16_t level = writer::kNoLevel; // the New kinds: the map the new object stands on
+	const char* what = nullptr; // for the log line, and the section of NewOfSection
+};
+
+// The writer of the new root of a create with no parent (W1.2): a unit this process makes is its own, the world server's (W1.d) and a
+// map server's on its own map (born under its slice and held from its birth, W1.2b; also while it starts); anything else is a
+// resident of its map, written by whoever writes that map's residents (`resident`: the Mode's answer for a resident there). A map
+// server never writes another map, so a unit it would make there counts as that map's resident.
+inline writer::Writer new_root_writer(writer::ProcessKind p, Target kind, bool on_own_level, const writer::Writer& resident)
+{
+	if (kind != Target::NewUnit)
+		return resident;
+	switch (p)
+	{
+	case writer::ProcessKind::World: return writer::this_process();
+	case writer::ProcessKind::Level: return on_own_level ? writer::this_process() : resident;
+	case writer::ProcessKind::Whole:
+	case writer::ProcessKind::Mirror: break;
+	}
+	return resident;
+}
+
+// Is the root the ghost: actor 0 of a process whose actor plays nobody (the world server, a map server; W1.5)?
+inline bool is_ghost(const writer::RootFacts& root, bool actor_is_player)
+{
+	return !actor_is_player && root.kind == writer::RootKind::Character && root.root == writer::kGhostId;
+}
+
+// What the engine found about one gated write on this process: its kind, the writer of the target's root (Mode::writer_of, or
+// new_root_writer for a create with no parent), the scope of the code, whether that root stands on the map this process leads, and
+// whether it is the ghost.
+struct WriteFacts
+{
+	writer::ProcessKind process;
+	writer::Writer writer;
+	writer::CodeScope scope;
+	bool root_on_own_level;
+	bool ghost;
+};
+
+struct WriteDecision
+{
+	writer::GateVerdict verdict;
+	WriteAct act;
+	Gate gate; // what the call site does: today's gate, or Refuse
+};
+
+// The whole writer gate of one write: the W2a verdict, what it does under the setting, and the gate the call site acts on.
+inline WriteDecision decide_writer_gate(const WriteFacts& f, writer::WriteOp op, Gate today, WriterGate setting)
+{
+	const writer::GateVerdict v = writer::gate(f.process, f.writer, op, f.scope, f.root_on_own_level, f.ghost);
+	const WriteAct act = write_act(v, setting);
+	return WriteDecision{v, act, decide_write(today, act)};
+}
+
+// ------------------------------------------------------------------------------------------------- the census (coop_status)
+
+//   Refuse, Ask, Order  the verdict (census_counts);
+//   RunIntoLed          the world server ran a create into a map a map server leads, from code that may run on that map server as
+//                       well (§9.2, §2 row A: "WS unknown-scope writes into a led level", each case a route line): it runs in both
+//                       settings, and only the census can name it.
+enum class CensusKind : uint8_t
+{
+	Refuse,
+	Ask,
+	Order,
+	RunIntoLed,
+};
+
+// The census kind of a counted verdict (census_counts); Refuse for any other.
+inline CensusKind census_kind(writer::GateVerdict v)
+{
+	return v == writer::GateVerdict::Ask ? CensusKind::Ask : v == writer::GateVerdict::Order ? CensusKind::Order : CensusKind::Refuse;
+}
+
+inline const char* census_name(CensusKind k)
+{
+	switch (k)
+	{
+	case CensusKind::Refuse: return "refuse";
+	case CensusKind::Ask: return "ask";
+	case CensusKind::Order: return "order";
+	case CensusKind::RunIntoLed: return "run into led";
+	}
+	return "refuse";
+}
+
+// What the census counts of one write:
+//   - a verdict the gate does not run here (or would not, under Log): Refuse, Ask, Order;
+//   - on the world server, a create that runs under a root a map server writes (`root_writer`: Mode::writer_of for the target's root,
+//     or for the map of a new root, before new_root_writer), from code not known to run on the world only: an unknown scope (a time
+//     event or unique call of no known scope, a C++ to Lua path; the table runs it as a decision) or level code (it makes a new unit
+//     there, the world's own by new_root_writer, while that map's server runs the same level code). That map server may make the same
+//     object: RunIntoLed. A decision (the host domain) is not counted: the router keeps it off the map server.
+// Nothing else is counted: the co-op host, a player's machine, a map server's own writes.
+struct CensusNote
+{
+	bool counted;
+	CensusKind kind;
+};
+
+inline CensusNote census_note(writer::ProcessKind p, const writer::Writer& root_writer, writer::WriteOp op, writer::CodeScope scope,
+    writer::GateVerdict v)
+{
+	if (census_counts(v))
+		return CensusNote{true, census_kind(v)};
+	const bool into_led = p == writer::ProcessKind::World && v == writer::GateVerdict::Run && op == writer::WriteOp::Create &&
+	    root_writer.is == writer::WriterIs::Other && scope != writer::CodeScope::Decision;
+	return CensusNote{into_led, CensusKind::RunIntoLed};
+}
+
+// The kind of a new object of a class with no parent (coop_router.cpp section_kind): a squad or a monster is a unit (writer::is_unit;
+// a new creature lives: CSE_ALifeCreatureAbstract starts with health 1), anything else a resident of its map.
+inline Target new_kind_of_class(bool group, bool monster)
+{
+	return writer::is_unit(group, monster, true) ? Target::NewUnit : Target::NewResident;
+}
+
+// What the gate refused, asked or ordered (or would have, under Log), and the world's creates that ran into a led map (census_note),
+// per (kind, call, script), for coop_status: the census the stand reads before enforce. The first note of a key gets its one log line ("one log line per script", W2a); the table is bounded: a key
+// past kMaxKeys counts in the totals only, without a line.
+class WriterCensus
+{
+public:
+	static constexpr size_t kMaxKeys = 512;
+
+	struct Totals
+	{
+		uint64_t refuse = 0, ask = 0, order = 0, led = 0; // led: RunIntoLed
+	};
+
+	// Counts one write; true when its (kind, call, script) is new since clear(): the caller writes its log line.
+	bool note(CensusKind k, std::string_view call, std::string_view script)
+	{
+		switch (k)
+		{
+		case CensusKind::Refuse: ++m_totals.refuse; break;
+		case CensusKind::Ask: ++m_totals.ask; break;
+		case CensusKind::Order: ++m_totals.order; break;
+		case CensusKind::RunIntoLed: ++m_totals.led; break;
+		}
+		std::string key;
+		key.reserve(call.size() + script.size() + 16);
+		key.append(census_name(k)).append(" ").append(call).append(" @ ").append(script);
+		const auto it = m_keys.find(key);
+		if (it != m_keys.end())
+		{
+			++it->second;
+			return false;
+		}
+		if (m_keys.size() >= kMaxKeys)
+		{
+			++m_dropped;
+			return false;
+		}
+		m_keys.emplace(std::move(key), 1);
+		return true;
+	}
+
+	const Totals& totals() const { return m_totals; }
+	size_t keys() const { return m_keys.size(); }
+	uint64_t dropped() const { return m_dropped; }
+
+	// The keys counted most, most first (a tie by key), at most n: "refuse alife:create @ some_script" -> count.
+	std::vector<std::pair<std::string, uint64_t>> top(size_t n) const
+	{
+		std::vector<std::pair<std::string, uint64_t>> all(m_keys.begin(), m_keys.end());
+		const auto more = [](const std::pair<std::string, uint64_t>& a, const std::pair<std::string, uint64_t>& b)
+		{ return a.second != b.second ? a.second > b.second : a.first < b.first; };
+		const size_t k = n < all.size() ? n : all.size();
+		std::partial_sort(all.begin(), all.begin() + std::ptrdiff_t(k), all.end(), more);
+		all.resize(k);
+		return all;
+	}
+
+	void clear()
+	{
+		m_totals = Totals();
+		m_keys.clear();
+		m_dropped = 0;
+	}
+
+private:
+	Totals m_totals;
+	std::map<std::string, uint64_t> m_keys;
+	uint64_t m_dropped = 0;
+};
+
+// ===================================================================================================================== R32 W9
+// A map server takes the ids of its own pool (its slice and the world's blocks: Mode::own_free_id, xrServer::PerformIDgen). What it
+// does when the pool has no id left depends on where the id is taken:
+//   Start  the start of a create a caller can still refuse with the stock "nothing": a script create before any stock code runs
+//          (alife_simulator_script.cpp), a new entity of a spawn packet (xrServer::Process_spawn's own "not created", NULL);
+//   Chain  an id a stock chain that already runs needs: the supplies of an object being made (CSE_ALifeObject::spawn_supplies,
+//          CSE_ALifeMonsterBase::spawn_supplies, CSE_ALifeTraderAbstract::spawn_supplies dereference what spawn_item returns), a
+//          spawn-graph group's member. No caller there can take a refusal.
+enum class IdStep : uint8_t
+{
+	Start,
+	Chain,
+};
+
+//   StockId  the stock generator's id, outside the pool, logged loudly: the world refuses its Spawn (IdRange) and the W2b repair
+//            releases it one round trip later;
+//   Refuse   not created.
+enum class NoId : uint8_t
+{
+	StockId,
+	Refuse,
+};
+
+// Enforce refuses a create at its start; Log refuses nothing (the census build); a chain is never refused.
+inline NoId no_id(WriterGate setting, IdStep step)
+{
+	return setting == WriterGate::Enforce && step == IdStep::Start ? NoId::Refuse : NoId::StockId;
+}
 } // namespace calls
 } // namespace coop

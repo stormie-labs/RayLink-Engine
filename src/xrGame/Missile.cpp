@@ -649,7 +649,7 @@ bool CMissile::Action(u16 cmd, u32 flags)
 			m_constpower = true;
 			if (flags & CMD_START)
 			{
-				if (GetState() == eIdle)
+				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // Anomaly Coop: not while its create is pending
 				{
 					m_throw = true;
 					SwitchState(eThrowStart);
@@ -668,7 +668,7 @@ bool CMissile::Action(u16 cmd, u32 flags)
 			if (flags & CMD_START)
 			{
 				m_throw = false;
-				if (GetState() == eIdle)
+				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // Anomaly Coop: not while its create is pending
 					SwitchState(eThrowStart);
 				else if (GetState() == eReady)
 				{

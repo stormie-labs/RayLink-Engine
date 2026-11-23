@@ -59,6 +59,12 @@ public:
 	int iPaused;
 	BOOL bMoved;
 	BOOL b2D;
+	// Anomaly Coop: sm_Mono3D (TZ R59). The target mixes this emitter's stereo source down to mono, so it can play positional.
+	// Set once, right after start (OpenAL keeps one format per buffer queue); the cursor, length and end of sound still count
+	// the source's own bytes.
+	bool bMono3D;
+	// Whether the sound follows its position: a mono source (stock), or a stereo one mixed down (sm_Mono3D).
+	bool positional_source();
 	bool bIntro;
 	BOOL bStopping;
 	BOOL bRewind;

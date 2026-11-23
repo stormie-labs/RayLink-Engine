@@ -27,6 +27,11 @@
 //   EntityResync  u8 bucket
 //   EntityTraits  u16 object, i32 community, i32 rank, i32 reputation
 //   EntitySquad   u16 squad, u16 n, n x u16 member
+// R32 W3 (at the end): what every copy does with a spawn of an id it has (spawn_of_known), when a squad from the wire is whole
+// (squad_whole), and the echo of a fact a map server reported (merged_echo, echo_reaches; tests/test_relay_echo.cpp). WP5 fix round:
+// a stale spawn never replaces the writer's own object (Known::Keep), a repeat's item state goes into an offline copy only
+// (repeat_takes_state), a stalled move asks Spawn only for what is missing (stalled_ask), a map server compares its world's digest
+// mapless (mapless), coop_squad_complete is raised where the squad's map is led (squad_complete_here).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -37,7 +42,7 @@
 #include <map>
 #include <vector>
 
-#include "coop_level_hash.h"
+#include "srv/coop_level_hash.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -475,6 +480,103 @@ inline bool read(Reader& r, SquadMsg& m)
 	for (uint16_t& id : m.members)
 		id = r.u16();
 	return r.ok();
+}
+
+// ---------------------------------------------------------------- R32 W3: the receive of every copy (design R32-final.md §1 W3)
+
+// npc-cleanup F5: what a copy does with an EntitySpawn of an id it already has. The same kind is a repeat (P6: harmless, nothing
+// changes); another kind is another object under that id now (the copy missed a release and the id was given again): the copy's
+// object goes and the writer's comes (Replace), at once, not a roster round later. Kind 0 is a player's character (kind_of never
+// gives 0): its section differs between the machines (a client's own actor, the proxies), it is never replaced.
+// `writes_known`: this process writes the object it has under that id (writing::writes; a mirror never does). Then another kind is
+// a stale word of its world (the echo of a spawn of its own from before it released the object and made another under the id, an
+// answer to an older ask): the writer is the truth of its object, the stale spawn goes nowhere (Keep; verify-D finding 7).
+enum class Known : uint8_t
+{
+	Repeat,
+	Replace,
+	Keep,
+};
+
+inline Known spawn_of_known(uint16_t kind_here, uint16_t kind_spawn, bool writes_known)
+{
+	if (kind_here == 0 || kind_spawn == 0 || kind_here == kind_spawn)
+		return Known::Repeat;
+	return writes_known ? Known::Keep : Known::Replace;
+}
+
+// W8.4 (verify-D finding 6): the item state of a repeated spawn (the initial-state tail) goes into the copy's entity, and the decider's
+// versions with it, only where both can be taken: this process does not write the object (`writes_it`: its own state stands) and has no
+// game object for it (`object_here`: the object's own state stands, and versions without their values would claim a write it has not
+// applied, so the decider's push of that write would be dropped as known).
+inline bool repeat_takes_state(bool writes_it, bool object_here)
+{
+	return !writes_it && !object_here;
+}
+
+// npc-alife F4: a squad from the wire lists its members by id, and they may come after it. It is whole when it lists somebody and
+// every listed id is here (`here(id)`). A copy that runs the world's logic (not a mirror) raises coop_squad_complete(squad) at the
+// spawn that makes it whole: the squad's own (its members came first) or its last missing member's. A repeated spawn changes
+// nothing, so it raises nothing.
+template <class Here>
+inline bool squad_whole(const std::vector<uint16_t>& members, Here here)
+{
+	if (members.empty())
+		return false;
+	for (const uint16_t id : members)
+		if (!here(id))
+			return false;
+	return true;
+}
+
+// ---------------------------------------------------------------- R32 W3: the relay down (design R32-final.md §1 W3)
+
+// A fact a map server reported reaches every other copy once. The world applies it under the EchoOf of the reporting level
+// (levels::echo_now); what it records then (a holder change, a death, a release) keeps that level until the frame's flush sends it,
+// when the scope is over. That level's players and its map server have it already: the broadcast skips them (the players: the
+// passes_to of an EchoOf; the bridge: echo_reaches below, in the mode's delivery). kNoEcho = levels::wire::kNoLevel: no echo.
+constexpr uint16_t kNoEcho = 0xFFFF;
+
+// Two records of one object in a frame keep the level only when both came from it: a change of the world's own in between (or one
+// from another level) goes to everybody, the last state of the object is in the flush.
+inline uint16_t merged_echo(uint16_t first, uint16_t then)
+{
+	return first == then ? first : kNoEcho;
+}
+
+// Does a broadcast made under the echo of level `echo` reach the copy that leads level `at` (a map server's bridge)?
+inline bool echo_reaches(uint16_t echo, uint16_t at)
+{
+	return echo == kNoEcho || at != echo;
+}
+
+// ---------------------------------------------------------------- R32 WP5 fix round (the verify-D findings 2, 3, 4)
+
+// D5 (coop_events.cpp client_step_parents): a holder change that did not finish in time asks for the item and for its holder.
+// An EntitySpawn answer is the object's whole subtree (W5.1: a player's character with all he carries), so Spawn is asked only for
+// an id this copy lacks (`here` false); in that case Gone lets the authority confirm the id was destroyed.
+inline uint8_t stalled_ask(bool here)
+{
+	return here ? uint8_t(Parent | State) : uint8_t(Spawn | Parent | State | Gone);
+}
+
+// W5.1 (finding 3): a row as a copy that leads a map of its own compares it with its world (a map server). What is online on its map is
+// its own business: its world holds such an object offline (online_here is false there) and cannot say it. The online flag goes; a
+// player's character (kind 0) keeps the flag row_of gives it at both ends. The other half of the mapless row, an item state without the
+// uses only a game object shows, is the engine's (coop_entities.cpp mapless_row). The world sends its links the digest of mapless rows.
+inline Row mapless(Row r)
+{
+	if (r.kind != 0)
+		r.online = false;
+	return r;
+}
+
+// npc-alife F4 (finding 4): coop_squad_complete makes the srv Lua put a squad in its smart, a write to the smart. It is raised where the
+// smart is written: by the process that leads the squad's map apart from its world (`leads_apart`: Mode::level() is a level side, a map
+// server), for a squad standing on that map (`squad_level` == `my_level`, both known; kNoEcho is no level).
+inline bool squad_complete_here(bool leads_apart, uint16_t squad_level, uint16_t my_level)
+{
+	return leads_apart && my_level != kNoEcho && squad_level == my_level;
 }
 } // namespace reconcile
 } // namespace coop

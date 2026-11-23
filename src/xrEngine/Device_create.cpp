@@ -4,6 +4,7 @@
 #include "../Include/xrRender/DrawUtils.h"
 //#include "xr_effgamma.h"
 #include "render.h"
+#include "IGame_Persistent.h"
 #include "dedicated_server_only.h"
 #include "../xrcdb/xrxrc.h"
 
@@ -194,7 +195,7 @@ PROTECT_API void CRenderDevice::Create()
 		style = WS_POPUP;
 	}
 
-	if (!g_coop_headless) // Anomaly Coop: without SWP_NOACTIVATE this takes the focus from the player's game
+	if (!g_dedicated_server) // Anomaly Coop: without SWP_NOACTIVATE this takes the focus from the player's game
 	{
 		SetWindowLongPtr(m_hWnd, GWL_STYLE, style);
 		SetWindowPos(m_hWnd, HWND_TOP, monX, monY, w, h, SWP_FRAMECHANGED);
@@ -243,7 +244,7 @@ PROTECT_API void CRenderDevice::Create()
 	// m_window_focused if it is not.
 	m_window_focused = true;
 	UpdateCursorClip(true);
-	if (!g_coop_headless) // Anomaly Coop: the same
+	if (!g_dedicated_server) // Anomaly Coop: the same
 		SetActiveWindow(m_hWnd);
 
 	string_path fname;
