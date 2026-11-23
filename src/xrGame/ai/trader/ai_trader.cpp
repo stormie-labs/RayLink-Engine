@@ -25,6 +25,7 @@
 #include "../../../xrServerEntities/clsid_game.h"
 #include "../../coop/coop_trade.h" // Anomaly Coop
 #include "../../coop/coop_remote.h" // Anomaly Coop (WP1)
+#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
 
 CAI_Trader::CAI_Trader()
 {
@@ -201,6 +202,16 @@ void CAI_Trader::OnEvent(NET_Packet& P, u16 type)
 			bool just_before_destroy = !P.r_eof() && P.r_u8();
 			bool dont_create_shell = (type == GE_TRADE_SELL) || just_before_destroy;
 
+			// Anomaly Coop (O1-container, b57 RL-WKWE-CPCY): drop only a found item this trader's inventory lists. On a co-op
+			// client "taken out" may come for an item that is no game object here (stock read a null item, at net_Stop too),
+			// and DropItem of another inventory's item would wipe that inventory's pointer and take it off its real holder
+			CInventoryItem* item = Obj ? smart_cast<CInventoryItem*>(Obj) : nullptr;
+			if (!coop::container::reject_applies(Obj != nullptr, item && item->m_pInventory == &inventory()))
+			{
+				Msg("[coop] trader %u [%s]: item %u taken out, but %s", u32(ID()), cName().c_str(), u32(id),
+				    Obj ? "its inventory does not list it" : "it is no game object here");
+				break;
+			}
 			Obj->SetTmpPreDestroy(just_before_destroy);
 			inventory().DropItem(smart_cast<CGameObject*>(Obj), just_before_destroy, dont_create_shell);
 			//if(inventory().DropItem(smart_cast<CGameObject*>(Obj), just_before_destroy)) 

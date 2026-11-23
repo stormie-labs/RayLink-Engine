@@ -63,7 +63,7 @@
 #include "alife_object_registry.h"
 
 #include "xrCoop/coop_prefetch_life.h" // Anomaly Coop: SPAWN_ANTIFREEZE prefetch thread life
-#include "xrCoop/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
+#include "xrCoop/srv/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
 
 #ifdef DEBUG
 #include "level_debug.h"
@@ -311,24 +311,18 @@ CLevel::CLevel() :
     eEnvironment = Engine.Event.Handler_Attach("LEVEL:Environment", this);
     eEntitySpawn = Engine.Event.Handler_Attach("LEVEL:spawn", this);
     m_pBulletManager = xr_new<CBulletManager>();
-    if (!g_dedicated_server || g_coop_headless)
-    {
-        m_map_manager = xr_new<CMapManager>();
-        m_game_task_manager = xr_new<CGameTaskManager>();
-    }
+    m_map_manager = xr_new<CMapManager>();
+    m_game_task_manager = xr_new<CGameTaskManager>();
     m_dwDeltaUpdate = u32(fixed_step * 1000);
     m_seniority_hierarchy_holder = xr_new<CSeniorityHierarchyHolder>();
-    if (!g_dedicated_server || g_coop_headless)
-    {
-        m_level_sound_manager = xr_new<CLevelSoundManager>();
-        m_space_restriction_manager = xr_new<CSpaceRestrictionManager>();
-        m_client_spawn_manager = xr_new<CClientSpawnManager>();
-        m_autosave_manager = xr_new<CAutosaveManager>();
-        m_debug_renderer = xr_new<CDebugRenderer>();
+    m_level_sound_manager = xr_new<CLevelSoundManager>();
+    m_space_restriction_manager = xr_new<CSpaceRestrictionManager>();
+    m_client_spawn_manager = xr_new<CClientSpawnManager>();
+    m_autosave_manager = xr_new<CAutosaveManager>();
+    m_debug_renderer = xr_new<CDebugRenderer>();
 #ifdef DEBUG
-        m_level_debug = xr_new<CLevelDebug>();
+    m_level_debug = xr_new<CLevelDebug>();
 #endif
-    }
     m_ph_commander = xr_new<CPHCommander>();
     m_ph_commander_scripts = xr_new<CPHCommander>();
     pObjects4CrPr.clear();
@@ -395,8 +389,7 @@ CLevel::~CLevel()
     xr_delete(m_autosave_manager);
     xr_delete(m_debug_renderer);
     delete_data(m_debug_render_queue);
-    if (!g_dedicated_server || g_coop_headless)
-        ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);
+    ai().script_engine().remove_script_process(ScriptEngine::eScriptProcessorLevel);
     xr_delete(game);
     xr_delete(game_events);
 
@@ -575,12 +568,18 @@ void CLevel::cl_Process_Event(u16 dest, u16 type, NET_Packet& P)
 #endif
             ok = false;
         }
-        GO->OnEvent(P, GE_OWNERSHIP_REJECT);
+        // Anomaly Coop (O1-container, builds 56-57): the holder hears "taken out" only of a child that is a game object
+        // here. In single player every child of an online holder is one; on a co-op client it may be none (its spawn was
+        // dropped, its entity is gone), and a box then erased the end of its list, a trader read a null item
+        // (xrCoop/coop_container_rules.h)
         if (ok)
         {
+            GO->OnEvent(P, GE_OWNERSHIP_REJECT);
             Game().OnDestroy(GD);
             GD->OnEvent(P, GE_DESTROY);
         }
+        else
+            Msg("[coop] destroy of %u held by %u: no game object here, the holder is not told", u32(id), u32(dest));
     }
 }
 
@@ -768,7 +767,7 @@ void CLevel::ProcessGameEvents()
 #ifdef SPAWN_ANTIFREEZE
 			// Anomaly Coop: a map server has no load screen to keep g_bootComplete down while the level's first spawns come: postponed,
 			// its zones would update before the actor stands (live 2026-11-01, GAMMA: drx_da_main, db.actor nil on every load)
-			if (spawn_antifreeze && g_bootComplete && (!g_coop_headless || g_actor))
+			if (spawn_antifreeze && g_bootComplete && (!g_dedicated_server || g_actor))
 			{
 				// Postpone M_EVENT for postponed spawns
 				//if (M_EVENT == ID && PostponedSpawn(dest))
@@ -1067,16 +1066,13 @@ void CLevel::OnFrame()
 
 	if (m_bNeed_CrPr)
 		make_NetCorrectionPrediction();
-	if (!g_dedicated_server || g_coop_headless)
-	{
-		if (g_mt_config.test(mtMap))
-			Device.seqParallel.push_back(xr_make_delegate(m_map_manager, &CMapManager::Update));
-		else
-			MapManager().Update();
+	if (g_mt_config.test(mtMap))
+		Device.seqParallel.push_back(xr_make_delegate(m_map_manager, &CMapManager::Update));
+	else
+		MapManager().Update();
 
-        if (!mt_TaskManager && Device.dwPrecacheFrame == 0)
-            GameTaskManager().UpdateTasks();
-	}
+    if (!mt_TaskManager && Device.dwPrecacheFrame == 0)
+        GameTaskManager().UpdateTasks();
 
 	// Inherited update
 	inherited::OnFrame();
@@ -1189,13 +1185,10 @@ void CLevel::OnFrame()
 	}
 
 	// defer LUA-GC-STEP
-	if (!g_dedicated_server || g_coop_headless)
-	{
-		if (g_mt_config.test(mtLUA_GC))
-			Device.seqParallel.push_back(xr_make_delegate(this, &CLevel::script_gc));
-		else
-			script_gc();
-	}
+	if (g_mt_config.test(mtLUA_GC))
+		Device.seqParallel.push_back(xr_make_delegate(this, &CLevel::script_gc));
+	else
+		script_gc();
 	if (pStatGraphR)
 	{
 		static float fRPC_Mult = 10.0f;

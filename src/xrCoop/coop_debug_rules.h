@@ -264,6 +264,15 @@ inline uint8_t wanted_local(const StateMsg& m, PeerId self, bool has_player)
 	return has_player ? uint8_t(m.flags_of(self) & kLocalFlags) : uint8_t(0);
 }
 
+// What a reset of this machine's state (sync::reset) takes off its actor of the flags it set (`applied`). The debug is the server's
+// and goes on through a world replaced inside the session (a trip, a rejoin, a save the host loaded): those keep them, and the
+// DebugState at the end of the join decides (apply_local). Only the session's end takes them. b57i creator10_server: every trip
+// took god off and the end of the join gave it back, 3.4-6.3 s after the client was live.
+inline uint8_t flags_taken_at_reset(uint8_t applied, bool session_goes_on)
+{
+	return session_goes_on ? uint8_t(0) : uint8_t(applied & kLocalFlags);
+}
+
 // ---------------------------------------------------------------- the gate of the requests (coop.sync.request, §B.5)
 
 constexpr std::string_view kRequestPrefix = "coop.dbg.";

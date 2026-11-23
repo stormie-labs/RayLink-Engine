@@ -34,6 +34,7 @@ constexpr size_t kMaxCvarsPerCall = 64;
 Pending g_pending; // the new game that waits for its world
 CvarLayer g_layer; // the game's console values over the machine's
 std::string g_world_faction; // the world's group; "" none
+NextLoad g_next_load; // the save a level change or a load from a running game has the next world load
 
 // ---------------------------------------------------------------- the console
 
@@ -360,20 +361,23 @@ int l_world_faction(lua_State* L)
 
 void before_world_start()
 {
+	// Every world start takes the remembered save: it was meant for this start or for none.
+	const std::string remembered = g_next_load.take();
 	if (!g_pGamePersistent)
 		return;
 	const IGame_Persistent::params& p = g_pGamePersistent->m_game_params;
-	const StartMode mode = start_mode(p.m_new_or_load);
-	if (mode == StartMode::Other)
+	const WorldStart start = world_start(p.m_new_or_load, p.m_game_or_spawn, remembered);
+	if (start.mode == StartMode::Other)
 	{
 		::Msg("[coop] game settings: world start '%s' is neither new nor load, left alone", p.m_new_or_load);
 		return;
 	}
-	on_world_start(mode, g_pending, g_world_faction);
-	::Msg("[coop] game settings: world start (%s, '%s'), group '%s', %s", start_mode_name(mode), p.m_game_or_spawn,
-	    g_world_faction.c_str(), g_pending.staged() ? "a new game is staged" : "no game staged");
+	on_world_start(start.mode, g_pending, g_world_faction);
+	::Msg("[coop] game settings: world start (%s, '%s')%s, group '%s', %s", start_mode_name(start.mode), start.save.c_str(),
+	    *p.m_new_or_load ? "" : " named by the level change or load before it", g_world_faction.c_str(),
+	    g_pending.staged() ? "a new game is staged" : "no game staged");
 
-	switch (call_hook(start_mode_name(mode), p.m_game_or_spawn))
+	switch (call_hook(start_mode_name(start.mode), start.save.c_str()))
 	{
 	case HookCall::Done:
 	case HookCall::Failed: // logged by call_hook
@@ -390,6 +394,15 @@ void before_world_start()
 		break;
 	}
 	}
+}
+
+void remember_next_load(const char* command_line)
+{
+	// Parsed the way IGame_Persistent::Start parses the line for the next world (items cut at '/', trimmed, lower case), so
+	// the name is compared with that world's m_game_or_spawn as it will be.
+	IGame_Persistent::params parsed;
+	parsed.parse_cmd_line(command_line ? command_line : "");
+	g_next_load.remember(parsed.m_game_or_spawn);
 }
 
 void on_level_exit() { release_cvars("the level is left"); }

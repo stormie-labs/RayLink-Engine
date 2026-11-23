@@ -564,6 +564,18 @@ public:
 	virtual void on_before_register();
 	void on_after_game_load();
 	bool coop_bind_members(bool forget);
+	// Anomaly Coop (R32 W3): the world server applies a map server's Joined / Left of a squad it writes: what register_member and
+	// unregister_member do, without switching anything online in the world. False: nothing changed (no such living member).
+	bool coop_join_member(ALife::_OBJECT_ID member_id);
+	bool coop_leave_member(ALife::_OBJECT_ID member_id);
+	// Anomaly Coop (R32 §8a A17): a living member left this squad on the map server that holds the squad, and that map server holds it
+	// on its own now: out of the squad, online elsewhere (m_bOnline), in no registry of this world. Defined in
+	// coop/srv/coop_levels_alife.cpp. False: it was no bound member.
+	bool coop_leave_member_held(ALife::_OBJECT_ID member_id);
+	// Anomaly Coop (R32 §8a A17, fix round 2): a Left of a member another squad bound before it (the map server made that squad and
+	// moved the member into it in one frame): only this squad's list forgets it, the member stays as its new squad has it. Defined in
+	// coop/srv/coop_levels_alife.cpp. False: it is not listed.
+	bool coop_unlist_member(ALife::_OBJECT_ID member_id);
 	virtual bool synchronize_location();
 	virtual void try_switch_online();
 	virtual void try_switch_offline();

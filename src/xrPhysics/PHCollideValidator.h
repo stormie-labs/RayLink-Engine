@@ -26,7 +26,11 @@ public:
 		//класс анимированного физического объекта
 		cbNCClassAnimated = 1 << 11,
 		//свойство игнорирования класса анимированного физического объекта
-		cbNone = 1 << 12
+		// Anomaly Coop (TZ P50): the character body of a player in a session, and "passes the bodies of players" (an avatar whose
+		// pair with this machine's actor is off). Only xrGame/coop/coop_player_touch.cpp sets them; outside a session no body has them.
+		cbClassPlayer = 1 << 12,
+		cbNCClassPlayer = 1 << 13,
+		cbNone = 1 << 14
 	};
 
 	static CGID RegisterGroup();

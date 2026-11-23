@@ -109,6 +109,10 @@ enum
 	sm_2D = (1ul << 1ul),
 	//!< 2D mode
 	sm_Intro = (1ul << 2ul), //!< Only for music and video
+	// Anomaly Coop: a stereo source plays positional (3D), mixed down to mono as it streams (TZ R59): OpenAL places only mono
+	// buffers. Only on request: without the bit a stereo source plays flat as in stock. Ignored by mono sources and under
+	// sm_2D. Latched when the emitter starts. Lua: sound_object.mono3d. Rules: xrSound/SoundRender_downmix.h.
+	sm_Mono3D = (1ul << 3ul),
 	sm_forcedword = u32(-1),
 };
 

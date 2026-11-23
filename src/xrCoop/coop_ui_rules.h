@@ -44,5 +44,13 @@ inline bool tutorials_xml_reusable(bool read_before, bool boot_complete, uint32_
 {
 	return read_before && boot_complete && world_read == world_now;
 }
+
+// The Lua NPC relay pairs a stop with the local start of the same sequence, including same-name restarts.
+inline uint32_t next_tutorial_id(uint32_t& serial)
+{
+	if (++serial == 0)
+		++serial;
+	return serial;
+}
 } // namespace ui_rules
 } // namespace coop

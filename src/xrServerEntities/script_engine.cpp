@@ -318,6 +318,10 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
 
 void printLuaStack()
 {
+	// Anomaly Coop (TZ R38): the crash handlers call it in the end of the process too, after clean_game_globals deleted the AI space:
+	// ai() would build a new one there, with a script engine that loads the scripts through an FS that is gone
+	if (!g_ai_space)
+		return;
 	ai().script_engine().print_stack();
 }
 

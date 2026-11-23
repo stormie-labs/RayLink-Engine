@@ -18,6 +18,7 @@ protected:
 	CUISequenceItem* GetNextItem();
 	shared_str m_start_lua_function;
 	shared_str m_stop_lua_function;
+	const u32 m_id;
 
 public:
 	IInputReceiver* m_pStoredInputReceiver;
@@ -33,6 +34,7 @@ public:
 	virtual void OnRender();
 	CUIWindow* MainWnd() { return m_UIWindow; }
 	bool IsActive() { return !!m_flags.test(etsActive); }
+	u32 Id() const { return m_id; }
 
 
 	LPCSTR m_name;

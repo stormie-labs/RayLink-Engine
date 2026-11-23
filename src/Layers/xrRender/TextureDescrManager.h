@@ -3,6 +3,7 @@
 
 #pragma once
 #include "ETextureParams.h"
+#include "texture_descr_merge.h"
 
 class cl_dt_scaler;
 struct TH_LoadTHM;
@@ -50,8 +51,14 @@ private:
 	map_TD m_texture_details;
 	map_CS m_detail_scalers;
 
+	// O4-thm: the loaders of the last Load ($game_textures$, $level$), each with its own maps, until WaitLoaded merges them
+	TH_LoadTHM* m_thm_loads[2] = {nullptr, nullptr};
+	mutable texture_descr_merge::load_gate m_thm_gate;
+
 	static void LoadTHM(LPCSTR initial, map_TD& s_texture_details, map_CS& s_detail_scalers);
 	static void LoadTHMThread(void* args);
+	void WaitLoaded() const; // every lookup, Load, UnLoad and the destructor: the loaders end and are merged first
+	u32 MergeLoaded(); // under the gate's lock: both loaders ended; returns the records merged
 
 public:
 	~CTextureDescrMngr();

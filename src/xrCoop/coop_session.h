@@ -10,13 +10,26 @@
 #include <string>
 #include <vector>
 
-#include "coop_local_link.h"
 #include "coop_protocol.h"
 #include "coop_wire.h"
 #include "coop_world_gate.h"
 
 namespace coop
 {
+// The client side of the protocol: where a process takes the world server's messages and runs its client-side handlers (each
+// module's install_client). A remote client's endpoint is its Session (connected to the host); the co-op host's process has the host
+// player's end of its LocalLink (coop_local_link.h, co-op layer). Ядро: both modes have it, it answers no question of a mode.
+class Endpoint
+{
+public:
+	using Handler = std::function<void(PeerId from, Reader& payload)>;
+	virtual ~Endpoint() = default;
+	// Game message handlers (type >= Msg::GameBase): one per type, the last wins, an empty one removes it.
+	virtual void on(Msg type, Handler h) = 0;
+};
+
+class LocalLink; // the co-op's internal channel (coop_local_link.h, included at the end of this file)
+
 // R1 I3: what a host takes from one client in blobs (a client announces any size it likes; the host buffers it).
 constexpr uint64_t kMaxClientBlobBytes = 1024 * 1024; // one blob
 constexpr uint64_t kMaxClientBlobBytesInFlight = 4 * 1024 * 1024; // announced sizes of its unfinished blobs together
@@ -60,7 +73,10 @@ struct PeerInfo
 struct SessionConfig
 {
 	uint16_t port = kDefaultPort; // host: listen port
-	uint32_t max_players = kMaxPlayers; // host only, including the host itself
+	// Host only: the seats that play, the host's own one included when it plays (limits::client_capacity). No default (F5-SEAT-1,
+	// docs/MODES.md rule 5): the mode's start says it (Mode::configure: co-op 8, the server 16); host() refuses 0 and cuts what is
+	// over kMaxPlayers. A carried host ignores it (its seats are its carrier's).
+	uint32_t max_players = 0;
 	std::string build_id; // must match between host and client
 	Manifest manifest; // local content manifest
 	PlayerKey key{};
@@ -74,10 +90,14 @@ struct SessionConfig
 	std::array<uint8_t, kHelloTokenSize> hello_token{};
 	// Protocol 31, host only. host_plays: the host's own seat is a player (an ordinary host). A world server (-coop_dedicated)
 	// sets false: its seat is in no list, the Welcome says so (HostSeatPlays off) and max_players counts clients only
-	// (limits::client_capacity). operator_token: the token of -coop_operator (op::find_token); all zeros = no operator. The first
-	// player key that presents it from the loopback becomes the operator for the life of this Session (op::operator_verdict).
+	// (limits::client_capacity). Which player holds the host's rights is the session's part's to say (SessionPart::rights_of): no
+	// config holds the token that decides it (A-S4Sb).
 	bool host_plays = true;
-	std::array<uint8_t, kHelloTokenSize> operator_token{};
+	// Protocol 33: the session's mode, said in every Welcome of a listening host (WelcomeMsg::mode). The game's start sets it
+	// (Mode::configure): host() refuses None, a carried host's too, and a listening host's mode that contradicts its seat. A carried
+	// host's session answers its carrier's mode (SessionPart::carrier: a map server's level is part of its world's session, whose
+	// Welcome says it).
+	SessionMode mode = SessionMode::None;
 };
 
 // Per message type counters (P9 / R-12.4).
@@ -90,6 +110,14 @@ struct MsgStats
 	uint64_t world_dropped = 0; // ... and was dropped (void without the world, or a client that is not in the host's world)
 };
 
+// Lifetime and last five completed seconds of ENet payload on one joined physical link.
+struct PeerTraffic
+{
+	PeerId id;
+	uint64_t out_bytes, in_bytes;
+	uint64_t out_5s, in_5s;
+};
+
 // Network condition emulation for tests (applied on send and receive inside Session).
 struct NetSim
 {
@@ -97,6 +125,88 @@ struct NetSim
 	uint32_t jitter_ms = 0; // +- random extra delay
 	float loss = 0.f; // 0..1 drop probability, Unreliable lane only
 	bool enabled() const { return lag_ms || jitter_ms || loss > 0.f; }
+};
+
+// Transport slots a host keeps beyond its players for connections of another Hello role than a player's (SessionPart::admit).
+constexpr uint32_t kTrunkSlots = 7;
+
+class Session;
+
+// The part of a Session that one mode's layer adds (docs/MODES.md section 4, critique H10). The Session runs every connection and
+// calls its part at fixed points; it never asks what the part is. A part decides:
+//   - the connections of another Hello role than a player's (trunks): who comes in, under which id. A trunk takes no player slot, is
+//     in no peers() and no players(), may send MsgSender::TrunkOnly (nobody else may), and no rate limit or in-filter applies to it.
+//     send(), send_blob() and kick() take its id like a player's; broadcast() reaches it with what trunk_takes admits;
+//   - a host carried by another session: no transport of its own, its peers have none either (Owner::carried_*), what is sent to
+//     one the part carries; send(kHostPeer) and what a session does as a client (the epoch, the hold of the link, the silence of
+//     the host) go to the carrier, and self() is the carrier's;
+//   - which player holds the host's rights (PeerInfo::host_rights), and what a console line of a player (Msg::OperatorCommand) does.
+// Without a part a session is what both modes have: it refuses every Hello of another role, gives no player the host's rights and
+// runs no console line. A part is made by its layer (Session::part), owned by the Session and kept for its life, across its
+// sessions, like the handlers. Every call on the thread of Session::update; what reaches the game goes through Owner::emit.
+class SessionPart
+{
+public:
+	// What the Session gives its part to act on it: handed over once, in attached(). Nobody else gets one.
+	class Owner
+	{
+	public:
+		virtual Session& session() = 0;
+		// One line of the session's log, "[coop] " in front (Session::set_log). The text is a line, never a format.
+		virtual void log(const char* line) = 0;
+		// `fn` runs at the next safe point of Session::update, after what is queued before it (as the session's callbacks do).
+		virtual void emit(std::function<void()> fn) = 0;
+		// Host: the joined trunks, by id; is `id` one of them.
+		virtual std::vector<PeerId> trunks() const = 0;
+		virtual bool trunk(PeerId id) const = 0;
+		// A carried host: its peers. join: `id` (the carrier's host's numbering) is one from now on, on_peer_joined follows; nothing
+		// if he is one already or this is no carried host. leave: he is not, on_peer_left follows. receive: a game message of his (the
+		// 2-byte type first), run here as a remote client's (the same checks, the same world gate); dropped if he is none.
+		virtual void carried_join(PeerId id, const std::string& nick) = 0;
+		virtual void carried_leave(PeerId id, const std::string& reason) = 0;
+		virtual void carried_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size) = 0;
+
+	protected:
+		~Owner() = default;
+	};
+
+	// What admit() says of a Hello of another role than a player's.
+	struct Admission
+	{
+		bool accept = false;
+		PeerId id = kInvalidPeer; // accepted: its peer id, no player slot (kMaxPeerSlots or more)
+		std::string nick; // accepted: its name when its Hello has none
+		std::string replaced; // accepted: what a joined trunk of the same id hears when this one takes its place
+		RejectReason reason = RejectReason::Kicked; // refused: its Reject
+		std::string text;
+	};
+
+	virtual ~SessionPart() = default;
+	virtual void attached(Owner& owner) = 0;
+	// host(): the session that carries this host (nullptr: a host with a transport of its own). Asked once by each host() that goes
+	// ahead; host_starts follows with the answer once the config is in, before the transport.
+	virtual Session* carrier() = 0;
+	virtual void host_starts(Session* carrier) = 0;
+	// The session ended (shutdown, a refusal, a lost connection): what was given out for it goes.
+	virtual void ended() = 0;
+	// Host: a Hello of another role than a player's, its protocol, build and content checked; `address` is its "ip:port".
+	virtual Admission admit(const std::string& address, const HelloMsg& hello) = 0;
+	// Host: the trunk `id` has its Welcome; it is gone (Bye, kick, lost: no trunk() any more).
+	virtual void trunk_joined(PeerId id, const std::string& address) = 0;
+	virtual void trunk_left(PeerId id, const std::string& reason) = 0;
+	// Host: does a broadcast of `type` reach the trunks?
+	virtual bool trunk_takes(Msg type) const = 0;
+	// Host, a player's Hello before his place is given: is the last place of a full session kept for a holder of the host's rights who
+	// has not come (`holder_in`: a joined player holds them)? Nothing is bound and nothing logged.
+	virtual bool holds_place(const std::string& address, const HelloMsg& hello, bool holder_in) const = 0;
+	// Host, a player's Hello: does `player` (his slot, nick and address set) hold the host's rights?
+	virtual bool rights_of(const PeerInfo& player, const HelloMsg& hello) = 0;
+	// Host: a console line of a player that passed the rate limit (kClientRateRules OperatorCommand); `may`: he holds the host's
+	// rights over a connection of his own. The part judges it; the session never runs it.
+	virtual void console_line(const PeerInfo& from, bool may, const std::string& line) = 0;
+	// A carried host: a game message to its peer `to` (the 2-byte type, then a, then b), through the carrier. The bytes it sent,
+	// counted in stats(type); 0 when it dropped it.
+	virtual size_t carry(PeerId to, Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb) = 0;
 };
 
 // F3a T4: a session connected to a host is the Endpoint of a remote client (its install_client handlers are registered
@@ -112,7 +222,7 @@ public:
 	Session(const Session&) = delete;
 	Session& operator=(const Session&) = delete;
 
-	// Starts listening. false + err on failure (port busy, ENet init).
+	// Starts listening with the configured mode, or hosts through its carrier. Returns false and sets err on failure.
 	bool host(const SessionConfig& cfg, std::string* err);
 	// Starts connecting; result arrives via on_welcome / on_rejected / on_disconnected.
 	bool connect(const SessionConfig& cfg, const std::string& address, uint16_t port, std::string* err);
@@ -123,6 +233,15 @@ public:
 	void update(uint64_t now_ms);
 
 	Role role() const;
+	// Protocol 33, what this session is (docs/MODES.md section 4: start_client installs the mode of its process by it). Host: what
+	// its Welcome says. A carried host (a map server's level, SessionPart::carrier): its carrier's. Client: what the host's Welcome
+	// said, kept with the host's row from the Welcome on - set before on_welcome and before any game message of the session runs.
+	// None before the Welcome, outside a session, and from the end of a session on.
+	SessionMode session_mode() const;
+	// F5-SEAT-1: the seats that play in this session (the mode's number; coop.session_info().max_players). Host: its config's (cut to
+	// kMaxPlayers). A carried host: its carrier's. Client: what the host's Welcome said (cut to kMaxPlayers), from the Welcome on.
+	// 0 before the Welcome, outside a session and from the end of a session on.
+	uint32_t max_players() const;
 	uint16_t listen_port() const; // host: the port it listens on
 	PeerId self() const; // host: 0; client: slot from Welcome, kInvalidPeer before
 	bool is_active() const; // host listening, or client joined
@@ -150,68 +269,20 @@ public:
 	void attach_local(LocalLink* link);
 	LocalLink* local() const;
 
-	// F3a, the bridges (plan §1.3, xrCoop/coop_mapserver_rules.h). A map server is a process of the host's PC that connects with
-	// Hello role MapServer: taken from the loopback only and with a token issued here, once. It takes no player slot: its peer id is
-	// bridge_peer(k), it is in no peers() and no players(), it may send MsgSender::TrunkOnly (nobody else may) and no rate limit or
-	// in-filter applies to it. send(), send_blob() and kick() take its id like a player's; broadcast() reaches it with what
-	// bridge_takes admits. Host only.
-	void issue_bridge(uint32_t k, const std::array<uint8_t, kHelloTokenSize>& token);
-	void revoke_bridge(uint32_t k); // a token nobody used goes: its process was given up on
-	std::vector<PeerId> bridges() const; // the connected ones
-	bool bridge_connected(PeerId id) const;
+	// H10 (A-S4Sb): the part `kind` names (SessionPart; `kind` is the address of a tag of the layer that owns it), made by `make` the
+	// first time it is asked for. nullptr: the Session holds a part of another kind, or none and `make` is null. For that layer's own
+	// code: the server's part is srv::SessionSrv's (xrCoop/srv/coop_session_srv.h). The Core never asks for a part: whether there is
+	// one would tell it the mode.
+	SessionPart* part(const void* kind, std::unique_ptr<SessionPart> (*make)());
+	// Host: `id` is a joined peer of this session (a player, a trunk, a carried host's peer). Client: `id` is the host's and this
+	// session is joined. What send(id) reaches (the host player's link aside).
+	bool joined(PeerId id) const;
 
 	// F3a: the host's last word on a game message that passed everything else (sender, epoch, rate): false drops it, quietly (the
 	// filter may have sent it on, coop_trunk.cpp). `packet` is the whole message, the 2-byte type first. Null: every message goes
 	// on. Kept across sessions, like the handlers.
 	using InFilter = bool (*)(PeerId from, Msg type, Lane lane, const uint8_t* packet, size_t size);
 	void set_in_filter(InFilter filter);
-
-	// F3a, the host's move that nobody else notices (xrCoop/coop_soft_move.h, docs/SPLIT_LEVELS.md §7a). Host only, main thread.
-	// soft_park: from now on the connections of these players and map servers are parked. What they send waits, in order, untouched by
-	// anything here (the world it would change is about to go), and the transport's helper thread is the road between them: the
-	// traffic of the level runs with the main thread away. What goes to them from here is dropped: it is of the world that goes. The
-	// session's world epoch moves under them without a word: nobody of them learns of it, and nothing of theirs is stale.
-	// soft_keep_out: the new world exists, what goes to them from here on is of the world they will live in: it waits too.
-	// soft_release: the road closes, what waited to go out goes, what they sent runs (a limited number per update, they stay behind it).
-	struct SoftPlayer
-	{
-		PeerId peer = kInvalidPeer;
-		uint16_t level = 0;
-	};
-	struct SoftServer
-	{
-		PeerId bridge = kInvalidPeer;
-		uint16_t level = 0;
-	};
-	struct SoftStats
-	{
-		uint64_t to_servers = 0, to_players = 0; // through the road
-		uint64_t road_dropped = 0; // the road had nobody to give it to
-		uint64_t parked = 0; // what waited for the main thread here
-		uint64_t held_out = 0, dropped_out = 0; // what the world sent the parked: kept for them, dropped
-		size_t inbox_max = 0, inbox_bytes_max = 0;
-		bool road_overflowed = false;
-	};
-	void soft_park(const std::vector<SoftPlayer>& players, const std::vector<SoftServer>& servers);
-	void soft_keep_out();
-	void soft_release();
-	bool soft_parked(PeerId id) const;
-	bool soft_replaying() const; // soft_release was called, what they said has not all run yet
-	void limit_events_per_update(int events); // what one update reads of the transport (the tests)
-	SoftStats soft_stats() const;
-
-	// F3a, a map server (plan §1.3): two sessions in one process. `world` is its connection to the host's process, a client of the
-	// world; this session is the host of its level with no transport of its own. Its peers are virtual: the players of the level, in
-	// the world server's numbering, whom the world server's LevelMap names. What is sent to one goes up `world` in a Msg::Tunnel, what
-	// a player sent comes down in one and runs here as a remote client's message (virtual_receive, the same checks, the same world
-	// gate), so the host's code of a level is the same code on a map server. send(kHostPeer) and what a session does for a client
-	// (the epoch, the hold of the link, the silence of the host) go to `world`; self() is the bridge. `world` must outlive this one.
-	bool host_virtual(const SessionConfig& cfg, Session& world, std::string* err);
-	bool is_virtual() const;
-	void virtual_join(PeerId id, const std::string& nick); // on_peer_joined follows
-	void virtual_leave(PeerId id, const std::string& reason); // on_peer_left follows
-	// A game message of player `from` out of a Tunnel (the 2-byte type first). Dropped if he is no virtual peer here.
-	void virtual_receive(PeerId from, Lane lane, const uint8_t* packet, size_t size);
 
 	// Sends payload as message `type`. Host: to any client, and to the host player (0) over an attached LocalLink.
 	// Client: only to kHostPeer.
@@ -285,8 +356,6 @@ public:
 	// --- callbacks (all optional) ---
 	std::function<void(const PeerInfo&)> on_peer_joined; // host: client accepted; client: other player joined
 	std::function<void(PeerId, const std::string& reason)> on_peer_left;
-	std::function<void(PeerId)> on_bridge_joined; // host: a map server connected (Session::issue_bridge)
-	std::function<void(PeerId, const std::string& reason)> on_bridge_left; // host: its connection is gone
 	std::function<void(const WelcomeMsg&)> on_welcome; // client: accepted by host
 	std::function<void(const RejectMsg&, const ManifestDiff&)> on_rejected; // client
 	std::function<void(const std::string& reason)> on_disconnected; // client: lost host / closed
@@ -296,23 +365,20 @@ public:
 
 	void send_chat(const std::string& text); // client -> host -> all; host -> all
 
-	// Protocol 31, the operator (xrCoop/coop_operator.h, docs/plans/2026-11-12-split-levels-native.md §2.3).
+	// Protocol 31, a console line of a player for the host (docs/plans/2026-11-12-split-levels-native.md §2.3).
 	// Client: sends one console line to the host as Msg::OperatorCommand. false if this is not a joined client. It does not check
-	// the rights or the line: the host is the judge (Lua checks has_host_rights before, stage 3).
+	// the rights or the line: the host is the judge (Lua checks has_host_rights before, stage 3). The host's side is its part's
+	// (SessionPart::console_line); a host without one refuses every line.
 	bool send_operator_command(const std::string& line);
 	// Client: the host's PeerList gave this client the flag Operator. false on a host (its own rights are is_host()).
 	bool self_host_rights() const;
-	// Host: a line of the operator that passed the rate (kClientRateRules OperatorCommand), the length and the list
-	// (op::command_verdict Run). Stage 3 runs it on the server's console (dedicated::run_for). Called from update(), like the
-	// other callbacks.
-	std::function<void(PeerId from, const std::string& line)> on_operator_command;
-	// Host: OperatorCommands refused after the rate limit (not the operator, too long, not on the list), for the life of the
-	// Session; each refusal is logged with its op::command_name.
-	uint64_t operator_refused() const;
 
 	void set_log(LogFn fn);
 	void set_netsim(const NetSim& sim);
 	const NetSim& netsim() const;
+
+	// Links of this transport only, including trunks. Independent of the message-type counters and reset_stats().
+	std::vector<PeerTraffic> peer_traffic() const;
 
 	// Stats indexed by message type value.
 	const MsgStats& stats(uint16_t type) const;
@@ -396,3 +462,7 @@ private:
 	std::map<PeerId, Peer> m_peers;
 };
 } // namespace coop
+
+// The co-op's LocalLink for whoever includes this file and owns one by value (coop_manager.h keeps the host player's link): the line
+// goes when the co-op layer owns the link (A-S4C's co-op mode). After the namespace: coop_local_link.h includes this file for Endpoint.
+#include "coop_local_link.h"

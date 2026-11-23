@@ -1,14 +1,16 @@
 #include "stdafx.h"
 #include "coop_players.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_join.h"
-#include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_world.h"
 #include "coop_survival.h"
 #include "coop_entities.h"
 #include "coop_sound.h"
 #include "coop_instrument.h"
+#include "coop_vehicles.h" // F5-VEH-2: a seated player's character is not placed by his snapshots
+#include "coop_vehicles_state.h" // F5-VEH-4: a seated player's doll sits in the car
 #include "xrCoop/coop_validate.h"
 
 #include "Level.h"
@@ -53,6 +55,8 @@ struct Track
 	u64 last_rx = 0; // our clock, last state received
 	// W5: what the avatar was last driven with (read by coop_sound, coop_equip)
 	bool driven = false;
+	// TZ P50: its object has been placed from the snapshots since it spawned here (on_object_spawn clears it; placed())
+	bool placed = false;
 	u32 mstate = 0;
 	float view_yaw = 0.f, view_pitch = 0.f;
 };
@@ -133,7 +137,7 @@ bool capture(State& s)
 // Host: a client sent its own state.
 void host_on_player_state(PeerId from, Reader& r)
 {
-	if (!levels::on_host_level(from))
+	if (from != kHostPeer && !mode().leads_level() && mode().where(from) == Where::Away)
 		return; // F3a multilevel: his body is no object here, and his coordinates mean nothing on this level
 	r.u16(); // avatar id claimed by the client: ignored, the host knows who it is
 	State s;
@@ -171,7 +175,7 @@ void client_on_player_state(PeerId, Reader& r)
 
 void on_player_state(PeerId from, Reader& r)
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		host_on_player_state(from, r);
 	else if (mgr().is_live_client())
 		client_on_player_state(from, r);
@@ -296,7 +300,7 @@ void reset()
 
 void on_peer_left(PeerId id)
 {
-	const u16 avatar = is_map_authority() ? join::proxy_of_peer(id) : world::avatar_of(id);
+	const u16 avatar = (mode().decides_world() || mode().leads_level()) ? join::proxy_of_peer(id) : world::avatar_of(id);
 	if (avatar != 0xffff)
 	{
 		instrument_forget(avatar);
@@ -307,12 +311,12 @@ void on_peer_left(PeerId id)
 void frame()
 {
 	equip_loading_frame(); // build 56: does nothing unless this is a client that is loading the world
-	const bool live = mgr().is_host() || mgr().is_live_client();
+	const bool live = mode().decides_world() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;
 	instrument_frame();
 	equip_frame();
-	if (ghost_actor())
+	if (!mode().actor_is_player())
 		return; // nobody's state
 	const u64 now = mgr().now_ms();
 	if (now - g_last_send < kSendIntervalMs)
@@ -323,9 +327,9 @@ void frame()
 	if (!capture(s))
 		return;
 	Writer w(64);
-	w.u16(mgr().is_host() ? u16(0) : join::my_proxy());
+	w.u16(mode().decides_world() ? u16(0) : join::my_proxy());
 	s.write(w);
-	if (mgr().is_host())
+	if (mode().decides_world())
 		net::host_stream(Msg::PlayerState, w);
 	else
 		mgr().session().send(kHostPeer, Lane::Unreliable, Msg::PlayerState, w);
@@ -358,6 +362,10 @@ bool reported_speed(u16 avatar_id, float& speed)
 
 bool drive_avatar(CAI_Stalker* avatar)
 {
+	if (vehicles::doll_frame(avatar))
+		return true; // F5-VEH-4: at his seat of the car (another machine's copy), the vehicle idle or hidden
+	if (vehicles::seated(avatar->ID()))
+		return true; // F5-VEH-2: he sits where his car puts him (vehicles::server_frame), not where his snapshots say
 	auto it = g_tracks.find(avatar->ID());
 	if (it == g_tracks.end())
 		return false;
@@ -371,6 +379,7 @@ bool drive_avatar(CAI_Stalker* avatar)
 	xform.rotateY(-s.body_yaw);
 	xform.c.set(s.pos);
 	avatar->XFORM().set(xform);
+	t.placed = true; // TZ P50: where its player stands now (coop_player_touch.cpp counts the distance from here on)
 	const u32 mstate_before = t.mstate;
 	const bool was_driven = t.driven;
 	t.driven = true;
@@ -427,6 +436,19 @@ void on_avatar_visual_changed(u16 avatar_id)
 	// R3 В4: ChangeVisual gives the avatar a fresh skeleton with no cycle playing. The owner's MotionIDs are often
 	// the same numbers on the new visual, so `applied == value` would skip them for good: the avatar froze in a T-pose.
 	t.applied_legs = t.applied_torso = t.applied_head = 0;
+}
+
+void on_object_spawn(u16 id)
+{
+	auto it = g_tracks.find(id);
+	if (it != g_tracks.end())
+		it->second.placed = false; // a new object: it stands where this world spawned it
+}
+
+bool placed(u16 avatar_id)
+{
+	auto it = g_tracks.find(avatar_id);
+	return it != g_tracks.end() && it->second.placed;
 }
 
 u32 avatar_mstate(u16 avatar_id)

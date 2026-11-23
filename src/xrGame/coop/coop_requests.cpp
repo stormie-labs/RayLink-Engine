@@ -3,11 +3,13 @@
 #include "coop_requests.h"
 #include "coop_events.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_levels.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
 #include "coop_sync.h"
+#include "coop_script.h"
 #include "coop_entities.h"
 #include "coop_alife.h"
 #include "coop_trade.h"
@@ -26,9 +28,13 @@
 #include "xrCoop/coop_local_zones.h" // personal map zones
 #include "xrCoop/coop_clone_slot.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
 #include "xrCoop/coop_replacement.h"
+#include "xrCoop/coop_move_admission.h" // F4 G6-1 (finding m17:4): the mods' limits on moves into containers
+#include "xrCoop/coop_item_rider_rules.h" // F4 G3-1c (findings m01:2, m27:5): weapon riders go with the move
 
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <optional>
 
 #include "Level.h"
 #include "Actor.h"
@@ -339,7 +345,9 @@ enum class Act : u8
 struct Action
 {
 	Act kind = Act::Destroy;
+	std::optional<u32> item_world; // leased creates and item mutations only
 	u16 item = kNoId, from = kNoId, to = kNoId; // local numbering
+	const CSE_Abstract* removal_entity = nullptr; // compare only, never dereference on a retry
 	Fvector pos{};
 	u8 flags = 0;
 	bool open = false; // a reject a take of the same item can still complete (box -> actor)
@@ -477,6 +485,9 @@ u32 g_pool_world = 0; // join::world_generation() the ids are reserved in
 u64 g_last_ack = 0;
 // Round 1 (review C1): requests about our items the host has not created yet wait for its answer (lease::Held)
 lease::Held<Action> g_held;
+using RemovalBook = lease::RemovalBook<const CSE_Abstract*>;
+RemovalBook g_removals;
+lease::DestroyPacer g_destroy_pacer; // ReqDestroy and ReqUse share the decider's bucket
 // Round 2 (review N1): our ReqSpawn go no faster than the host takes them; the rest waits here, in order
 lease::SpawnPacer g_spawn_pacer;
 xr_deque<Action> g_spawn_backlog;
@@ -489,6 +500,7 @@ struct LeaseCounters
 	u64 acks = 0, given_back = 0, bad_leases = 0, stale_leases = 0, not_created = 0;
 	u64 held = 0, held_dropped = 0, clones_refused = 0, temps_left = 0, quarantine_left = 0; // round 1
 	u64 queued = 0, resent = 0, unanswered = 0, paced = 0, not_variant = 0; // round 2
+	u64 zones_left = 0; // #859: personal map zones a script let go of while their world was going (local_zone_release)
 } g_lc;
 // Round 1 (review I2): the world (join::world_generation) the temporary objects of g_lua_temps were made in
 u32 g_temps_world = 0;
@@ -513,6 +525,64 @@ u32 track(Msg type, u16 item)
 	const u32 seq = ++g_seq;
 	g_inflight[seq] = {type, item, mgr().now_ms()};
 	return seq;
+}
+
+bool is_removal(Act kind) { return kind == Act::Destroy || kind == Act::Use; }
+bool is_removal(Msg type) { return type == Msg::ReqDestroy || type == Msg::ReqUse; }
+
+Action removal_action(const RemovalBook::Request& request)
+{
+	Action a;
+	a.kind = request.type == Msg::ReqUse ? Act::Use : Act::Destroy;
+	a.item_world = join::world_generation();
+	a.item = request.item;
+	a.removal_entity = request.identity;
+	return a;
+}
+
+// The item a Spawn creates does not depend on itself, only its holder.
+std::array<u16, 3> lease_targets(const Action& a)
+{
+	switch (a.kind)
+	{
+	case Act::Spawn:
+	case Act::Destroy:
+	case Act::Use:
+	case Act::ItemEvent: return {a.item, kNoId, kNoId};
+	case Act::Move: return {a.item, a.from, a.to};
+	case Act::Hit:
+	case Act::Died: return {kNoId, kNoId, kNoId};
+	}
+	return {kNoId, kNoId, kNoId};
+}
+
+// Mark and discard under the same lock as the SpecBook rollback, before Lua or destruction can reenter the outbox.
+void mark_lease_rollback_locked(u16 id, xr_vector<u32>& holds)
+{
+	g_give_back_wait.push_back(id);
+	g_clone_slots.refused(id, mgr().now_ms());
+	const auto mentions = [id](const Action& a)
+	{
+		const auto targets = lease_targets(a);
+		return a.lease == id || std::find(targets.begin(), targets.end(), id) != targets.end();
+	};
+	const auto drop = [&holds](const Action& a)
+	{
+		if (a.hold)
+			holds.push_back(a.hold);
+		if (is_removal(a.kind))
+			g_removals.forget(a.item, a.removal_entity);
+	};
+	g_lc.held_dropped += g_held.drop_matching(id, mentions, drop);
+	const auto discard = [&](const Action& a)
+	{
+		if (!mentions(a))
+			return false;
+		drop(a);
+		return true;
+	};
+	g_outbox.erase(std::remove_if(g_outbox.begin(), g_outbox.end(), discard), g_outbox.end());
+	g_spawn_backlog.erase(std::remove_if(g_spawn_backlog.begin(), g_spawn_backlog.end(), discard), g_spawn_backlog.end());
 }
 
 // W5 C2.1: the engine's before-hit Lua entry for the victim's class (as CAI_Stalker::Hit / CBaseMonster::Hit call it).
@@ -589,19 +659,99 @@ bool client_hit_perks(u16 local_target, SHit& h)
 	return true;
 }
 
+// ---------------------------------------------------------------- F4 G3-1c: weapon riders go with the move
+// (xrCoop/coop_item_rider_rules.h; findings m01:2, m27:5). The 3DSS camo and the Lua jam type of a weapon are item riders of
+// scripts\coop_mods_item_state: the holder's machine sends them in the economy's se channel, which the deciding Lua checks
+// against the item's holder when its inbox runs. A move is applied when its request arrives, and a client sends a frame's
+// requests before its script events, so that check saw the next holder and dropped the former holder's last change. A client
+// appends the riders of a weapon leaving its character to the ReqDrop / ReqTransfer; the process that applies the move (the
+// co-op host; the map server of the player's level, to which the world tunnels the request) hands them to the script before
+// apply_move, under the move's own holder check.
+constexpr const char* kRiderScript = "coop_mods_item_state";
+struct CarryCounters
+{
+	u64 sent = 0, too_long = 0, failed = 0; // client
+	u64 taken = 0, written = 0, refused_long = 0, not_holder = 0, lua_failed = 0; // the process that applies moves
+} g_carry;
+
+// Under lua_pcall: coop_mods_item_state.<fn> with the `args` arguments at the stack's bottom; its first result.
+int lua_rider_fn(lua_State* L, const char* fn, int args)
+{
+	lua_getglobal(L, kRiderScript); // _G.__index loads the module if it was not yet
+	if (!lua_istable(L, -1))
+		return 0;
+	lua_getfield(L, -1, fn);
+	if (!lua_isfunction(L, -1))
+		return 0;
+	for (int i = 1; i <= args; ++i)
+		lua_pushvalue(L, i);
+	lua_call(L, args, 1);
+	return 1;
+}
+int lua_rider_carry(lua_State* L) { return lua_rider_fn(L, "carry", 1); }
+int lua_rider_carried(lua_State* L) { return lua_rider_fn(L, "carried", 4); }
+
+// Client: the riders of our weapon `local_item` (coop_mods_item_state.carry), empty when it has none.
+std::string client_carry(u16 local_item)
+{
+	std::string out;
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 16))
+		return out;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_rider_carry);
+	lua_pushnumber(L, lua_Number(local_item));
+	if (lua_pcall(L, 1, 1, 0) != 0)
+	{
+		++g_carry.failed;
+		if (log_allowed())
+			::Msg("! [coop] the riders of weapon %u did not go with its move: the item state script failed", local_item);
+	}
+	else if (lua_type(L, -1) == LUA_TSTRING)
+	{
+		size_t size = 0;
+		const char* text = lua_tolstring(L, -1, &size);
+		switch (riders::text_of(size))
+		{
+		case riders::Text::None: break;
+		case riders::Text::Fits:
+			out.assign(text, size);
+			++g_carry.sent;
+			break;
+		case riders::Text::TooLong:
+			++g_carry.too_long;
+			if (log_allowed())
+				::Msg("! [coop] the riders of weapon %u did not go with its move: %u bytes", local_item, u32(size));
+			break;
+		}
+	}
+	lua_settop(L, top);
+	return out;
+}
+
 void send_action(const Action& a)
 {
+	if (a.item_world && *a.item_world != join::world_generation())
+	{
+		money::client_release(a.hold);
+		return;
+	}
 	switch (a.kind)
 	{
 	case Act::Spawn:
 	{
 		if (a.flags & 0x80) // local rider activation failed after the speculative spawn
 		{
+			xr_vector<u32> holds;
 			{
 				xrCriticalSectionGuard guard(g_out_lock);
-				g_specs.forget(a.lease);
+				if (!g_specs.forget(a.lease))
+					return;
 				g_spec_actions.erase(a.lease);
+				mark_lease_rollback_locked(a.lease, holds);
 			}
+			for (u32 hold : holds)
+				money::client_release(hold);
 			rollback_leased(a.lease, "replacement rider activation failed");
 			return;
 		}
@@ -626,8 +776,18 @@ void send_action(const Action& a)
 	case Act::Use:
 	{
 		const Msg type = a.kind == Act::Use ? Msg::ReqUse : Msg::ReqDestroy;
+		u32 seq;
+		{
+			xrCriticalSectionGuard guard(g_out_lock);
+			if (!g_removals.ready(a.item, a.removal_entity, mgr().now_ms()) ||
+			    events::find_entity(a.item) != a.removal_entity)
+				return;
+			seq = track(type, a.item);
+			g_inflight.at(seq).world = join::world_generation();
+			g_removals.sent(a.item, seq);
+		}
 		Writer w(8);
-		w.u32(track(type, a.item));
+		w.u32(seq);
 		w.u16(to_host_id(a.item));
 		net::client_send(type, w);
 		++g_cl.sent[a.kind == Act::Use ? 2 : 1];
@@ -644,7 +804,14 @@ void send_action(const Action& a)
 			return;
 		}
 		const Msg type = a.from == kNoId ? Msg::ReqTake : (a.to == kNoId ? Msg::ReqDrop : Msg::ReqTransfer);
-		Writer w(24);
+		// F4 G3-1c: a weapon of ours leaving our character takes its riders along (the host writes them first)
+		const bool from_ours = a.from != kNoId && events::root_of(a.from) == kActor;
+		const bool to_ours = a.to != kNoId && events::root_of(a.to) == kActor;
+		const std::string carried = riders::carries(smart_cast<CWeapon*>(valid_go(a.item)) != nullptr, from_ours, to_ours,
+		                                (a.flags & kMoveLocal) != 0) ?
+		    client_carry(a.item) :
+		    std::string();
+		Writer w(24 + carried.size() + 4);
 		w.u32(track(type, a.item));
 		w.u16(to_host_id(a.item));
 		w.u16(to_host_id(a.from));
@@ -652,6 +819,8 @@ void send_action(const Action& a)
 		const float p[3] = {a.pos.x, a.pos.y, a.pos.z};
 		w.vec3(p);
 		w.u8(a.flags);
+		if (!carried.empty())
+			w.str(carried); // optional: a host without it reads up to the flags and ignores the rest
 		net::client_send(type, w);
 		++g_cl.sent[3];
 		break;
@@ -712,17 +881,8 @@ void send_action(const Action& a)
 // Under g_out_lock.
 u16 held_by_locked(const Action& a)
 {
-	switch (a.kind)
-	{
-	case Act::Spawn:
-	case Act::Destroy:
-	case Act::Use:
-	case Act::ItemEvent: return g_specs.first_pending({a.item});
-	case Act::Move: return g_specs.first_pending({a.item, a.from, a.to});
-	case Act::Hit:
-	case Act::Died: return kNoId;
-	}
-	return kNoId;
+	const auto targets = lease_targets(a);
+	return g_specs.first_pending({targets[0], targets[1], targets[2]});
 }
 
 void client_flush()
@@ -732,34 +892,37 @@ void client_flush()
 		xrCriticalSectionGuard guard(g_out_lock);
 		out.swap(g_outbox);
 		const u64 now = mgr().now_ms();
+		const u32 world = join::world_generation();
+		const bool can_send_removals = is_live_mirror() && g_pool_world == world;
+		if (can_send_removals)
+			g_removals.discard_gone(events::find_entity);
 		for (auto it = g_child_spawns.begin(); it != g_child_spawns.end();)
 			it = now - it->second > kChildSpawnHoldMs ? g_child_spawns.erase(it) : std::next(it);
-		if (g_specs.size())
-		{
-			// F2 T12b round 1 (review C1): what names an item the host has not made yet waits for its answer
-			xr_vector<Action> now_out;
-			now_out.reserve(out.size());
-			for (Action& a : out)
-			{
-				const u16 by = held_by_locked(a);
-				if (by == kNoId)
-					now_out.push_back(std::move(a));
-				else
-				{
-					g_held.hold(by, std::move(a));
-					++g_lc.held;
-				}
-			}
-			out.swap(now_out);
-		}
-		// round 2 (review N1): spawns no faster than the host takes them (its CatSpawn bucket, the session's row that
-		// drops what is over it without an answer); the others go now, the spawns keep their order
 		xr_vector<Action> paced_out;
 		paced_out.reserve(out.size());
 		for (Action& a : out)
 		{
+			if (a.item_world && *a.item_world != world)
+			{
+				money::client_release(a.hold);
+				continue;
+			}
+			const u16 by = g_specs.size() ? held_by_locked(a) : kNoId;
+			if (by != kNoId)
+			{
+				g_held.hold(by, std::move(a));
+				++g_lc.held;
+				continue;
+			}
 			if (a.kind == Act::Spawn)
 				g_spawn_backlog.push_back(std::move(a));
+			else if (is_removal(a.kind))
+			{
+				if (can_send_removals && g_removals.ready(a.item, a.removal_entity, now) && g_destroy_pacer.take(now))
+					paced_out.push_back(std::move(a));
+				else if (g_removals.pending(a.item, a.removal_entity))
+					g_outbox.push_back(std::move(a));
+			}
 			else
 				paced_out.push_back(std::move(a));
 		}
@@ -794,6 +957,11 @@ void client_flush()
 				++it;
 				continue; // Same sequence: a late answer must not create a second addon.
 			}
+			if (is_removal(it->second.type) && it->second.world == join::world_generation())
+			{
+				xrCriticalSectionGuard guard(g_out_lock);
+				g_removals.answer(it->second.item, it->first, false, false, now);
+			}
 			money::client_release(it->second.hold); // F2 T5: the next balance from the host decides
 			it = g_inflight.erase(it);
 		}
@@ -818,7 +986,7 @@ constexpr u32 kRebuildTries = 3;
 struct Rebuild
 {
 	u16 host_id = kNoId;
-	xr_vector<u16> children; // host numbering
+	xr_vector<u16> children; // local numbering, also used to cancel release marks
 	u32 epoch = 0; // the world it belongs to
 	u64 at = 0; // destroyed / last asked
 	u32 asked = 0;
@@ -837,9 +1005,7 @@ void client_rebuild_item(u16 local_item)
 		return; // not ours, not online here: nothing of ours to correct
 	Rebuild& rb = g_rebuilds[local_item];
 	rb.host_id = to_host_id(local_item);
-	for (u16 child : e->children)
-		if (rb.children.size() < kMaxRebuildChildren)
-			rb.children.push_back(to_host_id(child));
+	rb.children.assign(e->children.begin(), e->children.end());
 	rb.epoch = mgr().session().world_epoch();
 	rb.at = mgr().now_ms();
 	entities::ClientApply apply; // a host command: nothing goes to the host
@@ -848,6 +1014,9 @@ void client_rebuild_item(u16 local_item)
 	packet.w_u32(Level().timeServer());
 	packet.w_u16(GE_DESTROY);
 	packet.w_u16(local_item);
+	script::keep_instance(local_item);
+	for (u16 child : rb.children)
+		script::keep_instance(child);
 	Level().Send(packet, net_flags(TRUE, TRUE));
 	++g_rebuilt;
 	if (log_allowed())
@@ -859,12 +1028,20 @@ void client_ask_rebuild(const Rebuild& rb)
 	Writer w(4);
 	w.u16(rb.host_id); // the holder before its children
 	net::client_send(Msg::StateDumpRequest, w);
-	for (u16 child : rb.children)
+	const size_t count = std::min<size_t>(rb.children.size(), kMaxRebuildChildren);
+	for (size_t i = 0; i < count; ++i)
 	{
 		Writer wc(4);
-		wc.u16(child);
+		wc.u16(to_host_id(rb.children[i]));
 		net::client_send(Msg::StateDumpRequest, wc);
 	}
+}
+
+void client_unkeep_rebuild(u16 local_item, const Rebuild& rb)
+{
+	script::unkeep_instance(local_item);
+	for (u16 child : rb.children)
+		script::unkeep_instance(child);
 }
 
 void client_pump_rebuilds()
@@ -879,6 +1056,7 @@ void client_pump_rebuilds()
 		const bool here = events::find_entity(it->first) != nullptr;
 		if (rb.epoch != epoch || (rb.asked && here))
 		{
+			client_unkeep_rebuild(it->first, rb);
 			it = g_rebuilds.erase(it); // another world (it came with the host's state), or back from the host
 			continue;
 		}
@@ -889,6 +1067,7 @@ void client_pump_rebuilds()
 				if (now - rb.at > kRebuildDestroyMs)
 				{
 					++g_rebuild_lost; // the local destroy did not happen: keep it as it is
+					client_unkeep_rebuild(it->first, rb);
 					it = g_rebuilds.erase(it);
 					continue;
 				}
@@ -904,6 +1083,7 @@ void client_pump_rebuilds()
 			if (rb.asked >= kRebuildTries)
 			{
 				++g_rebuild_lost; // the host has it no more (or does not answer): its relays decide
+				client_unkeep_rebuild(it->first, rb);
 				it = g_rebuilds.erase(it);
 				continue;
 			}
@@ -948,7 +1128,11 @@ void lease_sync_world_locked()
 	for (auto& it : g_temp_leases)
 		it.first->ID = kNoId; // still a temporary object (g_lua_temps): its register takes the request path
 	g_temp_leases.clear();
-	g_held.clear([](Action&) {}); // requests about items of the old world (its money holds went with it)
+	g_held.clear([](const Action& a) { money::client_release(a.hold); });
+	g_removals.clear();
+	g_destroy_pacer.reset();
+	g_spawn_backlog.clear();
+	g_spawn_pacer.reset();
 	xrCriticalSectionGuard guard(g_quarantine_lock);
 	g_quarantine_marks.clear(); // their entities went with the old world, or wait in the quarantine
 }
@@ -1092,6 +1276,7 @@ bool create_leased(CSE_Abstract* e, u16 id, u16 source)
 	}
 	Action a;
 	a.kind = Act::Spawn;
+	a.item_world = join::world_generation();
 	a.item = e->ID_Parent;
 	a.pos = holder->o_Position;
 	a.section = e->s_name.c_str() ? e->s_name.c_str() : "";
@@ -1150,34 +1335,51 @@ bool take_temp_lease(CSE_Abstract* e, LeasedTemp& out)
 	return true;
 }
 
-// A pending clone of ours replaces item `id` (local numbering): the host releases it with the clone's creation, and keeps
-// it when it refuses the clone. So a release of it now is that clone's part, not a request of its own. Under g_out_lock.
-bool clone_source_locked(u16 id)
+bool temp_clone_source_locked(u16 id)
 {
-	if (id == kNoId)
-		return false;
-	if (g_specs.is_source(id))
-		return true;
 	for (const auto& it : g_temp_leases)
 		if (it.second.source == id)
 			return true;
 	return false;
 }
 
+// A pending clone replaces its source as part of the create. Its release is handled by the clone.
 bool clone_source(u16 id)
 {
+	if (id == kNoId)
+		return false;
 	xrCriticalSectionGuard guard(g_out_lock);
-	return clone_source_locked(id);
+	return g_specs.is_source(id) || temp_clone_source_locked(id);
 }
 
-// Round 1 (review C1): item `id` waits for the host - its create is not answered yet, or a clone of ours replaces it. A
-// clone of it now would be refused or take the source the other clone took (and its scope would go for nothing).
+// These items are already being removed or replaced locally and cannot take another mutation.
+bool replacement_fenced_locked(u16 id)
+{
+	if (std::find(g_give_back_wait.begin(), g_give_back_wait.end(), id) != g_give_back_wait.end())
+		return true;
+	if (g_clone_prepared.count(id) || temp_clone_source_locked(id))
+		return true;
+	for (const auto& clone : g_clone_prepared)
+		if (join::to_local(clone.second.source) == id)
+			return true;
+	return false;
+}
+
+bool can_queue_mutation_locked(u16 id, bool mirror_live)
+{
+	if (mirror_live)
+		lease_sync_world_locked();
+	return g_specs.can_queue_mutation(id, mirror_live, mirror_live && replacement_fenced_locked(id));
+}
+
+// Lua also needs to block a second action while a create or a removal is pending.
 bool lease_waiting(u16 id)
 {
 	if (id == kNoId)
 		return false;
 	xrCriticalSectionGuard guard(g_out_lock);
-	return g_specs.pending(id) || clone_source_locked(id);
+	return g_pool_world == join::world_generation() && (replacement_fenced_locked(id) ||
+	    g_specs.waiting(id, g_removals.pending(id, events::find_entity(id))));
 }
 
 // Round 1 (review M1): a leased id a create could not use. Reserved here and held by nothing: back into the pool (given to
@@ -1205,11 +1407,6 @@ void rollback_leased(u16 id, const char* why)
 {
 	after_clone_register(id, false);
 	++g_lc.rolled_back;
-	{
-		xrCriticalSectionGuard guard(g_out_lock);
-		g_give_back_wait.push_back(id);
-		g_clone_slots.refused(id, mgr().now_ms()); // live 2026-11-08: its old weapon gets its slot back
-	}
 	CSE_ALifeDynamicObject* e = lease_world_ready() ? ai().alife().objects().object(id, true) : nullptr;
 	if (!e)
 		return;
@@ -1281,7 +1478,7 @@ void client_pump_leases()
 			// round 2 (review N1): kMaxResends requests without an answer: no waiting for ever - taken back, and the
 			// requests that waited for it go too
 			g_spec_actions.erase(id);
-			g_lc.held_dropped += g_held.drop(id, [&holds](Action& a) { holds.push_back(a.hold); });
+			mark_lease_rollback_locked(id, holds);
 			unanswered.push_back(id);
 		}
 		for (auto it = g_give_back_wait.begin(); it != g_give_back_wait.end();)
@@ -1328,7 +1525,7 @@ void client_pump_leases()
 // it (a bolt, a fake missile: the same class as R2's "ID already used").
 void client_on_lease(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !mgr().is_client())
+	if (from != kHostPeer || mode().decides_world())
 		return;
 	lease::IdsMsg m;
 	if (!m.read(r))
@@ -1375,7 +1572,8 @@ void client_on_result(PeerId, Reader& r)
 		bool ours = false;
 		{
 			xrCriticalSectionGuard guard(g_out_lock);
-			ours = g_specs.queued(seq);
+			if (g_pool_world == join::world_generation())
+				ours = g_specs.queued(seq);
 		}
 		g_lc.queued += ours ? 1 : 0;
 		g_inflight.erase(seq);
@@ -1387,7 +1585,8 @@ void client_on_result(PeerId, Reader& r)
 	xr_vector<u32> holds; // round 1: money held for upgrades of a rolled-back item
 	{
 		xrCriticalSectionGuard guard(g_out_lock);
-		outcome = g_specs.answer(seq, accepted, reason == u8(Reason::RateLimited), mgr().now_ms(), leased);
+		if (g_pool_world == join::world_generation())
+			outcome = g_specs.answer(seq, accepted, reason == u8(Reason::RateLimited), mgr().now_ms(), leased);
 		if (outcome == lease::Outcome::Confirmed || outcome == lease::Outcome::RolledBack)
 			g_spec_actions.erase(leased);
 		if (outcome == lease::Outcome::Confirmed)
@@ -1399,7 +1598,7 @@ void client_on_result(PeerId, Reader& r)
 			g_outbox.insert(g_outbox.begin(), std::make_move_iterator(back.begin()), std::make_move_iterator(back.end()));
 		}
 		else if (outcome == lease::Outcome::RolledBack)
-			g_lc.held_dropped += g_held.drop(leased, [&holds](Action& a) { holds.push_back(a.hold); });
+			mark_lease_rollback_locked(leased, holds);
 	}
 	for (u32 hold : holds)
 		money::client_release(hold);
@@ -1417,14 +1616,25 @@ void client_on_result(PeerId, Reader& r)
 	Msg type = Msg::ReqResult;
 	u16 local_item = kNoId;
 	xr_string detached_silencer;
-	bool silencer_world_matches = false;
+	bool same_world = false;
+	bool removal_requeued = false;
 	auto it = g_inflight.find(seq);
 	if (it != g_inflight.end())
 	{
 		type = it->second.type;
 		local_item = it->second.item;
 		detached_silencer = it->second.silencer;
-		silencer_world_matches = it->second.world == join::world_generation();
+		same_world = it->second.world == join::world_generation();
+		if (is_removal(type) && same_world)
+		{
+			xrCriticalSectionGuard guard(g_out_lock);
+			const auto retry = g_removals.answer(local_item, seq, accepted, reason == u8(Reason::RateLimited), mgr().now_ms());
+			if (retry)
+			{
+				g_outbox.push_back(removal_action(*retry));
+				removal_requeued = true;
+			}
+		}
 		// F2 T5: an upgrade's answer. The host sends the balance right after it (charged or not), so the money shown
 		// stays as it is until then.
 		money::client_release(it->second.hold);
@@ -1433,7 +1643,7 @@ void client_on_result(PeerId, Reader& r)
 	if (!detached_silencer.empty())
 	{
 		g_detaching_silencers.erase(local_item);
-		if (accepted && silencer_world_matches)
+		if (accepted && same_world)
 		{
 			CWeaponMagazined* weapon = smart_cast<CWeaponMagazined*>(find_go(local_item));
 			if (weapon)
@@ -1452,6 +1662,8 @@ void client_on_result(PeerId, Reader& r)
 		return;
 	}
 	++g_cl.rejected;
+	if (removal_requeued)
+		return; // the next flush sends it when the retry delay and the shared pacer allow
 	// F2 T5 fix round 1 (review 1): our item has the upgrade the host refused; it is built again from the host's
 	// entity. Not for Offline / NoProxy: our world is being replaced (or we have no character), and the next world
 	// comes with the host's state of our items.
@@ -1612,7 +1824,17 @@ bool local_zone_release(CSE_Abstract* object)
 		if (!g_zones.has(id))
 			return false;
 	}
-	CSE_ALifeDynamicObject* e = lease_world_ready() ? ai().alife().objects().object(id, true) : nullptr;
+	if (!lease_world_ready())
+	{
+		// #859 (builds 56-57): the world is going - we leave it (a disconnect, a rejoin, a load) and Personal Adjustable Waypoint
+		// lets go of its zones. Their objects go with this world's ALife and their ids with its pool (lease_sync_world_locked):
+		// out of the book, handled here. The stock release would be a client's world call with no request path.
+		xrCriticalSectionGuard guard(g_out_lock);
+		if (g_zones.cancel(id))
+			++g_lc.zones_left;
+		return true;
+	}
+	CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true);
 	if (!e || e != object || e->m_bOnline)
 	{
 		if (log_allowed())
@@ -1737,7 +1959,7 @@ bool host_drops_requests_of(PeerId from) { return sync::host_peer_joining(from) 
 
 bool host_begin(PeerId from, Reader& r, Msg type, Req& q, bool has_seq = true)
 {
-	if (!is_map_authority())
+	if (!(mode().decides_world() || mode().leads_level()))
 		return false;
 	if (host_drops_requests_of(from))
 	{
@@ -1964,7 +2186,7 @@ void host_pump_leases()
 		if (p.state != PeerState::Joined)
 			continue;
 		// F3a: a player on a map server's level has his ids from it: what he spawns goes there, and only its own leases count there
-		if (sync::host_peer_joining(p.id) || !levels::on_host_level(p.id))
+		if (sync::host_peer_joining(p.id) || mode().where(p.id) == Where::Away)
 		{
 			if (g_leases.count(p.id))
 			{
@@ -2007,7 +2229,7 @@ void host_pump_leases()
 // Msg::IdLeaseAck: ids the player gives back (busy on his machine, or his create was refused) go back to the generator.
 void host_on_lease_ack(PeerId from, Reader& r)
 {
-	if (!is_map_authority())
+	if (!(mode().decides_world() || mode().leads_level()))
 		return;
 	lease::IdsMsg m;
 	if (!m.read(r))
@@ -2719,7 +2941,201 @@ moves::Side move_side(const Req& q, u16 id)
 	return s;
 }
 
-Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvector& pos)
+// ---------------------------------------------------------------- F4 G6-1 (finding m17:4): moves into a container
+// Hideout Furniture's stash capacity (stash_capacities.script) was checked only in the mover's window: two players filling
+// one stash at once each saw the old weight, and both moves were applied here. Before apply_move of a move into a container
+// that is not a player's character, this process asks the mods' move rules (coop_mods_move_limits.admit, Lua) with the moves
+// it let in that the container's game inventory does not show yet (xrCoop/coop_move_admission.h): a client's request
+// (host_move) and this process's own script and window moves (host_transfer_item). The windows stay a preview. A refusal is
+// Reason::NotAllowed: the ReqResult a client gets for a refused move already (no new wire field).
+// R32 WP18 P4 (§8a A24): a move into a player's character asks the same rules without this book (player_move), so only a
+// rule's refusal stops it (the Weapon Showcase display copy); onto the ground nothing is asked.
+admission::Ledger g_admission;
+constexpr size_t kAdmissionWhyMax = 160;
+struct AdmissionCounters
+{
+	u64 asked = 0, let_in = 0, refused = 0, too_many = 0, no_rule = 0, failed = 0, undone = 0;
+	u64 player_asked = 0, player_refused = 0, player_failed = 0; // R32 WP18 P4: moves into a player's character
+} g_ac;
+
+// Under lua_pcall: args 1-5 (container, item, pending count, pending weight, from); returns admit's two results.
+int lua_move_rules(lua_State* L)
+{
+	lua_getglobal(L, "coop_mods_move_limits"); // _G.__index loads the module if it was not yet
+	if (!lua_istable(L, -1))
+		return 0;
+	lua_getfield(L, -1, "admit");
+	if (!lua_isfunction(L, -1))
+		return 0;
+	for (int i = 1; i <= 5; ++i)
+		lua_pushvalue(L, i);
+	lua_call(L, 5, 2);
+	return 2;
+}
+
+// A text of Lua for one log line: bounded, control characters blanked.
+void admission_text(const char* text, size_t size, xr_string& out)
+{
+	out.assign(text ? text : "", text ? _min(size, kAdmissionWhyMax) : 0);
+	for (char& c : out)
+		if (u8(c) < 0x20)
+			c = ' ';
+}
+
+// The move rules' answer for `item` from `src` into `dst`; `text`: a refusal's reason or the Lua error.
+admission::Answer ask_move_rules(u16 item, u16 src, u16 dst, const admission::Pending& pending, xr_string& text)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 16))
+		return admission::Answer::Failed;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_move_rules);
+	lua_pushnumber(L, lua_Number(dst));
+	lua_pushnumber(L, lua_Number(item));
+	lua_pushnumber(L, lua_Number(pending.count));
+	lua_pushnumber(L, lua_Number(pending.weight));
+	lua_pushnumber(L, lua_Number(src));
+	admission::Answer answer = admission::Answer::Failed;
+	size_t size = 0;
+	const char* said = nullptr;
+	if (lua_pcall(L, 5, 2, 0) != 0)
+		said = lua_tolstring(L, -1, &size);
+	else
+	{
+		const int verdict = lua_type(L, -2);
+		if (verdict == LUA_TBOOLEAN)
+			answer = lua_toboolean(L, -2) ? admission::Answer::Admit : admission::Answer::Refuse;
+		else if (verdict == LUA_TNIL)
+			answer = admission::Answer::NoRule;
+		if (lua_type(L, -1) == LUA_TSTRING)
+			said = lua_tolstring(L, -1, &size);
+	}
+	admission_text(said, size, text);
+	lua_settop(L, top);
+	return answer;
+}
+
+// Where a held move of `item` into `container` stands now (admission::Ledger::settle).
+admission::Track admission_track(u16 item, u16 container)
+{
+	const CSE_Abstract* e = events::find_entity(item);
+	if (!e || e->ID_Parent != container)
+		return admission::Track::Gone; // moved on, released
+	CGameObject* go = valid_go(item);
+	if (!go || !valid_go(container))
+		return admission::Track::Gone; // nothing here weighs that container's game inventory
+	const CObject* parent = go->H_Parent();
+	return parent && parent->ID() == container ? admission::Track::Landed : admission::Track::Waiting;
+}
+
+// R32 WP18 P4 (§8a A21 E-3): a move into a character whose root is a player. The move rules are asked without the admission
+// book (nothing pending, nothing settled, held or released: a player's game inventory is no rule's weight). Only a refusal
+// stops the move - the Weapon Showcase display copy rule (coop_mods_hf.script hf_showcase_display), whose mod vetoes a pickup
+// only on the picker's machine; a let-in, no rule or a failed asking moves it as in the stock game.
+Reason player_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos, xr_string& refused)
+{
+	++g_ac.player_asked;
+	xr_string text;
+	const admission::Answer answer = ask_move_rules(item, src, dst, admission::Pending{}, text);
+	if (answer == admission::Answer::Failed)
+	{
+		++g_ac.player_failed;
+		if (log_allowed())
+			::Msg("! [coop] move rules for item %u into player %u failed (moved as in the stock game): %s", item, dst,
+			    text.c_str());
+	}
+	if (admission::judge(g_admission, admission::Route::Ask, answer, dst, item, 0.f, 0) != admission::Verdict::Full)
+		return apply_move(item, src, dst, drop_pos);
+	++g_ac.player_refused;
+	refused = admission::refusal_text(text.c_str());
+	return Reason::NotAllowed;
+}
+
+// apply_move of a move this process decided, after the move rules let it in. A move onto the ground asks nothing (the stock
+// game's limits); one into a player's character asks without the admission book (player_move). `refused`: the rules' reason
+// when they refused it (else left empty).
+Reason admitted_move(u16 item, u16 src, u16 dst, const Fvector* drop_pos, xr_string& refused)
+{
+	switch (admission::route_of(dst, dst != kNoId && is_player(events::root_of(dst))))
+	{
+	case admission::Route::Stock: return apply_move(item, src, dst, drop_pos);
+	case admission::Route::Ask: return player_move(item, src, dst, drop_pos, refused);
+	case admission::Route::AskAndHold: break;
+	}
+	const u64 now = mgr().now_ms();
+	g_admission.settle(dst, now, &admission_track);
+	++g_ac.asked;
+	xr_string text;
+	const admission::Answer answer = ask_move_rules(item, src, dst, g_admission.pending(dst), text);
+	const CInventoryItem* inventory_item = smart_cast<CInventoryItem*>(valid_go(item));
+	const admission::Verdict verdict =
+	    admission::decide(g_admission, answer, dst, item, inventory_item ? inventory_item->Weight() : 0.f, now);
+	switch (answer)
+	{
+	case admission::Answer::Admit:
+		if (verdict == admission::Verdict::Ok)
+			++g_ac.let_in;
+		else
+			++g_ac.too_many;
+		break;
+	case admission::Answer::Refuse: ++g_ac.refused; break;
+	case admission::Answer::NoRule: ++g_ac.no_rule; break;
+	case admission::Answer::Failed:
+		++g_ac.failed;
+		if (log_allowed())
+			::Msg("! [coop] move rules for item %u into %u failed (moved as in the stock game): %s", item, dst, text.c_str());
+		break;
+	}
+	if (verdict == admission::Verdict::Full)
+	{
+		refused = answer == admission::Answer::Refuse ? (text.empty() ? xr_string("refused by a move rule") : text) :
+		                                                xr_string("too many moves in flight");
+		return Reason::NotAllowed;
+	}
+	const Reason result = apply_move(item, src, dst, drop_pos);
+	if (verdict == admission::Verdict::Ok && result != Reason::Ok && g_admission.release(item))
+		++g_ac.undone;
+	return result;
+}
+
+// F4 G3-1c: the riders a client's move of `item` carried, before admitted_move. `holds`: host_move's check that the
+// requester's character holds the item. The script checks them again like his se riders and writes them as this process's
+// own facts (the co-op host relays them; a map server's go up to the world server). Never logged: client data.
+void host_take_carried(const Req& q, u16 item, bool holds, const std::string& text)
+{
+	switch (riders::judge(text.size(), holds))
+	{
+	case riders::Carried::None: return;
+	case riders::Carried::TooLong: ++g_carry.refused_long; return;
+	case riders::Carried::NotHolder: ++g_carry.not_holder; return;
+	case riders::Carried::Take: break;
+	}
+	++g_carry.taken;
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 16))
+	{
+		++g_carry.lua_failed;
+		return;
+	}
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_rider_carried);
+	lua_pushnumber(L, lua_Number(item));
+	lua_pushnumber(L, lua_Number(q.from));
+	lua_pushlstring(L, text.data(), text.size());
+	lua_pushnumber(L, lua_Number(q.proxy));
+	if (lua_pcall(L, 4, 1, 0) != 0)
+	{
+		++g_carry.lua_failed;
+		if (log_allowed())
+			::Msg("! [coop] %s #%u from player #%u: the riders of item %u were not written, the item state script failed",
+			    msg_name(q.type), q.seq, q.from, item);
+	}
+	else if (lua_toboolean(L, -1))
+		++g_carry.written;
+	lua_settop(L, top);
+}
+
+Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvector& pos, const std::string& carried)
 {
 	CSE_Abstract* e = events::find_entity(item);
 	if (!e)
@@ -2764,7 +3180,14 @@ Reason host_move(const Req& q, u16 item, u16 src, u16 dst, u8 flags, const Fvect
 	}
 	const bool exact = (flags & kMovePos) && dst == kNoId && validate::vec_finite(pos) &&
 	    position_of(q.proxy).distance_to(pos) <= kDropPosRange;
-	return apply_move(item, src, dst, exact ? &pos : nullptr);
+	// F4 G3-1c: the requester still holds the item; write his riders before admitted_move.
+	host_take_carried(q, item, mine_src && e->ID_Parent == src, carried);
+	xr_string refused; // F4 G6-1: the mods' limits on moves into containers (stash capacity)
+	const Reason result = admitted_move(item, src, dst, exact ? &pos : nullptr, refused);
+	if (!refused.empty() && log_allowed())
+		::Msg("[coop] %s #%u from player #%u: item %u into %u refused: %s", msg_name(q.type), q.seq, q.from, item, dst,
+		    refused.c_str());
+	return result;
 }
 
 void host_on_move(PeerId from, Reader& r, Msg type)
@@ -2778,6 +3201,8 @@ void host_on_move(PeerId from, Reader& r, Msg type)
 	float p[3];
 	r.vec3(p);
 	const u8 flags = r.u8();
+	// F4 G3-1c: a weapon's riders, optional (a client of an older build sends none); Reader::str bounds the length
+	const std::string carried = r.ok() && r.remaining() > 0 ? r.str() : std::string();
 	if (!r.ok())
 		return reply(q, Reason::Malformed, kNoId);
 	if (!validate::finite3(p)) // R3 В8: a fair client sends zeros when it has no drop position
@@ -2788,7 +3213,7 @@ void host_on_move(PeerId from, Reader& r, Msg type)
 	}
 	if (!allow(from, CatMove))
 		return reply(q, Reason::RateLimited, item);
-	reply(q, host_move(q, item, src, dst, flags, Fvector().set(p[0], p[1], p[2])), item);
+	reply(q, host_move(q, item, src, dst, flags, Fvector().set(p[0], p[1], p[2]), carried), item);
 }
 
 Reason host_destroy(const Req& q, u16 item)
@@ -3205,7 +3630,7 @@ void host_on_item_event(PeerId from, Reader& r)
 	// Fix round 1 (review 5): host_begin drops a request silently while its player joins or a world is precached. The
 	// client of an upgrade holds what it paid until the answer, so this one is answered: Offline (his world is being
 	// replaced; the new one brings the host's state of his items), with the balance after it.
-	if (is_map_authority() && host_drops_requests_of(from))
+	if ((mode().decides_world() || mode().leads_level()) && host_drops_requests_of(from))
 	{
 		Reader peek = r;
 		Req dropped;
@@ -3444,6 +3869,35 @@ void host_on_launch(PeerId from, Reader& r)
 		host_discard_rocket(q, rocket);
 	reply(q, why, rocket);
 }
+
+// Script moves of this process (host_transfer_item): refused with a line, done already, of an item being destroyed, to the holder
+// the item has (the stock pair). coop_status.
+struct ScriptMoveCounters
+{
+	u64 refused = 0, already = 0, dying = 0, in_place = 0;
+} g_script_moves;
+
+// The item's game object is being destroyed here (a release or a death clean-up of this frame got there first).
+bool item_dying(u16 item)
+{
+	const CObject* o = item != kNoId && g_pGameLevel ? Level().Objects.net_Find(item) : nullptr;
+	return o && o->getDestroy();
+}
+
+// One line for a script move this process refused (reports #705, #708, the arena #1709): the item's section and the holder it has
+// now tell a stale script (the item moved on), a lost item (no server object, only a game object) and a rule's refusal apart.
+void log_script_move_refused(u16 item, u16 from, u16 to, Reason why, const xr_string& refused)
+{
+	CSE_Abstract* e = events::find_entity(item);
+	const CObject* o = g_pGameLevel ? Level().Objects.net_Find(item) : nullptr;
+	const char* section = e ? e->s_name.c_str() : o ? o->cNameSect_str() : nullptr;
+	const u16 holder = e ? e->ID_Parent : o && o->H_Parent() ? u16(o->H_Parent()->ID()) : kNoId;
+	CSE_Abstract* h = events::find_entity(holder);
+	const char* holder_section = h ? h->s_name.c_str() : nullptr;
+	::Msg("! [coop] script transfer item %u [%s] from %u to %u refused: %s%s%s; it is in %u [%s]%s", item,
+	    section ? section : "?", from, to, reason_name(why), refused.empty() ? "" : ": ", refused.c_str(), holder,
+	    holder_section ? holder_section : "-", e ? "" : " (no server object here, its game object only)");
+}
 } // namespace
 
 bool clone_export(u16 source, std::string& metadata, const char* stamp)
@@ -3662,7 +4116,7 @@ void client_keeps_world(u32 epoch)
 
 void local_actor_hit(const SHit& hit, CObject* who, CObject* weapon)
 {
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 		apply_to_actor(hit, who, weapon);
 }
 
@@ -3709,9 +4163,9 @@ void install_server(Session& s)
 
 void install_client(Endpoint& e)
 {
-	e.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_result(from, r); });
+	e.on(Msg::ReqResult, [](PeerId from, Reader& r) { if (!mode().decides_world()) client_on_result(from, r); });
 	e.on(Msg::IdLease, &client_on_lease); // F2 T12b
-	e.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (mgr().is_client()) client_on_player_hit(from, r); });
+	e.on(Msg::PlayerHit, [](PeerId from, Reader& r) { if (!mode().decides_world()) client_on_player_hit(from, r); });
 }
 
 void reset()
@@ -3731,6 +4185,7 @@ void reset()
 	g_spawn_budgets.clear(); // F2 T2: a session starts or ends (Ruling F2-11: kept across a peer leaving and rejoining)
 	g_spawn_queue.clear(drop_queued); // Ruling F2-21: nothing of the old session is created
 	g_last_launch.clear(); // W3a
+	g_admission.clear(); // F4 G6-1: held moves of the old session
 	g_log_count = 0;
 	// Lua may still hold these pointers; reset runs when a session ends, long after any script used them. Round 1 (review
 	// I2): only those of this world; an old world's Lua state is closed.
@@ -3759,6 +4214,8 @@ void reset()
 		g_give_back.clear();
 		g_give_back_wait.clear();
 		g_held.clear([](Action&) {}); // money holds go with the session (money::reset)
+		g_removals.clear();
+		g_destroy_pacer.reset();
 		g_spawn_backlog.clear(); // round 2
 		g_spawn_pacer.reset();
 	}
@@ -3772,7 +4229,7 @@ void on_peer_left(PeerId id)
 	const auto his = [id](const spawn::QueuedRequest& r) { return PeerId(r.peer) == id; };
 	for (const std::string& key : g_spawn_queue.keys())
 		g_spawn_queue.drop_if(key, his, drop_queued);
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		// F2 T12b: what he still held goes back to this world's generator
 		host_sync_leases();
@@ -3782,7 +4239,7 @@ void on_peer_left(PeerId id)
 
 void frame()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		host_pump_spawns(); // Ruling F2-21
 		host_pump_leases(); // F2 T12b
@@ -3804,7 +4261,7 @@ void register_console()
 
 void print_status()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		u64 ok = g_h.results[u32(Reason::Ok)], refused = 0;
 		for (u32 i = 1; i < u32(Reason::Count); ++i)
@@ -3823,6 +4280,19 @@ void print_status()
 		      "%llu out-of-reach moves claimed as local, %llu upgrades",
 		    g_bad[BadBone], g_bad[BadSection], g_bad[BadSpawnState], g_bad[BadNumber], g_bad[BadMoveRange],
 		    g_bad[BadUpgrade]);
+		::Msg("[coop]   moves into containers (move rules, F4 G6-1): %llu asked, %llu let in, %llu refused by a rule, %llu "
+		      "refused as too many in flight, %llu without a rule, %llu failed (moved as stock), %llu undone by the engine; "
+		      "%u held now",
+		    g_ac.asked, g_ac.let_in, g_ac.refused, g_ac.too_many, g_ac.no_rule, g_ac.failed, g_ac.undone,
+		    u32(g_admission.size()));
+		::Msg("[coop]   moves into players (move rules, R32 P4): %llu asked, %llu refused by a rule, %llu failed (moved as stock)",
+		    g_ac.player_asked, g_ac.player_refused, g_ac.player_failed);
+		::Msg("[coop]   script moves here (transfer_item): %llu refused, %llu done already, %llu of items being destroyed, %llu "
+		      "to the holder the item has (the stock pair: into the ruck)",
+		    g_script_moves.refused, g_script_moves.already, g_script_moves.dying, g_script_moves.in_place);
+		::Msg("[coop]   weapon riders carried by moves (F4 G3-1c): %llu taken, %llu written, %llu too long, %llu not the "
+		      "holder's, %llu script failures",
+		    g_carry.taken, g_carry.written, g_carry.refused_long, g_carry.not_holder, g_carry.lua_failed);
 		using spawn::SpawnVerdict;
 		::Msg("[coop]   spawns refused: class %llu, line %llu, parent %llu, denied %llu, quest %llu, budget %llu "
 		      "(budget %u RU in a row + %u RU/s per character, %u characters this session; %u allow-listed, %u "
@@ -3871,6 +4341,8 @@ void print_status()
 	    g_cl.child_dups, g_cl.lua_forwarded, g_cl.lua_refused, g_cl.hits_in);
 	::Msg("[coop]   hit perks (%s): %llu hits through the before-hit Lua, %llu dropped by it, %llu lua errors",
 	    g_coop_client_hit_perks ? "on" : "off", g_cl.hits_perked, g_cl.hits_cancelled, g_cl.perk_errors);
+	::Msg("[coop]   weapon riders sent with moves (F4 G3-1c): %llu, %llu too long, %llu script failures", g_carry.sent,
+	    g_carry.too_long, g_carry.failed);
 	::Msg("[coop]   refused upgrades (F2 T5): %llu items built again from the host's copy (%u waiting, %llu given up)",
 	    g_rebuilt, (u32)g_rebuilds.size(), g_rebuild_lost);
 	size_t pool = 0, pending = 0, temps = 0, waiting = 0;
@@ -3912,8 +4384,8 @@ void print_status()
 		zones_alive = g_zones.size();
 	}
 	::Msg("[coop]   personal map zones: %u alive here, %llu made, %llu released, %llu refused (no leased id to spare), "
-	      "%llu ids not lent out again",
-	    (u32)zones_alive, zone_stats.issued, zone_stats.retired, zone_stats.refused, zone_stats.lost);
+	      "%llu ids not lent out again, %llu let go of while their world was going",
+	    (u32)zones_alive, zone_stats.issued, zone_stats.retired, zone_stats.refused, zone_stats.lost, g_lc.zones_left);
 	::Msg("[coop]   leased ids, round 2: %u spawn requests wait for the pace (%llu frames paced), %llu creates in the "
 	      "host's budget queue, %llu asked again for want of an answer, %llu taken back unanswered, %llu clones refused "
 	      "as not a variant",
@@ -3991,41 +4463,65 @@ bool client_forward_spawn(CSE_Abstract* e)
 
 void client_destroy(u16 local_item, bool use)
 {
-	if (client_lease_waiting(local_item))
-		return;
-	if (!is_live_mirror())
+	const bool live = is_live_mirror();
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!can_queue_mutation_locked(local_item, live))
 	{
-		++g_cl.not_live;
+		if (!live)
+			++g_cl.not_live;
 		return;
 	}
-	Action a;
-	a.kind = use ? Act::Use : Act::Destroy;
-	a.item = local_item;
-	push(std::move(a));
+	const auto* entity = events::find_entity(local_item);
+	const Msg type = use ? Msg::ReqUse : Msg::ReqDestroy;
+	if (entity && g_removals.begin(local_item, type, entity))
+		g_outbox.push_back(removal_action({local_item, type, entity}));
 }
 
+// G.A.M.M.A.'s keep_guns_on_bodies (at death) and the wounded animation fix (handle_weapon 0, the default) call
+// npc:transfer_item(item, npc): the stock GE_TRADE_SELL + GE_TRADE_BUY to the holder the item has puts a slotted weapon into the
+// ruck. Up to build 58 that call did nothing here. False lets CScriptGameObject::TransferItem send that very pair on this process
+// (no move rule: it stays in one inventory); the server hooks relay nothing (back where it was), the creature's snapshot carries
+// its empty hands to the copies.
 bool host_transfer_item(u16 item, u16 from, u16 to)
 {
-	if (!is_map_authority())
+	if (!(mode().decides_world() || mode().leads_level()))
 		return false;
+	if (item_dying(item))
+	{
+		++g_script_moves.dying; // #705: nothing to move, not even in place
+		return true;
+	}
 	CSE_Abstract* e = events::find_entity(item);
-	const Reason why = !e ? Reason::Missing : e->ID_Parent != from ? Reason::Moved :
-	    from == to ? Reason::Ok : apply_move(item, from, to, nullptr);
+	if (e && e->ID_Parent == from && from == to)
+	{
+		++g_script_moves.in_place;
+		return false; // the stock pair
+	}
+	if (e && e->ID_Parent == to)
+	{
+		++g_script_moves.already; // #708: a second call for a move that is done already
+		return true;
+	}
+	xr_string refused; // F4 G6-1: this process's own moves (scripts, G.A.M.M.A.'s window) go through the same move rules
+	const Reason why = !e ? Reason::Missing : e->ID_Parent != from ? Reason::Moved : admitted_move(item, from, to, nullptr, refused);
 	if (why != Reason::Ok)
-		::Msg("! [coop] script transfer item %u from %u to %u refused: %s", item, from, to, reason_name(why));
+	{
+		++g_script_moves.refused;
+		log_script_move_refused(item, from, to, why, refused);
+	}
 	return true;
 }
 
 void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 {
-	if (client_lease_waiting(local_item))
-		return;
-	if (!is_live_mirror())
+	const bool live = is_live_mirror();
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!can_queue_mutation_locked(local_item, live))
 	{
-		++g_cl.not_live;
+		if (!live)
+			++g_cl.not_live;
 		return;
 	}
-	xrCriticalSectionGuard guard(g_out_lock);
 	if (to != kNoId && !(flags & kMoveLocal))
 	{
 		// reject + take of one item right after each other is one transfer (box <-> actor, trade).
@@ -4033,7 +4529,7 @@ void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 		// way (box -> actor -> box before the first answer): the reject names the real source.
 		for (auto it = g_outbox.rbegin(); it != g_outbox.rend(); ++it)
 		{
-			if (it->kind != Act::Move || it->item != local_item)
+			if (it->kind != Act::Move || it->item != local_item || it->item_world != g_pool_world)
 				continue;
 			if (it->open)
 			{
@@ -4047,6 +4543,7 @@ void client_move(u16 local_item, u16 from, u16 to, const Fvector* pos, u8 flags)
 	}
 	Action a;
 	a.kind = Act::Move;
+	a.item_world = g_pool_world;
 	a.item = local_item;
 	a.from = from;
 	a.to = to;
@@ -4065,7 +4562,7 @@ bool client_move_position(u16 local_item, const Fvector& pos)
 	xrCriticalSectionGuard guard(g_out_lock);
 	for (auto it = g_outbox.rbegin(); it != g_outbox.rend(); ++it)
 	{
-		if (it->kind == Act::Move && it->item == local_item && it->to == kNoId)
+		if (it->kind == Act::Move && it->item == local_item && it->to == kNoId && it->item_world == join::world_generation())
 		{
 			it->pos = pos;
 			it->flags |= kMovePos;
@@ -4103,19 +4600,21 @@ void client_flush_outbox()
 
 void client_item_event(u16 local_item, u16 ge_type, const void* data, u32 size)
 {
-	if (client_lease_waiting(local_item))
+	if (size > 512)
 		return;
-	if (!is_live_mirror() || size > 512)
+	xrCriticalSectionGuard guard(g_out_lock);
+	if (!can_queue_mutation_locked(local_item, is_live_mirror()))
 		return;
 	Action a;
 	a.kind = Act::ItemEvent;
+	a.item_world = g_pool_world;
 	a.item = local_item;
 	a.ge_type = ge_type;
 	a.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
 	// F2 T5: an upgrade bought at a mechanic carries him and its price (items::UpgradePurchase); else none, nothing
 	if (ge_type == GE_INSTALL_UPGRADE)
 		items::claim_upgrade_payment(local_item, a.mechanic, a.paid, a.hold);
-	push(std::move(a));
+	g_outbox.push_back(std::move(a));
 }
 
 void client_player_died(u16 local_killer)
@@ -4158,7 +4657,7 @@ bool client_launch(u16 local_launcher, u16 local_rocket)
 bool lua_client()
 {
 	const Phase p = mgr().phase();
-	return mgr().is_client() && (p == Phase::LoadingWorld || p == Phase::Live);
+	return !mode().decides_world() && (p == Phase::LoadingWorld || p == Phase::Live);
 }
 
 bool lua_mirror() { return lua_client() && is_mirror(); }
@@ -4223,7 +4722,7 @@ CSE_Abstract* lua_clone(CSE_Abstract* source, const char* section, const Fvector
 	if (lease_waiting(from->ID))
 	{
 		++g_lc.clones_refused;
-		return lua_refuse("alife:clone_weapon", "its weapon waits for the host (a create or a clone of ours in flight)");
+		return lua_refuse("alife:clone_weapon", "its weapon waits for the host (a create, clone or removal in flight)");
 	}
 	// round 2 (review N3): a variant of the same weapon only (the host refuses another: its source's rounds would become
 	// another ammo); a plain create would leave the source beside the clone
@@ -4393,18 +4892,7 @@ bool clone_spawn_slot(u16 id, u16& slot)
 	return slot != cloneslot::kNone;
 }
 
-bool client_lease_waiting(u16 id)
-{
-	xrCriticalSectionGuard guard(g_out_lock);
-	if (std::find(g_give_back_wait.begin(), g_give_back_wait.end(), id) != g_give_back_wait.end())
-		return true; // a refused speculative object is still being removed here
-	if (g_clone_prepared.count(id))
-		return true;
-	for (const auto& clone : g_clone_prepared)
-		if (join::to_local(clone.second.source) == id)
-			return true;
-	return lease_waiting(id);
-}
+bool client_lease_waiting(u16 id) { return lease_waiting(id); }
 
 int lua_lease_waiting(lua_State* L)
 {
@@ -4469,7 +4957,7 @@ void journal_sent_hit(u16 id, PeerId peer, const SHit& hit, hits::Source source,
 {
 	static xr_map<u16, hits::Journal> journals;
 	const hits::JournalLine l = hits::journal_note(journals[id], mgr().now_ms(), hit.power);
-	const char* role = mgr().is_host() ? "host" : "map server";
+	const char* role = mode().decides_world() ? "host" : "map server";
 	if (l.summary)
 		::Msg("[coop] hits -> player #%u (character %u): %u more hit(s) in the last 15 s, power %.3f in all (%s)", peer, id,
 		    l.quiet_hits, l.quiet_power, role);
@@ -4496,7 +4984,7 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 			return false;
 		return sync::is_remote_driven(npc);
 	}
-	if (!is_map_authority())
+	if (!(mode().decides_world() || mode().leads_level()))
 		return false;
 	const u16 id = npc->ID();
 	if (!world::is_player_proxy(id))
@@ -4538,7 +5026,7 @@ bool stalker_hit(CAI_Stalker* npc, SHit* hit)
 
 bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
 {
-	if (!actor || !hit || !is_map_authority())
+	if (!actor || !hit || !(mode().decides_world() || mode().leads_level()))
 		return false;
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
 	// Collision damage (Actor.cpp) names the contact object as both initiator and weapon.
@@ -4551,7 +5039,7 @@ bool host_actor_hit_dropped(const CActor* actor, const SHit* hit)
 
 bool host_explode_as(u16 explosive, u16 initiator)
 {
-	if (!is_map_authority() || !g_pGameLevel || !is_player(initiator) || !valid_go(initiator))
+	if (!(mode().decides_world() || mode().leads_level()) || !g_pGameLevel || !is_player(initiator) || !valid_go(initiator))
 		return false;
 	CGameObject* go = valid_go(explosive);
 	CExplosive* ex = go ? go->cast_explosive() : nullptr;

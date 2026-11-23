@@ -14,6 +14,8 @@
 #include "profiler.h"
 #include "stalker_movement_manager_smart_cover.h"
 #include "Inventory.h"
+#include "Weapon.h"
+#include "stalker_animation_data.h"
 #include "coop/coop_remote.h" // Anomaly Coop
 #include "coop/coop_ai.h" // Anomaly Coop: undrawn_tracks
 #include "ik_anim_state.h" // Anomaly Coop: checked_motion_def (RL-4BXZ-R24J)
@@ -197,11 +199,36 @@ IC void CStalkerAnimationManager::play_torso()
 	MotionID animation = assign_torso_animation();
 	if (!checked_motion_def(m_skeleton_animated, animation))
 	{
-		static u32 missing = 0;
-		if (++missing <= 20 || (missing % 100) == 0)
-			Msg("! [coop] stalker [%s] visual [%s]: the torso motion of its active item is not in the visual (%u so far), "
-			    "the no-item motion plays",
-			    object().cName().c_str(), object().cNameVisual().c_str(), missing);
+		string128 motion;
+		if (animation.valid())
+			xr_sprintf(motion, "MotionID %u:%u", u32(animation.slot), u32(animation.idx));
+		else
+			xr_strcpy(motion, "name unavailable");
+
+		// The selection has already discarded the name. A non-panic reload has a known naming scheme and stage.
+		CWeapon* weapon = object().inventory().ActiveItem() ? m_weapon : nullptr;
+		if (!animation.valid() && m_skeleton_animated && weapon && weapon->GetState() == CWeapon::eReload &&
+			object().movement().mental_state() != MonsterSpace::eMentalStatePanic &&
+			!object().CObjectHandler::weapon_strapped(weapon))
+		{
+			const u32 state = u32(body_state());
+			const u32 slot = weapon->animation_slot();
+			const u32 stage = u32(weapon->GetReloadState());
+			const auto& states = m_data_storage->m_part_animations.A;
+			if (state < states.size() && slot < states[state].m_torso.A.size() && stage <= CWeapon::eSubstateReloadEnd)
+			{
+				string128 candidate;
+				xr_sprintf(candidate, "%storso_%sreload_%u", state_names[state], weapon_names[slot], stage);
+				if (!m_skeleton_animated->ID_Cycle_Safe(candidate) && !m_skeleton_animated->ID_FX_Safe(candidate))
+					xr_strcpy(motion, candidate);
+			}
+		}
+
+		const shared_str& visual = object().cNameVisual();
+		static xr_set<std::pair<shared_str, shared_str>> reported;
+		if (reported.emplace(visual, motion).second)
+			Msg("[coop] stalker [%s] visual [%s]: torso motion [%s] is missing", object().cName().c_str(),
+			    visual.c_str(), motion);
 		animation = no_object_animation(body_state());
 		if (!checked_motion_def(m_skeleton_animated, animation))
 		{

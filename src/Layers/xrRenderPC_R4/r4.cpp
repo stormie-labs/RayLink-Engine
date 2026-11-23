@@ -203,7 +203,7 @@ void CRender::create()
 
 	// Anomaly Coop: a map server draws nothing (dx10HW.cpp, CreateHeadless), its user.ltx asks for nothing here. The fluid manager
 	// is off for more than memory: Resources->Create is null with g_dedicated_server and it dereferences the shaders it gets.
-	if (g_coop_headless)
+	if (g_dedicated_server)
 	{
 		ps_r3_msaa = 0;
 		ps_r4_hdr10_on = 0;
@@ -361,7 +361,7 @@ void CRender::create()
 	if (Core.ParamsData.test(ECoreParams::smap2560)) o.smapsize = 2560;
 	if (Core.ParamsData.test(ECoreParams::smap3072)) o.smapsize = 3072;
 	if (Core.ParamsData.test(ECoreParams::smap4096)) o.smapsize = 4096;
-	if (g_coop_headless) o.smapsize = 64; // Anomaly Coop: the largest target there is
+	if (g_dedicated_server) o.smapsize = 64; // Anomaly Coop: the largest target there is
 
 	// gloss
 	char* g = strstr(Core.Params, "-gloss ");

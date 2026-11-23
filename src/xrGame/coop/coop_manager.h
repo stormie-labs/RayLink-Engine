@@ -23,9 +23,11 @@ enum class Phase : u8
 };
 const char* phase_name(Phase p);
 
-// F3a split levels: the roles of this process are flags, ProcessRole in xrCoop/coop_roles.h. The roles of a phase: hosting =
-// host_roles(); a client in any phase after its transport start = client_roles(); off = none. A process started with
-// -coop_mapserver has map_server_roles() in every phase but off: it goes the client's phases, the world comes to it as to a client.
+class Mode; // xrCoop/coop_mode.h
+
+// F3a split levels: the roles of this process are flags, ProcessRole in xrCoop/coop_roles.h. S4: the session's mode gives them
+// (Mode::roles: the co-op host host_roles(), the world server dedicated_roles(), a map server map_server_roles() in every phase but
+// off, a client client_roles()); a client before its Welcome, whose mode is not known yet, has client_roles(); off = none.
 u8 roles_of(Phase p);
 
 class Manager
@@ -41,6 +43,9 @@ public:
 	// F3a: this process is a map server (the key -coop_mapserver, xrCoop/coop_mapserver_rules.h): it connects to the host's process.
 	bool start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& token);
 	void stop(const char* reason);
+	// TZ R38: the game's own teardown (on_app_end): the sessions end there, while the engine and the log are up, not in the
+	// destructor of this static inside the CRT's exit, after the log has closed. Main thread.
+	void app_end();
 
 	void print_status() const;
 	void send_chat(const char* text);
@@ -90,17 +95,17 @@ private:
 	void install_session_callbacks();
 	// What a session does for a process that is a client of the world: a client's session, the bridge of a map server.
 	void install_world_callbacks(Session& s);
-	// F3a T4: the handler tables of the role this process starts in (every module's install_server / install_client):
-	// hosting, the server's on the session and the client's on the host player's LocalLink; connecting, the client's on
-	// the session; a map server, the server's on the session of its level and the client's on its bridge. What a table had
-	// before goes first.
-	enum class Tables : u8
-	{
-		Hosting,
-		Client,
-		MapServer,
-	};
-	void install_handlers(Tables tables);
+	// S4 (docs/MODES.md section 4, xrCoop/coop_mode.h): the session's mode `m` (the switchboard's answer to a start) goes in and
+	// installs its own handler tables (every module's install_server / install_client on the endpoints of its process: the co-op
+	// host the server's on the session and the client's on the host player's LocalLink; the world server the server's and the
+	// map servers'; a map server the server's on the session of its level and the client's on its bridge). What a table had
+	// before goes first. False: no mode, or another one is in; nothing changed.
+	bool enter_mode(Mode* m);
+	// A client (player and mirror) from its start: the Core's client tables on the session connected to the host, the same for
+	// both modes. Its mode comes with the Welcome (enter_mode_of_welcome) and adds none.
+	void install_client_tables();
+	// Protocol 33: a client's mode is the one its Welcome says, in before any game message of the session runs.
+	void enter_mode_of_welcome(SessionMode said);
 	void autostart();
 	SessionConfig make_config(u16 port);
 
@@ -108,6 +113,7 @@ private:
 	Session m_world; // F3a: a map server's bridge to the host's process (m_session hosts its level); declared first: it outlives it
 	Session m_session;
 	Phase m_phase = Phase::Off;
+	u64 m_live_since_ms = 0; // W9: when this machine last went live (link_hold::FrameState::live_ms)
 	u8 m_roles = 0; // ProcessRole flags, set with the phase
 	bool m_map_server = false; // F3a: started with -coop_mapserver
 	PlayerKey m_key{};
@@ -144,6 +150,8 @@ bool world_gap();
 void register_console_commands();
 // Engine hook, see CGamePersistent::OnFrame.
 void on_frame();
+// Engine hook (TZ R38), CGamePersistent::OnAppEnd: the first step of the game's teardown, in every kind of process.
+void on_app_end();
 // F3a T5, coop_mapserver_stats.cpp: a map server's line in the log every 60 s, and the console command.
 void mapserver_stats_frame();
 void mapserver_stats_register_console();
@@ -156,9 +164,6 @@ void on_blocking_work();
 // Engine hook: skip the "press any key" screen after a level load (a joining client, or an
 // instance started with -coop_host / -coop_connect for automated tests).
 bool skip_keypress_on_load();
-// The launcher's Steam mode started this game with a lobby: Steam's "invite a friend" window can open over the game.
-bool steam_invite_ready();
-bool steam_invite_window();
 } // namespace coop
 
 // Player nick shown to others (console var coop_nick, saved in user.ltx).

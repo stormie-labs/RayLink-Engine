@@ -1,12 +1,12 @@
 // Anomaly Coop — "Game settings", the part of the engine side that needs no engine (docs/GAME_SETTINGS.md §1.2, §3.4,
-// §3.5). A host's game carries its own values for the 20 console rules of the co-op (friendly fire, death, autosave,
-// split levels...).
+// §3.5). A host's game carries its own values for the 18 console rules of the co-op (friendly fire, death, autosave...).
 // They are set before the world starts and must not stay in the machine's console (user.ltx) when the level is left:
 //   - kGameCvars    the white list: the only console commands Lua may set for a game (coop.game.set_cvars);
 //   - CvarLayer     sets them, remembers the machine's value the first time and gives it back (coop.game.release_cvars,
 //                   called when the level is left); the console is reached through the CvarConsole interface;
 //   - Pending       the new game that waits in memory between the "new game" screen and the world start;
-//   - on_world_start  what the start of a world does to the pending game and the world's group.
+//   - on_world_start  what the start of a world does to the pending game and the world's group;
+//   - world_start, NextLoad  the start mode of a world, also when the engine's word for it is gone (a level change).
 // Pure C++17, header-only, no engine dependencies: used by xrGame (coop/coop_game_settings.cpp) and by the unit-test exe.
 #pragma once
 
@@ -24,12 +24,13 @@ namespace game
 {
 // ---------------------------------------------------------------- the white list
 
-// The game rules (§1.2, rows 1..20): the console commands of the co-op host. Everything else (coop_nick, fov, the money
+// The game rules (§1.2): the console commands of the co-op host. Everything else (coop_nick, fov, the money
 // limits, the sounds, coop_max_map_servers and coop_mapserver_linger of the host's PC) is the machine's own and stays out
-// of a game. coop_death_share is registered by the death build, coop_split_levels and coop_story_together (F3a, rows 18
-// and 19: "split levels" and "story maps together", both on by default) by the split-levels build, coop_npc_finish_downed (row 20:
-// stalkers finish a downed player, on by default) by the AI; a command the console
-// does not know is refused by CvarLayer::apply, so the list may run ahead of the console.
+// of a game. coop_death_share is registered by the death build, coop_npc_finish_downed (stalkers finish a downed player, on
+// by default) by the AI; a command the console does not know is refused by CvarLayer::apply, so the list may run ahead of
+// the console. Owner 2026-11-18: no hybrid, so "split levels", "story maps together" and "the world as a process of its
+// own" are no rules any more. Their keys stay in the records of old worlds (tools/persisted_keys.txt): they are refused
+// (NotAllowed), never fatal.
 inline constexpr std::string_view kGameCvars[] = {
 	"coop_friendly_fire",
 	"coop_max_new_characters",
@@ -48,16 +49,10 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_autosave_interval",
 	"coop_autosave_count",
 	"coop_death_share",
-	"coop_split_levels",
-	"coop_story_together",
 	"coop_npc_finish_downed",
-	// Owner 2026-11-13: the old split mode stays, the new one is a choice of its own. On: a new world with split levels runs as a
-	// world server, a process of its own on the creator's PC, and his game joins it. Only Lua reads it (the new game screen,
-	// Continue); the engine keeps the value in the game's record like any rule.
-	"coop_world_server",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
-static_assert(kGameCvarCount == 21, "docs/GAME_SETTINGS.md §1.2 lists 21 game rules");
+static_assert(kGameCvarCount == 18, "docs/GAME_SETTINGS.md §1.2: 18 game rules since build 57 (no hybrid)");
 
 // The longest value of a rule: a number or a token name (the longest of them, "checkpoint", has ten characters).
 constexpr size_t kMaxCvarValue = 64;
@@ -232,7 +227,7 @@ private:
 // ---------------------------------------------------------------- the start of a world
 
 // IGame_Persistent::params::m_new_or_load, compared exactly like alife_simulator.cpp does. Other: neither (the engine then
-// tries a load and falls back to a new game); the co-op leaves such a start alone.
+// tries a load and falls back to a new game); the co-op leaves such a start alone, unless world_start knows its save.
 enum class StartMode
 {
 	New,
@@ -282,6 +277,55 @@ inline void on_world_start(StartMode mode, Pending& pending, std::string& world_
 	case StartMode::Other:
 		break;
 	}
+}
+
+// ---------------------------------------------------------------- the start after a level change
+
+// The start of a world as the co-op hook sees it: the mode and the name Lua's before_world_start(mode, save) gets.
+struct WorldStart
+{
+	StartMode mode = StartMode::Other;
+	std::string save; // m_game_or_spawn: the save of a load, the spawn of a new game
+};
+
+// The save the next world loads from when its start will not say "load". CALifeSimulator keeps "<name>/single/alife" as the
+// alife command line (it drops the fourth part, "new" or "load"); CALifeUpdateManager::change_level (the level change's
+// autosave, or the slot it went to) and load_game (a load from a running game) put a save's name in front of it, and the
+// next world is started from that line: m_new_or_load is "" there, and alife_simulator.cpp loads m_game_or_spawn (no
+// assert, a new game when the save is missing). The engine remembers the name the way that world will parse it
+// (coop_game_settings.cpp remember_next_load); every world start takes it, so a name never outlives the start it was meant
+// for. Report #5 (builds 55-58): without it the hook was not called on a level change, load_state switched the record on
+// late, and the scripts that read an option only in on_game_start kept the machine's value for that level.
+class NextLoad
+{
+public:
+	// The last line written is the one the next world starts from.
+	void remember(std::string name) { name_ = std::move(name); }
+
+	// The remembered name, once; "" when none.
+	std::string take()
+	{
+		std::string name;
+		name.swap(name_);
+		return name;
+	}
+
+private:
+	std::string name_;
+};
+
+// The start mode of a world (coop::game::before_world_start). The engine's word ("new", "load") wins. Without it, a start
+// whose save is exactly the name taken from NextLoad is a load of that save; anything else is Other and left alone (a
+// console `start server(<x>/single/alife)`, a name remembered for another save).
+inline WorldStart world_start(const char* new_or_load, const char* game_or_spawn, const std::string& remembered)
+{
+	std::string game = game_or_spawn ? std::string(game_or_spawn) : std::string();
+	const StartMode mode = start_mode(new_or_load);
+	if (mode != StartMode::Other)
+		return {mode, std::move(game)};
+	if (!remembered.empty() && remembered == game)
+		return {StartMode::Load, std::move(game)};
+	return {StartMode::Other, std::move(game)};
 }
 } // namespace game
 } // namespace coop

@@ -5,6 +5,7 @@
 #include "pch_script.h"
 #include "coop_rest.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_levels.h"
@@ -13,6 +14,7 @@
 #include "coop_script.h"
 #include "coop_checkpoints.h"
 #include "coop_checkpoint_sources.h"
+#include "xrCoop/coop_checkpoint_base_rules.h" // Build 57: the camp a lie-down on a base writes
 #include "coop_autosave.h"
 #include "coop_worldstate.h"
 #include "coop_alife.h" // alife_rw: the clock is changed through mutable ALife
@@ -265,7 +267,7 @@ void host_request(u16 character, const Request& rq)
 	++g_stat.lie_downs;
 	CGameObject* obj = host_world_ready() ? object_here(character) : nullptr;
 	levels::BodyFacts there; // a player on a map server's level: his body is no object here, its authority says what it sees
-	const bool elsewhere = !obj && host_world_ready() && levels::body_facts(character, there);
+	const bool elsewhere = !obj && host_world_ready() && mode().facts_of(character, there);
 	if (!obj && !elsewhere)
 		return refuse(character, Refusal::Busy); // the host's world is not up, or his character is not in it
 	const bool alive = survival::life_of(character) == survival::Life::Alive;
@@ -296,8 +298,15 @@ void host_request(u16 character, const Request& rq)
 	// store refuses (host_set logged why: off the AI map, not this level...) refuses the lie-down, and he is told "camp".
 	if (!rq.forced)
 	{
-		const checkpoint::Record camp =
+		checkpoint::Record camp =
 		    elsewhere ? checkpoints::record_far(character, kind_of(place), source) : checkpoints::record_here(obj, kind_of(place), source);
+		// Build 57 (owner 2026-11-18): lying down on a friendly base (at its campfire, in a shelter on its ground) writes
+		// the base's record (its bed, or the point of a base without a sleeping place), not the spot he lies at - unless he
+		// lies at his own tent. Who may lie down where is unchanged (rest_place above). A player on a map server's level: the
+		// same, by the footing its map server reported (base_bed_record answers for him too).
+		checkpoint::Record bed;
+		const bool on_base = checkpoints::sources::base_bed_record(character, bed);
+		camp = checkpoint::base::lie_down_record(camp, place == Place::Tent, on_base ? &bed : nullptr);
 		if (!checkpoints::host_set(character, camp, elsewhere))
 			return refuse(character, Refusal::Camp);
 		++g_stat.camps;
@@ -370,7 +379,7 @@ void host_tick(u64 now)
 			continue; // out of a hardcore run: not one of the group (rest::decide)
 		const CGameObject* obj = object_here(c);
 		levels::BodyFacts there;
-		const bool elsewhere = !obj && levels::body_facts(c, there); // on a map server's level he is one of the group all the same
+		const bool elsewhere = !obj && mode().facts_of(c, there); // on a map server's level he is one of the group all the same
 		if (!obj && !elsewhere)
 			continue;
 		Seen s;
@@ -383,7 +392,7 @@ void host_tick(u64 now)
 	// once per sleep, not on every tick): one who walked away from his camp loses his rest ("place").
 	const Group::PlaceCheck at_place = [](uint16_t id) {
 		levels::BodyFacts there;
-		if (!object_here(id) && levels::body_facts(id, there))
+		if (!object_here(id) && mode().facts_of(id, there))
 			return Place(there.place) != Place::None;
 		u16 source = checkpoint::kNoSource;
 		return checkpoints::sources::rest_place(id, source) != Place::None;
@@ -432,7 +441,7 @@ void host_frame()
 // A player's lie-down or get-up (F3a T7: the host player's from peer 0 over the internal channel).
 void host_on_request(PeerId from, Reader& rd)
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return; // ClientOnly: only the host takes it
 	Request rq;
 	if (!read_request(rd, rq))
@@ -529,7 +538,7 @@ void client_on_sleep(PeerId from, Reader& rd)
 
 // This machine's player: his word goes to the world server (F3a T7: the host player's over the internal channel, at the
 // pace a client keeps), his Lua hears his copy of the book.
-bool player_live() { return mgr().is_host() || mgr().is_live_client(); }
+bool player_live() { return mode().decides_world() || mgr().is_live_client(); }
 
 void player_frame()
 {
@@ -558,7 +567,7 @@ void player_frame()
 
 bool say(Op op, int hours, bool forced, u16 bag = kNoBag)
 {
-	if (!mgr().is_host() && !mgr().is_live_client())
+	if (!mode().decides_world() && !mgr().is_live_client())
 		return false;
 	Pending p;
 	p.rq.op = op;
@@ -573,12 +582,12 @@ bool say(Op op, int hours, bool forced, u16 bag = kNoBag)
 
 std::vector<Entry> entries_here()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		host_sync_world();
 		return g_host.group.entries();
 	}
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 	{
 		client_sync_world();
 		return g_mirror.entries;
@@ -588,7 +597,7 @@ std::vector<Entry> entries_here()
 
 bool set_world_block(const char* reason)
 {
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 		return false; // the host's world decides
 	const std::string now = reason ? reason : "";
 	if (now != world_block_reason())
@@ -679,12 +688,12 @@ int l_waiting_for(lua_State* L)
 int l_block(lua_State* L)
 {
 	Block b = Block::None;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		host_sync_world();
 		b = g_host.group.block();
 	}
-	else if (mgr().is_client())
+	else if (mgr().active() && !mode().decides_world())
 	{
 		client_sync_world();
 		b = g_mirror.block;
@@ -747,7 +756,7 @@ void reset()
 
 void frame()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 		host_frame();
 	if (is_player())
 		player_frame();
@@ -756,7 +765,7 @@ void frame()
 void print_status()
 {
 	const std::string& wb = world_block_reason();
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		::Msg("[coop]   rest: %u resting, block %s, world %s, sleep %s", u32(g_host.group.resting()),
 		    block_name(g_host.group.block()), wb.empty() ? "free" : wb.c_str(),
@@ -780,7 +789,7 @@ void print_status()
 		      "received %llu (refusals %llu), sleeps %llu (ignored %llu)",
 		    g_stat.asked, g_stat.held, g_stat.received, g_stat.refusals, g_stat.sleeps_seen, g_stat.sleeps_ignored);
 	}
-	else if (mgr().is_client())
+	else if (mgr().active() && !mode().decides_world())
 	{
 		::Msg("[coop]   rest: block %s; asked %llu (held back %llu), RestState received %llu (refusals %llu), sleeps %llu "
 		      "(ignored %llu), malformed %llu",
@@ -831,12 +840,12 @@ void register_lua(lua_State* L)
 
 State state_of(u16 local_id)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		host_sync_world();
 		return g_host.group.state_of(local_id);
 	}
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 	{
 		client_sync_world();
 		const Entry* e = mirror_find(local_id);
@@ -847,12 +856,12 @@ State state_of(u16 local_id)
 
 u8 hours_of(u16 local_id)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		host_sync_world();
 		return g_host.group.hours_of(local_id);
 	}
-	if (mgr().is_client())
+	if (mgr().active() && !mode().decides_world())
 	{
 		client_sync_world();
 		const Entry* e = mirror_find(local_id);
@@ -863,7 +872,7 @@ u8 hours_of(u16 local_id)
 
 void host_cancel(u16 character, const char* reason)
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return;
 	host_sync_world();
 	if (!g_host.group.get_up(character))

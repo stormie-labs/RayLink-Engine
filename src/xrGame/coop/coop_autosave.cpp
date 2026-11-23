@@ -3,6 +3,7 @@
 #include "pch_script.h"
 #include "coop_autosave.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_survival.h"
 #include "coop_rest.h"
 
@@ -110,7 +111,7 @@ const char* reason_name(Reason r)
 // The host's level can be saved at all: a running level of the host with a living actor, not coming up (precache).
 bool can_write()
 {
-	return mgr().is_host() && g_pGameLevel && g_actor && g_actor->g_Alive() && ai().get_alife() &&
+	return mode().decides_world() && g_pGameLevel && g_actor && g_actor->g_Alive() && ai().get_alife() &&
 		Device.dwPrecacheFrame == 0;
 }
 
@@ -491,7 +492,7 @@ bool save(Reason why)
 	if (survival::life_of(0) != survival::Life::Alive)
 	{
 		++g_stat.skipped;
-		::Msg("! [coop] autosave (%s) skipped: the host's character is down (%s), the last save stays", reason_name(why),
+		::Msg("[coop] autosave (%s) skipped: the host's character is down (%s), the last save stays", reason_name(why),
 		    survival::life_name(survival::life_of(0)));
 		return false;
 	}
@@ -548,7 +549,7 @@ public:
 	CCC_CoopAutosaveNow(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
 	void Execute(LPCSTR) override
 	{
-		if (!mgr().is_host())
+		if (!mode().decides_world())
 		{
 			::Msg("! [coop] coop_autosave_now: only the host of a co-op session writes autosaves");
 			return;
@@ -749,7 +750,7 @@ const std::string& game()
 
 void suspend(bool on)
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return;
 	const u64 now = mgr().now_ms();
 	if (on)
@@ -767,7 +768,7 @@ void suspend(bool on)
 
 void request(Reason r)
 {
-	if (!mgr().is_host() || g_pending.on) // one save serves every request made before it
+	if (!mode().decides_world() || g_pending.on) // one save serves every request made before it
 		return;
 	g_pending.on = true;
 	g_pending.why = r;
@@ -783,7 +784,7 @@ void request_before_transfer()
 
 void frame()
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 	{
 		g_pending = Pending(); // a client, or no session: nothing to write, nothing to wait for
 		return;
@@ -838,7 +839,7 @@ void frame()
 
 const char* level_change_name()
 {
-	if (!mgr().is_host() || g_saving)
+	if (!mode().decides_world() || g_saving)
 		return nullptr;
 	// While the Restore window is open every slot may be the one the host is going back to: the stock name is used then,
 	// the level change is saved outside the ring.
@@ -895,7 +896,7 @@ const char* level_change_commit()
 
 void host_on_session_end()
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return;
 	save_at_end("the end of the session");
 }
@@ -904,7 +905,7 @@ void host_on_level_exit()
 {
 	// A level that closes to open another (a level change, a load, a new game) queues KERNEL:start behind this
 	// disconnect (CApplication::OnEvent, the same test as for the main menu): its world is saved by its own path.
-	if (!mgr().is_host() || Engine.Event.Peek("KERNEL:start"))
+	if (!mode().decides_world() || Engine.Event.Peek("KERNEL:start"))
 		return;
 	save_at_end("the close of the host's level");
 }

@@ -429,6 +429,8 @@ private:
 	////////////////////////////////////////////////////
 	friend struct SWheel;
 	friend struct SDoor;
+	friend struct CoopCarDriver; // Anomaly Coop (F5-VEH-2, coop_vehicles_seat.cpp): a client's car driven without an Owner
+	friend struct CoopCarState; // Anomaly Coop (F5-VEH-4, coop_vehicles_state.cpp): a car's state read on the decider, played on a copy
 
 	xr_map<u16, SWheel> m_wheels_map;
 	xr_vector<SWheelDrive> m_driving_wheels;

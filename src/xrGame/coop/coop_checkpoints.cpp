@@ -5,6 +5,7 @@
 #include "coop_checkpoints.h"
 #include "coop_checkpoint_sources.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_levels.h"
@@ -12,6 +13,7 @@
 #include "coop_survival.h"
 #include "coop_script.h"
 #include "xrCoop/coop_checkpoint_store.h"
+#include "xrCoop/coop_checkpoint_base_rules.h" // Build 57: the respawn past the bed of a hostile base
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -77,6 +79,8 @@ struct Stats
 	u64 sets = 0, refused = 0, arrivals = 0, stories = 0, rollbacks = 0;
 	u64 sent = 0, reloads = 0, fixes = 0, unreadable = 0, vanished = 0;
 	u64 received = 0, malformed = 0, mirror_full = 0, refusals = 0; // refusals: F3 T7 round 1
+	u64 same = 0; // Build 57: the same place again, nothing written or announced
+	u64 hostile_beds = 0; // Build 57: a respawn passed by the bed of a base hostile to him
 };
 Stats g_stat;
 
@@ -216,9 +220,13 @@ const Slot* slot_of(u16 character)
 	return g_host.store.find(character);
 }
 
-// A new record into the character's slot, written through and queued for the players.
-bool apply_set(u16 character, const Record& r)
+// A new record into the character's slot, written through and queued for the players. Build 57 (owner 2026-11-18: "checkpoint
+// updated" every N-th time at one and the same campfire): the same place again (checkpoint::same_place) writes nothing and
+// queues nothing, and still answers true (`same` set), so a sleep at the same campfire is not refused.
+bool apply_set(u16 character, const Record& r, bool* same = nullptr)
 {
+	if (same)
+		*same = false;
 	Slot s;
 	if (!load_slot(character, s))
 		return false;
@@ -228,7 +236,29 @@ bool apply_set(u16 character, const Record& r)
 		    character);
 		return false;
 	}
-	checkpoint::set(s, r);
+	// Build 57 round 3 (lead 2026-11-18, review S3): a base's record over an Arrival record on that base's ground takes the
+	// arrival's place and keeps the record before it (checkpoint::base::set_on_base); any other record is checkpoint::set
+	checkpoint::base::Spot ground;
+	const checkpoint::SetOutcome outcome =
+	    sources::base_ground(r, ground) ? checkpoint::base::set_on_base(s, r, ground) : checkpoint::set(s, r);
+	if (outcome == checkpoint::SetOutcome::Same)
+	{
+		// Build 57 (owner 2026-11-18, review S2): a record of this process's level whose vertex is off its AI map (a corrupt
+		// save, a map update) is no place to come back to (host_respawn_point drops it): the same place repairs it. Only where
+		// this process has that level's AI map; elsewhere the same place is kept as it is.
+		const bool stale = !s.cur.level.empty() && s.cur.level == current_level() && ai().get_level_graph() &&
+			!ai().level_graph().valid_vertex_id(s.cur.level_vertex);
+		if (!stale)
+		{
+			++g_stat.same;
+			if (same)
+				*same = true;
+			return true;
+		}
+		s.cur = r;
+	}
+	else if (!checkpoint::changes_slot(outcome))
+		return false; // not a valid record (the callers check before)
 	return store_slot(character, s) && g_host.store.change(character, s, false);
 }
 
@@ -294,7 +324,7 @@ void load_into_cache(u16 character, const std::string& level, const Record* fall
 // characters' custom data. False when there is no host world to read (yet).
 bool ensure_loaded()
 {
-	if (!mgr().is_host() || !ai().get_alife() || !ai().get_game_graph() || !ai().get_level_graph() ||
+	if (!mode().decides_world() || !ai().get_alife() || !ai().get_game_graph() || !ai().get_level_graph() ||
 	    !ai().alife().graph().actor())
 		return false;
 	const u32 epoch = join::host_world_epoch();
@@ -339,17 +369,21 @@ std::string describe(const Record& r)
 
 // ---------------------------------------------------------------- telling the players
 
-// coop_checkpoint_changed(local_id, kind, source_local_id | -1, rollback, level | nil) on this machine. A player with
-// no checkpoint (rolled back to nothing, gone, no longer shared) gets kind "none", source -1, level nil (R1 M-8).
+// coop_checkpoint_changed(local_id, kind, source_local_id | -1, rollback, level | nil, base | nil) on this machine. A player with
+// no checkpoint (rolled back to nothing, gone, no longer shared) gets kind "none", source -1, level nil (R1 M-8). Build 57
+// round 3 (lead 2026-11-18, review S6): `base` is what the record is for the text, as this machine's engine tells it
+// (sources::record_base): "bed" (a sleep zone base's record), "base" (a start base's), "none" (neither), nil (this machine
+// cannot tell: the script's own lookup).
 void fire_changed(u16 local_id, bool rollback, const Record& r, u16 source_local)
 {
 	using namespace script;
 	if (r.valid())
 		queue_callback(kChangedCallback, {cb_int(local_id), cb_str(checkpoint::kind_name(r.kind)),
-		    cb_int(source_local == kNoSource ? -1 : s64(source_local)), cb_bool(rollback), cb_str(r.level.c_str())});
+		    cb_int(source_local == kNoSource ? -1 : s64(source_local)), cb_bool(rollback), cb_str(r.level.c_str()),
+		    cb_str(sources::record_base(r, source_local))}); // nullptr -> nil
 	else
 		queue_callback(kChangedCallback, {cb_int(local_id), cb_str(checkpoint::kind_name(Kind::None)), cb_int(-1),
-		    cb_bool(rollback), cb_nil()});
+		    cb_bool(rollback), cb_nil(), cb_nil()});
 }
 
 void send_state(PeerId to, u16 character, bool rollback, const Record& cur)
@@ -413,7 +447,7 @@ void arrivals_frame()
 	{
 		if (survival::life_of(proxy) != survival::Life::Alive || world::is_parked(proxy))
 			continue;
-		const bool away = levels::host_character_elsewhere(proxy);
+		const bool away = mode().decider_of(proxy) == Decider::Other;
 		const CGameObject* o = away ? nullptr : object_here(proxy);
 		if (!away && !o)
 			continue;
@@ -552,13 +586,13 @@ public:
 	CCC_CoopCheckpointHere(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
 	void Execute(LPCSTR) override
 	{
-		if (!mgr().is_host())
+		if (!mode().decides_world())
 		{
 			::Msg("! [coop] coop_checkpoint_here: host only, in a co-op session");
 			return;
 		}
 		const CGameObject* me = object_here(0);
-		if (me && host_set(0, record_here(me, Kind::Rest, kNoSource)))
+		if (me && host_set(0, record_here(me, Kind::Rest, kNoSource), false))
 			::Msg("[coop] coop_checkpoint_here: a rest checkpoint is set where you stand");
 		else
 			::Msg("! [coop] coop_checkpoint_here: refused (see above)");
@@ -591,7 +625,7 @@ void reset()
 
 void frame()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 		host_frame();
 	if (is_player())
 	{
@@ -602,16 +636,17 @@ void frame()
 
 void print_status()
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		const checkpoint::HostStore& st = g_host.store;
 		::Msg("[coop]   checkpoints: %u character(s) with one, group view %s, host arrival %s", u32(st.slots().size()),
 		    g_group ? "on" : "off", describe(g_host.arrival).c_str());
 		::Msg("[coop]   checkpoints: sets %llu, refused %llu, arrivals %llu, story %llu, rollbacks %llu, sent %llu, "
 		      "reloads %llu, arrival fixes %llu, changed under the store %llu, unreadable %llu, not kept %llu, "
-		      "not announced %llu",
+		      "not announced %llu, same place again %llu, hostile beds passed at respawn %llu",
 		    g_stat.sets, g_stat.refused, g_stat.arrivals, g_stat.stories, g_stat.rollbacks, g_stat.sent, g_stat.reloads,
-		    g_stat.fixes, g_stat.vanished, g_stat.unreadable, st.not_kept(), st.not_announced());
+		    g_stat.fixes, g_stat.vanished, g_stat.unreadable, st.not_kept(), st.not_announced(), g_stat.same,
+		    g_stat.hostile_beds);
 		for (const auto& it : st.slots())
 			::Msg("[coop]   checkpoint of %u: %s | prev %s", it.first, describe(it.second.cur).c_str(),
 			    describe(it.second.prev).c_str());
@@ -619,7 +654,7 @@ void print_status()
 		      "refused %llu), malformed %llu",
 		    u32(g_mirror.size()), g_stat.received, g_stat.refusals, g_stat.malformed);
 	}
-	else if (mgr().is_client())
+	else if (mgr().active() && !mode().decides_world())
 	{
 		::Msg("[coop]   checkpoints: %u known, received %llu (claims refused %llu), malformed %llu, over the bound %llu",
 		    u32(g_mirror.size()), g_stat.received, g_stat.refusals, g_stat.malformed, g_stat.mirror_full);
@@ -690,6 +725,7 @@ bool host_set(u16 character, const Record& r, bool elsewhere)
 	if (!ensure_loaded())
 		return false;
 	const char* why = nullptr;
+	bool same = false; // Build 57: the same place again: nothing written or announced, still "set"
 	if (!r.valid())
 		why = "not a valid record";
 	else if (!elsewhere && r.level != current_level())
@@ -702,7 +738,7 @@ bool host_set(u16 character, const Record& r, bool elsewhere)
 		why = "not a player's character";
 	else if (survival::life_of(character) != survival::Life::Alive)
 		why = "not alive";
-	else if (!apply_set(character, r))
+	else if (!apply_set(character, r, &same))
 		why = "not stored";
 	if (why)
 	{
@@ -711,6 +747,8 @@ bool host_set(u16 character, const Record& r, bool elsewhere)
 			::Msg("[coop] checkpoint of character %u refused: %s (%s)", character, why, describe(r).c_str());
 		return false;
 	}
+	if (same)
+		return true; // counted in g_stat.same; no log line for every repeat
 	++g_stat.sets;
 	if (log_allowed(g_stat.sets)) // R1 M-3: a mod may set them in a loop
 		::Msg("[coop] checkpoint of character %u: %s", character, describe(r).c_str());
@@ -819,10 +857,21 @@ bool host_story(const char* reason)
 	{
 		const bool living = survival::life_of(c) == survival::Life::Alive && (c == 0 || !world::is_parked(c));
 		const CGameObject* o = living ? object_here(c) : nullptr;
-		switch (checkpoint::story_from(living, levels::host_character_elsewhere(c), o != nullptr))
+		const bool elsewhere = mode().decider_of(c) == Decider::Other;
+		const checkpoint::StoryFrom from = checkpoint::story_from(living, elsewhere, o != nullptr);
+		// Build 57 round 2 (lead 2026-11-18, review S3): a living player on a friendly base gets the base's record instead
+		// (Co-op: by his position here; Server: by the footing of his map server), so the same base again is Same: no tip,
+		// and the base does not write itself again 3 s later
+		checkpoint::Record bed;
+		if (from != checkpoint::StoryFrom::Nothing && sources::base_bed_record(c, bed))
 		{
-		case checkpoint::StoryFrom::Object: set += host_set(c, record_here(o, Kind::Story, kNoSource)) ? 1 : 0; break;
-		case checkpoint::StoryFrom::Body: set += host_set(c, record_far(c, Kind::Story, kNoSource), true) ? 1 : 0; break;
+			set += host_set(c, bed, elsewhere) ? 1 : 0;
+			continue;
+		}
+		switch (from)
+		{
+		case checkpoint::StoryFrom::Object: set += host_set(c, record_here(o, Kind::Story, kNoSource), elsewhere) ? 1 : 0; break;
+		case checkpoint::StoryFrom::Body: set += host_set(c, record_far(c, Kind::Story, kNoSource), elsewhere) ? 1 : 0; break;
 		case checkpoint::StoryFrom::Nothing: break;
 		}
 	}
@@ -839,7 +888,7 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 	if (!ensure_loaded())
 		return false;
 	// F3a multilevel: a player on another level comes back on HIS level; the AI map of this process is not his
-	const CSE_ALifeDynamicObject* away = levels::host_character_elsewhere(character) ? ai().alife().objects().object(character, true) : nullptr;
+	const CSE_ALifeDynamicObject* away = mode().decider_of(character) == Decider::Other ? ai().alife().objects().object(character, true) : nullptr;
 	const std::string level = away && ai().game_graph().valid_vertex_id(away->m_tGraphID) ? level_of(away->m_tGraphID) : current_level();
 	const CLevelGraph& lg = ai().level_graph();
 	Slot s;
@@ -854,6 +903,29 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 		s.cur = s.prev;
 		s.prev = Record();
 	}
+	// Build 57 (owner 2026-11-18): the record of a base whose owners are all his enemies now (he killed a guard, his standing
+	// fell) is no place to come back to: the previous record on his level is used. Round 2 (lead 2026-11-18, compile review
+	// S2): without one the hostile record is not used either, he comes back where a player without a checkpoint does
+	// (resolve below: the anchor, the host's arrival point on his level, else where the body lies). Only this respawn's copy
+	// `s` changes, the slot in the store stays. The same for a player on a map server's level (`away`): bed_hostile needs no
+	// geometry (the owners are this process's tables, the relations and his server entity are the world server's), `level`
+	// is his level. Round 3 (lead 2026-11-18, review S1): the previous record is used only when it is not a hostile base's too.
+	const Slot before = s; // round 3 review S1: the ground of a dropped record keeps the fallback points off it
+	const checkpoint::base::BedChoice bed_choice = checkpoint::base::skip_hostile_bed(
+	    s, level, sources::bed_hostile(character, s.cur), sources::bed_hostile(character, s.prev));
+	checkpoint::base::Spot dropped_ground;
+	const bool dropped = (bed_choice == checkpoint::base::BedChoice::DropCur &&
+	                         sources::base_ground(before.cur, dropped_ground)) ||
+		(bed_choice == checkpoint::base::BedChoice::DropPrev && sources::base_ground(before.prev, dropped_ground));
+	const checkpoint::base::Spot* hostile_ground = dropped ? &dropped_ground : nullptr;
+	if (bed_choice != checkpoint::base::BedChoice::Keep)
+	{
+		++g_stat.hostile_beds;
+		if (log_allowed(g_stat.hostile_beds))
+			::Msg("[coop] checkpoints: character %u: the base of his %s checkpoint is hostile to him, he comes back %s",
+			    character, bed_choice == checkpoint::base::BedChoice::DropPrev ? "previous" : "current",
+			    bed_choice == checkpoint::base::BedChoice::UsePrev ? "at his previous checkpoint" : "as without a checkpoint");
+	}
 	float a[3] = {0, 0, 0};
 	if (anchor)
 	{
@@ -864,7 +936,16 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 	const bool arrival = !away && g_host.arrival.valid() && g_host.arrival.level == level &&
 		lg.valid_vertex_id(g_host.arrival.level_vertex);
 	const float b[3] = {body.x, body.y, body.z};
-	const checkpoint::Choice c = checkpoint::resolve(s, level, anchor ? a : nullptr, arrival ? g_host.arrival.pos : nullptr, b);
+	// Round 3 review S1: the anchor and the arrival are passed only when they are off the dropped hostile base's ground; the
+	// body is the last resort and stays where it is (logged when it lies on that base too).
+	const bool anchor_ok = anchor && checkpoint::base::fallback_ok(hostile_ground, level, a);
+	const bool arrival_ok = arrival && checkpoint::base::fallback_ok(hostile_ground, level, g_host.arrival.pos);
+	if (hostile_ground && !anchor_ok && !arrival_ok && !checkpoint::base::fallback_ok(hostile_ground, level, b) &&
+	    log_allowed(g_stat.hostile_beds))
+		::Msg("! [coop] checkpoints: character %u: no point off the hostile base to come back at, he comes back where he fell",
+		    character);
+	const checkpoint::Choice c =
+	    checkpoint::resolve(s, level, anchor_ok ? a : nullptr, arrival_ok ? g_host.arrival.pos : nullptr, b);
 	out.set(c.pos[0], c.pos[1], c.pos[2]);
 	switch (c.pick)
 	{
@@ -903,7 +984,7 @@ bool get(u16 local_id, Record& out)
 {
 	if (local_id == kNoId)
 		return false;
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		if (!checkpoint::may_see(0, local_id, g_group != 0))
 			return false;
@@ -914,7 +995,7 @@ bool get(u16 local_id, Record& out)
 		out = s.cur;
 		return true;
 	}
-	if (!mgr().is_client())
+	if (!mgr().active())
 		return false;
 	client_sync_world();
 	const Record* r = g_mirror.get(local_id);

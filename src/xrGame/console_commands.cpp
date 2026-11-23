@@ -1094,7 +1094,7 @@ public:
 	virtual void Execute(LPCSTR args)
 	{
 		if (!coop::join::may_save_world()) // Anomaly Coop: includes mirror teardown after disconnect (R-9.2)
-			{ Msg("! [coop] saving is disabled on a co-op client, the host saves the world"); return; }
+			{ Msg("[coop] saving is disabled on a co-op client, the host saves the world"); return; }
 		// Anomaly Coop: a world server keeps its world in the autosaves of its game (coop_autosave: by time, when a map server starts or
 		// stops, at the end of the session; its operator saves with coop_autosave_now). A stock save asked by a script would land in
 		// the savedgames it shares with its creator's game under its ghost's name: itms_manager's new game save was there as

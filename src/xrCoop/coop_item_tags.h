@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "coop_wire.h"
+
 namespace coop
 {
 namespace itemtags
@@ -189,6 +191,122 @@ std::uint32_t state_digest(const D& d, bool with_uses)
 	if (with_uses)
 		mix(d.has_uses ? d.uses : 0xFFFFu);
 	return h | 1u; // never 0: a row without a state
+}
+
+// ---------------------------------------------------------------- TZ R32 W8.2 (protocol 34): a version per tagged field
+
+// The decider of an item (its writer, coop_writer_rules.h) changes a field on purpose: a script's set_condition or
+// set_remaining_uses, an upgrade it installs. The owner (the player whose character holds the item) reports the state his game has.
+// Before protocol 34 the newer report won: a report the owner made before he had applied the decider's debit restored it (gap-g4
+// F1/F2), and a push of the decider could undo the owner's own eating. Now every tagged field has a version: the decider moves it
+// on at each deliberate write (bump) and pushes it with the value; the owner applies the push and keeps its version (take), and
+// reports the versions with the fields. The decider takes a field of a report only when the report was made on the latest version
+// of that field (fresh): the owner's own change on top of the latest write counts, a stale report never undoes a write.
+// Version 0: no deliberate write yet (an item as it was made, a state of protocol 33).
+constexpr std::size_t kTagCount = 8; // Cond .. Uses: one version each
+static_assert(kAll == 0xFFu, "one version per Bit: the u8 mask of write_versions names every tag");
+
+// The index of the version of `bit` (a single Bit); kTagCount for 0, for several bits, for a bit that is no tag.
+inline std::size_t tag_index(std::uint32_t bit)
+{
+	for (std::size_t i = 0; i < kTagCount; ++i)
+		if (bit == (1u << i))
+			return i;
+	return kTagCount;
+}
+
+struct FieldVersions
+{
+	std::uint16_t of[kTagCount] = {};
+
+	std::uint16_t get(Bit b) const
+	{
+		const std::size_t i = tag_index(b);
+		return i < kTagCount ? of[i] : std::uint16_t(0);
+	}
+	void set(Bit b, std::uint16_t v)
+	{
+		const std::size_t i = tag_index(b);
+		if (i < kTagCount)
+			of[i] = v;
+	}
+	bool operator==(const FieldVersions& o) const
+	{
+		for (std::size_t i = 0; i < kTagCount; ++i)
+			if (of[i] != o.of[i])
+				return false;
+		return true;
+	}
+	bool operator!=(const FieldVersions& o) const { return !(*this == o); }
+};
+
+// The version after `v`. 0 stays "never written": after 65535 comes 1.
+inline std::uint16_t next_version(std::uint16_t v) { return v == 0xFFFFu ? std::uint16_t(1) : std::uint16_t(v + 1); }
+
+// The decider wrote the tags in `mask` on purpose: their versions move on.
+inline void bump(FieldVersions& v, std::uint32_t mask)
+{
+	for (std::size_t i = 0; i < kTagCount; ++i)
+		if (mask & (1u << i))
+			v.of[i] = next_version(v.of[i]);
+}
+
+// The owner applied a push of the tags in `mask`: his versions of them are the push's.
+inline void take(FieldVersions& applied, const FieldVersions& push, std::uint32_t mask)
+{
+	for (std::size_t i = 0; i < kTagCount; ++i)
+		if (mask & (1u << i))
+			applied.of[i] = push.of[i];
+}
+
+// The tags of `mask` (those an owner's report carries) made on the decider's latest version: the ones the decider applies. A
+// version is compared, not ordered (it wraps).
+inline std::uint32_t fresh(const FieldVersions& latest, const FieldVersions& report, std::uint32_t mask)
+{
+	std::uint32_t out = 0;
+	for (std::size_t i = 0; i < kTagCount; ++i)
+		if ((mask & (1u << i)) && latest.of[i] == report.of[i])
+			out |= 1u << i;
+	return out;
+}
+
+// On the wire: a tag of the ItemState blob (coop_items.cpp Tag; 1 .. 11 are taken), u8 tag, varu len, payload, so a reader of
+// protocol 33 skips it by its length (read_data's default). Payload: u8 mask (the tags whose version follows), then a u16 per bit of
+// the mask, lowest bit first.
+constexpr std::uint8_t kVersionsTag = 12;
+// Two more tags of protocol 34 (an older reader skips them by their length too):
+// 13 the decider's own change of the portions in the push of its latest version of them: i16 (coop_owner_rules.h counters);
+// 14 the stock client_data of a held eatable as the writer's game object saved it (the CGameObject::net_Save body, at most
+//    initial::kMaxClientData bytes, coop_initial_rules.h): a map server's ItemFacts, so that a world with no object stores the
+//    binder's bytes too.
+constexpr std::uint8_t kUsesDeltaTag = 13;
+constexpr std::uint8_t kClientDataTag = 14;
+
+inline void write_versions(Writer& w, const FieldVersions& v, std::uint32_t mask)
+{
+	mask &= kAll;
+	w.u8(std::uint8_t(mask));
+	for (std::size_t i = 0; i < kTagCount; ++i)
+		if (mask & (1u << i))
+			w.u16(v.of[i]);
+}
+
+// False (`v` and `mask` cleared) for a cut payload. What follows the versions of the mask is the caller's to refuse, as for every
+// reader of the wire; a tag that is not in the mask reads as version 0.
+inline bool read_versions(Reader& r, FieldVersions& v, std::uint32_t& mask)
+{
+	v = FieldVersions();
+	mask = 0;
+	FieldVersions tmp;
+	const std::uint32_t m = r.u8();
+	for (std::size_t i = 0; i < kTagCount && r.ok(); ++i)
+		if (m & (1u << i))
+			tmp.of[i] = r.u16();
+	if (!r.ok())
+		return false;
+	v = tmp;
+	mask = m;
+	return true;
 }
 } // namespace itemtags
 } // namespace coop

@@ -9,9 +9,14 @@
 extern u32 psSoundModel;
 extern float psSoundVEffects;
 
+bool CSoundRender_Emitter::positional_source()
+{
+	return bMono3D || source()->channels_num() == 1; // Anomaly Coop (sm_Mono3D)
+}
+
 void CSoundRender_Emitter::set_position(const Fvector& pos)
 {
-	if (source()->channels_num() == 1)
+	if (positional_source()) // Anomaly Coop: stock channels_num() == 1, plus a stereo source mixed down (sm_Mono3D)
 		p_source.update_position(pos);
 	else
 		p_source.position.set(0, 0, 0);
@@ -38,6 +43,7 @@ CSoundRender_Emitter::CSoundRender_Emitter(void)
 	set_cursor(0);
 	bMoved = TRUE;
 	b2D = FALSE;
+	bMono3D = false; // Anomaly Coop
 	bStopping = FALSE;
 	bRewind = FALSE;
 	iPaused = 0;

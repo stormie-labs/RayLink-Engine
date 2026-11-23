@@ -151,6 +151,8 @@ protected:
         Msg("%s", s.c_str());
     }
 };
+static bool no_dialog(); // Anomaly Coop: below, by silent_fatal_begin
+
 extern void printLuaStack();
 void LogStackTrace(LPCSTR header = nullptr, bool printStack = false)
 {
@@ -250,7 +252,10 @@ void xrDebug::gather_info(const char* expression, const char* description, const
     memory_monitor::flush_each_time(false);
 #endif //-USE_MEMORY_MONITOR
 
-	if (!IsDebuggerPresent() && !strstr(GetCommandLine(), "-no_call_stack_assert"))
+	// Anomaly Coop (TZ R38): with the launcher's key the debugger is its watcher (it answers DebugBreak "handled" and shows nothing),
+	// not a developer at a call stack: the stack goes into the log as with no debugger. Before, every FATAL under the watcher ended
+	// with no stack, and one after the log closed with nothing at all.
+	if ((!IsDebuggerPresent() || no_dialog()) && !strstr(GetCommandLine(), "-no_call_stack_assert"))
 	{
 		if (shared_str_initialized)
 			Msg("stack trace:\n");
@@ -803,6 +808,19 @@ void save_mini_dump (_EXCEPTION_POINTERS* pExceptionInfo)
             xr_strcat ( szDumpPath, t_stemp );
             xr_strcat ( szDumpPath, ".mdmp" );
 
+            // Anomaly Coop (TZ R38): after the core's teardown there is no FS: the dump goes next to the log (its path stays), not
+            // into the game's working folder, where nobody looked for it
+            const string_path& log_path = xrLogger::GetLogPath();
+            LPCSTR log_slash = strrchr(log_path, '\\');
+            if (!xr_FS && log_slash)
+            {
+                string_path temp;
+                xr_strcpy (temp,szDumpPath);
+                xr_strcpy (szDumpPath,log_path);
+                szDumpPath[log_slash - log_path + 1] = 0;
+                xr_strcat (szDumpPath,temp);
+            }
+            else
             __try
             {
                 if (FS.path_exist("$logs$"))

@@ -2,16 +2,13 @@
 #include "pch_script.h"
 #include "coop_debug.h"
 #include "coop_manager.h"
-#include "xrCoop/coop_dedicated_rules.h" // log_shown: what the dedicated window shows of the log
-#include "xrCoop/coop_operator.h" // op::allowed: what the operator's console may send (plan 2026-11-12 §2.3)
-#include "coop_dedicated.h" // answer_line: the answers to an operator's command
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_script.h"
 #include "coop_ai.h" // coop.debug.unseen: npc_ai::debug_unseen
 #include "Level.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
-#include "../../xrEngine/coop_host_console.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
 #include "Actor_Flags.h"
 
@@ -44,43 +41,40 @@ ServerState g_server; // the world server's state
 StateMsg g_seen; // the last DebugState this process took (a player's machine, the host player's half, a map server)
 bool g_seen_any = false;
 u8 g_applied = 0; // the flags this machine set on its own actor from DebugState (apply_local)
+bool g_keep_own_flags = false; // the next reset is of a world replaced inside the session (keep_own_flags_through_next_reset)
 bool g_dirty = false; // the world server: a change to send
 Stats g_stats;
 
 bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
 
-// An answer to the operator: in the log, and in the dedicated host's window whatever its log level. The window shows a log line its level
-// lets through (dedicated::log_shown); any other is written to it here, once (the Lua's coop.debug.say lines start without "[coop").
+// Every process logs debug output. The console layer also sends it to its window and back to an operator.
 void say(const char* line)
 {
 	::Msg("%s", line);
-	if (!dedicated::log_shown(line, coop_console::log_level()))
-		coop_console::print(line);
-	dedicated::answer_line(line); // a line of the operator's command (dedicated::run_for) goes back to him too
+	coop::console_line(line);
 }
 
 void say(const std::string& line) { say(line.c_str()); }
 
 // This process is a client that holds the host's rights of a world server (plan 2026-11-12 §2.3).
-bool operator_here() { return mgr().is_client() && mgr().session().self_host_rights(); }
+bool operator_here() { return mgr().active() && !mode().decides_world() && mgr().session().self_host_rights(); }
 
-// The operator's console: the line goes to the world server as an OperatorCommand; the server checks it again and answers.
+// The operator's console: the line goes to the world server as an OperatorCommand; the server checks it again and answers. The
+// mode checks and sends it (H-OPCMD: a player of a server world; INTEG-C), this keeps the lines.
 void send_to_server(const std::string& line)
 {
-	if (!op::allowed(line))
+	switch (mode().send_operator_command(line))
 	{
+	case OperatorSend::Refused:
 		say("! [coop] " + line.substr(0, line.find(' ')) + ": this line cannot go to the server (one blank between words, no ';')");
 		return;
-	}
-	if (!mgr().session().send_operator_command(line))
-	{
-		say("! [coop] the world server is not reachable now");
-		return;
+	case OperatorSend::Unreachable: say("! [coop] the world server is not reachable now"); return;
+	case OperatorSend::Sent: break;
 	}
 	say("[coop] sent to the world server: " + line);
 }
 
-bool world_server_now() { return mgr().active() && is_world_server(); }
+bool keeps_debug_flags() { return mgr().active() && mode().decides_world(); }
 
 // The world server's own state, or the last one this process took.
 const StateMsg& seen_or_empty()
@@ -134,7 +128,7 @@ void set_actor_flags(u8 bits, bool value)
 // it has (the map server keeps AF_GODMODE on its ghost for good, coop_mapserver.cpp ghost_frame).
 void apply_own_actor(const StateMsg& m)
 {
-	const bool has_player = is_player() && !ghost_actor();
+	const bool has_player = mgr().active() && mode().actor_is_player();
 	const LocalApply a = apply_local(g_applied, wanted_local(m, mgr().self(), has_player), actor_flags());
 	if (a.set)
 		set_actor_flags(a.set, true);
@@ -174,7 +168,7 @@ void write_server_state(Writer& w) { write_state(w, g_server.message()); }
 // Msg::DebugState: a player's machine (a remote client's session, the host player's LocalLink) and a map server's bridge.
 void client_on_state(PeerId from, Reader& r)
 {
-	if (from != kHostPeer || !(mgr().is_client() || is_world_server()))
+	if (from != kHostPeer || !mgr().active())
 		return;
 	StateMsg m;
 	if (!read_state(r, m))
@@ -195,7 +189,7 @@ void client_on_state(PeerId from, Reader& r)
 	g_seen_any = true;
 	++g_stats.states_in;
 	apply_own_actor(g_seen);
-	if (is_world_server())
+	if (keeps_debug_flags())
 		return; // the host's process: its world server's half told its Lua already
 	if (g_seen.on != was_on || g_seen.source != was_source)
 		::Msg("[coop] debug of the server: %s (%s)", g_seen.on ? "on" : "off", source_name(g_seen.source));
@@ -206,7 +200,7 @@ void client_on_state(PeerId from, Reader& r)
 
 void print_state()
 {
-	if (world_server_now())
+	if (keeps_debug_flags())
 	{
 		say(make_string("[coop] debug: %s (%s), serial %u", g_server.on() ? "on" : "off", source_name(g_server.source()), g_server.serial())
 		        .c_str());
@@ -244,7 +238,7 @@ void console_switch(LPCSTR args)
 		print_state();
 		return;
 	}
-	switch (switch_allowed(mgr().active(), is_world_server(), operator_here()))
+	switch (switch_allowed(mgr().active(), keeps_debug_flags(), operator_here()))
 	{
 	case Operator::Ok: break;
 	case Operator::NoSession:
@@ -320,7 +314,7 @@ void console_dbg(LPCSTR args)
 		say("! coop_dbg: " + why);
 		return;
 	}
-	switch (console_allowed(mgr().active(), is_world_server(), g_server.on(), parsed.cmd, operator_here()))
+	switch (console_allowed(mgr().active(), keeps_debug_flags(), g_server.on(), parsed.cmd, operator_here()))
 	{
 	case Operator::Ok: break;
 	case Operator::NoSession: say("! [coop] coop_dbg: no co-op session"); return;
@@ -387,7 +381,7 @@ int fail(lua_State* L, const char* why)
 // coop.debug.state() -> {on, source, serial, operator, mine, flags = {[peer] = bits}}
 int l_state(lua_State* L)
 {
-	const bool ws = world_server_now();
+	const bool ws = keeps_debug_flags();
 	const StateMsg m = ws ? g_server.message() : seen_or_empty();
 	lua_createtable(L, 0, 6);
 	lua_pushboolean(L, m.on ? 1 : 0);
@@ -398,7 +392,7 @@ int l_state(lua_State* L)
 	lua_setfield(L, -2, "serial");
 	lua_pushboolean(L, ws ? 1 : 0);
 	lua_setfield(L, -2, "operator");
-	const bool has_player = mgr().active() && is_player() && !ghost_actor();
+	const bool has_player = mgr().active() && mode().actor_is_player();
 	lua_pushnumber(L, lua_Number(has_player ? m.flags_of(mgr().self()) : 0));
 	lua_setfield(L, -2, "mine");
 	lua_createtable(L, 0, int(m.rows.size()));
@@ -440,7 +434,7 @@ bool table_bit(lua_State* L, const char* key, u8 bit, u8& bits, bool& bad)
 // coop.debug.set_flags(peer, bits | {god, ammo, invis}) -> true | false, why
 int l_set_flags(lua_State* L)
 {
-	if (!world_server_now())
+	if (!keeps_debug_flags())
 		return fail(L, "the world server only");
 	PeerId peer = kInvalidPeer;
 	if (!arg_peer(L, 1, peer))
@@ -483,7 +477,7 @@ int l_set_flags(lua_State* L)
 
 int l_is_operator(lua_State* L)
 {
-	lua_pushboolean(L, world_server_now() ? 1 : 0);
+	lua_pushboolean(L, keeps_debug_flags() ? 1 : 0);
 	return 1;
 }
 
@@ -573,7 +567,7 @@ void install_client(Endpoint& e) { e.on(Msg::DebugState, &client_on_state); }
 void on_session_started()
 {
 	reset();
-	if (!is_world_server())
+	if (!keeps_debug_flags())
 		return;
 	if (Core.isDebug() && g_server.switch_on(Source::LaunchKey))
 	{
@@ -582,9 +576,13 @@ void on_session_started()
 	}
 }
 
+void keep_own_flags_through_next_reset() { g_keep_own_flags = true; }
+
 void reset()
 {
-	take_back_own_flags();
+	if (flags_taken_at_reset(g_applied, g_keep_own_flags))
+		take_back_own_flags();
+	g_keep_own_flags = false;
 	g_server.reset();
 	g_seen = StateMsg();
 	g_seen_any = false;
@@ -593,13 +591,13 @@ void reset()
 
 void on_peer_left(PeerId peer)
 {
-	if (is_world_server() && g_server.drop_peer(peer))
+	if (keeps_debug_flags() && g_server.drop_peer(peer))
 		server_changed();
 }
 
 void host_on_peer_in_world(PeerId peer)
 {
-	if (!world_server_now())
+	if (!keeps_debug_flags())
 		return;
 	Writer w(32);
 	write_server_state(w);
@@ -612,7 +610,7 @@ void frame()
 	if (!g_dirty)
 		return;
 	g_dirty = false;
-	if (!world_server_now())
+	if (!keeps_debug_flags())
 		return;
 	Writer w(64);
 	write_server_state(w);
@@ -622,7 +620,7 @@ void frame()
 
 void print_status()
 {
-	const bool ws = world_server_now();
+	const bool ws = keeps_debug_flags();
 	const StateMsg m = ws ? g_server.message() : seen_or_empty();
 	::Msg("[coop] debug: %s (%s), serial %u, %u player(s) with flags%s | states: sent %llu, at joins %llu, taken %llu, stale %llu, bad "
 	      "%llu | god hits dropped %llu, coop.dbg requests refused %llu, local cheats refused %llu",
@@ -631,13 +629,13 @@ void print_status()
 	    g_stats.cheats_refused);
 }
 
-bool on() { return world_server_now() ? g_server.on() : g_seen_any && g_seen.on; }
+bool on() { return keeps_debug_flags() ? g_server.on() : g_seen_any && g_seen.on; }
 
-uint8_t flags(PeerId peer) { return world_server_now() ? g_server.flags(peer) : seen_or_empty().flags_of(peer); }
+uint8_t flags(PeerId peer) { return keeps_debug_flags() ? g_server.flags(peer) : seen_or_empty().flags_of(peer); }
 
 bool anyone_has(uint8_t flag)
 {
-	if (world_server_now())
+	if (keeps_debug_flags())
 	{
 		for (const auto& it : g_server.all_flags())
 			if (it.second & flag)
@@ -673,7 +671,7 @@ bool refuses_request(const std::string& name)
 bool refuse_local_cheat(const char* command)
 {
 	const char* name = command ? command : "";
-	switch (local_cheat(name, mgr().active(), is_world_server()))
+	switch (local_cheat(name, mgr().active(), keeps_debug_flags()))
 	{
 	case Cheat::Run: return false;
 	case Cheat::RefuseClient:

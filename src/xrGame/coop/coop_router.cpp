@@ -1,11 +1,36 @@
 // Anomaly Coop — callback router (F2 T10, review R5 I4) and binder router (F2 T11). See coop_router.h and
 // xrCoop/coop_routes.h.
+//
+// R32 W2a (temp/r30/design/R32-final.md §1 W2a, §8): the code scope and the writer gate of script writes, next to runs_now.
+//   - Scope: coop_route.script registers every wrapper it makes with its domain (coop.route.scoped(wrapper, domain)); the table is
+//     kept in the Lua registry, weak-keyed. The scope of the running code is the domain of the innermost registered wrapper on the
+//     live Lua stack (coop.route.scope(); writer_refuses below), so a Lua error leaves nothing stale.
+//   - Gate: writer_refuses(call, op, target) is what alife_simulator_script.cpp and level_script.cpp ask after today's call gate. The
+//     co-op host, a player's machine and single player get false at once (calls::decide_writer_gate: Run, Mirror). The world server
+//     and a map server compute the target's root (writing::root_facts_of), its writer (Mode::writer_of), the scope, and the pure
+//     verdict (writer::gate); Refuse, Ask and Order are counted per (call, script) with one log line each (the census, coop_status),
+//     and so is a world server's create that runs into a led map from code that may run on its map server as well (calls::census_note,
+//     §9.2 "WS unknown-scope writes into a led level").
+//     Under coop_writer_gate = enforce a Refuse is refused; Ask and Order have no engine path yet and keep today's code (counted).
+//   - Setting: the console command coop_writer_gate = log | enforce (register_console; log in the first build).
+// The declarations live in the stock files that call them until coop_router.h gets them (the lead's file).
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_router.h"
-#include "coop_levels.h"
 #include "coop_manager.h"
-#include "xrCoop/coop_routes.h"
+#include "coop_net.h"
+#include "coop_writer.h" // R32 W2a: writing::root_facts_of
+#include "coop_levels.h"
+#include "xrCoop/coop_calls.h"
+#include "xrCoop/coop_mode.h"
+
+#include "ai_space.h"
+#include "script_engine.h"
+#include "alife_simulator.h"
+#include "alife_object_registry.h"
+#include "xrServer_Objects_ALife_Monsters.h"
+#include "../../xrEngine/XR_IOConsole.h"
+#include "../../xrEngine/xr_ioc_cmd.h"
 
 #include <algorithm>
 #include <string>
@@ -60,10 +85,217 @@ struct State
 	std::vector<BinderSlot> binder_slots;
 	std::unordered_map<std::string, size_t> binder_by_name; // binding as written -> slot
 	std::unordered_map<const char*, size_t> binder_by_ptr;  // address of the binding string -> slot
+	// R32 W2a: what the writer gate refused, asked or ordered (or would have, under log), and the world's creates that ran into a led
+	// map, per (kind, call, script)
+	calls::WriterCensus census;
+	// R32 W2a: the kind of a new object of a class (section_kind), per factory class; a constant of the process (the classes are
+	// registered once), so install and reset keep it
+	std::unordered_map<CLASS_ID, calls::Target> class_kinds;
 };
 
 State g;
 xrCriticalSection g_lock;
+
+// --- R32 W2a: the code scope ---
+
+constexpr int kScopeDepth = 64; // Lua frames looked at for the innermost wrapper and the calling script
+char g_scope_key = 0; // its address keys the wrapper -> domain table in the Lua registry
+
+// Pushes the wrapper -> domain table of L; false (nothing pushed) when this state has none.
+bool push_scopes(lua_State* L)
+{
+	lua_pushlightuserdata(L, &g_scope_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (lua_istable(L, -1))
+		return true;
+	lua_pop(L, 1);
+	return false;
+}
+
+// The helpers whose frames do not name the maker of a write: the stock _g.script (alife_create_item, alife_release ...), axr_main,
+// coop_route.script and the utils_*.script (as coop_core_world.script's HELPER_SCRIPTS for news).
+bool helper_script(const std::string& key)
+{
+	return key == "_g" || key == "axr_main" || key == "coop_route" || key.compare(0, 6, "utils_") == 0;
+}
+
+// What the Lua stack of L says about the running code: the domain of the innermost registered wrapper (empty: no wrapper), and the
+// script that made the engine call: the innermost Lua function that is no helper's, else the innermost one ("?" when there is none).
+struct StackFacts
+{
+	std::string domain;
+	std::string script = "?";
+};
+
+StackFacts stack_facts(lua_State* L)
+{
+	StackFacts out;
+	if (!L)
+		return out;
+	const int top = lua_gettop(L);
+	const bool have_table = push_scopes(L);
+	const int base = lua_gettop(L);
+	bool script_found = false;
+	std::string innermost;
+	for (int level = 0; level < kScopeDepth; ++level)
+	{
+		lua_Debug ar;
+		if (!lua_getstack(L, level, &ar))
+			break;
+		if (!lua_getinfo(L, "Sf", &ar)) // pushes the function of that frame
+			continue;
+		if (!script_found && ar.what && xr_strcmp(ar.what, "C") && ar.source && *ar.source)
+		{
+			std::string key = routes::script_key(ar.source);
+			if (innermost.empty())
+				innermost = key;
+			if (!helper_script(key))
+			{
+				out.script = std::move(key);
+				script_found = true;
+			}
+		}
+		bool found = false;
+		if (have_table)
+		{
+			lua_rawget(L, base); // the function -> its domain
+			if (lua_type(L, -1) == LUA_TSTRING)
+			{
+				size_t n = 0;
+				const char* d = lua_tolstring(L, -1, &n);
+				out.domain.assign(d, n);
+				found = true;
+			}
+		}
+		lua_settop(L, base);
+		if (found)
+			break;
+	}
+	lua_settop(L, top);
+	if (!script_found && !innermost.empty())
+		out.script = innermost;
+	return out;
+}
+
+// --- R32 W2a: the writer gate ---
+
+const char* root_kind_name(writer::RootKind k)
+{
+	switch (k)
+	{
+	case writer::RootKind::Character: return "a character";
+	case writer::RootKind::Unit: return "a unit";
+	case writer::RootKind::Resident: return "a resident";
+	case writer::RootKind::None: return "no map's object";
+	}
+	return "no map's object";
+}
+
+// The kind of a new object of the factory class of `e` (calls::new_kind_of_class: a squad or a monster is a unit).
+calls::Target class_kind(CSE_Abstract* e)
+{
+	return calls::new_kind_of_class(smart_cast<CSE_ALifeOnlineOfflineGroup*>(e) != nullptr, smart_cast<CSE_ALifeMonsterAbstract*>(e) != nullptr);
+}
+
+// A create with no parent whose kind is read from its section: a unit as the writer rule names one. The section's `class` names one
+// factory class, so the kind is the class's, kept per class (g.class_kinds). It is read from a live object of that class in this world,
+// not from a scratch object: building one runs a script class's constructor (sim_squad_scripted:__init -> init_squad evaluates the
+// squad's relationship condlist), and the create that follows builds the real object again. Only a class with no object in this world
+// is built once as a scratch, logged. Asked only where the kind changes the writer (writer_refuses).
+calls::Target section_kind(const char* section)
+{
+	if (!section || !*section || !pSettings->section_exist(section) || !pSettings->line_exist(section, "class"))
+		return calls::Target::NewResident; // the stock create fails on it itself
+	const CLASS_ID cls = pSettings->r_clsid(section, "class");
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		const auto kept = g.class_kinds.find(cls);
+		if (kept != g.class_kinds.end())
+			return kept->second;
+	}
+	calls::Target kind = calls::Target::NewResident;
+	bool read = false;
+	for (const auto& it : ai().alife().objects().objects())
+		if (it.second && it.second->m_tClassID == cls)
+		{
+			kind = class_kind(it.second);
+			read = true;
+			break;
+		}
+	if (!read)
+	{
+		CSE_Abstract* e = F_entity_Create(section);
+		if (e)
+		{
+			kind = class_kind(e);
+			F_entity_Destroy(e);
+		}
+		::Msg("[coop] writer gate: the kind of [%s] (%s) was read from a scratch object: no object of its class in this world (once per "
+		      "class)", section, kind == calls::Target::NewUnit ? "a unit" : "a resident");
+	}
+	xrCriticalSectionGuard guard(g_lock);
+	g.class_kinds.emplace(cls, kind);
+	return kind;
+}
+
+// The census line of a counted write (once per kind, call and script). `who`: the writer the verdict used (after new_root_writer);
+// `root_writer`: the writer of the root, or of the new root's map, as Mode::writer_of said. Under g_lock.
+void census_line(const char* call, writer::WriteOp op, const calls::WriteTarget& t, const writer::RootFacts& root,
+    const writer::Writer& who, const writer::Writer& root_writer, writer::CodeScope scope, const std::string& script,
+    calls::CensusKind kind, const calls::WriteDecision& d, calls::WriterGate setting)
+{
+	string256 what;
+	if (t.kind == calls::Target::Object)
+		xr_sprintf(what, " on object %u (root %u, %s of map %u)", u32(t.id), u32(root.root), root_kind_name(root.kind), u32(root.level));
+	else
+		xr_sprintf(what, " with no parent (a new root on map %u)", u32(t.level));
+	string64 writer_text;
+	if (who.is == writer::WriterIs::Other)
+		xr_sprintf(writer_text, "peer %u", u32(who.peer));
+	else
+		xr_strcpy(writer_text, writer::writer_name(who.is));
+	string64 map_text = "";
+	if (root_writer != who && root_writer.is == writer::WriterIs::Other)
+		xr_sprintf(map_text, " (the root's writer: peer %u)", u32(root_writer.peer));
+	const char* outcome = kind == calls::CensusKind::RunIntoLed
+	    ? "ran in every setting: a create into a map a map server leads, from code that may run there as well (a double: a route line)"
+	    : d.act == calls::WriteAct::Refuse                                     ? "refused"
+	    : d.act == calls::WriteAct::Today && setting == calls::WriterGate::Log ? "counted only (coop_writer_gate log)"
+	                                                                           : "kept: no engine path for an ask or an order yet";
+	::Msg("[coop] writer gate: %s %s%s%s%s%s of %s: %s, verdict %s, written by %s%s, %s, from %s; %s (the rest of this call and script "
+	      "only count in coop_status)",
+	    call, writer::op_name(op), t.what && *t.what ? " [" : "", t.what ? t.what : "", t.what && *t.what ? "]" : "", what,
+	    writer::kind_name(writer::process_kind(is_mirror(), mode().decides_world(), mode().leads_level())), calls::census_name(kind),
+	    writer::verdict_name(d.verdict), writer_text, map_text, calls::scope_name(scope), script.c_str(), outcome);
+}
+
+// The console command coop_writer_gate = log | enforce (saved with the machine's settings).
+class CCC_WriterGate : public IConsole_Command
+{
+public:
+	CCC_WriterGate(LPCSTR name) : IConsole_Command(name) {}
+	void Execute(LPCSTR args) override
+	{
+		calls::WriterGate setting = calls::writer_gate_setting().load();
+		if (!calls::parse_writer_gate(args ? args : "", setting))
+		{
+			InvalidSyntax();
+			return;
+		}
+		calls::writer_gate_setting().store(setting);
+		::Msg("[coop] coop_writer_gate %s", calls::writer_gate_name(setting));
+	}
+	void Status(TStatus& S) override { xr_strcpy(S, calls::writer_gate_name(calls::writer_gate_setting().load())); }
+	void Info(TInfo& I) override
+	{
+		xr_strcpy(I, "the writer gate of script writes (R32 W2a): log (counts in coop_status what it would refuse, ask or order) | enforce");
+	}
+	void fill_tips(vecTips& tips, u32 /*mode*/) override
+	{
+		tips.push_back("log");
+		tips.push_back("enforce");
+	}
+};
 
 bool iends_with(std::string_view s, std::string_view suffix)
 {
@@ -204,7 +436,7 @@ Domain route_of(std::string_view callback, const std::string& script)
 bool runs_now(Domain d)
 {
 	const Manager& m = mgr();
-	return !m.active() || routes::runs_here(d, m.is_host(), levels::leads_my_level());
+	return net::route_runs_here(d, m.active(), mode());
 }
 
 bool arg_string(lua_State* L, int idx, std::string_view& out)
@@ -299,6 +531,35 @@ int l_none_functions(lua_State* L)
 	return 1;
 }
 
+// coop.route.scoped(wrapper, domain): R32 W2a, the wrapper's code runs in that domain ("host", "owner", "view", "level", "none", or
+// calls::kUnknownScope). Anything else is ignored.
+int l_scoped(lua_State* L)
+{
+	std::string_view name;
+	routes::Domain unused = routes::Domain::Owner;
+	if (lua_type(L, 1) != LUA_TFUNCTION || !arg_string(L, 2, name) ||
+		(name != calls::kUnknownScope && !routes::parse_domain(name, unused)))
+		return 0;
+	if (!push_scopes(L))
+		return 0;
+	lua_pushvalue(L, 1);
+	lua_pushlstring(L, name.data(), name.size());
+	lua_rawset(L, -3);
+	lua_pop(L, 1);
+	return 0;
+}
+
+// coop.route.scope() -> the domain of the innermost registered wrapper on this Lua stack, nil outside any.
+int l_scope(lua_State* L)
+{
+	const StackFacts f = stack_facts(L);
+	if (f.domain.empty())
+		lua_pushnil(L);
+	else
+		lua_pushlstring(L, f.domain.data(), f.domain.size());
+	return 1;
+}
+
 // --- F2 T11: binders ---
 
 // Under g_lock. The slot of a binding: made on the first ask, with the actions resolved against the table. A reference
@@ -345,6 +606,7 @@ void install()
 	g.binder_slots.clear();
 	g.binder_by_name.clear();
 	g.binder_by_ptr.clear();
+	g.census.clear();
 }
 
 void reset()
@@ -353,6 +615,7 @@ void reset()
 	g.counters.clear();
 	for (BinderSlot& b : g.binder_slots)
 		std::fill(std::begin(b.skipped), std::end(b.skipped), u64(0));
+	g.census.clear(); // R32 W2a: a session's census, its lines again
 }
 
 void load_overrides()
@@ -381,8 +644,24 @@ void register_lua(lua_State* L)
 		{"runs", &l_runs},
 		{"note", &l_note},
 		{"none_functions", &l_none_functions},
+		{"scoped", &l_scoped}, // R32 W2a
+		{"scope", &l_scope},
 		{nullptr, nullptr},
 	};
+	// R32 W2a: the wrapper -> domain table of this state, weak-keyed (a wrapper goes with its handler); made once per state, so a second
+	// registration keeps the marks of the wrappers made before it
+	if (!push_scopes(L))
+	{
+		lua_pushlightuserdata(L, &g_scope_key);
+		lua_newtable(L);
+		lua_createtable(L, 0, 1);
+		lua_pushstring(L, "k");
+		lua_setfield(L, -2, "__mode");
+		lua_setmetatable(L, -2);
+		lua_rawset(L, LUA_REGISTRYINDEX);
+	}
+	else
+		lua_pop(L, 1);
 	lua_pushstring(L, "coop");
 	lua_rawget(L, LUA_GLOBALSINDEX);
 	if (!lua_istable(L, -1))
@@ -390,7 +669,7 @@ void register_lua(lua_State* L)
 		lua_pop(L, 1);
 		return; // coop_script logs it
 	}
-	lua_createtable(L, 0, 4);
+	lua_createtable(L, 0, 6);
 	for (const luaL_Reg* f = fns; f->name; ++f)
 	{
 		lua_pushcfunction(L, f->func);
@@ -398,6 +677,61 @@ void register_lua(lua_State* L)
 	}
 	lua_setfield(L, -2, "route");
 	lua_pop(L, 1);
+}
+
+bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarget& target)
+{
+	if (!call || !mgr().active())
+		return false; // single player: the stock game writes everything
+	const writer::ProcessKind kind = writer::process_kind(is_mirror(), mode().decides_world(), mode().leads_level());
+	if (kind == writer::ProcessKind::Whole || kind == writer::ProcessKind::Mirror)
+		return false; // the co-op host writes everything; a player's machine keeps today's verdict (calls::decide; the golden table)
+	if (!ai().get_alife())
+		return false;
+	const u16 own = levels::my_level();
+	writer::RootFacts root{writer::RootKind::None, writer::kNoId, writer::kNoLevel};
+	if (target.kind == calls::Target::Object)
+	{
+		if (target.id == writer::kNoId || !ai().alife().objects().object(target.id, true))
+			return false; // no such object: the stock code says so itself
+		root = writing::root_facts_of(target.id);
+	}
+	else
+		root = writer::RootFacts{writer::RootKind::Resident, writer::kNoId, target.level}; // a create with no parent: its new root
+	const StackFacts stack = stack_facts(ai().script_engine().lua());
+	const writer::CodeScope scope = stack.domain.empty() ? writer::CodeScope::Unknown : calls::scope_of_domain(stack.domain);
+	const bool on_own_level = kind == writer::ProcessKind::Level && root.level != writer::kNoLevel && root.level == own;
+	const calls::WriterGate setting = calls::writer_gate_setting().load();
+	const writer::Writer root_writer = mode().writer_of(root);
+	writer::Writer who = root_writer;
+	calls::WriteFacts facts{kind, who, scope, on_own_level, calls::is_ghost(root, mode().actor_is_player())};
+	calls::WriteDecision d = calls::decide_writer_gate(facts, op, calls::Gate::Run, setting);
+	// a new root that is a unit is this process's own (new_root_writer): asked only where the resident's answer would not run, so the
+	// section is read only then
+	if (d.verdict != writer::GateVerdict::Run && target.kind != calls::Target::Object && target.kind != calls::Target::NewResident)
+	{
+		const calls::Target made = target.kind == calls::Target::NewOfSection ? section_kind(target.what) : target.kind;
+		who = calls::new_root_writer(kind, made, on_own_level, root_writer);
+		facts.writer = who;
+		d = calls::decide_writer_gate(facts, op, calls::Gate::Run, setting);
+	}
+	// the census (§9.2): what the gate does not run here, and the world's creates into a led map from code that may run there as well
+	// (counted with the root's writer from before new_root_writer: a level-code squad on a led map is the world's own unit, yet that
+	// map's server runs the same code)
+	const calls::CensusNote note = calls::census_note(kind, root_writer, op, scope, d.verdict);
+	if (!note.counted)
+		return false;
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		if (g.census.note(note.kind, call, stack.script))
+			census_line(call, op, target, root, who, root_writer, scope, stack.script, note.kind, d, setting);
+	}
+	return d.gate == calls::Gate::Refuse;
+}
+
+void register_console()
+{
+	CMD1(CCC_WriterGate, "coop_writer_gate"); // R32 W2a
 }
 
 routes::BinderAction binder_action(const char* binding, BinderMethod method)
@@ -472,6 +806,16 @@ void print_status()
 	for (size_t i = 0; i < rows.size() && i < kTopBinders; ++i)
 		line += (line.empty() ? "" : ", ") + rows[i].first + " " + std::to_string(rows[i].second);
 	::Msg("[coop] binders: most skipped %s", line.empty() ? "(none)" : line.c_str());
+
+	// R32 W2a: the census of the writer gate (what the stand reads before coop_writer_gate enforce)
+	const calls::WriterCensus::Totals& c = g.census.totals();
+	::Msg("[coop] writer gate: coop_writer_gate %s | refuse %llu, ask %llu, order %llu, run into led %llu (%u call/script pair(s)%s)",
+		calls::writer_gate_name(calls::writer_gate_setting().load()), c.refuse, c.ask, c.order, c.led, u32(g.census.keys()),
+		g.census.dropped() ? ", more than the table keeps" : "");
+	line.clear();
+	for (const std::pair<std::string, u64>& s : g.census.top(kTopSkipped))
+		line += (line.empty() ? "" : ", ") + s.first + " " + std::to_string(s.second);
+	::Msg("[coop] writer gate: most counted %s", line.empty() ? "(none)" : line.c_str());
 }
 } // namespace router
 } // namespace coop

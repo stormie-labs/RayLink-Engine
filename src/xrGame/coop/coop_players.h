@@ -93,6 +93,11 @@ bool drive_avatar(class CAI_Stalker* avatar);
 // coop_equip.cpp calls it right after ChangeVisual on an avatar (R3 В4): the new visual plays nothing, so the
 // motions applied so far are forgotten and drive_avatar plays the owner's current ones again.
 void on_avatar_visual_changed(u16 avatar_id);
+// TZ P50 (review 2026-11-23), coop_remote.cpp on_net_spawn: an object with this id spawned here. If it is an avatar, its
+// object stands where this world spawned it, not yet where its player is (placed() is false until drive_avatar places it).
+void on_object_spawn(u16 id);
+// TZ P50: drive_avatar has put avatar `avatar_id` where its player stands (from his snapshots) since its object spawned here.
+bool placed(u16 avatar_id);
 
 // --- read-only views of the last state an avatar was driven with (local numbering; W5) ---
 // Movement flags (actor EMoveCommand, low 16 bits as sent); 0 if the avatar was never driven.

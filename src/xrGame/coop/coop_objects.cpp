@@ -2,6 +2,7 @@
 #include "pch_script.h"
 #include "coop_objects.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_world.h"
@@ -12,12 +13,18 @@
 #include "coop_story.h"
 #include "coop_checkpoint_sources.h"
 #include "coop_survival.h" // build 51: life_of (zone_feels_player)
+#include "coop_vehicles.h" // F5-VEH-3: the copy of the car this player drives
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_motion_rules.h"
 #include "xrCoop/coop_hits.h" // build 51: zone_blowout_start, zone_state_waits
+#include "xrCoop/coop_zone_path_rules.h" // F4 G11-2: the wander path of a moving zone (DAO's Ghost)
+#include "xrCoop/coop_throw_rules.h" // R32 W7 follow-up: no throw of a lease-pending item; a save flushes removals
+#include "coop_requests.h" // client_lease_waiting
+#include "xrCoop/coop_mode.h" // F4 G11-2: only the process that leads its map runs a path of its own
 
 #include "ai_space.h"
+#include "level_graph.h"
 #include "script_engine.h"
 #include "Level.h"
 #include "Actor.h"
@@ -98,6 +105,7 @@ enum class StateKind : u8
 enum class ZoneKind : u8
 {
 	Zones = 1,
+	Paths = 2, // F4 G11-2: wander paths of moving zones, xrCoop/coop_zone_path_rules.h
 };
 enum class RequestKind : u8
 {
@@ -190,6 +198,10 @@ struct Counters
 	// script cycles of world physic objects (coop_motion_rules.h): host words out; client words in, replayed, held, local
 	// play_cycle calls dropped, malformed words
 	u64 motions_sent = 0, motions_in = 0, motions_played = 0, motions_held = 0, cycles_dropped = 0, motions_malformed = 0;
+	// F4 G11-2, wander paths of moving zones (coop_zone_path_rules.h): started here by a script, refused to it, said to the
+	// players, gone before the frame took them; in from the authority, malformed, put on a copy, refused for a copy
+	u64 paths_started = 0, paths_refused = 0, paths_sent = 0, paths_lost = 0;
+	u64 paths_in = 0, paths_malformed = 0, paths_met = 0, paths_wrong_copy = 0;
 };
 
 xrCriticalSection g_lock;
@@ -602,6 +614,30 @@ xr_map<u16, u64> g_push_sent; // local id -> time
 
 u64 g_last_scan = 0, g_last_push_check = 0;
 
+// ---------------------------------------------------------------- wander paths of moving zones (F4 G11-2)
+
+// A path this machine runs (xrCoop/coop_zone_path_rules.h): one a script of the map it leads started, or that authority's on
+// a copy here. Main thread only; local ids.
+struct PathRun
+{
+	zonepath::Path p;
+	std::vector<float> ys; // the heights of one period, built at its first frame here (this machine's level graph)
+	u64 base_ms = 0; // the path had run base_run ms at base_ms of this machine's clock
+	u32 base_run = 0;
+	u64 received = 0; // when it came (a viewer keeps it kPendingTtlMs for a copy that is not here yet)
+	const CCustomZone* zone = nullptr; // the object it is put on; nullptr: not met yet
+	u32 last_tick = 0xffffffffu;
+};
+xr_map<u16, PathRun> g_paths;
+// Started by a script (coop.zone_path, any game thread), under g_lock: the next frame takes them.
+struct PathStart
+{
+	zonepath::Path p;
+	u64 at = 0;
+};
+xr_vector<PathStart> g_ev_paths;
+constexpr size_t kMaxPathStarts = 1024; // not taken yet: more is a script that calls it in a loop
+
 // Apply scopes (main thread only).
 int g_zone_apply = 0;
 u16 g_zone_apply_id = kNoId;
@@ -834,6 +870,9 @@ void client_apply_bodies()
 {
 	const u64 now = now_ms();
 	const u64 render = now > kInterpDelayMs ? now - kInterpDelayMs : 0;
+	// F5-VEH-3 (docs/VEHICLES.md section 14): the copy of the car this player drives shows the decider's latest pose extrapolated
+	// (<= kMaxExtrapolateMs), not the buffer kInterpDelayMs behind: his keys go there and back already
+	const u16 driven = vehicles::driving_car();
 	xr_vector<Pose> poses;
 	for (auto it = g_bodies.begin(); it != g_bodies.end();)
 	{
@@ -866,7 +905,7 @@ void client_apply_bodies()
 		}
 		if (!b.samples.empty())
 		{
-			if (sample_at(b, render, poses) && apply_poses(go, poses, true))
+			if (sample_at(b, id == driven ? now : render, poses) && apply_poses(go, poses, true))
 				++g_c.poses_applied;
 			if (b.samples.back().local_time + 1000 < now)
 				b.samples.clear(); // the host went quiet without a rest: keep the last pose
@@ -897,6 +936,8 @@ void client_push_check()
 	CActor* actor = Actor();
 	if (!actor || !actor->g_Alive() || !actor->character_physics_support() || !actor->character_physics_support()->movement())
 		return;
+	if (actor->Holder())
+		return; // F5-VEH-3: a seated player walks into nothing (his controller is gone; its last velocity stays behind)
 	Fvector vel = actor->character_physics_support()->movement()->GetVelocity();
 	vel.y = 0.f;
 	const float speed = vel.magnitude();
@@ -1267,6 +1308,243 @@ void client_hold_motions()
 		play_word(it.first, it.second, now);
 }
 
+// ---------------------------------------------------------------- both: wander paths of moving zones (F4 G11-2)
+
+// The heights of one period of `p` on this machine's level graph (DAO: level.vertex_id(x, spawn y, z), vertex_position().y).
+// A point off the graph's box is asked nothing (CLevelGraph::vertex_id would log every call): the spawn height there.
+std::vector<float> path_heights(const zonepath::Path& p)
+{
+	const CLevelGraph* graph = ai().get_level_graph();
+	return zonepath::heights(p, [graph](float x, float y, float z, float& out) {
+		if (!graph)
+			return false;
+		const Fvector at = Fvector().set(x, y, z);
+		if (!graph->valid_vertex_position(at))
+			return false;
+		const u32 v = graph->vertex_id(at);
+		if (!graph->valid_vertex_id(v))
+			return false;
+		out = graph->vertex_position(v).y;
+		return true;
+	});
+}
+
+// Every path this machine runs: the zone goes where its path is now, once per tick of the path. The authority's own runs end
+// with their zone; a viewer's wait kPendingTtlMs for a copy that is not here yet, and are put only on a copy of that section
+// near the path's origin (zonepath::same_zone).
+void apply_paths(u64 now)
+{
+	for (auto it = g_paths.begin(); it != g_paths.end();)
+	{
+		PathRun& run = it->second;
+		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(it->first));
+		if (!zone)
+		{
+			if (run.zone || now - run.received > zonepath::kPendingTtlMs)
+				it = g_paths.erase(it); // gone (offline, released), or never came
+			else
+				++it;
+			continue;
+		}
+		if (run.zone != zone)
+		{
+			const Fvector& at = zone->Position();
+			const float pos[3] = {at.x, at.y, at.z};
+			if (run.zone ||
+				!zonepath::same_zone(run.p.section_hash, zonepath::name_hash(zone->cNameSect().c_str()), run.p.origin, pos))
+			{
+				++g_c.paths_wrong_copy; // another object under that id
+				it = g_paths.erase(it);
+				continue;
+			}
+			run.zone = zone;
+			++g_c.paths_met;
+		}
+		if (run.ys.empty())
+			run.ys = path_heights(run.p);
+		const u64 ran = zonepath::run_at(run.base_ms, run.base_run, now);
+		const u32 tick = zonepath::tick_at(run.p, ran);
+		if (tick != run.last_tick)
+		{
+			run.last_tick = tick;
+			const zonepath::Point to = zonepath::point_at(run.p, run.ys, ran);
+			zone->MoveScript(Fvector().set(to.x, to.y, to.z));
+		}
+		++it;
+	}
+}
+
+// One path as it leaves at `now`: with the time it has run by then.
+void add_path(Batcher& b, const PathRun& run, u64 now)
+{
+	Writer w(48);
+	zonepath::write_path(w, run.p, zonepath::phase_ms(run.p, zonepath::run_at(run.base_ms, run.base_run, now)));
+	b.add(w);
+	++g_c.paths_sent;
+}
+
+// The authority: the paths its scripts started since the last frame run here from now on and go to the players of its map.
+void host_take_paths(u64 now)
+{
+	xr_vector<PathStart> starts;
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		if (g_ev_paths.empty())
+			return;
+		starts.swap(g_ev_paths);
+	}
+	Batcher b(Msg::ZoneState, u8(ZoneKind::Paths), false, Lane::Reliable, kInvalidPeer, true);
+	for (const PathStart& s : starts)
+	{
+		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(s.p.id));
+		bool here = zone != nullptr;
+		if (here)
+		{
+			const Fvector& at = zone->Position();
+			const float pos[3] = {at.x, at.y, at.z};
+			here = zonepath::same_zone(s.p.section_hash, zonepath::name_hash(zone->cNameSect().c_str()), s.p.origin, pos);
+		}
+		if (!here)
+		{
+			++g_c.paths_lost; // gone between the script's call and this frame (or replaced with its world)
+			continue;
+		}
+		PathRun& run = g_paths[s.p.id]; // a new path of the same zone replaces the old one
+		run = PathRun();
+		run.p = s.p;
+		run.base_ms = s.at;
+		run.received = now;
+		run.zone = zone;
+		add_path(b, run, now);
+	}
+	b.flush();
+	g_c.zone_msgs += b.packets();
+}
+
+void host_paths()
+{
+	const u64 now = now_ms();
+	host_take_paths(now);
+	apply_paths(now);
+}
+
+// A player who comes into the map: every path that runs here, with the time it has run by now.
+u32 host_send_paths(PeerId to, u64 now)
+{
+	if (g_paths.empty() || !mode().leads_level())
+		return 0;
+	u32 n = 0;
+	Batcher b(Msg::ZoneState, u8(ZoneKind::Paths), false, Lane::Reliable, to, true);
+	for (const auto& it : g_paths)
+	{
+		if (!it.second.zone || !find_go(it.first))
+			continue; // its zone went this frame: apply_paths drops it
+		add_path(b, it.second, now);
+		++n;
+	}
+	b.flush();
+	g_c.zone_msgs += b.packets();
+	return n;
+}
+
+// A viewer: the authority's paths. A word that does not read whole ends the message (what follows it cannot be trusted).
+void client_on_paths(Reader& r)
+{
+	const u16 count = r.u16();
+	if (!r.ok() || count > zonepath::kMaxPathsPerMessage)
+	{
+		++g_c.paths_malformed;
+		return;
+	}
+	const u64 now = now_ms();
+	for (u16 k = 0; k < count; ++k)
+	{
+		zonepath::Path p;
+		u32 phase = 0;
+		if (!zonepath::read_path(r, p, phase))
+		{
+			++g_c.paths_malformed;
+			if (!r.ok())
+				return;
+			continue;
+		}
+		p.id = join::to_local(p.id);
+		PathRun& run = g_paths[p.id]; // the latest word on a zone wins
+		run = PathRun();
+		run.p = p;
+		run.base_ms = now;
+		run.base_run = phase;
+		run.received = now;
+		++g_c.paths_in;
+	}
+}
+
+bool lua_whole(lua_State* L, int i, double lo, double hi, u32& out)
+{
+	if (lua_type(L, i) != LUA_TNUMBER)
+		return false;
+	const double v = double(lua_tonumber(L, i));
+	if (!(v >= lo && v <= hi) || v != std::floor(v))
+		return false;
+	out = u32(v);
+	return true;
+}
+
+bool lua_finite(lua_State* L, int i, float& out)
+{
+	if (lua_type(L, i) != LUA_TNUMBER)
+		return false;
+	const double v = double(lua_tonumber(L, i));
+	if (!(v > -double(zonepath::kMaxCoord) && v < double(zonepath::kMaxCoord))) // NaN and infinities too
+		return false;
+	out = float(v);
+	return true;
+}
+
+// coop.zone_path(zone_id, x, y, z, i0, i_step, j_step, x_mod, z_mod) -> bool   (scripts\coop_mods_dao_fx.script)
+// The process that leads its map starts the wander path of a moving zone: the engine runs it here from this frame on and
+// gives it to every player of the map (and to one who comes later). x, y, z: the point the zone spawned at; the rest as
+// DAO's Ghost rolls them. False (nothing started): this process leads no map (a player's machine gets the authority's path,
+// the world server has no map), no such zone, a value DAO does not roll, or the zone stands too far from that point.
+int l_zone_path(lua_State* L)
+{
+	zonepath::Path p;
+	u32 id = 0, i0 = 0, i_step = 0, j_step = 0;
+	bool ok = lua_gettop(L) >= 9 && lua_whole(L, 1, 0, 0xfffe, id) && lua_finite(L, 2, p.origin[0]) &&
+		lua_finite(L, 3, p.origin[1]) && lua_finite(L, 4, p.origin[2]) && lua_whole(L, 5, 0, zonepath::kCircle - 1, i0) &&
+		lua_whole(L, 6, 1, zonepath::kMaxIStep, i_step) && lua_whole(L, 7, 1, zonepath::kMaxJStep, j_step) &&
+		lua_finite(L, 8, p.x_mod) && lua_finite(L, 9, p.z_mod) && g_pGameLevel && mode().leads_level();
+	if (ok)
+	{
+		p.id = u16(id);
+		p.i0 = u16(i0);
+		p.i_step = u8(i_step);
+		p.j_step = u8(j_step);
+		const CCustomZone* zone = smart_cast<CCustomZone*>(find_go(p.id));
+		ok = zone != nullptr;
+		if (ok)
+		{
+			p.section_hash = zonepath::name_hash(zone->cNameSect().c_str());
+			const Fvector& at = zone->Position();
+			const float pos[3] = {at.x, at.y, at.z};
+			ok = zonepath::valid(p) && zonepath::same_zone(p.section_hash, p.section_hash, p.origin, pos);
+		}
+	}
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		ok = ok && g_ev_paths.size() < kMaxPathStarts;
+		if (ok)
+		{
+			g_ev_paths.push_back(PathStart{p, now_ms()});
+			++g_c.paths_started;
+		}
+		else
+			++g_c.paths_refused;
+	}
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
 // ---------------------------------------------------------------- client: message handlers
 
 u64 to_local_time(u32 remote)
@@ -1483,7 +1761,13 @@ void client_on_zones(PeerId, Reader& r)
 		return;
 	if (before_live(Msg::ZoneState))
 		return; // a zone phase of another world: the host sends ours when we are in (host_on_peer_ready)
-	if (ZoneKind(r.u8()) != ZoneKind::Zones)
+	const ZoneKind kind = ZoneKind(r.u8());
+	if (kind == ZoneKind::Paths)
+	{
+		client_on_paths(r); // F4 G11-2
+		return;
+	}
+	if (kind != ZoneKind::Zones)
 		return;
 	const u16 count = r.u16();
 	const u64 now = now_ms();
@@ -1708,7 +1992,7 @@ void host_on_activate(PeerId from, Reader& r)
 
 void host_on_request(PeerId from, Reader& r)
 {
-	if (!is_map_authority() || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
+	if (!(mode().decides_world() || mode().leads_level()) || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
 		return;
 	switch (RequestKind(r.u8()))
 	{
@@ -1726,6 +2010,8 @@ void host_on_request(PeerId from, Reader& r)
 }
 
 // ---------------------------------------------------------------- host: frame
+
+void consume_due(u64 now, bool saving); // below: the removal records of thrown hand items
 
 void host_apply_throws()
 {
@@ -1789,16 +2075,25 @@ void host_apply_throws()
 		++g_c.projectiles;
 		it = g_pending_throws.erase(it);
 	}
+	consume_due(now, false);
+}
+
+// R3 В7 / R32 addendum PJ3: a removal record of a thrown hand item. Due (3 s over) or a save: remove it now; a reused
+// id is never removed by an old record (xrCoop/coop_throw_rules.h consume_at).
+void consume_due(u64 now, bool saving)
+{
 	for (auto it = g_consume.begin(); it != g_consume.end();)
 	{
-		if (now < it->second.deadline)
+		const bool due = now >= it->second.deadline;
+		if (!due && !saving)
 		{
 			++it;
 			continue;
 		}
 		// R3 В7: wherever the thrown item went meanwhile (dropped, stashed, handed over), it was thrown.
 		CSE_Abstract* e = events::find_entity(it->first);
-		if (e && e == it->second.entity && e->s_name == it->second.section)
+		const bool same = e && e == it->second.entity && e->s_name == it->second.section;
+		if (throws::consume_at(saving, due, same) == throws::ConsumeAt::Remove)
 		{
 			host_destroy_entity(e); // the owner never removed the thrown item itself
 			++g_c.consumed;
@@ -2125,12 +2420,14 @@ void host_frame()
 	host_apply_throws();
 	host_stream();
 	host_resend_torrid();
+	host_paths(); // F4 G11-2
 }
 
 void client_frame()
 {
 	client_scan();
 	client_apply_zones();
+	apply_paths(now_ms()); // F4 G11-2: the authority's paths on the copies of its zones
 	client_apply_bodies();
 	client_apply_events();
 	client_push_check();
@@ -2139,6 +2436,15 @@ void client_frame()
 } // namespace
 
 // ---------------------------------------------------------------- API
+
+// R32 PJ3 (WP8b): declared in coop_objects.h, so it lives outside the anonymous namespace (inside it the save's call did not
+// link: build 58, LNK2001)
+void host_flush_consumes()
+{
+	if (!(mode().decides_world() || mode().leads_level()))
+		return;
+	consume_due(now_ms(), true);
+}
 
 void install_server(Session& s)
 {
@@ -2151,11 +2457,25 @@ void install_client(Endpoint& e)
 	e.on(Msg::ZoneState, [](PeerId from, Reader& r) { client_on_zones(from, r); });
 }
 
+void register_lua(lua_State* L)
+{
+	lua_pushstring(L, "coop");
+	lua_rawget(L, LUA_GLOBALSINDEX);
+	if (!lua_istable(L, -1))
+	{
+		lua_pop(L, 1);
+		return;
+	}
+	lua_pushcfunction(L, &l_zone_path);
+	lua_setfield(L, -2, "zone_path");
+	lua_pop(L, 1);
+}
+
 void frame()
 {
 	if (!g_pGameLevel || !ai().get_alife())
 		return;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 		host_frame();
 	else if (is_live_mirror())
 		client_frame();
@@ -2180,7 +2500,11 @@ void reset()
 		g_motion_book.clear();
 		g_ev_motions.clear();
 		g_motion_words.clear();
+		// g_ev_paths stays: the scripts of a world that was loaded under the session start their paths while it loads,
+		// before the host's world watch resets this module (coop_join host_watch_world, the frame before ours); the take
+		// checks each start against the zone it finds and drops what is older than kPathStartTtlMs
 	}
+	g_paths.clear();
 	g_next_motion_check = 0;
 	g_anim_host.clear();
 	g_anim_host_ms.clear();
@@ -2211,7 +2535,7 @@ void reset()
 
 void host_on_peer_ready(PeerId id)
 {
-	if (!is_map_authority() || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
+	if (!(mode().decides_world() || mode().leads_level()) || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
 		return;
 	const u64 now = now_ms();
 	u32 zones = 0, bodies = 0, anims = 0;
@@ -2228,6 +2552,7 @@ void host_on_peer_ready(PeerId id)
 			++zones;
 		}
 	}
+	const u32 paths = host_send_paths(id, now); // F4 G11-2: the Ghosts of this map, mid-path
 	{
 		Batcher b(Msg::EntityState, u8(StateKind::Rest), true, Lane::Reliable, id);
 		xr_vector<Pose> poses;
@@ -2289,8 +2614,8 @@ void host_on_peer_ready(PeerId id)
 			++motions;
 		}
 	}
-	::Msg("[coop] objects -> #%u: %u zone states, %u moved bodies, %u animated objects, %u script cycles", id, zones, bodies,
-	    anims, motions);
+	::Msg("[coop] objects -> #%u: %u zone states, %u zone paths, %u moved bodies, %u animated objects, %u script cycles", id,
+	    zones, paths, bodies, anims, motions);
 }
 
 bool is_host_driven(const CGameObject* obj)
@@ -2300,7 +2625,7 @@ bool is_host_driven(const CGameObject* obj)
 
 void print_status()
 {
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   objects out: %llu sample packets (%llu entries), %llu rests, %llu zone msgs, %llu anim msgs, "
 		    "%u moved bodies",
@@ -2316,6 +2641,8 @@ void print_status()
 		    g_c.consumed, g_c.consume_forced, g_c.activations, (u32)g_pending_throws.size());
 		::Msg("[coop]   objects out: %llu script cycles of world physic objects said, %u objects in the book",
 		    g_c.motions_sent, (u32)g_motion_book.size());
+		::Msg("[coop]   zone paths (G11-2): %llu started by scripts (%llu refused, %llu zones gone first), %llu said, %u running",
+		    g_c.paths_started, g_c.paths_refused, g_c.paths_lost, g_c.paths_sent, (u32)g_paths.size());
 	}
 	else if (is_mirror())
 	{
@@ -2339,6 +2666,8 @@ void print_status()
 		    "%llu own play_cycle calls dropped",
 		    g_c.motions_in, g_c.motions_malformed, g_c.motions_played, g_c.motions_held, (u32)g_motion_words.size(),
 		    g_c.cycles_dropped);
+		::Msg("[coop]   zone paths in (G11-2): %llu (%llu malformed), %llu put on a copy, %llu refused for the copy, %u running",
+		    g_c.paths_in, g_c.paths_malformed, g_c.paths_met, g_c.paths_wrong_copy, (u32)g_paths.size());
 	}
 }
 
@@ -2350,7 +2679,7 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 		return;
 	const u64 now = now_ms();
 	const u16 id = obj->ID();
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		AnimEntry cur;
 		cur.id = id;
@@ -2466,7 +2795,7 @@ bool script_cycle_blocked(CGameObject* obj)
 
 void on_script_cycle(CGameObject* obj, const char* anim, bool mix_in)
 {
-	if (!obj || !anim || !*anim || !mgr().active() || !is_map_authority())
+	if (!obj || !anim || !*anim || !mgr().active() || !(mode().decides_world() || mode().leads_level()))
 		return;
 	if (obj->H_Parent() || !smart_cast<CPhysicObject*>(obj) || xr_strlen(anim) > motion::kMaxCycleName)
 		return;
@@ -2522,7 +2851,7 @@ bool ph_destroy(CGameObject* obj, const SHit& fatal_hit)
 		return false;
 	if (is_mirror())
 		return true; // fragments are host entities; they arrive through WP2's EntityLocal relay
-	if (!is_map_authority() || !smart_cast<CDestroyablePhysicsObject*>(obj))
+	if (!(mode().decides_world() || mode().leads_level()) || !smart_cast<CDestroyablePhysicsObject*>(obj))
 		return false;
 	DestroyedEntry d;
 	d.id = obj->ID();
@@ -2542,7 +2871,7 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 		return false;
 	if (is_mirror())
 		return true;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		g_ev_fragments.push_back(part->ID());
@@ -2552,7 +2881,7 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 
 void on_break(CGameObject* obj)
 {
-	if (!obj || !is_map_authority())
+	if (!obj || !(mode().decides_world() || mode().leads_level()))
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_ev_broken.push_back(obj->ID());
@@ -2579,7 +2908,7 @@ int on_zone_state(CCustomZone* zone, u8 new_state)
 {
 	if (!zone)
 		return 0;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		ZoneEntry e;
 		e.id = zone->ID();
@@ -2638,7 +2967,7 @@ void zone_blast_passed(CCustomZone* zone)
 
 bool zone_feels_player(u16 id)
 {
-	if (id == kNoId || !mgr().active() || !is_map_authority())
+	if (id == kNoId || !mgr().active() || !(mode().decides_world() || mode().leads_level()))
 		return false;
 	if (!world::is_player_proxy(id) || world::is_parked(id))
 		return false;
@@ -2664,7 +2993,7 @@ bool campfire_turn_blocked(CGameObject* campfire, bool on)
 		return false;
 	if (is_mirror())
 		return g_zone_apply == 0; // the host lights and puts out fires
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		ZoneEntry e;
 		e.id = campfire->ID();
@@ -2683,7 +3012,7 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 		return dt;
 	const float length = anim.max_t - anim.min_t;
 	const float local = anim.t_current - anim.min_t;
-	if (is_map_authority())
+	if (mode().decides_world() || mode().leads_level())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		TorridPhase& p = g_torrid_host[zone->ID()];
@@ -2731,7 +3060,7 @@ bool skip_fake_missile(CGameObject* missile) { return missile && is_mirror(); }
 
 void host_mark_projectile(CSE_Abstract* projectile)
 {
-	if (!projectile || !is_map_authority())
+	if (!projectile || !(mode().decides_world() || mode().leads_level()))
 		return;
 	// The thrown copy becomes an ALife object when it leaves the hand (game_sv_Single::OnDetach), so
 	// coop_entities replicates its spawn and release; on_projectile_free() clears the flag again so it
@@ -2742,15 +3071,27 @@ void host_mark_projectile(CSE_Abstract* projectile)
 
 void on_projectile_free(CGameObject* missile)
 {
-	if (!missile || !is_map_authority() || !smart_cast<CMissile*>(missile->H_Parent()))
+	if (!missile || !(mode().decides_world() || mode().leads_level()) || !smart_cast<CMissile*>(missile->H_Parent()))
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_ev_projectiles.emplace_back(missile->ID(), now_ms());
 }
 
+bool throw_may_start(CMissile* missile)
+{
+	if (!missile)
+		return true;
+	return throws::may_start(is_mirror(), is_mirror() && requests::client_lease_waiting(missile->ID()));
+}
+
 bool client_throw(CMissile* missile)
 {
 	if (!missile || !is_mirror() || entities::client_applying())
+		return false;
+	// R32 W7 follow-up: the authority does not have an item whose create is still pending. No throw request then; the
+	// engine throw stops by itself (no fake missile here) and the item stays in hand (CMissile::Action normally does not
+	// even start the throw: throw_may_start).
+	if (!throws::may_start(true, requests::client_lease_waiting(missile->ID())))
 		return false;
 	CActor* actor = smart_cast<CActor*>(missile->H_Parent());
 	if (!actor || actor->ID() != kActor || !is_live_mirror())
@@ -2809,7 +3150,7 @@ bool explode_blocked(CGameObject* explosive)
 
 void on_explode(CGameObject* explosive, u16 initiator, const Fvector& pos, const Fvector& normal)
 {
-	if (!explosive || !is_map_authority())
+	if (!explosive || !(mode().decides_world() || mode().leads_level()))
 		return;
 	ExplodeEntry x;
 	x.id = explosive->ID();

@@ -30,6 +30,13 @@
 #include "coop_levels.h" // F3a
 #include "coop_monster_fx.h" // audit A5
 #include "coop_debug.h" // protocol 29: the server's debug
+#include "coop_vehicles.h" // F5: vehicles for players
+#include "coop_vehicles_client.h" // F5-VEH-3: the client half's coop_status lines
+#include "coop_vehicles_state.h" // F5-VEH-4: the state's coop_status lines
+#include "coop_vehicles_ride.h" // F5-VEH-5: the ride's coop_status lines
+#include "coop_progress.h" // F5: a player's progress checked where his record is kept
+#include "coop_player_touch.h" // TZ P50: collision between players where they appear and at level exits
+#include "xrCoop/coop_mode.h" // S4: the frame of the session's mode
 
 #include "Level.h"
 #include "Actor.h"
@@ -90,6 +97,7 @@ void install_server(Session& s)
 	levels::install_server(s); // F3a
 	monster_fx::install_server(s); // audit A5
 	debug::install_server(s); // protocol 29
+	vehicles::install_server(s); // F5: VehicleReq, VehicleInput (the decider of the level: the co-op host, a map server)
 }
 
 void install_client(Endpoint& e)
@@ -116,6 +124,7 @@ void install_client(Endpoint& e)
 	levels::install_client(e); // F3a
 	monster_fx::install_client(e); // audit A5
 	debug::install_client(e); // protocol 29: DebugState (the host player's over the link, a map server's on its bridge)
+	vehicles::install_client(e); // F5: VehicleSeat, VehicleState (a player's machine; the host player's over the link)
 }
 
 void on_session_started()
@@ -166,7 +175,10 @@ void on_peer_left(PeerId id)
 
 void reset()
 {
+	vehicles::session_over(); // F5-VEH-2: the cars clients drove parked, their proxies on their feet, the seat table forgotten
+	vehicles::ride_session_over(); // F5-VEH-5 (rv_F5-VEH-5): a passenger seated in this world stands up, the ride is forgotten
 	npc_ai::viewers_clear(); // the scheduler looks at the host's camera alone again
+	player_touch::reset(); // TZ P50: the players' bodies collide as in single player again
 	players::reset();
 	entities::reset();
 	world::reset();
@@ -180,6 +192,7 @@ void reset()
 	dialog::reset();
 	trade::reset();
 	money::reset(); // F2 T1
+	progress::reset(); // F5-REV-1 note 2: the keeper's book of a player's progress and its counters are this session's
 	survival::reset();
 	checkpoints::reset(); // F3
 	death::reset();
@@ -240,6 +253,8 @@ void frame()
 		npc_ai::viewers_clear();
 	if (up)
 		players::frame();
+	if (up)
+		player_touch::frame(); // TZ P50: after the avatars were placed from their snapshots
 	if (!gap)
 		survival::frame(); // leaves the session's state when there is no level
 	if (up)
@@ -259,6 +274,14 @@ void frame()
 	entities::reconcile_frame(); // after events: a digest counts what this frame told the clients
 	if (up)
 		objects::frame();
+	if (up)
+	{
+		// F5: every process runs the four; each does nothing where it keeps no state (no seat decided here, no car driven here)
+		vehicles::server_frame(); // the decider: releases, stale input, seated proxies parked at their seats
+		vehicles::state_frame(); // the decider: VehicleState of the cars with a sitter or a running engine, the dolls of sitters
+		vehicles::client_frame(); // a player's machine: VehicleInput of the car he drives, the answer timeout
+		vehicles::ride_frame(); // a passenger follows his seat, after objects::frame posed the copy of the car this frame
+	}
 	requests::frame();
 	if (up)
 		dialog::frame();
@@ -269,7 +292,9 @@ void frame()
 	script::frame();
 	syncapi::frame(); // F2 T14
 	story::frame();
-	levels::frame(); // F3a: the registry and the map servers (T10, T9)
+	if (up)
+		progress::frame(); // F5: the checks of a player's progress where his record is kept (coop_progress.h)
+	mode().frame(); // S4 (P-E): the mode's own frame (the server's: the levels, the map servers, a map's sky; the co-op's: none)
 	monster_fx::frame(up); // audit A5: abilities that came before their monster
 	debug::frame(); // protocol 29: a change of the server's debug goes out
 }
@@ -279,6 +304,7 @@ void print_status()
 	net::print_status();
 	world::print_status();
 	players::print_status();
+	player_touch::print_status(); // TZ P50
 	entities::print_status();
 	remote::print_status();
 	worldstate::print_status();
@@ -303,6 +329,11 @@ void print_status()
 	objects::print_status();
 	monster_fx::print_status(); // audit A5
 	debug::print_status(); // protocol 29
+	vehicles::print_status(); // F5: seats, cars driven, requests by verdict, inputs
+	vehicles::client_print_status(); // F5-VEH-3: this machine's half: requests, answers, inputs, its own seat
+	vehicles::state_print_status(); // F5-VEH-4: VehicleState sent / played, the dolls
+	vehicles::ride_print_status(); // F5-VEH-5: this machine's ride, the places read
+	progress::print_status(); // F5: the checks of a player's progress
 }
 
 void dump_state(LPCSTR args)
@@ -367,7 +398,7 @@ bool is_remote_driven(const CGameObject* obj)
 	return entities::is_mirrored(id) && smart_cast<const CEntityAlive*>(obj) != nullptr;
 }
 
-bool alife_frozen() { return mgr().is_client(); }
+bool alife_frozen() { return net::client(); }
 
 bool intercept_local_spawn(CSE_Abstract* entity) { return entities::intercept_local_spawn(entity); }
 } // namespace sync

@@ -2,9 +2,9 @@
 #include "stdafx.h"
 #include "coop_survival.h"
 #include "coop_manager.h"
+#include "xrCoop/coop_mode.h"
 #include "coop_join.h"
 #include "coop_levels.h"
-#include "coop_mapserver.h"
 #include "coop_world.h"
 #include "coop_net.h"
 #include "coop_script.h"
@@ -72,6 +72,7 @@ constexpr u32 kLuaHudMs = 1000; // the Lua HUD (coop.revive_progress) polled wit
 constexpr float kReviveRange = 2.5f; // reviver side
 constexpr float kHostReviveRange = 4.5f; // host check (avatars are rendered 100 ms in the past)
 constexpr u32 kStateRefreshMs = 5000; // own life state and (host) rules / roster resend: P5, late joiners
+constexpr u32 kRaisedRefreshMs = 1000; // Build 57: own life state while a teammate raises me (my time stands still)
 constexpr u32 kRevivePendingMs = 5000; // host: one medkit per fall, even if the order is slow
 constexpr u32 kDamageMsPerHealth = 100000; // damage taken while down shortens bleed-out (0.1 health = 10 s)
 constexpr u32 kRespawnSettleMs = 300; // owner: the Respawning state goes out before the teleport
@@ -256,6 +257,8 @@ struct Local
 	xr_string sent_item_sect;
 	// somebody reviving me: the ring the host's Reviving started, on this machine's clock
 	revive::LiftView lift;
+	// Build 57 (owner 2026-11-18): while that ring is on, my time stands still (local_frame)
+	revive::BleedPause bleed_pause;
 	// spectating
 	u16 spectate = 0xffff; // local id of the watched avatar
 	bool next_was_down = false, prev_was_down = false;
@@ -392,9 +395,9 @@ xr_set<u16> g_guard_logged;
 
 // ---------------------------------------------------------------- helpers
 
-bool live() { return mgr().is_host() || mgr().is_live_client(); }
+bool live() { return mode().decides_world() || mgr().is_live_client(); }
 u64 now() { return mgr().now_ms(); }
-u16 my_host_id() { return mgr().is_host() ? u16(0) : join::my_proxy(); }
+u16 my_host_id() { return mode().decides_world() ? u16(0) : join::my_proxy(); }
 
 CActor* local_actor() { return g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity()) : nullptr; }
 
@@ -498,11 +501,11 @@ PeerId peer_of_host_id(u16 host_id)
 		return kHostPeer;
 	if (host_id == my_host_id())
 		return mgr().self();
-	return mgr().is_host() ? join::peer_of_proxy(host_id) : world::avatar_peer(join::to_local(host_id));
+	return mode().decides_world() ? join::peer_of_proxy(host_id) : world::avatar_peer(join::to_local(host_id));
 }
 
 // The object id of the character `host_id` on this machine (the host numbers its own objects, a client maps them).
-u16 local_of_host_id(u16 host_id) { return mgr().is_host() ? host_id : join::to_local(host_id); }
+u16 local_of_host_id(u16 host_id) { return mode().decides_world() ? host_id : join::to_local(host_id); }
 
 // ---------------------------------------------------------------- camera effectors
 
@@ -1297,7 +1300,7 @@ bool host_order_respawn(u16 id, u16 seq)
 	CGameObject* body = object_here(id);
 	// F3a multilevel: a player on another level has no object here. He comes back on his own level, from where his server entity
 	// stands; the anchor is a place on the level the host knows him on, it means nothing there.
-	const CSE_ALifeDynamicObject* away = !body && levels::host_character_elsewhere(id) && ai().get_alife() ?
+	const CSE_ALifeDynamicObject* away = !body && mode().decider_of(id) == Decider::Other && ai().get_alife() ?
 	    ai().alife().objects().object(id, true) :
 	    nullptr;
 	if (!body && !away)
@@ -1322,30 +1325,18 @@ bool host_order_respawn(u16 id, u16 seq)
 	return true;
 }
 
-// The map server whose level his body stands on: the body is an object of that level, what touches it is done there. kInvalidPeer: here.
-PeerId bridge_of_body(u16 character)
-{
-	const PeerId peer = peer_of_character(character);
-	return peer != kInvalidPeer && !levels::on_host_level(peer) ? mapserver::bridge_of(levels::level_of_player(peer)) : kInvalidPeer;
-}
-
 // Checkpoint death: the items (coop_death, by coop_death_drop) and the money go now, the owner is evacuated for
 // coop_respawn_delay, host_frame respawns him.
 void host_take_losses_and_evacuate(u16 id, u16 seq)
 {
-	const PeerId bridge = bridge_of_body(id);
+	Writer w(8);
+	w.u8(OpLosses);
+	w.u16(id);
+	w.u16(seq);
+	w.u8(u8(g_world_rules.drop));
+	w.u8(g_world_rules.share_pct);
 	u32 items = 0;
-	if (bridge != kInvalidPeer)
-	{
-		Writer w(8);
-		w.u8(OpLosses);
-		w.u16(id);
-		w.u16(seq);
-		w.u8(u8(g_world_rules.drop));
-		w.u8(g_world_rules.share_pct);
-		net::host_send(bridge, Msg::PlayerRevive, w);
-	}
-	else
+	if (!mode().to_level_of(peer_of_character(id), Msg::PlayerRevive, w, Lane::Reliable))
 		items = death::host_apply_losses(id, seq, g_world_rules.drop, g_world_rules.share_pct);
 	const u32 money = death::host_take_money(id, g_world_rules.money_pct);
 	::Msg("[coop] death of %s (fall #%u): %u item(s) (%s, share %u%%), %u RU; respawn in %u s", nick_of(id).c_str(), seq,
@@ -1824,7 +1815,7 @@ void host_new_character(u16 character)
 	death::learn_out(h.tracker, flag_read(character, kOutKey));
 	const xr_string who = nick_of(character);
 	const char* refused = nullptr;
-	const PeerId bridge = bridge_of_body(character);
+	const PeerId peer = peer_of_character(character);
 	switch (death::on_new_character(h.tracker, g_retire.find(character) != g_retire.end()))
 	{
 	case death::NewCharVerdict::Busy:
@@ -1832,7 +1823,7 @@ void host_new_character(u16 character)
 		return;
 	case death::NewCharVerdict::NotOut: refused = "he is not out of a hardcore run"; break;
 	case death::NewCharVerdict::Start:
-		if (bridge == kInvalidPeer && (character == 0 ? !local_actor() : !object_here(character)))
+		if (!mode().led_elsewhere(peer) && (character == 0 ? !local_actor() : !object_here(character)))
 			refused = "his character is not in the world here";
 		break;
 	}
@@ -1844,12 +1835,11 @@ void host_new_character(u16 character)
 	}
 	Retirement r;
 	r.since = now();
-	if (bridge != kInvalidPeer)
+	Writer w(4);
+	w.u8(OpStash);
+	w.u16(character);
+	if (mode().to_level_of(peer, Msg::PlayerRevive, w, Lane::Reliable))
 	{
-		Writer w(4);
-		w.u8(OpStash);
-		w.u16(character);
-		net::host_send(bridge, Msg::PlayerRevive, w);
 		r.at_map_server = true;
 		g_retire[character] = r;
 		::Msg("[coop] %s starts a new character: his things go into a stash on his level", who.c_str());
@@ -2005,7 +1995,27 @@ void host_read_worn(u16 proxy, u16 seq, Reader& r)
 	++g_stat.worn_reports;
 }
 
-// The world server: a player's life report (F3a T7: the host player's comes over the internal channel from peer 0). His
+// A map server takes the tunnel's copy, in step with the player's stream. Only the world decides and relays it.
+void map_on_state(PeerId from, Reader& r)
+{
+	r.u16(); // the claimed id is unused
+	const u8 life = r.u8();
+	const u16 seq = r.u16();
+	const u32 left = r.u32();
+	const u64 nick_bytes = r.varu();
+	if (!r.ok() || life > u8(Life::Respawning) || nick_bytes > Writer::kMaxString || !r.skip(size_t(nick_bytes)))
+		return; // skip the wire nickname without allocating it; the worn list can follow
+	const u16 own = character_of_peer(from);
+	if (own == 0xffff)
+		return;
+	const PeerInfo* p = mgr().session().peer(from);
+	if (Life(life) == Life::Dead)
+		host_read_worn(own, seq, r); // the losses are taken here on the world server's word (OpLosses)
+	// The session supplies the name, and death::Rules caps bleed-out at 600 s.
+	apply_remote_state(own, Life(life), seq, std::min(left, u32(600000)), p ? p->nick.c_str() : "?");
+}
+
+// The world decider: a player's life report (F3a T7: the host player's comes over the internal channel from peer 0). His
 // character is the one of his peer, never the id he claims; the report is decided on (host_on_state) and relayed to the
 // others. A remote player's record is kept here (apply_remote_state: the world's view, which is the host player's view of
 // him too: one process); the host player's own life is g_me, which his report comes from.
@@ -2018,18 +2028,7 @@ void server_on_state(PeerId from, Reader& r)
 	const std::string nick = r.str();
 	if (!r.ok() || life > u8(Life::Respawning))
 		return;
-	if (is_map_server())
-	{
-		// the tunnel's copy: the body is an object of this level, and the report comes in step with his stream
-		const u16 own = character_of_peer(from);
-		if (own == 0xffff)
-			return;
-		if (Life(life) == Life::Dead)
-			host_read_worn(own, seq, r); // the losses are taken here, on the world server's word (OpLosses)
-		apply_remote_state(own, Life(life), seq, left, nick.c_str());
-		return;
-	}
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return;
 	const u16 id = character_of_peer(from);
 	if (id == 0xffff)
@@ -2060,18 +2059,26 @@ void client_on_state(PeerId from, Reader& r)
 		return;
 	if (!mgr().is_live_client() || from != kHostPeer || id == my_host_id())
 		return; // our own state is ours
-	if (is_map_server() && peer_of_character(id) != kInvalidPeer)
-		return; // a player of this level: his own report came through the tunnel
 	apply_remote_state(id, Life(life), seq, left, nick.c_str());
+}
+
+void map_on_state_relay(PeerId from, Reader& r)
+{
+	Reader header = r;
+	const u16 id = header.u16();
+	if (header.ok() && peer_of_character(id) != kInvalidPeer)
+		return; // a player of this level: his own report came through the tunnel
+	client_on_state(from, r);
 }
 
 // The world server: a reviver's request, hold or cancel (F3a T7: the host player's over the internal channel).
 void server_on_revive(PeerId from, Reader& r)
 {
 	const u8 op = r.u8();
-	if (!r.ok() || !is_map_authority() || !revive::is_client_op(op))
+	if (!r.ok() || (!mode().decides_world() && !mode().leads_level()) || !revive::is_client_op(op))
 		return; // orders come only from the world server
-	if (mgr().is_host() && !levels::on_host_level(from))
+	// Peer 0 still goes through character lookup, which requires an attached local-player link.
+	if (mode().decides_world() && from != kHostPeer && mode().where(from) == Where::Away)
 		return; // the bodies stand on a map server's level: its copy is judged there
 	const u16 reviver = character_of_peer(from);
 	if (reviver == 0xffff)
@@ -2110,28 +2117,39 @@ void server_on_revive(PeerId from, Reader& r)
 void client_on_revive(PeerId from, Reader& r)
 {
 	const u8 op = r.u8();
-	if (r.ok() && op == OpLosses)
+	if (op == OpLosses || op == OpStash)
+		return; // these orders are for the process leading the body
+	if (r.ok() && live() && from == kHostPeer && !revive::is_client_op(op))
+		apply_order(op, r);
+}
+
+void map_on_revive(PeerId from, Reader& r)
+{
+	Reader body = r;
+	const u8 op = body.u8();
+	if (!body.ok() || from != kHostPeer)
+		return;
+	if (op == OpLosses)
 	{
-		const u16 character = r.u16();
-		const u16 seq = r.u16();
-		const u8 drop = r.u8();
-		const u8 share = r.u8();
-		if (r.ok() && is_map_server() && from == kHostPeer && drop <= u8(death::Drop::Keep))
+		const u16 character = body.u16();
+		const u16 seq = body.u16();
+		const u8 drop = body.u8();
+		const u8 share = body.u8();
+		if (body.ok() && drop <= u8(death::Drop::Keep))
 			death::host_apply_losses(character, seq, death::Drop(drop), share);
 		return;
 	}
-	if (r.ok() && op == OpStash)
+	if (op == OpStash)
 	{
-		const u16 character = r.u16();
-		if (r.ok() && is_map_server() && from == kHostPeer && std::find(g_stashing.begin(), g_stashing.end(), character) == g_stashing.end())
+		const u16 character = body.u16();
+		if (body.ok() && std::find(g_stashing.begin(), g_stashing.end(), character) == g_stashing.end())
 		{
 			death::host_move_to_stash(character, true);
 			g_stashing.push_back(character);
 		}
 		return;
 	}
-	if (r.ok() && live() && from == kHostPeer && !revive::is_client_op(op))
-		apply_order(op, r);
+	client_on_revive(from, r);
 }
 
 // The world server, F3 Task 10 step 2: Msg::NewCharacter (no payload; bytes after are a newer client's) from a player out
@@ -2139,7 +2157,7 @@ void client_on_revive(PeerId from, Reader& r)
 // an id he names.
 void on_new_character_msg(PeerId from, Reader&)
 {
-	if (!mgr().is_host())
+	if (!mode().decides_world())
 		return; // ClientOnly: the session refuses it from the host before any handler
 	const u16 character = character_of_peer(from);
 	if (character == 0xffff)
@@ -2151,29 +2169,31 @@ void on_new_character_msg(PeerId from, Reader&)
 	host_new_character(character);
 }
 
-// A player: the world server's rules (F3a T7: the host player takes them over the internal channel like a client; the
-// world server's own are g_world_rules).
-void on_rules_msg(PeerId from, Reader& r)
+// The map server uses the world rules when it judges interactions on its level.
+void map_on_rules(PeerId from, Reader& r)
 {
-	if (is_map_server() && from == kHostPeer)
+	if (from != kHostPeer)
+		return;
+	death::Rules rules = g_world_rules;
+	if (!rules.read(r))
 	{
-		death::Rules rules = g_world_rules; // no player here: what it judges by (the revive of a player of its level)
-		if (!rules.read(r))
-		{
-			::Msg("! [coop] map server: malformed PlayerRules ignored, the rules stay as they were");
-			return;
-		}
-		static bool told = false; // the host sends them every few seconds
-		const bool changed = !told || !(rules == g_world_rules);
-		told = true;
-		g_world_rules = rules;
-		g_coop_friendly_fire = rules.friendly_fire ? 1 : 0; // no game record here: its console is the machine's
-		npc_ai::set_finish_downed(rules.finish_downed);
-		if (changed)
-			::Msg("[coop] map server: the world's rules: friendly fire %s, stalkers finish a downed player %s", rules.friendly_fire ? "on" : "off",
-			    rules.finish_downed ? "on" : "off");
+		::Msg("! [coop] map server: malformed PlayerRules ignored, the rules stay as they were");
 		return;
 	}
+	static bool told = false; // the host sends them every few seconds
+	const bool changed = !told || !(rules == g_world_rules);
+	told = true;
+	g_world_rules = rules;
+	g_coop_friendly_fire = rules.friendly_fire ? 1 : 0; // no game record here: its console is the machine's
+	npc_ai::set_finish_downed(rules.finish_downed);
+	if (changed)
+		::Msg("[coop] map server: the world's rules: friendly fire %s, stalkers finish a downed player %s",
+		    rules.friendly_fire ? "on" : "off", rules.finish_downed ? "on" : "off");
+}
+
+// A player: the world decider's rules (F3a T7: the host player takes them over the internal channel like a client).
+void on_rules_msg(PeerId from, Reader& r)
+{
 	if (!is_player() || from != kHostPeer)
 		return;
 	death::Rules rules = g_rules;
@@ -2408,6 +2428,19 @@ void local_frame(CActor* a, u64 t)
 {
 	if (g_hook_fell.exchange(false) && g_me.life == Life::Alive)
 		enter_wounded(a, t);
+
+	// Build 57 (owner 2026-11-18): "when another player raises somebody, his time must stop running for as long as he is
+	// being raised". The time is mine to keep in both modes (the host relays the hold, LiftView); it is moved on before the
+	// damage and the giving up below, so those still end it. The others see what is left from my reports: one a second
+	// while I am raised (the host's roster refresh alone would let their count run down for kStateRefreshMs).
+	if (g_me.life == Life::Wounded)
+	{
+		g_me.bleed_end = g_me.bleed_pause.step(t, g_me.lift.active(t, g_me.seq), g_me.bleed_end);
+		if (g_me.bleed_pause.on() && t - g_me.last_sent >= kRaisedRefreshMs)
+			send_my_state(t);
+	}
+	else
+		g_me.bleed_pause.clear();
 
 	const u32 damage = g_hook_damage.exchange(0);
 	if (damage && g_me.life == Life::Wounded)
@@ -2791,7 +2824,7 @@ void collect_players(xr_vector<PlayerRef>& out, bool include_self)
 		me.self = true;
 		out.push_back(me);
 	}
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		for (const PeerInfo& p : mgr().session().peers())
 		{
@@ -2829,7 +2862,7 @@ xr_string nick_of(u16 host_id)
 		return "?";
 	if (host_id == my_host_id())
 		return mgr().nick();
-	if (mgr().is_host())
+	if (mode().decides_world())
 	{
 		const PeerId peer = join::peer_of_proxy(host_id);
 		const PeerInfo* p = peer != kInvalidPeer ? mgr().session().peer(peer) : nullptr;
@@ -2846,13 +2879,9 @@ xr_string nick_of(u16 host_id)
 
 u16 character_of_peer(PeerId peer)
 {
-	if (is_map_server())
-	{
-		const auto& on = mapserver::trunk_peers().on();
-		const auto it = on.find(peer);
-		return it == on.end() ? u16(0xffff) : u16(it->second.proxy);
-	}
-	if (!mgr().is_host())
+	if (LevelSide* level = mode().level())
+		return level->level_character_of(peer);
+	if (!mode().decides_world())
 		return 0xffff;
 	if (peer == kHostPeer)
 		return mgr().session().local() ? u16(0) : u16(0xffff); // the host player, over the internal channel
@@ -2861,14 +2890,9 @@ u16 character_of_peer(PeerId peer)
 
 PeerId peer_of_character(u16 character)
 {
-	if (is_map_server())
-	{
-		for (const auto& it : mapserver::trunk_peers().on())
-			if (it.second.proxy == character)
-				return it.first;
-		return kInvalidPeer;
-	}
-	if (!mgr().is_host() || character == 0xffff)
+	if (LevelSide* level = mode().level())
+		return level->level_peer_of(character);
+	if (!mode().decides_world() || character == 0xffff)
 		return kInvalidPeer;
 	if (character == 0)
 		return mgr().session().local() ? kHostPeer : kInvalidPeer;
@@ -2879,7 +2903,7 @@ bool out_of_run(u16 character) { return flag_read(character, kOutKey); }
 
 bool player_in_world(u16 character)
 {
-	if (!mgr().is_host() || character == 0xffff)
+	if (!mode().decides_world() || character == 0xffff)
 		return false;
 	if (character == 0)
 		return mgr().session().local() && g_pGameLevel && local_actor() && g_world_served == join::world_generation();
@@ -2985,7 +3009,7 @@ void host_stash_over(u16 character, bool things_stay)
 bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 {
 	out.clear();
-	if (!is_map_authority())
+	if (!mode().decides_world() && !mode().leads_level())
 		return false; // a map server takes the losses of its level and keeps the list of his Dead report (host_read_worn)
 	const auto it = g_host.find(character);
 	if (it == g_host.end() || !it->second.has_worn || it->second.worn_seq != seq)
@@ -2994,8 +3018,23 @@ bool host_worn_items(u16 character, u16 seq, xr_vector<u16>& out)
 	return true;
 }
 
+// The map server's mode (srv/coop_srv_mode.cpp, MapServerMode::install) installs these right after the Core's tables, on its
+// virtual-player session and world endpoint respectively: they replace the Core's PlayerWounded / PlayerRevive / PlayerRules there.
+void install_level_server(Session& s)
+{
+	s.on(Msg::PlayerWounded, &map_on_state);
+}
+
+void install_level_client(Endpoint& e)
+{
+	e.on(Msg::PlayerWounded, &map_on_state_relay);
+	e.on(Msg::PlayerRevive, &map_on_revive);
+	e.on(Msg::PlayerRules, &map_on_rules);
+}
+
 // F3a T7: PlayerWounded and PlayerRevive go both ways (Either): each side has its own function, so that the host
 // player's copy on the internal channel never runs the world server's part.
+// A map server's PlayerWounded is its mode's (install_level_server above).
 void install_server(Session& s)
 {
 	s.on(Msg::PlayerWounded, &server_on_state);
@@ -3003,6 +3042,7 @@ void install_server(Session& s)
 	s.on(Msg::NewCharacter, &on_new_character_msg); // F3 Task 10
 }
 
+// A map server's three are its mode's (install_level_client above).
 void install_client(Endpoint& e)
 {
 	e.on(Msg::PlayerWounded, &client_on_state);
@@ -3026,11 +3066,9 @@ void register_console()
 	CMD1(CCC_CoopNewCharacter, "coop_new_character"); // F3 Task 10
 }
 
-namespace
-{
 // A map server: the retirements of its level that are over go up, after the Parent of each thing that moved (the same queue). Its word
 // on what stayed on him counts: the body is its object.
-void server_stash_frame()
+void level_stash_frame()
 {
 	for (size_t i = 0; i < g_stashing.size();)
 	{
@@ -3045,8 +3083,6 @@ void server_stash_frame()
 		g_stashing.erase(g_stashing.begin() + i);
 	}
 }
-} // namespace
-
 void reset()
 {
 	end_spectate_fade();
@@ -3063,7 +3099,7 @@ void reset()
 void frame()
 {
 	// R1: join::frame runs before this one in Manager::frame and serves the world it finds (host_watch_world)
-	g_world_served = mgr().is_host() && g_pGameLevel ? join::world_generation() : 0;
+	g_world_served = mode().decides_world() && g_pGameLevel ? join::world_generation() : 0;
 	if (!g_pGameLevel || !live())
 	{
 		if (g_me.actor || !g_players.empty() || !g_host.empty())
@@ -3071,10 +3107,10 @@ void frame()
 		return;
 	}
 	const u64 t = now();
-	if (mgr().is_host())
+	if (mode().decides_world())
 		host_frame(t);
-	else if (is_map_server())
-		server_stash_frame();
+	else if (mode().level())
+		level_stash_frame();
 	if (!g_rules_from_host)
 		g_rules = console_rules(); // until the world server's rules arrive (F3a T7: the host player's too, over the link)
 
@@ -3114,7 +3150,7 @@ void print_status()
 	::Msg("[coop]   survival: me %s (fall #%u), death mode %s%s, drop %s (share %u%%), bleed-out %u s, revive health "
 	      "%.2f, respawn delay %u s, contusion %u s, money %u%%, wear %u%%, rank %u%%",
 	    life_name(g_me.life), g_me.seq, mode_name(shown.mode),
-	    mgr().is_host() || g_rules_from_host ? "" : " (host rules not received yet)", death::drop_name(shown.drop),
+	    mode().decides_world() || g_rules_from_host ? "" : " (host rules not received yet)", death::drop_name(shown.drop),
 	    u32(shown.share_pct), shown.bleedout_ms / 1000, shown.revive_health, shown.delay_ms / 1000,
 	    shown.contusion_s, u32(shown.money_pct), u32(shown.wear_pct), u32(shown.rank_pct));
 	::Msg("[coop]   survival: falls %llu, deaths %llu, revived %llu, refused %llu, evacuated %llu, respawns %llu, "
@@ -3330,11 +3366,11 @@ bool own_pose_held(const CActor* actor) { return actor && g_pose_actor.load() ==
 
 bool look_locked() { return live() && g_me.actor && death::look_locked(u8(g_me.life)); }
 
-const death::Rules& rules() { return mgr().is_host() ? g_world_rules : g_rules; }
+const death::Rules& rules() { return mode().decides_world() ? g_world_rules : g_rules; }
 
 void rollback_failed(u16 character, u16 seq)
 {
-	if (mgr().is_host())
+	if (mode().decides_world())
 		host_rollback_failed(character, seq);
 }
 

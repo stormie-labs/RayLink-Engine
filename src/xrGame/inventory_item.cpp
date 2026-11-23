@@ -26,6 +26,7 @@
 #include "object_broker.h"
 #include "../xrEngine/igame_persistent.h"
 #include "coop/coop_players.h" // Anomaly Coop
+#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
 
 
 #ifdef DEBUG
@@ -387,7 +388,43 @@ void CInventoryItem::net_Destroy()
 {
 	if (m_pInventory)
 	{
-		VERIFY(std::find(m_pInventory->m_all.begin(), m_pInventory->m_all.end(), this)==m_pInventory->m_all.end());
+		// Anomaly Coop (O1-container, #1710-1712): an item that goes away while its holder's inventory still lists it is
+		// taken out of the lists (stock only VERIFYed it in a debug build; a release build kept a dangling entry, and scripts
+		// got a nil object from IterateRuck). The inventory is read only when its owner is still a registered object: an
+		// owner that went first is freed by now (register_object_to_destroy queues the children after it, Objects.Unload
+		// goes in any order). No DropItem here: its drop callbacks would run for an item already going, maybe in a level
+		// that is unloading (xrCoop/coop_container_rules.h)
+		CInventory* inv = nullptr;
+		if (g_pGameLevel)
+			for (u32 i = 0, n = g_pGameLevel->Objects.o_count(); i < n && !inv; ++i)
+			{
+				CInventoryOwner* owner = g_pGameLevel->Objects.o_get_by_iterator(i)->cast_inventory_owner();
+				if (owner && &owner->inventory() == m_pInventory)
+					inv = m_pInventory;
+			}
+		const bool in_slot = inv && CurrPlace() == eItemPlaceSlot && CurrSlot() <= inv->LastSlot() &&
+			inv->ItemFromSlot(CurrSlot()) == this;
+		TIItemContainer* lists[] = {inv ? &inv->m_all : nullptr, inv ? &inv->m_ruck : nullptr, inv ? &inv->m_belt : nullptr};
+		bool listed = in_slot;
+		for (TIItemContainer* list : lists)
+			listed = listed || (list && std::find(list->begin(), list->end(), this) != list->end());
+		const coop::container::Leftover left = coop::container::leftover_on_destroy(inv != nullptr, listed, in_slot);
+		if (left.unlist)
+		{
+			for (TIItemContainer* list : lists)
+			{
+				TIItemContainer::iterator it = std::find(list->begin(), list->end(), this);
+				if (it != list->end())
+					list->erase(it);
+			}
+			inv->CalcTotalWeight();
+			inv->InvalidateState();
+		}
+		if (left.note)
+			Msg("[coop] item %u [%s] goes away still listed by its holder's inventory: taken out%s", u32(object().ID()),
+			    object().cNameSect().c_str(), in_slot ? " of its lists, its slot still names it" : "");
+		if (left.forget)
+			m_pInventory = NULL;
 	}
 
 	//инвентарь которому мы принадлежали

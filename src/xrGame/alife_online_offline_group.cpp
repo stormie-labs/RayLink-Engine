@@ -8,6 +8,8 @@
 
 #include "stdafx.h"
 #include "coop/coop_alife.h"
+#include "coop/coop_entities.h" // Anomaly Coop (R32 W3): client_applying, for the member hook
+#include "xrCoop/coop_mode.h" // Anomaly Coop (R32 W3): the level side the member hook tells (docs/MODES.md section 4)
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "ai_space.h"
 #include "alife_simulator.h"
@@ -26,6 +28,38 @@
 #pragma warning(pop)
 
 extern void setup_location_types_line(GameGraph::TERRAIN_VECTOR& m_vertex_types, LPCSTR string);
+
+// Anomaly Coop (R32 W3, world-view D3; temp/r30/design/R32-final.md §1 W3, §8): a member joined or left a squad. A process that leads
+// the squad's level apart from its world has a level side (mode().level(): a map server, whose journal carries Joined / Left up); the
+// others have none (the world server, the co-op host and client, a player of a server world, single player) and say nothing. Not a
+// change this process makes, so quiet: a copy's apply of its world's word (entities::client_applying), the world's own apply of a
+// journal entry (coop_join_member, coop_leave_member, coop_bind_members) and a load that binds the members of a save again
+// (on_after_game_load), and a squad that is no object of this world any more (its release is under way: its Destroy says it).
+// Per thread: the ALife's thread and the main thread do not quiet each other.
+namespace
+{
+thread_local int g_coop_member_quiet = 0;
+
+struct CoopMemberQuiet
+{
+	CoopMemberQuiet() { ++g_coop_member_quiet; }
+	~CoopMemberQuiet() { --g_coop_member_quiet; }
+	CoopMemberQuiet(const CoopMemberQuiet&) = delete;
+	CoopMemberQuiet& operator=(const CoopMemberQuiet&) = delete;
+};
+
+void coop_member_up(ALife::_OBJECT_ID squad, ALife::_OBJECT_ID member, bool joined)
+{
+	if (g_coop_member_quiet)
+		return;
+	if (coop::entities::client_applying())
+		return;
+	coop::LevelSide* side = coop::mode().level();
+	if (!side || !ai().get_alife() || !ai().alife().objects().object(squad, true))
+		return;
+	side->level_entity_up(joined ? coop::EntityUp::Joined : coop::EntityUp::Left, squad, member);
+}
+} // namespace
 
 CSE_ALifeItemWeapon* CSE_ALifeOnlineOfflineGroup::tpfGetBestWeapon(ALife::EHitType& tHitType, float& fHitPower)
 {
@@ -135,6 +169,7 @@ void CSE_ALifeOnlineOfflineGroup::register_member(ALife::_OBJECT_ID member_id)
 	VERIFY((monster->m_group_id == 0xffff) || (monster->m_group_id == ID));
 	monster->m_group_id = ID;
 	m_members.insert(std::make_pair(member_id, monster));
+	coop_member_up(ID, member_id, true); // Anomaly Coop (R32 W3): Joined, to the world of a map server
 
 	if (!empty)
 		return;
@@ -160,6 +195,7 @@ void CSE_ALifeOnlineOfflineGroup::unregister_member(ALife::_OBJECT_ID member_id)
 			m_members.erase(U);
 			if (m_members.empty())
 				m_flags.set(flUsedAI_Locations,FALSE);
+			coop_member_up(ID, member_id, false); // R32 W3: Left (a held squad's member whose packet had not come yet)
 			return;
 		}
 	}
@@ -180,6 +216,7 @@ void CSE_ALifeOnlineOfflineGroup::unregister_member(ALife::_OBJECT_ID member_id)
 	{
 		m_flags.set(flUsedAI_Locations,FALSE);
 	}
+	coop_member_up(ID, member_id, false); // Anomaly Coop (R32 W3): Left, to the world of a map server
 }
 
 CSE_ALifeOnlineOfflineGroup::MEMBER* CSE_ALifeOnlineOfflineGroup::member(ALife::_OBJECT_ID member_id, bool no_assert)
@@ -391,6 +428,7 @@ void CSE_ALifeOnlineOfflineGroup::on_after_game_load()
 
 	m_members.clear();
 
+	const CoopMemberQuiet quiet; // Anomaly Coop (R32 W3): a load binds the members of the save again, nobody joined
 	for (i = temp; i != e; ++i)
 		register_member(*i);
 }
@@ -400,6 +438,7 @@ void CSE_ALifeOnlineOfflineGroup::on_after_game_load()
 // stands: it may be an object of its own by now. `forget`: an id with no object goes, else it waits for its packet. True: all are bound.
 bool CSE_ALifeOnlineOfflineGroup::coop_bind_members(bool forget)
 {
+	const CoopMemberQuiet quiet; // R32 W3: it binds what its world said, it changes no membership of its own
 	xr_vector<ALife::_OBJECT_ID> gone;
 	bool placed = false;
 	CALifeGraphRegistry& graph = alife().graph();
@@ -414,6 +453,18 @@ bool CSE_ALifeOnlineOfflineGroup::coop_bind_members(bool forget)
 		{
 			gone.push_back((*I).first);
 			continue;
+		}
+		if (monster->m_group_id != 0xffff && monster->m_group_id != ID)
+		{
+			// R32 §8a A17 (package A, fix round 2, finding 2): a map server made this squad and moved the member in from another in one
+			// frame, so this Spawn comes before the old squad's Left. The member leaves its old squad's list first, as coop_join_member
+			// does: never listed in two squads, also when that Left is refused (the Left then finds no member: nothing to change).
+			CSE_ALifeOnlineOfflineGroup* old =
+			    smart_cast<CSE_ALifeOnlineOfflineGroup*>(ai().alife().objects().object(monster->m_group_id, true));
+			if (old)
+				old->coop_leave_member(monster->ID);
+			else
+				monster->m_group_id = 0xffff;
 		}
 		monster->m_bOnline = m_bOnline;
 		alife().scheduled().remove(monster, true);
@@ -446,6 +497,60 @@ bool CSE_ALifeOnlineOfflineGroup::coop_bind_members(bool forget)
 	if (placed)
 		graph.add(this, m_tGraphID, false); // it stood in no graph point with no place
 	return forget || gone.empty();
+}
+
+// Anomaly Coop (R32 W3, world-view D3): a member joined this squad on the map server that writes it. A creature of another squad
+// leaves that one first, as the stock re-registration does; then it is bound as coop_bind_members binds a member, its m_bOnline that
+// of the squad: a squad held by a map server is online there, never here (register_member would switch it online in this world).
+bool CSE_ALifeOnlineOfflineGroup::coop_join_member(ALife::_OBJECT_ID member_id)
+{
+	const CoopMemberQuiet quiet; // the world applies a journal entry: it raises no Joined / Left of its own
+	const MEMBERS::iterator known = m_members.find(member_id);
+	if (known != m_members.end())
+		return (*known).second != nullptr; // a repeat
+	CSE_ALifeMonsterAbstract* monster = smart_cast<CSE_ALifeMonsterAbstract*>(ai().alife().objects().object(member_id, true));
+	if (!monster || !monster->g_Alive() || monster->ID_Parent != 0xffff || monster->ID == ID)
+		return false;
+	if (monster->m_group_id != 0xffff && monster->m_group_id != ID)
+	{
+		CSE_ALifeOnlineOfflineGroup* old = smart_cast<CSE_ALifeOnlineOfflineGroup*>(ai().alife().objects().object(monster->m_group_id, true));
+		if (old)
+			old->coop_leave_member(member_id);
+		else
+			monster->m_group_id = 0xffff;
+	}
+	m_members.insert(std::make_pair(member_id, static_cast<MEMBER*>(nullptr)));
+	coop_bind_members(false);
+	const MEMBERS::iterator bound = m_members.find(member_id);
+	return bound != m_members.end() && (*bound).second != nullptr;
+}
+
+// Anomaly Coop (R32 W3): a member left this squad on the map server that writes it, alive. It is a creature of its own at home in this
+// world (unregister_member puts it in the graph and the scheduler), not online anywhere here; a map server that keeps it near a
+// player asks the world for it as for any creature. False: it was no member.
+bool CSE_ALifeOnlineOfflineGroup::coop_leave_member(ALife::_OBJECT_ID member_id)
+{
+	const CoopMemberQuiet quiet; // the world applies a journal entry: it raises no Left of its own
+	const MEMBERS::iterator I = m_members.find(member_id);
+	if (I == m_members.end())
+		return false;
+	if (MEMBER* m = (*I).second)
+	{
+		m->m_bOnline = false;
+		if (!ai().game_graph().valid_vertex_id(m->m_tGraphID) && ai().game_graph().valid_vertex_id(m_tGraphID))
+			m->m_tGraphID = m_tGraphID; // the graph registry takes it at a vertex: its squad's
+		if (!ai().game_graph().valid_vertex_id(m->m_tGraphID))
+		{
+			// no vertex to put it at (a squad that came as a packet and never stood anywhere): it leaves the squad and nothing else
+			m->m_group_id = 0xffff;
+			m_members.erase(I);
+			if (m_members.empty())
+				m_flags.set(flUsedAI_Locations, FALSE);
+			return true;
+		}
+	}
+	unregister_member(member_id);
+	return true;
 }
 
 ALife::_OBJECT_ID CSE_ALifeOnlineOfflineGroup::commander_id()
