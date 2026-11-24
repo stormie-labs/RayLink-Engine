@@ -16,6 +16,7 @@
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
 #include "xrCoop/coop_enemy_rules.h"
+#include "xrCoop/coop_hands_rules.h" // TZ R71
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_reconcile.h"
 #include "coop_events.h"
@@ -34,6 +35,7 @@
 #include "Inventory.h"
 #include "Torch.h"
 #include "Weapon.h"
+#include "HudItem.h"
 #include "sight_manager.h"
 #include "object_handler_planner.h"
 #include "object_handler_space.h"
@@ -90,6 +92,8 @@ xr_vector<HostEvent> g_host_events;
 u64 g_last_snapshot = 0;
 u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_sent = 0, g_snapshots_sent = 0;
 u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
+u64 g_hands_waits = 0, g_hands_put_away = 0; // TZ R71: applies that waited for a puppet's swap or hide; items put away
+u32 g_hands_log = 0; // "[coop-hands]" lines of this session (log_allowed)
 
 // F3a multilevel: online here, or "online at a client" (coop_levels_alife.cpp): a player of the host's level hears the first only.
 bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !mode().online_elsewhere(e->ID); }
@@ -412,10 +416,29 @@ CTorch* puppet_torch(CGameObject* obj)
 	return nullptr;
 }
 
-// True when the puppet shows what the host reported; false when an item has not arrived yet (EntitySpawn): try again
-// later. The item in hands goes through the puppet's object handler, as an avatar's does (coop_equip apply_equip).
-bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
+bool log_allowed(u32& n);
+
+// TZ R71: a puppet's hands as this machine follows the host's (MirrorTrack::hands, coop_hands_rules.h).
+struct HandsTrack
 {
+	bool wrong = false; // its active item is visible and is not the one the host holds (hands::wrong_item_shown)
+	u64 wrong_since = 0; // since then: the put-away clock (a put-away restarts it)
+	bool waiting = false; // the last apply waited for a swap or a hide
+	u64 waiting_since = 0;
+	bool waiting_said = false; // this wait has had its "[coop-hands]" line
+	u8 lines = 0; // "[coop-hands]" lines of this puppet
+	bool retry_soon = false; // the last apply failed only on the hands (a swap or hide under way): look again shortly
+};
+constexpr u8 kHandsLinesPerPuppet = 3;
+
+u32 ms_since(u64 since, u64 now) { return now > since ? u32(_min(now - since, u64(u32(-1)))) : 0u; }
+
+// True when the puppet shows what the host reported; false when an item has not arrived yet (EntitySpawn): try again
+// later, or while its planner still swaps or hides the item in its hands (TZ R71, `track.retry_soon`: shortly). The item
+// in hands goes through the puppet's object handler, as an avatar's does (coop_equip apply_equip).
+bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held, u64 now, HandsTrack& track)
+{
+	track.retry_soon = false;
 	CAI_Stalker* stalker = obj->cast_stalker();
 	if (!stalker)
 	{
@@ -450,19 +473,107 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 		if (o && o->H_Parent() == obj)
 			item = smart_cast<CGameObject*>(o);
 		if (!item)
-			return false; // not in its inventory here yet
+		{
+			// not in its inventory here yet: the hands clocks start again with the item (review of R71: a stale clock let
+			// the next episode put an item away at once and inflated the logged wait)
+			track.wrong = false;
+			track.waiting = false;
+			return false;
+		}
 	}
 	ClientApply scope; // local inventory moves of the puppet pass the client router
 	const bool strapped = (flags & CreatureStrapped) != 0;
 	stalker->CObjectHandler::set_goal(strapped ? MonsterSpace::eObjectActionStrapped : MonsterSpace::eObjectActionIdle, item);
+
+	// The puppet's active item here, for the rule (coop_hands_rules.h).
+	PIItem active = stalker->inventory().ActiveItem();
+	CHudItem* active_hud = active ? active->cast_hud_item() : nullptr;
+	CWeapon* active_weapon = active ? smart_cast<CWeapon*>(active) : nullptr;
+	hands::Seen seen;
+	seen.want_holds = (flags & CreatureHolds) != 0;
+	seen.want_strapped = strapped;
+	seen.held_id = item ? item->ID() : hands::kNoId;
+	seen.active_id = active ? active->object().ID() : hands::kNoId;
+	seen.active_hidden = active_hud && active_hud->IsHidden();
+	seen.active_can_strap = active_weapon && active_weapon->can_be_strapped();
+	// The held item: strappable, and one the object planner can put in hands at all (its operators are for weapons and
+	// missiles only, as coop_equip's "planned" for avatars); another never becomes active and must not be waited for.
+	PIItem held_item = item ? item->cast_inventory_item() : nullptr;
+	CWeapon* held_weapon = held_item ? held_item->cast_weapon() : nullptr;
+	seen.held_can_strap = held_weapon && held_weapon->can_be_strapped();
+	seen.held_planned = held_item && (held_item->cast_weapon() || held_item->cast_missile());
+	// The put-away clock runs while an item the host does not hold is visible in the puppet's hands; the right item, or
+	// the item hidden or gone, stops it.
+	const bool wrong = hands::wrong_item_shown(seen);
+	if (wrong && !track.wrong)
+		track.wrong_since = now;
+	track.wrong = wrong;
+	seen.ms_wrong_item_visible = wrong ? ms_since(track.wrong_since, now) : 0u;
+	const hands::Decision rule = hands::decide(seen);
+
 	// Live 2026-10-25 (build 21): "an NPC at a campfire drinks beer with his gun in the same hand". The weapon goes on the
 	// back only when the torso animation of strapping ends (CObjectActionStrapping::on_animation_end sets
 	// eWorldPropertyStrapped, which CObjectHandler::weapon_bones reads); a puppet plays the host's motions, so that end
 	// never comes and the weapon stayed in the right hand. The host's word sets the planner's world state itself.
+	// TZ R71 (live: a guitar player with a pistol in his hand): the property is one for all of the stalker's weapons, so
+	// it says strapped only once the item the host straps is the one shown here. Forced from the host's bit while the
+	// pistol of a moment ago was still active, it made the pistol "strapped" too: Hide needs it false, and the only
+	// operator left, Unstrapping, waits for an animation end a puppet never gets. Until then the planner swaps the items.
 	CPropertyStorage& world = stalker->CObjectHandler::planner().m_storage;
-	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped, strapped);
+	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped, rule.strap);
 	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped2Idle, false);
-	return done;
+
+	// TZ R71: an item the host does not hold (its hands empty, or another item held) is still seen in the puppet's a grace
+	// later: the planner's hide
+	// (CObjectActionHide: Activate(NO_ACTIVE_SLOT), then the hide motion's timer) did not end it. It is put away here:
+	// the stock hide request, then the end of the hide motion now (CWeaponMagazined::OnAnimationEnd(eHiding) and
+	// CHudItem::OnMoveToRuck do SwitchState(eHidden)); its next inventory update clears the active slot. The weapon state
+	// events stay local under this ClientApply, as a puppet's at death do (coop_remote.cpp on_puppet_die).
+	if (rule.put_away && active)
+	{
+		stalker->inventory().Activate(NO_ACTIVE_SLOT);
+		if (active_hud && !active_hud->IsHidden())
+			active_hud->SwitchState(CHUDState::eHidden);
+		track.wrong_since = now; // if this one does not take, the next push comes a grace later
+		++g_hands_put_away;
+	}
+
+	if (!rule.done)
+	{
+		if (!track.waiting)
+		{
+			track.waiting = true;
+			track.waiting_since = now;
+			track.waiting_said = false;
+		}
+		// One line for a put-away or for a wait longer than a stock hide: the first few of each puppet, within the
+		// session's budget (log_allowed).
+		const u32 waited = ms_since(track.waiting_since, now);
+		if (rule.put_away || (!track.waiting_said && waited >= hands::kHideGraceMs))
+		{
+			track.waiting_said = true;
+			if (track.lines < kHandsLinesPerPuppet && log_allowed(g_hands_log))
+			{
+				++track.lines;
+				::Msg("! [coop-hands] npc %u held %u active %u strap_wanted %u put_away %u (strap %u, active hidden %u, "
+				      "%u ms waiting, line %u)",
+				    u32(obj->ID()), u32(seen.held_id), u32(seen.active_id), u32(seen.want_strapped), u32(rule.put_away),
+				    u32(rule.strap), u32(seen.active_hidden), waited, g_hands_log);
+			}
+		}
+	}
+	else
+		track.waiting = false;
+
+	if (!done)
+		return false; // the torch: try again in a second
+	if (!rule.done)
+	{
+		++g_hands_waits;
+		track.retry_soon = true;
+		return false;
+	}
+	return true;
 }
 
 bool apply_attachments(CGameObject* obj, const attachments::State& state)
@@ -602,6 +713,7 @@ struct MirrorTrack
 	u16 held_shown = kNoId; // the item it holds
 	u64 flags_retry = 0; // a failed apply (torch not here yet) is tried again from this time
 	u64 flags_check = 0; // and the shown state is re-checked from time to time (local engine paths may switch it)
+	HandsTrack hands; // TZ R71: the put-away clock and the "[coop-hands]" lines of this puppet
 	attachments::State attachments_shown;
 	bool attachments_pending = true;
 	u64 attachments_retry = 0, attachments_check = 0;
@@ -2163,14 +2275,14 @@ bool drive_mirror(CGameObject* obj)
 		|| now >= track.flags_check)
 	{
 		track.flags_check = now + 2000;
-		if (apply_creature_flags(obj, want, want_held))
+		if (apply_creature_flags(obj, want, want_held, now, track.hands))
 		{
 			track.flags_shown = want;
 			track.held_shown = want_held;
 			track.flags_retry = 0;
 		}
-		else
-			track.flags_retry = now + 1000;
+		else // TZ R71: a swap or hide under way is looked at again shortly (it ends within a second), as attachments are
+			track.flags_retry = now + (track.hands.retry_soon ? 100 : 1000);
 	}
 
 	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
@@ -2258,6 +2370,8 @@ void print_status()
 {
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
+	::Msg("[coop]   NPC hands (R71): %llu applies waited for a swap or hide, %llu items put away", g_hands_waits,
+	    g_hands_put_away);
 	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
