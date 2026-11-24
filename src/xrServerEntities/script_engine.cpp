@@ -17,6 +17,7 @@
 #include <set>
 #include <luabind/class_info.hpp>
 #include "coop/coop_lua_errors.h" // Anomaly Coop (2026-11): Lua errors survived in a co-op session
+#include "script_file_rules.h" // Anomaly Coop (TZ R74): an empty script file is no module
 
 #ifdef USE_DEBUGGER
 #	ifndef USE_LUA_STUDIO
@@ -572,8 +573,18 @@ void CScriptEngine::process_file_if_exists(LPCSTR file_name, bool warn_if_not_ex
 	if (m_reload_modules || (*file_name && !namespace_loaded(file_name)))
 	{
 		FS.update_path(S, "$game_scripts$", strconcat(sizeof(S1), S1, file_name, ".script"));
-		if (!warn_if_not_exist && !FS.exist(S))
+		// Anomaly Coop (TZ R74, section 6.16): a script of zero bytes is how GAMMA removes a module (axr_main skips such
+		// files); asked for by name, it is no module, like a missing file. Loading it stopped Stable 60 at the world start.
+		// The size is read under the FS guard (-1: no such file).
+		const int script_size = FS.file_length(S);
+		if (!warn_if_not_exist && (script_size < 0 || !script_file_rules::is_module(u32(script_size))))
 		{
+			if (script_size == 0)
+			{
+				// Once per name (add_no_file below): which empty module was asked for, and by whom.
+				Msg("! [coop] script %s is an empty file: no module (GAMMA removes scripts this way); asked for by:", S1);
+				print_stack();
+			}
 #ifdef DEBUG
 #	ifndef XRSE_FACTORY_EXPORTS
             if (psAI_Flags.test(aiNilObjectAccess))

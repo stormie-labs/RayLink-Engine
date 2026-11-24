@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include "ai_script_lua_extension.h"
 #include "ai_script_space.h"
+#include "../xrServerEntities/script_file_rules.h" // Anomaly Coop (TZ R74): room for the header's terminator
 
 #ifdef XRRENDER_R4_EXPORTS
 #define ENGINE_BUILD
@@ -259,8 +260,11 @@ bool Script::bfLoadBuffer(CLuaVirtualMachine* tpLuaVM, LPCSTR caBuffer, size_t t
 		string256 insert;
 		xr_sprintf(insert, sizeof(insert), "local this = %s\n", caNameSpaceName);
 		size_t str_len = xr_strlen(insert);
-		LPSTR script = xr_alloc<char>(u32(str_len + tSize));
-		xr_strcpy(script, str_len + tSize, insert);
+		// Anomaly Coop (TZ R74, section 6.16): the same buffer as CScriptStorage::load_buffer, one byte short of the header's
+		// terminator for an empty file (a zero-byte shader script would stop the renderer at init).
+		size_t const total_size = script_file_rules::buffer_size(str_len, tSize);
+		LPSTR script = xr_alloc<char>(u32(total_size));
+		xr_strcpy(script, total_size, insert);
 		CopyMemory(script + str_len, caBuffer, u32(tSize));
 		l_iErrorCode = luaL_loadbuffer(tpLuaVM, script, tSize + str_len, caScriptName);
 		xr_free(script);

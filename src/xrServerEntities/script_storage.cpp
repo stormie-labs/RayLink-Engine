@@ -15,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <regex>
+#include "script_file_rules.h" // Anomaly Coop (TZ R74): room for the terminator of the namespace header
 
 #if !defined(DEBUG) && defined(USE_LUAJIT_ONE)
 #	include "opt.lua.h"
@@ -725,7 +726,9 @@ bool CScriptStorage::load_buffer(lua_State* L, LPCSTR caBuffer, size_t tSize, LP
 
 		xr_sprintf(insert, header, caNameSpaceName, a, b);
 		u32 str_len = xr_strlen(insert);
-		u32 const total_size = str_len + tSize;
+		// Anomaly Coop (TZ R74, section 6.16): xr_strcpy below writes the header's terminator; with an empty body the buffer
+		// was one byte short and strncpy_s stopped the game. Lua still reads str_len + tSize bytes.
+		u32 const total_size = u32(script_file_rules::buffer_size(str_len, tSize));
 		LPSTR script = 0;
 		bool dynamic_allocation = false;
 
