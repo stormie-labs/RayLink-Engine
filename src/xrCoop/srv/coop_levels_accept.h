@@ -63,10 +63,11 @@ inline Kind kind_of(uint8_t op)
 	return Kind::Own;
 }
 
-// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of the unit at
-// its root (A6; 0 for a root that is no unit the sender holds) match (writer::same_object). One allowance: a unit the sender made
-// (its SpawnPrepare is registered here under `spawn_gen`, and the unit has not moved since: gen_here == spawn_gen) is named with
-// gen 0 by a sender that has not heard the world's Ack yet: it is the same unit. A unit granted again since is another.
+// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of its root (A6;
+// the sender's hold of that root whatever it is now, 0 when the sender does not hold it: levels::root_gen, Р68-3) match
+// (writer::same_object). One allowance: a unit the sender made (its SpawnPrepare is registered here under `spawn_gen`, and the unit
+// has not moved since: gen_here == spawn_gen) is named with gen 0 by a sender that has not heard the world's Ack yet: it is the same
+// unit. A unit granted again since is another.
 inline bool identity(uint16_t crc_here, uint16_t crc_report, uint32_t gen_here, uint32_t gen_report, uint32_t spawn_gen)
 {
 	if (writer::same_object(crc_here, crc_report, gen_here, gen_report))

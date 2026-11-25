@@ -105,7 +105,16 @@ namespace coop
 //    layout change (srv/coop_mapserver_rules.h): a map server may ask its world StateDumpRequest and EntityResync, EntityDied and
 //    EntityHash reach the map servers. The ItemState blob carries a u16 version per tagged field (coop_item_tags.h, blob tag 12),
 //    the EntitySpawn tail the initial state of an item (coop_initial_rules.h). Dev 57 (33) and 34 never meet: Hello refuses it.
-constexpr uint32_t kProtocolVersion = 34;
+// 35 (TZ R90, a player's trade window is the host's; review 2026-11-24): TradeOp Deal flag 2 is the deal of a player's Lua trade
+//    window (G.A.M.M.A.'s ui_inventory), priced on the decider with that window's Lua formula, and such a deal carries
+//    `u32 sell_shown, u32 buy_shown` after its two lists: the sums the window showed. The decider settles each side against them
+//    (xrCoop/coop_trade_window_rules.h settle_side): a sale pays the smaller sum, a purchase costs what was shown. Review of
+//    2026-11-25 (the same Dev build, still 35): a side the decider prices worse for the player than shown beyond rounding is refused
+//    with TradeResult 10 (PriceChanged), whose Result carries `u32 decider_sell, u32 decider_buy` after `u32 trader_money` (only with
+//    code 10); flag 0 (the engine window) keeps its layout, but the decider settles its CTrade sums against the Lua formula the same
+//    way (with 2 RU an item for CTrade's floors). A 34 reader would price flag 2 with the engine's formula and read no sums; Hello
+//    refuses it.
+constexpr uint32_t kProtocolVersion = 35;
 constexpr uint16_t kDefaultPort = 27960;
 // The most seats that play the wire carries (F5-SEAT-1, TZ 6.7 and R19, Dev build 58): a server's 16 clients (its own seat plays
 // no character, SessionConfig::host_plays; limits::client_capacity). How many a session has is its mode's: the start says

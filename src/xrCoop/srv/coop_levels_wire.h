@@ -1257,11 +1257,13 @@ inline size_t varu_size(uint64_t v)
 //   Money: today's layout {u32 peer, u64 delta, u8 trade}, no head (a player's book is no object).
 //   Joined, Left: MemberBody. Info: InfoBody. Ask: AskBody. IdAsk: no body. Carry: CarryBody. Done: DoneBody. Flushed: FlushedBody.
 //   Report (6) is no journal op: it stays a LevelEntity of its own (the answer to LevelResync).
-// The head's `gen` is the keeper generation of the unit at the object's root (W1.2: the squad of a member, the holder chain of an
-// item) as the sender holds it, 0 when that root is no unit it holds (W3: facts about a held unit carry its keeper generation and
-// are refused for an older grant; same_object, coop_writer_rules.h, compares it with the world's). Section 5 of the design names
-// the head `u16 id, u16 section crc` alone; the generation is the W3 / same_object half of an identity that it left out. The head's
-// `crc` is section_crc of the object's section (for a Spawn the new object's).
+// The head's `gen` is the keeper generation of the object's root (W1.2: the squad of a member, the holder chain of an item) as the
+// sender holds it, whatever that root is now, 0 when the sender does not hold it (W3: facts about a held unit carry its keeper
+// generation and are refused for an older grant; same_object, coop_writer_rules.h, compares it with the world's). Р68-3: the hold
+// decides, not the kind: the body of a held unit that died stays held (no Joined, no release ends it) and is named with the hold's
+// gen on both sides; a player's character is never held, 0. One rule for both sides: levels::root_gen (coop_levels_root_gen.h).
+// Section 5 of the design names the head `u16 id, u16 section crc` alone; the generation is the W3 / same_object half of an identity
+// that it left out. The head's `crc` is section_crc of the object's section (for a Spawn the new object's).
 namespace journal
 {
 constexpr size_t kMaxEntries = 16384; // entries of one batch (a surge frame: deaths, drops, item facts of some hundred NPCs)

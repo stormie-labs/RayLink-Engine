@@ -210,8 +210,11 @@ private:
 
 // R32 §8a A17: does a map server's Holder adopt a creature at the Left of a squad (levels::client_adopt_left, at the hook and again at
 // the flush)? Only one that leaves a squad it writes, that it does not write already (it keeps its own hold), a living creature on
-// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident), and whose release is not
-// under way (fix round 2, finding 1: ReleasesUnderWay).
+// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident, adopted by nobody), and
+// whose release is not under way (fix round 2, finding 1: ReleasesUnderWay). A resident is not a root of gen 0 by its kind: the gen
+// at a root is the sender's hold of it for any root (Р68-3, levels::root_gen in coop_levels_root_gen.h). A creature adopted here
+// alive that dies later keeps that hold, and its body and loot are named with it on both sides; one that dies in its squad leaves
+// it unheld, 0 on both.
 struct LeftAdoptFacts
 {
 	bool squad_written = false; // its Holder authors the squad

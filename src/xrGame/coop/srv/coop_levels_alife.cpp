@@ -29,6 +29,7 @@
 #include "xrCoop/srv/coop_levels_accept.h"
 #include "xrCoop/srv/coop_levels_journal.h" // O6: object_note, the uses refusal's branch
 #include "xrCoop/srv/coop_levels_keeper.h"
+#include "xrCoop/srv/coop_levels_root_gen.h" // Р68-3: the gen at a root, one rule with the map servers (held_gen_of)
 
 #include "ai_space.h"
 #include "game_graph.h"
@@ -585,6 +586,11 @@ struct Seen
 	uint16_t crc = 0;
 	bool move = false;
 	u16 to = wire::kNoObject;
+	// Р68-3: an Identity refusal names the gen of the root on both sides (this world's, the head's), so the next one in a log shows
+	// which side named what instead of leaving it to the code
+	bool gens = false;
+	u32 gen_here = 0;
+	u32 gen_sent = 0;
 };
 
 // One log line for the first refusals of each reason, then every 100th. It names the object as this world sees it now (its section and
@@ -600,8 +606,14 @@ ApplyVerdict refuse(PeerId author, uint8_t op, u16 id, uint8_t why_code, uint8_t
 		const CSE_ALifeDynamicObject* here = id != wire::kNoObject ? object_of(id) : nullptr;
 		if (op == wire::LevelEntityHead::Item && journal::is_uses_refusal(detail))
 			detail = journal::uses_refusal_text(journal::uses_refusal_of(here && !here->client_data.empty()));
-		const std::string note = journal::object_note(here != nullptr, here ? here->s_name.c_str() : nullptr, seen.crc,
+		std::string note = journal::object_note(here != nullptr, here ? here->s_name.c_str() : nullptr, seen.crc,
 		    here ? here->ID_Parent : u16(wire::kNoObject), seen.move, seen.to);
+		if (why_code == journal::Identity && seen.gens)
+		{
+			char gens[64];
+			std::snprintf(gens, sizeof(gens), ", root gen here %u, sent %u", seen.gen_here, seen.gen_sent);
+			note += gens;
+		}
 		::Msg("! [coop] levels: %s of object %u from map server %u refused (%u so far): %s%s%s; %s", journal::op_name(op), u32(id),
 		    mapserver::bridge_index(author), n, journal::why_name(why_code), detail ? ", " : "", detail ? detail : "", note.c_str());
 	}
@@ -632,23 +644,28 @@ RootSeen root_seen(u16 id)
 	return s;
 }
 
-// The object here against a head (A6): its section crc, and the keeper generation of the unit at its root as `author` holds it.
-bool same_as(const CSE_ALifeDynamicObject* e, const RootSeen& root, const journal::ObjectHead& h, PeerId author)
+// The object here against a head (A6): its section crc, and the keeper generation of its root as `author` holds it, whatever the root
+// is now (levels::root_gen, the map server's rule as well: Р68-3, the body of a held lone unit and its loot). `gen_here`: what this
+// world named.
+bool same_as(const CSE_ALifeDynamicObject* e, const RootSeen& root, const journal::ObjectHead& h, PeerId author, u32& gen_here)
 {
 	u32 spawn_gen = 0;
-	const u32 gen_here = root.facts.kind == writer::RootKind::Unit ? xfer_held_gen(root.facts.root, author, spawn_gen) : 0;
+	gen_here = root_gen(root.facts.kind, xfer_held_gen(root.facts.root, author, spawn_gen));
 	return accept::identity(crc_of(e), h.crc, gen_here, h.gen, spawn_gen);
 }
 
-// The facts of an object the entry names, through its root.
-void object_facts(accept::Facts& f, const CSE_ALifeDynamicObject* e, const journal::ObjectHead& h, PeerId author, RootSeen& root)
+// The facts of an object the entry names, through its root; `seen` gets both gens of its root for an Identity refusal line.
+void object_facts(accept::Facts& f, const CSE_ALifeDynamicObject* e, const journal::ObjectHead& h, PeerId author, RootSeen& root,
+    Seen& seen)
 {
 	f.exists = e != nullptr;
 	if (!e)
 		return;
 	root = root_seen(e->ID);
 	f.ghost = root.ghost;
-	f.same = same_as(e, root, h, author);
+	f.same = same_as(e, root, h, author, seen.gen_here);
+	seen.gens = true;
+	seen.gen_sent = h.gen;
 	f.writer = root.writer;
 	f.fence = host_fence_of(author, root.facts.root);
 }
@@ -972,7 +989,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 	}
 
 	CSE_ALifeDynamicObject* obj = object_of(h.id);
-	object_facts(f, obj, h, author, root);
+	object_facts(f, obj, h, author, root, seen);
 	switch (e.op)
 	{
 	case H::Destroy:

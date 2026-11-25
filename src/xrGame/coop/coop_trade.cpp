@@ -15,6 +15,7 @@
 #include "coop_items.h"
 #include "xrCoop/coop_talks.h" // R4 2: may_trade_with
 #include "xrCoop/coop_search_view.h"
+#include "xrCoop/coop_trade_window_rules.h" // TZ R90: the Lua trade window of a player's copy
 #include "xrCoop/coop_reconcile.h"
 #include "xrCoop/coop_trade_permit.h" // G6-3: remote trade through a trading computer
 
@@ -36,6 +37,8 @@
 
 #include <atomic>
 #include <limits>
+#include <mutex>
+#include <string>
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife.h"
 #include "script_callback_ex.h"
@@ -63,7 +66,8 @@ constexpr u64 kMoveCheckMs = 2500; // container move not applied after this -> r
 constexpr u64 kRefreshMinMs = 150; // at most one list rebuild per this period (take-all bursts)
 constexpr u64 kPendingWarnMs = 15000; // client: a deal without answer is logged
 constexpr s64 kMaxMoney = 0xffffffffll;
-constexpr u8 kDealDonate = 1;
+using trade_window::kDealDonate; // TradeOp Deal flags (xrCoop/coop_trade_window_rules.h)
+using trade_window::kDealLuaPrices; // TZ R90: priced with the Lua window's formula
 // kTradeReach: coop_trade.h (F2 T5: also a mechanic's reach)
 
 enum class Op : u8
@@ -86,7 +90,9 @@ enum TradeResult : u8
 	Malformed = 7,
 	TooFar = 8, // the player's character is not by the trader on the host (R4 2)
 	NotTraded = 9, // the trader does not buy / sell one of the items (R4 2)
+	PriceChanged = 10, // TZ R90, review of 2026-11-25: the decider's price is worse for the player than his window showed (settle_side)
 };
+static_assert(PriceChanged == trade_window::kPriceChanged, "xrCoop/coop_trade_window_rules.h, scripts\\coop_trade_window.script");
 
 const char* result_name(u8 r)
 {
@@ -102,6 +108,7 @@ const char* result_name(u8 r)
 	case Malformed: return "malformed";
 	case TooFar: return "too far from the trader";
 	case NotTraded: return "item not traded";
+	case PriceChanged: return "the price is not the one the window showed";
 	default: return "?";
 	}
 }
@@ -113,6 +120,8 @@ enum ContainerKind : u8
 	ContCorpse = 2,
 	ContTrader = 3,
 };
+
+static_assert(ContBox == kViewBox && ContCorpse == kViewCorpse && ContTrader == kViewTrader, "xrCoop/coop_search_view.h kinds");
 
 const char* container_name(u8 k)
 {
@@ -207,6 +216,9 @@ struct LastResult
 	u8 code = Ok;
 	s32 delta = 0;
 	u32 trader_money = 0;
+	// TZ R90, review of 2026-11-25: PriceChanged only, the decider's price of each side (the player's window shows them)
+	u32 decider_sell = 0;
+	u32 decider_buy = 0;
 };
 struct PeerTrade
 {
@@ -230,11 +242,19 @@ struct Deal
 	u32 seq = 0;
 	u16 trader = kNoId;
 	bool donate = false;
+	bool lua_prices = false; // TZ R90: from Anomaly's Lua window, priced with its formula (lua_price_deal)
 	xr_vector<u16> sell; // player -> trader
 	xr_vector<u16> buy; // trader -> player
 	// Priced by the host (R4 2), not sent by the client.
 	u32 sell_total = 0; // the trader pays the player
 	u32 buy_total = 0; // the player pays the trader
+	// TZ R90 (protocol 35): what the player's window showed for each side; the decider settles against them (settle_side). A Lua
+	// window sends them; for the engine window's deal they are the engine formula's sums, which that window showed (host_apply).
+	u32 sell_shown = 0;
+	u32 buy_shown = 0;
+	// Review of 2026-11-25: the decider's formula's sums (lua_price_deal), told to the player when it refuses the deal for its price.
+	u32 sell_decider = 0;
+	u32 buy_decider = 0;
 };
 
 struct OpenView
@@ -324,6 +344,65 @@ bool call_trade_computer(const char* fn, double a, double b, double out[3])
 	return true;
 }
 
+// ---------------------------------------------------------------- TZ R90: Anomaly's Lua trade window (scripts\coop_trade_window.script)
+// Under lua_pcall: arg 1 the name of a function of coop_trade_window.script, the rest its arguments. Returns what it returns (two
+// values kept); nothing when the script or the function is missing (an older gamedata: a copy keeps the engine window).
+int lua_trade_window_fn(lua_State* L)
+{
+	const int args = lua_gettop(L) - 1;
+	lua_getglobal(L, "coop_trade_window"); // _G.__index loads the module if it was not yet
+	if (!lua_istable(L, -1))
+		return 0;
+	lua_pushvalue(L, 1);
+	lua_gettable(L, -2);
+	if (!lua_isfunction(L, -1))
+		return 0;
+	for (int i = 2; i <= args + 1; ++i)
+		lua_pushvalue(L, i);
+	lua_call(L, args, 2);
+	return 2;
+}
+
+u32 g_window_errors = 0;
+
+// coop_trade_window.<fn>(...), protected: `push(L)` pushes the arguments and returns their number, `read(L, at)` reads the two results
+// at `at` and `at + 1` (nil when the script gave none). False: no Lua here, or a Lua error (logged a few times).
+template <class Push, class Read>
+bool call_trade_window(const char* fn, Push push, Read read)
+{
+	lua_State* L = ai().script_engine().lua();
+	if (!L || !lua_checkstack(L, 16))
+		return false;
+	const int top = lua_gettop(L);
+	lua_pushcfunction(L, &lua_trade_window_fn);
+	lua_pushstring(L, fn);
+	const int n = push(L);
+	if (lua_pcall(L, 1 + n, 2, 0) != 0)
+	{
+		if (g_window_errors++ < 5)
+		{
+			const char* err = lua_tostring(L, -1);
+			::Msg("! [coop] coop_trade_window.%s failed: %s", fn, err ? err : "?");
+		}
+		lua_settop(L, top);
+		return false;
+	}
+	read(L, top + 1);
+	lua_settop(L, top);
+	return true;
+}
+
+// A Lua array of ids.
+void push_ids(lua_State* L, const xr_vector<u16>& ids)
+{
+	lua_createtable(L, int(ids.size()), 0);
+	for (size_t i = 0; i < ids.size(); ++i)
+	{
+		lua_pushnumber(L, lua_Number(ids[i]));
+		lua_rawseti(L, -2, int(i + 1));
+	}
+}
+
 // Player `from`'s trade window with `trader_id` opened here: the grant the decider's Lua kept for it (take_grant, taken once)
 // becomes his permit when the computer it names is here and his character stands at it. Any older permit of his goes: one
 // window, one permit.
@@ -383,6 +462,8 @@ struct PendingDeal
 {
 	u16 trader = kNoId; // host numbering
 	bool donate = false;
+	bool lua = false; // TZ R90: sent by the Lua window (coop.trade_deal): its answer goes to coop_trade_window.on_result
+	bool lua_prices = false; // TZ R90: flag kDealLuaPrices
 	xr_vector<DealItem> sell; // player -> trader
 	xr_vector<DealItem> buy; // trader -> player
 	u32 sell_total = 0;
@@ -456,7 +537,9 @@ void client_take_window(CInventoryOwner* partner)
 		g_view.remote = trade_permit::window_of(trader, g[0], g[1], now_ms());
 }
 
-std::atomic<u16> g_search_now{kNoId}; // what the Lua inventory searches, local numbering: Lua may run on the game worker thread
+// What the Lua inventory shows, local numbering, in the low 16 bits; above them the view the script named (kViewTrader: a trade window,
+// TZ R90). Lua may run on the game worker thread.
+std::atomic<u32> g_search_now{kNoId};
 u16 g_search_sent = kNoId;
 u8 g_search_kind = ContNone;
 u64 g_rebuilds = 0, g_moves_failed = 0;
@@ -515,13 +598,19 @@ void host_broadcast_trader_money(CInventoryOwner* trader, PeerId except)
 
 void host_send_result(PeerId to, const LastResult& r)
 {
-	Writer w(20);
+	Writer w(28);
 	w.u8(u8(Op::Result));
 	w.u32(r.seq);
 	w.u16(r.trader);
 	w.u8(r.code);
 	w.i32(r.delta);
 	w.u32(r.trader_money);
+	// TZ R90, review of 2026-11-25 (protocol 35, the same Dev build): a refusal for its price carries the decider's prices
+	if (r.code == PriceChanged)
+	{
+		w.u32(r.decider_sell);
+		w.u32(r.decider_buy);
+	}
 	net::host_send(to, Msg::TradeOp, w);
 }
 
@@ -563,6 +652,93 @@ u8 price_list(CTrade& pricing, CInventoryOwner* trader, const xr_vector<u16>& li
 		return Malformed;
 	total = u32(sum);
 	return Ok;
+}
+
+// TZ R90: coop_trade_window.host_price here, under lua_pcall: the sums of both lists of a player's deal by the Lua window's formula, run
+// under his character (the trader's lists and discounts for him, utils_item.get_item_cost; the player's items as his own window sees
+// them, held by the actor), the host's own window's formula. Priced: two numbers. Refused: nil and why (`why`: what the script said),
+// or a Lua error, or no Lua. NoFormula (review of 2026-11-25): nothing at all, the decider's gamedata has no such function.
+trade_window::Answer ask_host_price(u16 proxy_id, u16 trader_id, const Deal& d, double raw[2], std::string& why)
+{
+	trade_window::Answer answer = trade_window::Answer::Refused;
+	const bool called = call_trade_window("host_price", [&](lua_State* L)
+	{
+		lua_pushnumber(L, lua_Number(proxy_id));
+		lua_pushnumber(L, lua_Number(trader_id));
+		push_ids(L, d.sell);
+		push_ids(L, d.buy);
+		return 4;
+	}, [&](lua_State* L, int at)
+	{
+		if (lua_type(L, at) == LUA_TNUMBER && lua_type(L, at + 1) == LUA_TNUMBER)
+		{
+			answer = trade_window::Answer::Priced;
+			raw[0] = double(lua_tonumber(L, at));
+			raw[1] = double(lua_tonumber(L, at + 1));
+		}
+		else if (lua_isnoneornil(L, at) && lua_isnoneornil(L, at + 1))
+			answer = trade_window::Answer::NoFormula; // lua_trade_window_fn gave nothing: no script, no host_price
+		else if (lua_type(L, at + 1) == LUA_TSTRING)
+			why = lua_tostring(L, at + 1);
+	});
+	return called ? answer : trade_window::Answer::Refused;
+}
+
+// TZ R90: the prices of a player's deal by the decider's own window's formula (ask_host_price), each side floored once as TMode_Sell
+// does, then settled against what the player's window showed (xrCoop/coop_trade_window_rules.h settle_side): the sums a Lua window sent
+// (protocol 35), or for the engine window's deal (flag 0) the engine formula's sums host_apply put there, which that window showed.
+// Review of 2026-11-25: the formula is the decider's, not the flag's (charge_of): flag 0 is no way around the Lua formula. A side the
+// decider prices worse for the player than shown is refused (PriceChanged) with the decider's prices in d.sell_decider / buy_decider.
+// No fallback price for a Lua window's deal: no answer refuses it; the engine window's deal keeps its engine sums only where this
+// decider has no Lua formula at all (its gamedata is older than R90).
+u8 lua_price_deal(u16 proxy_id, u16 trader_id, Deal& d)
+{
+	double raw[2] = {0.0, 0.0};
+	std::string why;
+	const trade_window::Answer answer = ask_host_price(proxy_id, trader_id, d, raw, why);
+	const trade_window::Charge charge = trade_window::charge_of(d.lua_prices, answer);
+	if (charge == trade_window::Charge::EngineOnly)
+		return Ok; // d.sell_total, d.buy_total: the engine formula's, as before R90
+	const char* window = d.lua_prices ? "a Lua window" : "the engine window";
+	const bool priced = charge == trade_window::Charge::Settle;
+	u32 decider[2] = {0, 0};
+	const trade_window::PriceVerdict vs = trade_window::host_total(!d.sell.empty(), priced, raw[0], u32(kMaxMoney), decider[0]);
+	const trade_window::PriceVerdict vb = trade_window::host_total(!d.buy.empty(), priced, raw[1], u32(kMaxMoney), decider[1]);
+	trade_window::PriceVerdict v = vs != trade_window::PriceVerdict::Ok ? vs : vb;
+	if (v == trade_window::PriceVerdict::Ok)
+	{
+		d.sell_decider = decider[0];
+		d.buy_decider = decider[1];
+		const trade_window::PriceVerdict ss =
+		    trade_window::settle_side(!d.sell.empty(), true, decider[0], d.sell_shown,
+		        trade_window::slack_of(d.lua_prices, d.sell.size()), d.sell_total);
+		const trade_window::PriceVerdict sb =
+		    trade_window::settle_side(!d.buy.empty(), false, decider[1], d.buy_shown,
+		        trade_window::slack_of(d.lua_prices, d.buy.size()), d.buy_total);
+		v = ss != trade_window::PriceVerdict::Ok ? ss : sb;
+		if (v == trade_window::PriceVerdict::Ok)
+		{
+			if (d.sell_total != decider[0] || d.buy_total != decider[1])
+				::Msg("[coop] trade #%u from %s: the formula here says %u RU for the sale and %u RU for the purchase, the window "
+				      "showed %u and %u RU: sold for %u, bought for %u RU",
+				    d.seq, window, decider[0], decider[1], d.sell_shown, d.buy_shown, d.sell_total, d.buy_total);
+			return Ok;
+		}
+		if (v == trade_window::PriceVerdict::Changed)
+		{
+			d.sell_total = d.buy_total = 0;
+			::Msg("[coop] trade #%u from %s refused for its price: the formula here says %u RU for the sale and %u RU for the "
+			      "purchase, the window showed %u and %u RU; the player's window shows the price here now",
+			    d.seq, window, decider[0], decider[1], d.sell_shown, d.buy_shown);
+			return PriceChanged;
+		}
+		why = "the window showed nothing to pay";
+	}
+	d.sell_total = d.buy_total = 0;
+	d.sell_decider = d.buy_decider = 0;
+	::Msg("! [coop] trade #%u from %s: %s%s%s", d.seq, window, trade_window::price_verdict_name(v), why.empty() ? "" : ": ",
+	    why.c_str());
+	return v == trade_window::PriceVerdict::TooMuch ? u8(Malformed) : u8(NotTraded);
 }
 
 // One deal, everything or nothing. Money: the trader's and the player's both live on the host (the
@@ -683,8 +859,19 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 
 	// R4 2: the host's prices. A temporary CTrade: the trader's own one may hold the host actor's trade with him.
 	// A gift is free, as the stock DonateCurrentItem (TransferItem with b_free).
+	// TZ R90: a deal from a player's Lua window is priced with that window's formula, as the host's own window prices his trades.
+	// Review of 2026-11-25: the engine window's deal (flag 0) too: its engine sums are what that window showed, and the decider's own
+	// window's formula settles them as a Lua window's sums (lua_price_deal). The player's choice of window chooses no formula.
 	d.sell_total = d.buy_total = 0;
-	if (!d.donate)
+	switch (trade_window::pricing_of(d.donate, d.lua_prices))
+	{
+	case trade_window::Pricing::Free:
+		break;
+	case trade_window::Pricing::Lua:
+		if (const u8 c = lua_price_deal(proxy_id, trader_id, d))
+			return c;
+		break;
+	case trade_window::Pricing::Engine:
 	{
 		CTrade pricing(trader);
 		pricing.SetActorPartner(proxy);
@@ -692,6 +879,12 @@ u8 host_apply(PeerId from, Deal& d, s64& delta)
 			return c;
 		if (const u8 c = price_list(pricing, trader, d.buy, false, d.buy_total))
 			return c;
+		d.sell_shown = d.sell_total; // what the engine window showed (R4 2: its formula for this character, as here)
+		d.buy_shown = d.buy_total;
+		if (const u8 c = lua_price_deal(proxy_id, trader_id, d))
+			return c;
+		break;
+	}
 	}
 
 	// F2 T1: the player's money is his balance on the host, never a figure from the client.
@@ -744,7 +937,14 @@ void host_on_deal(PeerId from, Reader& r)
 	if (!r.ok())
 		return; // no seq to answer
 	d.donate = (flags & kDealDonate) != 0;
-	const bool parsed = read_list(r, d.sell) && read_list(r, d.buy);
+	d.lua_prices = (flags & kDealLuaPrices) != 0; // TZ R90
+	bool parsed = read_list(r, d.sell) && read_list(r, d.buy);
+	if (parsed && d.lua_prices) // TZ R90, protocol 35: the sums the player's window showed follow the lists
+	{
+		d.sell_shown = r.u32();
+		d.buy_shown = r.u32();
+		parsed = r.ok();
+	}
 
 	host_sync_world();
 	PeerTrade& p = g_peers[from];
@@ -768,12 +968,14 @@ void host_on_deal(PeerId from, Reader& r)
 	last.code = code;
 	last.delta = s32(delta);
 	last.trader_money = trader ? trader->get_money() : 0;
+	last.decider_sell = d.sell_decider; // read by the player only with PriceChanged
+	last.decider_buy = d.buy_decider;
 	host_send_result(from, last);
 
 	const PeerInfo* info = mgr().session().peer(from);
-	::Msg("[coop] trade #%u <%s> with %u: %s %u item(s) for %u RU, buys %u item(s) for %u RU: %s", d.seq,
+	::Msg("[coop] trade #%u <%s> with %u: %s %u item(s) for %u RU, buys %u item(s) for %u RU%s: %s", d.seq,
 	    info ? info->nick.c_str() : "?", d.trader, d.donate ? "gives" : "sells", (u32)d.sell.size(), d.sell_total,
-	    (u32)d.buy.size(), d.buy_total, result_name(code));
+	    (u32)d.buy.size(), d.buy_total, d.lua_prices && !d.donate ? " (Lua window prices)" : "", result_name(code));
 	if (code == Ok)
 	{
 		++g_host_ok;
@@ -867,30 +1069,112 @@ void write_list(Writer& w, const xr_vector<DealItem>& list)
 		w.u16(join::to_host(it.id));
 }
 
-void client_send_deal(u16 trader_local, PendingDeal& deal)
+// TZ R90: coop.trade_deal may run on the game's worker thread (Lua does, see lua_search_window): a deal of the Lua window is queued with
+// its seq under this lock and frame() sends it on the main thread. client_send_deal takes the lock too: the wire carries the deals in
+// the order of their seq (the host ignores a deal older than its last answer).
+struct QueuedDeal
+{
+	u32 seq;
+	u16 trader; // local numbering
+	PendingDeal deal;
+};
+std::mutex g_deal_lock;
+xr_vector<QueuedDeal> g_queued; // under g_deal_lock
+std::atomic<bool> g_have_queued{false};
+
+// One deal with its seq (the caller holds g_deal_lock).
+void send_deal_locked(u32 seq, u16 trader_local, PendingDeal& deal)
 {
 	client_sync_world();
 	// Item moves and money changes (ReqMoney, F2 T1) made before the deal go out first: on the one
 	// reliable lane the host checks the deal against them.
 	requests::client_flush_outbox();
-	// Our own prices stay here (the money pre-checks of the trade buttons); the host prices the deal (R4 2).
-	deal.sell_total = list_total(deal.sell);
-	deal.buy_total = list_total(deal.buy);
-	const u32 seq = ++g_seq;
+	// Our own prices stay here (the money pre-checks of the trade buttons); the host prices the deal (R4 2). The Lua window's sums are
+	// the ones it showed, floored once (lua_trade_deal).
+	if (!deal.lua)
+	{
+		deal.sell_total = list_total(deal.sell);
+		deal.buy_total = list_total(deal.buy);
+	}
 	deal.trader = join::to_host(trader_local);
 	deal.sent_at = now_ms();
 
-	// F2 T1: no money of ours in the deal; the host checks it against our balance there.
+	// F2 T1: no money of ours in the deal (a Lua window's shown sums are prices); the host checks it against our balance there.
 	Writer w(32 + (deal.sell.size() + deal.buy.size()) * 2);
 	w.u8(u8(Op::Deal));
 	w.u32(seq);
 	w.u16(deal.trader);
-	w.u8(deal.donate ? kDealDonate : 0);
+	w.u8(u8((deal.donate ? kDealDonate : 0) | (deal.lua_prices ? kDealLuaPrices : 0)));
 	write_list(w, deal.sell);
 	write_list(w, deal.buy);
+	if (deal.lua_prices) // TZ R90, protocol 35: the sums the window showed, which the decider settles against
+	{
+		w.u32(deal.sell_total);
+		w.u32(deal.buy_total);
+	}
 	net::client_send(Msg::TradeOp, w);
 	g_pending[seq] = std::move(deal);
 	++g_cl_deals;
+}
+
+// The Lua window's deals queued since the last frame, in seq order (the caller holds g_deal_lock).
+void send_queued_locked()
+{
+	if (g_queued.empty())
+		return;
+	const bool live = is_live_mirror();
+	for (QueuedDeal& q : g_queued)
+	{
+		if (live)
+			send_deal_locked(q.seq, q.trader, q.deal);
+		else
+			::Msg("! [coop] trade #%u of the Lua window dropped: this machine is no longer in the world", q.seq);
+	}
+	g_queued.clear();
+	g_have_queued.store(false);
+}
+
+void client_send_deal(u16 trader_local, PendingDeal& deal)
+{
+	std::lock_guard<std::mutex> lock(g_deal_lock);
+	send_queued_locked();
+	send_deal_locked(++g_seq, trader_local, deal);
+}
+
+// A Lua array of ids at `at` (nil: none). False: neither, or an element that is no id.
+bool read_lua_ids(lua_State* L, int at, std::vector<uint16_t>& out)
+{
+	if (lua_isnoneornil(L, at))
+		return true;
+	if (!lua_istable(L, at))
+		return false;
+	const int n = int(lua_objlen(L, at));
+	for (int i = 1; i <= n; ++i)
+	{
+		lua_rawgeti(L, at, i);
+		uint16_t id = kNoId;
+		const bool ok = lua_type(L, -1) == LUA_TNUMBER && trade_window::id_of(double(lua_tonumber(L, -1)), kNoId, id);
+		lua_pop(L, 1);
+		if (!ok)
+			return false;
+		out.push_back(id);
+	}
+	return true;
+}
+
+// The prices the window showed for a list of `n` items (none, or no number: 0).
+void read_lua_prices(lua_State* L, int at, size_t n, std::vector<double>& out)
+{
+	out.assign(n, 0.0);
+	if (!lua_istable(L, at))
+		return;
+	for (size_t i = 0; i < n; ++i)
+	{
+		lua_rawgeti(L, at, int(i + 1));
+		if (lua_type(L, -1) == LUA_TNUMBER)
+			out[i] = double(lua_tonumber(L, -1));
+		lua_pop(L, 1);
+	}
 }
 
 void client_on_result(Reader& r)
@@ -900,6 +1184,12 @@ void client_on_result(Reader& r)
 	const u8 code = r.u8();
 	const s32 delta = r.i32();
 	const u32 trader_money = r.u32();
+	u32 decider_sell = 0, decider_buy = 0; // TZ R90, review of 2026-11-25: the decider's prices of a deal refused for its price
+	if (code == PriceChanged)
+	{
+		decider_sell = r.u32();
+		decider_buy = r.u32();
+	}
 	if (!r.ok())
 		return;
 	client_sync_world(); // an answer from a replaced world is already in the new world's money
@@ -963,11 +1253,36 @@ void client_on_result(Reader& r)
 			dialog::hud_message("st_coop_trade_no_trader", "Trade failed: the trader does not trade now");
 		else if (code == NotTraded)
 			dialog::hud_message("st_coop_trade_not_traded", "Trade failed: the trader does not trade this item");
+		else if (code == PriceChanged)
+		{
+			// TZ R90, review of 2026-11-25: never more to pay nor less to get than the window showed without the player seeing it. The
+			// Lua window shows the decider's price now (coop_trade_window.on_result), and its next press agrees to it.
+			::Msg("[coop] trade #%u: the trader's prices are %u RU for the sale and %u RU for the purchase, this window showed %u and "
+			      "%u RU",
+			    seq, decider_sell, decider_buy, deal.sell_total, deal.buy_total);
+			if (trade_window::tell_purchase(!deal.buy.empty(), decider_buy, deal.buy_total))
+				dialog::hud_message_n("st_coop_trade_price_buy", "Trade cancelled: the trader asks %u RU, more than the window showed",
+				    decider_buy);
+			else
+				dialog::hud_message_n("st_coop_trade_price_sell", "Trade cancelled: the trader pays %u RU, less than the window showed",
+				    decider_sell);
+		}
 		else
 			dialog::hud_message("st_coop_trade_failed", "Trade failed: the goods are no longer available");
 		request_rebuild(now_ms()); // undo the optimistic move of the cells
 	}
 	g_view.labels = true;
+	if (deal.lua) // TZ R90: the Lua window's buttons wait for this answer; it follows the items that come
+		call_trade_window("on_result", [&](lua_State* L)
+		{
+			lua_pushnumber(L, lua_Number(seq));
+			lua_pushnumber(L, lua_Number(code));
+			lua_pushnumber(L, lua_Number(delta));
+			lua_pushstring(L, result_name(code));
+			lua_pushnumber(L, lua_Number(decider_sell)); // review of 2026-11-25: PriceChanged only, else 0
+			lua_pushnumber(L, lua_Number(decider_buy));
+			return 6;
+		}, [](lua_State*, int) {});
 }
 
 void client_on_trader_money(Reader& r)
@@ -1047,7 +1362,9 @@ void install_client(Endpoint& e) { e.on(Msg::TradeOp, &on_trade_op); }
 
 static void search_frame()
 {
-	u16 now = g_search_now.load();
+	const u32 said = g_search_now.load();
+	u16 now = u16(said & 0xffff);
+	const u8 asked = u8(said >> 16);
 	if (now == kNoId && g_search_sent == kNoId)
 		return;
 	u8 kind = ContNone;
@@ -1055,11 +1372,12 @@ static void search_frame()
 	{
 		CObject* o = find_object(now);
 		CInventoryOwner* owner = o ? smart_cast<CInventoryOwner*>(o) : nullptr;
-		kind = o && smart_cast<CInventoryBox*>(o) ? ContBox : (owner && !alive(owner) ? ContCorpse : ContNone);
+		const bool box = o && smart_cast<CInventoryBox*>(o);
+		kind = search_kind(o != nullptr, box, owner != nullptr, owner && alive(owner), asked); // TZ R90: a trader of a trade window
 		if (kind == ContNone)
 			now = kNoId; // a companion's bag, or the box went
 	}
-	const SearchStep step = search_step(g_search_sent, now, kNoId);
+	const SearchStep step = search_step_kind(g_search_sent, g_search_kind, now, kind, kNoId);
 	if (step.close)
 		send_container(false, g_search_kind, g_search_sent);
 	if (step.open)
@@ -1071,6 +1389,11 @@ static void search_frame()
 void frame()
 {
 	search_frame();
+	if (g_have_queued.load()) // TZ R90: the Lua window's deals, sent on the main thread
+	{
+		std::lock_guard<std::mutex> lock(g_deal_lock);
+		send_queued_locked();
+	}
 	if (!is_mirror())
 		return;
 	client_sync_world();
@@ -1125,6 +1448,11 @@ void reset()
 	g_permits.clear(); // G6-3
 	g_search_now.store(kNoId);
 	g_search_sent = kNoId;
+	{
+		std::lock_guard<std::mutex> lock(g_deal_lock); // TZ R90
+		g_queued.clear();
+		g_have_queued.store(false);
+	}
 	g_pending.clear();
 	g_callbacks.clear();
 	g_view.labels = false;
@@ -1219,7 +1547,85 @@ int client_trader_money_in_flight(CInventoryOwner* trader)
 	return clamp_int(sum);
 }
 
-bool lua_trade_window_allowed() { return !is_mirror(); }
+bool lua_trade_window_allowed()
+{
+	// TZ R90: a copy gets the host's window once the Lua adapter has its Sell, Buy and Donate (coop_trade_window.ready()).
+	const bool mirror = is_mirror();
+	bool adapter = false;
+	std::string said;
+	if (mirror)
+		call_trade_window("ready", [](lua_State*) { return 0; }, [&](lua_State* L, int at)
+		{
+			adapter = lua_toboolean(L, at) != 0;
+			if (lua_type(L, at + 1) == LUA_TSTRING)
+				said = lua_tostring(L, at + 1);
+		});
+	const bool lua = trade_window::choose(mirror, adapter) == trade_window::Window::Lua;
+	if (net::live()) // which window a player saw, and why: the log answers "a different window than the host's"
+	{
+		const std::string tail = said.empty() ? std::string() : " (" + said + ")";
+		::Msg("[coop] trade window: %s - %s%s", lua ? "Anomaly's Lua window, as the host's" : "the engine window",
+		    trade_window::why(mirror, adapter), tail.c_str());
+	}
+	return lua;
+}
+
+int lua_trade_deal(lua_State* L)
+{
+	const auto refuse = [L](const char* why)
+	{
+		lua_pushnumber(L, 0);
+		lua_pushstring(L, why);
+		return 2;
+	};
+	if (!is_live_mirror())
+		return refuse("not a player's copy in the world");
+	u16 trader = kNoId;
+	if (lua_type(L, 1) != LUA_TNUMBER || !trade_window::id_of(double(lua_tonumber(L, 1)), kNoId, trader))
+		return refuse("no trader id");
+	for (int at = 2; at <= 3; ++at)
+		if (lua_istable(L, at) && lua_objlen(L, at) > kMaxDealItems)
+			return refuse(trade_window::list_check_name(trade_window::ListCheck::TooMany));
+	std::vector<uint16_t> sell, buy;
+	if (!read_lua_ids(L, 2, sell) || !read_lua_ids(L, 3, buy))
+		return refuse(trade_window::list_check_name(trade_window::ListCheck::BadId));
+	const u8 flags = lua_type(L, 4) == LUA_TNUMBER ? u8(int(lua_tonumber(L, 4)) & trade_window::kDealFlags) : u8(0);
+	const bool donate = (flags & kDealDonate) != 0;
+	const trade_window::ListCheck c = trade_window::check_lists(sell, buy, donate, kMaxDealItems, kNoId);
+	if (c != trade_window::ListCheck::Ok)
+		return refuse(trade_window::list_check_name(c));
+	std::vector<double> sell_prices, buy_prices;
+	read_lua_prices(L, 5, sell.size(), sell_prices);
+	read_lua_prices(L, 6, buy.size(), buy_prices);
+	// Review of 2026-11-24: the sums the window shows (arguments 7 and 8: TMode_UpdatePrice's GetCellCost sums), else the item prices
+	// added up. They fill the log line "this window showed" and, with flag 2, travel with the deal (protocol 35).
+	std::vector<double> sell_sum = sell_prices, buy_sum = buy_prices;
+	if (lua_type(L, 7) == LUA_TNUMBER)
+		sell_sum.assign(1, double(lua_tonumber(L, 7)));
+	if (lua_type(L, 8) == LUA_TNUMBER)
+		buy_sum.assign(1, double(lua_tonumber(L, 8)));
+
+	PendingDeal deal;
+	deal.donate = donate;
+	deal.lua = true;
+	deal.lua_prices = !donate && (flags & kDealLuaPrices) != 0;
+	if (!donate && (!trade_window::total_of(sell_sum, u32(kMaxMoney), deal.sell_total) ||
+	                   !trade_window::total_of(buy_sum, u32(kMaxMoney), deal.buy_total)))
+		return refuse("a price of the window is no number");
+	for (size_t i = 0; i < sell.size(); ++i)
+		deal.sell.push_back({sell[i], donate ? 0u : trade_window::item_price(sell_prices[i])});
+	for (size_t i = 0; i < buy.size(); ++i)
+		deal.buy.push_back({buy[i], trade_window::item_price(buy_prices[i])});
+	u32 seq = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_deal_lock);
+		seq = ++g_seq;
+		g_queued.push_back({seq, trader, std::move(deal)});
+		g_have_queued.store(true);
+	}
+	lua_pushnumber(L, lua_Number(seq));
+	return 1;
+}
 
 void on_local_trade_done(CTrade* trade)
 {
@@ -1253,7 +1659,10 @@ bool deal_list_stale(CUIDragDropListEx* deal_list, CInventoryOwner* owner)
 int lua_search_window(lua_State* L)
 {
 	const lua_Number id = lua_isnumber(L, 1) ? lua_tonumber(L, 1) : -1;
-	g_search_now.store(id >= 0 && id < lua_Number(kNoId) ? u16(id) : kNoId);
+	const u16 now = id >= 0 && id < lua_Number(kNoId) ? u16(id) : kNoId;
+	// TZ R90: kind 3 - a trade window with that trader (the decider sends his money, his items' states and a computer's permit)
+	const u32 kind = lua_isnumber(L, 2) && lua_tonumber(L, 2) == lua_Number(kViewTrader) ? u32(kViewTrader) : u32(kViewNone);
+	g_search_now.store(now == kNoId ? u32(kNoId) : (u32(now) | (kind << 16)));
 	return 0;
 }
 

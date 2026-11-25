@@ -14,18 +14,37 @@
 // so "sell A, then buy B" before the sale is answered is checked against the money after the sale.
 //
 // TradeOp payload, first byte is the sub-operation (ids in host numbering, reliable lane):
-//   4 Deal         client -> host  u32 seq, u16 trader, u8 flags (1 donate),
+//   4 Deal         client -> host  u32 seq, u16 trader, u8 flags (1 donate, 2 the Lua window's prices: TZ R90),
 //                                  u16 n, n x u16 item   (player -> trader)
 //                                  u16 n, n x u16 item   (trader -> player)
+//                                  flag 2 only (protocol 35): u32 sell_shown, u32 buy_shown   (what the window showed)
 //   2 Result       host -> client  u32 seq, u16 trader, u8 TradeResult (0 ok), i32 money_delta
 //                                  (sell_total - buy_total), u32 trader_money
+//                                  code 10 only: u32 decider_sell, u32 decider_buy   (PriceChanged, TZ R90, review of
+//                                  2026-11-25; protocol 35, the same Dev build: the decider's prices, which the window shows)
 //   3 TraderMoney  host -> all     u16 trader, u32 money   (after any trade; answer to an open)
 //   1 (retired single-direction request; ignored)
 // A repeated Deal (same seq) gets the stored answer again and changes nothing.
 // Prices (review R4 2): the host prices every item with the stock CTrade::GetItemPrice for the
 // player's character (its relations, rank, reputation, faction) as for the actor, and checks that
 // the trader trades now, stands by that character and trades each item; the client's own prices
-// only fill its window.
+// only fill its window. A deal from Anomaly's Lua window (flag 2, TZ R90) is priced with that window's
+// formula instead, as the host's own window prices his trades: scripts\coop_trade_window.script
+// host_price under the player's character (the trader's lists and discounts for him, get_item_cost),
+// then each side is settled against the sum the player's window showed (review of 2026-11-24,
+// xrCoop/coop_trade_window_rules.h settle_side): a sale pays the smaller sum, a purchase costs the
+// larger, so the player never gets more nor pays less than his window showed or the formula here says.
+// Review of 2026-11-25: nor does he pay more or get less than his window showed without seeing it: a
+// side the decider prices worse for him than shown beyond rounding (1 RU; for the engine window's
+// CTrade sums 1 RU + 2 RU an item, trade_window::slack_of) is refused with TradeResult 10
+// (PriceChanged) and the decider's prices; his Lua window shows them, its next press agrees. Within
+// the rounding a purchase costs what was shown and a sale pays the decider's price.
+// The formula is the decider's, not the player's choice of window: an engine window's deal (flag 0) is
+// priced with CTrade (what that window showed) and then settled against the Lua formula the same way;
+// CTrade alone only where the decider has no coop_trade_window.host_price. Host_price prices the
+// player's items as his own window sees them, held by the actor (id 0): Weapon Parts Overhaul's checks
+// of the owner's id give the worn part's price and the busted-parts refusal there too.
+// Flag 2, the shown sums and the tail of PriceChanged are protocol 35: a reader of 34 never meets them (Hello).
 //
 // Containers (boxes, stashes, corpses) have one content for all players. Takes and puts are
 // ownership events that the item layer (WP2) turns into host requests. Here: the open window
@@ -85,17 +104,27 @@ bool deal_list_stale(CUIDragDropListEx* deal_list, CInventoryOwner* owner);
 // over all waiting deals; trader: the opposite over the deals with `trader`. 0 unless a coop client.
 int client_money_in_flight();
 int client_trader_money_in_flight(CInventoryOwner* trader);
-// For CUIGameSP::StartTrade (not wired yet, see the W3b report): false on a coop client, which must
-// trade in the engine window. Anomaly's Lua inventory (ui_inventory.script) replaces that window and
-// trades with transfer_item + give_money, which bypasses this module (no money check on the host,
-// trader money changed on the client only, items moved one by one).
+// CUIGameSP::StartTrade (TZ R90): may Anomaly's Lua inventory window (ui_inventory, G.A.M.M.A.'s copy) open this trade? Yes in a
+// process that trades for itself (the host, single player), and on a copy (a co-op client, a server's player) once
+// scripts\coop_trade_window.script has taken over the window's Sell, Buy and Donate (coop_trade_window.ready()): they send one deal
+// to the decider (lua_trade_deal) instead of transfer_item + give_money on the copy, which would move the trader's money there only.
+// Else the copy keeps the engine window. In a session the log says which window opened and why ("[coop] trade window: ...").
 bool lua_trade_window_allowed();
+// coop.trade_deal(trader, sell_ids, buy_ids, flags[, sell_prices, buy_prices, sell_shown, buy_shown]) -> seq, or 0 and why (TZ R90):
+// the trade of the Lua window of a copy. Ids in local numbering; flags 1 a gift, 2 priced with the window's formula; the item prices
+// are the ones the window showed (actor_on_trade only), the two sums what it showed for each side (GetCellCost: the log line and,
+// with flag 2, the deal: the decider never pays more nor charges less than them; without them, the item prices added up). Queued, sent by frame() on the main thread (Lua may run on
+// the game's worker thread). The answer goes to coop_trade_window.on_result(seq, code, money_delta, why, decider_sell, decider_buy)
+// (the last two: PriceChanged only, else 0).
+int lua_trade_deal(lua_State* L);
 
 // --- engine hooks: actor menu (ui/UIActorMenu.cpp, ui/UIActorMenuDeadBodySearch.cpp) ---
 // CUIActorMenu::Show(status), first line (mode, partner and box are already set when opening).
 void on_actor_menu_shown(CUIActorMenu& menu, bool shown);
-// coop.search_window([id]): Anomaly's inventory, a Lua dialog, searches `id` now, no id: it closed (coop_mods_items.script, xrCoop/
-// coop_search_view.h). frame() tells the host as CUIActorMenu::Show tells it of the engine's window. Any thread.
+// coop.search_window([id[, kind]]): Anomaly's inventory, a Lua dialog, searches `id` now, no id: it closed (coop_mods_items.script, xrCoop/
+// coop_search_view.h). Kind 3 (TZ R90, coop_trade_window.script): a trade window with the trader `id` (the decider sends his money,
+// his items' states and a trading computer's permit). frame() tells the host as CUIActorMenu::Show tells it of the engine's window.
+// Any thread.
 int lua_search_window(lua_State* L);
 // CUIActorMenu::Update, first line. Rebuilds the lists through the menu's public API when a shared
 // container changed elsewhere, a trade answer arrived or a container move was not applied.
