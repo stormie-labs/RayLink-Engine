@@ -38,9 +38,11 @@
 #include "../coop_script.h" // R32 W7.2: coop_op_done (script::queue_callback)
 #include "../coop_survival.h"
 #include "../coop_world.h"
+#include "../coop_writer.h" // Р68-3: writing::root_facts_of, the root and its kind as the world reads them (held_gen_of)
 #include "xrCoop/srv/coop_levels_keeper.h"
 #include "xrCoop/srv/coop_levels_audit.h"
 #include "xrCoop/srv/coop_levels_journal.h" // R32 W3: the map server's journal, its batches and the world's Ack
+#include "xrCoop/srv/coop_levels_root_gen.h" // Р68-3: the gen at a root, one rule with the world (same_as)
 #include "xrCoop/srv/coop_session_srv.h"
 #include "xrCoop/coop_reconcile.h" // R32 W5: a refused change is repaired with StateDumpRequest Replace
 
@@ -300,25 +302,17 @@ void client_send_journal()
 	}
 }
 
-// R32 A6: the keeper generation of the unit at the object's root as this map server's holder holds it; 0 when that root is no unit
-// it holds. The root: up its holders (8 at most), then a creature's squad (m_group_id, A5). Under g.lock.
+// R32 A6, Р68-3: the keeper generation of the object's root as this map server's holder holds it, whatever that root is now (a unit,
+// or the body of one held here that died: levels::root_gen, the world's rule as well); 0 when it does not hold the root. The root and
+// its kind come from writing::root_facts_of, the function the world reads them with (srv/coop_levels_alife.cpp root_seen, same_as):
+// up its holders (8 at most), then a creature's squad (m_group_id, A5), and the kind is that root's own, so a member counts as its
+// squad (a unit) on both sides, whatever the member is. Under g.lock.
 u32 held_gen_of(const CSE_ALifeDynamicObject* e)
 {
 	if (!e || !g.holder)
 		return 0;
-	const CSE_ALifeDynamicObject* root = e;
-	for (int depth = 0; root->ID_Parent != 0xffff && depth < 8; ++depth)
-	{
-		const CSE_ALifeDynamicObject* up = ai().alife().objects().object(root->ID_Parent, true);
-		if (!up)
-			break;
-		root = up;
-	}
-	u16 unit = root->ID;
-	const CSE_ALifeMonsterAbstract* m = smart_cast<const CSE_ALifeMonsterAbstract*>(root);
-	if (m && m->m_group_id != 0xffff)
-		unit = m->m_group_id;
-	return g.holder->gen(join::to_host(unit));
+	const writer::RootFacts root = writing::root_facts_of(e->ID);
+	return root_gen(root.kind, g.holder->gen(join::to_host(root.root)));
 }
 
 // The head of a per-object entry (A13): the object's id in the world's numbering, its section crc, the generation of its root.
@@ -1589,8 +1583,17 @@ void client_on_journal_ack(PeerId from, Reader& r)
 				// O6 (reports #1644-#1649): the object as this map server has it (its section, its parent in the world's numbering)
 				const CSE_ALifeDynamicObject* mine =
 				    f.id != wire::kNoObject && ai().get_alife() ? ai().alife().objects().object(join::to_local(f.id), true) : nullptr;
-				const std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
+				std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
 				    mine && mine->ID_Parent != 0xffff ? join::to_host(mine->ID_Parent) : wire::kNoObject, false, wire::kNoObject);
+				if (f.why == journal::Identity && mine && f.op != wire::LevelEntityHead::Parent)
+				{
+					// Р68-3: the gen this map server names the object's root with NOW, next to the world's line (root gen here, sent:
+					// the gen of the head is there, this side keeps no copy of it). Not for a Parent: its head named the root the
+					// thing left, and by now it stands in its new root (a player's character: always 0), so the number says nothing.
+					char gen[48];
+					std::snprintf(gen, sizeof(gen), ", root gen now %u", held_gen_of(mine));
+					note += gen;
+				}
 				::Msg("! [coop] levels: the world refused %s of object %u in batch %u (%u so far): %s; %s", journal::op_name(f.op), u32(f.id),
 				    f.seq, g.journal_refusals, journal::why_name(f.why), note.c_str());
 			}

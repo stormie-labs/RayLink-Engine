@@ -2069,6 +2069,7 @@ void register_raw(lua_State* L)
 		{"lease_waiting", &coop::requests::lua_lease_waiting}, // F2 T12b round 1: an item that waits for the host
 		{"writes", &coop::writing::lua_writes}, // R32 W1: this process writes the object (coop_mode.writes)
 		{"search_window", &coop::trade::lua_search_window}, // what Anomaly's Lua inventory searches now (scripts\coop_mods_items)
+		{"trade_deal", &coop::trade::lua_trade_deal}, // TZ R90: the deal of a copy's Lua trade window (scripts\coop_trade_window)
 		{nullptr, nullptr},
 	};
 	lua_pushstring(L, "coop");

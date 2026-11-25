@@ -12,6 +12,7 @@
 #include "coop_vehicles.h" // F5-VEH-2: a seated player's character is not placed by his snapshots
 #include "coop_vehicles_state.h" // F5-VEH-4: a seated player's doll sits in the car
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_player_touch_rules.h" // TZ P75: drop_stale
 
 #include "Level.h"
 #include "Actor.h"
@@ -75,19 +76,22 @@ bool refuse_state(const char* why)
 	return false;
 }
 
+void end_stream(Track& t)
+{
+	t.samples.clear();
+	t.have_offset = false;
+	t.applied_legs = t.applied_torso = t.applied_head = 0; // a respawned avatar replays the motions
+	t.driven = false;
+	t.mstate = 0;
+}
+
 void push_sample(u16 avatar, const State& s)
 {
 	Track& t = g_tracks[avatar];
 	++t.received;
 	const u64 now = mgr().now_ms();
 	if (t.have_offset && now - t.last_rx > kStreamGapMs)
-	{
-		t.samples.clear();
-		t.have_offset = false;
-		t.applied_legs = t.applied_torso = t.applied_head = 0; // a respawned avatar replays the motions
-		t.driven = false;
-		t.mstate = 0;
-	}
+		end_stream(t);
 	t.last_rx = now;
 	if (t.have_offset && s32(s.time_ms - t.last_remote_time) <= 0)
 	{
@@ -441,8 +445,16 @@ void on_avatar_visual_changed(u16 avatar_id)
 void on_object_spawn(u16 id)
 {
 	auto it = g_tracks.find(id);
-	if (it != g_tracks.end())
-		it->second.placed = false; // a new object: it stands where this world spawned it
+	if (it == g_tracks.end())
+		return;
+	Track& t = it->second;
+	t.placed = false; // a new object: it stands where this world spawned it
+	// TZ P75: snapshots of a stream that ended before it appeared are where he stood before (the host keeps a client's through
+	// its own world change, a player who stayed keeps those of one who left and came back): drive_avatar would hold the newest
+	// of them for a frame and the pair switched on there. Those of the stream he sends now stay (one may come before his object).
+	player_touch::drop_stale(t.samples, mgr().now_ms(), kStreamGapMs, [](const Sample& smp) { return smp.local_time; });
+	if (t.samples.empty())
+		end_stream(t); // as push_sample does after a gap: not driven, its motions replayed on the new object
 }
 
 bool placed(u16 avatar_id)
