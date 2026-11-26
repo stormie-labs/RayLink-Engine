@@ -38,9 +38,11 @@
 #include "../coop_script.h" // R32 W7.2: coop_op_done (script::queue_callback)
 #include "../coop_survival.h"
 #include "../coop_world.h"
+#include "../coop_writer.h" // Р68-3: writing::root_facts_of, the root and its kind as the world reads them (held_gen_of)
 #include "xrCoop/srv/coop_levels_keeper.h"
 #include "xrCoop/srv/coop_levels_audit.h"
 #include "xrCoop/srv/coop_levels_journal.h" // R32 W3: the map server's journal, its batches and the world's Ack
+#include "xrCoop/srv/coop_levels_root_gen.h" // Р68-3: the gen at a root, one rule with the world (same_as)
 #include "xrCoop/srv/coop_session_srv.h"
 #include "xrCoop/coop_reconcile.h" // R32 W5: a refused change is repaired with StateDumpRequest Replace
 
@@ -158,6 +160,7 @@ struct State
 	u32 journal_acked = 0; // the highest batch the world acknowledged
 	u32 journal_batches = 0, journal_entries = 0, journal_refusals = 0, journal_bad = 0;
 	u32 repairs_released = 0, repairs_fetched = 0, repairs_none = 0;
+	u32 parents_unchanged = 0; // the departure flood (2026-11-26): Parents left out, back where they stood (ParentNet::unchanged)
 	u32 done_queued = 0, done_replayed = 0; // R32 W7.2: Done entries queued here, records of its level raised from its save
 	// R32 W9: his ids, the slice and the world's blocks. An empty pool gives leader_free_id no id; what a create does then is
 	// xrServer::CoopMayCreate's and PerformIDgen's (xrServer.h, package E: refused at its start under coop_writer_gate = enforce)
@@ -300,25 +303,17 @@ void client_send_journal()
 	}
 }
 
-// R32 A6: the keeper generation of the unit at the object's root as this map server's holder holds it; 0 when that root is no unit
-// it holds. The root: up its holders (8 at most), then a creature's squad (m_group_id, A5). Under g.lock.
+// R32 A6, Р68-3: the keeper generation of the object's root as this map server's holder holds it, whatever that root is now (a unit,
+// or the body of one held here that died: levels::root_gen, the world's rule as well); 0 when it does not hold the root. The root and
+// its kind come from writing::root_facts_of, the function the world reads them with (srv/coop_levels_alife.cpp root_seen, same_as):
+// up its holders (8 at most), then a creature's squad (m_group_id, A5), and the kind is that root's own, so a member counts as its
+// squad (a unit) on both sides, whatever the member is. Under g.lock.
 u32 held_gen_of(const CSE_ALifeDynamicObject* e)
 {
 	if (!e || !g.holder)
 		return 0;
-	const CSE_ALifeDynamicObject* root = e;
-	for (int depth = 0; root->ID_Parent != 0xffff && depth < 8; ++depth)
-	{
-		const CSE_ALifeDynamicObject* up = ai().alife().objects().object(root->ID_Parent, true);
-		if (!up)
-			break;
-		root = up;
-	}
-	u16 unit = root->ID;
-	const CSE_ALifeMonsterAbstract* m = smart_cast<const CSE_ALifeMonsterAbstract*>(root);
-	if (m && m->m_group_id != 0xffff)
-		unit = m->m_group_id;
-	return g.holder->gen(join::to_host(unit));
+	const writer::RootFacts root = writing::root_facts_of(e->ID);
+	return root_gen(root.kind, g.holder->gen(join::to_host(root.root)));
 }
 
 // The head of a per-object entry (A13): the object's id in the world's numbering, its section crc, the generation of its root.
@@ -375,9 +370,10 @@ journal::CreaturePlace place_of_creature(u16 local_id, journal::ObjectHead& h)
 }
 
 // R32 A6: where things stood under this map server's held units at the end of the frame (journal::HeldMemory): the children of every
-// held creature (a held squad's members, a held creature of no squad) and the members of every held squad. A Parent hook that comes
-// later finds the old holder here (its children lack the item by then), a Died or a Destroy finds the squad the death chain or
-// remove_npc took the member out of. Children of children are not listed: an item in an item that moves names gen 0. Under g.lock.
+// held creature (a held squad's members, a held creature of no squad) and of every character its players play here (the departure
+// flood, below), and the members of every held squad. A Parent hook that comes later finds the old holder here (its children lack the
+// item by then), a Died or a Destroy finds the squad the death chain or remove_npc took the member out of. Children of children are
+// not listed: an item in an item that moves names gen 0. Under g.lock.
 void client_remember_held()
 {
 	g.memory.begin();
@@ -406,6 +402,16 @@ void client_remember_held()
 		else if (smart_cast<const CSE_ALifeCreatureAbstract*>(e))
 			children_of(e);
 	}
+	// The departure flood (2026-11-26): and the children of the characters of the players of this level. A player who leaves it (quits,
+	// drops, takes an exit) has his character switched offline here (join::on_peer_left -> take_offline, the same id as here): every item
+	// rejected with a hook, taken back without one (add_offline_impl). Listed, each is back where it stood at the flush and is left out
+	// (journal::ParentNet); unlisted, each went up as a Parent to the same character, which the world, writing the parked character by
+	// then, refused as not the writer, and each repair (Fetch) made the item again here. His virtual peer leaves the trunk in the next
+	// frame's world update and his character goes offline in its session update, both before that frame's flush and before this
+	// snapshot is taken again; should that order change, the world still takes such a Parent as a repeat (accept::unchanged_parent).
+	for (const auto& it : mapserver::trunk_peers().on())
+		if (const CSE_ALifeDynamicObject* played = ai().alife().objects().object(it.second.proxy, true))
+			children_of(played);
 }
 
 // R32 §8a A17: a creature left a squad this map server writes (local ids), alive and here: it inherits the squad's hold at once
@@ -831,6 +837,7 @@ void client_flush_up()
 		default: continue;
 		}
 	}
+	g.parents_unchanged += net.unchanged(); // the departure flood (2026-11-26): what the snapshot let it leave out
 	g.flushing = was_flushing;
 }
 
@@ -1589,8 +1596,17 @@ void client_on_journal_ack(PeerId from, Reader& r)
 				// O6 (reports #1644-#1649): the object as this map server has it (its section, its parent in the world's numbering)
 				const CSE_ALifeDynamicObject* mine =
 				    f.id != wire::kNoObject && ai().get_alife() ? ai().alife().objects().object(join::to_local(f.id), true) : nullptr;
-				const std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
+				std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
 				    mine && mine->ID_Parent != 0xffff ? join::to_host(mine->ID_Parent) : wire::kNoObject, false, wire::kNoObject);
+				if (f.why == journal::Identity && mine && f.op != wire::LevelEntityHead::Parent)
+				{
+					// Р68-3: the gen this map server names the object's root with NOW, next to the world's line (root gen here, sent:
+					// the gen of the head is there, this side keeps no copy of it). Not for a Parent: its head named the root the
+					// thing left, and by now it stands in its new root (a player's character: always 0), so the number says nothing.
+					char gen[48];
+					std::snprintf(gen, sizeof(gen), ", root gen now %u", held_gen_of(mine));
+					note += gen;
+				}
 				::Msg("! [coop] levels: the world refused %s of object %u in batch %u (%u so far): %s; %s", journal::op_name(f.op), u32(f.id),
 				    f.seq, g.journal_refusals, journal::why_name(f.why), note.c_str());
 			}
@@ -2438,6 +2454,8 @@ void xfer_print_status()
 	    g.journal_batches, g.journal_entries, g.journal_acked, g.batch.last_seq(), g.journal_refusals, g.repairs_released,
 	    g.repairs_fetched, g.repairs_none, g.journal_bad + g.batch.dropped(), u32(g.ids.size()), u32(g.ids.reserved_count()),
 	    g.id_blocks_in, g.ids_empty);
+	::Msg("[coop] levels: Parent entries left out, back where they stood (a holder or a player's character went offline here): %u",
+	    g.parents_unchanged);
 	::Msg("[coop] levels: done-records journaled %u, raised from the world's save %u", g.done_queued, g.done_replayed);
 	if (g.holder)
 		::Msg("[coop] levels: holding %u object(s), %s, granted %u, taken back %u, refused %u, retries %llu",

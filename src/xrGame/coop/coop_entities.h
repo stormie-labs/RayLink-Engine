@@ -16,6 +16,10 @@ class xrServer;
 
 namespace coop
 {
+namespace mirror_pose
+{
+struct Book; // xrCoop/coop_mirror_pose_rules.h (P101)
+}
 namespace entities
 {
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
@@ -90,8 +94,14 @@ struct ClientApply
 	ClientApply(const ClientApply&) = delete;
 	ClientApply& operator=(const ClientApply&) = delete;
 };
-// Client: play the host snapshot on a mirrored creature (called by coop_remote).
-bool drive_mirror(CGameObject* obj);
+// Client: play the host snapshot on a mirrored creature (called by coop_remote). `book` is the copy's pose book for its
+// skeleton (coop_remote keeps it per copy): a partition no usable host motion reaches gets the copy's own idle once the
+// copy settled, and a copy that may stand in its spawn pose is said once per episode (P101). False when no snapshot of
+// the id is here (the copy is neither placed nor driven by the host then).
+bool drive_mirror(CGameObject* obj, mirror_pose::Book& book);
+// Client, one bounded line: what the copy `id` (local numbering) has from the decider and what it plays now; `why` is
+// the reason it is asked (P101: a talk the decider answered "gone" for an NPC that is here).
+void describe_copy(u16 id, const char* why);
 // True if a MotionID value from another machine exists in this visual's motion set. Same visual
 // means same ids; a different one may have fewer motions, and playing a missing one reads past
 // the motion table.

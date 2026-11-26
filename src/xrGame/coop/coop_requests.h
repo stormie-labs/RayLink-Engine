@@ -185,6 +185,21 @@ bool cancel_unregistered_clone(CSE_Abstract* object);
 bool write_clone_initial(Writer& w, CSE_Abstract* entity);
 bool read_clone_initial(Reader& r, u16 target, std::vector<u8>& initial);
 bool stage_clone_initial(CSE_Abstract* entity, const std::vector<u8>& initial, bool existing = false);
+// A whole EntitySpawn message of another process (its 2-byte type first, then the layout of write_spawn, coop_entities.cpp): this
+// copy of the entity it names takes the stamp of the magazined weapon it carries: coop_economy_mdata.script clone_take_stamp takes it
+// while this copy has no stamp or the same one. Nothing else of the spawn is applied (review R1: not the whole adoption of a repeated
+// spawn, client_on_spawn Known::Repeat -> stage_clone_initial, existing -> clone_adopt; the item's held and pending changes stay).
+// `id_host`: the id it names (host numbering).
+enum class SpawnStamp : u8
+{
+	NoWeapon, // another message, or a spawn with no weapon state in it (no magazined weapon)
+	Malformed, // not read as write_spawn writes it
+	NoEntity, // nothing under its id here, or a clone transaction of this process's own stands under it
+	Refused, // not taken: this copy keeps another stamp, another item stands under the id (the name), a clone of it is in flight in
+	         // Lua, or the snapshot or the Lua function is not there (clone_take_stamp)
+	Taken,
+};
+SpawnStamp adopt_spawn_stamp(const u8* message, size_t size, u16& id_host);
 // Live 2026-11-08 (G.A.M.M.A., a scope fitted to the SR-3M in a client's slot went into the backpack): our clone `id` of a
 // weapon spawns in our actor - the slot its old weapon had (xrCoop/coop_clone_slot.h), while that slot is free. False: the
 // engine's own default. CInventoryItem::net_Spawn (coop_equip.cpp on_item_spawn), main thread.

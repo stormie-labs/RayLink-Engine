@@ -11,6 +11,7 @@
 #include "coop_money.h"
 #include "coop_requests.h"
 #include "coop_trade.h" // O2-partner: a revoked lock closes a trade or upgrade window opened from the talk
+#include "coop_entities.h" // P101: describe_copy for a talk the decider answers "gone"
 #include "xrCoop/coop_talks.h" // Ruling F2-34 (F2 T12 round 2)
 
 #include "Level.h"
@@ -376,7 +377,8 @@ void client_release()
 	g_cl.start = kNoId;
 }
 
-void notify_denied(u8 result, talks::Reason why = talks::Reason::None)
+// `host_npc`: the NPC asked about (host numbering), kNoId when the caller has none.
+void notify_denied(u8 result, talks::Reason why = talks::Reason::None, u16 host_npc = kNoId)
 {
 	if (result == NotWilling) // B8: the host's meet rules for our character say no; the line tells which
 		hud_message(talks::reason_string_id(why), talks::reason_fallback(why));
@@ -387,7 +389,16 @@ void notify_denied(u8 result, talks::Reason why = talks::Reason::None)
 	else if (result == TooFar) // F2 T6b: the host sees the player's character far from the NPC
 		hud_message("st_coop_talk_too_far", "You are too far away to talk");
 	else
-		::Msg("[coop] talk refused by the host: %s", talks::lock::name(result));
+	{
+		// P101 (Dev 64, Server mode): 17 "talk refused by the host: gone" lines on Cordon, in the two sessions where Wolf stood in
+		// a T-pose, and no NPC named. The line names it now, and for "gone" (no live NPC of this id on the decider, while it is
+		// here and talkable) it says what the copy has from the decider and what it plays.
+		const u16 local = host_npc != kNoId ? join::to_local(host_npc) : kNoId;
+		::Msg("[coop] talk refused by the host: %s (NPC %u here, %u on the host, [%s])", talks::lock::name(result), u32(local),
+		    u32(host_npc), local != kNoId ? name_of(local) : "?");
+		if (result == Gone && local != kNoId)
+			entities::describe_copy(local, "the decider has no live NPC of this id");
+	}
 }
 
 void client_on_result(PeerId, Reader& r)
@@ -414,7 +425,7 @@ void client_on_result(PeerId, Reader& r)
 	if (result != Granted)
 	{
 		++g_denies;
-		notify_denied(result, msg.reason);
+		notify_denied(result, msg.reason, npc);
 		return;
 	}
 	++g_grants;

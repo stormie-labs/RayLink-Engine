@@ -36,8 +36,10 @@ enum class Spawn : uint8_t
 
 // mirror: join::world_is_mirror(); entity_here: the level's server has an entity under the spawn's id;
 // same_section: its section is the spawn's; live_same_kind: the level has a game object of the spawn's section under the
-// id, not being destroyed. A live object of ANOTHER section under the id does not hold the new one back: it is a stale
-// object that outlived its entity; the new one registers under the id and the stale one falls silent (export_verdict).
+// id, not being destroyed. A live object of ANOTHER section under the id is no Duplicate: it is a stale object that
+// outlived its entity, and it falls silent (export_verdict). Make is not the last word: the stock CGameObject::net_Spawn
+// refuses a spawn while ANY object holds the id (the stale one, or one that GE_DESTROY marked in this frame), after
+// half-making the new one; coop_spawn_wait_rules.h (TZ P104) holds such a spawn back until the id is free.
 inline Spawn spawn_verdict(bool mirror, bool entity_here, bool same_section, bool live_same_kind)
 {
 	if (!mirror)

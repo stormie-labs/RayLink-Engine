@@ -210,8 +210,11 @@ private:
 
 // R32 §8a A17: does a map server's Holder adopt a creature at the Left of a squad (levels::client_adopt_left, at the hook and again at
 // the flush)? Only one that leaves a squad it writes, that it does not write already (it keeps its own hold), a living creature on
-// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident), and whose release is not
-// under way (fix round 2, finding 1: ReleasesUnderWay).
+// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident, adopted by nobody), and
+// whose release is not under way (fix round 2, finding 1: ReleasesUnderWay). A resident is not a root of gen 0 by its kind: the gen
+// at a root is the sender's hold of it for any root (Р68-3, levels::root_gen in coop_levels_root_gen.h). A creature adopted here
+// alive that dies later keeps that hold, and its body and loot are named with it on both sides; one that dies in its squad leaves
+// it unheld, 0 on both.
 struct LeftAdoptFacts
 {
 	bool squad_written = false; // its Holder authors the squad
@@ -390,14 +393,14 @@ inline std::string object_note(bool here, const char* section, uint16_t crc, uin
 // out of its squad (game->on_death before events::host_on_death: se_stalker:on_death -> squad:on_npc_death -> remove_npc ->
 // unregister_member), a script's remove_npc unregisters a member before it releases it. So the map server keeps what it needs to
 // name the root before the change:
-//   HeldMemory      where the children of its held creatures and the members of its held squads stood at the end of the last frame,
-//                   and every Parent hook since;
+//   HeldMemory      where the children of its held creatures and of its players' characters, and the members of its held squads,
+//                   stood at the end of the last frame, and every Parent hook since;
 //   creature_place  where a Died or a Destroy of a creature goes among the frame's pending ups, and which squad its head names;
 //   ParentNet       which Parent entries of one flush the world can take (the flush writes where an object stands now).
 
 // The parent an object had before the hook that moves it: known (the snapshot or a move since says so; kNoObject: on the ground),
-// or not known (no held creature held it at the end of the last frame and no hook moved it since: its old root is no unit this map
-// server holds, the head names gen 0).
+// or not known (no held creature and no player's character here held it at the end of the last frame and no hook moved it since: its
+// old root is no unit this map server holds, the head names gen 0).
 struct ParentBefore
 {
 	bool known = false;
@@ -482,7 +485,7 @@ private:
 		m_sorted = true;
 	}
 
-	Pairs m_children; // child -> its holder, of the held creatures
+	Pairs m_children; // child -> its holder, of the held creatures and of the players' characters here
 	Pairs m_members; // member -> its squad, of the held squads
 	Pairs m_moved; // item -> its new parent, every Parent hook since the snapshot, in order
 	bool m_sorted = false;
@@ -538,6 +541,10 @@ CreaturePlace creature_place(const Ups& ups, uint16_t creature, uint16_t squad_n
 //   an object back where it stood before its first move (known) changes nothing: left out;
 //   an object whose Spawn was left out (made and gone within the frame) is never heard of by the world: its later entries are left
 //     out too.
+// Server, the departure flood (2026-11-26, world log xray_banan4ik2.log: 23 of 23 printed refusals "parent X, moved to X"): a player
+// who leaves the level (quits, drops, takes an exit) has his character switched offline here, every item rejected with a hook and
+// taken back without one. The snapshot knows where those items stood only when it lists his character (client_remember_held); then
+// each is back where it stood and left out here, and unchanged() counts it.
 class ParentNet
 {
 public:
@@ -549,12 +556,21 @@ public:
 	{
 		if (m_unborn.count(id) || !m_placed.insert(id).second)
 			return false;
-		return !before.known || before.parent != parent_now;
+		if (before.known && before.parent == parent_now)
+		{
+			++m_unchanged;
+			return false;
+		}
+		return true;
 	}
+
+	// Objects of this flush whose first Parent was left out because they stand where they stood before it.
+	uint32_t unchanged() const { return m_unchanged; }
 
 private:
 	std::set<uint16_t> m_placed;
 	std::set<uint16_t> m_unborn;
+	uint32_t m_unchanged = 0;
 };
 
 // ---------------------------------------------------------------- R32 W7.2 (§8a A21 E-1): the done-records of numbered ops

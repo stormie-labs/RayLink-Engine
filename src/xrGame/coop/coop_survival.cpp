@@ -131,6 +131,20 @@ const char* refusal_text(u8 r)
 	}
 }
 
+const char* refusal_id(u8 r)
+{
+	switch (r)
+	{
+	case RefNotWounded: return "st_coop_refusal_not_wounded";
+	case RefTooFar: return "st_coop_refusal_too_far";
+	case RefNoMedkit: return "st_coop_refusal_no_medkit";
+	case RefBusy: return "st_coop_refusal_busy";
+	case RefYouAreDown: return "st_coop_refusal_you_are_down";
+	case RefSelf: return "st_coop_refusal_self";
+	default: return "st_coop_refusal_other";
+	}
+}
+
 // Items a reviver uses, by section prefix, in order of preference.
 const char* const kReviveItems[] = {"medkit", "stimpack"};
 
@@ -175,6 +189,13 @@ xr_token g_death_drop_tokens[] = {
 const char* mode_name(death::Mode m)
 {
 	return m == death::Mode::Hardcore ? "hardcore" : m == death::Mode::Rollback ? "rollback" : "checkpoint";
+}
+
+const char* mode_id(death::Mode m)
+{
+	return m == death::Mode::Hardcore   ? "st_coop_game_death_mode_hardcore"
+	       : m == death::Mode::Rollback ? "st_coop_game_death_mode_rollback"
+	                                    : "st_coop_game_death_mode_checkpoint";
 }
 
 u8 console_pct(float v) { return u8(iFloor(clampr(v, 0.f, 100.f) + 0.5f)); }
@@ -409,6 +430,18 @@ CGameObject* object_here(u16 local_id)
 	return o && !o->getDestroy() ? o : nullptr;
 }
 
+// A feed line: `shown` on the HUD, `logged` in the log (the English text our tools and reports read).
+void feed_line(const char* shown, const char* logged)
+{
+	::Msg("[coop] %s", logged);
+	FeedLine l;
+	l.text = shown;
+	l.until = now() + 7000;
+	g_feed.push_back(l);
+	while (g_feed.size() > 5)
+		g_feed.pop_front();
+}
+
 void feed(const char* fmt, ...)
 {
 	string512 buf;
@@ -417,13 +450,7 @@ void feed(const char* fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 	buf[sizeof(buf) - 1] = 0;
-	::Msg("[coop] %s", buf);
-	FeedLine l;
-	l.text = buf;
-	l.until = now() + 7000;
-	g_feed.push_back(l);
-	while (g_feed.size() > 5)
-		g_feed.pop_front();
+	feed_line(buf, buf);
 }
 
 // A HUD string of text/*/st_coop_survival.xml, `fallback` while the table does not have it.
@@ -439,6 +466,29 @@ xr_string tr_format(const char* id, const char* fallback, char conv)
 {
 	const xr_string f = tr(id, fallback);
 	return death::one_conversion(f.c_str(), conv) ? f : xr_string(fallback);
+}
+
+// Feed lines the player reads in his language (text/*/st_coop_survival.xml, Р99 owner's screenshot 2026-11-25: English
+// lines on a Russian screen); the log keeps the English fallback. `fallback` has exactly one conversion (%s / %d).
+void feed_tr(const char* id, const char* fallback)
+{
+	feed_line(tr(id, fallback).c_str(), fallback);
+}
+
+void feed_tr_s(const char* id, const char* fallback, const char* value)
+{
+	string512 shown, logged;
+	xr_sprintf(logged, fallback, value);
+	xr_sprintf(shown, tr_format(id, fallback, 's').c_str(), value);
+	feed_line(shown, logged);
+}
+
+void feed_tr_d(const char* id, const char* fallback, int value)
+{
+	string512 shown, logged;
+	xr_sprintf(logged, fallback, value);
+	xr_sprintf(shown, tr_format(id, fallback, 'd').c_str(), value);
+	feed_line(shown, logged);
 }
 
 bool action_down(EGameActions a)
@@ -833,7 +883,8 @@ void enter_wounded(CActor* a, u64 t)
 	hold_controls(a);
 	set_cam(a, 1);
 	++g_stat.falls;
-	feed("You are down! A teammate can revive you with a medkit (%u s).", g_rules.bleedout_ms / 1000);
+	feed_tr_d("st_coop_feed_you_down", "You are down! A teammate can revive you with a medkit (%d s).",
+	    int(g_rules.bleedout_ms / 1000));
 	send_my_state(t);
 }
 
@@ -850,7 +901,7 @@ void enter_dead(CActor* a, u64 t)
 	hold_controls(a);
 	set_cam(a, 1);
 	++g_stat.deaths;
-	feed("You died.");
+	feed_tr("st_coop_feed_you_died", "You died.");
 	send_my_state(t); // the host decides by its death mode
 }
 
@@ -917,7 +968,7 @@ void apply_revive(u16 seq, u16 reviver, float health, PeerId reviver_peer, const
 	}
 	++g_stat.revives;
 	stand_up(a, health, false, now());
-	feed("%s revived you.", nick_of(reviver).c_str());
+	feed_tr_s("st_coop_feed_revived_by", "%s revived you.", nick_of(reviver).c_str());
 	if (reviver_peer == kInvalidPeer) // a host without the W5 tail: derive it from the character id
 		reviver_peer = peer_of_host_id(reviver);
 	script::on_actor_revived(reviver_peer, medkit); // Lua coop_actor_revived, from the frame queue
@@ -998,7 +1049,7 @@ void finish_new_life(CActor* a, u64 t)
 	stand_up(a, 1.f, true, t); // Alive goes out: the world's tracker starts over with it
 	::Msg("[coop] my new character stands up at (%.1f, %.1f, %.1f)", g_me.respawn_pos.x, g_me.respawn_pos.y,
 	    g_me.respawn_pos.z);
-	feed("A new character. Choose faction and gear.");
+	feed_tr("st_coop_feed_new_char", "A new character. Choose faction and gear.");
 }
 
 void finish_respawn(CActor* a, u64 t)
@@ -1016,10 +1067,11 @@ void finish_respawn(CActor* a, u64 t)
 	const checkpoint::Kind kind = g_me.respawn_kind;
 	const u16 seq = g_me.seq; // the fall this respawn answers (apply_respawn took it from the host's order)
 	stand_up(a, a->conditions().GetMaxHealth(), true, t);
+	// The player reads it in Lua's tip st_coop_respawned_<kind> (coop_death.script); here only the log.
 	if (kind == checkpoint::Kind::None)
-		feed("You respawned (no camp of yours on this level).");
+		::Msg("[coop] You respawned (no camp of yours on this level).");
 	else
-		feed("You are back at your camp (%s).", checkpoint::kind_name(kind));
+		::Msg("[coop] You are back at your camp (%s).", checkpoint::kind_name(kind));
 	// Lua (F3 Task 15): contusion, rank; the money is the host's (death::host_take_money), Lua only tells it. R1 I-1 (Ruling
 	// F3-12): the fifth argument is the number of the fall, so that Lua acts once on a repeated order (T8 review M-1) and
 	// on every real fall, however soon after the previous one. The numbers belong to one actor (forget_local starts them
@@ -1049,7 +1101,7 @@ void apply_spectate(u16 seq)
 	hold_controls(a);
 	set_cam(a, 2);
 	++g_stat.spectates;
-	feed("Hardcore: your character is gone. Hold USE to start a new one.");
+	feed_tr("st_coop_feed_hardcore_out", "Hardcore: your character is gone. Hold USE to start a new one.");
 	send_my_state(t);
 }
 
@@ -1118,7 +1170,15 @@ void apply_order(u8 op, Reader& r)
 		if (!r.ok())
 			return;
 		++g_stat.refused;
-		feed("Revive of %s refused: %s.", nick_of(target).c_str(), refusal_text(reason));
+		{
+			string256 head;
+			xr_sprintf(head, tr_format("st_coop_feed_revive_refused", "Revive of %s refused", 's').c_str(),
+			    nick_of(target).c_str());
+			string512 shown, logged;
+			xr_sprintf(shown, "%s: %s.", head, tr(refusal_id(reason), refusal_text(reason)).c_str());
+			xr_sprintf(logged, "Revive of %s refused: %s.", nick_of(target).c_str(), refusal_text(reason));
+			feed_line(shown, logged);
+		}
 		// A Begin the host refused: the hold cannot end well (it would be refused again), so it ends here; the host has
 		// none open for it, nothing to cancel. After a refused Request the hold is over already: nothing happens.
 		if (g_me.revive_target != 0xffff && join::to_host(g_me.revive_target) == target)
@@ -1183,14 +1243,16 @@ void announce(u16 id, Life from, Life to)
 	const xr_string who = nick_of(id);
 	switch (to)
 	{
-	case Life::Wounded: feed("%s is down! Hold USE on them with a medkit to revive.", who.c_str()); break;
-	case Life::Dead: feed("%s died.", who.c_str()); break;
-	case Life::Spectating: feed("%s is out of the run (hardcore).", who.c_str()); break;
+	case Life::Wounded:
+		feed_tr_s("st_coop_feed_peer_down", "%s is down! Hold USE on them with a medkit to revive.", who.c_str());
+		break;
+	case Life::Dead: feed_tr_s("st_coop_feed_peer_died", "%s died.", who.c_str()); break;
+	case Life::Spectating: feed_tr_s("st_coop_feed_peer_out", "%s is out of the run (hardcore).", who.c_str()); break;
 	case Life::Alive:
 		if (from == Life::Wounded)
-			feed("%s is back on their feet.", who.c_str());
+			feed_tr_s("st_coop_feed_peer_up", "%s is back on their feet.", who.c_str());
 		else if (from == Life::Respawning || from == Life::Dead)
-			feed("%s respawned.", who.c_str());
+			feed_tr_s("st_coop_feed_peer_respawned", "%s respawned.", who.c_str());
 		break;
 	default: break;
 	}
@@ -1912,7 +1974,7 @@ void host_frame(u64 t)
 		g_world_rules = r;
 		host_broadcast_rules();
 		if (mode_changed)
-			feed("Death mode: %s.", mode_name(r.mode));
+			feed_tr_s("st_coop_feed_death_mode", "Death mode: %s.", tr(mode_id(r.mode), mode_name(r.mode)).c_str());
 	}
 
 	// players that left: their characters are parked. Dead or evacuated: the countdown stops and the respawn waits for
@@ -2264,18 +2326,25 @@ void reviver_frame(CActor* a, u64 t)
 	const u16 target = g_me.revive_target;
 	CGameObject* o = object_here(target);
 	const char* cancel = nullptr;
+	const char* cancel_id = "";
 	if (!a || is_down(g_me.life) || !o)
 		cancel = "";
 	else if (life_of(target) != Life::Wounded || seq_by_host_id(join::to_host(target)) != g_me.revive_seq)
 		cancel = "";
 	else if (o->Position().distance_to(a->Position()) > kReviveRange)
+	{
 		cancel = "too far";
+		cancel_id = "st_coop_cancel_too_far";
+	}
 	else if (!action_down(kUSE))
+	{
 		cancel = "released";
+		cancel_id = "st_coop_cancel_released";
+	}
 	if (cancel)
 	{
 		if (*cancel)
-			feed("Revive cancelled (%s).", cancel);
+			feed_tr_s("st_coop_feed_revive_cancel", "Revive cancelled (%s).", tr(cancel_id, cancel).c_str());
 		stop_revive_hold(true);
 		return;
 	}
@@ -2630,24 +2699,26 @@ void build_hud(u64 t)
 	{
 		if (lua_hud)
 			break;
-		line("YOU ARE DOWN", 0xffe03c3c, true);
+		line(tr("st_coop_hud_down", "YOU ARE DOWN").c_str(), 0xffe03c3c, true);
 		const u32 left = g_me.bleed_end > t ? u32((g_me.bleed_end - t + 999) / 1000) : 0;
-		xr_sprintf(buf, "Bleeding out: %u s. A teammate can revive you with a medkit.", left);
+		xr_sprintf(buf, tr_format("st_coop_hud_bleeding", "Bleeding out: %d s. A teammate can revive you with a medkit.", 'd').c_str(),
+		    int(left));
 		line(buf, 0xfff0f0f0, false);
 		if (g_me.giveup_start)
 		{
-			xr_sprintf(buf, "Giving up... %u%%", u32(_min<u64>(100, (t - g_me.giveup_start) * 100 / kGiveUpHoldMs)));
+			xr_sprintf(buf, "%s %u%%", tr("st_coop_revive_giving_up", "Giving up...").c_str(),
+			    u32(_min<u64>(100, (t - g_me.giveup_start) * 100 / kGiveUpHoldMs)));
 			line(buf, 0xffffa040, false);
 		}
 		else
-			line("Hold USE to give up.", 0xffa0a0a0, false);
+			line(tr("st_coop_revive_give_up", "Hold USE to give up.").c_str(), 0xffa0a0a0, false);
 		break;
 	}
 	case Life::Dead:
 		if (!g_me.evac_end)
 		{
-			line("YOU DIED", 0xffe03c3c, true);
-			line("Waiting for the host...", 0xfff0f0f0, false);
+			line(tr("st_coop_hud_dead", "YOU DIED").c_str(), 0xffe03c3c, true);
+			line(tr("st_coop_hud_wait_host", "Waiting for the host...").c_str(), 0xfff0f0f0, false);
 			break;
 		}
 		{
@@ -2660,13 +2731,13 @@ void build_hud(u64 t)
 				xr_sprintf(buf, tr_format("st_coop_evac_watch", "Watching: %s", 's').c_str(),
 				    nick_of(join::to_host(g_me.spectate)).c_str());
 				line(buf, 0xfff0f0f0, false);
-				line("Fire: next player   Aim: previous player", 0xffa0a0a0, false);
+				line(tr("st_coop_hud_spectate_keys", "Fire: next player   Aim: previous player").c_str(), 0xffa0a0a0, false);
 			}
 			else
 				line(tr("st_coop_evac_no_watch", "Nobody here to watch.").c_str(), 0xffa0a0a0, false);
 		}
 		break;
-	case Life::Respawning: line("Respawning...", 0xfff0f0f0, true); break;
+	case Life::Respawning: line(tr("st_coop_hud_respawning", "Respawning...").c_str(), 0xfff0f0f0, true); break;
 	case Life::Spectating: // out of a hardcore run: watch the others, or start a new character (F3 Task 10)
 	{
 		line(tr("st_coop_hardcore_out", "Your character is gone.").c_str(), 0xffe03c3c, true);
@@ -2675,16 +2746,17 @@ void build_hud(u64 t)
 			xr_sprintf(buf, tr_format("st_coop_evac_watch", "Watching: %s", 's').c_str(),
 			    nick_of(join::to_host(g_me.spectate)).c_str());
 			line(buf, 0xfff0f0f0, false);
-			line("Fire: next player   Aim: previous player", 0xffa0a0a0, false);
+			line(tr("st_coop_hud_spectate_keys", "Fire: next player   Aim: previous player").c_str(), 0xffa0a0a0, false);
 		}
 		else
 			line(tr("st_coop_evac_no_allies", "Nobody is left alive. The world is not rolled back.").c_str(),
 			    0xffa0a0a0, false);
 		if (g_me.newchar_asked)
-			line("Starting a new character...", 0xffffa040, false);
+			line(tr("st_coop_hud_newchar_starting", "Starting a new character...").c_str(), 0xffffa040, false);
 		else if (g_me.newchar_start)
 		{
-			xr_sprintf(buf, "New character... %u%%", u32(_min<u64>(100, (t - g_me.newchar_start) * 100 / kNewCharHoldMs)));
+			xr_sprintf(buf, "%s %u%%", tr("st_coop_hud_newchar", "New character...").c_str(),
+			    u32(_min<u64>(100, (t - g_me.newchar_start) * 100 / kNewCharHoldMs)));
 			line(buf, 0xffffa040, false);
 		}
 		else
@@ -3301,7 +3373,7 @@ bool on_use_person(CInventoryOwner* person)
 	PIItem medkit = find_revive_item(a);
 	if (!medkit)
 	{
-		feed("You need a medkit to revive %s.", who.c_str());
+		feed_tr_s("st_coop_feed_need_medkit", "You need a medkit to revive %s.", who.c_str());
 		return true;
 	}
 	g_me.revive_target = o->ID();

@@ -35,9 +35,26 @@ void CLevel::cl_Process_Spawn(NET_Packet& P)
 		F_entity_Destroy(E);
 		return;
 	}
-	// Anomaly Coop (RL-UGYE-3WGE): on a co-op client no game object for an entity that is gone or whose id another one has now
-	if (!coop::events::client_spawn_allowed(E))
+	// Anomaly Coop (RL-UGYE-3WGE): on a co-op client no game object for an entity that is gone or whose id another one has now.
+	// TZ P104 (Dev 64 crash): nor while a game object still holds its id (GE_DESTROY came in this frame, the destroy queue has
+	// not run) or its holder's object is on its way out: the stock net_Spawn below would refuse it after half-making the
+	// object and run its whole net_Destroy chain. The whole M_SPAWN goes back into the event queue and is decided again at a
+	// next frame, by the stock pipeline from the start (xrCoop/coop_spawn_wait_rules.h).
+	switch (coop::events::client_spawn_gate(E))
 	{
+	case coop::events::SpawnGate::Make:
+		break;
+	case coop::events::SpawnGate::Wait:
+		{
+#ifdef SPAWN_ANTIFREEZE
+			xrSRWLockGuard g(prefetch_lock);
+#endif
+			game_events->insert(P); // the packet is whole (reading moved only r_pos); this frame's events were taken already
+		}
+		F_entity_Destroy(E);
+		return;
+	case coop::events::SpawnGate::Refuse:
+	default:
 		F_entity_Destroy(E);
 		return;
 	}

@@ -4,6 +4,10 @@
 
 typedef void crashhandler(void);
 typedef void on_dialog(bool before);
+// RayLink (crash triage, 2026-11-25): the renderer's note on why its D3D device was lost (gpu_device_lost.h). It writes a
+// terminated note into out and answers true, or answers false. The crash path calls it: no exceptions, no heavy work, no
+// call into Debug. code is the HRESULT the failed call returned.
+typedef bool device_lost_note(long code, char* out, unsigned int out_size);
 
 class XRCORE_API xrDebug
 {
@@ -43,6 +47,13 @@ public:
 	}
 
 	LPCSTR error2string(long code);
+
+	// RayLink (crash triage, 2026-11-25): xrCore knows no D3D. The renderer sets its note after it creates its device and
+	// clears it (nullptr) before it releases it; a process without a hardware device never sets one. error2string appends the
+	// note to the system's text of DXGI_ERROR_DEVICE_REMOVED / _RESET / _HUNG; every other code keeps its text as it was.
+	void set_device_lost_note(device_lost_note* note);
+	// The note for code into out: true when one was written; false (out empty) for any other code or without a note.
+	bool device_lost_note_of(long code, char* out, unsigned int out_size);
 
 	void gather_info(const char* expression, const char* description, const char* argument0, const char* argument1,
 	                 const char* file, int line, const char* function, LPSTR assertion_info,

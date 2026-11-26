@@ -172,7 +172,8 @@ void CUIGameSP::StartTrade(CInventoryOwner* pActorInv, CInventoryOwner* pOtherOw
 
 	//---- before trade mode ---------------------------
 	::luabind::functor<bool> funct1;
-	// Anomaly Coop: on a client the engine trade window is used: Anomaly's Lua window moves money locally
+	// Anomaly Coop (TZ R90): Anomaly's Lua window wherever its trades reach the decider (a copy: scripts\coop_trade_window.script),
+	// else the engine window below; coop::trade::lua_trade_window_allowed logs which one and why
 	if (coop::trade::lua_trade_window_allowed() && ai().script_engine().functor("actor_menu_inventory.CUIActorMenu_OnMode_Trade", funct1))
 	{
 		CGameObject* GO = smart_cast<CGameObject*>(pOtherOwner);

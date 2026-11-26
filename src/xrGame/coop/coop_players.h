@@ -95,6 +95,8 @@ bool drive_avatar(class CAI_Stalker* avatar);
 void on_avatar_visual_changed(u16 avatar_id);
 // TZ P50 (review 2026-11-23), coop_remote.cpp on_net_spawn: an object with this id spawned here. If it is an avatar, its
 // object stands where this world spawned it, not yet where its player is (placed() is false until drive_avatar places it).
+// TZ P75: the snapshots of a stream that ended before this object appeared are dropped (player_touch::drop_stale); if none
+// is left, the stream ends (not driven, motions replayed).
 void on_object_spawn(u16 id);
 // TZ P50: drive_avatar has put avatar `avatar_id` where its player stands (from his snapshots) since its object spawned here.
 bool placed(u16 avatar_id);

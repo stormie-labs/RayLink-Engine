@@ -16,6 +16,7 @@
 #include "../../xrEngine/renderdoc_integration.h"
 #include "../../Include/xrAPI/xrAPI.h"
 #include "../xrRender/xrRender_console.h"
+#include "../../xrCore/gpu_device_lost.h" // RayLink: the note on a lost device (install_device_lost_note)
 
 #include "StateManager\dx10SamplerStateCache.h"
 #include "StateManager\dx10StateCache.h"
@@ -34,6 +35,62 @@ void	free_render_mode_list		()			{}
 #endif
 
 CHW HW;
+
+#if defined(USE_DX11)
+// xr_gpu (xrCore, no Windows headers) spells the codes out; here the SDK's own values check them.
+static_assert(xr_gpu::code_ok == S_OK, "xr_gpu::code_ok");
+static_assert(xr_gpu::code_invalid_call == DXGI_ERROR_INVALID_CALL, "xr_gpu::code_invalid_call");
+static_assert(xr_gpu::code_device_removed == DXGI_ERROR_DEVICE_REMOVED, "xr_gpu::code_device_removed");
+static_assert(xr_gpu::code_device_hung == DXGI_ERROR_DEVICE_HUNG, "xr_gpu::code_device_hung");
+static_assert(xr_gpu::code_device_reset == DXGI_ERROR_DEVICE_RESET, "xr_gpu::code_device_reset");
+static_assert(xr_gpu::code_driver_internal_error == DXGI_ERROR_DRIVER_INTERNAL_ERROR, "xr_gpu::code_driver_internal_error");
+static_assert(xr_gpu::code_out_of_memory == E_OUTOFMEMORY, "xr_gpu::code_out_of_memory");
+
+// RayLink (crash triage, 2026-11-25, report RL-5TE8-EFGE): why the device was lost, for the log and the FATAL
+// (xrDebug::set_device_lost_note). Set only for the hardware device of CreateDevice, cleared in DestroyDevice before the
+// device goes. The adapter is the device's own (D3D11CreateDevice takes the default adapter, not m_pAdapter), asked once at
+// creation: the crash path only reads it. IDXGIAdapter3 needs Windows 10; without it the note has no memory part.
+static IDXGIAdapter3* s_device_lost_adapter = nullptr;
+
+static bool renderer_device_lost_note(long /*code*/, char* out, unsigned int out_size)
+{
+    ID3D11Device1* const device = HW.pDevice;
+    if (!device)
+        return false;
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+    IDXGIAdapter3* const adapter = s_device_lost_adapter;
+    const bool have_memory =
+        adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory));
+    xr_gpu::format_note(out, out_size, reason, have_memory, memory.CurrentUsage, memory.Budget);
+    return true;
+}
+
+static void install_device_lost_note(ID3D11Device* device)
+{
+    _RELEASE(s_device_lost_adapter);
+    IDXGIDevice* dxgi_device = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_device)))
+    {
+        IDXGIAdapter* adapter = nullptr;
+        if (SUCCEEDED(dxgi_device->GetAdapter(&adapter)))
+        {
+            if (FAILED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&s_device_lost_adapter)))
+                s_device_lost_adapter = nullptr;
+            adapter->Release();
+        }
+        dxgi_device->Release();
+    }
+    Debug.set_device_lost_note(renderer_device_lost_note);
+}
+
+// Only the hook goes: the adapter stays until the next install (or the process end), so a crash on another thread while
+// the device goes cannot reach a released adapter (review of 2026-11-25).
+static void remove_device_lost_note()
+{
+    Debug.set_device_lost_note(nullptr);
+}
+#endif // USE_DX11
 
 //	DX10: Don't neeed this?
 /*
@@ -589,6 +646,8 @@ void CHW::CreateDevice(HWND hwnd, bool move_window)
     _RELEASE(device);
     _RELEASE(context);
 
+    install_device_lost_note(pDevice); // RayLink: a lost device says why (above)
+
     // create swapchain
     R_CHK(m_pFactory->CreateSwapChainForHwnd(pDevice, m_hWnd, &sd, &sd_fullscreen, NULL, &m_pSwapChain));
 
@@ -836,6 +895,9 @@ void CHW::DestroyDevice()
 
 #ifndef USE_DX11
     _RELEASE(HW.pDevice1);
+#endif
+#if defined(USE_DX11)
+    remove_device_lost_note(); // RayLink: before the device goes (a no-op for a device that never set it)
 #endif
     _SHOW_REF("DeviceREF:", HW.pDevice);
     _RELEASE(HW.pDevice);

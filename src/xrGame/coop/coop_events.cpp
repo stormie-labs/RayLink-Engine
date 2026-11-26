@@ -22,6 +22,7 @@
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_reconcile.h"
 #include "xrCoop/coop_object_identity.h" // live RL-UGYE-3WGE: one id, one object on a mirror
+#include "xrCoop/coop_spawn_wait_rules.h" // TZ P104: a spawn waits while an object on its way out holds its id
 
 #include "Level.h"
 #include "Car.h"
@@ -132,7 +133,11 @@ struct IdentityCounters
 {
 	u64 spawns_stale = 0, spawns_other_kind = 0, spawns_duplicate = 0, exports_unregistered = 0, exports_other_kind = 0,
 	    updates_skipped = 0;
+	u64 spawns_waited = 0, spawns_made_after_wait = 0, spawns_gave_up = 0; // TZ P104 (xrCoop/coop_spawn_wait_rules.h)
 } g_ic;
+spawn_wait::WaitBook g_spawn_wait; // TZ P104: frames each id waited for the object that holds it (game thread)
+u32 g_spawn_wait_log = 0;
+bool spawn_wait_log_allowed() { return ++g_spawn_wait_log <= kLogBurst || (g_spawn_wait_log % 100) == 0; }
 
 u32 g_log_count = 0;
 bool log_allowed() { return ++g_log_count <= kLogBurst || (g_log_count % 100) == 0; }
@@ -1205,6 +1210,8 @@ void reset()
 	g_spawn_once.reset();
 	g_export_once.reset();
 	g_update_once.reset();
+	g_spawn_wait.reset();
+	g_spawn_wait_log = 0;
 }
 
 void frame()
@@ -1260,6 +1267,10 @@ void print_status()
 	      "back %llu unregistered / %llu of another kind, update reads skipped %llu",
 	    g_ic.spawns_stale, g_ic.spawns_other_kind, g_ic.spawns_duplicate, g_ic.exports_unregistered,
 	    g_ic.exports_other_kind, g_ic.updates_skipped);
+	::Msg("[coop]   spawns that waited for the object holding their id: %llu waits, %llu made after waiting, %llu not "
+	      "made after %u frames, %u id(s) with a wait on record (TZ P104)",
+	    g_ic.spawns_waited, g_ic.spawns_made_after_wait, g_ic.spawns_gave_up, spawn_wait::kMaxWaitFrames,
+	    (u32)g_spawn_wait.size());
 }
 
 bool client_filter(NET_Packet& P)
@@ -1469,17 +1480,59 @@ u16 host_last_holder(u16 item)
 
 // ---------------------------------------------------------------- one id, one object on a mirror (RL-UGYE-3WGE)
 
-bool client_spawn_allowed(const CSE_Abstract* spawn)
+SpawnGate client_spawn_gate(const CSE_Abstract* spawn)
 {
 	if (!spawn || spawn->ID == kNoId || !g_pGameLevel || !Level().Server || !join::world_is_mirror())
-		return true;
+		return SpawnGate::Make;
 	const u16 id = spawn->ID;
 	CSE_Abstract* e = Level().Server->ID_to_entity(id);
 	const CObject* live = Level().Objects.net_Find(id);
 	const bool live_same_kind = live && !live->getDestroy() && live->cNameSect() == spawn->s_name;
 	const identity::Spawn v = identity::spawn_verdict(true, e != nullptr, e && e->s_name == spawn->s_name, live_same_kind);
-	if (v == identity::Spawn::Make)
-		return true;
+	// TZ P104 (Dev 64 crash, xrCoop/coop_spawn_wait_rules.h): the stock net_Spawn refuses a spawn while ANY object holds the
+	// id, and its soft fail runs the net_Destroy chain of a half-made object. An object marked by GE_DESTROY stays under its
+	// id until the destroy queue: the spawn waits for it, and a held item for its holder's dying object.
+	const spawn_wait::Holder self =
+	    spawn_wait::holder_of(live != nullptr, live && live->getDestroy(), live && live->cNameSect() == spawn->s_name);
+	const CObject* holder = spawn->ID_Parent == kNoId ? nullptr : Level().Objects.net_Find(spawn->ID_Parent);
+	const bool holder_leaving = holder && holder->getDestroy();
+	const u32 waited = g_spawn_wait.waited(id, Device.dwFrame);
+	// for the log lines: the object in the way (the one under its own id, else its holder's dying one)
+	const bool own_id_held = self != spawn_wait::Holder::None;
+	const CObject* in_way = own_id_held ? live : holder;
+	const char* in_way_sect = in_way ? in_way->cNameSect().c_str() : "none";
+	const char* in_way_state = in_way && in_way->getDestroy() ? "on its way out" : "staying, a stale copy";
+	switch (spawn_wait::decide(true, v, self, holder_leaving, waited))
+	{
+	case spawn_wait::Verdict::Make:
+		g_spawn_wait.done(id);
+		if (waited)
+		{
+			++g_ic.spawns_made_after_wait;
+			if (spawn_wait_log_allowed())
+				::Msg("[coop] game object %u [%s] made after waiting %u frame(s) for the object that held its id",
+				    join::to_host(id), spawn->s_name.c_str(), waited);
+		}
+		return SpawnGate::Make;
+	case spawn_wait::Verdict::Wait:
+		g_spawn_wait.wait(id, Device.dwFrame);
+		++g_ic.spawns_waited;
+		if (!waited && spawn_wait_log_allowed())
+			::Msg("[coop] game object %u [%s] waits for a next frame: %s is still held by [%s], %s (frame %u)",
+			    join::to_host(id), spawn->s_name.c_str(), own_id_held ? "its id" : "its holder's id", in_way_sect,
+			    in_way_state, Device.dwFrame);
+		return SpawnGate::Wait;
+	case spawn_wait::Verdict::GiveUp:
+		g_spawn_wait.done(id);
+		++g_ic.spawns_gave_up;
+		if (spawn_wait_log_allowed())
+			::Msg("! [coop] game object %u [%s] not made: %s was still held by [%s], %s, after %u frames", join::to_host(id),
+			    spawn->s_name.c_str(), own_id_held ? "its id" : "its holder's id", in_way_sect, in_way_state, waited);
+		return SpawnGate::Refuse;
+	case spawn_wait::Verdict::Refuse:
+		g_spawn_wait.done(id);
+		break;
+	}
 	const char* why = "?";
 	switch (v)
 	{
@@ -1502,7 +1555,7 @@ bool client_spawn_allowed(const CSE_Abstract* spawn)
 	if (g_spawn_once.first(id))
 		::Msg("%s[coop] game object %u [%s] not made: %s (entity here: [%s])", v == identity::Spawn::OtherKind ? "! " : "",
 		    join::to_host(id), spawn->s_name.c_str(), why, e ? e->s_name.c_str() : "none");
-	return false;
+	return SpawnGate::Refuse;
 }
 
 bool client_export_allowed(CObject* obj)

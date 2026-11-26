@@ -4108,6 +4108,51 @@ bool stage_clone_initial(CSE_Abstract* entity, const std::vector<u8>& initial, b
 	return true;
 }
 
+SpawnStamp adopt_spawn_stamp(const u8* message, size_t size, u16& id_host)
+{
+	id_host = kNoId;
+	Reader r(message, size);
+	if (r.u16() != u16(Msg::EntitySpawn))
+		return SpawnStamp::NoWeapon;
+	// the layout of write_spawn (coop_entities.cpp), read as client_on_spawn reads it: u16 id, u16 parent, u8 online; the placement
+	// (write_placement: two vec3, u32 node, u16 graph vertex); the spawn and the update packet (write_packet: u16 length, the bytes);
+	// then the clone initial (write_clone_initial)
+	id_host = r.u16();
+	r.u16();
+	r.u8();
+	float skipped[3];
+	r.vec3(skipped);
+	r.vec3(skipped);
+	r.u32();
+	r.u16();
+	for (int packet = 0; packet < 2; ++packet)
+		r.skip(r.u16());
+	const u16 id = join::to_local(id_host);
+	std::vector<u8> initial;
+	if (!r.ok() || !read_clone_initial(r, id, initial))
+		return SpawnStamp::Malformed;
+	if (initial.empty())
+		return SpawnStamp::NoWeapon;
+	xrCriticalSectionGuard guard(g_out_lock);
+	CSE_Abstract* entity = events::find_entity(id);
+	// a clone transaction of this process's own under the id stages its own metadata (g_clone_prepared): never another's stamp
+	if (!entity || g_clone_prepared.count(id))
+		return SpawnStamp::NoEntity;
+	// review R1: the stamp alone (coop_economy_mdata.script clone_take_stamp), not the whole adoption stage_clone_initial(existing)
+	// does through clone_adopt (its SE_HOST_ONLY keys, parts seed, purge of the item's held and pending changes, resend to everyone)
+	replacement::Snapshot snapshot;
+	if (!replacement::decode(initial.data(), initial.size(), snapshot) ||
+	    snapshot.source_name != (entity->name_replace() ? entity->name_replace() : ""))
+		return SpawnStamp::Refused;
+	int top = 0;
+	lua_State* L = clone_function("clone_take_stamp", top);
+	if (!L)
+		return SpawnStamp::Refused;
+	lua_pushnumber(L, entity->ID);
+	lua_pushlstring(L, snapshot.metadata.data(), snapshot.metadata.size());
+	return clone_return(L, top, 2) ? SpawnStamp::Taken : SpawnStamp::Refused;
+}
+
 void client_keeps_world(u32 epoch)
 {
 	g_lease_epoch_was = mgr().session().world_epoch();

@@ -14,6 +14,8 @@
 //   an ask (release, info of an object the sender does not write) is taken when the world writes the object and its root stands
 //     on the sender's map;
 //   the journal's own ops (Money, Carry, Done, Flushed, IdAsk) are no object's: each has its own rule where it is applied.
+// The departure flood (2026-11-26): a Parent to the holder the object has here already changes nothing; it is taken as a repeat
+// whoever sent it (unchanged_parent), after the checks of the fence, the object and its identity, before the writer's.
 // A refusal names its reason (journal::Why): the journal's Ack carries it back and the sender repairs towards the world (W2b).
 // R32 fix package A: a Spawn with no holder is the sender's only while it leads its map or stops (rootless_spawn_writer, A2); the
 // world's release of what a map server released follows release_plan (A5); a Left it accepted follows leave_plan (§8a A17, fix round
@@ -63,10 +65,11 @@ inline Kind kind_of(uint8_t op)
 	return Kind::Own;
 }
 
-// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of the unit at
-// its root (A6; 0 for a root that is no unit the sender holds) match (writer::same_object). One allowance: a unit the sender made
-// (its SpawnPrepare is registered here under `spawn_gen`, and the unit has not moved since: gen_here == spawn_gen) is named with
-// gen 0 by a sender that has not heard the world's Ack yet: it is the same unit. A unit granted again since is another.
+// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of its root (A6;
+// the sender's hold of that root whatever it is now, 0 when the sender does not hold it: levels::root_gen, Р68-3) match
+// (writer::same_object). One allowance: a unit the sender made (its SpawnPrepare is registered here under `spawn_gen`, and the unit
+// has not moved since: gen_here == spawn_gen) is named with gen 0 by a sender that has not heard the world's Ack yet: it is the same
+// unit. A unit granted again since is another.
 inline bool identity(uint16_t crc_here, uint16_t crc_report, uint32_t gen_here, uint32_t gen_report, uint32_t spawn_gen)
 {
 	if (writer::same_object(crc_here, crc_report, gen_here, gen_report))
@@ -106,7 +109,27 @@ struct Facts
 	bool rootless = false;
 	uint16_t spawn_level = writer::kNoLevel;
 	bool sender_leads = false;
+	// A Parent: the object is in that holder here already (unchanged_parent).
+	bool unchanged = false;
 };
+
+// The departure flood (Server, 2026-11-26). A map server switches a leaving player's character offline: the stock switch rejects every
+// item with a hook and takes each back without one, and a map server whose snapshot did not list his character sent a Parent of each
+// to the same character. The world writes the parked character by then, so it refused each as not the writer, and each refusal's
+// repair (Fetch: StateDumpRequest Replace) destroyed and made the item again on that map server: 100-300 items per departure. A
+// Parent into the holder the object has here already changes nothing whoever sends it: a repeat, never a refusal. A Parent to the
+// ground is never one: it carries the place the object was put down at.
+inline bool unchanged_parent(uint16_t parent_here, uint16_t to)
+{
+	return to != wire::kNoObject && parent_here == to;
+}
+
+// The sender writes the object's root, and for a Parent or a Joined the new root as well.
+inline bool sender_writes(const Facts& f)
+{
+	const writer::Writer sender = writer::other(f.sender);
+	return f.writer == sender && (!f.two_roots || f.writer_new == sender);
+}
 
 // R32 fix A2 (W1.2c, §8a A4): only a map server that leads its map, or stops, writes the map's residents; one that is still
 // Starting (in session, loading its world before it says Ready) does not, and neither does one that leads another map. The writer
@@ -268,7 +291,9 @@ inline Verdict accepts(const Facts& f)
 		return refused(journal::Ghost);
 	if (!f.same)
 		return refused(journal::Identity);
-	if (f.writer != sender || (f.two_roots && f.writer_new != sender))
+	if (f.op == wire::LevelEntityHead::Parent && f.unchanged)
+		return taken(true); // the departure flood: it changes nothing, so there is nothing to refuse and nothing to repair
+	if (!sender_writes(f))
 		return refused(journal::NotWriter);
 	return taken();
 }

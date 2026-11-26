@@ -1179,7 +1179,9 @@ void equip_reset()
 	g_gear_table.clear();
 	g_gear_table_built = false;
 	g_gear_logged = true;
-	// g_host_arrivals stays: players::reset runs on a client going live too, and on the host's own world change
+	// g_host_arrivals stays: it is the host's book of arrivals that span a level change. players::reset (and this) runs at a
+	// session's start and end, on a client at its group load or rejoin (sync::reset) and when it goes live; NOT at the host's
+	// own world change (review 2026-11-24: the other players' snapshots outlive it, coop_players.cpp on_object_spawn culls them)
 }
 
 // Build 56 (live 2026-11-18), a client that is still loading the world (players::frame, before its live gate): a player

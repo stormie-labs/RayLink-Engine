@@ -348,12 +348,47 @@ inline bool loopback_address(const std::string& ip_port) { return ip_port.compar
 //   a world message       here; the ones that touch his body go to the authority of his level too;
 //   a map message         there, and here only what the world keeps of him for the save and the HUD. While his map server is not
 //                         connected there is nobody to act on it: it is dropped, as a stream is;
+//   his repair            (StateDumpRequest, answered_by_his_map_server) there alone while his map server is connected, here
+//                         alone before its bridge connects and after it drops: one answer. While his map server loads he is
+//                         held on the loading screen and asks nothing, so the world's answer is not expected for him in play;
+//                         the stamp of a weapon in his map server's answer reaches the world on its way up (review D1);
 //   with split off, or on the host's level, everything as always.
 struct Incoming
 {
 	bool here = true;
 	bool tunnel = false;
 };
+
+// TZ 6.28 (P99, 2026-11-26): ONE process answers a player's repair. A StateDumpRequest of a player on a map server's level was kept
+// and answered by the world server (kept_from_every_level) and tunnelled to and answered by that map server (install_server,
+// coop_entities.cpp: decides_world() || leads_level()). Each answer is an EntitySpawn of its own process (send_subtree ->
+// write_spawn), and write_clone_initial stamps a magazined weapon there with that process's instance (clone_export keeps the first
+// stamp it gave): the player got two spawns with two stamps. The one that matched his copy took him off the retry list
+// (reconcile::Retry::done), the other failed its stage and put him back on it (Retry::add, a new 20 s), so the weapon was asked
+// for again every 2 s with two answers each time; the item riders (jam, camo) keep a strict instance and were refused under the
+// other stamp. While the bridge of his map server is up, that map server alone answers, because the facts he asks about are its:
+//   - he compares his registry with ITS digest and roster (EntityHash reaches him from it only, level_passes; his EntityResync is
+//     tunnelled only): only its copy closes the difference he asked about. Online on a map and the uses of what is online there
+//     are no facts of the world (coop_entities.cpp mapless_row): the world's EntitySwitch and EntitySpawn of an object online at a
+//     map server say "offline" (online_here: Mode::online_elsewhere), the map server's spawn is marked online at his level on its
+//     way up (mark_spawn_of_your_level). Build 57 S3 made the same choice for spawns: the world sends that level's players no copy
+//     of a map server's spawn (host_spawn_from_leader);
+//   - an object of another map and the world's own: the map server is a client of the world for them and repairs its copy against
+//     it (R32 W5), so its answer carries the world's word one hop later, as the roster he compares with does.
+// Without that bridge nobody else would answer, and the world's copy does, as before: only before the bridge connects and after it
+// drops. While the map server loads, its players are held on the loading screen (the LoadWait barrier, docs/SPLIT_LEVELS.md, the
+// life of a map server) and ask nothing; when it drops they load anew (host_rejoin_level). The world's answer is therefore not
+// expected for a player in play (at most a repair asked in the moment between the drop and his new load). Only this request: his
+// data the world keeps (vitals, equipment, items) still goes both ways, and what a map server asks its world
+// (map_server_asks_the_world) never comes through here (coop_trunk.cpp host_incoming takes a bridge's messages first).
+// The stamp (review D1): the world's Lua keeps the item data (coop_economy_core.script owns_world), and a weapon nobody had stamped
+// before gets its stamp from the map server's answer. The world's copy takes it from that spawn on its way up (coop_trunk.cpp
+// trunk_host_on_tunnel -> requests::adopt_spawn_stamp -> clone_take_stamp, the stamp alone), so a strict rider under it (jam, camo)
+// is taken there too; a weapon the world had stamped otherwise keeps the world's stamp (the parts still pass by the P99 alias,
+// parts_alias). Not solved: a copy the map server's spawn never reached still holds the save's weapon (no stamp, its instance the
+// name), and its strict riders and SE vars of that weapon are refused wherever the stamp is held, the world's copy now included, and
+// it refuses theirs (tests/lua/test_srv_rider_stamp.lua, known limit).
+inline bool answered_by_his_map_server(Msg type) { return type == Msg::StateDumpRequest; }
 
 inline Incoming route_incoming(Msg type, bool split, bool on_host_level, bool has_bridge)
 {
@@ -363,8 +398,8 @@ inline Incoming route_incoming(Msg type, bool split, bool on_host_level, bool ha
 	const Scope scope = scope_of(type);
 	if (route(scope, false) == Route::TunnelToServer)
 	{
-		out.here = kept_from_every_level(type);
 		out.tunnel = has_bridge;
+		out.here = kept_from_every_level(type) && !(out.tunnel && answered_by_his_map_server(type));
 	}
 	else if (scope == Scope::World)
 		out.tunnel = has_bridge && also_to_level_authority(type);

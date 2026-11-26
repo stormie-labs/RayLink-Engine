@@ -16,7 +16,9 @@
 #include "xrCoop/coop_mirror.h" // B2
 #include "xrCoop/coop_attachments.h"
 #include "xrCoop/coop_enemy_rules.h"
+#include "xrCoop/coop_hands_rules.h" // TZ R71
 #include "xrCoop/coop_limits.h"
+#include "xrCoop/coop_mirror_pose_rules.h" // P101: a copy's partition no host motion reaches, and the T-pose lines
 #include "xrCoop/coop_reconcile.h"
 #include "coop_events.h"
 #include "coop_items.h"
@@ -34,6 +36,7 @@
 #include "Inventory.h"
 #include "Torch.h"
 #include "Weapon.h"
+#include "HudItem.h"
 #include "sight_manager.h"
 #include "object_handler_planner.h"
 #include "object_handler_space.h"
@@ -90,6 +93,8 @@ xr_vector<HostEvent> g_host_events;
 u64 g_last_snapshot = 0;
 u64 g_host_spawns = 0, g_host_releases = 0, g_host_switches = 0, g_host_events_sent = 0, g_snapshots_sent = 0;
 u64 g_attachment_incomplete = 0, g_attachment_applies = 0, g_attachment_retries = 0;
+u64 g_hands_waits = 0, g_hands_put_away = 0; // TZ R71: applies that waited for a puppet's swap or hide; items put away
+u32 g_hands_log = 0; // "[coop-hands]" lines of this session (log_allowed)
 
 // F3a multilevel: online here, or "online at a client" (coop_levels_alife.cpp): a player of the host's level hears the first only.
 bool online_here(const CSE_ALifeDynamicObject* e) { return e->m_bOnline && !mode().online_elsewhere(e->ID); }
@@ -277,6 +282,195 @@ bool is_creature(CGameObject* obj)
 	return remote::is_puppet_type(obj); // stalkers, monsters, traders (WP1)
 }
 
+// ---------------------------------------------------------------- poses in the log (P101, P103; xrCoop/coop_mirror_pose_rules.h)
+
+// The partitions of a skeleton (bits); none for a model without motions (its partition table is not set then).
+u8 parts_of(IKinematicsAnimated* ka)
+{
+	if (!ka || !ka->LL_MotionsSlotCount())
+		return 0;
+	u8 parts = 0;
+	for (u16 p = 0; p < kMaxPartitions; ++p)
+		if (ka->partitions().part(p))
+			parts |= mirror_pose::bit(p);
+	return parts;
+}
+
+// The name of a MotionID value in this model, or "-" (a walk over the slot's name table: for the log lines only).
+const char* motion_name(IKinematicsAnimated* ka, u32 value)
+{
+	if (!motion_valid(ka, value))
+		return "-";
+	MotionID m;
+	m.val = value;
+	const accel_map* names = const_cast<shared_motions&>(ka->LL_MotionsSlot(m.slot)).motion_map();
+	if (names)
+		for (const auto& it : *names)
+			if (it.second == m.idx)
+				return it.first.c_str();
+	return "?";
+}
+
+// "N slot(s): omf:motions ..." of this model, for the lines (P101: an id names another motion when the tables differ).
+void describe_slots(IKinematicsAnimated* ka, string512& out)
+{
+	out[0] = 0;
+	if (!ka)
+	{
+		xr_strcpy(out, "no animated model");
+		return;
+	}
+	const u16 n = ka->LL_MotionsSlotCount();
+	xr_sprintf(out, "%u slot(s):", u32(n));
+	for (u16 i = 0; i < n && i < 6; ++i)
+	{
+		shared_motions& slot = const_cast<shared_motions&>(ka->LL_MotionsSlot(i));
+		const MotionDefVec* defs = slot.motion_defs();
+		string128 one;
+		xr_sprintf(one, " %s:%u", slot.id().c_str() ? slot.id().c_str() : "?", defs ? u32(defs->size()) : 0u);
+		xr_strcat(out, one);
+	}
+}
+
+// The decider (the Coop host, the map server of a level): what it streams itself, once a round (mirror_pose::kRoundMs).
+// Bounded lines; nothing here changes play. A round, not every snapshot: the name lookups stay off the 66 ms path, and what
+// the lines look for lasts (a creature stuck in its placeholder, a seat taken for minutes, an object that never came).
+struct RoundSeen
+{
+	const void* what = nullptr; // the object (or server entity) the streak is about: an id goes to another one later
+	u8 streak = 0; // rounds in a row
+};
+u64 g_decider_round_at = 0;
+xr_map<u16, RoundSeen> g_decider_unposed; // live creatures with a partition in the spawn placeholder or with no motion
+xr_set<u16> g_decider_rootctl; // creatures the animation movement controller moved at the last round (P103)
+xr_map<u16, RoundSeen> g_bodiless; // creature entities online here without a game object
+u32 g_decider_lines = 0; // "[coop-anim] decider ... spawn placeholder" lines of this session (mirror_pose::line_allowed)
+u32 g_rootctl_lines = 0; // "[coop-anim] decider ... movement controller" lines (P103)
+u32 g_bodiless_lines = 0; // "[coop-anim] decider ... no game object" lines
+
+// The streak of `id` this round: one more when the same thing was met at the last round, else a new one.
+bool next_round(const xr_map<u16, RoundSeen>& last, xr_map<u16, RoundSeen>& this_round, u16 id, const void* what)
+{
+	const auto old = last.find(id);
+	RoundSeen seen;
+	seen.what = what;
+	seen.streak = old != last.end() && old->second.what == what ? old->second.streak : u8(0);
+	const bool say = mirror_pose::second_round(seen.streak);
+	this_round[id] = seen;
+	return say;
+}
+
+// One stalker of the decider in the round.
+void watch_creature(CGameObject* obj, xr_map<u16, RoundSeen>& unposed, xr_set<u16>& rootctl)
+{
+	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
+	if (!ka)
+		return;
+	const u16 id = obj->ID();
+	AnimState a;
+	capture_anims(obj, a); // what the snapshots of this creature name
+	// P103 (Kholod sat sunk into a table on a player's screen; not seen in game): an animation under the movement controller
+	// (an animpoint or a smart cover that gives the motion a place, a root-mover motion) moves the object by the root key and
+	// holds the root bone at identity (animation_movement_controller RootBoneCallback). A copy takes the object's place and
+	// yaw from the snapshot and plays the same motion with no controller (make_remote destroys it), so its root bone plays the
+	// root key on top. This line says whether the NPC that sinks plays such an animation on the decider.
+	if (obj->animation_movement_controlled())
+	{
+		rootctl.insert(id);
+		if (!g_decider_rootctl.count(id) && mirror_pose::line_allowed(g_rootctl_lines))
+		{
+			const u32 shown = a.count > 1 ? a.motion[1] : (a.count ? a.motion[0] : instrument::kNoMotion);
+			::Msg("[coop-anim] decider: %u [%s] plays [%s] (%08x) under the animation movement controller: the root key "
+			      "moves the object, its root bone stays (a copy plays that root key on top of the streamed place, P103) "
+			      "(%u such line(s))",
+			    u32(id), obj->cName().c_str(), motion_name(ka, shown), shown, g_rootctl_lines);
+		}
+	}
+	// P101 (d): a live creature that names its spawn placeholder "death_init", or no motion, on a partition of its model in
+	// two rounds in a row does not run its own animation update; its copies mirror that as a T-pose.
+	CEntityAlive* alive = smart_cast<CEntityAlive*>(obj);
+	if (!alive || !alive->g_Alive())
+		return;
+	const MotionID placeholder = ka->ID_Cycle_Safe("death_init");
+	const u8 parts = parts_of(ka);
+	u8 in_placeholder = 0, none = 0;
+	for (u8 part = 0; part < kMaxPartitions; ++part)
+	{
+		if (!(parts & mirror_pose::bit(part)))
+			continue;
+		const u32 value = part < a.count ? a.motion[part] : instrument::kNoMotion;
+		if (!instrument::motion_present(value))
+			none |= mirror_pose::bit(part);
+		else if (placeholder.valid() && value == placeholder.val)
+			in_placeholder |= mirror_pose::bit(part);
+	}
+	if (!(in_placeholder | none) || !next_round(g_decider_unposed, unposed, id, obj) ||
+	    !mirror_pose::line_allowed(g_decider_lines))
+		return;
+	::Msg("! [coop-anim] decider: %u [%s] visual [%s], alive, plays its spawn placeholder death_init on parts %x and no "
+	      "motion on parts %x in two rounds %u s apart (parts %x; motions %08x %08x %08x %08x): its own animation update does "
+	      "not run, its copies show that as a T-pose (P101) (%u such line(s))",
+	    u32(id), obj->cName().c_str(), obj->cNameVisual().c_str(), u32(in_placeholder), u32(none),
+	    u32(mirror_pose::kRoundMs / 1000), u32(parts), a.count > 0 ? a.motion[0] : instrument::kNoMotion,
+	    a.count > 1 ? a.motion[1] : instrument::kNoMotion, a.count > 2 ? a.motion[2] : instrument::kNoMotion,
+	    a.count > 3 ? a.motion[3] : instrument::kNoMotion, g_decider_lines);
+}
+
+// The round's last part, P101: a creature's server entity online on this decider's level with no game object (a lost or
+// refused net_Spawn): its copies get no snapshot and stand in their spawn pose, a talk with it answers "gone"
+// (coop_dialog.cpp find_owner). Two rounds in a row, so that a spawn under way is not counted.
+void watch_entity(CSE_ALifeDynamicObject* e, xr_map<u16, RoundSeen>& bodiless)
+{
+	if (!e || !e->m_bOnline || e->ID == 0 || bodiless.count(e->ID)) // met this round already: once per round
+		return;
+	CSE_ALifeCreatureAbstract* creature = smart_cast<CSE_ALifeCreatureAbstract*>(e);
+	if (!creature || !online_here(e) || game_object_here(e->ID))
+		return;
+	if (next_round(g_bodiless, bodiless, e->ID, e) && mirror_pose::line_allowed(g_bodiless_lines))
+		::Msg("! [coop-anim] decider: %u [%s] (%s, %s) is online here with no game object in two rounds %u s apart: its "
+		      "copies get no snapshot and stand in their spawn pose, a talk with it answers \"gone\" (P101) (%u such line(s))",
+		    u32(e->ID), e->name_replace(), e->s_name.c_str(), creature->g_Alive() ? "alive" : "dead",
+		    u32(mirror_pose::kRoundMs / 1000), g_bodiless_lines);
+}
+
+// The round.
+void watch_decider(u64 now)
+{
+	if (!mode().leads_level() || now < g_decider_round_at || !ai().get_alife() || !g_pGameLevel)
+		return;
+	g_decider_round_at = now + mirror_pose::kRoundMs;
+	xr_map<u16, RoundSeen> unposed;
+	xr_set<u16> rootctl;
+	for (u32 i = 0, n = Level().Objects.o_count(); i < n; ++i)
+	{
+		CGameObject* obj = smart_cast<CGameObject*>(Level().Objects.o_get_by_iterator(i));
+		// Stalkers (traders and monsters stream too, but their partitions need not all play channel 0, and animpoints and
+		// smart covers are stalkers' only): the NPCs of P101 and P103.
+		if (obj && !obj->getDestroy() && obj->cast_stalker() && !world::is_player_proxy(obj->ID()))
+			watch_creature(obj, unposed, rootctl);
+	}
+	g_decider_unposed.swap(unposed);
+	g_decider_rootctl.swap(rootctl);
+
+	// The server entities of this level only (P101 review: the whole ALife registry, every item of the world, was walked on the
+	// decider's main thread). Only objects of the current level can be online here. A squad's members are not in the level
+	// registry (CSE_ALifeOnlineOfflineGroup::register_member takes them out): they are met through their squad.
+	xr_map<u16, RoundSeen> bodiless;
+	if (ai().alife().graph().level_exists())
+		for (const auto& it : ai().alife().graph().level().objects())
+		{
+			CSE_ALifeDynamicObject* e = it.second;
+			if (CSE_ALifeOnlineOfflineGroup* squad = e ? smart_cast<CSE_ALifeOnlineOfflineGroup*>(e) : nullptr)
+			{
+				for (const auto& member : squad->squad_members())
+					watch_entity(member.second, bodiless);
+			}
+			else
+				watch_entity(e, bodiless);
+		}
+	g_bodiless.swap(bodiless);
+}
+
 // Ambient scripts run only on the host. Replicate their real attachments, not a list of known prop sections.
 attachments::State capture_attachments(CGameObject* obj)
 {
@@ -412,10 +606,29 @@ CTorch* puppet_torch(CGameObject* obj)
 	return nullptr;
 }
 
-// True when the puppet shows what the host reported; false when an item has not arrived yet (EntitySpawn): try again
-// later. The item in hands goes through the puppet's object handler, as an avatar's does (coop_equip apply_equip).
-bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
+bool log_allowed(u32& n);
+
+// TZ R71: a puppet's hands as this machine follows the host's (MirrorTrack::hands, coop_hands_rules.h).
+struct HandsTrack
 {
+	bool wrong = false; // its active item is visible and is not the one the host holds (hands::wrong_item_shown)
+	u64 wrong_since = 0; // since then: the put-away clock (a put-away restarts it)
+	bool waiting = false; // the last apply waited for a swap or a hide
+	u64 waiting_since = 0;
+	bool waiting_said = false; // this wait has had its "[coop-hands]" line
+	u8 lines = 0; // "[coop-hands]" lines of this puppet
+	bool retry_soon = false; // the last apply failed only on the hands (a swap or hide under way): look again shortly
+};
+constexpr u8 kHandsLinesPerPuppet = 3;
+
+u32 ms_since(u64 since, u64 now) { return now > since ? u32(_min(now - since, u64(u32(-1)))) : 0u; }
+
+// True when the puppet shows what the host reported; false when an item has not arrived yet (EntitySpawn): try again
+// later, or while its planner still swaps or hides the item in its hands (TZ R71, `track.retry_soon`: shortly). The item
+// in hands goes through the puppet's object handler, as an avatar's does (coop_equip apply_equip).
+bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held, u64 now, HandsTrack& track)
+{
+	track.retry_soon = false;
 	CAI_Stalker* stalker = obj->cast_stalker();
 	if (!stalker)
 	{
@@ -450,19 +663,107 @@ bool apply_creature_flags(CGameObject* obj, u8 flags, u16 held)
 		if (o && o->H_Parent() == obj)
 			item = smart_cast<CGameObject*>(o);
 		if (!item)
-			return false; // not in its inventory here yet
+		{
+			// not in its inventory here yet: the hands clocks start again with the item (review of R71: a stale clock let
+			// the next episode put an item away at once and inflated the logged wait)
+			track.wrong = false;
+			track.waiting = false;
+			return false;
+		}
 	}
 	ClientApply scope; // local inventory moves of the puppet pass the client router
 	const bool strapped = (flags & CreatureStrapped) != 0;
 	stalker->CObjectHandler::set_goal(strapped ? MonsterSpace::eObjectActionStrapped : MonsterSpace::eObjectActionIdle, item);
+
+	// The puppet's active item here, for the rule (coop_hands_rules.h).
+	PIItem active = stalker->inventory().ActiveItem();
+	CHudItem* active_hud = active ? active->cast_hud_item() : nullptr;
+	CWeapon* active_weapon = active ? smart_cast<CWeapon*>(active) : nullptr;
+	hands::Seen seen;
+	seen.want_holds = (flags & CreatureHolds) != 0;
+	seen.want_strapped = strapped;
+	seen.held_id = item ? item->ID() : hands::kNoId;
+	seen.active_id = active ? active->object().ID() : hands::kNoId;
+	seen.active_hidden = active_hud && active_hud->IsHidden();
+	seen.active_can_strap = active_weapon && active_weapon->can_be_strapped();
+	// The held item: strappable, and one the object planner can put in hands at all (its operators are for weapons and
+	// missiles only, as coop_equip's "planned" for avatars); another never becomes active and must not be waited for.
+	PIItem held_item = item ? item->cast_inventory_item() : nullptr;
+	CWeapon* held_weapon = held_item ? held_item->cast_weapon() : nullptr;
+	seen.held_can_strap = held_weapon && held_weapon->can_be_strapped();
+	seen.held_planned = held_item && (held_item->cast_weapon() || held_item->cast_missile());
+	// The put-away clock runs while an item the host does not hold is visible in the puppet's hands; the right item, or
+	// the item hidden or gone, stops it.
+	const bool wrong = hands::wrong_item_shown(seen);
+	if (wrong && !track.wrong)
+		track.wrong_since = now;
+	track.wrong = wrong;
+	seen.ms_wrong_item_visible = wrong ? ms_since(track.wrong_since, now) : 0u;
+	const hands::Decision rule = hands::decide(seen);
+
 	// Live 2026-10-25 (build 21): "an NPC at a campfire drinks beer with his gun in the same hand". The weapon goes on the
 	// back only when the torso animation of strapping ends (CObjectActionStrapping::on_animation_end sets
 	// eWorldPropertyStrapped, which CObjectHandler::weapon_bones reads); a puppet plays the host's motions, so that end
 	// never comes and the weapon stayed in the right hand. The host's word sets the planner's world state itself.
+	// TZ R71 (live: a guitar player with a pistol in his hand): the property is one for all of the stalker's weapons, so
+	// it says strapped only once the item the host straps is the one shown here. Forced from the host's bit while the
+	// pistol of a moment ago was still active, it made the pistol "strapped" too: Hide needs it false, and the only
+	// operator left, Unstrapping, waits for an animation end a puppet never gets. Until then the planner swaps the items.
 	CPropertyStorage& world = stalker->CObjectHandler::planner().m_storage;
-	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped, strapped);
+	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped, rule.strap);
 	world.set_property(ObjectHandlerSpace::eWorldPropertyStrapped2Idle, false);
-	return done;
+
+	// TZ R71: an item the host does not hold (its hands empty, or another item held) is still seen in the puppet's a grace
+	// later: the planner's hide
+	// (CObjectActionHide: Activate(NO_ACTIVE_SLOT), then the hide motion's timer) did not end it. It is put away here:
+	// the stock hide request, then the end of the hide motion now (CWeaponMagazined::OnAnimationEnd(eHiding) and
+	// CHudItem::OnMoveToRuck do SwitchState(eHidden)); its next inventory update clears the active slot. The weapon state
+	// events stay local under this ClientApply, as a puppet's at death do (coop_remote.cpp on_puppet_die).
+	if (rule.put_away && active)
+	{
+		stalker->inventory().Activate(NO_ACTIVE_SLOT);
+		if (active_hud && !active_hud->IsHidden())
+			active_hud->SwitchState(CHUDState::eHidden);
+		track.wrong_since = now; // if this one does not take, the next push comes a grace later
+		++g_hands_put_away;
+	}
+
+	if (!rule.done)
+	{
+		if (!track.waiting)
+		{
+			track.waiting = true;
+			track.waiting_since = now;
+			track.waiting_said = false;
+		}
+		// One line for a put-away or for a wait longer than a stock hide: the first few of each puppet, within the
+		// session's budget (log_allowed).
+		const u32 waited = ms_since(track.waiting_since, now);
+		if (rule.put_away || (!track.waiting_said && waited >= hands::kHideGraceMs))
+		{
+			track.waiting_said = true;
+			if (track.lines < kHandsLinesPerPuppet && log_allowed(g_hands_log))
+			{
+				++track.lines;
+				::Msg("! [coop-hands] npc %u held %u active %u strap_wanted %u put_away %u (strap %u, active hidden %u, "
+				      "%u ms waiting, line %u)",
+				    u32(obj->ID()), u32(seen.held_id), u32(seen.active_id), u32(seen.want_strapped), u32(rule.put_away),
+				    u32(rule.strap), u32(seen.active_hidden), waited, g_hands_log);
+			}
+		}
+	}
+	else
+		track.waiting = false;
+
+	if (!done)
+		return false; // the torch: try again in a second
+	if (!rule.done)
+	{
+		++g_hands_waits;
+		track.retry_soon = true;
+		return false;
+	}
+	return true;
 }
 
 bool apply_attachments(CGameObject* obj, const attachments::State& state)
@@ -602,13 +903,21 @@ struct MirrorTrack
 	u16 held_shown = kNoId; // the item it holds
 	u64 flags_retry = 0; // a failed apply (torch not here yet) is tried again from this time
 	u64 flags_check = 0; // and the shown state is re-checked from time to time (local engine paths may switch it)
+	HandsTrack hands; // TZ R71: the put-away clock and the "[coop-hands]" lines of this puppet
 	attachments::State attachments_shown;
 	bool attachments_pending = true;
 	u64 attachments_retry = 0, attachments_check = 0;
-	u64 anim_diag_after = 0; // a puppet with no base motion playing (a T-pose) is said again from this time
 };
 xr_map<u16, MirrorTrack> g_tracks;
-u32 g_anim_diag_lines = 0; // "[coop-anim]" lines of this session (the first ones, then every 50th)
+// P101 (replaces the 26fe5b0b line, which never saw the spawn placeholder and was not reached without a snapshot)
+u64 g_pose_fallbacks = 0; // partitions of copies given their own idle (mirror_pose::PartPlay::Fallback)
+u32 g_pose_lines = 0; // "[coop-anim] copy ... may stand in its spawn pose" lines of this session (mirror_pose::line_allowed)
+u32 g_copy_state_lines = 0; // "[coop-anim] copy ... :" lines asked for by other modules (describe_copy)
+// P101 review: when this process last took a snapshot sample of any creature (client_on_snapshot), 0 = none this session
+// (mirror_pose::stream_reaches); the one "[coop-anim] no snapshot stream" line of the gap since then, and its budget.
+u64 g_snapshot_in_at = 0;
+bool g_pose_gap_said = false;
+u32 g_pose_gap_lines = 0;
 xr_set<u16> g_refetched; // entities asked again because their holder was missing (once each)
 u64 g_client_spawns = 0, g_client_releases = 0, g_client_switches = 0, g_missing = 0, g_blocked_spawns = 0,
     g_forwarded_spawns = 0;
@@ -1549,6 +1858,8 @@ void client_on_snapshot(PeerId, Reader& r)
 		t.samples.push_back(s);
 		while (t.samples.size() > 24)
 			t.samples.pop_front();
+		g_snapshot_in_at = now; // P101 review: the stream reaches this process (a taken sample, not a packet that broke)
+		g_pose_gap_said = false;
 	}
 }
 
@@ -1833,6 +2144,17 @@ void reset()
 	g_id_retry.clear();
 	g_rc_pacer.reset();
 	g_rc_log = 0;
+	// P101/P103 (review): the copies' and the decider's books and line budgets are the session's. The rounds hold object
+	// pointers (RoundSeen::what) of a world that is gone.
+	g_pose_fallbacks = 0;
+	g_pose_lines = g_copy_state_lines = g_pose_gap_lines = 0;
+	g_snapshot_in_at = 0;
+	g_pose_gap_said = false;
+	g_decider_round_at = 0;
+	g_decider_unposed.clear();
+	g_decider_rootctl.clear();
+	g_bodiless.clear();
+	g_decider_lines = g_rootctl_lines = g_bodiless_lines = 0;
 }
 
 void on_peer_left(PeerId id)
@@ -2118,14 +2440,194 @@ bool motion_valid(IKinematicsAnimated* ka, u32 motion)
 	return defs && m.idx < defs->size();
 }
 
-bool drive_mirror(CGameObject* obj)
+namespace
 {
+// This skeleton's spawn placeholder (CCharacterPhysicsSupport::in_NetSpawn plays "death_init" by name on a live NPC), looked up
+// once per skeleton; kNoMotion when the model has none.
+u32 placeholder_of(IKinematicsAnimated* ka, mirror_pose::Book& book)
+{
+	if (!book.placeholder_known)
+	{
+		const MotionID m = ka->ID_Cycle_Safe("death_init");
+		book.placeholder = m.valid() ? m.val : instrument::kNoMotion;
+		book.placeholder_known = true;
+	}
+	return book.placeholder;
+}
+
+// Channel 0 of the partition plays nothing, or nothing but the placeholder.
+bool part_bare(IKinematicsAnimated* ka, u16 part, u32 placeholder)
+{
+	for (u32 i = 0, n = ka->LL_PartBlendsCount(part); i < n; ++i)
+	{
+		const CBlend* b = ka->LL_PartBlend(part, i);
+		if (b && instrument::mirrored_channel(b->channel) && b->blend_state() != CBlend::eFREE_SLOT &&
+		    b->motionID.val != placeholder)
+			return false;
+	}
+	return true;
+}
+
+// P101: a stalker copy's partition no usable host motion reaches plays the copy's own standing idle (mirror_pose::fallback_motion,
+// looked up by name in this model, never a host id), on channel 0 like the host motions that replace it later. Tried once
+// per partition and skeleton; monsters and traders have no such motions (the line tells about them).
+void play_own_idle(CGameObject* obj, IKinematicsAnimated* ka, u16 part, mirror_pose::Book& book)
+{
+	const u8 b = mirror_pose::bit(part);
+	if (book.fallback_tried & b)
+		return;
+	book.fallback_tried |= b;
+	if (!obj->cast_stalker() || !(parts_of(ka) & b))
+		return;
+	const char* name = mirror_pose::fallback_motion(ka->partitions().part(part)->Name.c_str());
+	const MotionID m = name ? ka->ID_Cycle_Safe(name) : MotionID();
+	if (m.valid() && ka->LL_PlayCycle(part, m, TRUE, nullptr, nullptr))
+	{
+		book.fallback |= b;
+		++g_pose_fallbacks;
+	}
+}
+
+// Every partition of the copy: the decider's motion where this model has it (as before P101), else keep, or the own idle
+// for a partition still in the spawn placeholder (mirror_pose::part_play). `s` is null when no snapshot of the id is here.
+void drive_parts(CGameObject* obj, IKinematicsAnimated* ka, mirror_pose::Book& book, const MirrorSample* s,
+                 MirrorTrack* track, u64 now)
+{
+	const bool settled = mirror_pose::settled(book, now);
+	const u32 placeholder = placeholder_of(ka, book);
+	const u8 count = s ? s->anims.count : 0;
+	for (u8 part = 0; part < kMaxPartitions; ++part)
+	{
+		const u32 value = part < count ? s->anims.motion[part] : instrument::kNoMotion;
+		const u8 b = mirror_pose::bit(part);
+		mirror_pose::PartFacts f;
+		f.named = instrument::motion_present(value);
+		f.valid = motion_valid(ka, value);
+		f.placeholder = f.valid && value == placeholder;
+		f.driven = (book.driven & b) != 0;
+		if (!(f.named && f.valid) && !f.driven)
+			f.bare = part_bare(ka, part, placeholder);
+		switch (mirror_pose::part_play(f, settled))
+		{
+		case mirror_pose::PartPlay::Host:
+		{
+			MotionID m;
+			m.val = value;
+			CBlend* playing = nullptr;
+			for (u32 i=0,n=ka->LL_PartBlendsCount(part); i<n; ++i)
+			{
+				CBlend* blend=ka->LL_PartBlend(part,i);
+				if (blend && instrument::mirrored_channel(blend->channel) && blend->motionID==m && blend->blend_state()==CBlend::eAccrue) { playing=blend; break; }
+			}
+			if (!playing) playing=ka->LL_PlayCycle(u16(part),m,TRUE,nullptr,nullptr);
+			if (playing)
+			{
+				const float phase=clampr(float(s->anims.time_ms[part])/1000.f,0.f,_max(0.f,playing->timeTotal-.001f));
+				if (instrument::phase_needs_sync(phase,playing->timeCurrent)) playing->timeCurrent=phase;
+				if (track)
+					track->applied[part]=value;
+				if (!f.placeholder)
+					book.driven |= b; // the decider's placeholder drives nothing: the copy is still a T-pose suspect
+			}
+			break;
+		}
+		case mirror_pose::PartPlay::Fallback:
+			play_own_idle(obj, ka, part, book);
+			break;
+		case mirror_pose::PartPlay::Keep:
+			break;
+		}
+	}
+}
+
+// P101: one bounded line for a live copy that may stand in its spawn pose, once per episode (mirror_pose::say_now), with
+// what tells the triggers apart: snapshots of the id here, their age, the decider's health, its motions per partition, whether
+// this model has them, what they are called here, and this model's motion tables.
+void watch_pose(CGameObject* obj, IKinematicsAnimated* ka, mirror_pose::Book& book, const MirrorTrack* track,
+                const MirrorSample* shown, u64 now)
+{
+	CEntityAlive* alive = obj->cast_entity_alive();
+	if (!alive || !alive->g_Alive())
+		return;
+	mirror_pose::WatchFacts f;
+	f.stream = mirror_pose::stream_reaches(g_snapshot_in_at, book.since_ms, now);
+	f.track = track != nullptr;
+	f.samples = track ? u32(track->samples.size()) : 0u;
+	const MirrorSample* newest = track && !track->samples.empty() ? &track->samples.back() : nullptr;
+	f.newest_age_ms = newest && now > newest->local_time ? now - newest->local_time : 0;
+	f.decider_dead = newest && newest->health <= 0.f;
+	// Partitions count for stalkers only: a monster's or a trader's model need not play channel 0 on each of its partitions,
+	// and they have no idle of ours. They have no line (P101 review: no idle partition, Cause::None); the decider's
+	// "online here with no game object" line covers every creature.
+	f.present = obj->cast_stalker() ? parts_of(ka) : u8(0);
+	f.driven = book.driven;
+	const u32 placeholder = ka ? placeholder_of(ka, book) : instrument::kNoMotion;
+	u32 host[kMaxPartitions] = {instrument::kNoMotion, instrument::kNoMotion, instrument::kNoMotion, instrument::kNoMotion};
+	for (u8 part = 0; shown && part < shown->anims.count && part < kMaxPartitions; ++part)
+	{
+		host[part] = shown->anims.motion[part];
+		const u8 b = mirror_pose::bit(part);
+		if (instrument::motion_present(host[part]))
+			f.named |= b;
+		if (motion_valid(ka, host[part]))
+		{
+			f.valid |= b;
+			if (host[part] == placeholder)
+				f.placeholder |= b;
+		}
+	}
+	const mirror_pose::Cause cause = mirror_pose::cause_of(f);
+	if (cause == mirror_pose::Cause::NoStream)
+	{
+		// No stream reaches this process (the decider loads or saves, or streams to nobody here yet): every copy of the level
+		// is in the same gap, so one line for the gap, not one per copy (those would fill g_pose_lines and hide the copies the
+		// decider leaves out while it streams the rest). A new gap starts with the next sample taken (client_on_snapshot).
+		if (mirror_pose::settled(book, now) && !g_pose_gap_said)
+		{
+			g_pose_gap_said = true;
+			if (mirror_pose::line_allowed(g_pose_gap_lines))
+				::Msg("! [coop-anim] no snapshot stream to this client: copy %u [%s] has %llu ms with this model here and %s, "
+				      "the last snapshot sample of any creature came %lld ms ago (-1: none this session); stalker copies with no "
+				      "host motion stand in their own idle meanwhile (P101) (%u such line(s))",
+				    u32(obj->ID()), obj->cName().c_str(), now > book.since_ms ? now - book.since_ms : 0ull,
+				    f.samples ? "only stale samples" : "no sample", g_snapshot_in_at ? s64(now) - s64(g_snapshot_in_at) : -1ll,
+				    g_pose_gap_lines);
+		}
+		return;
+	}
+	if (!mirror_pose::say_now(book, cause, mirror_pose::settled(book, now)) || !mirror_pose::line_allowed(g_pose_lines))
+		return;
+	string512 slots;
+	describe_slots(ka, slots);
+	::Msg("! [coop-anim] copy %u [%s] visual [%s] may stand in its spawn pose: %s (%llu ms with this model here, online here %s, "
+	      "%u sample(s), the newest %llu ms old, host health %.2f); parts %x, driven by the host %x, own idle %x; host motions "
+	      "%08x %08x %08x %08x, in this model %x, the placeholder %x; here they are [%s] [%s] [%s]; %s (%u such line(s))",
+	    u32(obj->ID()), obj->cName().c_str(), obj->cNameVisual().c_str(), mirror_pose::cause_name(cause),
+	    now > book.since_ms ? now - book.since_ms : 0ull, g_online.count(obj->ID()) ? "yes" : "no", f.samples,
+	    f.newest_age_ms, newest ? newest->health : -1.f, u32(f.present), u32(book.driven), u32(book.fallback), host[0], host[1],
+	    host[2], host[3], u32(f.valid), u32(f.placeholder), motion_name(ka, host[0]), motion_name(ka, host[1]),
+	    motion_name(ka, host[2]), slots, g_pose_lines);
+}
+} // namespace
+
+bool drive_mirror(CGameObject* obj, mirror_pose::Book& book)
+{
+	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
+	const u64 now = mgr().now_ms();
+	++book.frames;
 	auto it = g_tracks.find(obj->ID());
-	if (it == g_tracks.end())
-		return false;
 	MirrorSample s;
-	if (!interpolate(it->second, mgr().now_ms() - kInterpDelayMs, s))
+	if (it == g_tracks.end() || !interpolate(it->second, now - kInterpDelayMs, s))
+	{
+		// P101: no snapshot of this id here: nothing places or animates the copy. Its stalker partitions still in the spawn
+		// placeholder (the bind pose, arms out) get its own idle once it settled, and the line says why (before P101 this
+		// returned at once, silently).
+		MirrorTrack* track = it != g_tracks.end() ? &it->second : nullptr;
+		if (ka)
+			drive_parts(obj, ka, book, nullptr, track, now);
+		watch_pose(obj, ka, book, track, nullptr, now);
 		return false;
+	}
 	Fmatrix xform;
 	xform.setHPB(s.yaw, 0.f, 0.f);
 	xform.c.set(s.pos);
@@ -2141,7 +2643,6 @@ bool drive_mirror(CGameObject* obj)
 
 	// W5 C2.6: creature flags from the newest sample (state, not motion: no interpolation).
 	MirrorTrack& track = it->second;
-	const u64 now = mgr().now_ms();
 	if (((track.attachments_pending || !(s.attachments == track.attachments_shown)) && now >= track.attachments_retry)
 		|| now >= track.attachments_check)
 	{
@@ -2163,75 +2664,20 @@ bool drive_mirror(CGameObject* obj)
 		|| now >= track.flags_check)
 	{
 		track.flags_check = now + 2000;
-		if (apply_creature_flags(obj, want, want_held))
+		if (apply_creature_flags(obj, want, want_held, now, track.hands))
 		{
 			track.flags_shown = want;
 			track.held_shown = want_held;
 			track.flags_retry = 0;
 		}
-		else
-			track.flags_retry = now + 1000;
+		else // TZ R71: a swap or hide under way is looked at again shortly (it ends within a second), as attachments are
+			track.flags_retry = now + (track.hands.retry_soon ? 100 : 1000);
 	}
 
-	IKinematicsAnimated* ka = obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
 	if (ka)
 	{
-		for (u8 part = 0; part < s.anims.count; ++part)
-		{
-			const u32 value = s.anims.motion[part];
-			if (!instrument::motion_present(value))
-				continue;
-			if (!motion_valid(ka, value))
-				continue;
-			MotionID m;
-			m.val = value;
-			CBlend* playing = nullptr;
-			for (u32 i=0,n=ka->LL_PartBlendsCount(part); i<n; ++i)
-			{
-				CBlend* b=ka->LL_PartBlend(part,i);
-				if (b && instrument::mirrored_channel(b->channel) && b->motionID==m && b->blend_state()==CBlend::eAccrue) { playing=b; break; }
-			}
-			if (!playing) playing=ka->LL_PlayCycle(u16(part),m,TRUE,nullptr,nullptr);
-			if (playing)
-			{
-				const float phase=clampr(float(s.anims.time_ms[part])/1000.f,0.f,_max(0.f,playing->timeTotal-.001f));
-				if (instrument::phase_needs_sync(phase,playing->timeCurrent)) playing->timeCurrent=phase;
-				it->second.applied[part]=value;
-			}
-		}
-		// A live stalker with no base motion on any part stands in its bind pose (the owner's screenshot, 2026-11-13, a game without
-		// split levels; the cause was not found by reading). The line says which of three it is: the host named no motion (src),
-		// this model has no such motion (valid: another visual or motion table here), or the motion would not start (live).
-		CAI_Stalker* puppet = obj->cast_stalker();
-		if (puppet && puppet->g_Alive() && now >= track.anim_diag_after)
-		{
-			u32 src = 0, valid = 0, live = 0;
-			for (u8 part = 0; part < s.anims.count && part < kMaxPartitions; ++part)
-			{
-				if (instrument::motion_present(s.anims.motion[part]))
-					src |= 1u << part;
-				if (motion_valid(ka, s.anims.motion[part]))
-					valid |= 1u << part;
-				for (u32 i = 0, n = ka->LL_PartBlendsCount(part); i < n; ++i)
-				{
-					CBlend* b = ka->LL_PartBlend(part, i);
-					if (b && instrument::mirrored_channel(b->channel))
-						live |= 1u << part;
-				}
-			}
-			if (live)
-				track.anim_diag_after = now + 1000;
-			else
-			{
-				track.anim_diag_after = now + 10000;
-				if (++g_anim_diag_lines <= 40 || g_anim_diag_lines % 50 == 0)
-					::Msg("! [coop-anim] %u [%s] visual [%s] plays no base motion: parts %u, named by the host %x, known to this model %x, "
-					      "motions %08x %08x %08x %08x (%u such line(s))",
-					    u32(obj->ID()), obj->cName().c_str(), obj->cNameVisual().c_str(), u32(s.anims.count), src, valid,
-					    s.anims.count > 0 ? s.anims.motion[0] : 0u, s.anims.count > 1 ? s.anims.motion[1] : 0u,
-					    s.anims.count > 2 ? s.anims.motion[2] : 0u, s.anims.count > 3 ? s.anims.motion[3] : 0u, g_anim_diag_lines);
-			}
-		}
+		drive_parts(obj, ka, book, &s, &track, now);
+		watch_pose(obj, ka, book, &track, &s, now);
 	}
 	return true;
 }
@@ -2251,17 +2697,53 @@ void frame()
 		}
 		host_process_events();
 		host_send_snapshots();
+		watch_decider(mgr().now_ms()); // P101/P103: a round over this decider's creatures every 10 s (bounded lines)
 	}
+}
+
+void describe_copy(u16 id, const char* why)
+{
+	if (!mirror_pose::line_allowed(g_copy_state_lines))
+		return;
+	CObject* o = g_pGameLevel ? Level().Objects.net_Find(id) : nullptr;
+	CGameObject* obj = o && !o->getDestroy() ? smart_cast<CGameObject*>(o) : nullptr;
+	IKinematicsAnimated* ka = obj && obj->Visual() ? smart_cast<IKinematicsAnimated*>(obj->Visual()) : nullptr;
+	const auto it = g_tracks.find(id);
+	const MirrorTrack* track = it != g_tracks.end() ? &it->second : nullptr;
+	const MirrorSample* newest = track && !track->samples.empty() ? &track->samples.back() : nullptr;
+	const u64 now = mgr().now_ms();
+	// What channel 0 of each partition plays here now (the accruing blend): a T-pose copy shows death_init.
+	const char* plays[3] = {"-", "-", "-"};
+	for (u16 part = 0; ka && part < 3; ++part)
+		for (u32 i = 0, n = ka->LL_PartBlendsCount(part); i < n; ++i)
+		{
+			const CBlend* b = ka->LL_PartBlend(part, i);
+			if (b && instrument::mirrored_channel(b->channel) && b->blend_state() == CBlend::eAccrue)
+				plays[part] = motion_name(ka, b->motionID.val);
+		}
+	const CEntityAlive* alive = obj ? obj->cast_entity_alive() : nullptr;
+	::Msg("[coop-anim] copy %u [%s] (%s): %s here, online here %s, %u sample(s), the newest %lld ms old (host health %.2f), "
+	      "plays [%s] [%s] [%s] (%u such line(s))",
+	    u32(id), obj ? obj->cName().c_str() : "no game object", why, !obj ? "none" : (alive && alive->g_Alive() ? "alive" : "dead"),
+	    g_online.count(id) ? "yes" : "no", track ? u32(track->samples.size()) : 0u,
+	    newest ? s64(now) - s64(newest->local_time) : -1ll, newest ? newest->health : -1.f, plays[0], plays[1], plays[2],
+	    g_copy_state_lines);
 }
 
 void print_status()
 {
 	::Msg("[coop]   NPC attachments: %llu incomplete host samples, %llu client applies, %llu retries",
 		g_attachment_incomplete, g_attachment_applies, g_attachment_retries);
+	::Msg("[coop]   NPC hands (R71): %llu applies waited for a swap or hide, %llu items put away", g_hands_waits,
+	    g_hands_put_away);
 	if (mode().decides_world() || mode().leads_level())
 	{
 		::Msg("[coop]   world out: %llu spawns, %llu releases, %llu switches, %llu snapshot packets", g_host_spawns,
 		    g_host_releases, g_host_switches, g_snapshots_sent);
+		::Msg("[coop]   poses here (P101/P103), at the last round: %u stalkers in their spawn placeholder or with no motion, "
+		      "%u under the animation movement controller, %u creatures online with no game object (%u + %u + %u lines)",
+		    (u32)g_decider_unposed.size(), (u32)g_decider_rootctl.size(), (u32)g_bodiless.size(), g_decider_lines,
+		    g_rootctl_lines, g_bodiless_lines);
 		::Msg("[coop]   roster: %s, %llu digests, %llu rosters (%llu rows, %u waiting), %llu entity requests, %llu destroys "
 		      "of ids that are gone", g_coop_reconcile ? "on" : "off", g_rc.digests, g_rc.rosters, g_rc.rows,
 		    (u32)g_rc_asked.size(), g_rc.repairs_in, g_rc.repairs_gone);
@@ -2306,6 +2788,10 @@ void print_status()
 		    g_mirror_with_holder, g_mirror_broken_holder, g_mirror_stale, g_mirror_lost, g_mirror_listed_destroys);
 		::Msg("[coop]   mirror without a game vertex: %llu brought online at their EntitySpawn (psy phantoms)",
 		    g_mirror_online_now);
+		::Msg("[coop]   copy poses (P101): %llu partitions given their own idle, %u spawn-pose lines, %u copy state lines, %u "
+		      "no-stream lines, the last snapshot sample %lld ms ago (-1: none this session)",
+		    g_pose_fallbacks, g_pose_lines, g_copy_state_lines, g_pose_gap_lines,
+		    g_snapshot_in_at ? s64(mgr().now_ms()) - s64(g_snapshot_in_at) : -1ll);
 	}
 }
 } // namespace entities

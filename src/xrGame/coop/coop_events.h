@@ -75,10 +75,19 @@ void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvect
 u16 host_last_holder(u16 item);
 
 // --- one id, one object on a mirror (xrCoop/coop_object_identity.h, live RL-UGYE-3WGE 2026-11-09). The game thread
-// (CLevel::net_Update). Single player and the host: the stock behaviour (true / nothing). ---
-// CLevel::cl_Process_Spawn: false = this M_SPAWN makes no game object (its entity is gone or another one has the id
-// now, or a live object of its section holds the id). Logged once per id.
-bool client_spawn_allowed(const CSE_Abstract* spawn);
+// (CLevel::net_Update). Single player and the host: the stock behaviour (Make / true / nothing). ---
+// CLevel::cl_Process_Spawn (TZ P104: xrCoop/coop_spawn_wait_rules.h). Make = the stock path makes the game object;
+// Wait = a game object still holds the id (marked for destruction, or a stale one of another section) or the holder's
+// object is marked for destruction: the caller puts the whole M_SPAWN back into the level's event queue, decided again at
+// a next frame (kMaxWaitFrames at most, then Refuse, logged); Refuse = no game object (its entity is gone or another one
+// has the id now, or a live object of its section holds the id; logged once per id).
+enum class SpawnGate : u8
+{
+	Make,
+	Wait,
+	Refuse
+};
+SpawnGate client_spawn_gate(const CSE_Abstract* spawn);
 // CLevel::ClientSend: false = this object writes no update (another object is the level's one for its id, or the
 // entity under its id is of another section). Logged once per id.
 bool client_export_allowed(CObject* obj);

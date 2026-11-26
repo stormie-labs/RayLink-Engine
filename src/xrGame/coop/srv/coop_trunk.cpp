@@ -3,6 +3,7 @@
 #include "../coop_join.h"
 #include "../coop_levels.h"
 #include "../coop_manager.h"
+#include "../coop_requests.h" // P99 D1: the world takes a weapon's stamp from its map server's spawn
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/srv/coop_session_srv.h"
 #include "xrCoop/srv/coop_srv_departure_rules.h" // VEH-DISC
@@ -36,8 +37,20 @@ bool host_incoming(PeerId from, Msg type, Lane lane, const u8* packet, size_t si
 	if (!split)
 		return true;
 	const u16 level = levels::level_of_player(from);
-	const PeerId bridge = levels::on_host_level(from) ? kInvalidPeer : bridge_of(level);
-	const Incoming go = route_incoming(type, split, levels::on_host_level(from), bridge != kInvalidPeer);
+	const bool home = levels::on_host_level(from);
+	const PeerId bridge = home ? kInvalidPeer : bridge_of(level);
+	const Incoming go = route_incoming(type, split, home, bridge != kInvalidPeer);
+	// TZ 6.28 (P99): one answer to a player's repair, his map server's while it is connected, else this world's (route_incoming).
+	// Each of the two ways counts and logs on its own: its first three and every 500th. A player on no level (between two, or not
+	// seated yet) is no player of a map server: no line for him (review D5: "level 65535").
+	static u32 s_by_map = 0, s_by_world = 0;
+	if (answered_by_his_map_server(type) && !home && level != levels::wire::kNoLevel)
+	{
+		u32& n = go.tunnel ? s_by_map : s_by_world;
+		if (++n <= 3 || n % 500 == 0)
+			::Msg("[coop] trunk: a repair asked by player %u on level %u is answered by %s alone (P99, %u so far)", u32(from), u32(level),
+			    go.tunnel ? "the map server of his level" : "the world server (his map server is not connected)", n);
+	}
 	if (go.tunnel)
 	{
 		wire::TunnelMsg m;
@@ -51,6 +64,55 @@ bool host_incoming(PeerId from, Msg type, Lane lane, const u8* packet, size_t si
 	return go.here;
 }
 
+namespace
+{
+// TZ 6.28 (P99, review D1, 2026-11-26): the world's copy of a weapon takes the stamp its map server's spawn carries. write_clone_initial
+// stamps a magazined weapon with the instance its process gave it first (clone_export keeps it), and the players of the level take
+// that stamp from the map server's spawn (client_on_spawn -> stage_clone_initial). A weapon this world never stamped (loaded from the
+// save, never in a spawn of this process) had no stamp here, so its item riders (jam, camo) a player sent under the map server's stamp
+// were refused here: the rider lane keeps a strict instance (coop_mods_item_state.script matches_instance, "weapon instance changed";
+// coop_economy_mdata.script on_imd), and an unstamped copy's instance is the weapon's name (item_instance). Its
+// copy takes the stamp alone (requests::adopt_spawn_stamp -> coop_economy_mdata.script clone_take_stamp; review R1: not clone_adopt,
+// whose purge would drop the item's held changes here): while it has no stamp or the same one. A weapon this world stamped otherwise
+// keeps the world's (refused, counted and logged).
+void world_takes_spawn_stamp(u16 level, const std::vector<u8>& packet)
+{
+	u16 id = 0;
+	const requests::SpawnStamp got = requests::adopt_spawn_stamp(packet.data(), packet.size(), id);
+	if (got == requests::SpawnStamp::NoWeapon)
+		return;
+	// each outcome counts and logs on its own: its first three and every 500th
+	static u32 s_taken = 0, s_refused = 0, s_absent = 0, s_malformed = 0;
+	switch (got)
+	{
+	case requests::SpawnStamp::Taken:
+		if (++s_taken <= 3 || s_taken % 500 == 0)
+			::Msg("[coop] trunk: weapon %u holds the stamp the map server of level %u gave it, here too (P99 D1, %u so far)", u32(id),
+			    u32(level), s_taken);
+		break;
+	case requests::SpawnStamp::Refused:
+		if (++s_refused <= 3 || s_refused % 500 == 0)
+			::Msg("! [coop] trunk: weapon %u keeps this world's stamp, the map server of level %u gave it another, or not taken (another "
+			      "item stands under its id here, its clone is in flight, its state is not read): its riders under that one are refused "
+			      "here (P99 D1, %u so far)",
+			    u32(id), u32(level), s_refused);
+		break;
+	case requests::SpawnStamp::NoEntity:
+		if (++s_absent <= 3 || s_absent % 500 == 0)
+			::Msg("[coop] trunk: weapon %u of the map server of level %u is not in this world yet (or its clone is in flight here): its "
+			      "stamp is not taken (P99 D1, %u so far)",
+			    u32(id), u32(level), s_absent);
+		break;
+	default:
+		if (++s_malformed <= 3 || s_malformed % 500 == 0)
+			::Msg("! [coop] trunk: a spawn of the map server of level %u is not read as write_spawn writes it: its weapon stamp is not "
+			      "taken (P99 D1, %u so far)",
+			    u32(level), s_malformed);
+		break;
+	}
+}
+} // namespace
+
 void trunk_host_on_tunnel(PeerId from, Reader& r)
 {
 	wire::TunnelMsg m;
@@ -59,6 +121,10 @@ void trunk_host_on_tunnel(PeerId from, Reader& r)
 	const u16 level = level_of_bridge(from);
 	if (level == wire::kNoLevel)
 		return;
+	// P99 D1: before the spawn goes on, so that no rider under its stamp can reach this world before the stamp does. Whether or not a
+	// player of the level gets it now: the stamp is the level's, the world's own later spawns of the weapon carry it (clone_export)
+	if (m.type() == Msg::EntitySpawn)
+		world_takes_spawn_stamp(level, m.packet);
 	// Build 57, S3 (protocol 33; TZ 6.3, the psy phantoms of a bloodsucker were unseen): this goes only to players of that level, so
 	// a spawn its map server has online is online at the authority of the level they stand on. Their machine knows it by the byte
 	// (xrCoop/coop_levels_wire.h mark_spawn_of_your_level) and brings a free entity with no game vertex online at once, as a co-op

@@ -268,7 +268,9 @@ inline bool kept_from_every_level(Msg type)
 	case Msg::PlayerEquip:
 	case Msg::ItemState:
 	case Msg::IdLeaseAck:
-	case Msg::StateDumpRequest: // the repair of his registry: an entity he misses comes from the world's copy
+	case Msg::StateDumpRequest: // the repair of his registry: the world's copy answers it only while the map server of his level is
+		                        // not connected; with it, that map server alone answers (P99: coop_mapserver_rules.h
+		                        // answered_by_his_map_server, route_incoming)
 		return true;
 	default: break; // F5 VehicleReq / VehicleInput too: only the decider of his level acts on them; the world server keeps nothing
 	}

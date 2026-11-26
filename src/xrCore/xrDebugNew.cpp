@@ -4,6 +4,7 @@
 #include "xrdebug.h"
 #include "os_clipboard.h"
 #include "raylink_version.h" // the crash dialogs name the engine and its build
+#include "gpu_device_lost.h" // RayLink: why a D3D device was lost (xrDebug::set_device_lost_note)
 
 #include <sal.h>
 #include <dxerr.h>
@@ -502,10 +503,56 @@ LPCSTR xrDebug::error2string(long code)
 #endif
 	if (0 == result)
 	{
-		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, 0, code, 0, desc_storage, sizeof(desc_storage) - 1, 0);
+		const DWORD written = FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, 0, code, 0, desc_storage, sizeof(desc_storage) - 1, 0);
 		result = desc_storage;
+		// RayLink (crash triage, 2026-11-25): a lost D3D device says why, on the description's own line (the renderer's note,
+		// set_device_lost_note). Every other code, and a lost device with no note to ask, keeps the system's text as it was.
+		char note[256];
+		if (device_lost_note_of(code, note, sizeof(note)))
+		{
+			if (0 == written) // no system text: the code's name, not what the buffer held before
+				xr_gpu::reason_text(code, desc_storage, sizeof(desc_storage));
+			xr_gpu::append_before_line_end(desc_storage, sizeof(desc_storage), note);
+		}
 	}
 	return result;
+}
+
+// RayLink (crash triage, 2026-11-25): xrDebug::set_device_lost_note. The renderer's thread sets and clears it, a crash on any
+// thread reads it: a pointer-sized store, volatile so every read goes to memory.
+static device_lost_note* volatile s_device_lost_note = nullptr;
+
+void xrDebug::set_device_lost_note(device_lost_note* note)
+{
+	s_device_lost_note = note;
+}
+
+// SEH only, no C++ object in this function: a driver that faults on its lost device costs the note, not the FATAL that asked.
+static bool call_device_lost_note(device_lost_note* note, long code, char* out, unsigned int out_size)
+{
+	__try
+	{
+		return note(code, out, out_size);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+bool xrDebug::device_lost_note_of(long code, char* out, unsigned int out_size)
+{
+	if (!out || !out_size)
+		return false;
+	out[0] = 0;
+	device_lost_note* const note = s_device_lost_note;
+	if (!note || !xr_gpu::is_device_lost(code))
+		return false;
+	const bool written = call_device_lost_note(note, code, out, out_size);
+	out[out_size - 1] = 0;
+	if (!written)
+		out[0] = 0;
+	return written && out[0] != 0;
 }
 
 void xrDebug::error(long hr, const char* expr, const char* file, int line, const char* function, bool& ignore_always)

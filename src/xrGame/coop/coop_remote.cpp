@@ -10,6 +10,7 @@
 #include "coop_ai.h"
 #include "coop_vehicles.h" // F5-VEH-2: save_position
 #include "xrCoop/coop_rules.h"
+#include "xrCoop/coop_mirror_pose_rules.h" // P101: the pose book of a copy
 
 #include "Level.h"
 #include "GameObject.h"
@@ -56,10 +57,11 @@ constexpr float kMinAliveHealth = 0.001f;
 // object as an engine Remote object.
 struct Puppet
 {
-	const IKinematicsAnimated* visual = nullptr; // legs_part belongs to this skeleton (avatars change visuals)
+	const IKinematicsAnimated* visual = nullptr; // legs_part and pose belong to this skeleton (avatars change visuals)
 	u16 legs_part = kPartUnknown;
 	u32 legs_motion = 0;
 	const CBlend* legs_blend = nullptr;
+	mirror_pose::Book pose; // P101: what entities::drive_mirror knows of this skeleton (its own idle, the T-pose line)
 };
 xr_map<u16, Puppet> g_puppets;
 u64 g_made_remote = 0, g_made_local = 0, g_deaths = 0, g_driven = 0, g_holstered = 0;
@@ -285,6 +287,16 @@ bool apply(CGameObject* obj)
 	if (ka)
 		ka->UpdateTracks(); // the skipped engine selectors used to advance the tracks
 
+	// A new skeleton (spawn, a visual change) starts this copy's books again: the legs partition (track_legs did this alone
+	// before P101, after the drive) and the pose book, whose clock starts now. Same reset, one step earlier in the frame.
+	auto puppet = g_puppets.find(obj->ID());
+	if (puppet != g_puppets.end() && ka && puppet->second.visual != ka)
+	{
+		puppet->second = Puppet();
+		puppet->second.visual = ka;
+		puppet->second.pose.since_ms = mgr().now_ms();
+	}
+
 	bool driven = false;
 	if (world::is_player_proxy(obj->ID()))
 	{
@@ -292,7 +304,11 @@ bool apply(CGameObject* obj)
 			driven = players::drive_avatar(avatar);
 	}
 	else if (net::client())
-		driven = entities::drive_mirror(obj);
+	{
+		mirror_pose::Book none; // no puppet entry (not expected: make_remote makes one): never settles, says nothing
+		none.since_ms = mgr().now_ms();
+		driven = entities::drive_mirror(obj, puppet != g_puppets.end() ? puppet->second.pose : none);
+	}
 	if (!driven)
 		return false;
 
