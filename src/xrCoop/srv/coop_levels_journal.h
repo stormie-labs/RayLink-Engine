@@ -1,25 +1,23 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the map server's level journal, its batches and the world's answer (TZ Р32, temp/r30/design/R32-final.md §1 W3
-// "Up", W2b refusal answers, W5 repair, §5, §8a A11). Pure C++17, header-only: the engine (srv/coop_levels_xfer.cpp) and the
-// unit-test exe use it.
-//   Batcher     a map server: the registry facts of a frame, in order, cut into LevelJournal batches under 1 MiB (A11: the world
+// Anomaly Coop — the map server's level journal, its batches and the world's answer (the refusals and the repair). Pure C++17,
+// header-only: the engine (srv/coop_levels_xfer.cpp) and the unit-test exe use it.
+//   Batcher     a map server: the registry facts of a frame, in order, cut into LevelJournal batches under 1 MiB (the world
 //               gate's hold queue evicts a bigger message) and numbered from 1;
 //   Receiver    the world server: the last batch it applied of each bridge (a repeat is answered again, never applied twice);
 //   acks_of     the world server: the Ack(s) of one batch, 255 refusals each (a u8 count), the id block in the last one;
-//   repair_of   a map server: what it does about an entry the world refused (W2b, W5): it releases a create the world refused,
-//               keeping the id reserved (W9), and asks the world for an object whose change or removal it refused; the world's
+//   repair_of   a map server: what it does about an entry the world refused: it releases a create the world refused,
+//               keeping the id reserved, and asks the world for an object whose change or removal it refused; the world's
 //               answer is an ordinary EntitySpawn / EntityDestroy (StateDumpRequest Replace). No new message.
 //   refused_id  the object a refusal row names;
 //   HeldMemory, creature_place, ParentNet   a map server: the head of a move, a death, a release names the root the world still sees
-//               when it applies the entry (A6; review WP4 #1, #2), see below.
-//   ReleasesUnderWay, adopts_at_left   a map server: who its Holder adopts at a squad's Left (§8a A17; fix round 2 of package A).
-//   done::Store     the world server: the done-records of numbered ops, per level (R32 W7.2, §8a A21 E-1), see below;
+//               when it applies the entry, see below.
+//   ReleasesUnderWay, adopts_at_left   a map server: who its Holder adopts at a squad's Left.
+//   done::Store     the world server: the done-records of numbered ops, per level, see below;
 //   done::Loaded    the records of a save just loaded, until the world server adopts them or a map server raises its level's.
-//   done::ReplayGate  a map server's Ready waits until the records it raised reached its Lua (§8a A22 open item a, O6).
-//   uses_refusal_of, object_note   what a refusal line says (O6, reports #1644-#1649).
+//   done::ReplayGate  a map server's Ready waits until the records it raised reached its Lua.
+//   uses_refusal_of, object_note   what a refusal line says.
 #pragma once
 
-#include "coop_levels_wire.h"
+#include "coop_journal_wire.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -40,7 +38,7 @@ namespace levels
 {
 namespace journal
 {
-// A11: a LevelJournal stays under 1 MiB with its message header (the world gate's hold queue keeps 1 MiB at most,
+// A LevelJournal stays under 1 MiB with its message header (the world gate's hold queue keeps 1 MiB at most,
 // coop_world_gate.h max_bytes); the rest of a frame goes in the next batch, in order.
 constexpr size_t kMaxSendBytes = 1000 * 1024;
 
@@ -74,7 +72,7 @@ public:
 		size_t bytes = 4 + 2;
 		for (Entry& e : m_entries)
 		{
-			const size_t n = 1 + wire::detail::varu_size(e.body.size()) + e.body.size();
+			const size_t n = 1 + Writer::varu_size(e.body.size()) + e.body.size();
 			if (!cur.entries.empty() && (bytes + n > kMaxSendBytes || cur.entries.size() >= kMaxEntries))
 			{
 				cur.seq = next_seq();
@@ -158,7 +156,7 @@ private:
 	std::map<uint32_t, uint32_t> m_last;
 };
 
-// R32 fix A3: does the world apply (and answer) a journal batch of this bridge? A map server the keeper has connected (it said
+// Does the world apply (and answer) a journal batch of this bridge? A map server the keeper has connected (it said
 // Ready: it leads its map), and also the current bridge of its map that has not said Ready yet (Starting: in session, loading its
 // world, where it may make objects before it says Ready). The acceptance decides each entry of it as of any other (the writer rule:
 // a Starting map server writes no resident, so its creates and changes are refused and its repair releases or fetches them; its
@@ -169,7 +167,7 @@ inline bool applies_batch_of(bool keeper_connected, bool current_bridge_of_its_m
 	return keeper_connected || current_bridge_of_its_map;
 }
 
-// R32 fix A7: a Spawn of `id` waits among the pending ups of the frame (`ups`: op, a = the object; any allocator). Until the flush
+// A Spawn of `id` waits among the pending ups of the frame (`ups`: op, a = the object; any allocator). Until the flush
 // writes it (and Holder::spawned registers a unit there), a unit the map server just made is its own from birth all the same
 // (writer::Hold::Born): levels::xfer_born asks this.
 template <class Ups>
@@ -181,7 +179,7 @@ bool spawn_queued(const Ups& ups, uint16_t id)
 	return false;
 }
 
-// R32 §8a A17 (fix round 2 of package A, verifier finding 1): the creatures whose release is under way on a map server (local ids).
+// the creatures whose release is under way on a map server (local ids).
 // The stock release (CALifeSimulatorBase::release) runs the Released hook first, then the releases of the children, then
 // unregister_object -> on_unregister -> the squad's unregister_member -> the Left hook, with the creature still alive and in the
 // registry, and only then takes it out of the registry. Its Destroy, queued at the Released hook while it was still a member, releases
@@ -208,10 +206,13 @@ private:
 	std::set<uint16_t> m_ids;
 };
 
-// R32 §8a A17: does a map server's Holder adopt a creature at the Left of a squad (levels::client_adopt_left, at the hook and again at
+// does a map server's Holder adopt a creature at the Left of a squad (levels::client_adopt_left, at the hook and again at
 // the flush)? Only one that leaves a squad it writes, that it does not write already (it keeps its own hold), a living creature on
-// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident), and whose release is not
-// under way (fix round 2, finding 1: ReleasesUnderWay).
+// the ground that transfers (no player's character; a dead one is nobody's unit: its body is a resident, adopted by nobody), and
+// whose release is not under way. A resident is not a root of gen 0 by its kind: the gen
+// at a root is the sender's hold of it for any root (levels::root_gen in coop_levels_root_gen.h). A creature adopted here
+// alive that dies later keeps that hold, and its body and loot are named with it on both sides; one that dies in its squad leaves
+// it unheld, 0 on both.
 struct LeftAdoptFacts
 {
 	bool squad_written = false; // its Holder authors the squad
@@ -285,12 +286,12 @@ inline std::vector<wire::LevelJournalAckMsg> acks_of(uint32_t upto, const std::v
 	return out;
 }
 
-// What a map server does about an entry the world refused (W2b, W5): the non-writer repairs towards the writer.
+// What a map server does about an entry the world refused: the non-writer repairs towards the writer.
 enum class Repair : uint8_t
 {
 	None, // nothing to repair: the world's rule (a deal, a body report that crossed a move, an item word the item engine takes),
 	      // an entry that names no object, an ask the map server did not apply first, a malformed entry (logged)
-	ReleaseKeepId, // a create the world refused: released here, its id stays out of the slice's use (W9)
+	ReleaseKeepId, // a create the world refused: released here, its id stays out of the slice's use
 	Fetch, // a change or a removal the world refused: the world's copy replaces this one (StateDumpRequest Replace; the answer is
 	       // an EntitySpawn, or an EntityDestroy when the world has no such object)
 };
@@ -318,41 +319,15 @@ inline Repair repair_of(uint8_t op, uint8_t why)
 	}
 	return Repair::None;
 }
-// O6 (reports #1646/#1649: a Parent of an object the world does not have, so the item players see may vanish): a Parent + Unknown keeps
-// its Fetch. Repair::None would lose no state of the world, but it is not shown to lose none at all: when the world released the object
-// first its own EntityDestroy reaches the map server anyway (both rules end alike); when the world never took its Spawn, Fetch removes
-// the item now, None keeps it on the map server alone until its hand-over or a player's move through the world loses it anyway; when
-// the id is of the world's numbering and the world freed it, None leaves a copy under an id the world may give a new object (the
-// duplicate W5 repairs). The refusal lines carry the section and the parent now (object_note); the rule waits for that data.
+// A Parent of an object the world does not have (the item players see may vanish): a Parent + Unknown keeps its Fetch.
+// Repair::None would lose no state of the world, but it is not shown to lose none at all: when the world released the object
+// first its own EntityDestroy reaches the map server anyway (both rules end alike); when the world never took its Spawn, Fetch
+// removes the item now, None keeps it on the map server alone until its hand-over or a player's move through the world loses it
+// anyway; when the id is of the world's numbering and the world freed it, None leaves a copy under an id the world may give a new
+// object (the duplicate repairs). An entity outside the map server's ALife never reaches the journal (journals_parent), so a
+// Parent + Unknown names an object of its registry that the world does not have, and Fetch repairs that copy.
 
-// O6 (reports #1644/#1645): the world's uses store refuses an ItemFacts (coop_initial_rules.h uses_store -> Refuse) in one of two ways,
-// told apart by the client_data the world's entity has. None: a scripted section, whose bytes only the writer's object can make, and no
-// usable bytes of the writer's came (none, other uses, or the world's entity has no holder). Some: bytes that are no held eatable's (an
-// item that lies on the ground here keeps its physics state there). The item engine (coop_items.cpp) names both with one text, which
-// starts with kUsesRefusedPrefix; the world's line says which.
-constexpr const char* kUsesRefusedPrefix = "the uses cannot be stored";
-
-enum class UsesRefusal : uint8_t
-{
-	NoBytes, // no client_data here: a scripted section and no usable bytes of the writer's object
-	NotHeld, // client_data here that is no held eatable's: it lies on the ground in this world
-};
-
-inline bool is_uses_refusal(const char* why)
-{
-	return why && std::strncmp(why, kUsesRefusedPrefix, std::strlen(kUsesRefusedPrefix)) == 0;
-}
-
-inline UsesRefusal uses_refusal_of(bool client_data_here) { return client_data_here ? UsesRefusal::NotHeld : UsesRefusal::NoBytes; }
-
-inline const char* uses_refusal_text(UsesRefusal r)
-{
-	return r == UsesRefusal::NoBytes ?
-	    "the uses cannot be stored: a scripted section with no client_data here and no usable bytes of the writer's object" :
-	    "the uses cannot be stored: the client_data here is no held eatable's (it lies on the ground in this world)";
-}
-
-// O6 (reports #1644-#1649): what a refusal line says of the object it names. `here`: the process has it (its section, its parent now;
+// What a refusal line says of the object it names. `here`: the process has it (its section, its parent now;
 // kNoObject: none); else the section crc its entry named (0: the entry names none). `move`: the entry moves it, to `to` (kNoObject: it
 // is put down).
 inline std::string object_note(bool here, const char* section, uint16_t crc, uint16_t parent, bool move, uint16_t to)
@@ -381,7 +356,7 @@ inline std::string object_note(bool here, const char* section, uint16_t crc, uin
 	return out;
 }
 
-// ---------------------------------------------------------------- R32 A6: the head of a move, a death, a release (review WP4 #1, #2)
+// ---------------------------------------------------------------- the head of a move, a death, a release
 //
 // The world checks an entry against the object as the world still sees it when it applies that entry (coop_levels_accept.h: the
 // writer and the keeper generation of the root before the change), and it applies the entries of a map server in their order. The
@@ -390,14 +365,14 @@ inline std::string object_note(bool here, const char* section, uint16_t crc, uin
 // out of its squad (game->on_death before events::host_on_death: se_stalker:on_death -> squad:on_npc_death -> remove_npc ->
 // unregister_member), a script's remove_npc unregisters a member before it releases it. So the map server keeps what it needs to
 // name the root before the change:
-//   HeldMemory      where the children of its held creatures and the members of its held squads stood at the end of the last frame,
-//                   and every Parent hook since;
+//   HeldMemory      where the children of its held creatures and of its players' characters, and the members of its held squads,
+//                   stood at the end of the last frame, and every Parent hook since;
 //   creature_place  where a Died or a Destroy of a creature goes among the frame's pending ups, and which squad its head names;
 //   ParentNet       which Parent entries of one flush the world can take (the flush writes where an object stands now).
 
 // The parent an object had before the hook that moves it: known (the snapshot or a move since says so; kNoObject: on the ground),
-// or not known (no held creature held it at the end of the last frame and no hook moved it since: its old root is no unit this map
-// server holds, the head names gen 0).
+// or not known (no held creature and no player's character here held it at the end of the last frame and no hook moved it since: its
+// old root is no unit this map server holds, the head names gen 0).
 struct ParentBefore
 {
 	bool known = false;
@@ -482,7 +457,7 @@ private:
 		m_sorted = true;
 	}
 
-	Pairs m_children; // child -> its holder, of the held creatures
+	Pairs m_children; // child -> its holder, of the held creatures and of the players' characters here
 	Pairs m_members; // member -> its squad, of the held squads
 	Pairs m_moved; // item -> its new parent, every Parent hook since the snapshot, in order
 	bool m_sorted = false;
@@ -538,6 +513,10 @@ CreaturePlace creature_place(const Ups& ups, uint16_t creature, uint16_t squad_n
 //   an object back where it stood before its first move (known) changes nothing: left out;
 //   an object whose Spawn was left out (made and gone within the frame) is never heard of by the world: its later entries are left
 //     out too.
+// Server, the departure flood (without this every refusal reads "parent X, moved to X"): a player
+// who leaves the level (quits, drops, takes an exit) has his character switched offline here, every item rejected with a hook and
+// taken back without one. The snapshot knows where those items stood only when it lists his character (client_remember_held); then
+// each is back where it stood and left out here, and unchanged() counts it.
 class ParentNet
 {
 public:
@@ -549,15 +528,54 @@ public:
 	{
 		if (m_unborn.count(id) || !m_placed.insert(id).second)
 			return false;
-		return !before.known || before.parent != parent_now;
+		if (before.known && before.parent == parent_now)
+		{
+			++m_unchanged;
+			return false;
+		}
+		return true;
 	}
+
+	// Objects of this flush whose first Parent was left out because they stand where they stood before it.
+	uint32_t unchanged() const { return m_unchanged; }
 
 private:
 	std::set<uint16_t> m_placed;
 	std::set<uint16_t> m_unborn;
+	uint32_t m_unchanged = 0;
 };
 
-// ---------------------------------------------------------------- R32 W7.2 (§8a A21 E-1): the done-records of numbered ops
+// Does a map server's Parent hook (up_parent) go into the journal? Only for an object its ALife registers (`registered`, read at the
+// hook: the stock hook runs after the move, and an object of the registry is still in it then, its release coming after the reject),
+// and not for one a refused create's repair is releasing (`quiet`: the world never had it). The world has an object of a map server
+// only through that registry: one of the world's own that the map server was given or loaded, or one it made, whose Spawn the
+// registry's hook journals (host_on_entity_registered -> up_spawned). An xrServer entity outside the registry lives on this map server
+// alone while its holder is online, and neither the world nor a save keeps it: CALifeSimulatorBase::create skips an object that cannot
+// be saved (the bolt CInventoryOwner::spawn_supplies gives every NPC that comes online). When its holder goes offline, Perform_destroy
+// rejects it with a hook and destroys it without a release: its Parent "put down" would name an object the world never had, which the
+// world refuses as no such object, and its Fetch repair would ask the world for that object again.
+inline bool journals_parent(bool registered, bool quiet) { return registered && !quiet; }
+
+// Does a Parent out of a player's character go into the journal? Not when no player of this map server plays him any more
+// (`written_here`: its writer rule names this process; false once his player left: his virtual peer leaves the trunk before his
+// character goes offline here). The world writes the parked or departed character by then and refuses every move out of him as not
+// the writer, and its repair (Fetch) asks for the object again. The stock switch offline takes back each item with a hook (ParentNet
+// nets those out) but releases one that cannot be saved (a bolt of his belt): its Parent "put down" and its Destroy both named a
+// character this map server no longer writes. Both are left out (the Destroy through `departed` of client_flush_up); the world keeps the
+// item in him, and the map server of his next map gets it with him. `from_character`: the old holder (ParentBefore) is a player's
+// character.
+inline bool journals_move_out_of_character(bool from_character, bool written_here) { return !from_character || written_here; }
+
+// Does the release of an object go into the journal as its Destroy? Not for a refused create's repair (`quiet`: the world never had
+// it), and not for an object released with its holder (`with_holder`: its holder's release is under way here). The stock release
+// (CALifeSimulatorBase::release) raises the holder's Released hook first and then releases each child, so the holder's Destroy is
+// journaled before its children's; the world applies it with its own release of that holder, which takes the same children with it
+// (release_here, host_gone). Each child's Destroy then found nothing there and printed a refusal, "no such object" (the emission's
+// end on a map server: kill_all_unhided turns an NPC to a zombie, remove_npc releases him with his PDA and pistols; Dev 66 stand,
+// weather_server and cover_server).
+inline bool journals_destroy(bool quiet, bool with_holder) { return !quiet && !with_holder; }
+
+// ---------------------------------------------------------------- the done-records of numbered ops
 //
 // A numbered op that consumes or pays (an exchange, a heal receipt, a give, a story share: coop_ops_done.script) runs once, also when
 // its level moves to another map server. The map server that ran it records {op -> answer} with the effect: a Done entry (DoneBody)
@@ -809,7 +827,7 @@ private:
 	bool m_bad = false;
 };
 
-// §8a A22 open item (a), O6: a starting map server says Ready only once the records its replay raised reached its Lua, so a player that
+// A starting map server says Ready only once the records its replay raised reached its Lua, so a player that
 // Ready lets in retries an op only after the ledger has its record. The replay queues them in levels::frame of frame K
 // (client_replay_done), after that frame's script delivery (coop_sync.cpp: script::frame, then mode().frame()); the engine's queue goes to
 // Lua whole in the script delivery of the next frame whose Lua is up (coop_script.cpp frame: lua_ready(), the inbox, then the engine's

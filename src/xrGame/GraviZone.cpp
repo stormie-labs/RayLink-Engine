@@ -9,7 +9,7 @@
 #include "PhysicsShellHolder.h"
 #include "Level.h"
 #include "CharacterPhysicsSupport.h"
-#include "coop/coop_objects.h" // Anomaly Coop: zone_pull_blocked
+#include "coop/coop_objects.h" // coop: zone_pull_blocked
 
 CBaseGraviZone::CBaseGraviZone(void)
 {
@@ -187,7 +187,7 @@ void CBaseGraviZone::AffectPull(CPhysicsShellHolder* GO, const Fvector& throw_in
 
 void CBaseGraviZone::AffectPullAlife(CEntityAlive* EA, const Fvector& throw_in_dir, float dist)
 {
-	// Anomaly Coop: a player's character on the authority is placed by his PlayerState; his own game pulls its own actor
+	// coop: a player's character on the authority is placed by his PlayerState; his own game pulls its own actor
 	if (coop::objects::zone_pull_blocked(EA->ID()))
 		return;
 	float rel_power = RelativePower(dist, Radius());

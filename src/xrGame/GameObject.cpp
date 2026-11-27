@@ -34,9 +34,9 @@
 #include "../xrengine/xr_collide_form.h"
 #include "script_attachment_manager.h"
 #include "player_hud.h"
-#include "coop/coop_join.h" // Anomaly Coop
-#include "coop/coop_trade.h" // Anomaly Coop: the windows that show an inventory owner let go of it (O2-partner)
-#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode answers the binder's hook (docs/MODES.md section 4)
+#include "coop/coop_join.h"
+#include "coop/coop_trade.h" // coop: the windows that show an inventory owner let go of it
+#include "xrCoop/coop_mode.h" // coop: the session's mode answers the binder's hook (docs/MODES.md section 4)
 extern MagicBox3 MagicMinBox(int iQuantity, const Fvector* akPoint);
 
 #pragma warning(push)
@@ -117,7 +117,7 @@ void CGameObject::net_Destroy()
 
 	VERIFY(m_spawned);
 
-	// Anomaly Coop (O2-partner): a talk or trade window that shows this NPC, trader or corpse lets go of it while it is whole
+	// coop: a talk or trade window that shows this NPC, trader or corpse lets go of it while it is whole
 	if (CInventoryOwner* owner = cast_inventory_owner())
 		coop::trade::on_inv_owner_destroy(*owner);
 
@@ -1052,10 +1052,6 @@ void VisualCallback(IKinematics* tpKinematics)
 		(*I)(tpKinematics);
 }
 
-// Anomaly Coop: xrCore's stack printer (xrDebugNew.cpp, used by the crash handler: Lua stack, then C++ stack).
-// xrDebug.h declares only a one-argument LogStackTrace that has no definition, so the real signature is declared here.
-void LogStackTrace(LPCSTR header, bool printStack);
-
 CScriptGameObject* CGameObject::lua_game_object() const
 {
 	if (!this) return NULL;
@@ -1063,13 +1059,11 @@ CScriptGameObject* CGameObject::lua_game_object() const
 	{
 		Msg("! you are trying to use a destroyed object [%i]", ID());
 		ai().script_engine().print_stack();
-		// Anomaly Coop: who still holds a destroyed object (F0 task 14): C++ stack for the first 3 hits
-		// F0 final review: the first 3 hits after a player left a co-op session (coop::diag), not since the process
-		// started: single player and loads spent them, and every stack stalls the thread that prints it
+		// coop: who still holds a destroyed object: the C++ stack for the first 3 hits after a player left a co-op
+		// session (coop::diag), not since the process started: single player and loads would spend them, and every stack
+		// stalls the thread that prints it
 		if (coop::diag::take_destroyed_object_stack())
 		{
-			static std::mutex s_stack_lock; // DbgHelp behind the stack walker is single-threaded
-			std::lock_guard<std::mutex> lock(s_stack_lock);
 			LogStackTrace("! [coop] C++ stack of the access to a destroyed object (first 3 hits after a player left):",
 			    true);
 		}
@@ -1114,8 +1108,7 @@ void CGameObject::shedule_Update(u32 dt)
 	// Msg							("-SUB-:[%x][%s] CGameObject::shedule_Update",smart_cast<void*>(this),*cName());
 	inherited::shedule_Update(dt);
 
-	// Anomaly Coop: a map server looks first (its mode's binder_may_update). g_dedicated_server is set only for a server's process of
-	// this game, with g_coop_headless (x_ray.cpp; tests/test_mode_hooks.cpp mode_hooks_dedicated_means_headless), whose binders run.
+	// coop: a server's process without a window (g_dedicated_server) asks its mode first (binder_may_update)
 	if (!g_dedicated_server || coop::mode().binder_may_update(this))
 		CScriptBinder::shedule_Update(dt);
 }

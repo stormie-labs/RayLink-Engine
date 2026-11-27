@@ -1,8 +1,8 @@
 // Anomaly Coop — the layout of a player's equipment: which item sits in which slot, on the belt, or (for a thing that
 // would not go there by itself) in the backpack.
 //
-// Why it exists (live 2026-10-23, build 9, GAMMA: "all my gear came off and lay in the backpack, as if I had just
-// entered the game"): a client's slots and belt live on his machine only. His character on the host is a CAI_Stalker
+// Why it exists (without it a returning player finds all his gear in the backpack, as if he had just entered the game):
+// a client's slots and belt live on his machine only. His character on the host is a CAI_Stalker
 // proxy, which has no belt and fills its own slots in the order it took the things; when it goes offline (the player
 // left, was dropped, the group changed level) ALife clears the client data of its items, and the client data is what
 // holds an item's place (CInventoryItem::m_ItemCurrPlace). The player who comes back loads that save: every item with
@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "coop_hash.h"
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -41,7 +43,7 @@ enum class Place : uint8_t
 
 struct Entry
 {
-	uint16_t item = 0xffff; // host numbering
+	uint16_t item = kNoId; // host numbering
 	uint16_t tag = 0; // tag_of(section)
 	Place place = Place::Ruck;
 	uint8_t slot = 0; // Place::Slot only: 1..last slot
@@ -59,17 +61,8 @@ constexpr uint8_t kMaxSlotId = 63;
 constexpr uint8_t kTailVersion = 1;
 constexpr size_t kTailEntryBytes = 5;
 
-// FNV-1a over the section name, folded to 16 bits.
-inline uint16_t tag_of(const char* section)
-{
-	uint32_t h = 2166136261u;
-	for (const char* p = section; p && *p; ++p)
-	{
-		h ^= uint8_t(*p);
-		h *= 16777619u;
-	}
-	return uint16_t((h >> 16) ^ (h & 0xffffu));
-}
+// The section name as a u16 tag (the same value as levels::journal::section_crc).
+inline uint16_t tag_of(const char* section) { return fold16(fnv1a32(section)); }
 
 // Drops what makes no sense (no item, an unknown place, a slot that does not exist, an item or a slot named twice —
 // the first one stays), clears the slot of a belt / backpack entry, cuts at kMaxEntries. Returns how many entries it
@@ -84,7 +77,7 @@ inline size_t sanitize(std::vector<Entry>& v, uint8_t last_slot)
 	for (Entry e : v)
 	{
 		const bool place_ok = e.place == Place::Slot || e.place == Place::Belt || e.place == Place::Ruck;
-		bool ok = e.item != 0xffff && place_ok && items.find(e.item) == items.end();
+		bool ok = e.item != kNoId && place_ok && items.find(e.item) == items.end();
 		if (ok && e.place == Place::Slot)
 			ok = e.slot >= 1 && e.slot <= last_slot && e.slot <= kMaxSlotId && slots.find(e.slot) == slots.end();
 		if (ok && kept.size() >= kMaxEntries)

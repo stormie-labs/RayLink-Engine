@@ -1,4 +1,4 @@
-// Anomaly Coop — which hits on players' characters the host passes on, and which the host player drops (R-5.1, R3 В2).
+// Anomaly Coop — which hits on players' characters the host passes on, and which the host player drops.
 // The host computes the world's damage. A hit that lands on another player's character (its proxy on the host) goes to
 // that player as PlayerHit; the character itself is never damaged on the host. Hits the player's own game computes
 // (falls, anomalies, physics) stay on that game.
@@ -7,11 +7,13 @@
 
 #include <cstdint>
 
+#include "coop_ids.h"
+
 namespace coop
 {
 namespace hits
 {
-constexpr uint16_t kNoObject = 0xffff;
+constexpr uint16_t kNoObject = kNoId;
 // The host's actor. Also the weapon id of a hit built without one (SHit(), Lua hit() with the default weapon_id).
 constexpr uint16_t kHostActor = 0;
 
@@ -26,13 +28,13 @@ enum class Source : uint8_t
 };
 
 // The weapon of a hit names the character's own explosive: not the character, not "none", and not the host's actor
-// id 0 that a hit built without a weapon carries (R3 В2 review).
+// id 0 that a hit built without a weapon carries.
 inline bool names_own_weapon(uint16_t weapon_id, uint16_t victim_id)
 {
 	return weapon_id != victim_id && weapon_id != kNoObject && weapon_id != kHostActor;
 }
 
-// A blast wave or fragment: the weapon is an explosive. Or its late fragment (R3 В2 review): an explosive that went off
+// A blast wave or fragment: the weapon is an explosive. Or its late fragment: an explosive that went off
 // by itself is its own initiator, and with explode_duration 0 (mines, IEDs, RPG rockets) it is removed a few frames
 // after the blast while its fragments still fly — then neither the initiator nor the weapon is online, and the hit
 // names one object as both. Online objects that name themselves (artefacts, a poltergeist's flame, collisions) are not
@@ -55,7 +57,7 @@ struct ProxyHit
 //   Self      its own explosive: blast and fragments name the explosive as the weapon (a fall names the character)
 //   Player    only with friendly fire on
 //   Creature  always
-//   Object, Missing  only an explosion (R3 В2): a client's explosions are only a picture (WP7), so the player gets their
+//   Object, Missing  only an explosion: a client's explosions are only a picture, so the player gets their
 //             damage from here or not at all; anything else of that kind (anomalies, physics) its own game computes
 inline bool to_owner(const ProxyHit& h, bool friendly_fire)
 {
@@ -97,7 +99,7 @@ inline const char* source_name(Source s)
 }
 
 // The journal of the damage passed on to one player (the host or a map server) or taken from the authority (a client), live
-// 2026-11-08: a client's health ran down on a level a map server ran and stopped when the map server went away, and no log
+// A client's health ran down on a level a map server ran and stopped when the map server went away, and no log
 // said what hit him. Every hit counts. The first kJournalFirst hits of a kJournalWindowMs window get a line of their own;
 // the rest are counted quietly, and the next hit after the window says how many there were and how much they took. A steady
 // drain writes at most kJournalFirst + 1 lines per window and player.
@@ -147,7 +149,7 @@ inline JournalLine journal_note(Journal& j, uint64_t now, float power)
 	return out;
 }
 
-// --- anomaly zones on a client (build 51: "the Electra does not damage clients")
+// --- anomaly zones on a client: they must damage him
 // A client switches a zone only to the host's states, and learns of a Blowout late (the host's frame, the wire, its own
 // frame). CCustomZone::UpdateBlowout fires the blast only when the state clock crosses m_dwBlowoutExplosionTime (0 for an
 // Electra): started with any elapsed time, the Blowout never hit. One not long over starts at its blast.

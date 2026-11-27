@@ -1,11 +1,11 @@
-// Anomaly Coop - the host's rules for the two sides of a client's item move (Rulings F2-32, F2-32b; F2 T12 round 1).
+// Anomaly Coop - the host's rules for the two sides of a client's item move.
 // coop_requests.cpp host_move checks the request first (the item exists, it is where the client thinks, the requester
 // owns one side, never another player's pockets, the destination is a container, reach) and then these rules on the
 // two sides it fills from the game:
-//   - a live NPC's inventory, out of it or into it (Ruling F2-32b), only while the requesting player holds the talk
+//   - a live NPC's inventory, out of it or into it, only while the requesting player holds the talk
 //     lock of that NPC (a mechanic returning a repaired item, a dialog handing an item over) or when the NPC is a
-//     companion of the group (owner 2026-11-01: one backpack for every player, whoever leads the squad; the stock
-//     companion inventory opens without a dialog, axr_companions). With Ruling F2-30 a client may move an item out of
+//     companion of the group (one backpack for every player, whoever leads the squad; the stock
+//     companion inventory opens without a dialog, axr_companions). A client may move an item out of
 //     another's inventory to its own actor; without this rule it could take anything from a live trader in reach. A
 //     stranger without a talk is refused;
 //   - box and corpse locks as the stock game keeps them in its UI: a closed box (inv_box_closed) or corpse
@@ -78,8 +78,8 @@ inline Verdict check(const Side& src, const Side& dst)
 	return Verdict::Ok;
 }
 
-// An item used up where it lies (live 2026-11-01: a multitool takes apart what is in a stash; refused, the item stayed and the
-// parts came all the same). Allowed in the inventories a player may take it out of, under the same rules.
+// An item used up where it lies (a multitool takes apart what is in a stash: refused, the item would stay and the parts
+// come all the same). Allowed in the inventories a player may take it out of, under the same rules.
 inline Verdict destroy_check(const Side& holder)
 {
 	if (holder.kind != Side::Box && holder.kind != Side::Corpse && holder.kind != Side::LiveNpc)

@@ -39,8 +39,8 @@
 
 #include "controller_psy_hit.h"
 #include "../monster_cover_manager.h"
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
-#include "../../../coop/coop_ai.h" // Anomaly Coop (protocol 29): player_god
+#include "../../../coop/coop_monster_fx.h"
+#include "../../../coop/coop_ai.h" // coop: player_god
 //#include "controller_psy_aura.h"
 
 #ifdef _DEBUG
@@ -379,15 +379,13 @@ void CController::play_control_sound_start()
 	control_start_sound.play_at_pos(const_cast<CEntityAlive*>(EnemyMan.get_enemy()), pos);
 }
 
-void CController::play_control_sound_hit()
+void CController::play_control_sound_hit(const CEntityAlive* target)
 {
-	if (!EnemyMan.get_enemy())
-		return; // Anomaly Coop: a puppet plays it for our actor (control_fx_on_actor)
-	Fvector pos = EnemyMan.get_enemy()->Position();
+	Fvector pos = target->Position();
 	pos.y += 1.5f;
 
 	if (control_hit_sound._feedback()) control_hit_sound.stop();
-	control_hit_sound.play_at_pos(const_cast<CEntityAlive*>(EnemyMan.get_enemy()), pos);
+	control_hit_sound.play_at_pos(const_cast<CEntityAlive*>(target), pos);
 }
 
 void CController::reload(LPCSTR section)
@@ -431,7 +429,7 @@ void CController::control_hit()
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(EnemyMan.get_enemy()));
 	if (!pA)
 	{
-		// Anomaly Coop (audit A5): a remote player's character took the psy hit above (PlayerHit); his machine shakes
+		// coop: a remote player's character took the psy hit above (PlayerHit); his machine shakes
 		coop::monster_fx::host_send(EnemyMan.get_enemy(), this, coop::monster_fx::kControllerControl, 0, 0.f);
 		return;
 	}
@@ -448,8 +446,7 @@ void CController::control_fx_on_actor()
 	                                                          m_control_effector.time_attack,
 	                                                          m_control_effector.time_release));
 
-	if (control_hit_sound._feedback()) control_hit_sound.stop();
-	control_hit_sound.play_at_pos(Actor(), Fvector(Actor()->Position()).add(Fvector().set(0.f, 1.5f, 0.f)));
+	play_control_sound_hit(Actor());
 	/*
 		active_control_fx			= true;
 		time_control_hit_started	= Device.dwTimeGlobal;
@@ -461,7 +458,7 @@ void CController::control_fx_on_actor()
 void CController::UpdateCL()
 {
 	inherited::UpdateCL();
-	m_psy_hit->coop_update(); // Anomaly Coop (audit A5): a client's tube whose end never came
+	m_psy_hit->coop_update(); // coop: a client's tube whose end never came
 
 	if (m_sndShockEffector)
 	{
@@ -534,7 +531,7 @@ void CController::Die(CObject* who)
 
 void CController::net_Destroy()
 {
-	m_psy_hit->coop_abort(); // Anomaly Coop (audit A5): a puppet that leaves mid-tube lets our actor go
+	m_psy_hit->coop_abort(); // coop: a puppet that leaves mid-tube lets our actor go
 	inherited::net_Destroy();
 
 	FreeFromControl();
@@ -595,8 +592,7 @@ void CController::draw_fire_particles_to(const CEntityAlive* target)
 	/*if (Random.randI(100) > 30)*/
 	{
 		//		Hit_Psy						(enemy, m_tube_damage / 2.f);
-		if (control_hit_sound._feedback()) control_hit_sound.stop(); // as play_control_sound_hit, at the target
-		control_hit_sound.play_at_pos(enemy, Fvector(enemy->Position()).add(Fvector().set(0.f, 1.5f, 0.f)));
+		play_control_sound_hit(enemy);
 	}
 
 	//m_sound_hit_fx.set_volume(10.0f);
@@ -774,7 +770,7 @@ void CController::HitEntity(const CEntity* pEntity, float fDamage, float impulse
 {
 	if (pEntity == Actor())
 		stamina_hit_actor();
-	else if (!coop::npc_ai::player_god(pEntity)) // Anomaly Coop (audit A5): a remote player's machine drains its own actor; not a god's
+	else if (!coop::npc_ai::player_god(pEntity)) // coop: a remote player's machine drains its own actor; not a god's
 		coop::monster_fx::host_send(pEntity, this, coop::monster_fx::kControllerStamina, 0, 0.f);
 
 	inherited::HitEntity(pEntity, fDamage, impulse, dir, hit_type, draw_hit_marks);
@@ -782,7 +778,7 @@ void CController::HitEntity(const CEntity* pEntity, float fDamage, float impulse
 
 void CController::stamina_hit_actor()
 {
-	if (coop::npc_ai::player_god(Actor())) // Anomaly Coop (A.2 p. 7): the god of the player it lands on, was GodMode() of the process
+	if (coop::npc_ai::player_god(Actor())) // coop: the god of the player it lands on, was GodMode() of the process
 		return;
 	Actor()->conditions().PowerHit(m_stamina_hit, false);
 	if (Actor()->conditions().GetPower() < m_stamina_hit)

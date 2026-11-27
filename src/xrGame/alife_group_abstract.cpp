@@ -162,7 +162,7 @@ void CSE_ALifeGroupAbstract::try_switch_offline()
 				// to switch offline
 				break;
 
-			if (coop::observer_distance(tpGroupMember->o_Position) <= I->alife().offline_distance()) // Anomaly Coop
+			if (coop::observer_distance(tpGroupMember->o_Position) <= I->alife().offline_distance()) // coop: the nearest player, not only the actor
 				// so, it is not ready, breaking a cycle, because we can't 
 				// switch group offline since not all the group members are ready
 				// to switch offline

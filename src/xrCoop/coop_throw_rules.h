@@ -1,9 +1,9 @@
-// Anomaly Coop (R32 W7 follow-up, TZ P32/P38): when a player's machine may start a throw, and what a save does
+// Anomaly Coop: when a player's machine may start a throw, and what a save does
 // with a thrown hand item the authority has not yet removed. Pure rules, no engine types (tests/test_throw_rules.cpp).
 //
 // A throw of an item whose create is still pending (its leased id not confirmed by the authority) cannot be made:
 // the authority does not have the item yet and refuses the throw, and the hand item's own destroy, held by the
-// lease rule (coop_requests.cpp, W7) until the create is confirmed, would then use it up with no throw. So the throw
+// lease rule (coop_requests.cpp) until the create is confirmed, would then use it up with no throw. So the throw
 // does not start while the lease waits; the item stays in hand and the player can throw it a moment later. Nothing is
 // dropped: no request is sent, nothing is destroyed.
 //

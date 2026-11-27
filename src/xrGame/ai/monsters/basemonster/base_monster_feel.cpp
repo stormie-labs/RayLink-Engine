@@ -25,9 +25,9 @@
 #include "profiler.h"
 #include "../../../ActorEffector.h"
 #include "../../../../xrEngine/CameraBase.h"
-#include "../../../coop/coop_remote.h" // Anomaly Coop
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F2)
-#include "../../../coop/coop_presence.h" // Anomaly Coop (audit F7)
+#include "../../../coop/coop_remote.h"
+#include "../../../coop/coop_monster_fx.h"
+#include "../../../coop/coop_presence.h"
 
 void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr user_data, const Fvector& Position,
                                   float power)
@@ -82,7 +82,7 @@ void CBaseMonster::feel_sound_new(CObject* who, int eType, CSound_UserDataPtr us
 void CBaseMonster::HitEntity(const CEntity* pEntity, float fDamage, float impulse, Fvector& dir,
                              ALife::EHitType hit_type, bool draw_hit_marks)
 {
-	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
+	if (coop::remote::is_remote_creature(this)) return; // coop: the host deals puppet damage
 	if (!g_Alive()) return;
 	if (!pEntity || pEntity->getDestroy()) return;
 
@@ -120,7 +120,7 @@ void CBaseMonster::HitEntity(const CEntity* pEntity, float fDamage, float impuls
 		{
 			if (pEntityNC == Actor())
 				melee_fx_on_actor(fDamage, hit_dir, dir);
-			else // Anomaly Coop (audit F2): a client took the damage only, and walked out of a melee that pins the host
+			else // coop: a client took the damage only, and walked out of a melee that pins the host
 				coop::monster_fx::host_send(pEntity, this, coop::monster_fx::kMeleeHit, 0, fDamage);
 		}
 
@@ -130,8 +130,8 @@ void CBaseMonster::HitEntity(const CEntity* pEntity, float fDamage, float impuls
 	}
 }
 
-// Claw marks, the stagger and the camera shove of a blow that landed on this machine's actor. Anomaly Coop (audit F2): on a
-// client the monster is a puppet and this comes from the host (monster_fx::kMeleeHit).
+// Claw marks, the stagger and the camera shove of a blow that landed on this machine's actor. coop: on a client the monster
+// is a puppet and this comes from the host (monster_fx::kMeleeHit).
 void CBaseMonster::melee_fx_on_actor(float fDamage, const Fvector& hit_dir, Fvector& dir)
 {
 	START_PROFILE("BaseMonster/Animation/HitEntity")
@@ -275,7 +275,7 @@ void CBaseMonster::HitSignal(float amount, Fvector& vLocalDir, CObject* who, s16
 	else if ((yaw >= 5 * PI_DIV_4) && (yaw <= 7 * PI_DIV_4)) hit_side = eSideRight;
 
 	anim().FX_Play(hit_side, 1.0f);
-	coop::presence::on_monster_flinch(this, u8(hit_side)); // Anomaly Coop (audit F7)
+	coop::presence::on_monster_flinch(this, u8(hit_side)); // coop: the clients' copies flinch with it
 
 	HitMemory.add_hit(who, hit_side);
 
@@ -312,7 +312,7 @@ void CBaseMonster::SetAttackEffector()
 
 void CBaseMonster::Hit_Psy(CObject* object, float value)
 {
-	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
+	if (coop::remote::is_remote_creature(this)) return; // coop: the host deals puppet damage
 	NET_Packet P;
 	SHit HS;
 	HS.GenHeader(GE_HIT, object->ID()); //					//	u_EventGen		(P,GE_HIT, object->ID());				// 
@@ -330,7 +330,7 @@ void CBaseMonster::Hit_Psy(CObject* object, float value)
 
 void CBaseMonster::Hit_Wound(CObject* object, float value, const Fvector& dir, float impulse)
 {
-	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop: the host deals puppet damage
+	if (coop::remote::is_remote_creature(this)) return; // coop: the host deals puppet damage
 	NET_Packet P;
 	SHit HS;
 	HS.GenHeader(GE_HIT, object->ID()); //	u_EventGen	(P,GE_HIT, object->ID());

@@ -222,7 +222,7 @@ std::pair<LPCSTR,LPCSTR> *CStalkerAnimationPair::blend_id	(IKinematicsAnimated *
 
 void CStalkerAnimationPair::select_animation(const ANIM_VECTOR& array, const ANIMATION_WEIGHTS* weights)
 {
-	// Anomaly Coop (RL-4BXZ-R24J): a table the visual has no motion of (3_critical_hit_*, a missing draw_ / holster_) is
+	// coop: a table the visual has no motion of (3_critical_hit_*, a missing draw_ / holster_) is
 	// empty; both branches below read array[0] then. No motion: the caller's "no animation" path takes over.
 	if (array.empty())
 	{

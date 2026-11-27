@@ -10,16 +10,15 @@ namespace coop
 {
 namespace validate
 {
-// Not NaN and not +-inf.
-inline bool finite(float x)
-{
-	return std::isfinite(x);
-}
+// Transitional: coop_requests.cpp still calls it; it goes when that file calls std::isfinite.
+inline bool finite(float x) { return std::isfinite(x); }
 
-inline bool finite3(const float v[3])
-{
-	return finite(v[0]) && finite(v[1]) && finite(v[2]);
-}
+// Not NaN and not +-inf, all three.
+inline bool finite3(float x, float y, float z) { return std::isfinite(x) && std::isfinite(y) && std::isfinite(z); }
+inline bool finite3(const float v[3]) { return finite3(v[0], v[1], v[2]); }
+
+// A float in [0, 1]; NaN stays NaN.
+inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
 // |v| <= max_speed. A non-finite component or a NaN / negative limit fails. Summed in double: squares of huge
 // finite floats would overflow a float.
@@ -85,7 +84,7 @@ inline bool resource_name_ok(const char* s, std::size_t max_len)
 // The engine's "no bone" (BI_NONE = u16(-1)): the default of SHit, every hit path handles it.
 constexpr unsigned kNoBone = 0xffffu;
 
-// R3 В5: a hit's bone from a peer indexes the target's skeleton unchecked (CPHShell::applyImpulseTrace,
+// A hit's bone from a peer indexes the target's skeleton unchecked (CPHShell::applyImpulseTrace,
 // LL_GetBoneInstance, hit scales, wounds): it is a bone of that skeleton or "no bone".
 inline bool bone_ok(unsigned bone, unsigned bone_count)
 {

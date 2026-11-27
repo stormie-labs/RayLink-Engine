@@ -1,10 +1,12 @@
-// Anomaly Coop — a client's ReqSpawn on the wire, what the host checks before it constructs the entity (R3 В6) and
-// what a client may ask for at all: engine item classes, no quest items, a cost budget per character (F2 T2).
+// Anomaly Coop — a client's ReqSpawn on the wire, what the host checks before it constructs the entity and
+// what a client may ask for at all: engine item classes, no quest items, a cost budget per character.
 // The host never reads a peer's raw M_SPAWN bytes (Spawn_Read trusts every byte): it builds the entity from its own
 // section, after checking that the section has the lines the entity's constructor reads unchecked.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
+#include "coop_bucket.h"
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 #include <cstddef>
@@ -22,47 +24,39 @@ constexpr size_t kMaxItemState = 4096;
 
 namespace spawn
 {
-constexpr uint8_t kMarkerRaw = 0xC5; // raw M_SPAWN bytes (older clients): refused
 constexpr uint8_t kMarkerState = 0xC6; // section + item state
-constexpr uint8_t kMarkerLeased = 0xC7; // section + item state, created on the client under a leased id (F2 T12b)
+constexpr uint8_t kMarkerLeased = 0xC7; // section + item state, created on the client under a leased id
 constexpr size_t kMaxSection = 255; // string256
-constexpr uint16_t kNoId = 0xffff;
+using coop::kNoId;
 
 // Wire (client -> host, ids in host numbering):
 //   State   u32 seq, u8 0xC6, u16 parent, vec3 pos, str section, varu n, n bytes item state (coop_items blob)
 //   Leased  u32 seq, u8 0xC7, u16 parent, u16 id, u16 source, vec3 pos, str section, varu n, n bytes item state
 //           id: leased to the asker (xrCoop/coop_id_lease.h), the client has the item under it already; source: the
-//           weapon a clone replaces (alife():clone_weapon; the host releases it with the clone), 0xffff for a create
-//   Legacy  str section, u16 parent, vec3 pos  (no seq)
-//   Raw     u32 seq, u8 0xC5, ...              (refused)
+//           weapon a clone replaces (alife():clone_weapon; the host releases it with the clone), kNoId for a create
+// Any other marker, or a message too short to hold one: Unknown, refused.
 enum class Layout : uint8_t
 {
-	Legacy,
+	Unknown,
 	State,
-	Raw,
-	Leased, // F2 T12b
+	Leased,
 };
 
-// Byte 4 is the marker after u32 seq. The legacy layout starts with a short string (length < 0x80), so its byte 4
-// is a letter of the section (or the parent id for a section shorter than 4 characters).
+// Byte 4 is the marker after u32 seq.
 inline Layout detect(const uint8_t* data, size_t size)
 {
 	if (!data || size < 5)
-		return Layout::Legacy;
+		return Layout::Unknown;
 	if (data[4] == kMarkerState)
 		return Layout::State;
 	if (data[4] == kMarkerLeased)
 		return Layout::Leased;
-	if (data[4] == kMarkerRaw)
-		return Layout::Raw;
-	return Layout::Legacy;
+	return Layout::Unknown;
 }
-
-inline bool has_seq(Layout layout) { return layout != Layout::Legacy; }
 
 struct Request
 {
-	uint16_t parent = 0xffff;
+	uint16_t parent = kNoId;
 	float pos[3] = {0.f, 0.f, 0.f};
 	std::string section;
 	const uint8_t* state = nullptr; // points into the message
@@ -71,19 +65,12 @@ struct Request
 	uint16_t source = kNoId; // Leased: the weapon a clone replaces
 };
 
-// Reads what follows u32 seq (State) or the whole message (Legacy). False = malformed, or the Raw layout.
+// Reads what follows u32 seq. False = malformed, or the Unknown layout.
 inline bool read_body(Reader& r, Layout layout, Request& out)
 {
 	out = Request();
-	if (layout == Layout::Raw)
+	if (layout == Layout::Unknown)
 		return false;
-	if (layout == Layout::Legacy)
-	{
-		out.section = r.str();
-		out.parent = r.u16();
-		r.vec3(out.pos);
-		return r.ok();
-	}
 	const uint8_t marker = r.u8();
 	out.parent = r.u16();
 	if (marker == kMarkerLeased)
@@ -91,7 +78,7 @@ inline bool read_body(Reader& r, Layout layout, Request& out)
 		out.id = r.u16();
 		out.source = r.u16();
 		if (!r.ok() || out.id == 0 || out.id == kNoId)
-			return false; // 0 is the actor, 0xffff no id: never leased
+			return false; // 0 is the actor, kNoId no id: never leased
 	}
 	r.vec3(out.pos);
 	out.section = r.str();
@@ -116,7 +103,7 @@ inline void write_state(Writer& w, uint32_t seq, uint16_t parent, const float po
 		w.bytes(state, state_size);
 }
 
-// F2 T12b round 1 (review I1): the item state the host builds a request's entity with. A clone (`source` set) takes the
+// The item state the host builds a request's entity with. A clone (`source` set) takes the
 // state of the host's own source (`source_state`, as lua_clone copies it on the client), whatever the client's blob says:
 // otherwise a modified client gets upgrades, a full magazine and a repair for the price difference. A create takes the
 // client's blob (checked like any ItemState).
@@ -140,7 +127,7 @@ inline StateRef spawn_state(uint16_t source, const uint8_t* client_state, size_t
 	return s;
 }
 
-// F2 T12b: the request of an item the client created already under leased `id` (source: a clone's weapon, or kNoId).
+// The request of an item the client created already under leased `id` (source: a clone's weapon, or kNoId).
 inline void write_leased(Writer& w, uint32_t seq, uint16_t parent, uint16_t id, uint16_t source, const float pos[3],
     std::string_view section, const uint8_t* state, size_t state_size)
 {
@@ -156,7 +143,7 @@ inline void write_leased(Writer& w, uint32_t seq, uint16_t parent, uint16_t id, 
 		w.bytes(state, state_size);
 }
 
-// ---------------------------------------------------------------- what a client may ask for (F2 T2)
+// ---------------------------------------------------------------- what a client may ask for
 // A client may ask the host only for an item of an engine item class: the entity a section's `class` names must be
 // an inventory item (CSE_ALifeItem and below) or a launcher's rocket (CSE_Temporary), registered in a game that is
 // not a dedicated server. Everything else (stalkers, monsters, zones, physics objects, boxes, squads) has no rule.
@@ -180,15 +167,14 @@ enum class CseClass : uint8_t
 	Torch, // CSE_ALifeItemTorch
 	PDA, // CSE_ALifeItemPDA
 	Document, // CSE_ALifeItemDocument
-	// Classes Anomaly registers too (not in the F2 T2 brief's list):
+	// Classes Anomaly registers too:
 	WeaponAutoShotGun, // CSE_ALifeItemWeaponAutoShotGun: WP_ASHTG (se_weapon_automatic_shotgun)
 	Helmet, // CSE_ALifeItemHelmet: E_HLMET (se_helmet)
-	Temporary, // CSE_Temporary: G_RPG7, G_FAKE, a launcher's rocket the client's weapon asks for as its child (W3a)
+	Temporary, // CSE_Temporary: G_RPG7, G_FAKE, a launcher's rocket the client's weapon asks for as its child
 };
-constexpr uint8_t kCseClassCount = uint8_t(CseClass::Temporary) + 1;
 
 // The game object the factory builds for a clsid (its client class), grouped by what its constructor, Load and
-// net_Spawn read from the item's own section without line_exist (Ruling F2-17). The host builds that object too
+// net_Spawn read from the item's own section without line_exist. The host builds that object too
 // (Process_spawn), so a missing line of it is as FATAL as one of the server entity. Lines: kGameGroups below.
 enum class GameClass : uint8_t
 {
@@ -218,18 +204,16 @@ enum class GameClass : uint8_t
 	WeaponRocket, // CWeaponRG6, CWeaponSSRS (CRocketLauncher)
 	WeaponRPG7, // CWeaponRPG7
 };
-constexpr uint8_t kGameClassCount = uint8_t(GameClass::WeaponRPG7) + 1;
 
 struct ClassRule
 {
 	std::string_view clsid; // the `class` value of a section, as TEXT2CLSID reads it (case-sensitive, <= 8 chars)
 	CseClass cse;
-	GameClass game; // its game object (Ruling F2-17)
+	GameClass game; // its game object
 };
 
 // Every item class of the game, one rule per clsid, with its server entity class and the group of its game object (the
-// client class of the same registration: every Load above it must be in its group's `loads`). Sources
-// (tools/check_spawn_classes.py checks this table against them and fails on any difference, the cited lines included):
+// client class of the same registration: every Load above it must be in its group's `loads`). Registration sources:
 //   engine :N  engine/src/xrServerEntities/object_factory_register.cpp line N, an ADD(..., CSE_ALifeItem* or
 //              CSE_Temporary, id, ...) before `if (!g_dedicated_server) return;` (the ADDs after it exist only on a
 //              dedicated server); id from clsid_game.h or TEXT2CLSID;
@@ -419,7 +403,7 @@ inline std::vector<const char*> required_lines(CseClass cse)
 	return lines;
 }
 
-// ---------------------------------------------------------------- the game object's lines (Ruling F2-17)
+// ---------------------------------------------------------------- the game object's lines
 // When a line of the game object's Load is read at all, decided by other lines of the same section. Ini (missing_line)
 // answers has(line), number(line) (atoi, as r_s32 / r_u32; 0 if missing) and flag(line) (r_bool; false if missing).
 enum class When : uint8_t
@@ -446,7 +430,7 @@ struct GameLine
 {
 	const char* line;
 	When when;
-	const char* src; // the read, file:line in engine/src/xrGame (tools/check_spawn_classes.py checks each one)
+	const char* src; // source of the unchecked read, file:line in engine/src/xrGame
 };
 
 // CInventoryItem::Load, every item.
@@ -712,8 +696,8 @@ constexpr LineBlock block(const GameLine (&lines)[N])
 }
 
 // The blocks of each group, in Load order. `loads`: every class with its own Load(LPCSTR) above the group's client
-// classes (up to CGameObject), so the blocks cover all of them; tools/check_spawn_classes.py walks each client class's
-// bases in xrGame and fails on a Load that is not listed. A listed Load with no block reads nothing unchecked.
+// classes (up to CGameObject), so the blocks cover their unchecked reads in xrGame. A listed Load with no block
+// reads nothing unchecked.
 struct GameGroup
 {
 	GameClass game;
@@ -915,15 +899,15 @@ struct SectionFacts
 	uint32_t cost = 0;
 	bool allow_listed = false;
 	bool deny_listed = false;
-	bool in_dialog_to_own_actor = false; // Ruling F2-16
-	bool parent_ok = true; // review round 2, Important 1
-	bool queue_waiting = false; // Ruling F2-21
-	bool launch_child = false; // Ruling F2-22: a child its parent item takes (child_allowed): a shot
+	bool in_dialog_to_own_actor = false;
+	bool parent_ok = true; // child_allowed
+	bool queue_waiting = false;
+	bool launch_child = false; // a child its parent item takes (child_allowed): a shot
 };
 
 // What the budget does not charge (and the queue does not hold): an allow-listed section, and a child its parent item
-// takes (Ruling F2-22: a rocket in its launcher, a fake missile in its grenade or bolt - a shot, the charge already
-// left the client's inventory; waiting would refuse the shot; task 3's rate limits bound how often).
+// takes (a rocket in its launcher, a fake missile in its grenade or bolt - a shot, the charge already
+// left the client's inventory; waiting would refuse the shot; the rate limits bound how often).
 inline bool budget_free(const SectionFacts& facts)
 {
 	return facts.allow_listed || facts.launch_child;
@@ -932,23 +916,22 @@ inline bool budget_free(const SectionFacts& facts)
 // coop_dialog kTalkReach: a client talks only to an NPC his character stands by on the host (host_try_lock).
 constexpr float kTalkReach = 6.f;
 
-// Ruling F2-16: the stock dialogs create a quest reward on the client (alife_create_item(section, db.actor), the talk
+// The stock dialogs create a quest reward on the client (alife_create_item(section, db.actor), the talk
 // runs there). A quest item is a gift only into the asking player's own character (`parent` is his proxy on the host)
 // while he holds a talk lock with an NPC (coop_dialog host_lock_of) and his character stands within talk reach of that
-// NPC (round 2: as host_try_lock; `npc_distance` 0 for an NPC that talks from afar, NeedOsoznanieMode).
+// NPC.
 inline bool quest_gift(bool holds_talk_lock, float npc_distance, uint16_t parent, uint16_t own_character)
 {
-	return holds_talk_lock && npc_distance <= kTalkReach && own_character != 0xffff && parent == own_character;
+	return holds_talk_lock && npc_distance <= kTalkReach && own_character != kNoId && parent == own_character;
 }
 
-// Review round 2, Important 1: what may be created inside one of the player's items (the parent is not his character).
+// What may be created inside one of the player's items (the parent is not his character).
 // The host gives the parent the new entity with GE_OWNERSHIP_TAKE, and the items whose handler takes a child cast it
 // unchecked: CRocketLauncher::AttachRocket (RocketLauncher.cpp:56-57) to CCustomRocket, CMissile::OnEvent
 // (Missile.cpp:606-608) to CMissile. So only a rocket into a weapon with a rocket launcher; nothing else into an item.
-// Round 5 (Ruling F2-23):
 // - a launcher takes its rocket whatever it holds: the host itself loads a rocket into its copy of a loaded launcher
-//   (CWeaponRPG7::net_Spawn, CWeaponRG6::net_Spawn a rocket per round, the grenade launcher), so round 4's "room"
-//   refused every honest shot after a join or a load. A rocket is a CSE_Temporary (not saved, cheap), and the
+//   (CWeaponRPG7::net_Spawn, CWeaponRG6::net_Spawn a rocket per round, the grenade launcher), so a limit on the room in it
+//   would refuse every honest shot after a join or a load. A rocket is a CSE_Temporary (not saved, cheap), and the
 //   ReqSpawn rate limit bounds a flood;
 // - a grenade or bolt takes no child from a client: a fair client never asks for a fake missile (coop_objects.cpp
 //   skip_fake_missile = is_client()), and a fake missile is a whole ALife grenade that ReqDrop takes out (free grenades).
@@ -964,7 +947,7 @@ inline bool child_allowed(GameClass parent, std::string_view /*parent_section*/,
 	}
 }
 
-// Round 4 minor: what may be created straight into the player's character: any item but a launcher's rocket
+// What may be created straight into the player's character: any item but a launcher's rocket
 // (CSE_Temporary): a fair client asks for one only as its launcher's child.
 inline bool character_takes(GameClass child)
 {
@@ -980,14 +963,9 @@ struct SpawnPolicy
 };
 
 // One character's budget. It starts full at the character's first counted request.
-struct CostBudget
-{
-	double tokens = 0;
-	uint64_t at = 0; // ms of the last refill
-	bool started = false;
-};
+using CostBudget = TokenBucket;
 
-// Ruling F2-21: what an item takes from the budget: its cost, at most the whole burst (an item dearer than the burst
+// What an item takes from the budget: its cost, at most the whole burst (an item dearer than the burst
 // waits for a full budget instead of being refused for ever).
 inline uint32_t charge_of(uint32_t cost, const SpawnPolicy& policy)
 {
@@ -999,27 +977,13 @@ inline uint32_t charge_of(uint32_t cost, const SpawnPolicy& policy)
 inline bool charge(CostBudget& budget, uint32_t cost, const SpawnPolicy& policy, uint64_t now_ms)
 {
 	const double burst = double(policy.cost_burst);
-	if (!budget.started)
-	{
-		budget.started = true;
+	budget.refill(now_ms, burst, [&policy](uint64_t ms) { return double(ms) * double(policy.cost_per_sec) / 1000.0; });
+	if (budget.tokens > burst) // the policy's burst was lowered since the last refill
 		budget.tokens = burst;
-		budget.at = now_ms;
-	}
-	else if (now_ms > budget.at)
-	{
-		budget.tokens += double(now_ms - budget.at) * double(policy.cost_per_sec) / 1000.0;
-		budget.at = now_ms;
-	}
-	if (budget.tokens > burst)
-		budget.tokens = burst;
-	const double amount = double(charge_of(cost, policy));
-	if (amount > budget.tokens)
-		return false;
-	budget.tokens -= amount;
-	return true;
+	return budget.take(double(charge_of(cost, policy)));
 }
 
-// Ruling F2-21 (3): the charge of an item the engine then refused goes back (up to the burst).
+// The charge of an item the engine then refused goes back (up to the burst).
 inline void refund(CostBudget& budget, uint32_t cost, const SpawnPolicy& policy)
 {
 	budget.tokens += double(charge_of(cost, policy));
@@ -1045,7 +1009,7 @@ enum class SpawnVerdict : uint8_t
 //   4. deny-listed                            -> Denied
 //   5. allow-listed                           -> Allow, the budget untouched
 //   6. a quest item, unless a quest gift      -> QuestItem
-//   7. a child its parent item takes (launch_child, Ruling F2-22) -> Allow, the budget untouched, no queue
+//   7. a child its parent item takes (launch_child) -> Allow, the budget untouched, no queue
 //   8. requests of the character wait in the queue, or the budget does not hold charge_of(cost)
 //                                             -> OverBudget (nothing taken); else Allow and the charge is taken.
 // Only step 8 reads or changes `budget` (budget_free: steps 5 and 7 do not); a quest gift goes on to it like any item.
@@ -1071,9 +1035,9 @@ inline SpawnVerdict judge(const ClassRule* rule, const char* missing_line, const
 	return SpawnVerdict::Allow;
 }
 
-// Cost budgets per character for the whole session (Ruling F2-11): a player who leaves and joins again finds his
+// Cost budgets per character for the whole session: a player who leaves and joins again finds his
 // budget as he left it, whatever his new connection is; only a session start or end clears the book. The key is the
-// character's player key, as the money book's (ledger::character_key, Ruling F2-18): loading an older save gives the
+// character's player key, as the money book's (ledger::character_key): loading an older save gives the
 // same player's character another proxy id. A key the book has not seen yet starts with the full burst (the number of
 // new characters per session is a host setting of its own).
 class BudgetBook
@@ -1087,28 +1051,28 @@ private:
 	std::map<std::string, CostBudget> m_budgets;
 };
 
-// Ruling F2-21 (2): a request over its character's budget is not refused: it waits on the host, first in first out
+// A request over its character's budget is not refused: it waits on the host, first in first out
 // per character (budget key), and is created when the budget has refilled for it. Otherwise a fair mass disassembly
 // or craft would lose items: the inputs are already spent, the outputs refused. At most kMaxQueued wait per
 // character; more is refused.
 constexpr size_t kMaxQueued = 256;
 
-// What the queue keeps of a request: data only, never a built entity (review round 4, Important 2: the server entity of
+// What the queue keeps of a request: data only, never a built entity (the server entity of
 // a script class holds Lua references, and a save load closes the Lua state under it). The host builds and checks the
 // entity again when its turn comes (judge_queued, child_allowed, the world epoch).
 struct QueuedRequest
 {
 	uint32_t seq = 0;
 	uint32_t peer = 0; // PeerId of the asker
-	uint16_t character = 0xffff; // his proxy id in the host world
-	uint16_t parent = 0xffff;
+	uint16_t character = kNoId; // his proxy id in the host world
+	uint16_t parent = kNoId;
 	float pos[3] = {0.f, 0.f, 0.f};
 	std::string section;
 	std::vector<uint8_t> state; // its own copy of the item state blob (coop_items), checked again at its turn
 	uint32_t epoch = 0; // the host world it was asked in
-	bool quest_gift = false; // Ruling F2-16, decided when asked: the talk may be over by its turn
-	uint16_t id = kNoId; // F2 T12b: leased id the client created it under (it stays leased while it waits)
-	uint16_t source = kNoId; // F2 T12b: the weapon a clone replaces
+	bool quest_gift = false; // decided when asked: the talk may be over by its turn
+	uint16_t id = kNoId; // leased id the client created it under (it stays leased while it waits)
+	uint16_t source = kNoId; // the weapon a clone replaces
 };
 
 inline QueuedRequest queued_request(uint32_t seq, uint32_t peer, uint16_t character, uint16_t parent,

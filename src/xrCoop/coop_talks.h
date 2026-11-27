@@ -1,4 +1,4 @@
-// Anomaly Coop - the host's memory of a player's recent talk locks (Ruling F2-34, F2 T12 round 2).
+// Anomaly Coop - the host's memory of a player's recent talk locks.
 // coop_npc_companions.script takes a client's companion recruit only right after that player talked to the NPC (or to
 // another member of its squad): the stock recruit conditions live in the dialog, which runs on the client. "Holds the
 // lock now" is not enough: a client sends DialogUnlock as its talk window closes and the recruit event from its Lua
@@ -6,7 +6,7 @@
 // (deliver_inbox). So coop_dialog.cpp records, per player, the NPCs whose lock just ended, and coop.talk_recent asks
 // talked_recently with a window (5 s for a recruit).
 //
-// B8 (build 10): the host also judges whether an NPC talks to a client's character at all (the answer to a lock
+// The host also judges whether an NPC talks to a client's character at all (the answer to a lock
 // request), and says why not; and the client names the cause when a talk that the host allowed does not start. The
 // pure parts of both are here: the DialogLockResult layout, the refusal reasons, the start-blocker classification.
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
@@ -16,13 +16,14 @@
 #include <cstdint>
 #include <cstring>
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
 {
 namespace talks
 {
-constexpr uint16_t kNoNpc = 0xffff;
+constexpr uint16_t kNoNpc = kNoId;
 
 // The last kKept talk locks of one player that ended: the NPC and when. Bounded; the same NPC keeps one entry.
 class Recent
@@ -97,9 +98,9 @@ inline bool may_trade_with(bool trade_flag, bool talked_recently, bool wounded)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// B8: DialogLockResult - the host's answer to a client's request for the talk lock (ids in host numbering).
-//   u16 npc, u8 result, and for NotWilling one more byte: the Reason. Results 0..4 are unchanged since protocol 8; an
-//   older client reads three bytes and ignores the rest, so it only prints "talk refused by the host: ?".
+// DialogLockResult - the host's answer to a client's request for the talk lock (ids in host numbering).
+//   u16 npc, u8 result, and for NotWilling one more byte: the Reason (read_lock_result refuses a NotWilling
+//   without it).
 // ---------------------------------------------------------------------------------------------------------------------
 namespace lock
 {
@@ -110,7 +111,7 @@ enum LockResult : uint8_t
 	Gone = 2, // no such NPC on the host or it is dead
 	Refused = 3, // not a talk partner (player avatar)
 	TooFar = 4, // the host sees the player's character far from the NPC
-	NotWilling = 5, // B8: the NPC would not talk to this player's character (see Reason)
+	NotWilling = 5, // the NPC would not talk to this player's character (see Reason)
 };
 
 inline const char* name(uint8_t r)
@@ -219,7 +220,7 @@ inline void write_lock_result(Writer& w, const LockResultMsg& m)
 		w.u8(static_cast<uint8_t>(m.reason == Reason::None ? Reason::Unwilling : m.reason));
 }
 
-// False on a cut message. NotWilling without the reason byte (an older host) reads as Unwilling.
+// False on a cut message; NotWilling carries its reason byte.
 inline bool read_lock_result(Reader& r, LockResultMsg& m)
 {
 	m.npc = r.u16();
@@ -228,12 +229,12 @@ inline bool read_lock_result(Reader& r, LockResultMsg& m)
 	if (!r.ok())
 		return false;
 	if (m.result == lock::NotWilling)
-		m.reason = r.remaining() >= 1 ? reason_from_wire(r.u8()) : Reason::Unwilling;
+		m.reason = reason_from_wire(r.u8());
 	return r.ok();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// B8: a talk the host allowed did not start on the client. The state the engine reads right after the attempt; the
+// A talk the host allowed did not start on the client. The state the engine reads right after the attempt; the
 // first cause in the order below is reported in the log (one line), then the lock is given back.
 // ---------------------------------------------------------------------------------------------------------------------
 struct StartState

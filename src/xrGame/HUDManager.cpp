@@ -24,9 +24,9 @@
 #include "script_attachment_manager.h"
 
 #include "GametaskManager.h"
-#include "coop/coop_presence.h" // Anomaly Coop
-#include "coop/coop_survival.h" // Anomaly Coop
-#include "../xrEngine/ui_size_policy.h" // Anomaly Coop
+#include "coop/coop_presence.h"
+#include "coop/coop_survival.h"
+#include "../xrEngine/ui_size_policy.h"
 
 extern CUIGameCustom* CurrentGameUI()
 {
@@ -161,32 +161,36 @@ CGameFont* CFontManager::ExtraFallback(LPCSTR name)
 	return pFontLetterica18Russian;
 }
 
-// A name an XML attribute and a Lua call can carry around: letters, digits, '_', '-', '.', at most 63.
-static bool extra_font_name_ok(LPCSTR s)
+namespace
+{
+// 1..63 letters, digits and the characters of `extra`.
+bool font_token_ok(LPCSTR s, LPCSTR extra)
 {
 	if (!s || !s[0] || xr_strlen(s) > 63)
 		return false;
 	for (; *s; ++s)
 	{
 		const char c = *s;
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strchr(extra, c)))
 			return false;
 	}
 	return true;
 }
 
-// A shader name: what the engine's shader lists hold ("font", "hud\\font"): letters, digits, '_', '\\', '/', at most 63.
-static bool extra_font_shader_ok(LPCSTR s)
+// A name an XML attribute and a Lua call can carry around.
+constexpr LPCSTR kFontNameExtra = "_-.";
+// A shader name: what the engine's shader lists hold ("font", "hud\\font").
+constexpr LPCSTR kFontShaderExtra = "_\\/";
+} // namespace
+
+CFontManager::SExtraFont* CFontManager::AddExtra(LPCSTR name)
 {
-	if (!s || !s[0] || xr_strlen(s) > 63)
-		return false;
-	for (; *s; ++s)
-	{
-		const char c = *s;
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\\' || c == '/'))
-			return false;
-	}
-	return true;
+	SExtraFont* e = xr_new<SExtraFont>();
+	e->name = name;
+	e->font = nullptr;
+	e->fallback_logged = false;
+	m_extra_fonts.push_back(e);
+	return e;
 }
 
 bool CFontManager::RegisterFont(LPCSTR name, LPCSTR texture_base, LPCSTR shader, float target_height)
@@ -197,12 +201,12 @@ bool CFontManager::RegisterFont(LPCSTR name, LPCSTR texture_base, LPCSTR shader,
 		target_height = 0.f;
 	else if (target_height > 20000.f)
 		target_height = 20000.f;
-	if (!extra_font_name_ok(name))
+	if (!font_token_ok(name, kFontNameExtra))
 	{
 		Msg("! [font] RegisterFont: '%s' is not a font name (1..63 of A-Z a-z 0-9 _ - .)", name ? name : "(nil)");
 		return false;
 	}
-	if (!extra_font_shader_ok(shader))
+	if (!font_token_ok(shader, kFontShaderExtra))
 	{
 		Msg("! [font] RegisterFont '%s': '%s' is not a shader name", name, shader);
 		return false;
@@ -230,26 +234,16 @@ bool CFontManager::RegisterFont(LPCSTR name, LPCSTR texture_base, LPCSTR shader,
 		Msg("! [font] RegisterFont '%s': %s", name, why);
 		if (!e) // remembered: XML that names it falls back to a stock font instead of asserting
 		{
-			e = xr_new<SExtraFont>();
-			e->name = name;
+			e = AddExtra(name);
 			e->texture = texture_base;
 			e->shader = shader;
 			e->target_height = target_height;
-			e->font = nullptr;
-			e->fallback_logged = false;
-			m_extra_fonts.push_back(e);
 		}
 		return false;
 	}
 
 	if (!e)
-	{
-		e = xr_new<SExtraFont>();
-		e->name = name;
-		e->font = nullptr;
-		e->fallback_logged = false;
-		m_extra_fonts.push_back(e);
-	}
+		e = AddExtra(name);
 	e->texture = texture_base;
 	e->shader = shader;
 	e->target_height = target_height;
@@ -481,8 +475,8 @@ void CHUDManager::RenderUI()
 			xrCriticalSectionGuard guard(&ui_lock);
 			pUIGame->Render();
 		}
-		coop::presence::render_hud(); // Anomaly Coop: name tags over other players
-		coop::survival::render_hud(); // Anomaly Coop: wounded / dead / spectator hints
+		coop::presence::render_hud(); // coop: name tags over other players
+		coop::survival::render_hud(); // coop: wounded / dead / spectator hints
 
 		UI().RenderFont();
 	}
@@ -663,8 +657,8 @@ void CHUDManager::Load()
 
 void CHUDManager::OnScreenResolutionChanged()
 {
-	// Anomaly Coop: never rebuild the game UI on a degenerate device size (ui_size_policy.h): the UI picks its XML
-	// variants by the size at this moment (0x0 gave zone_map.xml, the minimap top-left on G.A.M.M.A.). The UI built
+	// coop: never rebuild the game UI on a degenerate device size (ui_size_policy.h): the UI picks its XML
+	// variants by the size at this moment (0x0 gives zone_map.xml, a minimap in the top-left corner). The UI built
 	// before stays; the next size change rebuilds it.
 	if (!ui_size_policy::hud_rebuild_allowed(Device.dwWidth, Device.dwHeight))
 	{

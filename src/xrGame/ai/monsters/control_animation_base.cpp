@@ -11,7 +11,7 @@
 #include "monster_event_manager.h"
 #include "control_jump.h"
 #include "../../sound_player.h"
-#include "../../coop/coop_remote.h" // Anomaly Coop
+#include "../../coop/coop_remote.h"
 
 // DEBUG purpose only
 char* dbg_action_name_table[] = {
@@ -372,7 +372,7 @@ void CControlAnimationBase::FX_Play(EHitSide side, float amount)
 
 	SAnimItem* anim_it = m_anim_storage[cur_anim_info().get_motion()];
 	VERIFY(anim_it);
-	if (!anim_it) return; // Anomaly Coop (audit F7): a puppet's "current motion" is its idle, not what the host plays
+	if (!anim_it) return; // coop: a puppet's "current motion" is its idle, not what the host plays
 
 	clamp(amount, 0.f, 1.f);
 
@@ -657,7 +657,7 @@ void CControlAnimationBase::set_animation_speed()
 
 void CControlAnimationBase::check_hit(MotionID motion, float time_perc)
 {
-	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: no local melee from puppets
+	if (coop::remote::is_remote_creature(m_object)) return; // coop: no local melee from puppets
 	if (!m_object->EnemyMan.get_enemy()) return;
 	const CEntityAlive* enemy = m_object->EnemyMan.get_enemy();
 

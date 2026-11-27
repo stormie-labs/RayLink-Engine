@@ -558,7 +558,7 @@ void CCharacterPhysicsSupport::in_Hit(SHit& H, bool is_killing)
 		//&& Type() == etStalker
 	{
 		m_hit_animations.PlayHitMotion(H.direction(), H.bone_space_position(), H.bone(), m_EntityAlife);
-		// Anomaly Coop (audit F7): additive, so not in the mirrored animations: a puppet plays its own
+		// coop: additive, so not in the mirrored animations: a puppet plays its own
 		coop::presence::on_flinch(&m_EntityAlife, H.direction(), H.bone_space_position(), H.bone());
 	}
 

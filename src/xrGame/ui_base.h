@@ -77,6 +77,7 @@ struct CFontManager : public pureDeviceReset
 
 private:
 	SExtraFont* FindExtra(LPCSTR name);
+	SExtraFont* AddExtra(LPCSTR name); // a new entry without a font yet
 	void InitializeExtraFonts();
 };
 

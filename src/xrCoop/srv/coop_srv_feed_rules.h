@@ -1,5 +1,4 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the feed lines of a server world (S5, unit A-S6J; TZ R7: "строки ленты «ушёл на карту / пришёл с карты»"): a player
+// Anomaly Coop — the feed lines of a server world: a player
 // of a server world reads in his PDA feed where the others went, "<nick> went to <level>" and, on the level he stands on, "<nick> came
 // from <level>".
 //
@@ -18,13 +17,15 @@
 #include <string>
 #include <vector>
 
+#include "../coop_ids.h"
+
 namespace coop
 {
 namespace srv
 {
 namespace feed
 {
-constexpr uint16_t kNoLevel = 0xFFFF; // levels::wire::kNoLevel: on no level, or not known
+using coop::kNoLevel; // on no level, or not known
 constexpr size_t kMaxNick = 32; // the bytes of a nick a line shows
 
 // Another player of the session and the level the world server's table puts him on now (kNoLevel: not known).

@@ -1,5 +1,5 @@
-// Anomaly Coop — the sky after a jump of the game clock (live report 41.4, 2026-11-08: after the shared sleep the clock said
-// 10:30 and the sky was night until about 11:00).
+// Anomaly Coop — the sky after a jump of the game clock (after the shared sleep the sky follows the clock at once, not
+// half an hour later).
 //
 // CEnvironment (xrEngine/Environment.cpp) blends two env sections of the weather cycle, Current[0] and Current[1], by the time
 // of day. With sections already chosen, SelectEnvs(gt) only ever steps one section on, and only once the time of day passed

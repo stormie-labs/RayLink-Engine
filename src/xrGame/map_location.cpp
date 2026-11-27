@@ -59,7 +59,7 @@ CMapLocation::CMapLocation(LPCSTR type, u16 object_id)
 	LoadSpot(spot_type, false);
 
 	DisablePointer();
-	if (spot_type && !strncmp(spot_type, "coop_ally_", 10)) // Anomaly Coop: allies keep their edge pointer
+	if (spot_type && !strncmp(spot_type, "coop_ally_", 10)) // coop: allies keep their edge pointer
 		EnablePointer();
 
 	EnableSpot();
@@ -105,14 +105,14 @@ void CMapLocation::LoadSpot(LPCSTR type, bool bReload)
 	XML_NODE* node = NULL;
 	string512 path_base, path;
 	xr_strcpy(path_base, type);
-	// Anomaly Coop (review R4 5): a type that this machine's map_spots.xml lacks (another mod set: a spot in the
+	// coop: a type that this machine's map_spots.xml lacks (another mod set: a spot in the
 	// host's save, a DXML type behind an MCM option) leaves the location without spots instead of a fatal error.
 	if (!g_uiSpotXml->NavigateToNode(path_base, 0))
 	{
 		static xr_set<shared_str> s_logged; // once per type: spots are reloaded and re-created
 		if (s_logged.insert(shared_str(path_base)).second)
 			Msg("! map spot type '%s' is not in map_spots.xml (different mods?), its spots are not shown", path_base);
-		// F0 final review (task 13): as the stock end of LoadSpot when the type has no spots. A reload into an unknown
+		// As the stock end of LoadSpot when the type has no spots. A reload into an unknown
 		// type keeps the spots of the type before (stock LoadSpot never enables a spot again).
 		if (m_minimap_spot == NULL && m_level_spot == NULL && m_complex_spot == NULL)
 			DisableSpot();
@@ -348,7 +348,7 @@ bool CMapLocation::Update() //returns actual
 		}
 	}
 
-	// Anomaly Coop: on a client a task's spot can arrive before the copy of an entity the host has just spawned
+	// coop: on a client a task's spot can arrive before the copy of an entity the host has just spawned
 	if (!m_owner_se_object && coop::join::world_is_mirror() && ai().get_alife())
 		m_owner_se_object = ai().alife().objects().object(m_objectID, true);
 
@@ -869,7 +869,7 @@ bool CRelationMapLocation::Update()
 			vis_res = false;
 	}
 
-	// Anomaly Coop (F0 final review, task 13): a relation location of a spot type unknown here has no minimap spot
+	// coop: a relation location of a spot type unknown here has no minimap spot
 	if (m_b_visible == false && vis_res == true && m_minimap_spot)
 		m_minimap_spot->ResetXformAnimation();
 

@@ -6,14 +6,14 @@
 #include "xrCoop/coop_session.h"
 
 class CGameObject;
-class CSE_Abstract;
 
 namespace coop
 {
 namespace sync
 {
-// F3a T4: what the modules set up once per process (Manager's constructor): settings, console commands, the
-// route and call-gate tables. The handler tables come by role when a session starts (Manager::install_handlers).
+// The passes of the module table (coop_sync.cpp), each in its own order.
+// What the modules set up once per process (Manager's constructor): settings, the route and call-gate tables. The handler
+// tables come with the session's mode when a session starts (Manager::enter_mode).
 void init();
 // The world server's handlers of every module, on the hosting session.
 void install_server(Session& s);
@@ -21,7 +21,6 @@ void install_server(Session& s);
 // host's process.
 void install_client(Endpoint& e);
 void on_session_started();
-void on_peer_joined(const PeerInfo& p);
 void on_peer_left(PeerId id);
 void reset();
 void frame();
@@ -42,8 +41,5 @@ bool host_peer_joining(PeerId id);
 bool is_remote_driven(const CGameObject* obj);
 // True on a coop client: ALife simulation (switching, scheduled updates, spawns) is frozen.
 bool alife_frozen();
-// Client: the local game asked its own server to create an entity. Returns true if the
-// request was forwarded to the host (caller must drop it locally).
-bool intercept_local_spawn(CSE_Abstract* entity);
 } // namespace sync
 } // namespace coop

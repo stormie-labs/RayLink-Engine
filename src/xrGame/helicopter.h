@@ -205,8 +205,9 @@ public:
 	void MGunFireEnd();
 	void MGunUpdateFire();
 	virtual void OnShot();
+	void play_shot_fx(const Fvector& fire_pos);
 
-	// Anomaly Coop (audits H2, W8): the host flies and shoots, a client copies what is seen and heard of it (coop_presence.h)
+	// coop: the host flies and shoots, a client copies what is seen and heard of it (coop_presence.h)
 	void coop_shot(const Fvector& pos, const Fvector& dir, bool bullets);
 	void coop_rocket(const Fvector& pos);
 	void coop_blast();

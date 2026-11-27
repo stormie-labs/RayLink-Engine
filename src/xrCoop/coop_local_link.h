@@ -1,4 +1,4 @@
-// Anomaly Coop — the internal channel of the host's process (F3a T4, docs/plans/2026-10-24-f3a-split-levels.md §1.2).
+// Anomaly Coop — the internal channel of the host's process.
 //
 // A listen server: the world server lives inside the host's game process, and the host player is a client of it over
 // this link, with the same messages, the same handlers and the same checks as a remote client. Above the line is the
@@ -18,7 +18,7 @@
 //    lane, and across the lanes as well.
 //  - No ENet, no blobs, no rate limits: the host player does not download the world.
 //  - The gate (the game: link_enabled) says which messages travel the link at all; the rest is refused at the push
-//    (counted). The host keeps its direct paths ("if host — itself") until its module is moved onto the link (F3a T7), so
+//    (counted). The host keeps its direct paths ("if host — itself") until its module is moved onto the link, so
 //    nothing may run twice: a message that is not moved never reaches either side.
 //  - R1 1: every packet carries the world epoch it was made in (set_epoch: the session keeps it current); a pump takes
 //    only the packets of the session's epoch and drops the rest (counted), either way. A remote client's game message of
@@ -44,18 +44,18 @@
 #include <vector>
 
 #include "coop_protocol.h"
-#include "coop_session.h" // Endpoint (Ядро: the client side of the protocol, both modes have it)
+#include "coop_session.h" // Endpoint (the Core: the client side of the protocol, both modes have it)
 #include "coop_wire.h"
 
 namespace coop
 {
 // The messages moved onto the link, module by module, together with the removal of the host's direct path in that
-// module (F3a T7, T8). A type is in here for both ways at once (one gate for push_to_server and push_to_client). A list
+// module. A type is in here for both ways at once (one gate for push_to_server and push_to_client). A list
 // whose length the compiler counts: every task adds its own lines.
 inline constexpr Msg kLinkMessages[] = {
-	// F3a T7: the host player's rest, checkpoint claims, life and revives, new character, the rules, death markers,
+	// The host player's rest, checkpoint claims, life and revives, new character, the rules, death markers,
 	// money transfers, coop.sync requests and Lua events to peer 0. Kept off on purpose: SyncSet / SyncFull / SyncCast
-	// (one store in the host's process), PlayerShot, PlayerDied (task-7-report.md).
+	// (one store in the host's process), PlayerShot, PlayerDied.
 	Msg::RestRequest, Msg::RestState, Msg::RestSleep, // coop_rest
 	Msg::CheckpointClaim, Msg::CheckpointState, // coop_checkpoints, coop_checkpoint_sources
 	Msg::PlayerWounded, Msg::PlayerRevive, Msg::PlayerRules, Msg::NewCharacter, // coop_survival
@@ -63,10 +63,10 @@ inline constexpr Msg kLinkMessages[] = {
 	Msg::ReqMoney, Msg::MoneyBalance, // coop_money
 	Msg::SyncRequest, Msg::SyncResult, // coop_sync_api
 	Msg::ScriptEvent, // coop_script: coop.send_event to peer 0 in the host's process
-	// F3a T8: the board (the host player's vote, his placard) and the simultaneous load (his LoadWait, his LoadReady)
+	// The board (the host player's vote, his placard) and the simultaneous load (his LoadWait, his LoadReady)
 	Msg::TransitionVote, Msg::TransitionState, // coop_join: the waiting point
 	Msg::LoadWait, Msg::LoadReady, // coop_join: the simultaneous load
-	// protocol 29: the server's debug reaches the host player as every client (docs/DEBUG_DESIGN.md §B.3); his half sets his flags
+	// The server's debug reaches the host player as every client (docs/DEBUG_DESIGN.md §B.3); his half sets his flags
 	Msg::DebugState, // coop_debug
 };
 

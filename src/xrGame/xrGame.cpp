@@ -28,7 +28,7 @@ extern "C" {
 DLL_API DLL_Pure* __cdecl xrFactory_Create(CLASS_ID clsid)
 {
 	DLL_Pure* object = object_factory().client_object(clsid);
-	// Anomaly Coop (2026-11, crash triage RL-K958-GVST): the null check was DEBUG only, a release build dereferenced it.
+	// coop: the null check stands in Release too, where the stock one is DEBUG only.
 	// Only a script class (object_item_script: its Lua creator failed) gives nothing; every caller gets nullptr and a line.
 	if (!object)
 	{

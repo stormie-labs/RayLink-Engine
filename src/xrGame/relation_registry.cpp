@@ -14,7 +14,7 @@
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "script_engine.h"
-#include "coop/coop_story.h" // Anomaly Coop
+#include "coop/coop_story.h"
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -150,7 +150,7 @@ CHARACTER_GOODWILL RELATION_REGISTRY::GetGoodwill(u16 from, u16 to) const
 
 void RELATION_REGISTRY::SetGoodwill(u16 from, u16 to, CHARACTER_GOODWILL goodwill)
 {
-	if (coop::story::on_personal_goodwill(from, to, goodwill, coop::story::GoodwillOp::Set)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_personal_goodwill(from, to, goodwill, coop::story::GoodwillOp::Set)) // coop: a co-op client asks the host instead
 		return;
 	RELATION_DATA& relation_data = relation_registry().registry().objects(from);
 
@@ -162,7 +162,7 @@ void RELATION_REGISTRY::SetGoodwill(u16 from, u16 to, CHARACTER_GOODWILL goodwil
 
 void RELATION_REGISTRY::ForceSetGoodwill(u16 from, u16 to, CHARACTER_GOODWILL goodwill)
 {
-	if (coop::story::on_personal_goodwill(from, to, goodwill, coop::story::GoodwillOp::Force)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_personal_goodwill(from, to, goodwill, coop::story::GoodwillOp::Force)) // coop: a co-op client asks the host instead
 		return;
 	RELATION_DATA& relation_data = relation_registry().registry().objects(from);
 
@@ -185,7 +185,7 @@ void RELATION_REGISTRY::ForceSetGoodwill(u16 from, u16 to, CHARACTER_GOODWILL go
 
 void RELATION_REGISTRY::ChangeGoodwill(u16 from, u16 to, CHARACTER_GOODWILL delta_goodwill)
 {
-	if (coop::story::on_personal_goodwill(from, to, delta_goodwill, coop::story::GoodwillOp::Change)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_personal_goodwill(from, to, delta_goodwill, coop::story::GoodwillOp::Change)) // coop: a co-op client asks the host instead
 		return;
 	CHARACTER_GOODWILL new_goodwill = GetGoodwill(from, to) + delta_goodwill;
 	SetGoodwill(from, to, new_goodwill);
@@ -213,7 +213,7 @@ CHARACTER_GOODWILL RELATION_REGISTRY::GetCommunityGoodwill(CHARACTER_COMMUNITY_I
 void RELATION_REGISTRY::SetCommunityGoodwill(CHARACTER_COMMUNITY_INDEX from_community, u16 to_character,
                                              CHARACTER_GOODWILL goodwill)
 {
-	if (coop::story::on_community_goodwill(from_community, to_character, goodwill, coop::story::GoodwillOp::Set)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_community_goodwill(from_community, to_character, goodwill, coop::story::GoodwillOp::Set)) // coop: a co-op client asks the host instead
 		return;
 	static Ivector2 gw_limits = pSettings->r_ivector2(ACTIONS_POINTS_SECT, "community_goodwill_limits");
 	clamp(goodwill, gw_limits.x, gw_limits.y);
@@ -225,7 +225,7 @@ void RELATION_REGISTRY::SetCommunityGoodwill(CHARACTER_COMMUNITY_INDEX from_comm
 void RELATION_REGISTRY::ChangeCommunityGoodwill(CHARACTER_COMMUNITY_INDEX from_community, u16 to_character,
                                                 CHARACTER_GOODWILL delta_goodwill)
 {
-	if (coop::story::on_community_goodwill(from_community, to_character, delta_goodwill, coop::story::GoodwillOp::Change)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_community_goodwill(from_community, to_character, delta_goodwill, coop::story::GoodwillOp::Change)) // coop: a co-op client asks the host instead
 		return;
 	CHARACTER_GOODWILL gw = GetCommunityGoodwill(from_community, to_character) + delta_goodwill;
 	SetCommunityGoodwill(from_community, to_character, gw);
@@ -261,7 +261,7 @@ CHARACTER_GOODWILL RELATION_REGISTRY::GetReputationRelation(CHARACTER_REPUTATION
 void RELATION_REGISTRY::SetCommunityRelation(CHARACTER_COMMUNITY_INDEX index1, CHARACTER_COMMUNITY_INDEX index2,
                                              CHARACTER_GOODWILL goodwill)
 {
-	if (coop::story::on_community_relation(index1, index2, goodwill)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_community_relation(index1, index2, goodwill)) // coop: a co-op client asks the host instead
 		return;
 	CHARACTER_COMMUNITY::set_relation(index1, index2, goodwill);
 }

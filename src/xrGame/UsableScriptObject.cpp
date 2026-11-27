@@ -6,7 +6,7 @@
 #include "game_object_space.h"
 #include "doors_door.h"
 #include "doors.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 
 
 
@@ -38,8 +38,8 @@ bool CUsableScriptObject::use(CGameObject* who_use)
 	))
 		return false;
 
-	if (coop::objects::client_intercept_use(pThis, who_use)) // Anomaly Coop: a client's use of a door/lever runs on the host
-		return true; // Anomaly Coop
+	if (coop::objects::client_intercept_use(pThis, who_use)) // coop: a client's use of a door/lever runs on the host
+		return true;
 	pThis->callback(GameObject::eUseObject)(pThis->lua_game_object(), who_use->lua_game_object());
 
 	return true;

@@ -1,5 +1,4 @@
-// Anomaly Coop - F3a split levels: the level hash of a map server (LevelHash 0x01D9) and its comparison (plan
-// 2026-10-24-f3a §1.7 "auditor", §4.1 requirement 4).
+// Anomaly Coop - the level hash of a map server (LevelHash 0x01D9) and its comparison (the auditor).
 // Every 10 s (and on coop_levels_audit) a map server sends the hash of what it owns: the number of ids, a hash of the
 // set of ids and 32 buckets over (id, gen, parent, alive, digest). The world server builds the same from its ledger
 // (xfer::Ledger::owned_by plus its own copies) and asks for a full resync of each bucket that differs (LevelResync,
@@ -13,13 +12,15 @@
 #include <cstdint>
 #include <vector>
 
+#include "coop_ids.h"
+
 namespace coop
 {
 namespace xfer
 {
 constexpr uint32_t kBuckets = 32;
 constexpr uint32_t kAllBuckets = 0xffffffffu;
-constexpr uint16_t kNoParent = 0xffff;
+constexpr uint16_t kNoParent = kNoId;
 
 // One object as its owner reports it (and as the world server expects it).
 struct Entry

@@ -2,15 +2,15 @@
 //
 // PlayerEquip (reliable, on change + every 5 s): the owner's visual, item in hands, torch.
 //   Applied to the player's avatar everywhere; on the host the proxy keeps the visual in its
-//   server entity, so the character looks right after a save/load (P4).
-//   A PDA in hands is drawn as an attachment of the avatar (show_pda, live 2026-10-29).
-//   With each one the character takes its player's nick as its name (apply_name, live 2026-10-29).
-//   W5 tail: handheld flashlight on + its light section (drawn here by our own lights, see HandLight)
+//   server entity, so the character looks right after a save/load.
+//   A PDA in hands is drawn as an attachment of the avatar (show_pda).
+//   With each one the character takes its player's nick as its name (apply_name).
+//   Then the handheld flashlight on + its light section (drawn here by our own lights, see HandLight)
 //   and safe mode (weapon lowered, coop.player_safemode).
 // PlayerVitals (reliable, every 2 s, client -> host): health, satiety, radiation, psy, power,
 //   bleeding. The host stores them in the proxy's custom data ([coop] section), i.e. inside the
-//   host save (P4). On join the client restores its actor from there.
-//   Tail (xrCoop/coop_gear.h, live 2026-10-23): where the owner's things sit (slots, belt, the backpack things that
+//   host save. On join the client restores its actor from there.
+//   Tail (xrCoop/coop_gear.h): where the owner's things sit (slots, belt, the backpack things that
 //   would not stay there by themselves). The host keeps it as `gear = ...` in the same custom data; the client's items
 //   are given their place while they spawn after a rejoin (on_item_spawn), as the engine does it from the client data
 //   of a saved game. Without it a returning player's outfit, helmet, backpack, artefacts and detector land in the
@@ -25,18 +25,20 @@
 #include "coop_net.h"
 #include "coop_alife.h"
 #include "coop_survival.h"
-#include "coop_requests.h" // live 2026-11-08: a clone of our weapon takes its old weapon's slot
-#include "coop_health_ledger.h" // live 2026-11-09: the restore in the own actor's health ledger
+#include "coop_requests.h"
+#include "coop_health_ledger.h"
+#include "coop_debug.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_nametag.h"
 #include "xrCoop/coop_gear.h"
 #include "xrCoop/coop_checkpoint_rules.h"
-#include "xrCoop/coop_arrival.h" // live 2026-11-07: the host's view of a client's arrival
+#include "xrCoop/coop_arrival.h"
+#include "xrCoop/coop_rules.h"
 
 #include "Level.h"
 #include "Actor.h"
 #include "ActorCondition.h"
-#include "Wound.h" // live 2026-11-07: the player's own bleeding comes back as a wound of his
+#include "Wound.h"
 #include "ai/stalker/ai_stalker.h"
 #include "Inventory.h"
 #include "inventory_item.h"
@@ -67,7 +69,7 @@ constexpr size_t kMaxLightSection = 64;
 constexpr size_t kMaxVisual = 200;
 u64 g_visual_bad = 0;
 
-// R3 K2: a peer's visual is loaded on every machine (no file = FATAL "Can't find model file") and goes into the
+// A peer's visual is loaded on every machine (no file = FATAL "Can't find model file") and goes into the
 // proxy's server entity, so into the host save. The name is checked first (printable ASCII, no "..", no ':'), then
 // the same lookup as CModelPool::Instance_Load.
 bool visual_exists(const xr_string& visual)
@@ -87,25 +89,21 @@ struct Equip
 	xr_string visual;
 	u16 active_item = 0xffff; // host numbering
 	bool torch = false; // head torch (CTorch)
-	// W5 tail: u8 flags (1 hand light, 2 safe mode), str light section. Appended to the old payload:
-	// a sender without it reads as "no hand light, safe mode unknown".
-	bool tail = false;
+	// Then u8 flags (1 hand light, 2 safe mode), str light section.
 	bool hand_light = false; // handheld flashlight (CFlashlight in DETECTOR_SLOT) is on
 	bool safemode = false; // weapon lowered (Anomaly safe mode)
 	xr_string light_section; // the flashlight's light section, as CFlashlight::Load reads it
 
 	bool operator==(const Equip& o) const
 	{
-		return visual == o.visual && active_item == o.active_item && torch == o.torch && tail == o.tail &&
-			hand_light == o.hand_light && safemode == o.safemode && light_section == o.light_section;
+		return visual == o.visual && active_item == o.active_item && torch == o.torch && hand_light == o.hand_light &&
+			safemode == o.safemode && light_section == o.light_section;
 	}
 	void write(Writer& w) const
 	{
 		w.str(visual.c_str());
 		w.u16(active_item);
 		w.boolean(torch);
-		if (!tail)
-			return;
 		w.u8(u8((hand_light ? 1 : 0) | (safemode ? 2 : 0)));
 		w.str(hand_light ? light_section.c_str() : "");
 	}
@@ -122,22 +120,18 @@ struct Equip
 				::Msg("! [coop] player visual refused (no such model here or bad name), %u chars", (u32)visual.size());
 			visual.clear(); // keep the item in hands and the lights
 		}
-		tail = hand_light = safemode = false;
+		hand_light = safemode = false;
 		light_section.clear();
-		if (r.remaining() > 0)
+		const u8 flags = r.u8();
+		const std::string sect = r.str();
+		if (r.ok() && sect.size() <= kMaxLightSection)
 		{
-			const u8 flags = r.u8();
-			const std::string sect = r.str();
-			if (r.ok() && sect.size() <= kMaxLightSection)
-			{
-				tail = true;
-				safemode = (flags & 2) != 0;
-				hand_light = (flags & 1) != 0 && !sect.empty();
-				if (hand_light)
-					light_section = sect.c_str();
-			}
+			safemode = (flags & 2) != 0;
+			hand_light = (flags & 1) != 0 && !sect.empty();
+			if (hand_light)
+				light_section = sect.c_str();
 		}
-		return true; // a broken tail does not cost the visual and the item in hands
+		return true; // a broken flashlight part does not cost the visual and the item in hands
 	}
 };
 
@@ -148,11 +142,11 @@ struct Vitals
 
 Equip g_last_sent;
 u64 g_last_check = 0, g_last_refresh = 0, g_last_vitals = 0;
-// Equipment waiting for its avatar to come online (P6), keyed by local avatar id.
+// Equipment waiting for its avatar to come online, keyed by local avatar id.
 xr_map<u16, Equip> g_pending;
 xr_map<u16, Equip> g_applied;
 bool g_vitals_restored = false;
-// Live 2026-11-07, host: a client's arrival on a new level, by peer (arrival_host_leaves / arrival_host_entered).
+// Host: a client's arrival on a new level, by peer (arrival_host_leaves / arrival_host_entered).
 struct HostArrival
 {
 	std::string nick, level;
@@ -192,8 +186,7 @@ bool capture_equip(Equip& e)
 			break;
 		}
 	}
-	// W5: the handheld flashlight lights only from our HUD; the others draw it themselves (hand_light_frame).
-	e.tail = true;
+	// The handheld flashlight lights only from our HUD; the others draw it themselves (hand_light_frame).
 	e.safemode = actor->is_safemode();
 	e.hand_light = false;
 	e.light_section.clear();
@@ -214,7 +207,7 @@ bool capture_equip(Equip& e)
 	return true;
 }
 
-// Owner, live 2026-10-29 (build 29): "the PDA in the hands for others". The object handler plans only for weapons and
+// The PDA in a player's hands is seen by the others. The object handler plans only for weapons and
 // missiles (object_handler_planner.cpp add_item): a goal on any other item (a PDA, an artefact) names a world property
 // it has no evaluator for, whose lookup (problem_solver_inline.h evaluator) reads past its table in Release. Such an
 // item leaves the avatar's hands empty for the planner (apply_equip); a PDA is drawn the way stock stalkers draw one in
@@ -252,10 +245,10 @@ void show_pda(CAI_Stalker* av, PIItem held)
 	}
 }
 
-// Owner, live 2026-10-29 (build 29): "remove the random names on each other". A player's character is a stalker of the
+// A player's character carries its player's nick, not a random stalker name. A player's character is a stalker of the
 // avatar profile, so its server entity got a random stalker name at spawn (specific_character, GENERATE_NAME_), saved
 // and sent as its name string; the nick create_proxy (coop_join.cpp) puts in the display copy is gone after a load and
-// on the other machines. The crosshair readout (HUDRecon.cpp), Lua character_name() (GAMMA's Faction ID HUD, HUD
+// on the other machines. The crosshair readout (HUDRecon.cpp), Lua character_name() (faction HUDs, HUD
 // marks, kill news, the loot window) and the server entity's name (PDA rankings, character info) showed it to the
 // other players. The character carries its player's nick instead, the text of the tag over its head. On each machine,
 // again with every PlayerEquip: nothing new on the wire, a nick learned late is there within 5 s.
@@ -273,12 +266,28 @@ void apply_name(u16 avatar_id, CAI_Stalker* av)
 		t->m_character_name = av->Name(); // the server entity's display copy; its saved name string is left as it is
 }
 
+u64 g_equip_no_entity = 0; // apply_equip met an avatar's game object without its server entity (rules::avatar_equip)
+
 // Returns false if the avatar is not online yet (keep it pending).
 bool apply_equip(u16 avatar_id, const Equip& e)
 {
 	CAI_Stalker* av = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(avatar_id));
-	if (!av || av->getDestroy())
+	const bool server_entity = av && Level().Server && Level().Server->ID_to_entity(avatar_id);
+	switch (rules::avatar_equip(av != nullptr, av && av->getDestroy(), server_entity))
+	{
+	case rules::AvatarEquip::Apply: break;
+	case rules::AvatarEquip::Wait: return false;
+	case rules::AvatarEquip::WaitNoEntity:
+		if (++g_equip_no_entity <= 10 || g_equip_no_entity % 100 == 0)
+		{
+			const CSE_ALifeDynamicObject* a = ai().get_alife() ? ai().alife().objects().object(avatar_id, true) : nullptr;
+			::Msg("[coop] equip: avatar %u [%s] is a game object here without its server entity (ALife: %s), spawned in frame "
+			      "%u, now frame %u: its equip waits (%llu such)",
+			    avatar_id, av->cName().c_str(), a ? (a->m_bOnline ? "online" : "offline") : "none", av->spawn_time(),
+			    Device.dwFrame, g_equip_no_entity);
+		}
 		return false;
+	}
 
 	entities::ClientApply scope; // our own local events below must pass the client router
 	if (!e.visual.empty() && xr_strcmp(av->cNameVisual(), e.visual.c_str()))
@@ -288,7 +297,7 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 		P.w_stringZ(e.visual.c_str());
 		av->u_EventSend(P); // server entity keeps the visual (saved with the host world)
 		av->ChangeVisual(e.visual.c_str());
-		on_avatar_visual_changed(avatar_id); // R3 В4: the new visual stands in a T-pose until its motions replay
+		on_avatar_visual_changed(avatar_id); // the new visual stands in a T-pose until its motions replay
 	}
 
 	CGameObject* in_hands = nullptr;
@@ -303,9 +312,9 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 	av->CObjectHandler::set_goal(MonsterSpace::eObjectActionIdle, planned ? in_hands : nullptr);
 	show_pda(av, held);
 
-	// Live 2026-10-29 (b29): the head torch of another player shone at the ground "who knows where", and a lamp given from
-	// one player to the other kept shining from where its old holder wore it. No torch item is ever attached to an
-	// avatar's head (GAMMA's device_torch_dummy / _nv_* are not in the stalker's attachable_items, and CAI_Stalker
+	// The torch items of an avatar stay dark. A lit one would shine at the ground, or, given from one player to the other,
+	// from where its old holder wore it. No torch item is ever attached to an
+	// avatar's head (a modded head torch is not in the stalker's attachable_items, and CAI_Stalker
 	// can_attach wants enable(true), which only sr_light gives an NPC), and in the backpack its CTorch::Update does not
 	// run: a lit one shone from wherever the item last was on this machine, every torch of the inventory at once. The
 	// items stay dark; the owner's head torch is drawn at the head, where the player looks (head lights below).
@@ -319,7 +328,7 @@ bool apply_equip(u16 avatar_id, const Equip& e)
 	return true;
 }
 
-// --- handheld flashlight of other players (W5) ---
+// --- handheld flashlight of other players ---
 // CFlashlight lights only from its owner's HUD (UpdateCL needs a CActor parent and HUD firedeps), so on an
 // avatar it shows nothing. Each machine draws it with its own lights, set up like CFlashlight::net_Spawn from
 // the owner's light section, at the avatar's left hand, pointing where the model faces (the owner's pitch is
@@ -341,10 +350,21 @@ struct HandLight
 // Heap objects: a static map destroyed at process exit must not release render lights after the renderer.
 xr_map<u16, HandLight*> g_lights; // local avatar id -> its hand light
 xr_map<u16, HandLight*> g_head_lights; // local avatar id -> its head torch
-// Where a stalker wears device_torch on bip01_head (its attach_position_offset; GAMMA's headlamps inherit it).
+// Where a stalker wears device_torch on bip01_head (its attach_position_offset; modded headlamps inherit it).
 const Fvector kHeadLampOffset = {0.134f, -0.007f, 0.09f};
 u32 g_lights_world = 0; // join::world_generation() the lights were made in
 u64 g_lights_made = 0, g_lights_bad = 0;
+// Avatar lookups for hand_light_frame, sorted by id. Cache misses too so an absent avatar is looked up only once.
+xr_vector<std::pair<u16, CAI_Stalker*>> g_frame_avatars;
+// An avatar whose head torch has no light section here (make_head_light failed). Its inputs are the avatar's items and the
+// configs: it is tried again when the items change (CInventory::ModifyFrame, set by every Take and Drop) or the id is another
+// object. A failure in the frame the items changed is not kept: a later change in the same frame keeps the same ModifyFrame.
+struct HeadLightMiss
+{
+	const CAI_Stalker* av = nullptr;
+	u32 items_frame = 0;
+};
+xr_map<u16, HeadLightMiss> g_head_light_misses;
 
 void destroy_light(HandLight* l)
 {
@@ -362,15 +382,11 @@ void destroy_lights()
 	for (auto& it : g_head_lights)
 		destroy_light(it.second);
 	g_head_lights.clear();
+	g_head_light_misses.clear();
 }
 
-CAI_Stalker* avatar_here(u16 id)
-{
-	if (!g_pGameLevel || id == 0 || id == 0xffff)
-		return nullptr;
-	CAI_Stalker* av = smart_cast<CAI_Stalker*>(Level().Objects.net_Find(id));
-	return av && !av->getDestroy() ? av : nullptr;
-}
+// Another player's avatar here (never this machine's actor, id 0).
+CAI_Stalker* avatar_here(u16 id) { return id == 0 ? nullptr : smart_cast<CAI_Stalker*>(world::object_here(id)); }
 
 // The same keys as CFlashlight::net_Spawn (R2+ variants on R2/R3/R4); every key optional: the section
 // comes from the network.
@@ -446,7 +462,7 @@ void place_light(HandLight* l, CAI_Stalker* av)
 	}
 	Fvector dir = X.k, right = X.i; // model facing (drive_avatar sets it from the owner's body yaw)
 	float view_yaw = 0.f, view_pitch = 0.f;
-	if (avatar_view(av->ID(), view_yaw, view_pitch)) // W5: the beam follows where the player looks
+	if (avatar_view(av->ID(), view_yaw, view_pitch)) // the beam follows where the player looks
 	{
 		dir.setHP(view_yaw, -view_pitch);
 		right.crossproduct(Fvector().set(0.f, 1.f, 0.f), dir);
@@ -494,7 +510,7 @@ void place_light(HandLight* l, CAI_Stalker* av)
 	l->glow->set_color(f);
 }
 
-// The head torch of a player: the light section of the torch its avatar carries (GAMMA's headlamps and the stock
+// The head torch of a player: the light section of the torch its avatar carries (modded headlamps and the stock
 // device_torch: torch_definition), placed like a stalker's attached device_torch, aimed by place_light.
 HandLight* make_head_light(CAI_Stalker* av)
 {
@@ -513,19 +529,49 @@ HandLight* make_head_light(CAI_Stalker* av)
 	return l;
 }
 
+CAI_Stalker* frame_avatar(u16 id)
+{
+	const auto it = std::lower_bound(g_frame_avatars.begin(), g_frame_avatars.end(), id,
+	    [](const std::pair<u16, CAI_Stalker*>& a, u16 key) { return a.first < key; });
+	if (it != g_frame_avatars.end() && it->first == id)
+	{
+		return it->second;
+	}
+	CAI_Stalker* av = avatar_here(id);
+	g_frame_avatars.emplace(it, id, av);
+	return av;
+}
+
+// The head torch of `av` (avatar `id`), or nullptr while its last failure still holds (HeadLightMiss).
+HandLight* make_head_light_once(u16 id, CAI_Stalker* av)
+{
+	const u32 items_frame = av->inventory().ModifyFrame();
+	const auto miss = g_head_light_misses.find(id);
+	if (miss != g_head_light_misses.end() && miss->second.av == av && miss->second.items_frame == items_frame)
+		return nullptr;
+	HandLight* made = make_head_light(av);
+	if (made || items_frame == Device.dwFrame)
+		g_head_light_misses.erase(id);
+	else
+		g_head_light_misses[id] = {av, items_frame};
+	return made;
+}
+
 // Every frame (main thread): lights follow the avatars, appear and go with the owners' flashlights and head torches.
 void hand_light_frame()
 {
+	PROF_EVENT("coop/coop_equip/hand_light_frame");
 	const u32 world = join::world_generation();
 	if (world != g_lights_world)
 	{
 		destroy_lights(); // a new world: the old avatars and render sectors are gone
 		g_lights_world = world;
 	}
+	g_frame_avatars.clear();
 	for (auto it = g_lights.begin(); it != g_lights.end();)
 	{
 		const auto e = g_applied.find(it->first);
-		if (!avatar_here(it->first) || e == g_applied.end() || !e->second.hand_light ||
+		if (!frame_avatar(it->first) || e == g_applied.end() || !e->second.hand_light ||
 			e->second.light_section != it->second->section)
 		{
 			destroy_light(it->second);
@@ -537,7 +583,7 @@ void hand_light_frame()
 	for (auto it = g_head_lights.begin(); it != g_head_lights.end();)
 	{
 		const auto e = g_applied.find(it->first);
-		if (!avatar_here(it->first) || e == g_applied.end() || !e->second.torch)
+		if (!frame_avatar(it->first) || e == g_applied.end() || !e->second.torch)
 		{
 			destroy_light(it->second);
 			it = g_head_lights.erase(it);
@@ -549,9 +595,7 @@ void hand_light_frame()
 		return;
 	for (const auto& it : g_applied)
 	{
-		if (!it.second.hand_light)
-			continue;
-		CAI_Stalker* av = avatar_here(it.first);
+		CAI_Stalker* av = it.second.hand_light ? frame_avatar(it.first) : nullptr;
 		if (!av)
 			continue;
 		auto l = g_lights.find(it.first);
@@ -569,15 +613,13 @@ void hand_light_frame()
 	}
 	for (const auto& it : g_applied)
 	{
-		if (!it.second.torch)
-			continue;
-		CAI_Stalker* av = avatar_here(it.first);
+		CAI_Stalker* av = it.second.torch ? frame_avatar(it.first) : nullptr;
 		if (!av)
 			continue;
 		auto l = g_head_lights.find(it.first);
 		if (l == g_head_lights.end())
 		{
-			HandLight* made = make_head_light(av);
+			HandLight* made = make_head_light_once(it.first, av);
 			if (!made)
 				continue;
 			l = g_head_lights.emplace(it.first, made).first;
@@ -658,7 +700,7 @@ bool read_vitals(Reader& r, Vitals& v)
 void store_vitals(u16 proxy, const Vitals& v)
 {
 	// A level change rebuilds the simulator while the session keeps pumping: a report that comes then is dropped (the
-	// client sends its vitals again). Live 2026-10-23 (build 9, GAMMA): ai().alife() here during CLevel::CLevel = AV.
+	// client sends its vitals again). ai().alife() here during CLevel::CLevel is an access violation.
 	if (!ai().get_alife())
 		return;
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(proxy, true);
@@ -680,7 +722,7 @@ void store_vitals(u16 proxy, const Vitals& v)
 
 // --- layout of the owner's things (slots, belt) ---
 
-// The last slot of an inventory on this machine (system.ltx lists them: GAMMA has more than stock). Host and clients
+// The last slot of an inventory on this machine (system.ltx lists them: a modpack may have more than stock). Host and clients
 // run the same configs.
 u8 last_slot_here()
 {
@@ -772,7 +814,7 @@ void capture_gear(CActor& actor, std::vector<gear::Entry>& out)
 }
 
 // Client, with a vitals report: the layout, when it changed or is due again. A live player always has something in
-// his slots; an inventory that shows none was not read (coop_death.cpp carried_of, T8b review N2) and must not
+// his slots; an inventory that shows none was not read (coop_death.cpp carried_of) and must not
 // replace what the host keeps.
 void append_gear(Writer& w, CActor& actor, u64 now)
 {
@@ -869,7 +911,7 @@ float bleed_speed_k(CActorCondition& c)
 	return k;
 }
 
-// Build 56: the own actor's save kept across a world load (coop_players.h condition_carry_take).
+// The own actor's save kept across a world load (coop_players.h condition_carry_take).
 struct ConditionCarry
 {
 	bool have = false;
@@ -891,7 +933,7 @@ u32 g_carried_world = 0; // ... and of the one where it came from g_carry
 // right moment: before the items come and the first update); else the first frame the world is up (a late second try).
 bool restore_carried_actor(CActor& actor, bool in_load)
 {
-	// Blind review: the world it was taken in is still up for some frames after the load is issued (the engine defers the
+	// The world it was taken in is still up for some frames after the load is issued (the engine defers the
 	// disconnect), with the new epoch already set: its actor must not take the state back
 	if (!g_carry.have || g_carry.from_world == join::world_generation())
 		return false;
@@ -941,7 +983,7 @@ void client_restore_vitals()
 	CActorCondition& c = actor->conditions();
 	if (restore_carried_actor(*actor, false))
 		return;
-	// Build 56: no condition of his own was held for this world (a join, a rejoin, a save the host loaded). What the
+	// No condition of his own was held for this world (a join, a rejoin, a save the host loaded). What the
 	// host's client data put here and no report brings back goes: the host's boosters with their effect (the scripts put
 	// the player's own back from his record), his alcohol, his medicine at work, his once-per-game flags.
 	c.DropLoadedExtras();
@@ -963,9 +1005,8 @@ void client_restore_vitals()
 		::Msg("[coop] new character: fresh condition (satiety, psy health, power)");
 		return;
 	}
-	// Live 2026-11-07: the wounds of the actor's client data are the host's: they always go, and the player's own bleeding
-	// comes back as one wound of its size. They went only when he was not bleeding: a bleeding client went on bleeding with
-	// the host's wounds after every level change.
+	// The wounds of the actor's client data are the host's: they always go, and the player's own bleeding comes back as one
+	// wound of its size. Kept otherwise, a bleeding client would go on bleeding with the host's wounds after every level change.
 	c.ClearWounds();
 	const float wound = arrival::restore_wounds(v.bleeding, bleed_speed_k(c));
 	if (wound > 0.f)
@@ -974,8 +1015,8 @@ void client_restore_vitals()
 			w->AddHit(wound, ALife::eHitTypeWound);
 	}
 	const float was = c.GetHealth();
-	health_ledger::coop_set_health(c, clampr(v.health, 0.05f, c.GetMaxHealth())); // live 2026-11-09: in the health ledger
-	join::arrival_apply("restore", was, c.GetHealth()); // live 2026-11-07: the spawn already has it (role swap): no jump
+	health_ledger::coop_set_health(c, clampr(v.health, 0.05f, c.GetMaxHealth())); // in the health ledger
+	join::arrival_apply("restore", was, c.GetHealth()); // the spawn already has it (role swap): no jump
 	c.SetSatiety(v.satiety);
 	c.SetRadiation(v.radiation);
 	c.ChangePsyHealth(v.psy - c.GetPsyHealth());
@@ -987,7 +1028,7 @@ void client_restore_vitals()
 
 namespace
 {
-// PlayerEquip, in both tables (F3a T4: the lambda of the old install, unchanged)
+// PlayerEquip, in both tables
 void on_equip_msg(PeerId from, Reader& r)
 {
 	if (mode().decides_world() || mgr().is_live_client())
@@ -1005,7 +1046,7 @@ void equip_install_client(Endpoint& e) { e.on(Msg::PlayerEquip, &on_equip_msg); 
 
 void on_item_spawn(SInvItemPlace& place, const CSE_Abstract& e)
 {
-	// Live 2026-11-08 (G.A.M.M.A.): our clone of a weapon (a scope, a kit, a detach) takes the slot its old weapon had, as
+	// Our clone of a weapon (a scope, a kit, a detach) takes the slot its old weapon had, as
 	// in single player, where the old one is released before the clone is registered (xrCoop/coop_clone_slot.h)
 	u16 clone_slot = NO_ACTIVE_SLOT;
 	if (e.ID_Parent == 0 && mgr().active() && !mode().decides_world() && requests::clone_spawn_slot(e.ID, clone_slot))
@@ -1061,8 +1102,8 @@ bool avatar_safemode(u16 avatar_id, bool& lowered)
 		auto p = g_pending.find(avatar_id);
 		e = p != g_pending.end() ? &p->second : nullptr;
 	}
-	if (!e || !e->tail)
-		return false; // not reported yet, or a sender without the W5 tail
+	if (!e)
+		return false; // not reported yet
 	lowered = e->safemode;
 	return true;
 }
@@ -1077,7 +1118,7 @@ void condition_carry_take(u32 to_epoch)
 {
 	CActor* actor = is_mirror() && g_pGameLevel ? smart_cast<CActor*>(Level().CurrentEntity()) : nullptr;
 	// His own state is in this actor when he plays in this world, or when he was still loading it and the load had put
-	// his held state into it already (blind review: a second reset during the load would lose it otherwise).
+	// his held state into it already (a second reset during the load would lose it otherwise).
 	const bool own = actor && actor->ID() == 0 &&
 	                 (mgr().is_live_client() || (join::client_loading_world() && condition_carried()));
 	if (!own)
@@ -1088,9 +1129,9 @@ void condition_carry_take(u32 to_epoch)
 		return;
 	}
 	CActorCondition& c = actor->conditions();
-	// Blind review: a player who is down, dead or watching has no standing character's state to take along. The engine's
+	// A player who is down, dead or watching has no standing character's state to take along. The engine's
 	// save of a dead condition holds no power, radiation or wounds (CEntityCondition::save), so the host's would stay on
-	// him; and a downed player's 0.01 health is not what he stands up with. He gets the host's record, as before build 56.
+	// him; and a downed player's 0.01 health is not what he stands up with. He gets the host's record.
 	if (survival::life_of(0) != survival::Life::Alive || c.GetHealth() <= 0.f)
 	{
 		::Msg("[coop] my state is not kept for the world of epoch %u: I am %s (the host's record is used)", to_epoch,
@@ -1172,21 +1213,23 @@ void equip_reset()
 	g_pending.clear();
 	g_applied.clear();
 	g_last_check = g_last_refresh = g_last_vitals = 0;
-	// build 56: a client going live resets this module too, and its condition is back by then (g_vitals_world): once a world
+	// A client going live resets this module too, and its condition is back by then (g_vitals_world): once a world
 	g_vitals_restored = g_vitals_world != 0 && g_vitals_world == join::world_generation();
 	g_gear_sent.clear(); // the next session reports the layout at once
 	g_gear_sent_at = 0;
 	g_gear_table.clear();
 	g_gear_table_built = false;
 	g_gear_logged = true;
-	// g_host_arrivals stays: players::reset runs on a client going live too, and on the host's own world change
+	// g_host_arrivals stays: it is the host's book of arrivals that span a level change. players::reset (and this) runs at a
+	// session's start and end, on a client at its group load or rejoin (sync::reset) and when it goes live; NOT at the host's
+	// own world change (the other players' snapshots outlive it, coop_players.cpp on_object_spawn culls them)
 }
 
-// Build 56 (live 2026-11-18), a client that is still loading the world (players::frame, before its live gate): a player
+// A client that is still loading the world (players::frame, before its live gate): a player
 // without a held state (a join, a rejoin, a rolled back world) gets the condition of the host's record the first frame the
-// loaded world is up, not when the screen lets him in. Until then the condition was the host's, and it ran: the host's
-// medkit healed the client under the loading screen and the restore took it back in one frame ("coop -0.122" in the
-// arrival lines), which G.A.M.M.A. shows as a hit. The condition stands still while he loads (own_condition_held).
+// loaded world is up, not when the screen lets him in. Otherwise the condition would be the host's, and it would run: the
+// host's medkit would heal the client under the loading screen and the restore would take it back in one frame, which a
+// modded HUD shows as a hit. The condition stands still while he loads (own_condition_held).
 void equip_loading_frame()
 {
 	if (g_pGameLevel && is_mirror() && join::client_loading_world() && g_vitals_world != join::world_generation())
@@ -1195,6 +1238,7 @@ void equip_loading_frame()
 
 void equip_frame()
 {
+	PROF_EVENT("coop/coop_equip/equip_frame");
 	const bool live = mode().decides_world() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
 		return;
@@ -1243,15 +1287,14 @@ void equip_frame()
 	hand_light_frame();
 }
 
-// Live 2026-10-31, still open: a head torch switched on and handed straight to the other player lit up "from the back of his
-// body". Reading the code finds nothing that lights it on either machine: OnH_B_Independent puts it out, the binder lights only
-// what its own actor has in the slot, apply_equip keeps an avatar's dark, the head light goes with the owner's PlayerEquip. So
-// the game says it: every switch of a player's torch on this machine, with where the item is, up to kTorchLines in a session.
+// Diagnostics of a player's torch, with the session debug on (debug::on): every switch of a player's torch on this machine, with
+// where the item is, up to kTorchLines per process. What should light one: OnH_B_Independent puts it out, the binder lights only
+// what its own actor has in the slot, apply_equip keeps an avatar's dark, the head light goes with the owner's PlayerEquip.
 void on_torch_switch(const CTorch& torch, bool on)
 {
 	constexpr u32 kTorchLines = 200;
 	static u32 lines = 0;
-	if (!g_pGameLevel || !mgr().active() || lines >= kTorchLines)
+	if (!g_pGameLevel || !mgr().active() || !debug::on() || lines >= kTorchLines)
 		return;
 	const CObject* parent = torch.H_Parent();
 	const CGameObject* holder = smart_cast<const CGameObject*>(parent);
@@ -1275,9 +1318,10 @@ void equip_resend()
 
 void equip_print_status()
 {
-	::Msg("[coop]   equipment: %llu out, %llu in, %u pending, %llu visuals refused, %llu PDAs not held (attachable_items); "
-	      "vitals: %llu out, %llu in",
-	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_visual_bad, g_pda_refused, g_vitals_out, g_vitals_in);
+	::Msg("[coop]   equipment: %llu out, %llu in, %u pending (%llu waits of an avatar without its server entity), %llu visuals "
+	      "refused, %llu PDAs not held (attachable_items); vitals: %llu out, %llu in",
+	      g_equip_out, g_equip_in, (u32)g_pending.size(), g_equip_no_entity, g_visual_bad, g_pda_refused, g_vitals_out,
+	      g_vitals_in);
 	::Msg("[coop]   equipment layout: %llu out, %llu in, %llu malformed; last placed on a rejoin: slots %u, belt %u, "
 	      "backpack %u, %u left to the engine",
 	      g_gear_out, g_gear_in, g_gear_bad, g_gear_placed[1], g_gear_placed[2], g_gear_placed[3], g_gear_placed[0]);

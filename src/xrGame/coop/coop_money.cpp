@@ -1,4 +1,4 @@
-// Anomaly Coop — player money lives on the host (F2 T1, review R4 7). See coop_money.h and xrCoop/coop_ledger.h.
+// Anomaly Coop — player money lives on the host. See coop_money.h and xrCoop/coop_ledger.h.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_money.h"
@@ -15,8 +15,9 @@
 #include "coop_world.h"
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_limits.h"
+#include "coop_lua.h" // lua_api: the registrar, the argument readers
+#include "xrCoop/coop_lua_errors.h" // lua_errors::LogBudget
 
-#include <cmath>
 #include <vector>
 
 #include "Level.h"
@@ -44,24 +45,24 @@ constexpr u32 kVerdictCount = ledger::kVerdictCount;
 constexpr int kMaxSetting = 2000000000; // console and ltx values are ints
 constexpr LPCSTR kSection = "coop_money";
 
-// ---------------------------------------------------------------- settings (Ruling 21, Ruling F2-1)
+// ---------------------------------------------------------------- settings
 int g_gain_burst = int(ledger::Policy().script_gain_burst);
 int g_gain_per_min = int(ledger::Policy().script_gain_per_min);
 int g_dialog_cap = int(ledger::Policy().dialog_gain_cap);
 int g_dialog_per_min = int(ledger::Policy().dialog_gain_per_min);
 int g_max_money = int(ledger::Policy().max_money);
-// F2 T5 fix round 1 (review 2): 1.7 (the lowest stock mech_discount) x 1.0 (the economy slider `upgrade` of
+// 1.7 (the lowest stock mech_discount) x 1.0 (the economy slider `upgrade` of
 // ui_options.script starts at 1.0; plugins\difficulty.ltx 1.3 is only a preset's value).
 float g_upgrade_min_percent = 1.7f;
-bool g_scripted_upgrades = false; // F2 T5: upgrades that name no mechanic (a script's) are refused
-// F2 T6b (Ruling F2-19): the session's transfer rules, pushed by the host's Lua (coop.money_set_rules). Kept for the
+bool g_scripted_upgrades = false; // upgrades that name no mechanic (a script's) are refused
+// The session's transfer rules, pushed by the host's Lua (coop.money_set_rules). Kept for the
 // process: a new session or a world load does not widen them (a host that played a session with transfers off starts the
 // next one with them off until its Lua has pushed again), the host's Lua says so when they change. Before it has said
-// anything: the options' defaults (T6b review M1), transfers on, kDefaultTransferMax at a time. Not fail-closed: a mod that
+// anything: the options' defaults, transfers on, kDefaultTransferMax at a time. Not fail-closed: a mod that
 // calls coop.money_give on a host without the economy script keeps working.
 bool g_transfer_on = true;
 u64 g_transfer_max = ledger::kDefaultTransferMax;
-// T6b review I1: how fast one character may give money away (Policy::transfer_burst, transfer_per_min).
+// How fast one character may give money away (Policy::transfer_burst, transfer_per_min).
 int g_transfer_burst = int(ledger::Policy().transfer_burst);
 int g_transfer_per_min = int(ledger::Policy().transfer_per_min);
 
@@ -122,7 +123,7 @@ void load_settings()
 			g_upgrade_min_percent = f;
 	}
 	if (ini.line_exist(kSection, "scripted_upgrades"))
-		g_scripted_upgrades = !!ini.r_bool(kSection, "scripted_upgrades"); // F2 T5
+		g_scripted_upgrades = !!ini.r_bool(kSection, "scripted_upgrades");
 }
 
 void register_console()
@@ -140,8 +141,7 @@ void register_console()
 	CMD4(CCC_Integer, "coop_money_transfer_per_min", &g_transfer_per_min, 0, kMaxSetting);
 }
 
-u64 g_log_count = 0;
-bool log_allowed() { return ++g_log_count <= 20 || (g_log_count % 100) == 0; }
+lua_errors::LogBudget g_log{20}; // the module's log lines: the first 20, then every 100th
 
 const char* verdict_name(Verdict v)
 {
@@ -180,22 +180,22 @@ const char* nick_of(PeerId id)
 
 // ---------------------------------------------------------------- host state
 // Per connection the newest answered change, per character (its player key) the allowances for the whole session:
-// leaving and joining again refills nothing (fix round 1); they refill from the moment the character is live
-// (host_on_peer_in_world, Ruling F2-20). Rules: xrCoop/coop_ledger.h HostBook.
+// leaving and joining again refills nothing; they refill from the moment the character is live
+// (host_on_peer_in_world). Rules: xrCoop/coop_ledger.h HostBook.
 ledger::HostBook g_book;
-// Review A-REV-E-2 finding 2 (Server): a trade's charge his map server judged by an older balance and the world's balance could not pay:
-// his debt, paid by his next income (xrCoop/coop_ledger.h TradeDebts). For the session; a co-op never has one.
+// In Server mode, a trade based on a stale map server balance can exceed the world's balance. TradeDebts (xrCoop/coop_ledger.h)
+// keeps the shortfall for the session and applies the player's next income to it. Co-op uses the world's balance directly.
 ledger::TradeDebts g_debts;
 
 struct HostCounters
 {
 	u64 changes = 0, malformed = 0, no_character = 0, stale = 0, dropped_joining = 0, bad_receiver = 0;
-	u64 gaps = 0; // parity audit D11: requests that showed seqs never seen here
-	u64 notes_sent = 0; // F2 T6b: answers that carried a refusal, gifts told to the receiver
+	u64 gaps = 0; // requests that reveal missing sequence numbers at the host
+	u64 notes_sent = 0; // answers that carried a refusal, gifts told to the receiver
 	u64 verdicts[kVerdictCount] = {};
 	u64 gain_script = 0, gain_dialog = 0; // RU
 	u64 grants = 0, trades = 0, transfers = 0, capped = 0, joins = 0;
-	u64 shortfalls = 0, shortfall_ru = 0, debt_paid = 0; // A-REV-E-2 F2: trade charges kept as debt (RU), RU of debt paid back
+	u64 shortfalls = 0, shortfall_ru = 0, debt_paid = 0; // trade charges kept as debt (RU), RU of debt paid back
 } g_h;
 
 // The character that holds a player's money: the host's own actor, else his proxy (kNoId if none).
@@ -211,7 +211,7 @@ CInventoryOwner* owner_object(u16 id)
 
 CSE_ALifeTraderAbstract* owner_entity(u16 id)
 {
-	CSE_Abstract* e = id == kNoId ? nullptr : events::find_entity(id);
+	CSE_Abstract* e = id == kNoId ? nullptr : world::server_entity(id);
 	return e ? smart_cast<CSE_ALifeTraderAbstract*>(e) : nullptr;
 }
 
@@ -234,7 +234,7 @@ bool read_balance(u16 holder, u32& out)
 void write_balance(u16 holder, u32 value)
 {
 	if (CInventoryOwner* io = owner_object(holder))
-		io->set_money(value, true); // GE_MONEY: the server entity keeps it, so does the save (P4)
+		io->set_money(value, true); // GE_MONEY: the server entity keeps it, so does the save
 	else if (CSE_ALifeTraderAbstract* t = owner_entity(holder))
 		t->m_dwMoney = value;
 }
@@ -245,11 +245,11 @@ std::string custom_data_key(const CSE_Abstract* e)
 	return e && e->m_ini_string.size() ? ledger::character_key(e->m_ini_string.c_str()) : std::string();
 }
 
-// The key the money book knows a character by (Ruling F2-13). A character without a key line (none of coop_join's)
+// The key the money book knows a character by. A character without a key line (none of coop_join's)
 // gets one of its id that no save snapshot holds: it counts as made in this session.
 std::string character_key_of(u16 holder)
 {
-	std::string key = custom_data_key(events::find_entity(holder));
+	std::string key = custom_data_key(world::server_entity(holder));
 	if (key.empty())
 	{
 		char id[16];
@@ -273,7 +273,7 @@ void fire_note(const ledger::MoneyNote& n)
 		    cb_int(n.amount), cb_str(verdict_name(n.verdict)), cb_str(cause_name(n.cause))});
 }
 
-// The player's balance (and a note about it). F3a T7: the host player's too, over the internal channel: his actor holds
+// The player's balance (and a note about it). The host player's too, over the internal channel: his actor holds
 // the balance already (one object in the process), his machine is told the note from it (client_on_balance).
 void send_balance(PeerId to, u32 balance, const ledger::MoneyNote& note = ledger::MoneyNote())
 {
@@ -296,8 +296,8 @@ enum class Source : u8
 	Transfer, // the receiver's side of a transfer (counted with the transfer)
 };
 
-// Review A-REV-E-2 finding 2: an income of `credit` RU (> 0) of the character `holder` (player `peer`, kInvalidPeer: none here): what is
-// left for his balance after it paid his trade debt.
+// Returns the portion of positive `credit` in RU left after paying `holder`'s trade debt. `peer` identifies the player for the log
+// (kInvalidPeer if absent).
 s64 pay_debt(PeerId peer, u16 holder, s64 credit, const char* why)
 {
 	if (g_debts.empty() || credit <= 0)
@@ -313,8 +313,8 @@ s64 pay_debt(PeerId peer, u16 holder, s64 credit, const char* why)
 	return credit - s64(paid);
 }
 
-// Review A-REV-E-2 finding 2: a trade's charge `delta` (< 0) larger than `balance`, the world's balance now (his map server judged the
-// deal by an older copy of it: LevelMap, and the goods have moved there): what the balance cannot pay is his debt, not floored away.
+// A trade charge `delta` (< 0) can exceed the world's `balance` when the map server settles the goods using a stale LevelMap.
+// Keep the unpaid amount as the player's trade debt.
 void note_shortfall(PeerId peer, u16 holder, u32 balance, s64 delta)
 {
 	const u32 charge = -delta > s64(0xffffffffu) ? 0xffffffffu : u32(-delta);
@@ -330,7 +330,7 @@ void note_shortfall(PeerId peer, u16 holder, u32 balance, s64 delta)
 }
 
 // Host: changes a balance by `delta` within [0, max(max_money, balance)] and tells its player (with `note`).
-// Review A-REV-E-2 finding 2: a trade's charge the balance cannot pay is kept as his debt (note_shortfall); an income pays a debt first.
+// note_shortfall records the unpaid portion of a trade charge. Income pays trade debt first.
 bool adjust(PeerId peer, s64 delta, const char* why, Source source,
     const ledger::MoneyNote& note = ledger::MoneyNote())
 {
@@ -354,7 +354,7 @@ bool adjust(PeerId peer, s64 delta, const char* why, Source source,
 	if (s64(next) != want && !short_trade) // a short trade's line is note_shortfall's
 	{
 		++g_h.capped;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("! [coop] money of <%s>: %u RU %+lld (%s) capped at %u", nick_of(peer), balance, delta, why, next);
 	}
 	if (next != balance)
@@ -364,7 +364,7 @@ bool adjust(PeerId peer, s64 delta, const char* why, Source source,
 }
 
 // The world's balances by peer for ledger::settle_transfer: set writes a giver's balance, add credits a receiver (and
-// sends him his balance, with the giver's name: F2 T6b).
+// sends him his balance, with the giver's name).
 struct WorldBalances
 {
 	PeerId giver = kInvalidPeer;
@@ -399,7 +399,7 @@ ledger::Receiver receiver_of(PeerId to)
 	return r;
 }
 
-// A player's change of his money (F3a T7: the host player's from peer 0 over the internal channel - his transfers; his
+// A player's change of his money (the host player's from peer 0 over the internal channel - his transfers; his
 // other changes are the world's own, made on his actor directly).
 void host_on_req(PeerId from, Reader& r)
 {
@@ -415,7 +415,7 @@ void host_on_req(PeerId from, Reader& r)
 	if (!ledger::read(r, q))
 	{
 		++g_h.malformed;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("! [coop] malformed ReqMoney from #%u", from);
 		return;
 	}
@@ -436,7 +436,7 @@ void host_on_req(PeerId from, Reader& r)
 		++g_h.gaps;
 		send_balance(from, balance, ledger::note_gap(g_book.acked(from) + 1, skipped));
 	}
-	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's (F2-1).
+	// The talk lock is only the condition "a dialog is going on": the dialog allowance is the character's.
 	levels::BodyFacts there; // on a map server's level the talk lock is its authority's
 	const bool talking = dialog::host_lock_of(from) != kNoId || (mode().facts_of(join::proxy_of_peer(from), there) && there.talking);
 	const ledger::Decision d =
@@ -456,22 +456,22 @@ void host_on_req(PeerId from, Reader& r)
 		{
 			WorldBalances world;
 			world.giver = from;
-			ledger::settle_transfer(world, from, d.balance, q.ref, d.credit); // giver first (review round 2)
+			ledger::settle_transfer(world, from, d.balance, q.ref, d.credit); // giver first
 			++g_h.transfers;
 		}
-		else if (d.balance > balance) // a gain pays his trade debt first (A-REV-E-2 F2)
+		else if (d.balance > balance) // a gain pays his trade debt first
 			write_balance(holder, balance + u32(pay_debt(from, holder, s64(d.balance) - s64(balance), cause_name(q.cause))));
 		else if (d.balance != balance)
 			write_balance(holder, d.balance);
 	}
 	else if (q.cause == Cause::Transfer && (!to.present || to.peer == from))
 		++g_h.bad_receiver;
-	if (d.verdict != Verdict::Applied && log_allowed())
+	if (d.verdict != Verdict::Applied && g_log.allow())
 		::Msg("[coop] money change #%u of <%s> refused: %+d RU (%s), %s; balance %u RU", q.seq, nick_of(from), q.delta,
 		    cause_name(q.cause), verdict_name(d.verdict), d.balance);
 	u32 now_holds = d.balance; // what the character holds after it all (the same unless a transfer went to himself)
 	read_balance(holder, now_holds);
-	send_balance(from, now_holds, d.note); // F2 T6b: a refusal is told to the player with the answer
+	send_balance(from, now_holds, d.note); // a refusal is told to the player with the answer
 }
 
 // ---------------------------------------------------------------- client state
@@ -482,22 +482,22 @@ struct ClientState
 	u32 host_balance = 0, acked = 0; // the newest MoneyBalance
 	std::vector<ledger::Pending> pending; // changes sent (or queued) that the host has not answered
 	xr_vector<ledger::MoneyReq> outbox; // queued for frame()
-	ledger::UpgradeHolds holds; // F2 T5: payments requests carry, until their answers (client_hold)
-	ledger::RefusalGate refusals; // F2 T6b: how often a refusal of the host is told to the player (per cause)
+	ledger::UpgradeHolds holds; // payments requests carry, until their answers (client_hold)
+	ledger::RefusalGate refusals; // how often a refusal of the host is told to the player (per cause)
 };
 // GE_MONEY may come from the game thread; the answers come with the network pump on the main thread.
 xrCriticalSection g_cl_lock;
 ClientState g_cl;
 u32 g_cl_seq = 0; // process lifetime: an answer from an older world never covers a newer change
-u32 g_hold_seq = 0; // F2 T5, process lifetime: a request of an older world never releases a newer hold
+u32 g_hold_seq = 0; // process lifetime: a request of an older world never releases a newer hold
 ClientSpendScope* g_scope = nullptr; // the innermost alive ClientSpendScope (main thread)
 
 struct ClientCounters
 {
 	u64 sent = 0, balances = 0, set_by_host = 0, scoped = 0, gives = 0, malformed = 0;
-	u64 holds = 0, unclaimed = 0; // F2 T5
-	u64 gifts = 0, refusals = 0, refusals_muted = 0; // F2 T6b: notes told to the player (gifts, refusals), and the muted
-	u64 resent = 0; // parity audit D11: changes the host never saw, sent again
+	u64 holds = 0, unclaimed = 0;
+	u64 gifts = 0, refusals = 0, refusals_muted = 0; // notes told to the player (gifts, refusals), and the muted
+	u64 resent = 0; // changes resent to fill sequence gaps reported by the host
 } g_c;
 limits::Pacer g_cl_pacer; // D11: over the host's rate a ReqMoney is lost with no answer
 
@@ -511,7 +511,7 @@ void queue_change(s64 delta, Cause cause, PeerId ref)
 	g_cl.pending.push_back({q.seq, q.delta, q.cause, q.ref});
 }
 
-// Under g_cl_lock. F2 T6b: the answer's note is told once the balance is on screen. A mod that changes the money in a
+// Under g_cl_lock. The answer's note is told once the balance is on screen. A mod that changes the money in a
 // loop is refused over and over: only one refusal of a cause in a few seconds is told.
 bool note_allowed(const ledger::MoneyNote& n)
 {
@@ -530,7 +530,7 @@ void tell_note(const ledger::MoneyNote& n, bool tell)
 		fire_note(n);
 }
 
-// A player: the host's MoneyBalance. A remote client shows it (ledger::client_view) and is told its note. F3a T7: the
+// A player: the host's MoneyBalance. A remote client shows it (ledger::client_view) and is told its note. The
 // host player's actor holds his balance itself (the world wrote it: one object in the process): he is only told the note.
 void client_on_balance(PeerId from, Reader& r)
 {
@@ -540,8 +540,8 @@ void client_on_balance(PeerId from, Reader& r)
 	if (!ledger::read(r, m))
 	{
 		++g_c.malformed;
-		// T6b review M6: the layout of MoneyBalance grew inside protocol 8; a host of an older build sends 8 bytes
-		if (log_allowed())
+		// An incompatible MoneyBalance layout fails decoding and is logged under the rate limit.
+		if (g_log.allow())
 			::Msg("! [coop] malformed MoneyBalance from the host: is its build of the game different from ours?");
 		return;
 	}
@@ -567,7 +567,7 @@ void client_on_balance(PeerId from, Reader& r)
 		return;
 	}
 	// Live first: Actor() asserts on GameID(), which has no level in the main menu. Protocol 8 makes a new player's
-	// character before his world, so the host's money_set reaches him there (night run 2, 2026-10-23: client crash);
+	// character before his world, so the host's money_set reaches him there (else the client crashes);
 	// host_on_peer_in_world sends the balance again once he is live.
 	if (!mgr().is_live_client())
 		return;
@@ -580,7 +580,7 @@ void client_on_balance(PeerId from, Reader& r)
 		ledger::forget_acked(g_cl.pending, m.acked_seq);
 		g_cl.host_balance = m.balance;
 		g_cl.acked = m.acked_seq;
-		// F2 T5: an upgrade paid here whose request is not answered yet stays out of it (T1 concern 3)
+		// An upgrade paid here whose request is not answered yet stays out of it
 		view = ledger::client_view(m.balance, m.acked_seq, g_cl.pending, policy().max_money, g_cl.holds.sum());
 	}
 	++g_c.balances;
@@ -588,7 +588,7 @@ void client_on_balance(PeerId from, Reader& r)
 	if (shown != view)
 	{
 		++g_c.set_by_host;
-		if (log_allowed())
+		if (g_log.allow())
 		{
 			// The host's reason is the note that came with the balance (the wire has no other): a gift from a player, a
 			// refusal of a change of ours. A change of the host's own (a trade, a grant, the death fee: host_adjust /
@@ -620,26 +620,12 @@ void client_on_balance(PeerId from, Reader& r)
 }
 
 // ---------------------------------------------------------------- Lua
-// A whole number from argument `idx` within [lo, hi]: fractions are cut toward zero as give_money(int) does; NaN and
-// infinities are refused (P8).
-bool arg_int(lua_State* L, int idx, double lo, double hi, s64& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v))
-		return false;
-	const double whole = std::trunc(v);
-	if (whole < lo || whole > hi)
-		return false;
-	out = s64(whole);
-	return true;
-}
-
+// The numbers of coop.money_*: cut toward zero as give_money(int) does (lua_api::arg_trunc).
+// A peer id 0 .. kInvalidPeer - 1.
 bool arg_peer(lua_State* L, int idx, PeerId& out)
 {
 	s64 v = 0;
-	if (!arg_int(L, idx, 0.0, double(kInvalidPeer - 1), v))
+	if (!lua_api::arg_trunc(L, idx, 0.0, double(kInvalidPeer - 1), v))
 		return false;
 	out = PeerId(v);
 	return true;
@@ -658,7 +644,7 @@ int done(lua_State* L)
 	return 1;
 }
 
-// F3a T7: the host player gives money as a client does - a ReqMoney (Transfer) to his world server over the internal
+// The host player gives money as a client does - a ReqMoney (Transfer) to his world server over the internal
 // channel, from the next frame (client_flush); the world settles it by the same rules and rates as a client's and
 // answers him with a MoneyBalance (a refusal is his note). His actor's money is the world's balance: nothing is taken
 // here (the world takes it when it settles), only checked.
@@ -717,7 +703,7 @@ int l_money_give(lua_State* L)
 		return refuse(L, "no session");
 	PeerId to = kInvalidPeer;
 	s64 amount = 0;
-	if (!arg_peer(L, 1, to) || !arg_int(L, 2, 1.0, double(max_money()), amount))
+	if (!arg_peer(L, 1, to) || !lua_api::arg_trunc(L, 2, 1.0, double(max_money()), amount))
 		return refuse(L, "bad arguments");
 	return mode().decides_world() ? host_player_give(L, to, u32(amount)) : client_give(L, to, u32(amount));
 }
@@ -731,7 +717,7 @@ int l_money_grant(lua_State* L)
 	PeerId peer = kInvalidPeer;
 	s64 amount = 0;
 	const double cap = double(max_money());
-	if (!arg_peer(L, 1, peer) || !arg_int(L, 2, -cap, cap, amount) || amount == 0)
+	if (!arg_peer(L, 1, peer) || !lua_api::arg_trunc(L, 2, -cap, cap, amount) || amount == 0)
 		return refuse(L, "bad arguments");
 	return host_adjust(peer, amount, "grant") ? done(L) : refuse(L, "no character");
 }
@@ -742,7 +728,7 @@ int l_money_grant_to(lua_State* L)
 	if (!mode().decides_world())
 		return refuse(L, "host only");
 	s64 character = 0, amount = 0;
-	if (!arg_int(L, 1, 1.0, double(kNoId - 1), character) || !arg_int(L, 2, 1.0, double(max_money()), amount))
+	if (!lua_api::arg_trunc(L, 1, 1.0, double(kNoId - 1), character) || !lua_api::arg_trunc(L, 2, 1.0, double(max_money()), amount))
 		return refuse(L, "bad arguments");
 	u32 added = 0;
 	if (!host_add_to_character(u16(character), u32(amount), "group reward", added))
@@ -758,19 +744,19 @@ int l_money_set(lua_State* L)
 		return refuse(L, "host only");
 	PeerId peer = kInvalidPeer;
 	s64 amount = 0;
-	if (!arg_peer(L, 1, peer) || !arg_int(L, 2, 0.0, double(max_money()), amount))
+	if (!arg_peer(L, 1, peer) || !lua_api::arg_trunc(L, 2, 0.0, double(max_money()), amount))
 		return refuse(L, "bad arguments");
 	return host_set(peer, u32(amount), "set") ? done(L) : refuse(L, "no character");
 }
 
 // coop.money_set_rules(enabled, max_transfer) -> ok, why: host. The session's rules for money between players
-// (money_transfer, max_money_transfer; F2 T6b): the host's Lua pushes them, the ledger holds a client to them.
+// (money_transfer, max_money_transfer): the host's Lua pushes them, the ledger holds a client to them.
 int l_money_set_rules(lua_State* L)
 {
 	if (!mode().decides_world())
 		return refuse(L, "host only");
 	s64 limit = 0;
-	if (lua_type(L, 1) != LUA_TBOOLEAN || !arg_int(L, 2, 0.0, double(UINT32_MAX), limit))
+	if (lua_type(L, 1) != LUA_TBOOLEAN || !lua_api::arg_trunc(L, 2, 0.0, double(UINT32_MAX), limit))
 		return refuse(L, "bad arguments");
 	const bool on = lua_toboolean(L, 1) != 0;
 	if (on != g_transfer_on || u64(limit) != g_transfer_max)
@@ -835,7 +821,7 @@ void install_client(Endpoint& e) { e.on(Msg::MoneyBalance, &client_on_balance); 
 void reset()
 {
 	g_book.reset(); // a new session (or none): nothing is kept
-	g_debts.clear(); // A-REV-E-2 F2: the trade debts are the session's
+	g_debts.clear(); // the trade debts are the session's
 	// except the transfer rules (g_transfer_*): the host's Lua says when they change, and says them again every 2 s
 	xrCriticalSectionGuard guard(g_cl_lock);
 	g_cl = ClientState(); // g_cl_seq goes on: see its comment
@@ -846,9 +832,9 @@ void on_session_started()
 	reset();
 	if (!mode().decides_world() || !ai().get_alife())
 		return;
-	// Ruling F2-10: the player characters in the world now are "from the save" (returning players keep full
+	// The player characters in the world now are "from the save" (returning players keep full
 	// allowances). One the host makes later in this session for a player key it has not seen starts empty. Known by
-	// the key they are bound to their players by, not by id (F2-13).
+	// the key they are bound to their players by, not by id.
 	std::vector<std::string> from_save;
 	for (const auto& it : ai().alife().objects().objects())
 		if (it.second && world::is_player_character(it.second))
@@ -864,7 +850,7 @@ void on_session_started()
 
 void frame()
 {
-	if (mgr().is_live_client() || mode().decides_world()) // F3a T7: the host player's transfers go out too
+	if (mgr().is_live_client() || mode().decides_world()) // the host player's transfers go out too
 		client_flush(true);
 }
 
@@ -872,13 +858,13 @@ void on_peer_left(PeerId id) { g_book.peer_left(id); } // the character keeps it
 
 void host_on_peer_in_world(PeerId id)
 {
-	// Fix round 1: the client drops a MoneyBalance until it is live, and the save it loaded may be older than its
+	// The client drops a MoneyBalance until it is live, and the save it loaded may be older than its
 	// balance (a grant while it loaded). One answer now anchors it: its pending list is empty at this point.
 	const u16 holder = mode().decides_world() && id != kHostPeer ? holder_of(id) : kNoId;
 	u32 balance = 0;
 	if (holder == kNoId || !read_balance(holder, balance))
 		return;
-	// Ruling F2-20: the character is live. Its allowances refill from now (a new one starts empty, a returning one
+	// The character is live. Its allowances refill from now (a new one starts empty, a returning one
 	// keeps what it had), not from its first income; the time away pays nothing. money_set / host_set never touch them.
 	g_book.peer_online(id, character_key_of(holder), mgr().now_ms());
 	++g_h.joins;
@@ -925,7 +911,7 @@ void print_status()
 			const std::string key = holder != kNoId ? character_key_of(holder) : std::string();
 			const ledger::CharacterAllowances* a = key.empty() ? nullptr : g_book.allowances(key);
 			const bool saved = !key.empty() && g_book.from_save(key);
-			// Not used yet: full for a character from the save, empty for a new one (F2-10).
+			// Not used yet: full for a character from the save, empty for a new one.
 			const auto shown = [saved](const ledger::Allowance* x, u32 burst)
 			{ return x && x->started ? x->tokens : (saved ? double(burst) : 0.0); };
 			::Msg("[coop]     #%u <%s>: %u RU, answered #%u, character %u (%s), allowances script %.0f / dialog %.0f RU",
@@ -954,7 +940,7 @@ float upgrade_min_percent() { return g_upgrade_min_percent; }
 
 bool scripted_upgrades() { return g_scripted_upgrades; }
 
-// F3a: the book is the world server's. A map server judges a deal by the last balance the world server's LevelMap named, and what the
+// The book is the world server's. A map server judges a deal by the last balance the world server's LevelMap named, and what the
 // deal changes goes up at once (coop_levels_xfer.cpp LevelEntity Money); the player's MoneyBalance comes from the world server.
 u32 host_balance(PeerId peer)
 {
@@ -970,7 +956,7 @@ u32 host_balance(PeerId peer)
 
 bool host_adjust(PeerId peer, s64 delta, const char* why)
 {
-	// Fix round 1: trades are counted apart from grants (coop_trade passes "trade").
+	// Trades are counted apart from grants (coop_trade passes "trade").
 	const bool trade = why && !xr_strcmp(why, "trade");
 	if (LevelSide* side = mode().level())
 	{
@@ -983,12 +969,12 @@ bool host_adjust(PeerId peer, s64 delta, const char* why)
 bool host_add_to_character(u16 character, u32 amount, const char* why, u32& added)
 {
 	added = 0;
-	if (!mode().decides_world() || !world::is_player_character(events::find_entity(character)))
+	if (!mode().decides_world() || !world::is_player_character(world::server_entity(character)))
 		return false;
 	u32 balance = 0;
 	if (!read_balance(character, balance))
 		return false;
-	// A-REV-E-2 F2: an income pays his trade debt first (adjust and pay_debt below); `added` is what his balance gains
+	// An income pays his trade debt first (adjust and pay_debt below); `added` is what his balance gains
 	const u32 owed = g_debts.empty() ? 0u : g_debts.debt_of(character_key_of(character));
 	const u32 to_debt = owed < amount ? owed : amount;
 	added = ledger::capped_balance(balance, s64(amount) - s64(to_debt), policy().max_money) - balance;
@@ -1015,7 +1001,7 @@ bool host_set(PeerId peer, u32 amount, const char* why)
 	if (next != amount)
 	{
 		++g_h.capped;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("! [coop] money of <%s> set to %u RU (%s), capped at %u", nick_of(peer), amount, why, next);
 	}
 	if (next != balance)
@@ -1055,7 +1041,7 @@ void client_on_actor_money(u32 money)
 	if (g_scope && delta < 0)
 	{
 		const u64 sum = u64(g_scope->m_spent) + u64(-delta);
-		g_scope->m_spent = sum > u64(u32(-1)) ? u32(-1) : u32(sum); // its request carries the sum (F2 T5)
+		g_scope->m_spent = sum > u64(u32(-1)) ? u32(-1) : u32(sum); // its request carries the sum
 		++g_c.scoped;
 		return;
 	}
@@ -1132,19 +1118,7 @@ void register_lua(lua_State* L)
 		{"talk_lock_of", &l_talk_lock_of},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_pop(L, 1);
+	lua_api::fill(L, nullptr, fns); // coop_script logs a missing coop
 }
 } // namespace money
 } // namespace coop

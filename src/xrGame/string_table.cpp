@@ -88,9 +88,9 @@ void CStringTable::Init()
 	//---
 	ReparseKeyBindings();
 
-	// RayLink: the main menu's version line (ui_main_menu.script and the mods' copies of it show ui_st_game_version)
-	// names the engine after the game's own text: "S.T.A.L.K.E.R. G.A.M.M.A. 0.9.5 | RayLink Engine b28". Done once
-	// every file is loaded, so it holds whichever file defines the string last (G.A.M.M.A.'s text overhaul does).
+	// coop: the main menu's version line (ui_main_menu.script and the mods' copies of it show ui_st_game_version)
+	// names the engine after the game's own text: "S.T.A.L.K.E.R. Anomaly 1.5.2 | RayLink Engine b28". Done once every
+	// file is loaded, so it holds whichever file defines the string last (a mod's text overhaul may).
 	STRING_TABLE_MAP_IT game_version = pData->m_StringTable.find("ui_st_game_version");
 	if (game_version != pData->m_StringTable.end())
 	{

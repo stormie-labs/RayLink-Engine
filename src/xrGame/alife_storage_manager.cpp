@@ -16,9 +16,9 @@
 #include "alife_group_registry.h"
 #include "alife_registry_container.h"
 #include "coop/coop_join.h"
-#include "coop/coop_manager.h" // Anomaly Coop
+#include "coop/coop_manager.h"
 #include "coop/coop_levels.h"
-#include "coop/coop_objects.h" // Anomaly Coop (R32 PJ3): host_flush_consumes
+#include "coop/coop_objects.h" // coop: host_flush_consumes
 #include "xrserver.h"
 #include "level.h"
 #include "../xrEngine/x_ray.h"
@@ -49,15 +49,15 @@ CALifeStorageManager::~CALifeStorageManager()
 
 void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 {
-	// Anomaly Coop: the console is not the only caller; refuse before Lua, last-save state or disk writes.
+	// coop: the console is not the only caller; refuse before Lua, last-save state or disk writes.
 	if (!coop::join::may_save_world())
 	{
 		Msg("! [coop] only the host can save the shared world");
 		return;
 	}
 	PROF_EVENT();
-	coop::on_blocking_work(); // Anomaly Coop: writing a big save blocks the frame, keep the session link alive
-	coop::objects::host_flush_consumes(); // Anomaly Coop (R32 PJ3): a thrown hand item is never kept by the save
+	coop::on_blocking_work(); // coop: writing a big save blocks the frame, keep the session link alive
+	coop::objects::host_flush_consumes(); // coop: a thrown hand item is never kept by the save
 	LPCSTR game_saves_path = FS.get_path("$game_saves$")->m_Path;
 
 	string_path save_name;
@@ -99,7 +99,7 @@ void CALifeStorageManager::save(LPCSTR save_name_no_check, bool update_name)
 		spawns().save(stream);
 		objects().save(stream);
 		registry().save(stream);
-		coop::levels::xfer_save(stream); // Anomaly Coop: split levels, the transfers in flight
+		coop::levels::xfer_save(stream); // coop: split levels, the transfers in flight
 
 		source_count = stream.tell();
 		void* source_data = stream.pointer();
@@ -152,7 +152,7 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 	spawns().load(source, file_name);
 	graph().on_load();
 	objects().load(source);
-	coop::join::on_alife_objects_loaded(objects()); // Anomaly Coop: client role swap before registration
+	coop::join::on_alife_objects_loaded(objects()); // coop: client role swap before registration
 
 	VERIFY(can_register_objects());
 	can_register_objects(false);
@@ -168,13 +168,13 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 	}
 
 	registry().load(source);
-	coop::levels::xfer_load(source); // Anomaly Coop: split levels, the transfers in flight
+	coop::levels::xfer_load(source); // coop: split levels, the transfers in flight
 
 	can_register_objects(true);
 
 	for (I = B; I != E; ++I)
 		(*I).second->on_register();
-	coop::join::on_alife_registered(); // Anomaly Coop: a client's character put on the new level blind goes on its ground
+	coop::join::on_alife_registered(); // coop: a client's character put on the new level blind goes on its ground
 
 	if (!g_pGameLevel)
 		return;
@@ -184,10 +184,10 @@ void CALifeStorageManager::load(void* buffer, const u32& buffer_size, LPCSTR fil
 
 bool CALifeStorageManager::load(LPCSTR save_name_no_check)
 {
-	// Anomaly Coop: a received snapshot can only be loaded by the active join pipeline.
+	// coop: a received snapshot can only be loaded by the active join pipeline.
 	if (coop::join::is_client_cache_save(save_name_no_check) && !coop::join::client_loading_world())
 	{
-		// Crash triage RL-8VWD-XXXF (build 50): the refusal ended in a FATAL with no word of why; the phase names it
+		// the phase names why it is refused
 		Msg("! [coop] the received world [%s] is not loaded: the join phase is %s, not loading-world", save_name_no_check,
 		    coop::phase_name(coop::mgr().phase()));
 		return false;
@@ -213,7 +213,7 @@ bool CALifeStorageManager::load(LPCSTR save_name_no_check)
 		strconcat(sizeof(m_save_name), m_save_name, save_name, SAVE_EXTENSION);
 	}
 	string_path file_name;
-	CSavedGameWrapper::saved_game_full_name(save_name, file_name); // Anomaly Coop: also resolves the private join cache
+	CSavedGameWrapper::saved_game_full_name(save_name, file_name); // coop: also resolves the private join cache
 
 	if (!coop::join::is_client_cache_save(save_name))
 		xr_strcpy(g_last_saved_game, save_name);

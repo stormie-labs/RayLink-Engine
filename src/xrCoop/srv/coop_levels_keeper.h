@@ -1,13 +1,13 @@
 // Anomaly Coop — split levels (docs/SPLIT_LEVELS.md §7a): what a map server computes and what the world server keeps.
 // The world server holds the world: offline, for every map. A map server computes the creatures near the players of its level. A
 // creature (or a squad) the world server simulates offline moves between them only through the transfer core, xrCoop/coop_xfer.h,
-// where every change of owner goes (plan §1.7): the map server asks (TakeReq), the world server freezes it and grants it with its
+// where every change of owner goes: the map server asks (TakeReq), the world server freezes it and grants it with its
 // fresh state, the map server gives it back with its state when it goes offline. An object the world server does not simulate (a
 // restrictor, an item on the ground, a physics object, a smart terrain's online half) is not transferred: it goes online by the
 // stock rules on the process that has that map loaded, and only what happens to it travels (LevelEntity).
 //   lead_vote  the switch manager's question on a map server, for one object;
 //   Keeper     the world server's side: the Ledger over the bridges of the map servers, and the one place that decides "the world
-//              server does not simulate this object" (plan §5.3): every mark is set and cleared from what the ledger says after a
+//              server does not simulate this object": every mark is set and cleared from what the ledger says after a
 //              packet.
 // The engine applies the changes (coop_levels_alife.cpp): a mark takes the object out of the host's offline simulation, without
 // a game object on the host; the state of a change goes into its server entity.
@@ -119,7 +119,7 @@ inline xfer::Packet packet_of(const wire::LevelXferDownMsg& m, xfer::Peer self)
 // server or another map server makes. Nothing to lease, nothing to give back: the ids of a slice stay its own; an id it frees goes
 // back to its own generator and comes round again.
 // A slice feeds all a level makes and the id leases of its players: the four traders of k00_marsh alone are some 570 objects. The world
-// stands below the slices: GAMMA's has 27296 objects, 0x6AA0, and a loaded world's generator gives its lowest ids first (CID_Generator).
+// stands below the slices: a modded one has some 27300 objects, 0x6AA0, and a loaded world's generator gives its lowest ids first (CID_Generator).
 constexpr uint16_t kLeaderIdFirst = 0x9000;
 constexpr uint16_t kLeaderIdsEach = 4095; // 7 map servers: up to 0xFFF8
 constexpr uint32_t kLeaderSlots = 7;
@@ -140,7 +140,7 @@ inline uint32_t leader_slots_kept(uint32_t allowed, uint32_t highest)
 	return wanted < kLeaderSlots ? wanted : kLeaderSlots;
 }
 
-// ---------------------------------------------------------------- R32 W9: one generator per slice, no fallback
+// ---------------------------------------------------------------- one generator per slice, no fallback
 
 // A block of ids: first .. first + count - 1.
 struct IdBlock
@@ -160,10 +160,10 @@ constexpr size_t kIdLowWater = 512; // a map server asks for another block when 
 constexpr uint64_t kIdAskAgainMs = 10000; // ... and again after this, while no block came
 constexpr size_t kIdBlocksEach = 4; // the blocks one map server may hold besides its slice
 
-// A map server's ids (W9): its slice (leader_ids_of) and the blocks the world gave it in an Ack. next() hands out a free id of the
+// A map server's ids: its slice (leader_ids_of) and the blocks the world gave it in an Ack. next() hands out a free id of the
 // pool and nothing else: an empty pool answers kNoObject, never an id of the stock generator. (The engine's PerformIDgen still hands
-// that kNoObject to the stock generator, which then takes a stock id: W9's "no fallback" is open there, review WP4 #5.) An id
-// whose create the world refused stays reserved (W2b repair) until the pool is reset (a new world).
+// that kNoObject to the stock generator, which then takes a stock id: the "no fallback" is open there.) An id
+// whose create the world refused stays reserved (the repair) until the pool is reset (a new world).
 class IdPool
 {
 public:
@@ -283,10 +283,10 @@ private:
 	bool m_asking = false;
 };
 
-// The world server's book of the blocks it gave (W9): carved from its own free ids below the slices, top down, kIdBlockSize each,
+// The world server's book of the blocks it gave: carved from its own free ids below the slices, top down, kIdBlockSize each,
 // none given twice while its map server is connected. The engine keeps every id of a given block out of its own generator.
 constexpr uint16_t kIdGrantTop = kLeaderIdFirst; // the first id above the range blocks come from
-constexpr uint16_t kIdGrantFloor = 0x7000; // the lowest id a block may have (a GAMMA world stands below 0x6AA0)
+constexpr uint16_t kIdGrantFloor = 0x7000; // the lowest id a block may have (a modded world stands below 0x6AA0)
 
 class IdGrants
 {
@@ -373,7 +373,7 @@ private:
 	std::map<uint32_t, std::vector<IdBlock>> m_given;
 };
 
-// R32 W9 (review WP4 #4): is `id` the sender's own to make? Of its slice (leader_ids_of: `slice_first`, kLeaderIdsEach ids; 0: no
+// Is `id` the sender's own to make? Of its slice (leader_ids_of: `slice_first`, kLeaderIdsEach ids; 0: no
 // slice) or of a block the world gave that bridge. The world's acceptance of a Spawn asks this (coop_levels_accept.h id_in_slice): a
 // map server whose slice ran low hands out its blocks' ids, and a Spawn under one of them is its own.
 inline bool id_is_senders(uint16_t id, uint16_t slice_first, const IdGrants& grants, uint32_t bridge)
@@ -400,7 +400,7 @@ struct LeadAsk
 // `held`: this process writes it (Holder::authors); `frozen`: on its way back to the host (Holder::frozen);
 // `in_reach`: within the switch distance of a player of the level.
 // (Not `near`: the Windows headers define it to nothing. The parameter lost its name, `{Offline, near}` compiled as `{Offline, }`,
-// and a map server never asked for anything; the tests, without those headers, saw nothing. Live 2026-11-01, test_source_names.)
+// and a map server would never ask for anything; the tests, without those headers, would see nothing: test_source_names.)
 inline LeadAsk lead_vote(bool transferred, bool held, bool frozen, bool in_reach)
 {
 	if (!transferred)
@@ -431,7 +431,7 @@ public:
 
 	const xfer::Ledger& ledger() const { return m_ledger; }
 
-	// A new world: nothing of the old one counts, and no peer of the old ledger can pass for a new connection's (R7).
+	// A new world: nothing of the old one counts, and no peer of the old ledger can pass for a new connection's.
 	void restart()
 	{
 		xfer::Ledger fresh;
@@ -446,7 +446,7 @@ public:
 	// journal may need 256 KB).
 	std::string journal() const { return m_ledger.save_journal(); }
 
-	// That save was loaded (R8): every map server is gone and nobody's half counts. A release the world had taken comes home with its
+	// That save was loaded: every map server is gone and nobody's half counts. A release the world had taken comes home with its
 	// state, a grant rolls back to what the save holds; the gens go on in a new epoch and no peer is reused. False, and nothing
 	// changed, for a malformed text.
 	bool resume(const std::string& text)
@@ -525,7 +525,7 @@ public:
 		return down;
 	}
 
-	// The auditor (plan §1.7, requirements 3 and 4): the hash of what he says he writes against what the ledger gives him. States
+	// The auditor: the hash of what he says he writes against what the ledger gives him. States
 	// are not compared: the stream is seconds behind by design, only who writes what under which gen is the auditor's question.
 	static xfer::Entry bare(xfer::Entry e)
 	{
@@ -546,7 +546,7 @@ public:
 		const auto it = m_peers.find(session_peer);
 		return it == m_peers.end() ? 0u : xfer::mismatched(his, xfer::hash_of(bare(m_ledger.owned_by(it->second))));
 	}
-	// R32 W5.2: the same with a content digest per object (`digest_of(id)`, 0: none; the members of a held squad,
+	// The same with a content digest per object (`digest_of(id)`, 0: none; the members of a held squad,
 	// coop_levels_audit.h members_digest): a member missing or extra on either side makes its bucket differ, so it is asked for.
 	template <class Digest>
 	uint32_t differs(uint32_t session_peer, const xfer::LevelHash& his, Digest&& digest_of) const
@@ -607,8 +607,8 @@ public:
 		const auto it = m_marked.find(id);
 		return it == m_marked.end() ? kNoSession : session_of(it->second);
 	}
-	// R32 A6: the keeper generation of `id` while `session_peer` holds it (0: he does not), and the gen his SpawnPrepare registered it
-	// under when he made it (0: he did not). A16: the gen his Holder names it with: on its way home (Releasing) the gen he held it
+	// The keeper generation of `id` while `session_peer` holds it (0: he does not), and the gen his SpawnPrepare registered it
+	// under when he made it (0: he did not). The gen his Holder names it with: on its way home (Releasing) the gen he held it
 	// under, not the Ack's new gen (Ledger::held_gen).
 	uint32_t gen_held_by(uint16_t id, uint32_t session_peer, uint32_t& spawn_gen) const
 	{
@@ -623,7 +623,7 @@ public:
 		return m_ledger.held_gen(id, it->second);
 	}
 
-	// R32 §8a A17: a creature left a squad `session_peer`'s map server holds, alive, and stays with it (its journal's Left): it is held
+	// a creature left a squad `session_peer`'s map server holds, alive, and stays with it (its journal's Left): it is held
 	// by that map server from now on, under the squad's gen (Ledger::adopt), and marked away (a Mark change: the engine's mark of an
 	// object marked online already changes nothing). False: he does not hold `unit`, or `id` is somebody else's.
 	bool adopt(uint16_t id, uint16_t unit, uint32_t session_peer, xfer::Bytes state)
@@ -635,7 +635,7 @@ public:
 		return true;
 	}
 
-	// R32 §8a A17: a creature `session_peer`'s map server holds on its own joined a squad it writes (its journal's Joined): its own
+	// a creature `session_peer`'s map server holds on its own joined a squad it writes (its journal's Joined): its own
 	// hold ends (Ledger::drop) and its mark goes without a change: it is not home, it is a member of a squad held away now. False:
 	// he did not hold it on its own (nothing changes).
 	bool drop_own(uint16_t id, uint32_t session_peer, uint64_t now)

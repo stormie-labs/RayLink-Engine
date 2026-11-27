@@ -1,5 +1,5 @@
-// Anomaly Coop - F3a split levels: the text of the transfer journal, section [coop_xfer] of the host actor's custom
-// data (plan 2026-10-24-f3a §1.7 "journal", §4.1 requirement 2; coop_xfer.h R6, R8).
+// Anomaly Coop - the text of the transfer journal, section [coop_xfer] of the host actor's custom
+// data.
 //   [coop_xfer]
 //   v = 1
 //   gen = <the ledger's gen counter>
@@ -11,6 +11,7 @@
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
+#include "../coop_text.h"
 #include "coop_xfer_base.h"
 
 #include <algorithm>
@@ -114,33 +115,6 @@ inline bool unbase64(const std::string& in, std::vector<uint8_t>& out)
 	return true;
 }
 
-// Strict unsigned decimal within [0, max].
-inline bool parse_u32(const std::string& s, uint32_t max, uint32_t& out)
-{
-	if (s.empty() || s.size() > 10)
-		return false;
-	uint64_t v = 0;
-	for (char c : s)
-	{
-		if (c < '0' || c > '9')
-			return false;
-		v = v * 10 + uint64_t(c - '0');
-	}
-	if (v > max)
-		return false;
-	out = uint32_t(v);
-	return true;
-}
-
-inline std::string trim(const std::string& s)
-{
-	size_t b = 0, e = s.size();
-	while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
-		++b;
-	while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
-		--e;
-	return s.substr(b, e - b);
-}
 
 // Upper bounds of the journal text: the header and one entry line besides its base64.
 constexpr size_t kHeaderBytes = 64;
@@ -194,7 +168,7 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, Peer& next_
 		size_t nl = text.find('\n', pos);
 		if (nl == std::string::npos)
 			nl = text.size();
-		const std::string line = detail::trim(text.substr(pos, nl - pos));
+		const std::string line(ascii::trim(std::string_view(text).substr(pos, nl - pos), ascii::space_tab_cr));
 		pos = nl + 1;
 		if (line.empty())
 			continue;
@@ -216,18 +190,18 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, Peer& next_
 		const size_t eq = line.find('=');
 		if (eq == std::string::npos)
 			return false;
-		const std::string key = detail::trim(line.substr(0, eq));
-		if (key.empty() || !kv.emplace(key, detail::trim(line.substr(eq + 1))).second)
+		const std::string key(ascii::trim(std::string_view(line).substr(0, eq), ascii::space_tab_cr));
+		if (key.empty() || !kv.emplace(key, ascii::trim(std::string_view(line).substr(eq + 1), ascii::space_tab_cr)).second)
 			return false;
 	}
 	uint32_t version = 0, gen = 0, next_peer = 0, n = 0;
-	if (!kv.count("v") || !detail::parse_u32(kv["v"], 1, version) || version != 1)
+	if (!kv.count("v") || !ascii::parse_u32(kv["v"], 1, version) || version != 1)
 		return false;
-	if (!kv.count("gen") || !detail::parse_u32(kv["gen"], 0xffffffffu, gen))
+	if (!kv.count("gen") || !ascii::parse_u32(kv["gen"], 0xffffffffu, gen))
 		return false;
-	if (!kv.count("peer") || !detail::parse_u32(kv["peer"], 0xffffffffu, next_peer) || next_peer == kWorld)
+	if (!kv.count("peer") || !ascii::parse_u32(kv["peer"], 0xffffffffu, next_peer) || next_peer == kWorld)
 		return false;
-	if (!kv.count("n") || !detail::parse_u32(kv["n"], uint32_t(kJournalMaxEntries), n))
+	if (!kv.count("n") || !ascii::parse_u32(kv["n"], uint32_t(kJournalMaxEntries), n))
 		return false;
 	if (kv.size() != 4 + size_t(n))
 		return false;
@@ -252,10 +226,10 @@ inline bool read_journal(const std::string& text, uint32_t& gen_out, Peer& next_
 		JournalEntry j;
 		j.kind = f[0][0];
 		uint32_t id = 0;
-		if (!detail::parse_u32(f[1], 0xffff, id) || !detail::parse_u32(f[2], 0xffffffffu, j.peer) ||
-		    j.peer == kWorld || j.peer >= next_peer || !detail::parse_u32(f[3], 0xffffffffu, j.gen) || j.gen == 0 ||
+		if (!ascii::parse_u32(f[1], 0xffff, id) || !ascii::parse_u32(f[2], 0xffffffffu, j.peer) ||
+		    j.peer == kWorld || j.peer >= next_peer || !ascii::parse_u32(f[3], 0xffffffffu, j.gen) || j.gen == 0 ||
 		    j.gen > gen ||
-		    !detail::parse_u32(f[4], 0xffffffffu, j.from_gen) || !detail::unbase64(f[5], j.payload))
+		    !ascii::parse_u32(f[4], 0xffffffffu, j.from_gen) || !detail::unbase64(f[5], j.payload))
 			return false;
 		if (j.kind != 'R' && (!j.payload.empty() || j.from_gen != 0))
 			return false;

@@ -1,6 +1,6 @@
-// Anomaly Coop — the map servers in the engine (F3a, docs/plans/2026-10-24-f3a-split-levels.md §1.1, §1.3, §1.6, T9). The owner's decision
-// of 2026-10-24: every map is computed on the host's PC, a client never leads one. A level with players and without the host is led
-// by a background process of the same exe (Mk), started and stopped by the host's process.
+// Anomaly Coop — the map servers in the engine. Every map is computed on the host's PC, a client never leads one.
+// A level with players and without the host is led by a background process of the same exe (Mk), started and stopped
+// by the host's process.
 //
 // The host's process (coop_mapserver.cpp): one levels::ServerLife per level, the process and its fsgame, the Hello of its bridge, what
 // the process reports. Its world comes as a client's does (JoinRequest, the blob), its transfers are coop_levels_xfer.cpp, the Keeper over
@@ -16,7 +16,7 @@
 // The pure half is xrCoop/coop_mapserver_rules.h.
 #pragma once
 
-#include "xrCoop/srv/coop_levels_dynamic.h" // the cap, the room, the lingers (build 50)
+#include "xrCoop/srv/coop_levels_dynamic.h" // the cap, the room, the lingers
 #include "xrCoop/srv/coop_levels_wire.h"
 #include "xrCoop/srv/coop_mapserver_rules.h"
 #include "xrCoop/coop_session.h"
@@ -42,7 +42,7 @@ void host_frame(); // levels::frame
 bool host_serves(u16 level);
 // It loaded its world: a player may enter.
 bool host_ready(u16 level);
-// R32 W1 (§8a A4): the life of the server of `level` as the writer rule reads it (writer::lead_of); Off when it has none.
+// The life of the server of `level` as the writer rule reads it (writer::lead_of); Off when it has none.
 levels::ServerState host_life_of(u16 level);
 // A player may stand on `level`: it has a server, or one can be started under `cap` (levels::host_map_cap), if need be after the
 // server empty the longest is told to stop (host_stop_for_room, for `for_peer`).
@@ -79,7 +79,7 @@ void server_visitor_came(const Visitor& v);
 void server_visitor_in_world(PeerId peer);
 void server_frame(); // levels::frame
 bool server_leads(); // it told the world server its level is up: the world server hears what it says of the level
-// Plan §1.6: the actor of this process is nobody, for a map server and for the dedicated host. A world that is up, every frame.
+// The map server and dedicated host have unplayed actors. Keep the actor a ghost each frame while the world is up.
 void ghost_frame();
 // Its connection to the world server is over: nothing is left to do here. A process that is no map server: no effect.
 void server_session_over();

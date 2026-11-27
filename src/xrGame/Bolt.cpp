@@ -6,7 +6,7 @@
 // Tronex
 #include "inventory.h"
 #include "actor.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 
 CBolt::CBolt(void)
 {
@@ -26,8 +26,8 @@ void CBolt::OnH_A_Chield()
 
 void CBolt::Throw()
 {
-	if (coop::objects::client_throw(this)) // Anomaly Coop: the host spawns and throws the bolt
-	{ m_thrown = true; return; } // Anomaly Coop
+	if (coop::objects::client_throw(this)) // coop: the host spawns and throws the bolt
+	{ m_thrown = true; return; }
 	CMissile* l_pBolt = smart_cast<CMissile*>(m_fake_missile);
 	if (!l_pBolt) return;
 

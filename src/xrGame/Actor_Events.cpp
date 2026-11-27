@@ -16,7 +16,7 @@
 #include "CameraLook.h"
 #include "CameraFirstEye.h"
 #include "holder_custom.h"
-#include "coop/coop_vehicles.h" // Anomaly Coop F5-VEH-2: own_actor_may_attach
+#include "coop/coop_vehicles.h" // coop: own_actor_may_attach
 //.#include "ui/uiinventoryWnd.h"
 #include "game_base_space.h"
 #ifdef DEBUG
@@ -326,7 +326,7 @@ void CActor::OnEvent(NET_Packet& P, u16 type)
 			}
 			VERIFY(m_holder==NULL);
 			CHolderCustom* holder = smart_cast<CHolderCustom*>(O);
-			if (holder && !coop::vehicles::own_actor_may_attach(holder->cast_car())) break; // Anomaly Coop F5-VEH-2: a client drives it (no Owner here)
+			if (holder && !coop::vehicles::own_actor_may_attach(holder->cast_car())) break; // coop: a client drives it (no Owner here)
 			if (!holder->Engaged()) use_Holder(holder);
 		}
 		break;

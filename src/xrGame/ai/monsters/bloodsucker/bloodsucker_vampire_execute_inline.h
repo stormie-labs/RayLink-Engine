@@ -8,8 +8,8 @@
 //#include "../../../ActorCondition.h"
 #include "../../../HudManager.h"
 #include "../../../level.h"
-#include "../../../coop/coop_ai.h" // Anomaly Coop (audit A5): is_remote_player
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5): the grip on a remote player's machine
+#include "../../../coop/coop_ai.h" // coop: is_remote_player
+#include "../../../coop/coop_monster_fx.h" // coop: the grip on a remote player's machine
 
 #define TEMPLATE_SPECIALIZATION template <\
 	typename _Object\
@@ -27,7 +27,7 @@ void CStateBloodsuckerVampireExecuteAbstract::initialize()
 {
 	inherited::initialize();
 
-	// Anomaly Coop (audit A5): on a remote player's character the grip plays on his machine (coop_vampire)
+	// coop: on a remote player's character the grip plays on his machine (coop_vampire)
 	const CEntityAlive* enemy = object->EnemyMan.get_enemy();
 	m_coop_target = enemy && coop::npc_ai::is_remote_player(enemy) ? enemy->ID() : u16(-1);
 	if (m_coop_target == u16(-1))
@@ -141,7 +141,7 @@ void CStateBloodsuckerVampireExecuteAbstract::show_hud()
 TEMPLATE_SPECIALIZATION
 void CStateBloodsuckerVampireExecuteAbstract::cleanup()
 {
-	if (m_coop_target != u16(-1)) // Anomaly Coop (audit A5): the remote player's machine lets its actor go
+	if (m_coop_target != u16(-1)) // coop: the remote player's machine lets its actor go
 	{
 		coop::monster_fx::host_send(Level().Objects.net_Find(m_coop_target), object,
 		                            coop::monster_fx::kBloodsuckerVampire, 1, 0.f);
@@ -205,7 +205,7 @@ bool CStateBloodsuckerVampireExecuteAbstract::check_start_conditions()
 	if (!object->WantVampire())
 		return false;
 
-	// Anomaly Coop (audit A5): a remote player's character too, unless another monster holds him already
+	// coop: a remote player's character too, unless another monster holds him already
 	if (coop::npc_ai::is_remote_player(enemy))
 		return !coop::monster_fx::host_held(enemy->ID());
 
@@ -248,7 +248,7 @@ void CStateBloodsuckerVampireExecuteAbstract::execute_vampire_continue()
 {
 	const CEntityAlive* enemy = object->EnemyMan.get_enemy();
 
-	// Anomaly Coop: the one in the grip fell: let go of him, whoever the enemy is by now
+	// coop: the one in the grip fell: let go of him, whoever the enemy is by now
 	const CObject* held = m_coop_target != u16(-1) ? Level().Objects.net_Find(m_coop_target) : Actor();
 
 	//if (object->Position().distance_to(Actor()->Position()) > 2.f) {

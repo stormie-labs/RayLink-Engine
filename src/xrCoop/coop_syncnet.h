@@ -1,7 +1,7 @@
-// Anomaly Coop — coop.sync on the network (SYNC_SPEC §6.1-6.3, §6.5; F2 T14): the scope names of the Lua API, the five
+// Anomaly Coop — coop.sync on the network: the scope names of the Lua API, the five
 // sync messages, how the host stamps a change and who hears of it, what a client shows of its own changes until the
 // host answers, full copies at join, the host's limits on requests and a client's requests in flight. The store is
-// coop_syncstore.h (F2 T13); the glue to the engine, Lua and the host save is xrGame/coop/coop_sync_api.cpp.
+// coop_syncstore.h; the glue to the engine, Lua and the host save is xrGame/coop/coop_sync_api.cpp.
 //
 // Messages (Msg 0x0191-0x0195), all on Lane::Reliable: one ordered lane, so a full copy and the changes after it arrive
 // in the order they were made (Bulk is another ENet channel, with no order against Reliable).
@@ -15,7 +15,7 @@
 // Scopes, keys and values as coop_syncstore.h writes them; everything read is checked by type, size and finiteness, and
 // a refused read leaves its output as it was.
 //
-// Versions (the T13 contract). The host stamps every change from one counter that only grows: store.top_version() + 1
+// Versions. The host stamps every change from one counter that only grows: store.top_version() + 1
 // (host_set). A client's store holds only what the host sent. A client's own change shows at once on that client
 // (ClientView) and goes to the host with a seq; the host answers every change of a client, in order, with kAck and that
 // seq: the change as it applied it, or kRefused and the reason. An answer to seq N answers every older one still
@@ -39,9 +39,11 @@
 #include <utility>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_ledger.h"
 #include "coop_protocol.h"
 #include "coop_syncstore.h"
+#include "coop_text.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -75,26 +77,11 @@ struct ScopeName
 
 namespace detail
 {
-// A decimal number in its one spelling: digits only, no sign, no leading zero, at most `max` (19 digits fit a u64).
-inline bool parse_uint(std::string_view s, uint64_t max, uint64_t& out)
-{
-	if (s.empty() || s.size() > 19 || (s.size() > 1 && s[0] == '0'))
-		return false;
-	uint64_t v = 0;
-	for (const char c : s)
-	{
-		if (c < '0' || c > '9')
-			return false;
-		v = v * 10 + uint64_t(c - '0');
-	}
-	if (v > max)
-		return false;
-	out = v;
-	return true;
-}
+// A decimal number in its one spelling: digits only, no sign, no leading zero, at most 19 digits, at most `max`.
+inline bool parse_uint(std::string_view s, uint64_t max, uint64_t& out) { return ascii::parse_decimal(s, max, out, 19, false); }
 } // namespace detail
 
-// false (out untouched) for anything but the spellings above; a peer id below kInvalidPeer, an object id below 0xffff.
+// false (out untouched) for anything but the spellings above; a peer id below kInvalidPeer, an object id below kNoId.
 inline bool parse_scope(std::string_view text, ScopeName& out)
 {
 	ScopeName s;
@@ -319,7 +306,7 @@ inline bool may_broadcast(bool client, bool map_authority) { return !client || m
 // A cast bound to a level, as a point always is: a point means nothing on another level, though a body's record there may lie near
 // the same numbers. `wanted`: the level the script names (a far view), kNoCastLevel = the level of this process; `his`: where the
 // player stands, kNoCastLevel = not known; `on_mine`: he stands on the level of this process.
-constexpr uint16_t kNoCastLevel = 0xffff;
+constexpr uint16_t kNoCastLevel = kNoLevel;
 inline bool cast_reaches(uint16_t wanted, uint16_t his, bool on_mine)
 {
 	return wanted == kNoCastLevel || his == kNoCastLevel ? on_mine : his == wanted;
@@ -422,7 +409,7 @@ inline bool goes_to(const ScopeId& scope, const std::string& player_digest)
 }
 
 // The Player scope of a character, by its custom data: the player key on its "key" line, as money and the spawn budget
-// find it (ledger::character_key; Rulings F2-13, F2-18, F2-24), a legacy key line taken as its digest. false (out
+// find it (ledger::character_key), a legacy key line taken as its digest. false (out
 // untouched) for a character without a player key (an NPC).
 inline bool player_scope_of(const std::string& custom_data, ScopeId& out)
 {
@@ -433,8 +420,8 @@ inline bool player_scope_of(const std::string& custom_data, ScopeId& out)
 	return true;
 }
 
-// F2 T14 fix 1 (review I3, Ruling F2-31): the host's own data in the scopes clients write.
-// - Keys "coop.*" of a player scope are the host's (F3 keeps a player's checkpoint there, syncapi::player_set): his own
+// The host's own data in the scopes clients write.
+// - Keys "coop.*" of a player scope are the host's (the checkpoints keep a player's checkpoint there, syncapi::player_set): his own
 //   player cannot write or remove them, so he cannot forge them.
 // - Clients never take the room the host keeps for its own writes: kHostPlayerReserve of every player scope,
 //   kHostObjectReserve of every object scope, kHostPoolReserve of the pool all player and object scopes share. A client
@@ -481,7 +468,7 @@ inline SetResult client_check(const Store& store, const ScopeId& scope, std::str
 // object (may_set). `ack`: a client's change, answered to him with this seq whatever comes of it; nullptr for the
 // host's own. `player_peer`: the connected player whose Player scope this is (kInvalidPeer: none, or not a Player
 // scope). `event` (if given) gets the change when the store changed (Ok). Returns the store's result; a client's change
-// goes through client_check first (fix 1, Ruling F2-31).
+// goes through client_check first.
 inline SetResult host_set(Store& store, const ScopeId& scope, std::string_view key, Value value, PeerId by, bool by_owner,
     const uint32_t* ack, PeerId player_peer, std::vector<Delivery>& out, Change* event = nullptr)
 {
@@ -489,7 +476,7 @@ inline SetResult host_set(Store& store, const ScopeId& scope, std::string_view k
 	if (const Value* was = store.get(scope, key))
 		old = *was;
 	const uint64_t version = store.top_version() + 1; // above kMaxVersion the store refuses it (BadValue)
-	// F2 T14 fix 1 (Ruling F2-31): a client's change keeps off the host's keys and the host's room.
+	// A client's change keeps off the host's keys and the host's room.
 	SetResult r = by == kHostPeer ? SetResult::Ok : client_check(store, scope, key, value, by_owner);
 	if (r == SetResult::Ok)
 		r = store.set_by(scope, key, std::move(value), version, by == kHostPeer, by_owner);

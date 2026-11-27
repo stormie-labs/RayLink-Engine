@@ -12,7 +12,7 @@
 
 #include "memory_manager.h"
 #include "enemy_manager.h"
-#include "coop/coop_story.h" // Anomaly Coop
+#include "coop/coop_story.h"
 
 struct SAttackGoodwillStorage
 {
@@ -62,7 +62,7 @@ void load_attack_goodwill()
 
 void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAction action)
 {
-	coop::story::RelationActionScope coop_scope(from, action); // Anomaly Coop: on a client the host computes these changes
+	coop::story::RelationActionScope coop_scope(from, action); // coop: on a client the host computes these changes
 	static CHARACTER_GOODWILL friend_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "friend_kill_goodwill");
 	static CHARACTER_GOODWILL neutral_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "neutral_kill_goodwill");
 	static CHARACTER_GOODWILL enemy_kill_goodwill = pSettings->r_s32(ACTIONS_POINTS_SECT, "enemy_kill_goodwill");
@@ -97,9 +97,9 @@ void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAc
 
 
 	CActor* actor = smart_cast<CActor*>(from);
-	const bool actor_like = actor || coop::story::acts_as_actor(from); // Anomaly Coop: a player proxy counts as the actor (R-3.4)
+	const bool actor_like = actor || coop::story::acts_as_actor(from); // coop: a player proxy counts as the actor
 	CInventoryOwner* inv_owner_from = smart_cast<CInventoryOwner*>(from);
-	CAI_Stalker* stalker_from = actor_like ? nullptr : smart_cast<CAI_Stalker*>(from); // Anomaly Coop
+	CAI_Stalker* stalker_from = actor_like ? nullptr : smart_cast<CAI_Stalker*>(from);
 	CAI_Stalker* stalker = smart_cast<CAI_Stalker*>(to);
 
 	//вычисление изменения репутации и рейтинга пока ведется 
@@ -117,7 +117,7 @@ void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAc
 	{
 	case ATTACK:
 		{
-			if (actor_like) // Anomaly Coop: was (actor)
+			if (actor_like) // coop: was (actor)
 			{
 				//учитывать ATTACK и FIGHT_HELP, только если прошло время
 				//min_attack_delta_time 
@@ -138,7 +138,7 @@ void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAc
 					{
 						CAI_Stalker* attacking_stalker = smart_cast<CAI_Stalker*>(
 							Level().Objects.net_Find(fight_data->attacker));
-						Action(from, defending_stalker, attacking_stalker ? FIGHT_HELP_HUMAN : FIGHT_HELP_MONSTER); // Anomaly Coop: was actor
+						Action(from, defending_stalker, attacking_stalker ? FIGHT_HELP_HUMAN : FIGHT_HELP_MONSTER); // coop: was actor
 					}
 				}
 			}
@@ -147,7 +147,7 @@ void RELATION_REGISTRY::Action(CEntityAlive* from, CEntityAlive* to, ERelationAc
 			{
 				bool bDangerScheme = false;
 				const CEntityAlive* stalker_enemy = stalker->memory().enemy().selected();
-				if (actor_like && stalker_enemy) // Anomaly Coop: was (actor && ...)
+				if (actor_like && stalker_enemy) // coop: was (actor && ...)
 				{
 					const CInventoryOwner* const_inv_owner_from = inv_owner_from;
 					if (stalker_enemy->human_being())

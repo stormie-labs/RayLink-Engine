@@ -1,7 +1,7 @@
-// Anomaly Coop — shared sleep decision (F3, CHECKPOINTS_DEATH.md §4). Everybody present has to rest before the group
+// Anomaly Coop — shared sleep decision (CHECKPOINTS_DEATH.md §4). Everybody present has to rest before the group
 // sleeps; one player who is awake, in a fight or dead holds it, and so does a blocked world (an emission). The host
 // asks `decide` whenever somebody's rest state or the world changes and acts on the answer.
-// F3 Task 11: the messages RestRequest / RestState / RestSleep, the checks of a lie-down, the host's book of who rests
+// The messages RestRequest / RestState / RestSleep, the checks of a lie-down, the host's book of who rests
 // (Group: lie down, get up, the 500 ms tick that ends rests and starts / ends the sleep) and what a machine tells its
 // Lua (changes, waiting). The engine side is xrGame/coop/coop_rest.cpp.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
@@ -15,14 +15,15 @@
 #include <map>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_protocol.h" // kMaxPlayers, Writer, Reader
 
 namespace coop
 {
 namespace rest
 {
-constexpr uint16_t kNoBag = 0xffff; // a rest that is not on a sleeping bag (a rest zone, a campfire, a faint)
-constexpr uint16_t kNoId = 0xffff; // nobody
+using coop::kNoId; // nobody
+constexpr uint16_t kNoBag = kNoId; // a rest that is not on a sleeping bag (a rest zone, a campfire, a faint)
 
 enum class State : uint8_t
 {
@@ -114,7 +115,7 @@ inline Decision decide(const std::vector<Member>& present, bool world_blocked)
 	return d;
 }
 
-// ---------------------------------------------------------------- F3 Task 11
+// ---------------------------------------------------------------- the messages
 
 // The shared sleep (its effects on every machine) lasts this long; then everybody asleep is awake again.
 constexpr uint64_t kSleepMs = 12000;
@@ -129,8 +130,8 @@ enum class Refusal : uint8_t
 	Combat = 2, // in a fight
 	Dead = 3, // not alive (wounded, dead, respawning)
 	Busy = 4, // the group sleeps now, or the host cannot take it
-	Camp = 5, // T11 review M2: the checkpoint could not be set where he lies (checkpoints::host_set refused it)
-	Occupied = 6 // owner 2026-10-25: another player rests on this sleeping bag (protocol 14)
+	Camp = 5, // the checkpoint could not be set where he lies (checkpoints::host_set refused it)
+	Occupied = 6 // another player rests on this sleeping bag
 };
 inline bool refusal_ok(uint8_t v) { return v <= uint8_t(Refusal::Occupied); }
 
@@ -200,8 +201,8 @@ inline Refusal check_lie_down(bool alive, bool group_sleeping, bool forced, bool
 
 // ---------------------------------------------------------------- messages
 
-// RestRequest, client -> host: u8 op, u8 hours, u8 forced (0 / 1), u16 bag (protocol 14: the host id of the sleeping bag
-// he lies on, kNoBag if none), nothing after. The host clamps the hours; a get-up carries 0, 0, kNoBag.
+// RestRequest, client -> host: u8 op, u8 hours, u8 forced (0 / 1), u16 bag (the host id of the sleeping bag he lies
+// on, kNoBag if none), nothing after. The host clamps the hours; a get-up carries 0, 0, kNoBag.
 enum class Op : uint8_t
 {
 	LieDown = 1,
@@ -241,7 +242,7 @@ inline bool read_request(Reader& rd, Request& out)
 // One player of RestState (host numbering on the wire). An awake player has 0 hours, a resting or sleeping one 1..24.
 struct Entry
 {
-	uint16_t character = 0xffff;
+	uint16_t character = kNoId;
 	State state = State::Awake;
 	uint8_t hours = 0;
 };
@@ -253,7 +254,7 @@ inline bool operator!=(const Entry& a, const Entry& b) { return !(a == b); }
 
 // RestState, host -> clients: u8 block, u8 n (<= kMaxPlayers), n x {u16 character, u8 state, u8 hours} by character
 // ascending, u8 refused, nothing after. `block` is what holds the sleep while somebody rests (None when nobody does).
-// `refused` (a Refusal, 0..5; 5 Camp since T11 review M2) is not None only in the copy that goes to one player: his own
+// `refused` (a Refusal, 0..5) is not None only in the copy that goes to one player: his own
 // lie-down was refused, or his rest ended without his word (a fight, death, his place at the start of the sleep,
 // host_cancel). Every player present is listed, the awake ones too (waiting_for).
 struct StateMsg
@@ -292,7 +293,7 @@ inline bool read_state(Reader& rd, StateMsg& out)
 		e.character = rd.u16();
 		const uint8_t state = rd.u8();
 		e.hours = rd.u8();
-		if (!rd.ok() || e.character == 0xffff || state > uint8_t(State::Sleeping))
+		if (!rd.ok() || e.character == kNoId || state > uint8_t(State::Sleeping))
 			return false;
 		e.state = static_cast<State>(state);
 		const bool hours_ok = e.state == State::Awake ? e.hours == 0 : e.hours >= 1 && e.hours <= 24;
@@ -325,7 +326,7 @@ inline bool read_sleep(Reader& rd, uint8_t& out)
 // A player who takes part in the sleep at a tick (host numbering): in the world, not a hardcore spectator.
 struct Seen
 {
-	uint16_t id = 0xffff;
+	uint16_t id = kNoId;
 	bool alive = true;
 	bool in_combat = false;
 };
@@ -333,7 +334,7 @@ struct Seen
 // A rest that ended without the player's word. reason None: he left (nobody to tell).
 struct Cancel
 {
-	uint16_t id = 0xffff;
+	uint16_t id = kNoId;
 	Refusal reason = Refusal::None;
 };
 
@@ -388,14 +389,14 @@ public:
 	// He is awake (his own word, or the host ends his rest). True if he was not.
 	bool get_up(uint16_t id) { return m_rest.erase(id) != 0; }
 
-	// lie_down would take him: no sleep runs, and he rests already or the book has room. T11 review M2: the engine asks
+	// lie_down would take him: no sleep runs, and he rests already or the book has room. The engine asks
 	// this before it sets the camp, so a camp never comes without the rest.
 	bool may_lie_down(uint16_t id) const
 	{
 		return !m_sleep && (m_rest.count(id) != 0 || m_rest.size() < size_t(kMaxPlayers));
 	}
 
-	// T11 review M1: his lie-down was refused. His last word was to rest there and then, so a rest he was waiting in
+	// His lie-down was refused. His last word was to rest there and then, so a rest he was waiting in
 	// (Resting, an older lie-down somewhere else) ends with it: no old consent stays in the book. A running sleep is
 	// kept (the time is skipped already). True if a waiting rest ended.
 	bool on_refused(uint16_t id)
@@ -407,7 +408,7 @@ public:
 		return true;
 	}
 
-	// T11 review M1: is `id` (not passed out) still at a rest place? Asked by tick once per sleep, when everybody rests.
+	// Is `id` (not passed out) still at a rest place? Asked by tick once per sleep, when everybody rests.
 	using PlaceCheck = std::function<bool(uint16_t)>;
 
 	// Every 500 ms with the players taking part now (any order; an id twice counts once). In this order:
@@ -415,7 +416,7 @@ public:
 	//     spectator; reason None), he is not alive (Dead), or a fight began for him since the last tick (Combat; the
 	//     fight a forced rest started in does not count). This holds for the sleepers too: the time is skipped already.
 	//  2. the shared sleep ends kSleepMs after it started, or as soon as nobody sleeps any more: the sleepers are awake.
-	//  3. no sleep running: decide(present, world_blocked). On start (T11 review M1) every rest that is not a faint is
+	//  3. no sleep running: decide(present, world_blocked). On start every rest that is not a faint is
 	//     looked at once more with `at_place` (none given: all stand); one who is not at a rest place any more loses his
 	//     rest (Place) and nobody sleeps this tick. Else everybody present is Sleeping for kSleepMs.
 	// Present players: an id given twice counts once (the first one given), at most kMaxPlayers (by id) are taken.
@@ -522,7 +523,7 @@ public:
 			}
 			if (d.start)
 			{
-				for (auto& r : m_rest) // everybody present rests, and only they are in the book (step 1)
+				for (auto& r : m_rest) // everybody present rests, and only they are in the book
 					r.second.state = State::Sleeping;
 				m_sleep = true;
 				m_sleep_until = now_ms + kSleepMs;
@@ -609,7 +610,7 @@ private:
 // A coop_rest_changed(id, state, hours).
 struct Change
 {
-	uint16_t id = 0xffff;
+	uint16_t id = kNoId;
 	State state = State::Awake;
 	uint8_t hours = 0;
 };
@@ -659,7 +660,7 @@ struct Note
 	Refusal refused = Refusal::None;
 };
 
-// T11 review M4: what one update tells this machine's Lua, in one order on the host and on a client: every change
+// What one update tells this machine's Lua, in one order on the host and on a client: every change
 // (changes(before, after), by id), then why this machine's player was refused or his rest ended (when `refused` is not
 // None). The state is there before the reason is told.
 inline std::vector<Note> news(const std::vector<Entry>& before, const std::vector<Entry>& after, Refusal refused)

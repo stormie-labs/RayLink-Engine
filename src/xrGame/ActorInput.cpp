@@ -1,7 +1,7 @@
 #include "stdafx.h"
 #include "coop/coop_survival.h"
-#include "coop/coop_world.h" // Anomaly Coop
-#include "coop/coop_vehicles_ride.h" // Anomaly Coop F5-VEH-5: a passenger's keys
+#include "coop/coop_world.h"
+#include "coop/coop_vehicles_ride.h" // coop: a passenger's keys
 #include <dinput.h>
 #include "Actor.h"
 #include "Torch.h"
@@ -86,7 +86,7 @@ void CActor::IR_OnKeyboardPress(int cmd)
 
 	if (!g_Alive()) return;
 
-	if (coop::vehicles::ride_key(cmd)) return; // Anomaly Coop F5-VEH-5: a passenger: the use key asks out, nothing else moves him
+	if (coop::vehicles::ride_key(cmd)) return; // coop: a passenger: the use key asks out, nothing else moves him
 
 	if (m_holder && kUSE != cmd)
 	{
@@ -332,7 +332,7 @@ void CActor::IR_OnKeyboardRelease(int cmd)
 		if (cmd == kUSE && !psActorFlags.test(AF_MULTI_ITEM_PICKUP))
 			m_bPickupMode = false;
 
-		if (coop::vehicles::riding()) return; // Anomaly Coop F5-VEH-5: as the stock driver's releases go to his car alone
+		if (coop::vehicles::riding()) return; // coop: as the stock driver's releases go to his car alone
 
 		if (m_holder)
 		{
@@ -363,7 +363,7 @@ void CActor::IR_OnKeyboardHold(int cmd)
 	if (m_input_external_handler && !m_input_external_handler->authorized(cmd)) return;
 	if (IsTalking()) return;
 
-	if (coop::vehicles::ride_hold(cmd)) return; // Anomaly Coop F5-VEH-5: a passenger only looks around (the look keys)
+	if (coop::vehicles::ride_hold(cmd)) return; // coop: a passenger only looks around (the look keys)
 
 	if (m_holder)
 	{
@@ -464,7 +464,7 @@ void CActor::IR_OnMouseMove(int dx, int dy)
 
 	if (Remote()) return;
 
-	if (coop::survival::look_locked()) return; // Anomaly Coop (build 10): dead, spectating or respawning: no look around
+	if (coop::survival::look_locked()) return; // coop: dead, spectating or respawning: no look around
 
 	if (m_holder)
 	{
@@ -545,9 +545,9 @@ void CActor::ActorUse()
 		return;
 	}
 
-	if (m_pPersonWeLookingAt && coop::survival::on_use_person(m_pPersonWeLookingAt)) // Anomaly Coop: revive a wounded teammate
+	if (m_pPersonWeLookingAt && coop::survival::on_use_person(m_pPersonWeLookingAt)) // coop: revive a wounded teammate
 		return;
-	if (coop::survival::on_use_nearby()) // Anomaly Coop: ... in front of me, the crosshair on a corpse or an item beside him
+	if (coop::survival::on_use_nearby()) // coop: ... in front of me, the crosshair on a corpse or an item beside him
 		return;
 
 	if (!psActorFlags.test(AF_MULTI_ITEM_PICKUP))
@@ -556,7 +556,7 @@ void CActor::ActorUse()
 	if (character_physics_support()->movement()->PHCapture())
 		character_physics_support()->movement()->PHReleaseObject();
 
-	// Anomaly Coop (owner, live 2026-10-29): F does nothing else to another player's character for now - no use callback
+	// coop: F does nothing else to another player's character for now - no use callback
 	// (the stalker binder's use_callback: xr_meet's voice on use, trade_manager, npc_on_use mods), no talk, no search.
 	// Reviving a wounded teammate (the two hooks above) is the only thing it does to him.
 	if (coop::world::is_player_character(m_pObjectWeLookingAt))

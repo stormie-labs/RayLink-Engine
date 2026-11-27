@@ -2,6 +2,7 @@
 #include "dxRenderDeviceRender.h"
 
 #include "ResourceManager.h"
+#include "../../xrCore/gpu_device_lost.h" // RayLink: GetDeviceState logs the first lost-device answer
 
 dxRenderDeviceRender::dxRenderDeviceRender()
 	: Resources(0)
@@ -308,10 +309,25 @@ dxRenderDeviceRender::DeviceState dxRenderDeviceRender::GetDeviceState()
 
 	if (FAILED(_hr))
 	{
-		//LV: Check if it's correct. If so - that should be fix for AMD issues. Thank me later. Yo
-		// If the device was lost, do not render until we get it back
+		// RayLink: the first lost-device answer goes into the log once, with the renderer's note on
+		// why (xrDebug::device_lost_note_of; none under DX10). Only a log line: the answers below are the stock ones.
+		static bool device_lost_logged = false;
+		if (!device_lost_logged && xr_gpu::is_device_lost(_hr))
+		{
+			device_lost_logged = true;
+			char note[256];
+			Debug.device_lost_note_of(_hr, note, sizeof(note)); // out stays empty without a note
+			Msg("! GPU device lost: Present(DXGI_PRESENT_TEST) returned 0x%08X%s", static_cast<unsigned int>(_hr), note);
+		}
+
+		// coop: a removed D3D10/11 device never comes back. Waiting for it (dsLost) only hides the loss until a later checked
+		// create call fails in an unrelated place, with a frozen picture in between: stop here, at the moment of the loss, with
+		// the reason (error2string adds the renderer's note). DEVICE_RESET keeps the stock path (dsNeedReset).
 		if (DXGI_ERROR_DEVICE_REMOVED == _hr)
-			return dsLost;
+		{
+			const HRESULT gpu_device_lost_while_drawing = _hr;
+			R_CHK2(gpu_device_lost_while_drawing, "Present(DXGI_PRESENT_TEST)");
+		}
 
 		// Check if the device is ready to be reset
 		if (DXGI_ERROR_DEVICE_RESET == _hr)

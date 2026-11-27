@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../../coop/coop_ai.h" // Anomaly Coop: player_reloading
+#include "../../../coop/coop_ai.h" // coop: player_reloading
 
 template <class Object>
 CStateBurerShield<Object>::CStateBurerShield(Object* obj) : inherited(obj)
@@ -95,7 +95,7 @@ bool CStateBurerShield<Object>::check_completion()
 		if (actor_is_reloading_weapon())
 			return true;
 	}
-	else if (coop::npc_ai::player_reloading(enemy)) // Anomaly Coop (audit F3c): a client's reload drops it too
+	else if (coop::npc_ai::player_reloading(enemy)) // coop: a client's reload drops it too
 	{
 		return true;
 	}

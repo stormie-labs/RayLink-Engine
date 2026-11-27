@@ -5,8 +5,8 @@
 #include "../../../xrEngine/motion.h"
 #include "../Include/xrRender/RenderVisual.h"
 #include "../Include/xrRender/KinematicsAnimated.h"
-#include "../../coop/coop_ai.h" // Anomaly Coop: phantom_target
-#include "../../coop/coop_manager.h" // Anomaly Coop
+#include "../../coop/coop_ai.h" // coop: phantom_target
+#include "../../coop/coop_manager.h"
 
 CPhantom::CPhantom()
 {
@@ -81,7 +81,7 @@ BOOL CPhantom::net_Spawn(CSE_Abstract* DC)
 	// inherited
 	if (!inherited::net_Spawn(DC)) return FALSE;
 
-	// Anomaly Coop (audit F10): the nearest player. CurrentEntity sent the host's copy after the host from anywhere: a
+	// coop: the nearest player. CurrentEntity sent the host's copy after the host from anywhere: a
 	// phantom spawned by a client's fight flew on to him and stayed a body on the client's screen meanwhile.
 	m_enemy = coop::npc_ai::phantom_target(Position());
 
@@ -90,7 +90,7 @@ BOOL CPhantom::net_Spawn(CSE_Abstract* DC)
 	SetfHealth(0.001f);
 
 	// orientate to enemy
-	if (m_enemy) // Anomaly Coop: a client's copy may come before its actor
+	if (m_enemy) // coop: a client's copy may come before its actor
 	{
 		XFORM().k.sub(m_enemy->Position(), Position()).normalize();
 		XFORM().j.set(0, 1, 0);
@@ -128,7 +128,7 @@ void CPhantom::net_Destroy()
 	Particles::Details::Destroy(m_fly_particles);
 }
 
-// Anomaly Coop (audit F10): a player's character can go while a phantom flies at it (the player left)
+// coop: a player's character can go while a phantom flies at it (the player left)
 void CPhantom::net_Relcase(CObject* O)
 {
 	inherited::net_Relcase(O);
@@ -275,7 +275,7 @@ void CPhantom::UpdateFlyMedia()
 	if (!m_enemy)
 		m_enemy = Level().CurrentEntity();
 	if (!m_enemy)
-		return; // Anomaly Coop: a client's copy before its actor is here
+		return; // coop: a client's copy before its actor is here
 
 	UpdatePosition(m_enemy->Position());
 	Fmatrix xform = XFORM_center();
@@ -362,7 +362,7 @@ void CPhantom::UpdatePosition(const Fvector& tgt_pos)
 void CPhantom::PsyHit(const CObject* object, float value)
 {
 	if (coop::is_mirror())
-		return; // Anomaly Coop (audit F10): the host's copy strikes, and the target gets it as PlayerHit. Not twice.
+		return; // coop: the host's copy strikes, and the target gets it as PlayerHit. Not twice.
 
 	NET_Packet P;
 	SHit HS;

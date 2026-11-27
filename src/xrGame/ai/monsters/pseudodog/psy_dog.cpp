@@ -17,10 +17,10 @@
 #include "psy_dog_state_manager.h"
 #include "../../../alife_object_registry.h"
 #include "../../../../xrServerEntities/xrserver_objects_alife_monsters.h"
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
-#include "../../../coop/coop_ai.h" // Anomaly Coop: is_player
-#include "../../../coop/coop_remote.h" // Anomaly Coop
-#include "xrCoop/coop_enemy_rules.h" // Anomaly Coop
+#include "../../../coop/coop_monster_fx.h"
+#include "../../../coop/coop_ai.h" // coop: is_player
+#include "../../../coop/coop_remote.h"
+#include "xrCoop/coop_enemy_rules.h"
 
 CPsyDog::CPsyDog()
 {
@@ -174,7 +174,7 @@ void CPsyDog::Think()
 }
 
 
-// Anomaly Coop (audit F11): Think never runs on a puppet, and the aura is a look on this machine's actor
+// coop: Think never runs on a puppet, and the aura is a look on this machine's actor
 void CPsyDog::UpdateCL()
 {
 	inherited::UpdateCL();
@@ -304,11 +304,11 @@ void CPsyDogPhantom::Think()
 	setEnabled(TRUE);
 
 	coop_appear();
-	coop::monster_fx::host_shown(this, coop::monster_fx::kPhantomAppear); // Anomaly Coop (audit F11)
+	coop::monster_fx::host_shown(this, coop::monster_fx::kPhantomAppear); // coop: the clients see the phantom appear
 
 	if (EnemyMan.get_enemy() != Actor())
 	{
-		// Anomaly Coop (audit A5): at a remote player - his machine shakes its actor
+		// coop: at a remote player - his machine shakes its actor
 		coop::monster_fx::host_send(EnemyMan.get_enemy(), this, coop::monster_fx::kPsyDogAppear, 0, 0.f);
 		return;
 	}
@@ -335,7 +335,7 @@ void CPsyDogPhantom::appear_fx_on_actor()
 void CPsyDogPhantom::Hit(SHit* pHDS)
 {
 	if (is_wait_to_destroy_object()) return;
-	// Anomaly Coop (audit F10): any player's shot dispels it: a second player could not, only its own target
+	// coop: any player's shot dispels it: a second player could not, only its own target
 	if (coop::enemy_rules::phantom_dispelled(pHDS->who != 0, pHDS->who == EnemyMan.get_enemy(),
 	                                         coop::npc_ai::is_player(pHDS->who), coop::remote::is_remote_creature(this)))
 		destroy_me();

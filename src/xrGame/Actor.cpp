@@ -7,12 +7,12 @@
 #endif // DEBUG
 #include "alife_space.h"
 #include "hit.h"
-#include "coop/coop_events.h" // Anomaly Coop
-#include "coop/coop_objects.h" // Anomaly Coop: client_usable_tip
-#include "coop/coop_survival.h" // Anomaly Coop: camera_left_body
-#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the hits in the own actor's health ledger
-#include "coop/coop_vehicles.h" // Anomaly Coop F5-VEH-2: the decider's own actor in the seat table
-#include "coop/coop_vehicles_ride.h" // Anomaly Coop F5-VEH-5: a passenger's ride (hooks below)
+#include "coop/coop_events.h"
+#include "coop/coop_objects.h" // coop: client_usable_tip
+#include "coop/coop_survival.h" // coop: camera_left_body
+#include "coop/coop_health_ledger.h" // coop: the hits in the own actor's health ledger
+#include "coop/coop_vehicles.h" // coop: the decider's own actor in the seat table
+#include "coop/coop_vehicles_ride.h" // coop: a passenger's ride (hooks below)
 #include "PHDestroyable.h"
 #include "Car.h"
 #include "xrserver_objects_alife_monsters.h"
@@ -555,8 +555,8 @@ struct playing_pred
 
 void CActor::Hit(SHit* pHDS)
 {
-	if (coop::events::client_block_actor_hit(this, pHDS)) return; // Anomaly Coop: the host sends it as PlayerHit
-	const coop::health_ledger::HitScope coop_ledger_hit(this, pHDS->damage()); // Anomaly Coop (live 2026-11-09): a diagnostic
+	if (coop::events::client_block_actor_hit(this, pHDS)) return; // coop: the host sends it as PlayerHit
+	const coop::health_ledger::HitScope coop_ledger_hit(this, pHDS->damage()); // coop: a diagnostic
 	bool b_initiated = pHDS->aim_bullet; // physics strike by poltergeist
 
 	pHDS->aim_bullet = false;
@@ -873,7 +873,7 @@ void CActor::Die(CObject* who)
 #ifdef HOLDERCUSTOM_NEW
 	use_HolderEx(NULL, true);
 #endif
-	coop::vehicles::ride_actor_died(); // Anomaly Coop F5-VEH-5: a passenger leaves his seat here as the stock driver leaves his car
+	coop::vehicles::ride_actor_died(); // coop: a passenger leaves his seat here as the stock driver leaves his car
 
 #ifdef DEBUG
     Msg("--- Actor [%s] dies !", this->Name());
@@ -1135,7 +1135,7 @@ void CActor::UpdateCL()
 	PROF_EVENT("CActor UpdateCL");
 	if (g_Alive() && Level().CurrentViewEntity() == this)
 	{
-		if (CurrentGameUI() && (!CurrentGameUI()->TopInputReceiver() || (CurrentGameUI()->TopInputReceiver() && !CurrentGameUI()->TopInputReceiver()->StopAnyMove())) && !m_holder && !coop::vehicles::riding()) // Anomaly Coop F5-VEH-5 (rv_F5-VEH-5): no pickup mode in a passenger's seat, as none in the driver's
+		if (CurrentGameUI() && (!CurrentGameUI()->TopInputReceiver() || (CurrentGameUI()->TopInputReceiver() && !CurrentGameUI()->TopInputReceiver()->StopAnyMove())) && !m_holder && !coop::vehicles::riding()) // coop: no pickup mode in a passenger's seat, as none in the driver's
 		{
 			const bool allowed = psActorFlags.test(AF_MULTI_ITEM_PICKUP);
 
@@ -1184,7 +1184,7 @@ void CActor::UpdateCL()
 	SetZoomAimingMode(false);
 	CWeapon* pWeapon = smart_cast<CWeapon*>(inventory().ActiveItem());
 
-	if (!coop::vehicles::ride_camera(this, currentFOV())) // Anomaly Coop F5-VEH-5: a passenger looks from his seat (cam_Update returns for a holder too)
+	if (!coop::vehicles::ride_camera(this, currentFOV())) // coop: a passenger looks from his seat (cam_Update returns for a holder too)
 		cam_Update(float(Device.dwTimeDelta) / 1000.0f, currentFOV());
     m_legs_controller.update(this);
 
@@ -1510,7 +1510,7 @@ bool CActor::attach_Vehicle(CHolderCustom *object, bool bForce)
 
 			m_holder = object;
 			m_holderID = smart_cast<CObject *>(object)->ID();
-			coop::vehicles::own_actor_attached(smart_cast<CCar *>(object)); // Anomaly Coop F5-VEH-2: seat 0 in the seat table
+			coop::vehicles::own_actor_attached(smart_cast<CCar *>(object)); // coop: seat 0 in the seat table
 
 			if (pCamBobbing)
 			{
@@ -1606,7 +1606,7 @@ void CActor::detach_Vehicle(bool bForce)
 #endif
 
 		m_holder->detach_Actor();
-		coop::vehicles::own_actor_detached(car); // Anomaly Coop F5-VEH-2: out of the seat table
+		coop::vehicles::own_actor_detached(car); // coop: out of the seat table
 		m_holder = NULL;
 		m_holderID = u16(-1);
 
@@ -1814,7 +1814,7 @@ void CActor::shedule_Update(u32 DT)
 		}
 	}
 
-	if (coop::vehicles::riding()) // Anomaly Coop F5-VEH-5: a passenger sits as the stock driver does (below): no controls, no physics of his own
+	if (coop::vehicles::riding()) // coop: a passenger sits as the stock driver does (below): no controls, no physics of his own
 	{
 		if (pCamBobbing) // as CActor::attach_Vehicle: no walking sway in a seat
 		{
@@ -1958,7 +1958,7 @@ void CActor::shedule_Update(u32 DT)
 	pCamBobbing->SetState(mstate_real, conditions().IsLimping(), IsZoomAimingMode());
 
 	// Звук тяжелого дыхания при усталости и хромании (Heavy breathing sound when tired or limping)
-	if (coop::survival::camera_left_body()) // Anomaly Coop: he watches a teammate, his own body is quiet
+	if (coop::survival::camera_left_body()) // coop: he watches a teammate, his own body is quiet
 	{
 		m_HeavyBreathSnd.stop();
 		m_BloodSnd.stop();
@@ -2052,7 +2052,7 @@ void CActor::shedule_Update(u32 DT)
 
 		if (GameID() == eGameIDSingle)
 		{
-			coop::objects::client_usable_tip(m_pUsableObject, game_object); // Anomaly Coop: a client's sleeping bag
+			coop::objects::client_usable_tip(m_pUsableObject, game_object); // coop: a client's sleeping bag
 			if (m_pUsableObject && m_pUsableObject->tip_text())
 			{
 				m_sDefaultObjAction = CStringTable().translate(m_pUsableObject->tip_text());
@@ -2267,8 +2267,8 @@ bool canRenderLegs(CActor* actor, CHolderCustom* m_holder) noexcept
         && (legs_in_demo_record || pDemoRecords.empty())
         && showActorBody == 0
         && !actor->m_FPCam
-        && !coop::survival::camera_left_body() // Anomaly Coop: the legs hang on the camera, it may watch a teammate
-        && !coop::vehicles::riding(); // Anomaly Coop F5-VEH-5: none in a passenger's seat, as none for the stock driver (!m_holder)
+        && !coop::survival::camera_left_body() // coop: the legs hang on the camera, it may watch a teammate
+        && !coop::vehicles::riding(); // coop: none in a passenger's seat, as none for the stock driver (!m_holder)
 };
 
 void CActor::renderable_Render(IDSGraphManager* DM)
@@ -2724,7 +2724,7 @@ void CActor::UpdateArtefactsOnBeltAndOutfit()
 			float art_cond = artefact->GetCondition();
 			conditions().ChangeBleeding((artefact->m_fBleedingRestoreSpeed * art_cond) * f_update_time);
 			conditions().ChangeHealth((artefact->m_fHealthRestoreSpeed * art_cond) * f_update_time);
-			if (this == g_actor) // Anomaly Coop (build 51): the own actor's health ledger; anyone else pays this compare
+			if (this == g_actor) // coop: the own actor's health ledger; anyone else pays this compare
 				coop::health_ledger::worn(this, artefact->cNameSect().c_str(),
 				                          (artefact->m_fHealthRestoreSpeed * art_cond) * f_update_time);
 			conditions().ChangePower((artefact->m_fPowerRestoreSpeed * art_cond) * f_update_time);
@@ -2749,7 +2749,7 @@ void CActor::UpdateArtefactsOnBeltAndOutfit()
 		conditions().ChangeHealth(
 			((outfit ? outfit->m_fHealthRestoreSpeed : 0.f) + (pHelmet ? pHelmet->m_fHealthRestoreSpeed : 0.f)) *
 			f_update_time);
-		// Anomaly Coop (build 51, a diagnostic): the health ledger names the outfit and the helmet apart
+		// coop: the health ledger names the outfit and the helmet apart
 		if (outfit && this == g_actor)
 			coop::health_ledger::worn(this, outfit->cNameSect().c_str(), outfit->m_fHealthRestoreSpeed * f_update_time);
 		if (pHelmet && this == g_actor)

@@ -1,8 +1,8 @@
 #include "pch_script.h"
 #include "gamepersistent.h"
 #include "coop/coop_manager.h"
-#include "coop/coop_join.h" // Anomaly Coop F3a: hold_loading_screen
-#include "coop/coop_worldstate.h" // Anomaly Coop: parity audit W5, a bolt is the host's
+#include "coop/coop_join.h" // coop: hold_loading_screen
+#include "coop/coop_worldstate.h" // coop: a bolt is the host's
 #include "../xrEngine/fmesh.h"
 #include "../xrEngine/xr_ioconsole.h"
 #include "../xrEngine/gamemtllib.h"
@@ -170,7 +170,7 @@ void CGamePersistent::OnAppStart()
 
 void CGamePersistent::OnAppEnd()
 {
-	coop::on_app_end(); // Anomaly Coop (TZ R38): a session ends here, the engine and the log up, not in a static destructor after the log
+	coop::on_app_end(); // coop: a session ends here, the engine and the log up, not in a static destructor after the log
 	if (m_pMainMenu->IsActive())
 		m_pMainMenu->Activate(false);
 
@@ -187,7 +187,7 @@ void CGamePersistent::OnAppEnd()
 
 void CGamePersistent::Start(LPCSTR op)
 {
-	coop::on_blocking_work(); // Anomaly Coop: a level load starts, keep the session link alive
+	coop::on_blocking_work(); // coop: a level load starts, keep the session link alive
 	inherited::Start(op);
 }
 
@@ -318,9 +318,8 @@ float CGamePersistent::OnRainSound(LPCSTR file)
 	return 1.0f;
 }
 
-// Anomaly Coop: a device reset (an options change of the resolution, vid_restart) blocks the frame loop for 10-20 s with
-// GAMMA, longer than the session's silence timeout (10 s): the host dropped a client for it (live 2026-10-23, 16.7 s) and
-// the client rejoined. Arming the link hold lets the keep-alive thread answer for the stalled thread; the first frames
+// coop: a device reset (an options change of the resolution, vid_restart) can block the frame loop for 10-20 s with a
+// large mod pack, longer than the session's silence timeout (10 s): the host would drop a client for it. Arming the link hold lets the keep-alive thread answer for the stalled thread; the first frames
 // after the reset (precache) keep it (Manager::frame, coop_link_hold.h).
 void CGamePersistent::OnDeviceResetBegin() { coop::on_blocking_work(); }
 
@@ -579,14 +578,14 @@ namespace crash_saving {
 
 void CGamePersistent::game_loaded()
 {
-	if (coop::hold_loading_screen()) return; // Anomaly Coop F3a: a group's loading screens come off together (LoadWait Enter)
+	if (coop::hold_loading_screen()) return; // coop: a group's loading screens come off together (LoadWait Enter)
 	if (Device.dwPrecacheFrame <= 2)
 	{
 		if (g_pGameLevel &&
 			g_pGameLevel->bReady &&
 			(allow_intro() && psDeviceFlags2.test(rsKeypress)) &&
 			load_screen_renderer.b_need_user_input &&
-			!coop::skip_keypress_on_load() && // Anomaly Coop: no "press any key" for a joining client / autotest
+			!coop::skip_keypress_on_load() && // coop: no "press any key" for a joining client / autotest
 			m_game_params.m_e_game_type == eGameIDSingle)
 		{
 			VERIFY(NULL == m_intro);
@@ -613,7 +612,7 @@ void CGamePersistent::game_loaded()
 				 )
 		{
 			Msg("intro_start game_loaded");
-			CUISequencer::PreloadXml(); // Anomaly Coop: no "game_loaded" tutorial here, and that is what reads the file for this Lua state
+			CUISequencer::PreloadXml(); // coop: no "game_loaded" tutorial here, and that is what reads the file for this Lua state
 
             // demonized: Reset mouse state on loading the game
             pInput->resetMouseState();
@@ -698,7 +697,7 @@ extern CUISequencer* g_tutorial2;
 void CGamePersistent::OnFrame()
 {
 	PROF_EVENT("CGamePersistent OnFrame");
-	coop::on_frame(); // Anomaly Coop: network pump on the main thread
+	coop::on_frame(); // coop: network pump on the main thread
 	if (Device.dwPrecacheFrame == 5 && m_intro_event.empty())
 	{
 		m_intro_event.bind(this, &CGamePersistent::game_loaded);
@@ -888,9 +887,9 @@ void CGamePersistent::OnEvent(EVENT E, u64 P1, u64 P2)
 		if (Device.Paused())
 			Device.Pause(FALSE, TRUE, TRUE, "eQuickLoad");
 
-		// Live 2026-10-23 (GAMMA new game = tempsave + quickload): the tutorials stop first, while the dialogs they
-		// show are still alive. A stop function of a tutorial item calls Lua that touches its window (Show/Hide);
-		// stopped after HideShownDialogs, that window was already gone - an access violation in CallFunctions.
+		// coop: the tutorials stop first, while the dialogs they show are still alive (a new game of a mod pack may be a
+		// tempsave plus a quickload). A stop function of a tutorial item calls Lua that touches its window (Show/Hide);
+		// stopped after HideShownDialogs, that window would be gone - an access violation in CallFunctions.
 		if (g_tutorial)
 			g_tutorial->Stop();
 
@@ -1005,7 +1004,7 @@ void CGamePersistent::OnRenderPPUI_PP()
 
 void CGamePersistent::LoadTitle(bool change_tip, shared_str map_name)
 {
-	coop::on_blocking_work(); // Anomaly Coop: every load stage re-arms the session keep-alive
+	coop::on_blocking_work(); // coop: every load stage re-arms the session keep-alive
     {
         xrCriticalSectionGuard g(loadTitleCs);
         pApp->LoadStage();
@@ -1046,7 +1045,7 @@ void CGamePersistent::LoadTitle(bool change_tip, shared_str map_name)
 
 bool CGamePersistent::CanBePaused()
 {
-	// Anomaly Coop (G18): in a session the world never pauses, the host's pause would freeze everybody
+	// coop: in a session the world never pauses, the host's pause would freeze everybody
 	return (IsGameTypeSingle() && !coop::mgr().active()) || (g_pGameLevel && Level().IsDemoPlay());
 }
 

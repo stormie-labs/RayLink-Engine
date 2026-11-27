@@ -1,6 +1,7 @@
 // Bounded NPC attachment descriptors and engine-independent reconciliation.
 #pragma once
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 #include <algorithm>
@@ -13,14 +14,14 @@ constexpr size_t kMaxBone = 63;
 
 struct Item
 {
-    uint16_t id = 0xffff;
+    uint16_t id = kNoId;
     std::string bone;
     float angles[3] = {};
     float position[3] = {};
 
     bool valid() const
     {
-        if (!id || id == 0xffff || bone.empty() || bone.size() > kMaxBone)
+        if (!id || id == kNoId || bone.empty() || bone.size() > kMaxBone)
             return false;
         for (const unsigned char c : bone)
             if (c < 0x20 || c == 0x7f)

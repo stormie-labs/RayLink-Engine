@@ -1,4 +1,4 @@
-// Anomaly Coop — the pure part of the host checkpoint store (F3 Task 6, CHECKPOINTS_DEATH.md §2): the CheckpointState
+// Anomaly Coop — the pure part of the host checkpoint store (CHECKPOINTS_DEATH.md §2): the CheckpointState
 // message, the player's slot in his character's custom data, the arrival spots of a group level change and the
 // client's mirror of the records the host shares. The engine side is xrGame/coop/coop_checkpoints.cpp.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "coop_checkpoint_rules.h"
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -18,7 +19,7 @@ namespace coop
 namespace checkpoint
 {
 // Characters with a checkpoint that one machine keeps: the host's store and a client's mirror. A world has one player
-// character per player key that ever joined it (at most coop_max_new_characters new ones per session, F2-10 b);
+// character per player key that ever joined it (at most coop_max_new_characters new ones per session);
 // what is over the bound is refused and logged, never grown.
 constexpr size_t kMaxSlots = 256;
 
@@ -27,12 +28,12 @@ constexpr size_t kMaxSlots = 256;
 // Flags of CheckpointState: u16 character (host numbering), u8 flags, then the record unless kStateCleared.
 constexpr uint8_t kStateRollback = 1; // the source of the camp was lost: this is the previous one (or none)
 constexpr uint8_t kStateCleared = 2;  // the player has no checkpoint; no record follows (kind None is never sent)
-// F3 T7 round 1 (Ruling F3-5): the host refused the receiver's own CheckpointClaim. Alone, never with the other two:
+// The host refused the receiver's own CheckpointClaim. Alone, never with the other two:
 // u16 character, u8 flags = 4, u8 what (ClaimWhat), u8 reason (Refusal), nothing else. It goes to the claimant only,
 // and the receiver's mirror of the records does not change.
 constexpr uint8_t kStateRefused = 4;
 
-// CheckpointClaim `what` (client -> host; Rulings F3-6, F3-8). Numbers are sent: do not reorder.
+// CheckpointClaim `what` (client -> host). Numbers are sent: do not reorder.
 enum class ClaimWhat : uint8_t
 {
 	Tent = 1, // put up a tent here
@@ -53,7 +54,7 @@ enum class Refusal : uint8_t
 
 struct StateMsg
 {
-	uint16_t character = 0xffff;
+	uint16_t character = kNoId;
 	uint8_t flags = 0;
 	Record record; // valid unless cleared() or refused()
 	ClaimWhat what = ClaimWhat::Tent; // refused() only
@@ -120,9 +121,9 @@ inline bool read_state(Reader& rd, StateMsg& out)
 	StateMsg m;
 	m.character = rd.u16();
 	m.flags = rd.u8();
-	if (!rd.ok() || m.character == 0xffff)
+	if (!rd.ok() || m.character == kNoId)
 		return false;
-	if (m.flags == kStateRefused) // F3 T7 round 1 (Ruling F3-5): alone, a known what and reason, nothing after
+	if (m.flags == kStateRefused) // alone, a known what and reason, nothing after
 	{
 		const uint8_t what = rd.u8();
 		const uint8_t reason = rd.u8();
@@ -144,7 +145,7 @@ inline bool read_state(Reader& rd, StateMsg& out)
 }
 
 // ---------------------------------------------------------------- custom data
-// Until the player scope of F2 has a C++ API, a player's slot lives in the custom data of his character (the host's
+// Until the coop.sync player scope has a C++ API, a player's slot lives in the custom data of his character (the host's
 // actor, a client's proxy): section [coop_checkpoint], keys `cur` and `prev` (encode()), and on the host's actor also
 // `arrival`. Custom data goes into the host's save with the character (CSE_ALifeObject::STATE_Write), so a load gets
 // the checkpoints of that save and nothing else.
@@ -248,14 +249,14 @@ inline bool may_see(uint16_t viewer, uint16_t owner, bool group) { return group 
 // A change the host is to announce (frame() sends the character's record as it is then).
 struct Pending
 {
-	uint16_t character = 0xffff;
+	uint16_t character = kNoId;
 	bool rollback = false;
 };
 
 // One CheckpointState of a whole list: the character, the flag and his current record (not valid = cleared).
 struct Outgoing
 {
-	uint16_t character = 0xffff;
+	uint16_t character = kNoId;
 	bool rollback = false;
 	Record cur;
 };

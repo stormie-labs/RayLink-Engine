@@ -24,7 +24,7 @@ bool ApplyBooster_script(CActorCondition* cond, const SBooster& B, LPCSTR sect)
 
 void ClearAllBoosters(CActorCondition* conditions)
 {
-	// Anomaly Coop (build 56): the list itself is cleared, not a copy of it (CActorCondition::ClearBoosters)
+	// coop: the list itself is cleared, not a copy of it (CActorCondition::ClearBoosters)
 	conditions->ClearBoosters();
 }
 

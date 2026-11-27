@@ -7,11 +7,11 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
-#include "coop/coop_join.h" // Anomaly Coop: the private join cache is not the player's last save
+#include "coop/coop_join.h" // coop: the private join cache is not the player's last save
 #include "coop/coop_sync.h"
-#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode answers the hooks below (docs/MODES.md section 4)
-#include "coop/coop_checkpoints.h" // F3: arrival checkpoints on a level change
-#include "coop/coop_autosave.h" // F3: the host's autosave name on a level change
+#include "xrCoop/coop_mode.h" // coop: the session's mode answers the hooks below (docs/MODES.md section 4)
+#include "coop/coop_checkpoints.h" // arrival checkpoints on a level change
+#include "coop/coop_autosave.h" // the host's autosave name on a level change
 #include "coop/coop_game_settings.h" // report #5: the next world starts as a load of the save named here
 #include "alife_update_manager.h"
 #include "alife_simulator_header.h"
@@ -107,7 +107,7 @@ void CALifeUpdateManager::update_switch()
 
 void CALifeUpdateManager::update_scheduled(bool init_ef)
 {
-	// Anomaly Coop: a client has no simulation of its own, the host's world is mirrored. A map server runs what it holds and no
+	// coop: a client has no simulation of its own, the host's world is mirrored. A map server runs what it holds and no
 	// commander's binder updates; everything else offline is the world server's.
 	if (coop::sync::alife_frozen())
 	{
@@ -208,7 +208,7 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	net_packet.r(&graph().actor()->m_tNodeID, sizeof(graph().actor()->m_tNodeID));
 	net_packet.r_vec3(graph().actor()->o_Position);
 	net_packet.r_vec3(graph().actor()->o_Angle);
-	coop::checkpoints::host_on_level_change(*graph().actor()); // Anomaly Coop: arrival checkpoints go into this save
+	coop::checkpoints::host_on_level_change(*graph().actor()); // coop: arrival checkpoints go into this save
 
 	Level().ClientSave();
 
@@ -232,8 +232,8 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	}
 
 	string256 autoave_name;
-	LPCSTR coop_name = coop::autosave::level_change_name(); // Anomaly Coop: the host's coop_auto_N in a session
-	// Anomaly Coop: a world server outside a session never writes the stock name into the savedgames it shares with its creator
+	LPCSTR coop_name = coop::autosave::level_change_name(); // coop: the host's coop_auto_N in a session
+	// coop: a world server outside a session never writes the stock name into the savedgames it shares with its creator
 	LPCSTR server_name = coop_name ? nullptr : coop::autosave::world_server_level_change_name();
 	if (coop_name)
 		xr_strcpy(autoave_name, coop_name);
@@ -248,7 +248,7 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 
 	if (coop_name)
 	{
-		// Anomaly Coop: the world is written to a temporary name and moved over coop_auto_N when it is whole, so a crash
+		// coop: the world is written to a temporary name and moved over coop_auto_N when it is whole, so a crash
 		// in the middle of the write leaves no cut-off slot (the Restore list opens every slot).
 		save(coop::autosave::level_change_temp_name(), false);
 		// The name the new level loads from: coop_auto_N (the next slot if the first one could not take the save),
@@ -263,7 +263,7 @@ bool CALifeUpdateManager::change_level(NET_Packet& net_packet)
 	}
 	else
 		save(autoave_name);
-	// Anomaly Coop: the line names the save the next world loads, without "load": its game settings start as a load of it
+	// coop: the line names the save the next world loads, without "load": its game settings start as a load of it
 	coop::game::remember_next_load(**m_server_command_line);
 
 	graph().actor()->m_tGraphID = safe_graph_vertex_id;
@@ -334,7 +334,7 @@ void CALifeUpdateManager::load(LPCSTR game_name, bool no_assert, bool new_only)
 
 	if (new_only || !CALifeStorageManager::load(game_name))
 	{
-		// Anomaly Coop (crash triage RL-8VWD-XXXF, build 50): the client's copy of the host's world was refused (the storage
+		// coop: the client's copy of the host's world was refused (the storage
 		// manager logged the join phase): the session moved on or ended between the load command and this load. A new game
 		// cannot be made of it and the server cannot be left without a world, so the level start is dropped before the server
 		// loads it (CLevel::net_start2); reaching this line means that check missed it, and the player is told why, not "cannot
@@ -381,7 +381,7 @@ bool CALifeUpdateManager::load_game(LPCSTR game_name, bool no_assert)
 	R_ASSERT2(temp, "Invalid server options!");
 	strconcat(sizeof(S1), S1, game_name, temp);
 	*m_server_command_line = S1;
-	coop::game::remember_next_load(S1); // Anomaly Coop: the next world loads this save without "load" in its line
+	coop::game::remember_next_load(S1); // coop: the next world loads this save without "load" in its line
 	return (true);
 }
 
@@ -476,7 +476,7 @@ void CALifeUpdateManager::teleport_object(ALife::_OBJECT_ID id, GameGraph::_GRAP
 	}
 #endif
 
-	if (coop::mode().online_elsewhere(id)) return; // Anomaly Coop: a map server computes it; a story teleport waits until it comes home
+	if (coop::mode().online_elsewhere(id)) return; // coop: a map server computes it; a story teleport waits until it comes home
 	if (object->m_bOnline)
 		switch_offline(object);
 	graph().change(object, object->m_tGraphID, game_vertex_id);

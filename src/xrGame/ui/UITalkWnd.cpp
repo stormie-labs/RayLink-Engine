@@ -19,7 +19,7 @@
 #include "../../xrEngine/cameraBase.h"
 #include "UIXmlInit.h"
 #include "UI3tButton.h"
-#include "../coop/coop_dialog.h" // Anomaly Coop
+#include "../coop/coop_dialog.h"
 
 CUITalkWnd::CUITalkWnd()
 {
@@ -204,7 +204,7 @@ void UpdateCameraDirection(CGameObject* pTo)
 
 void CUITalkWnd::Update()
 {
-	if (coop::dialog::talk_window_refused()) // Anomaly Coop: talk lock not granted, the window does not open
+	if (coop::dialog::talk_window_refused()) // coop: talk lock not granted, the window does not open
 	{
 		HideDialog();
 		return;
@@ -251,16 +251,16 @@ void CUITalkWnd::Show(bool status)
 	inherited::Show(status);
 	if (status)
 	{
-		if (!coop::dialog::on_talk_window_open(Actor() ? Actor()->GetTalkPartner() : NULL, b_disable_break)) // Anomaly Coop: talk lock
+		if (!coop::dialog::on_talk_window_open(Actor() ? Actor()->GetTalkPartner() : NULL, b_disable_break)) // coop: talk lock
 		{
-			UITalkDialogWnd->Hide(); // Anomaly Coop: hides itself on the next Update
+			UITalkDialogWnd->Hide(); // coop: hides itself on the next Update
 			return;
 		}
 		InitTalkDialog();
 	}
 	else
 	{
-		coop::dialog::on_talk_window_closed(); // Anomaly Coop: release the talk lock
+		coop::dialog::on_talk_window_closed(); // coop: release the talk lock
 		StopSnd();
 		UITalkDialogWnd->Hide();
 
@@ -380,7 +380,7 @@ void CUITalkWnd::SwitchToUpgrade()
 
 bool CUITalkWnd::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {
-	if (coop::dialog::talk_window_refused()) // Anomaly Coop: not initialized, closes on the next Update
+	if (coop::dialog::talk_window_refused()) // coop: not initialized, closes on the next Update
 		return true;
 	if (keyboard_action == WINDOW_KEY_PRESSED)
 	{

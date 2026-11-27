@@ -1,6 +1,5 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — a player's own progress (rank, reputation, community) checked where his record is kept (F5-PRG-2, row 9 of F2,
-// TZ 6.4; temp/b58/f5_plan.md section 6): the pure half. The engine half is xrGame/coop/coop_progress.cpp (coop_progress.h).
+// Anomaly Coop — a player's own progress (rank, reputation, community) checked where his record is kept: the pure half. The
+// engine half is xrGame/coop/coop_progress.cpp (coop_progress.h).
 //
 // A player's game tells his rank, reputation and community (Msg::Progress, coop_story.cpp progress_frame). The process that keeps
 // his record (the co-op host; in the Server mode the world server) checks the report before it is stored, put on his character and
@@ -14,7 +13,7 @@
 //     of his rises (Peer::keeper_rep, spent first), whatever order his reports and the put-back come in;
 //   - the stored values belong to one world (Book::on_world): after a load or a level change they are forgotten;
 //   - a rise of rank or reputation must fit the budget: the points the keeper saw the player earn since the last stored rise (the
-//     ledger of coop_progress_check.rank_budget, F5-PRG-1/3/4), plus points pushed by coop.progress.budget, plus what was left of
+//     ledger of coop_progress_check.rank_budget), plus points pushed by coop.progress.budget, plus what was left of
 //     the budget at the last stored rise (kCreditMs, so that a kill the keeper saw before the player's rank shows it is not lost);
 //   - a loss always passes (nobody cheats himself down);
 //   - a community other than the base and the record needs the keeper's allowance (coop.progress.community_ok: the coop_faction
@@ -30,6 +29,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+
+#include "coop_ids.h"
+#include "coop_text.h"
 
 namespace coop
 {
@@ -51,17 +53,6 @@ enum class Trust : uint8_t
 
 namespace detail
 {
-// no strcmp here: the engine marks it deprecated (C4995, xrCore)
-inline bool same_text(const char* a, const char* b)
-{
-	for (;; ++a, ++b)
-	{
-		if (*a != *b)
-			return false;
-		if (!*a)
-			return true;
-	}
-}
 inline const char* after_prefix(const char* s, const char* prefix)
 {
 	const char* p = s;
@@ -77,11 +68,11 @@ inline bool trust_of(const char* text, Trust& out)
 {
 	if (!text)
 		return false;
-	if (detail::same_text(text, "log"))
+	if (ascii::equal(text, "log"))
 		out = Trust::Log;
-	else if (detail::same_text(text, "refuse"))
+	else if (ascii::equal(text, "refuse"))
 		out = Trust::Refuse;
-	else if (detail::same_text(text, "off"))
+	else if (ascii::equal(text, "off"))
 		out = Trust::Off;
 	else
 		return false;
@@ -106,7 +97,7 @@ struct Modes
 	Trust community = Trust::Log;
 };
 
-constexpr uint16_t kNoCharacter = 0xffff;
+constexpr uint16_t kNoCharacter = kNoId;
 // coop_progress_check.constants.max_number: no budget is larger.
 constexpr int64_t kMaxPoints = 1000000000;
 // What is carried from one stored rise to the next (left budget, coop.progress.budget pushes): an honest burst (achievements,
@@ -114,7 +105,7 @@ constexpr int64_t kMaxPoints = 1000000000;
 constexpr int64_t kMaxCreditRank = 5000;
 constexpr int64_t kMaxCreditReputation = 1000;
 constexpr uint64_t kCreditMs = 60000;
-// Players are at most 16 (F5-SEAT-1); the rest of the room is for pushes for peers that never report.
+// Players are at most 16; the rest of the room is for pushes for peers that never report.
 constexpr size_t kMaxPeers = 64;
 // coop_trust.script LOG_FIRST: the first 8 failures of a name are written, then every 64th.
 constexpr uint64_t kLogFirst = 8;
@@ -140,7 +131,7 @@ inline bool same_faction(const char* a, const char* b)
 		return false;
 	a = detail::after_prefix(a, "actor_");
 	b = detail::after_prefix(b, "actor_");
-	return *a && detail::same_text(a, b);
+	return *a && ascii::equal(a, b);
 }
 
 struct Values
@@ -313,7 +304,7 @@ public:
 		if (!r.told_community_valid)
 			o.out.community = p.have ? p.accepted.community : (r.record_known ? r.record.community : r.told.community);
 		// the keeper's reputation is noted before the repeat test: a refresh he sent before the keeper's change reached him repeats
-		// the stored values, and coop_story then stores and applies them (the record loses the change) - rv_F5-PRG-2 A1
+		// the stored values, and coop_story then stores and applies them (the record would lose the change)
 		if (now > p.keeper_at + kCreditMs)
 			p.keeper_rep = 0;
 		if (p.have && r.record_known && r.record.reputation > p.accepted.reputation)
@@ -425,7 +416,7 @@ public:
 		return n;
 	}
 
-	// F5-REV-1 S3: reputation the keeper gave `peer`'s `character` that its record does not show - a map server's verified fight on
+	// Reputation the keeper gave `peer`'s `character` that its record does not show - a map server's verified fight on
 	// the world server (coop.progress.apply_verified_fight: host_apply_fight puts it into his stored report, the alife record never
 	// sees it). Kept as the keeper's reputation of the budget (keeper_rep, kCreditMs), as the record's rise is for the co-op host's
 	// own fights. Only for the character his entry names, a rise only; nothing for a peer the book does not know.

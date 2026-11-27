@@ -31,7 +31,7 @@ public:
 	virtual void attach(CInventoryItem* inventory_item);
 	virtual void detach(CInventoryItem* inventory_item);
 	virtual bool can_attach(const CInventoryItem* inventory_item) const;
-	bool may_attach(const shared_str& section) const; // Anomaly Coop: the section is in attachable_items
+	bool may_attach(const shared_str& section) const; // coop: the section is in attachable_items
 	bool attached(const CInventoryItem* inventory_item) const;
 	bool attached(shared_str sect_name) const;
 	virtual void reattach_items();

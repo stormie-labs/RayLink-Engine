@@ -1,5 +1,4 @@
-// Anomaly Coop - F3a split levels: ownership transfer, the map server's side (plan 2026-10-24-f3a §1.7; the protocol
-// and its rulings are in coop_xfer.h).
+// Ownership transfer, the map server's side (the protocol and its rules are in coop_xfer.h).
 // Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
@@ -93,8 +92,8 @@ public:
 		auto known = m_objs.find(id);
 		if (known != m_objs.end())
 		{
-			// b57i progress_server (l05_bar): the switch vote ran on an object this map server had just made before its spawn
-			// was flushed, and asked the world for it (TakeReq). Only this map server makes an object under its leased id, so
+			// The switch vote may run on an object this map server has just made before its spawn
+			// is flushed, and would ask the world for it (TakeReq). Only this map server makes an object under its leased id, so
 			// that request is this spawn: it becomes one. The world's refusal of the request (Abort {0}, no such object yet)
 			// leaves a spawn alone (on_abort, St::Spawning). Before, the spawn was dropped, the object never became this map
 			// server's and came online only after refusals (kRefusedMs each).
@@ -110,7 +109,7 @@ public:
 		return {out(Op::SpawnPrepare, id, 0, ref.state)};
 	}
 
-	// R32 §8a A17: a creature left the squad `unit` this map server writes, alive, and stays here: it inherits the squad's hold, so
+	// a creature left the squad `unit` this map server writes, alive, and stays here: it inherits the squad's hold, so
 	// it never has a moment with no writer, and the world (which applies the same Left, Ledger::adopt) holds it as this map server's
 	// under the same gen. A unit held (or on its way home, Releasing: the gen it holds until the world's Ack) gives its gen; a unit
 	// whose spawn is not answered yet gives what a spawn does: gen 0, and a SpawnPrepare of the creature at the next tick, which the
@@ -150,7 +149,7 @@ public:
 		return true;
 	}
 
-	// R32 §8a A17: a creature it writes joined a squad it writes (or a held unit's death or release goes before the Left that would
+	// a creature it writes joined a squad it writes (or a held unit's death or release goes before the Left that would
 	// have made it its own): it goes with that squad from now on, its own hold ends here without a packet. The world drops its
 	// record in the same journal entry (Ledger::drop). False: not written here.
 	bool forget(uint16_t id)
@@ -171,7 +170,7 @@ public:
 		Obj& o = it->second;
 		if (o.st != St::Held && !(o.st == St::Spawning && !o.release_after))
 			return {}; // frozen for a release, deleted already, or only asked for
-		o.st = St::Destroying; // a spawn not answered yet: gen 0 (R4)
+		o.st = St::Destroying; // a spawn not answered yet: gen 0
 		o.state.clear();
 		arm(o, now);
 		return {out(Op::Destroy, id, o.gen)};
@@ -341,7 +340,7 @@ private:
 	std::map<uint16_t, Obj> m_objs;
 	std::map<uint16_t, uint32_t> m_tomb; // per id: the newest gen finished here, never made again
 	// Per id: the newest gen of a grant it answered AbortAck - "I do not hold (id, gen) and never will". Kept apart
-	// from m_tomb: it bars grants, never the Ack of its own spawn or the Done of its own destroy (review C1).
+	// from m_tomb: it bars grants, never the Ack of its own spawn or the Done of its own destroy.
 	std::map<uint16_t, uint32_t> m_declined;
 	uint64_t m_retries = 0;
 	std::vector<Event> m_events;
@@ -362,7 +361,7 @@ private:
 		uint32_t& t = m_tomb[id];
 		t = std::max(t, gen);
 	}
-	// It promises never to hold (id, gen): every AbortAck goes through here (review C1).
+	// It promises never to hold (id, gen): every AbortAck goes through here.
 	Packet decline(uint16_t id, uint32_t gen)
 	{
 		uint32_t& d = m_declined[id];
@@ -402,7 +401,7 @@ private:
 					return {out(Op::TakeCommit, id, x)}; // the grant repeated: the commit repeated
 				if (x > o.gen && x > barred(id))
 				{
-					// The world grants a newer incarnation: it holds that this one is not here. Follow the world (R2).
+					// The world grants a newer incarnation: it holds that this one is not here. Follow the world.
 					bury(id, o.gen);
 					m_events.push_back(Event{Event::Kind::Remove, id, {}});
 					o.gen = x;
@@ -413,13 +412,13 @@ private:
 					m_events.push_back(Event{Event::Kind::Create, id, o.state});
 					return {out(Op::TakeCommit, id, x)};
 				}
-				return {}; // an older grant, or one it promised never to hold: it keeps its own (R2)
+				return {}; // an older grant, or one it promised never to hold: it keeps its own
 			case St::Spawning:
 			case St::Releasing:
-				return {}; // writes an incarnation of it: never declined (R2); the world's abort will come
+				return {}; // writes an incarnation of it: never declined; the world's abort will come
 			case St::Requesting:
 				if (x <= barred(id))
-					break; // a gen it finished or declined: declined again, never made (review C1)
+					break; // a gen it finished or declined: declined again, never made
 				o.st = St::Held;
 				o.gen = x;
 				o.committed = false;
@@ -431,14 +430,14 @@ private:
 			case St::Committing:
 			case St::Destroying:
 				// Deleted here. A copy of the grant of its own incarnation (or an older one) gets no answer:
-				// declining it would let the world take the object back and undo the destroy (review round 2, H1).
+				// declining it would let the world take the object back and undo the destroy.
 				// A newer one is declined below.
 				if (x <= o.gen)
 					return {};
 				break;
 			}
 		}
-		// Not wanted, deleted here, or barred: declined - it will never hold this gen (R2).
+		// Not wanted, deleted here, or barred: declined - it will never hold this gen.
 		return {decline(id, x)};
 	}
 
@@ -480,7 +479,7 @@ private:
 				m_objs.erase(it);
 			}
 			else if (x == 0 && o.gen == 0)
-				m_objs.erase(it); // the world could not take its Destroy {0} (R11): it only has to stop asking
+				m_objs.erase(it); // the world could not take its Destroy {0}: it only has to stop asking
 			return {};
 		default:
 			return {};
@@ -535,9 +534,9 @@ private:
 		}
 	}
 
-	// Every AbortAck is a promise kept by decline(): (id, x) is never made here later, whatever state the id is in
-	// (review C1: Committing, Spawning, Destroying too). The one Abort not confirmed is the abort of the grant whose
-	// object it is destroying: the destroy wins (R5) and its Destroy, repeated, ends the world's abort.
+	// Every AbortAck is a promise kept by decline(): (id, x) is never made here later, whatever state the id is in.
+	// The one Abort not confirmed is the abort of the grant whose
+	// object it is destroying: the destroy wins and its Destroy, repeated, ends the world's abort.
 	std::vector<Packet> on_abort(const Packet& p, uint64_t now)
 	{
 		const uint16_t id = p.key.id;
@@ -555,7 +554,7 @@ private:
 			return {decline(id, x)};
 		case St::Destroying:
 			if (o.gen != 0 && x == o.gen)
-				return {}; // R5: the destroy wins - the world takes the Destroy while Aborting
+				return {}; // the destroy wins - the world takes the Destroy while Aborting
 			if (o.gen != 0 && x > o.gen)
 			{
 				bury(id, o.gen); // a newer abort (a heal): let go
@@ -586,11 +585,11 @@ private:
 		}
 		case St::Spawning:
 			// An Abort with a gen while spawning: the world registered this spawn and takes it back (a heal - the
-			// spawn's gen is below any gen of an abort sent after it). Let go, like any incarnation up to x (review
-			// round 2, item 3). Gen 0 refuses a request for an id the world never knew: nothing to let go.
+			// spawn's gen is below any gen of an abort sent after it). Let go, like any incarnation up to x.
+			// Gen 0 refuses a request for an id the world never knew: nothing to let go.
 			// Only an Abort above everything barred here is a heal's: its gen is fresh, above any gen this map server
 			// finished or declined, while a late copy of an Abort about an earlier life of the id is at or below the gen
-			// it was declined under, and must leave a spawn of this life alone (review round 3, H4).
+			// it was declined under, and must leave a spawn of this life alone.
 			if (x != 0 && x > barred(id))
 			{
 				m_events.push_back(Event{Event::Kind::Remove, id, {}});
@@ -613,7 +612,7 @@ private:
 		Obj& o = it->second;
 		// A spawn not answered yet (gen 0) obeys one Drop only: {0}, the world's refusal of its SpawnPrepare. A Drop {x}
 		// is about incarnations up to x - the late answer to a destroy of an earlier life of the id says nothing about
-		// this spawn, whatever x is (review round 3, path b).
+		// this spawn, whatever x is.
 		if (o.st == St::Spawning && x != 0)
 			return;
 		const bool writes = o.st == St::Held || o.st == St::Releasing || o.st == St::Spawning;

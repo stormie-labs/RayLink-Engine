@@ -11,7 +11,7 @@ namespace ui_rules
 {
 // The UI cursor is one object of the process. A level's dialogs die with it without closing (CUIGameSP::HideShownDialogs
 // closes the inventory and a talk only: never a PDA, a script's window or a message box), so the "cursor on" of the last one
-// stayed on over the next level (live 2026-10-31). A main menu that is open is the one thing it still points at.
+// stayed on over the next level. A main menu that is open is the one thing it still points at.
 inline bool cursor_outlives_level(bool main_menu_open) { return main_menu_open; }
 
 // The main menu closing: the cursor comes back for a dialog of the level that still wants it. The level it was shown for may
@@ -20,11 +20,9 @@ inline bool cursor_back_after_menu(bool shown_at_open, bool top_dialog_needs_it)
 
 // Device.seqRender runs from high to low, the last one drawn is on top. A loading screen a group holds stays registered at 0
 // (CLoadScreenRenderer), so a menu opened with Esc lay under it: the player saw nothing, his clicks went to buttons he could
-// not see, and the menu was simply there when the screen came off (live 2026-10-31: "pressed Esc and fell to the main menu").
+// not see, and the menu was simply there when the screen came off.
 constexpr int kMenuRenderPriority = 4; // the stock place: 1 console, 3 a combo box's list
-constexpr int kLoadScreenRenderPriority = 0;
-constexpr int kMenuOverLoadScreen = -1; // above the loading screen, under a tutorial (-2) and the cursor
-constexpr int kCursorRenderPriority = -3;
+constexpr int kMenuOverLoadScreen = -1; // above the loading screen (0), under a tutorial (-2) and the cursor (-3)
 
 inline int menu_render_priority(bool load_screen_on) { return load_screen_on ? kMenuOverLoadScreen : kMenuRenderPriority; }
 
@@ -36,8 +34,8 @@ inline bool input_off_after_hold(bool off_before, uint32_t world_before, uint32_
 	return off_before && world_before == world_now;
 }
 
-// CUISequencer keeps game_tutorials.xml for the process, but a DXML script edits it in Lua: G.A.M.M.A.'s
-// modxml_tutorial_hooks blanks the stock text of every "use" prompt and calls a function it generates in its own Lua state
+// CUISequencer keeps game_tutorials.xml for the process, but a DXML script edits it in Lua: a mod's
+// tutorial hook blanks the stock text of every "use" prompt and calls a function it generates in its own Lua state
 // instead. Every world has a new Lua state (restart_all), so the XML is only good in the world that read it. Single player
 // hid this: "press any key" starts a tutorial while the load is on, and that read the file again. A client has no such key.
 inline bool tutorials_xml_reusable(bool read_before, bool boot_complete, uint32_t world_read, uint32_t world_now)

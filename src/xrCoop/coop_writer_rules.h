@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — one writer per object (TZ Р32, temp/r30/design/R32-final.md §1 W1, W2a, W4, W6; §8 the frozen interface).
+// Anomaly Coop — one writer per object.
 //
 // The owner's rule as a contract: every object has exactly one writer. Only the writer's word changes it (creates under it,
 // releases it, moves it, kills it, changes its state, its squad, its info portions, its Lua rows). Everybody else keeps a copy
@@ -7,31 +6,32 @@
 //
 // The pure part, header-only, no engine: the Core names a root's kind (kind_of) and asks Mode::writer_of(RootFacts)
 // (xrCoop/coop_mode.h), each mode answers it with writer_of() below from the facts of its own tables (Seat: who leads a map, who
-// holds a unit, whose move fence is open; the server's processes build it with world_seat / map_seat of xrCoop/srv/coop_writer_seats.h from their tables' answers);
-// the Core's script gate asks gate() (W2a); the world's acceptance asks fence_admits() and same_object() (W2b); the module carry
-// of a map server follows the carry rule (W6). Pure C++17: used by the engine and by the unit-test exe
-// (tests/test_writer_rules.cpp).
+// holds a unit, whose move fence is open; the server's processes build it with world_seat / map_seat of
+// xrCoop/srv/coop_writer_seats.h from their tables' answers); the Core's script gate asks gate(); the world's acceptance asks
+// fence_admits() and same_object(); the module carry of a map server follows the carry rule. Pure C++17: used by the engine and
+// by the unit-test exe (tests/test_writer_rules.cpp).
 //
-// Everything is in coop::writer: coop::Writer is the wire writer (coop_wire.h), so the Writer of §8 lives here as
+// Everything is in coop::writer: coop::Writer is the wire writer (coop_wire.h), so the writer's Writer lives here as
 // coop::writer::Writer.
 #pragma once
 
 #include <cstdint>
 #include <string>
 
+#include "coop_ids.h"
 #include "coop_protocol.h"
 
 namespace coop
 {
 namespace writer
 {
-constexpr uint16_t kNoLevel = 0xffff; // no map (the same value as levels::kNoLevel)
-constexpr uint16_t kNoId = 0xffff; // no object: the top of a parent chain, no squad
-constexpr uint16_t kGhostId = 0; // actor 0: the ghost where this process's actor plays nobody (W1.5)
-constexpr int kRootHops = 8; // the parent chain is walked at most this far (as srv/coop_levels_alife.cpp host_apply_release)
+using coop::kNoLevel; // no map
+using coop::kNoId; // no object: the top of a parent chain, no squad
+constexpr uint16_t kGhostId = 0; // actor 0: the ghost where this process's actor plays nobody
+constexpr int kRootHops = 8; // the parent chain is walked at most this far (a deeper chain is a broken registry)
 constexpr uint32_t kNoFence = 0xffffffffu; // no fence: every entry of the sender is admitted
 
-// ------------------------------------------------------------------------------------------------- the root (W1.2)
+// ------------------------------------------------------------------------------------------------- the root
 
 // What the root of an object is. The Core finds the root (root_of) and its kind (kind_of) from its ALife data:
 //   Character  a player's character, and the ghost (actor 0 where the actor plays nobody);
@@ -55,7 +55,7 @@ struct RootFacts
 	uint16_t level;
 };
 
-// The root of `id` (W1.2): ID_Parent walked to the top (at most kRootHops hops); a top that is a creature in a squad gives its
+// The root of `id`: ID_Parent walked to the top (at most kRootHops hops); a top that is a creature in a squad gives its
 // squad (unit_of). parent_of(id) -> uint16_t: the parent, kNoId at the top or for an id that is not there; squad_of(id) ->
 // uint16_t: the squad of a creature, kNoId for none.
 template <class ParentOf, class SquadOf>
@@ -73,9 +73,9 @@ uint16_t root_of(uint16_t id, ParentOf parent_of, SquadOf squad_of)
 	return squad == kNoId ? top : squad;
 }
 
-// ------------------------------------------------------------------------------------------------- the writer (W1)
+// ------------------------------------------------------------------------------------------------- the writer
 
-// Who writes the object: this process, another process (peer: how this process names it), nobody (the ghost, W1.5).
+// Who writes the object: this process, another process (peer: how this process names it), nobody (the ghost).
 enum class WriterIs : uint8_t
 {
 	This,
@@ -133,9 +133,9 @@ struct Process
 // The server of a map as this process knows it (the world server: its table of map servers; a map server: its own state for
 // its own map, its world's LevelMap for the others).
 //   None      no process (Off, Lost): the world writes the map's residents;
-//   Starting  launched, loading its world (a save plus the tail, W4.4): the world still writes them;
+//   Starting  launched, loading its world (a save plus the tail): the world still writes them;
 //   Leads     up: Ready, Serving, Draining (mapserver::host_ready): it writes them;
-//   Stopping  its Stop order is out: it still writes them until its Stopped, after its journal is acknowledged (W1.3, W4.3).
+//   Stopping  its Stop order is out: it still writes them until its Stopped, after its journal is acknowledged.
 enum class Lead : uint8_t
 {
 	None,
@@ -165,7 +165,7 @@ struct MapLead
 	PeerId peer = kInvalidPeer;
 };
 
-// How a unit is held (W1.2b):
+// How a unit is held:
 //   Home  at home in the world: the world simulates it, also on a led map until it is granted;
 //   Held  granted to a map server (the keeper has it away, the holder authors it);
 //   Born  made by a map server under its own id slice: held by it from its birth (Holder::spawned -> SpawnPrepare), also
@@ -181,14 +181,14 @@ enum class Hold : uint8_t
 struct Seat
 {
 	MapLead map; // Character, Resident: the server of RootFacts::level
-	uint16_t from = kNoLevel; // Character: the map he left while his move fence is not through (W4.2); kNoLevel: no move
+	uint16_t from = kNoLevel; // Character: the map he left while his move fence is not through; kNoLevel: no move
 	MapLead from_map; // its server
 	Hold hold = Hold::Home; // Unit
 	uint16_t holder_level = kNoLevel; // Unit held or born: the map of the server that holds it
 	PeerId holder = kInvalidPeer; // that server as this process names it (the world server: its bridge)
 };
 
-// The writer of a root (W1.2), first match wins:
+// The writer of a root, first match wins:
 //   the ghost (a Character with id kGhostId where the actor plays nobody: World, Level)             nobody;
 //   Whole                                                                                           this process;
 //   Mirror                                                                                          its host;
@@ -244,7 +244,7 @@ inline Writer writer_of(const RootFacts& root, const Process& self, const Seat& 
 	return by_map && level == self.level ? this_process() : other(self.world);
 }
 
-// ------------------------------------------------------------------------------------------------- the kind of a root (W1.2)
+// ------------------------------------------------------------------------------------------------- the kind of a root
 
 // What the Core reads of a root to name its kind (writing::root_facts_of from the ALife objects; the tests from rows).
 struct KindFacts
@@ -259,8 +259,8 @@ struct KindFacts
 
 // A unit is what the world grants to a map server and takes back: a squad or a living monster, the predicate of the transfers
 // (srv/coop_levels_alife.cpp levels::transfers). A crow or a phantom is a creature but no monster: the transfers never move it, only
-// its map's server has it online, so it is that map's resident like a box (review R32 B1: the world named itself its writer and
-// refused the map server's Died and Destroy of a crow, which came back at every start).
+// its map's server has it online, so it is that map's resident like a box (the world must not name itself its writer and refuse
+// the map server's Died and Destroy of a crow).
 constexpr bool is_unit(bool group, bool monster, bool alive)
 {
 	return group || (monster && alive);
@@ -276,7 +276,7 @@ constexpr RootKind kind_of(const KindFacts& k)
 	                                             : RootKind::None;
 }
 
-// ------------------------------------------------------------------------------------------------- the gate (W2a)
+// ------------------------------------------------------------------------------------------------- the gate
 
 // What a script path does to its target: alife create / spawn_item / spawn_item2 / create_ammo / register / clone_weapon /
 // level.spawn_item (Create), release (Release), a change of its state (State), give_info / disable_info (Info).
@@ -315,9 +315,9 @@ enum class GateVerdict : uint8_t
 	Order,
 };
 
-// The W2a table. `w`: the writer of the target's root (Mode::writer_of); `root_on_own_level`: that root stands on the map this
+// The gate table. `w`: the writer of the target's root (Mode::writer_of); `root_on_own_level`: that root stands on the map this
 // process leads; `ghost_target`: the root is the ghost.
-//   WS or Mk  | the ghost             | create, info                       Refuse (W1.5), whatever `w` says
+//   WS or Mk  | the ghost             | create, info                       Refuse, whatever `w` says
 //   any       | This                  | -                                  Run
 //   Whole     | not This              | -                                  Run (it writes everything: nobody to defer to)
 //   Mirror    | not This              | -                                  Mirror
@@ -350,10 +350,10 @@ inline GateVerdict gate(ProcessKind p, Writer w, WriteOp op, CodeScope s, bool r
 	return GateVerdict::Refuse;
 }
 
-// ------------------------------------------------------------------------------------------------- fences and identity (W2b, W4)
+// ------------------------------------------------------------------------------------------------- fences and identity
 
 // Is an entry of the sender at `entry_epoch` (its journal's seq) before or at the sender's fence `fence_epoch` (the seq of its
-// Flushed for that fence; kNoFence: none)? The old writer's facts after its fence are refused (W4.2). Epochs count from 1 in each
+// Flushed for that fence; kNoFence: none)? The old writer's facts after its fence are refused. Epochs count from 1 in each
 // process's life and do not wrap within it (u32, one batch per frame).
 inline bool fence_admits(uint32_t entry_epoch, uint32_t fence_epoch)
 {
@@ -366,70 +366,6 @@ inline bool fence_admits(uint32_t entry_epoch, uint32_t fence_epoch)
 inline bool same_object(uint16_t section_crc_here, uint16_t section_crc_report, uint32_t gen_here, uint32_t gen_report)
 {
 	return section_crc_here == section_crc_report && gen_here == gen_report;
-}
-
-// ------------------------------------------------------------------------------------------------- the carry rule (W6)
-
-// The world's book of one carried path (m_data.coop_carry[path] = {base, new}); `value` is the design's `new`.
-struct CarryEntry
-{
-	bool set = false;
-	std::string base, value;
-};
-
-// What a carried leaf {base, value} of a map server did to the book (W6.5):
-//   Stored    nothing was kept for the path: the leaf is kept;
-//   Chained   it was made on the kept value: the value moves on, the first base stays;
-//   Same      the kept value already (a repeat): nothing changes;
-//   Conflict  it was made on another value: the kept value stays (the caller writes one log line).
-enum class CarryMerge : uint8_t
-{
-	Stored,
-	Chained,
-	Same,
-	Conflict,
-};
-
-inline CarryMerge carry_merge(CarryEntry& e, const std::string& base, const std::string& value)
-{
-	if (!e.set)
-	{
-		e.set = true;
-		e.base = base;
-		e.value = value;
-		return CarryMerge::Stored;
-	}
-	if (value == e.value)
-		return CarryMerge::Same;
-	if (base != e.value)
-		return CarryMerge::Conflict;
-	e.value = value;
-	return CarryMerge::Chained;
-}
-
-// What a load (a world server's restart, every map server's start) does with a kept entry, before load_state (W6.7):
-//   Set      the module still has the base: it gets the value;
-//   Done     it has the value already, or nothing is kept;
-//   Dropped  something else changed it since: left as it is (the caller writes one log line).
-enum class CarryApply : uint8_t
-{
-	Set,
-	Done,
-	Dropped,
-};
-
-inline CarryApply carry_apply(const std::string& current, const CarryEntry& e)
-{
-	if (!e.set || current == e.value)
-		return CarryApply::Done;
-	return current == e.base ? CarryApply::Set : CarryApply::Dropped;
-}
-
-// The writer filter (W6.6): a leaf under a table whose keys are all ids of live world objects is a row about that object, taken
-// only from the object's writer (`writer_here`: the world server's writer_of of it; `sender`: the bridge that carried the leaf).
-inline bool carry_admits(bool row_of_object, const Writer& writer_here, PeerId sender)
-{
-	return !row_of_object || (writer_here.is == WriterIs::Other && writer_here.peer == sender);
 }
 
 // ------------------------------------------------------------------------------------------------- names (log, coop_status)

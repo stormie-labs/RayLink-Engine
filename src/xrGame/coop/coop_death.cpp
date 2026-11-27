@@ -14,6 +14,8 @@
 #include "coop_world.h"
 #include "xrCoop/coop_death_items.h"
 #include "xrCoop/coop_ledger.h"
+#include "xrCoop/coop_ids.h"
+#include "xrCoop/coop_lua_errors.h" // lua_errors::LogBudget
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -51,7 +53,6 @@ namespace death
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr size_t kMaxPendingStashes = 16; // one per death; more at once falls back to dropping
 constexpr size_t kMaxMarkers = 32;
 constexpr size_t kMaxPreviewLine = 900; // section lists in coop_death_preview are cut here
@@ -173,33 +174,22 @@ int g_cv_new_kit = 0;
 struct Stats
 {
 	u64 deaths = 0, dropped = 0, moved = 0, destroyed = 0, stashes = 0, stash_fallbacks = 0, stash_lost = 0;
-	u64 stash_abandoned = 0; // released empty at the end of a session or on a new world (review minor 5)
-	u64 bags_released = 0; // Ruling L-1: emptied by the players, released by the host (release_empty_bags)
+	u64 stash_abandoned = 0; // released empty at the end of a session or on a new world
+	u64 bags_released = 0; // emptied by the players, released by the host (release_empty_bags)
 	u64 markers_sent = 0, markers_in = 0, markers_refused = 0, markers_dropped = 0;
 	u64 money_taken = 0;
 };
 Stats g_st;
-u32 g_log_count = 0;
-
-bool log_allowed() { return ++g_log_count <= 20 || (g_log_count % 100) == 0; }
-
-u64 now_ms() { return mgr().now_ms(); }
+constexpr u64 kLogBurst = 20; // the lines of this module: the first ones in full, then one in a hundred
+lua_errors::LogBudget g_log{kLogBurst};
 
 // ---------------------------------------------------------------- engine helpers
-
-CGameObject* game_object(u16 id)
-{
-	if (!g_pGameLevel || id == kNoId)
-		return nullptr;
-	CGameObject* go = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return go && !go->getDestroy() ? go : nullptr;
-}
 
 // Parent of an entity in the server state: every ownership event changes it at once (game objects follow a round
 // later), so this is where an item is right now on the host.
 u16 server_parent(u16 id)
 {
-	CSE_Abstract* e = events::find_entity(id);
+	CSE_Abstract* e = world::server_entity(id);
 	return e ? e->ID_Parent : kNoId;
 }
 
@@ -208,7 +198,7 @@ StashOwner owner_of(u16 character)
 {
 	StashOwner o;
 	o.peer = character == 0 ? kHostPeer : join::peer_of_proxy(character);
-	const CSE_Abstract* e = events::find_entity(character);
+	const CSE_Abstract* e = world::server_entity(character);
 	if (e && e->m_ini_string.size())
 		o.key = ledger::character_key(e->m_ini_string.c_str());
 	return o;
@@ -221,7 +211,7 @@ bool player_character(u16 character, CGameObject*& body, CInventoryOwner*& owner
 	owner = nullptr;
 	if (character != 0 && !join::is_proxy(character))
 		return false;
-	CGameObject* go = game_object(character);
+	CGameObject* go = world::object_here(character);
 	CInventoryOwner* io = go ? smart_cast<CInventoryOwner*>(go) : nullptr;
 	if (!io)
 		return false;
@@ -265,7 +255,7 @@ std::vector<ItemFacts> collect(CInventoryOwner* io, bool everything)
 
 const char* section_of(u16 id)
 {
-	CGameObject* go = game_object(id);
+	CGameObject* go = world::object_here(id);
 	return go ? go->cNameSect().c_str() : "?";
 }
 
@@ -426,7 +416,7 @@ void move_item(u16 from, u16 to, u16 item)
 // object (being spawned right now) stays: an empty stash.
 void release_stash(u16 id)
 {
-	if (CGameObject* go = game_object(id))
+	if (CGameObject* go = world::object_here(id))
 	{
 		go->DestroyObject();
 		return;
@@ -539,8 +529,8 @@ u16 stash_items(u16 character, CGameObject* body, const std::vector<u16>& picked
 	p.character = character;
 	p.owner = owner_of(character);
 	p.items = picked;
-	p.deadline = now_ms() + kStashWaitMs;
-	p.give_up_at = now_ms() + kStashAwayWaitMs;
+	p.deadline = mgr().now_ms() + kStashWaitMs;
+	p.give_up_at = mgr().now_ms() + kStashAwayWaitMs;
 	p.died = place.drop;
 	p.marker = marker;
 	write_owner(e, character, p.owner);
@@ -582,18 +572,18 @@ Presence character_presence(u16 character)
 	CSE_ALifeDynamicObject* d = ai().get_alife() ? ai().alife().objects().object(character, true) : nullptr;
 	if (d)
 		return d->m_bOnline ? Presence::Between : Presence::Offline;
-	return events::find_entity(character) ? Presence::Between : Presence::Gone;
+	return world::server_entity(character) ? Presence::Between : Presence::Gone;
 }
 
 // Where the stash is: Online only as an inventory box (another class under that section never fills: its 5 s run out).
 Presence stash_presence_of(u16 stash)
 {
-	if (CGameObject* go = game_object(stash))
+	if (CGameObject* go = world::object_here(stash))
 		return smart_cast<CInventoryBox*>(go) ? Presence::Online : Presence::Between;
 	CSE_ALifeDynamicObject* d = ai().get_alife() ? ai().alife().objects().object(stash, true) : nullptr;
 	if (d)
 		return d->m_bOnline ? Presence::Between : Presence::Offline;
-	return events::find_entity(stash) ? Presence::Between : Presence::Gone;
+	return world::server_entity(stash) ? Presence::Between : Presence::Gone;
 }
 
 void stash_filled(PendingStash& p, u32 moved, const char* how)
@@ -694,7 +684,7 @@ void abandon_stashes(const char* why)
 	{
 		if (!world)
 			continue;
-		const CSE_Abstract* e = events::find_entity(p.stash);
+		const CSE_Abstract* e = world::server_entity(p.stash);
 		if (!e || xr_strcmp(e->s_name, kStashSection) || !e->children.empty())
 			continue;
 		release_stash(p.stash);
@@ -739,7 +729,7 @@ void release_empty_bags(u64 t)
 		if (!section || xr_strcmp(section, kStashSection))
 			continue;
 		CInventoryBox* box = smart_cast<CInventoryBox*>(o);
-		const CSE_Abstract* e = box ? events::find_entity(box->ID()) : nullptr;
+		const CSE_Abstract* e = box ? world::server_entity(box->ID()) : nullptr;
 		BagState s;
 		s.death_stash = e && !xr_strcmp(e->s_name, kStashSection);
 		s.online = box && !box->getDestroy() && !box->object_removed();
@@ -754,7 +744,7 @@ void release_empty_bags(u64 t)
 	{
 		release_stash(id);
 		++g_st.bags_released;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("[coop] death stash %u is empty: released", id);
 	}
 }
@@ -773,7 +763,7 @@ void host_frame()
 	}
 	if (!g_stashes.empty() && ai().get_alife())
 	{
-		const u64 t = now_ms();
+		const u64 t = mgr().now_ms();
 		for (size_t i = 0; i < g_stashes.size();)
 		{
 			PendingStash& p = g_stashes[i];
@@ -791,12 +781,12 @@ void host_frame()
 			g_stashes.erase(g_stashes.begin() + i);
 		}
 	}
-	release_empty_bags(now_ms());
+	release_empty_bags(mgr().now_ms());
 	if (!g_markers.empty())
 		send_markers();
 }
 
-// ---------------------------------------------------------------- a player (a client, and the host player: F3a T7)
+// ---------------------------------------------------------------- a player (a client or the host player)
 
 void on_marker_msg(PeerId from, Reader& r)
 {
@@ -809,7 +799,7 @@ void on_marker_msg(PeerId from, Reader& r)
 	if (!read(r, m))
 	{
 		++g_st.markers_refused;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("! [coop] DeathMarker from the host refused: short, no id, or a mode without a marker");
 		return;
 	}
@@ -904,7 +894,7 @@ u32 host_apply_losses(u16 character, u16 seq, Drop mode, u8 share_pct)
 		{
 			if (server_parent(id) != character)
 				continue;
-			CGameObject* go = game_object(id);
+			CGameObject* go = world::object_here(id);
 			if (!go)
 				continue;
 			go->DestroyObject(); // a world item: the host removes it, clients follow (as a used medkit)
@@ -958,7 +948,7 @@ StashOutcome host_stash_outcome(u16 character)
 
 u32 host_items_on(u16 character)
 {
-	const CSE_Abstract* e = events::find_entity(character);
+	const CSE_Abstract* e = world::server_entity(character);
 	if (!e || !ai().get_alife())
 		return 0;
 	u32 n = 0;
@@ -1110,18 +1100,19 @@ void install_client(Endpoint& e) { e.on(Msg::DeathMarker, &on_marker_msg); }
 
 void reset()
 {
-	abandon_stashes("the session ended"); // review minor 5: an unfilled stash is released, not left empty in the world
+	abandon_stashes("the session ended"); // release unfilled stashes so they do not remain in the world
 	g_markers.clear();
 	g_epoch = 0xffffffff;
 	g_next_bag_poll = 0;
 	g_st = Stats();
-	g_log_count = 0;
+	g_log = lua_errors::LogBudget(kLogBurst);
 	g_gave_up.clear();
 	g_set.loaded = false; // read again at the first death (DLTX may differ between game starts)
 }
 
 void frame()
 {
+	PROF_EVENT("coop/coop_death/frame");
 	if (mode().decides_world() || mode().leads_level())
 		host_frame();
 }
@@ -1138,9 +1129,9 @@ void print_status()
 		    g_st.money_taken);
 		for (const PendingStash& p : g_stashes)
 			::Msg("[coop]     stash %u of %s: %u items, %lld ms left", p.stash, nick(p.character).c_str(),
-			    u32(p.items.size()), s64(p.deadline) - s64(now_ms()));
+			    u32(p.items.size()), s64(p.deadline) - s64(mgr().now_ms()));
 	}
-	if (mgr().active()) // F3a T7: the host player takes them too
+	if (mgr().active()) // the host player receives markers over the internal channel too
 		::Msg("[coop]   death: %llu markers from the host, %llu refused", g_st.markers_in, g_st.markers_refused);
 }
 

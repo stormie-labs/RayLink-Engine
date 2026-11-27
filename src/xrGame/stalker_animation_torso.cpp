@@ -21,7 +21,7 @@
 
 const u32 need_look_back_time_interval = 2000;
 
-// Anomaly Coop (RL-4BXZ-R24J, build 51): CAniVector::Load keeps only the motions the visual has, so A[i] of a missing one
+// coop: CAniVector::Load keeps only the motions the visual has, so A[i] of a missing one
 // (a shotgun's tri-state reload_1 / reload_2 on a visual with reload_0 only) read past the vector: a garbage MotionID that
 // faulted in PlayCycle (the stock catch(...) of CStalkerAnimationManager::update, 151 times) and then in the IK. A motion
 // that is not there is an invalid MotionID now; play_torso falls back to no_object_animation.
@@ -122,7 +122,7 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 	// animation shortcuts
 	typedef CStalkerAnimationState STATE;
 	if (!torso_slot_known(*m_data_storage, body_state, slot) || !torso_slot_known(*m_data_storage, eBodyStateStand, slot))
-		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
+		return (no_object_animation(body_state)); // coop: a motion the visual has not
 	const xr_vector<STATE>& part_animations = m_data_storage->m_part_animations.A;
 	const xr_vector<CAniVector>& animation = part_animations[body_state].m_torso.A[slot].A;
 	const xr_vector<CAniVector>& animation_stand = part_animations[eBodyStateStand].m_torso.A[slot].A;
@@ -202,7 +202,7 @@ MotionID CStalkerAnimationManager::unknown_object_animation(u32 slot, const EBod
 MotionID CStalkerAnimationManager::weapon_animation(u32 slot, const EBodyState& body_state)
 {
 	if (!torso_slot_known(*m_data_storage, body_state, slot))
-		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
+		return (no_object_animation(body_state)); // coop: a motion the visual has not
 	const xr_vector<CAniVector>& animation = m_data_storage->m_part_animations.A[body_state].m_torso.A[slot].A;
 
 	//Alun: Fix stalker sprint
@@ -274,7 +274,7 @@ MotionID CStalkerAnimationManager::missile_animation(u32 slot, const EBodyState&
 	//		slot						= 0;
 
 	if (!torso_slot_known(*m_data_storage, body_state, slot))
-		return (no_object_animation(body_state)); // Anomaly Coop (RL-4BXZ-R24J)
+		return (no_object_animation(body_state)); // coop: a motion the visual has not
 	const xr_vector<CAniVector>& animation = m_data_storage->m_part_animations.A[body_state].m_torso.A[slot].A;
 	//	const xr_vector<CAniVector>		&animation = m_data_storage->m_part_animations.A[eBodyStateStand].m_torso.A[slot].A;
 

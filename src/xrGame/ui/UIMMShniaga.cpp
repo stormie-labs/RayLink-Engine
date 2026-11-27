@@ -15,14 +15,14 @@
 #include "../login_manager.h"
 #include "MainMenu.h"
 #include "../coop/coop_survival.h"
-#include "../coop/coop_manager.h" // Anomaly Coop
+#include "../coop/coop_manager.h"
 
 extern string_path g_last_saved_game;
 
-// Anomaly Coop (F3): in a co-op session nobody saves or loads from the menu, the host included (the host restores
+// coop: in a co-op session nobody saves or loads from the menu, the host included (the host restores
 // from the emergency autosaves in the co-op window). The buttons of the save/load entries are not created. In the
 // rollback death mode the host has them as in the stock game.
-// The names are the same in stock Anomaly and in GAMMA (ui_mm_main_16.xml, MCM copy).
+// The names are those of stock Anomaly (ui_mm_main_16.xml).
 static bool coop_hidden_menu_button(LPCSTR name)
 {
 	if (!name || !coop::mgr().active())
@@ -148,7 +148,7 @@ void CUIMMShniaga::CreateList(xr_vector<CUITextWnd*>& lst, CUIXml& xml_doc, LPCS
 
 	for (int i = 0; i < nodes_num; ++i)
 	{
-		if (coop_hidden_menu_button(xml_doc.ReadAttrib("btn", i, "name"))) // Anomaly Coop
+		if (coop_hidden_menu_button(xml_doc.ReadAttrib("btn", i, "name"))) // coop: buttons a session hides
 			continue;
 		st = xr_new<CUITextWnd>();
 		st->SetWndPos(Fvector2().set(0, 0));

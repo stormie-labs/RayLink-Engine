@@ -1,6 +1,7 @@
 #pragma once
 #include "../control_combase.h"
 #include "../../../../Include/xrRender/KinematicsAnimated.h"
+#include "xrCoop/coop_monster_fx_rules.h"
 
 class CPsyHitEffectorCam;
 class CEntityAlive;
@@ -46,7 +47,7 @@ public:
 	void on_death();
 	bool tube_ready() const;
 
-	// Anomaly Coop (audit A5): the tube on a remote player's character. The host runs the stages and hits the
+	// coop: the tube on a remote player's character. The host runs the stages and hits the
 	// character (the player gets it as PlayerHit); the player's machine plays each stage on its actor here.
 	enum ECoopPhase : u8
 	{
@@ -72,10 +73,9 @@ private:
 	void hit();
 	bool check_conditions_final();
 
-	// Anomaly Coop (audit A5)
+	// coop: a tube on another player's machine
 	u16 m_coop_target = u16(-1); // host: the remote player's character the tube is on; -1: the actor (stock)
-	bool m_coop_playing = false; // client: a host tube plays on our actor
-	u32 m_coop_deadline = 0;
+	coop::monster_fx::ActorHold m_coop_hold; // client: a host tube plays on our actor
 	bool remote_target() const { return m_coop_target != u16(-1); }
 	const CEntityAlive* pick_target() const; // the enemy when it is a remote player seen now, else the actor
 	const CEntityAlive* target() const; // whom the running tube is on

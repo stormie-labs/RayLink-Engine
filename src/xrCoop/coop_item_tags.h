@@ -1,4 +1,4 @@
-// Anomaly Coop — which tags of an item state differ between the host copy and the owner's report (R3 В1).
+// Anomaly Coop — which tags of an item state differ between the host copy and the owner's report.
 // The host re-applies the owner's state to its copy of a player's item; a copy that still differs afterwards is
 // "stuck" and is not forced any more. A tag the owner never carried must not make a copy stuck: the old symmetric
 // comparison did exactly that for the scope tag of every weapon without scopes (pistols, knife).
@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "coop_hash.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -85,11 +86,10 @@ std::uint32_t diverged(const D& cur, const D& owner, SameUpgrades&& same_upgrade
 	return m;
 }
 
-// Live report 2026-11-08 (GAMMA, a looted gun went red in a client's hands). The host moves an item into a player's
+// The host moves an item into a player's
 // character and then pushes its own state of it (coop_items.cpp host_push, authority flag): the player's copy may be
-// stale (an NPC's magazine, a corpse's condition). By then the owner's own take callbacks have run on it (GAMMA's "Guns
-// Have No Condition", grok_gun_condition_fixed: a taken firearm is pinned at 0.83 in actor_on_item_take; parts keep the
-// wear). What the owner changed itself since the take is the owner's and must survive the host's push.
+// stale (an NPC's magazine, a corpse's condition). By then the owner's own take callbacks have run on it (a mod may pin a
+// taken firearm's condition in actor_on_item_take). What the owner changed itself since the take is the owner's and must survive the host's push.
 
 // Tags whose value differs between `now` (the owner's copy) and `base` (the same copy right before the take), whichever
 // side carries them.
@@ -103,7 +103,7 @@ std::uint32_t changed_since(const D& now, const D& base, SameUpgrades&& same_upg
 // coop_ledger.h), never the owner's.
 constexpr std::uint32_t kOwnerTakeTags = kAll & ~std::uint32_t(Upgrades);
 
-// Live report 2026-11-08 (stable 41.6, G.A.M.M.A., a scope on a client's SR-3M showed 7 %): an item the owner made
+// An item the owner made
 // itself under a leased id (a weapon's clone for a scope, a kit, a detach) is the owner's whole. The host builds its copy
 // from its own view of the source and pushes it into the owner's hands; that view may be older than the owner's live
 // weapon. The tags the owner keeps over the host's push: all of them (but the upgrade list) for an item it made itself,
@@ -174,7 +174,7 @@ D only_tags(D d, std::uint32_t mask)
 	return d;
 }
 
-// Parity audit F1: the digest of the state of an item nobody alive holds, as the host and a client each see it
+// The digest of the state of an item nobody alive holds, as the host and a client each see it
 // (coop_reconcile.h). Condition in steps of 1/1024: a step apart is a change, a float's last bits are not. The upgrades
 // are the host's and a mechanic's business (they go out with ItemState when sold). `with_uses`: portions live in the
 // game object only, so they count when the item is online at both ends.
@@ -182,8 +182,8 @@ D only_tags(D d, std::uint32_t mask)
 template <class D>
 std::uint32_t state_digest(const D& d, bool with_uses)
 {
-	std::uint32_t h = 2166136261u;
-	const auto mix = [&h](std::uint32_t v) { h = (h ^ v) * 16777619u; };
+	std::uint32_t h = kFnv32Basis;
+	const auto mix = [&h](std::uint32_t v) { h = fnv1a32_step(h, v); };
 	mix(d.has_cond ? (std::uint32_t(d.cond) + 32u) >> 6 : 0xFFFFu);
 	mix(d.has_box ? d.box : 0xFFFFu);
 	mix(d.has_addons ? d.addons : 0xFFFFu);
@@ -193,16 +193,16 @@ std::uint32_t state_digest(const D& d, bool with_uses)
 	return h | 1u; // never 0: a row without a state
 }
 
-// ---------------------------------------------------------------- TZ R32 W8.2 (protocol 34): a version per tagged field
+// ---------------------------------------------------------------- a version per tagged field
 
 // The decider of an item (its writer, coop_writer_rules.h) changes a field on purpose: a script's set_condition or
 // set_remaining_uses, an upgrade it installs. The owner (the player whose character holds the item) reports the state his game has.
-// Before protocol 34 the newer report won: a report the owner made before he had applied the decider's debit restored it (gap-g4
-// F1/F2), and a push of the decider could undo the owner's own eating. Now every tagged field has a version: the decider moves it
+// The newer report alone cannot decide: a report the owner made before he had applied the decider's debit would restore it, and
+// a push of the decider could undo the owner's own eating. So every tagged field has a version: the decider moves it
 // on at each deliberate write (bump) and pushes it with the value; the owner applies the push and keeps its version (take), and
 // reports the versions with the fields. The decider takes a field of a report only when the report was made on the latest version
 // of that field (fresh): the owner's own change on top of the latest write counts, a stale report never undoes a write.
-// Version 0: no deliberate write yet (an item as it was made, a state of protocol 33).
+// Version 0: no deliberate write yet (an item as it was made).
 constexpr std::size_t kTagCount = 8; // Cond .. Uses: one version each
 static_assert(kAll == 0xFFu, "one version per Bit: the u8 mask of write_versions names every tag");
 
@@ -270,11 +270,11 @@ inline std::uint32_t fresh(const FieldVersions& latest, const FieldVersions& rep
 	return out;
 }
 
-// On the wire: a tag of the ItemState blob (coop_items.cpp Tag; 1 .. 11 are taken), u8 tag, varu len, payload, so a reader of
-// protocol 33 skips it by its length (read_data's default). Payload: u8 mask (the tags whose version follows), then a u16 per bit of
+// On the wire: a tag of the ItemState blob (coop_items.cpp Tag; 1 .. 11 are taken), u8 tag, varu len, payload, so a reader
+// skips a tag it does not know by its length (read_data's default). Payload: u8 mask (the tags whose version follows), then a u16 per bit of
 // the mask, lowest bit first.
 constexpr std::uint8_t kVersionsTag = 12;
-// Two more tags of protocol 34 (an older reader skips them by their length too):
+// Two more tags:
 // 13 the decider's own change of the portions in the push of its latest version of them: i16 (coop_owner_rules.h counters);
 // 14 the stock client_data of a held eatable as the writer's game object saved it (the CGameObject::net_Save body, at most
 //    initial::kMaxClientData bytes, coop_initial_rules.h): a map server's ItemFacts, so that a world with no object stores the

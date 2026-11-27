@@ -25,8 +25,8 @@
 #include "ai_object_location.h"
 #include "object_broker.h"
 #include "../xrEngine/igame_persistent.h"
-#include "coop/coop_players.h" // Anomaly Coop
-#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
+#include "coop/coop_players.h"
+#include "xrCoop/coop_container_rules.h"
 
 
 #ifdef DEBUG
@@ -307,7 +307,7 @@ bool CInventoryItem::Detach(const char* item_section_name, bool b_spawn_item)
 			smart_cast<CSE_ALifeDynamicObject*>(D);
 		R_ASSERT(l_tpALifeDynamicObject);
 
-		l_tpALifeDynamicObject->m_tNodeID = (g_dedicated_server && !g_coop_headless) ? u32(-1) : object().ai_location().level_vertex_id();
+		l_tpALifeDynamicObject->m_tNodeID = object().ai_location().level_vertex_id();
 
 		// Fill
 		D->s_name = item_section_name;
@@ -362,7 +362,7 @@ BOOL CInventoryItem::net_Spawn(CSE_Abstract* DC)
 	CSE_ALifeInventoryItem* pSE_InventoryItem = smart_cast<CSE_ALifeInventoryItem*>(e);
 	if (!pSE_InventoryItem) return TRUE;
 
-	// Anomaly Coop: a client that came back gets its own things where they were (slot, belt, backpack): the host's
+	// coop: a client that came back gets its own things where they were (slot, belt, backpack): the host's
 	// proxy kept none of it, and with no place CInventory::Take puts every default_to_ruck item in the backpack
 	coop::players::on_item_spawn(m_ItemCurrPlace, *e);
 
@@ -388,7 +388,7 @@ void CInventoryItem::net_Destroy()
 {
 	if (m_pInventory)
 	{
-		// Anomaly Coop (O1-container, #1710-1712): an item that goes away while its holder's inventory still lists it is
+		// coop: an item that goes away while its holder's inventory still lists it is
 		// taken out of the lists (stock only VERIFYed it in a debug build; a release build kept a dangling entry, and scripts
 		// got a nil object from IterateRuck). The inventory is read only when its owner is still a registered object: an
 		// owner that went first is freed by now (register_object_to_destroy queues the children after it, Objects.Unload

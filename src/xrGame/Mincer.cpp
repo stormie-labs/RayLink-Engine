@@ -9,7 +9,7 @@
 #include "entity_alive.h"
 #include "PHDestroyableNotificate.h"
 #include "actor.h"
-#include "coop/coop_objects.h" // Anomaly Coop: zone_pull_blocked
+#include "coop/coop_objects.h" // coop: zone_pull_blocked
 
 CMincer::CMincer(void)
 {
@@ -28,7 +28,7 @@ void CMincer::OnStateSwitch(EZoneState new_state)
 		for (it = m_ObjectInfoMap.begin(); m_ObjectInfoMap.end() != it; ++it)
 		{
 			CPhysicsShellHolder* GO = smart_cast<CPhysicsShellHolder *>((*it).object);
-			// Anomaly Coop: a player's character is lifted by his own game, to his own actor (not on the authority)
+			// coop: a player's character is lifted by his own game, to his own actor (not on the authority)
 			if (GO && !coop::objects::zone_pull_blocked(GO->ID())) Telekinesis().activate(GO, m_fThrowInImpulse, m_fTeleHeight, 100000);
 		}
 	}
@@ -74,7 +74,7 @@ void CMincer::feel_touch_new(CObject* O)
 	if (m_eZoneState == eZoneStateBlowout && (m_dwBlowoutExplosionTime > (u32)m_iStateTime))
 	{
 		CPhysicsShellHolder* GO = smart_cast<CPhysicsShellHolder *>(O);
-		if (!coop::objects::zone_pull_blocked(O->ID())) // Anomaly Coop: as in OnStateSwitch
+		if (!coop::objects::zone_pull_blocked(O->ID())) // coop: as in OnStateSwitch
 			Telekinesis().activate(GO, m_fThrowInImpulse, m_fTeleHeight, 100000);
 	}
 }

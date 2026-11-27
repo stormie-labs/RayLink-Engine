@@ -12,7 +12,7 @@
 #include "../monster_velocity_space.h"
 #include "../../../gamepersistent.h"
 #include "../../../game_object_space.h"
-#include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_remote.h"
 
 #include "../control_animation_base.h"
 #include "../control_movement_base.h"
@@ -25,7 +25,7 @@
 
 #include "../../../PHDestroyable.h"
 #include "../../../CharacterPhysicsSupport.h"
-#include "../../../HudManager.h" // Anomaly Coop (audit A5): the vampire's grip hides the HUD
+#include "../../../HudManager.h" // coop: the vampire's grip hides the HUD
 
 #ifdef DEBUG
 #	include <dinput.h>
@@ -623,7 +623,7 @@ void CAI_Bloodsucker::UpdateCL()
 {
 	update_invisibility();
 	inherited::UpdateCL();
-	coop_vampire_update(); // Anomaly Coop (audit A5)
+	coop_vampire_update(); // coop: the watchdog of a host grip on our actor
 	CControlledActor::frame_update();
 	character_physics_support()->movement()->CollisionEnable(!is_collision_off());
 
@@ -654,13 +654,13 @@ void CAI_Bloodsucker::shedule_Update(u32 dt)
 void CAI_Bloodsucker::Die(CObject* who)
 {
 	inherited::Die(who);
-	// Anomaly Coop (build 51): renderable_Render draws nothing while m_visibility_state is no_visibility, and only
+	// coop: renderable_Render draws nothing while m_visibility_state is no_visibility, and only
 	// update_invisibility sets it back, through the 1 s gate of set_visibility_state and only while the body updates: a
 	// client's puppet that died invisible could stay an invisible body. Only a creature the host drives here is made
 	// visible at once; single player and the host keep the stock timing (update_invisibility, !g_Alive()).
 	if (coop::remote::is_remote_creature(this))
 	{
-		force_visibility_state(unset); // Anomaly Coop (audit F5b): the look the host sent ends with the monster
+		force_visibility_state(unset); // coop: the look the host sent ends with the monster
 		m_visibility_state = full_visibility;
 	}
 	stop_invisible_predator();
@@ -833,13 +833,6 @@ void CAI_Bloodsucker::predator_unfreeze()
 	control().animation().unfreeze();
 }
 
-namespace
-{
-// Anomaly Coop (audit A5): a grip whose letting go never came frees the actor by itself (the hold is 4 s, the
-// approach and the last blow a few more)
-constexpr u32 kCoopVampireMaxMs = 12000;
-} // namespace
-
 void CAI_Bloodsucker::coop_vampire(u8 phase)
 {
 	if (phase != 0)
@@ -848,11 +841,10 @@ void CAI_Bloodsucker::coop_vampire(u8 phase)
 		return;
 	}
 	CActor* actor = Actor();
-	if (!actor || !actor->g_Alive() || m_coop_vampire || actor->input_external_handler_installed())
+	if (!actor || !actor->g_Alive() || m_coop_vampire.on() || actor->input_external_handler_installed())
 		return; // another monster holds our actor
-	m_coop_vampire = true;
+	m_coop_vampire.start(Device.dwTimeGlobal, coop::monster_fx::kGripMaxMs); // coop: a letting go that never comes frees the actor by itself
 	m_coop_vampire_effector = false;
-	m_coop_vampire_deadline = Device.dwTimeGlobal + kCoopVampireMaxMs;
 	CControlledActor::install();
 	HUD().SetRenderable(false);
 	actor->SetWeaponHideState(INV_STATE_BLOCK_ALL, true);
@@ -861,9 +853,9 @@ void CAI_Bloodsucker::coop_vampire(u8 phase)
 
 void CAI_Bloodsucker::coop_vampire_release()
 {
-	if (!m_coop_vampire)
+	if (!m_coop_vampire.on())
 		return;
-	m_coop_vampire = false;
+	m_coop_vampire.stop();
 	if (CActor* actor = Actor())
 	{
 		actor->set_inventory_disabled(false);
@@ -876,9 +868,9 @@ void CAI_Bloodsucker::coop_vampire_release()
 
 void CAI_Bloodsucker::coop_vampire_update()
 {
-	if (!m_coop_vampire)
+	if (!m_coop_vampire.on())
 		return;
-	if (!g_Alive() || Device.dwTimeGlobal > m_coop_vampire_deadline)
+	if (!g_Alive() || m_coop_vampire.expired(Device.dwTimeGlobal))
 	{
 		coop_vampire_release();
 		return;
@@ -903,7 +895,7 @@ void CAI_Bloodsucker::coop_vampire_update()
 
 void CAI_Bloodsucker::net_Destroy()
 {
-	coop_vampire_release(); // Anomaly Coop (audit A5): a puppet that leaves mid-grip lets our actor go
+	coop_vampire_release(); // coop: a puppet that leaves mid-grip lets our actor go
 	inherited::net_Destroy();
 }
 

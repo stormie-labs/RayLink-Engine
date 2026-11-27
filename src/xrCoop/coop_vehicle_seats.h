@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, passengers (F5-VEH-5, build 58, docs/VEHICLES.md sections 4, 5 and 12): the pure half.
+// Anomaly Coop — vehicles for players, passengers (docs/VEHICLES.md sections 4, 5 and 12): the pure half.
 //
 // A stock car has one place, the driver's (car_definition driver_place of the model's user data, else the root: CCar::attach_Actor).
 // The passenger places come from configs/coop_vehicles.ltx, a section per car section:
@@ -33,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_text.h"
 #include "coop_vehicle_rules.h"
 
 namespace coop
@@ -131,17 +131,6 @@ enum class ExitSide : uint8_t
 	Back,
 };
 
-inline const char* exit_side_name(ExitSide s)
-{
-	switch (s)
-	{
-	case ExitSide::Left: return "left";
-	case ExitSide::Right: return "right";
-	case ExitSide::Back: return "back";
-	}
-	return "?";
-}
-
 // The name of seat_<i> that means the driver's place (car_definition driver_place, else the root).
 constexpr const char* kDriverPlaceBone = "driver";
 // An offset or a point farther than this from the car's origin is a typo: the longest car of the game is ~12 m.
@@ -169,16 +158,6 @@ struct CarSeats
 
 namespace detail
 {
-inline std::string trim(const std::string& s)
-{
-	size_t a = 0, b = s.size();
-	while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n'))
-		++a;
-	while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n'))
-		--b;
-	return s.substr(a, b - a);
-}
-
 inline std::vector<std::string> split_commas(const std::string& s)
 {
 	std::vector<std::string> out;
@@ -186,7 +165,8 @@ inline std::vector<std::string> split_commas(const std::string& s)
 	for (;;)
 	{
 		const size_t comma = s.find(',', at);
-		out.push_back(trim(s.substr(at, comma == std::string::npos ? std::string::npos : comma - at)));
+		const std::string_view field = std::string_view(s).substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+		out.emplace_back(ascii::trim(field, ascii::space_or_eol));
 		if (comma == std::string::npos)
 			return out;
 		at = comma + 1;
@@ -271,7 +251,7 @@ inline bool parse_seat_line(const std::string& value, SeatPlace& out)
 // exit_<i>: left | right | back.
 inline bool parse_exit_line(const std::string& value, ExitSide& out)
 {
-	const std::string v = detail::trim(value);
+	const std::string v(ascii::trim(value, ascii::space_or_eol));
 	if (v == "left")
 		out = ExitSide::Left;
 	else if (v == "right")
@@ -308,7 +288,7 @@ inline CarSeats parse_car_seats(const SeatLine& line)
 	std::string v;
 	if (!line("seats", v))
 		return out;
-	const std::string count_text = detail::trim(v);
+	const std::string count_text(ascii::trim(v, ascii::space_or_eol));
 	char* end = nullptr;
 	const long want = std::strtol(count_text.c_str(), &end, 10);
 	if (count_text.empty() || end != count_text.c_str() + count_text.size() || want < 1 || want > long(kMaxSeats))

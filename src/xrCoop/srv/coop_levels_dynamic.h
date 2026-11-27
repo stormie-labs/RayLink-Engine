@@ -1,6 +1,5 @@
-// Anomaly Coop — split levels, the dynamic mode of the map servers (build 50; docs/SPLIT_LEVELS.md "Жизнь Mk"). The owner's idea: as
-// many maps as players + 1; a map nobody stands on makes room when somebody wants another map; an empty map does not stay for ever.
-// The lead's contract, the pure part of it:
+// Anomaly Coop — the dynamic mode of the map servers (docs/SPLIT_LEVELS.md): as many maps as players + 1; a map nobody stands on
+// makes room when somebody wants another map; an empty map does not stay for ever. The lead's contract, the pure part of it:
 //   - map_server_cap   cap = min(players now + 1, coop_max_map_servers (the PC's ceiling), kMaxBridges);
 //   - decide_move      at the cap a move is not refused while a map server stands empty: the one empty the longest is stopped (a
 //                      Stopping server holds no place, the new one starts at once). RefuseCap only when every map server has a player;
@@ -23,7 +22,7 @@ namespace coop
 namespace levels
 {
 // coop_max_map_servers: what this PC can carry. Not kMaxBridges by default: the world server keeps a slice of object ids out of its own
-// generator for every server the setting allows (coop_levels_keeper.h leader_slots_kept: 4095 ids each from 0x9000), and GAMMA's world
+// generator for every server the setting allows (coop_levels_keeper.h leader_slots_kept: 4095 ids each from 0x9000), and a modded world
 // starts with some 27 300 objects. Seven slices would leave the world 9 500 free ids; six leave 13 600 and still give a group of five
 // its "players + 1". A host with more players raises the setting to 7.
 constexpr uint32_t kDefaultMaxMapServers = 6;

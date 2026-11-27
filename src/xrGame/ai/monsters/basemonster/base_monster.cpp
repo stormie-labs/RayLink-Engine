@@ -54,8 +54,8 @@
 #ifdef DEBUG
 #include "debug_text_tree.h"
 #endif
-#include "../../../coop/coop_remote.h" // Anomaly Coop
-#include "../../../coop/coop_ai.h" // Anomaly Coop: nearest_player
+#include "../../../coop/coop_remote.h"
+#include "../../../coop/coop_ai.h" // coop: nearest_player
 
 #pragma warning (disable:4355)
 #pragma warning (push)
@@ -347,20 +347,20 @@ void CBaseMonster::UpdateCL()
 	}
 
 	inherited::UpdateCL();
-	const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
+	const bool coop_remote = coop::remote::is_remote_creature(this); // coop: a copy another machine's creature drives
 
 	if (g_Alive())
 	{
-		if (!coop_remote) // Anomaly Coop: no AI bookkeeping
-		update_enemy_accessible_and_at_home_info();
+		if (!coop_remote) // coop: a copy keeps no AI bookkeeping
+			update_enemy_accessible_and_at_home_info();
 		CStepManager::update(false);
 
-		if (!coop_remote) // Anomaly Coop: no own movement
-		update_pos_by_grouping_behaviour();
+		if (!coop_remote) // coop: a copy has no movement of its own
+			update_pos_by_grouping_behaviour();
 	}
 
-	if (!coop_remote) // Anomaly Coop: no animation selection / abilities, the host drives the puppet
-	control().update_frame();
+	if (!coop_remote) // coop: a copy selects no animation and uses no ability, the host drives it
+		control().update_frame();
 
 	m_pPhysics_support->in_UpdateCL();
 }
@@ -377,11 +377,11 @@ void CBaseMonster::shedule_Update(u32 dt)
 #endif
 
 	inherited::shedule_Update(dt);
-	const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
+	const bool coop_remote = coop::remote::is_remote_creature(this); // coop: a copy another machine's creature drives
 
 	update_eyes_visibility();
 
-	if (m_anti_aim && !coop_remote) // Anomaly Coop: no abilities on puppets
+	if (m_anti_aim && !coop_remote) // coop: a copy uses no ability
 	{
 		m_anti_aim->update_schedule();
 	}
@@ -391,14 +391,12 @@ void CBaseMonster::shedule_Update(u32 dt)
 	m_base_aura.update_schedule();
 	m_radiation_aura.update_schedule();
 
-	if (!coop_remote) // Anomaly Coop: no control/morale/anomaly AI on puppets
-	control().update_schedule();
-
-	if (!coop_remote) // Anomaly Coop
-	Morale.update_schedule(dt);
-
-	if (!coop_remote) // Anomaly Coop
-	m_anomaly_detector->update_schedule();
+	if (!coop_remote) // coop: a copy runs no control, morale or anomaly AI
+	{
+		control().update_schedule();
+		Morale.update_schedule(dt);
+		m_anomaly_detector->update_schedule();
+	}
 
 	m_pPhysics_support->in_shedule_Update(dt);
 
@@ -608,7 +606,7 @@ void CBaseMonster::set_state_sound(u32 type, bool once)
 			case MonsterSound::eMonsterSoundIdle:
 				// check distance to actor
 
-				if (!coop::npc_ai::nearest_player(Position(), db().m_fDistantIdleSndRange)) // Anomaly Coop (audit F11): any player
+				if (!coop::npc_ai::nearest_player(Position(), db().m_fDistantIdleSndRange)) // coop: any player
 				{
 					delay = u32(float(db().m_dwDistantIdleSndDelay) * _sqrt(float(objects_count)));
 					type = MonsterSound::eMonsterSoundIdleDistant;

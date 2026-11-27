@@ -1,4 +1,4 @@
-// Anomaly Coop - the script cycle of a world physic object across machines (live 2026-11-09, the X-16 levers).
+// Anomaly Coop - the script cycle of a world physic object across machines.
 //
 // A ph_button (levers and switches: X-16 yan_labx16_switcher1..3 and _primary, Pripyat pas_b400, ...) shows its state only by the
 // cycle its section plays: stock ph_button.script reset_scheme calls object:play_cycle(st.anim, st.blending), e.g.
@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -36,7 +37,7 @@ constexpr uint32_t kMaxPlayedMs = 0x7fffffffu;
 
 struct Word
 {
-	uint16_t id = 0xFFFF; // host numbering on the wire, local after the client maps it
+	uint16_t id = kNoId; // host numbering on the wire, local after the client maps it
 	std::string cycle;
 	bool mix_in = true;
 	uint32_t played_ms = 0; // how long the host has played it when the word left

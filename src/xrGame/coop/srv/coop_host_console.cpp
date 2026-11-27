@@ -2,13 +2,13 @@
 #include "coop_host_console.h"
 
 #include "../../../xrCoop/srv/coop_dedicated_rules.h"
+#include "../../../xrCoop/srv/coop_line_writer.h"
 #include "../../../xrCoop/srv/coop_world_server_rules.h"
 
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <process.h>
 #include <mutex>
 #include <string>
 
@@ -28,57 +28,30 @@ std::atomic<bool> g_quit_asked{false};
 std::atomic<bool> g_quit_done{false};
 std::mutex g_lines_lock;
 std::deque<std::string> g_lines;
-std::mutex g_out_lock;
+// No game thread writes to the window or the pipe: either can hold a write without end (a paused window, a parent that does not read),
+// and the log's callback runs on the game's threads under the logger's locks. Each output has its own coop::world_server::LineWriter: the
+// game pushes, its one thread writes (coop_line_writer.h). The writers are made once and never destroyed: the logger calls log_line up to
+// the DLLs' detach, after this file's static objects are gone.
+using coop::world_server::LineWriter;
+using coop::world_server::OutputQueue;
+
+// Set before its writer starts, never changed after: read by that writer's thread only.
 HANDLE g_out = INVALID_HANDLE_VALUE;
-
-// -coop_hidden with a redirected standard output (plan 2026-11-12 stage 2): the lines go to a queue, one thread writes them. A write to a
-// full pipe blocks that thread only; the queue is bounded (coop::world_server::OutputQueue drops the oldest and says so), so a parent that
-// does not read costs the game nothing but the lines. A failed write (the parent closed its end) ends the output for good.
-std::atomic<bool> g_output{false};
 HANDLE g_stdout = INVALID_HANDLE_VALUE;
-std::mutex g_queue_lock;
-std::condition_variable g_queue_wake;
-coop::world_server::OutputQueue g_queue;
-bool g_writing = false; // under g_queue_lock: the writer holds a line it has not written yet
 
-void push_output(const char* line, bool rl)
+// The window takes log lines only, never @rl lines.
+LineWriter& window()
 {
-	if (!g_output || !line)
-		return;
-	{
-		std::lock_guard<std::mutex> hold(g_queue_lock);
-		g_queue.push(line, rl);
-	}
-	g_queue_wake.notify_all(); // the writer and flush_output wait on it
+	static LineWriter* const w =
+	    new LineWriter(OutputQueue(OutputQueue::kLogLines, OutputQueue::kRlLines, "console", "the window's output was paused"));
+	return *w;
 }
 
-DWORD WINAPI output_thread(LPVOID)
+// -coop_hidden with a redirected standard output: the log and the @rl lines in UTF-8.
+LineWriter& pipe()
 {
-	for (;;)
-	{
-		std::string line;
-		{
-			std::unique_lock<std::mutex> hold(g_queue_lock);
-			g_queue_wake.wait(hold, [] { return !g_queue.empty(); });
-			g_queue.pop(line);
-			g_writing = true;
-		}
-		const std::string bytes = coop::world_server::output_line(line);
-		DWORD written = 0;
-		const bool ok = WriteFile(g_stdout, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written == bytes.size();
-		std::lock_guard<std::mutex> hold(g_queue_lock);
-		g_writing = false;
-		if (!ok)
-		{
-			g_output = false; // the parent is gone: nobody will read the rest
-			while (g_queue.pop(line))
-			{
-			}
-			g_queue_wake.notify_all();
-			return 0;
-		}
-		g_queue_wake.notify_all(); // flush_output waits on the same condition
-	}
+	static LineWriter* const w = new LineWriter();
+	return *w;
 }
 
 std::string to_game(const wchar_t* text, int size)
@@ -90,18 +63,41 @@ std::string to_game(const wchar_t* text, int size)
 	return out;
 }
 
-void write_line(const char* line)
+// The window's writer thread only: WriteConsoleW waits while the window's output is paused. A failed write loses that line, the window
+// stays.
+bool write_window(const std::string& line)
 {
-	const int size = int(strlen(line));
-	const int n = MultiByteToWideChar(kGameCodePage, 0, line, size, nullptr, 0);
+	const int size = int(line.size());
+	const int n = MultiByteToWideChar(kGameCodePage, 0, line.data(), size, nullptr, 0);
 	std::wstring text(size_t(n > 0 ? n : 0), L'\0');
 	if (n > 0)
-		MultiByteToWideChar(kGameCodePage, 0, line, size, &text[0], n);
+		MultiByteToWideChar(kGameCodePage, 0, line.data(), size, &text[0], n);
 	text += L"\r\n";
 	DWORD written = 0;
-	std::lock_guard<std::mutex> hold(g_out_lock);
-	if (g_out != INVALID_HANDLE_VALUE)
-		WriteConsoleW(g_out, text.c_str(), DWORD(text.size()), &written, nullptr);
+	WriteConsoleW(g_out, text.c_str(), DWORD(text.size()), &written, nullptr);
+	return true;
+}
+
+// The pipe's writer thread only. A failed write: the parent closed its end, nobody will read the rest.
+bool write_pipe(const std::string& line)
+{
+	const std::string bytes = coop::world_server::output_line(line);
+	DWORD written = 0;
+	return WriteFile(g_stdout, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written == bytes.size();
+}
+
+// The writers' threads. A refused thread leaves that writer off and the server runs on without that output, as the engine's own
+// thread_spawn runs on after the same _beginthread fails.
+bool start_thread(void (*entry)(void*), void* arg) { return _beginthread(entry, 0, arg) != uintptr_t(-1); }
+
+// A line of the log or an answer: the window and the pipe, each in the order of the calls.
+void push_log(const char* line)
+{
+	if (!line)
+		return;
+	if (g_window)
+		window().push(line, false);
+	pipe().push(line, false);
 }
 
 void push_line(std::string line)
@@ -193,12 +189,7 @@ void open()
 	if (plan.write_output)
 	{
 		g_stdout = given_out;
-		g_output = true;
-		const HANDLE writer = CreateThread(nullptr, 0, output_thread, nullptr, 0, nullptr);
-		if (writer)
-			CloseHandle(writer);
-		else
-			g_output = false;
+		pipe().start(write_pipe, start_thread);
 		rl_line(coop::world_server::format(coop::world_server::Record::of_phase(coop::world_server::Phase::Starting)).c_str());
 	}
 	if (plan.window)
@@ -207,6 +198,8 @@ void open()
 			return;
 		g_out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
 		SetConsoleTitleW(L"RayLink: dedicated host");
+		if (g_out != INVALID_HANDLE_VALUE)
+			window().start(write_window, start_thread);
 	}
 	SetConsoleCtrlHandler(on_control, TRUE);
 	g_window = plan.window;
@@ -220,25 +213,29 @@ void open()
 		CloseHandle(reader);
 }
 
-bool is_open() { return g_open; }
-
 void log_line(const char* line)
 {
 	if (!g_open || !coop::dedicated::log_shown(line, g_level))
 		return;
-	if (g_window)
-		write_line(line);
-	push_output(line, false);
+	push_log(line);
 }
 
-void rl_line(const char* line) { push_output(line, true); }
-
-bool output_on() { return g_output; }
-
-bool flush_output(unsigned ms)
+void rl_line(const char* line)
 {
-	std::unique_lock<std::mutex> hold(g_queue_lock);
-	return g_queue_wake.wait_for(hold, std::chrono::milliseconds(ms), [] { return !g_output || (g_queue.empty() && !g_writing); }) && g_output;
+	if (line)
+		pipe().push(line, true);
+}
+
+bool output_on() { return pipe().on(); }
+
+bool flush_output(unsigned ms) { return pipe().flush(ms); }
+
+bool flush_window(unsigned ms) { return window().flush(ms); }
+
+void stop_output()
+{
+	window().close();
+	pipe().close();
 }
 
 void set_log_level(int level) { g_level = level; }
@@ -246,10 +243,8 @@ int log_level() { return g_level; }
 
 void print(const char* line)
 {
-	if (g_open && g_window)
-		write_line(line);
 	if (g_open)
-		push_output(line, false);
+		push_log(line);
 }
 
 void set_title(const char* title)

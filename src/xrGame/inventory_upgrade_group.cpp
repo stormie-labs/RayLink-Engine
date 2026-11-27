@@ -132,7 +132,7 @@ void Group::log_hierarchy( LPCSTR nest )
 			return result_ok;
 		}
 
-		// Anomaly Coop (R3 В6): the parents loop of can_install, without an item.
+		// coop: the parents loop of can_install, without an item.
 		void Group::required_groups(xr_vector<shared_str>& out) const
 		{
 			out.clear();

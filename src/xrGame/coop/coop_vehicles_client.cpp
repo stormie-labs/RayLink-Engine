@@ -1,5 +1,5 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, a player's machine (F5-VEH-3, build 57, docs/VEHICLES.md sections 5, 7 and 14).
+// Anomaly Coop — vehicles for players, a player's machine (docs/VEHICLES.md sections 5, 7 and 14).
 //
 // The car of a player's level is the decider's: the co-op host's process, in the Server mode the map server of his level (the world
 // server tunnels the four messages, Scope::Map). On a player's machine every car is a kinematic copy posed from the decider's
@@ -15,7 +15,7 @@
 //   - a request with no answer for kAnswerTimeoutMs: a line on the HUD, the request forgotten;
 //   - the copy he drives shows its latest pose extrapolated, not the 100 ms buffer (driving_car(), coop_objects.cpp).
 // Nothing here knows the mode: the requests go up through the mode's delivery (net::client_send -> mode().up) and the answers come
-// from whoever decides. VehicleState goes to state_on_state (F5-VEH-4). Main thread only.
+// from whoever decides. VehicleState goes to state_on_state (coop_vehicles_state.cpp). Main thread only.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_vehicles.h"
@@ -23,9 +23,11 @@
 #include "coop_manager.h"
 #include "coop_net.h"
 #include "coop_join.h"
-#include "coop_dialog.h"
+#include "coop_hud_text.h"
+#include "coop_lua.h"
+#include "coop_world.h"
 #include "xrCoop/coop_vehicle_input_rules.h"
-#include "xrCoop/coop_vehicle_state_rules.h" // F5-VEH-4 (rv_F5-VEH-3): TapLatch
+#include "xrCoop/coop_vehicle_state_rules.h" // TapLatch
 
 #include <cstdlib>
 
@@ -67,7 +69,6 @@ namespace vehicles
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 // The stock exit (CActor::detach_Vehicle) refuses while the actor's box does not fit where he sits (ActivateBoxDynamic): it is tried
 // again every frame; the log says so once after this long.
 constexpr u32 kExitStuckMs = 1000;
@@ -102,12 +103,12 @@ struct Counters
 SeatTable g_table; // the mirror of the decider's table (VehicleSeat)
 RequestTrack g_req;
 InputSender g_input;
-TapLatch g_tap; // F5-VEH-4 (rv_F5-VEH-3): a held key tapped between two VehicleInput messages is held until one is taken
+TapLatch g_tap; // a held key tapped between two VehicleInput messages is held until one is taken
 Mine g_mine;
 Counters g_c;
-u32 g_world = 0; // F5-REV-1 S1: join::world_generation() of the world the mirror and his own seat belong to
+u32 g_world = 0; // join::world_generation() of the world the mirror and his own seat belong to
 
-// F5-REV-1 S1 (both modes): the decider forgets its table at a world change (a load, a level change) without a released, and arrivals
+// The decider forgets its table at a world change (a load, a level change) without a released, and arrivals
 // send the sitters of the new world only: a row of the old world kept another player seated here (drawn in the car, his snapshots
 // skipped). A new world forgets the mirror, the request, the input, the latch and his own seat.
 void client_world()
@@ -151,15 +152,7 @@ const Text kRefusalText[u8(Refusal::Last) + 1] = {
 
 u32 now32() { return u32(mgr().now_ms()); }
 
-CGameObject* find_go(u16 local_id)
-{
-	if (local_id == kNoId || !g_pGameLevel)
-		return nullptr;
-	CGameObject* go = smart_cast<CGameObject*>(Level().Objects.net_Find(local_id));
-	return go && !go->getDestroy() ? go : nullptr;
-}
-
-CCar* find_car(u16 host_id) { return host_id == kNoCar ? nullptr : smart_cast<CCar*>(find_go(join::to_local(host_id))); }
+CCar* find_car(u16 host_id) { return host_id == kNoCar ? nullptr : smart_cast<CCar*>(world::object_here(join::to_local(host_id))); }
 
 u16 host_id_of(const CGameObject* go) { return go ? join::to_host(u16(go->ID())) : kNoCar; }
 
@@ -276,16 +269,16 @@ void say_release(Release why)
 	switch (why)
 	{
 	case Release::Wounded:
-		dialog::hud_message("st_coop_f5_vehicles_released_wounded", "Wounded: you fell out of the vehicle");
+		hud_text::say("st_coop_f5_vehicles_released_wounded", "Wounded: you fell out of the vehicle");
 		break;
 	case Release::LeftLevel:
-		dialog::hud_message("st_coop_f5_vehicles_released_left_level", "Out of the vehicle: the group leaves the level");
+		hud_text::say("st_coop_f5_vehicles_released_left_level", "Out of the vehicle: the group leaves the level");
 		break;
 	case Release::CarDestroyed:
-		dialog::hud_message("st_coop_f5_vehicles_released_car_destroyed", "The vehicle is wrecked");
+		hud_text::say("st_coop_f5_vehicles_released_car_destroyed", "The vehicle is wrecked");
 		break;
-	case Release::CarGone: dialog::hud_message("st_coop_f5_vehicles_released_car_gone", "The vehicle is gone"); break;
-	case Release::Script: dialog::hud_message("st_coop_f5_vehicles_released_script", "You were taken out of the vehicle"); break;
+	case Release::CarGone: hud_text::say("st_coop_f5_vehicles_released_car_gone", "The vehicle is gone"); break;
+	case Release::Script: hud_text::say("st_coop_f5_vehicles_released_script", "You were taken out of the vehicle"); break;
 	default: break; // he asked, he died, he left: nothing to say
 	}
 }
@@ -302,8 +295,8 @@ void client_on_seat(PeerId, Reader& r)
 		return;
 	}
 	if (!is_mirror())
-		return; // the co-op host player's link: his own actor drives by the stock path (F5-VEH-2 records it)
-	client_world(); // F5-REV-1 S1: a row of another world is no row of this one
+		return; // the co-op host player's link: his own actor drives by the stock path (coop_vehicles_seat.cpp records it)
+	client_world(); // a row of another world is no row of this one
 	g_table.apply(m);
 	const u16 me = join::my_proxy();
 	const bool answered = g_req.answer(m, me);
@@ -334,7 +327,7 @@ void client_on_seat(PeerId, Reader& r)
 				g_mine = Mine();
 			break;
 		}
-		dialog::hud_message(kRefusalText[m.reason].id, kRefusalText[m.reason].fallback);
+		hud_text::say(kRefusalText[m.reason].id, kRefusalText[m.reason].fallback);
 		break;
 	case SeatStep::Attach:
 		++g_c.granted;
@@ -362,7 +355,7 @@ void client_on_seat(PeerId, Reader& r)
 			want_exit(now32());
 			break;
 		}
-		// F5-VEH-5: a passenger's seat. The record stays this machine's (coop.vehicle.status, a release or a loss ends it); the ride
+		// A passenger's seat. The record stays this machine's (coop.vehicle.status, a release or a loss ends it); the ride
 		// (coop_vehicles_ride.cpp) sits him there, follows the record and asks out through it.
 		g_mine = Mine();
 		g_mine.car = m.car;
@@ -391,7 +384,7 @@ void client_on_seat(PeerId, Reader& r)
 		g_mine.leave_since = now32();
 		g_mine.exit_wanted = false;
 		if (g_mine.seat != kDriverSeat)
-			ride_exit_point(m.car, m.seat, g_mine.exit); // F5-VEH-5 (rv_F5-VEH-5): a passenger stands where the decider stood him
+			ride_exit_point(m.car, m.seat, g_mine.exit); // a passenger stands where the decider stood him
 		::Msg("[coop] vehicle: out of car %u seat %u (%s) at %.2f,%.2f,%.2f", u32(m.car), u32(m.seat), release_name(m.release()),
 		    m.exit[0], m.exit[1], m.exit[2]);
 		break;
@@ -416,7 +409,7 @@ void step_leave(CActor* actor, u32 now)
 {
 	if (!g_mine.leave_due)
 		return;
-	// F5-VEH-4 (rv_F5-VEH-3): out by the decider's word: no VehicleInput while the stock exit below waits for room (the decider has
+	// Out by the decider's word: no VehicleInput while the stock exit below waits for room (the decider has
 	// him in no seat and drops it as NotDriving)
 	g_input.stop();
 	CCar* car = find_car(g_mine.car);
@@ -539,7 +532,7 @@ void step_input(u32 now)
 	if (!g_input.driving() || !g_input.due(now))
 		return;
 	const InputMsg m = g_input.take(now);
-	// F5-VEH-4 (rv_F5-VEH-3): the keys tapped before this message went out with it pressed; their release goes in the next one
+	// The keys tapped before this message went out with it pressed; their release goes in the next one
 	for (int held_key : g_tap.taken())
 		g_input.release(held_key);
 	Writer w(16);
@@ -548,7 +541,7 @@ void step_input(u32 now)
 	++g_c.inputs;
 }
 
-// F5-VEH-4 (rv_F5-VEH-3): a held key (a gear, the brake, fire, a drive key) pressed and released before its press went out in a
+// A held key (a gear, the brake, fire, a drive key) pressed and released before its press went out in a
 // VehicleInput (a quick tap at a low frame rate: both in one frame) is held again until the next message is taken (step_input), so
 // the decider sees the press, then the release. `before`: the sender's held bits before this key.
 void latch_tap(int key, bool pressed, u16 before)
@@ -801,7 +794,7 @@ void install_client(Endpoint& e)
 	g_input.stop();
 	g_tap.reset();
 	g_mine = Mine();
-	g_world = join::world_generation(); // F5-REV-1 S1: the session starts in this world
+	g_world = join::world_generation(); // the session starts in this world
 	g_c = Counters();
 	e.on(Msg::VehicleSeat, &client_on_seat);
 	e.on(Msg::VehicleState, [](PeerId, Reader& r) {
@@ -816,7 +809,7 @@ void client_frame()
 {
 	if (!is_mirror() || !world_up())
 		return; // the decider's own process and a server: their actors drive by the stock path or never
-	client_world(); // F5-REV-1 S1: what was this machine's in another world is forgotten before anything acts on it
+	client_world(); // what was this machine's in another world is forgotten before anything acts on it
 	CActor* actor = Actor();
 	if (!actor)
 		return;
@@ -826,8 +819,8 @@ void client_frame()
 		++g_c.timeouts;
 		::Msg("[coop] vehicle: no answer to %s of car %u in %u ms: forgotten", op_name(g_req.op()), u32(g_req.car()),
 		    kAnswerTimeoutMs);
-		// F5-VEH-4 (rv_F5-VEH-3): one line for both modes (a co-op player has no map server)
-		dialog::hud_message("st_coop_f5_vehstate_no_answer", "No answer about the vehicle: try again in a moment");
+		// One line for both modes (a co-op player has no map server)
+		hud_text::say("st_coop_f5_vehstate_no_answer", "No answer about the vehicle: try again in a moment");
 	}
 	step_leave(actor, now);
 	step_attach(actor, now);
@@ -845,21 +838,7 @@ void register_lua(lua_State* L)
 		{"exit", &l_exit},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_createtable(L, 0, 3);
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_setfield(L, -2, "vehicle");
-	lua_pop(L, 1);
+	lua_api::fill(L, "vehicle", fns); // without the table coop: coop_script logs it
 }
 
 void register_console()
@@ -926,7 +905,7 @@ bool client_key(CCar* car, int key, bool pressed)
 		return true; // a copy is never driven here, and no input goes out for a car he does not drive
 	const u16 before = g_input.held();
 	const bool took = pressed ? g_input.press(key) : g_input.release(key);
-	latch_tap(key, pressed, before); // F5-VEH-4 (rv_F5-VEH-3): a tap is not lost
+	latch_tap(key, pressed, before); // a tap is not lost
 	// CarInput.cpp: after Press*/Release* of a steering key the stock turns the owner's hands; the owner of the copy is this machine's actor
 	if (key == kL_STRAFE || key == kR_STRAFE)
 		if (CActor* a = Actor())
@@ -961,7 +940,7 @@ void client_mouse_aim(CCar* car)
 
 bool mirror_seat_of(u16 character, Seated& out)
 {
-	// F5-VEH-4: the dolls of sitters (coop_vehicles_state.cpp); the mirror is filled on a player's machine only (client_on_seat)
+	// The dolls of sitters (coop_vehicles_state.cpp); the mirror is filled on a player's machine only (client_on_seat)
 	out = g_table.seat_of(character);
 	return out.car != kNoCar;
 }

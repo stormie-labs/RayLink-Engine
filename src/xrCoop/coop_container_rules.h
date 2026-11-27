@@ -1,6 +1,5 @@
-// Ядро: без проверок режима (docs/MODES.md)
 // Anomaly Coop - a holder that hears "taken out" (GE_OWNERSHIP_REJECT / GE_TRADE_SELL, or GE_DESTROY_REJECT before a
-// child's destroy) of an item it does not hold (O1-container; crash reports of builds 56-57).
+// child's destroy) of an item it does not hold.
 //
 // In single player every child of an online holder is a game object, listed by its holder and attached to it, so the stock
 // handlers never asked. A co-op client applies the decider's moves and destroys through its local server (coop_events.cpp
@@ -13,7 +12,7 @@
 //    wipes that inventory's pointer and detaches the item from its real holder;
 //  - CLevel::cl_Process_Event told the holder of a GE_DESTROY_REJECT even when the child was not found;
 //  - CInventoryItem::net_Destroy only VERIFYed (debug) that the item left its holder's inventory: a release build kept a
-//    dangling entry, and scripts got a nil object from IterateRuck (#1710-1712, plausible).
+//    dangling entry, and scripts got a nil object from IterateRuck.
 // Both modes run this code unchanged, and so does single player: a co-op client and a player's client of a map server apply
 // the decider's moves the same way; the co-op host, the map server and the world server keep their children consistent,
 // where every rule below gives the stock answer.

@@ -17,7 +17,7 @@
 #include "breakableobject.h"
 #include "GamePersistent.h"
 #include "../../script_game_object.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 
 #define WIND_RADIUS (4*Radius())	//расстояние до актера, когда появляется ветер 
 #define FASTMODE_DISTANCE (100.f)	//distance to camera from sphere, when zone switches to fast update sequence
@@ -626,7 +626,7 @@ void CCustomZone::shedule_Update(u32 dt)
 			}
 
 			// Ignore object override script callback
-			// Anomaly Coop (build 51): a player's character is the actor to a zone; the NPC filters of mods (GAMMA ignores a
+			// coop: a player's character is the actor to a zone; the NPC filters of mods (one may ignore a
 			// live stalker away from the centre) are not his. This wakes the host's zone only: the hit is his own copy's, and
 			// his own game runs this callback with its own actor there (zone_hit_blocked drops the host's hit on him)
 			if (pEntityAlive && !coop::objects::zone_feels_player(pObject->ID()))
@@ -1221,7 +1221,7 @@ void CCustomZone::UpdateBlowout()
 		m_dwBlowoutExplosionTime < (u32)m_iStateTime)
 	{
 		AffectObjects();
-		coop::objects::zone_blast_passed(this); // Anomaly Coop (build 51): a client's next state held behind this blast
+		coop::objects::zone_blast_passed(this); // coop: a client's next state held behind this blast
 
 		if (m_BendGrass_Blowout)
 			g_pGamePersistent->GrassBendersAddExplosion(ID(), Position(), Fvector().set(0, -99, 0), 1.33f, m_BendGrass_Blowout_speed, 1.0f, m_BendGrass_Blowout_radius);
@@ -1304,17 +1304,17 @@ void CCustomZone::OnStateSwitch(EZoneState new_state)
 		PlayAwakingParticles();
 
 	m_eZoneState = new_state;
-	m_iPreviousStateTime = m_iStateTime = 0;
-	m_iPreviousStateTime = m_iStateTime = coop::objects::on_zone_state(this, u8(new_state)); // Anomaly Coop: host relays, client resumes the host's phase
-	// Anomaly Coop (build 51): a client's Blowout that came a little late starts at its blast, else UpdateBlowout never
-	// crosses m_dwBlowoutExplosionTime and the zone does not hit (single player and the host: m_iStateTime is 0 here)
+	// coop: 0 outside a session, as in stock; the host relays the switch, a client resumes the host's phase
+	m_iPreviousStateTime = m_iStateTime = coop::objects::on_zone_state(this, u8(new_state));
+	// coop: a client's Blowout that came a little late starts at its blast, else UpdateBlowout never crosses
+	// m_dwBlowoutExplosionTime and the zone does not hit (single player and the host: m_iStateTime is 0 here)
 	if (new_state == eZoneStateBlowout && m_iStateTime > 0)
 		m_iPreviousStateTime = m_iStateTime = int(coop::objects::zone_blowout_start(u32(m_iStateTime), m_dwBlowoutExplosionTime));
 };
 
 void CCustomZone::SwitchZoneState(EZoneState new_state)
 {
-	if (coop::objects::zone_switch_blocked(this)) return; // Anomaly Coop: on a client the host runs the zone
+	if (coop::objects::zone_switch_blocked(this)) return; // coop: on a client the host runs the zone
 	if (OnServer())
 	{
 		// !!! Just single entry for given state !!!
@@ -1440,7 +1440,7 @@ void CCustomZone::CreateHit(u16 id_to,
                             float hit_impulse,
                             ALife::EHitType hit_type)
 {
-	if (coop::objects::zone_hit_blocked(this, id_to)) return; // Anomaly Coop: each player's game hurts its own actor
+	if (coop::objects::zone_hit_blocked(this, id_to)) return; // coop: each player's game hurts its own actor
 	if (OnServer())
 	{
 		if (m_owner_id != u32(-1))
@@ -1554,7 +1554,7 @@ void CCustomZone::UpdateOnOffState()
 
 void CCustomZone::GoDisabledState()
 {
-	if (coop::objects::zone_switch_blocked(this)) return; // Anomaly Coop: on a client the host runs the zone
+	if (coop::objects::zone_switch_blocked(this)) return; // coop: on a client the host runs the zone
 	//switch to disable	
 	NET_Packet P;
 	u_EventGen(P, GE_ZONE_STATE_CHANGE, ID());
@@ -1573,7 +1573,7 @@ void CCustomZone::GoDisabledState()
 
 void CCustomZone::GoEnabledState()
 {
-	if (coop::objects::zone_switch_blocked(this)) return; // Anomaly Coop: on a client the host runs the zone
+	if (coop::objects::zone_switch_blocked(this)) return; // coop: on a client the host runs the zone
 	//switch to idle	
 	NET_Packet P;
 	u_EventGen(P, GE_ZONE_STATE_CHANGE, ID());

@@ -11,6 +11,9 @@
     <xrIntDir>$(SolutionDir)..\_build\intermediate\$(Configuration)\</xrIntDir>
     <xrSdkDir>$(SolutionDir)..\sdk\</xrSdkDir>
     <xrGameDir>$(SolutionDir)..\_build\_game\</xrGameDir>
+    <!-- the Optick build (solution ProfiledDX11; luabind and xrPhysics name it Profiled, ProfiledNew) has a tree of its own:
+         its AnomalyDX11.exe and libraries never replace a release build's -->
+    <xrGameDir Condition="$(Configuration.StartsWith('Profiled'))">$(SolutionDir)..\_build\_game_profiled\</xrGameDir>
     <xrGameBinDir>$(xrGameDir)bin\</xrGameBinDir>
     <xr3rdPartyDir>$(SolutionDir)3rd party\</xr3rdPartyDir>
     <dxSdkDir>$(xrSdkDir)include\dxsdk\</dxSdkDir>

@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include <malloc.h>
 #include <errno.h>
+#include "heap_walk.h"
 
 XRCORE_API void vminfo(size_t* _free, size_t* reserved, size_t* committed)
 {
@@ -44,29 +45,9 @@ size_t xrMemory::mem_usage(bool assert)
 {
     xrCriticalSectionGuard g(mem_lock);
 	PROF_EVENT("mem_usage");
-	_HEAPINFO hinfo = {};
-	int status;
-	size_t bytesUsed = 0;
-	while ((status = _heapwalk(&hinfo)) == _HEAPOK)
-	{
-		if (hinfo._useflag == _USEDENTRY)
-			bytesUsed += hinfo._size;
-	}
-	switch (status)
-	{
-	case _HEAPEMPTY:
-		break;
-	case _HEAPEND:
-		break;
-	case _HEAPBADPTR:
-		if (assert) FATAL("bad pointer to heap");
-		break;
-	case _HEAPBADBEGIN:
-        if (assert) FATAL("bad start of heap");
-		break;
-	case _HEAPBADNODE:
-        if (assert) FATAL("bad node in heap");
-		break;
-	}
-	return bytesUsed;
+	// coop: the CRT heap is walked under its lock (heap_walk.h); _heapwalk walked it unlocked.
+	const xr_heap::WalkResult walk = xr_heap::used_bytes(reinterpret_cast<HANDLE>(_get_heap_handle()));
+	if (!walk.complete && assert)
+		FATAL("bad heap walk");
+	return walk.used;
 }

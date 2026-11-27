@@ -2,6 +2,8 @@
 #include "dx10SamplerStateCache.h"
 
 #include "../dx10StateUtils.h"
+#include "dx10StateCache.h" // coop: dx10_state_create_failed
+#include "dx10StateRecords.h"
 
 using dx10StateUtils::operator==;
 
@@ -36,47 +38,30 @@ dx10SamplerStateCache::SHandle dx10SamplerStateCache::GetState(D3D_SAMPLER_DESC&
 
 	if (hResult == hInvalidHandle)
 	{
-		StateRecord rec;
-		rec.m_crc = crc;
-		CreateState(desc, &rec.m_pState);
-		hResult = m_StateArray.size();
-		m_StateArray.push_back(rec);
+		// coop: a failed create keeps no record (dx10StateRecords.h); the slot stays unbound and the next shader asks again
+		const dx10_state_records::Added added =
+			dx10_state_records::add(m_StateArray, crc, [&](IDeviceState** state) { return CreateState(desc, state); });
+		if (added.index == dx10_state_records::not_found)
+			dx10_state_create_failed("sampler", added.code);
+		else
+			hResult = static_cast<SHandle>(added.index);
 	}
 
 	return hResult;
 }
 
-void dx10SamplerStateCache::CreateState(StateDecs desc, IDeviceState** ppIState)
+HRESULT dx10SamplerStateCache::CreateState(StateDecs desc, IDeviceState** ppIState)
 {
-	CHK_DX(HW.pDevice->CreateSamplerState( &desc, ppIState));
+	*ppIState = nullptr;
+	return HW.pDevice->CreateSamplerState(&desc, ppIState);
 }
 
 dx10SamplerStateCache::SHandle dx10SamplerStateCache::FindState(const StateDecs& desc, u32 StateCRC)
 {
-	u32 res = 0xffffffff;
-	u32 i = 0;
-	for (; i < m_StateArray.size(); ++i)
-	{
-		if (m_StateArray[i].m_crc == StateCRC)
-		{
-			StateDecs descCandidate;
-			m_StateArray[i].m_pState->GetDesc(&descCandidate);
-			if (descCandidate == desc)
-				//return i;
-				//	TEST
-			{
-				//return i;
-				res = i;
-				break;
-			}
-			//else
-			//{
-			//	VERIFY(0);
-			//}
-		}
-	}
-
-	return res != 0xffffffff ? i : (u32)hInvalidHandle;
+	// coop: a record whose state a re-creation lost is passed over (dx10StateRecords.h)
+	const size_t index = dx10_state_records::find(m_StateArray, desc, StateCRC,
+		[](const StateDecs& a, const StateDecs& b) { return a == b; });
+	return index != dx10_state_records::not_found ? static_cast<SHandle>(index) : (SHandle)hInvalidHandle;
 }
 
 void dx10SamplerStateCache::ClearStateArray()
@@ -198,7 +183,9 @@ void dx10SamplerStateCache::SetMaxAnisotropy(u32 uiMaxAniso)
 
 		//	This can cause fragmentation if called too often
 		rec.m_pState->Release();
-		CreateState(desc, &rec.m_pState);
+		const HRESULT code = CreateState(desc, &rec.m_pState); // coop: a failure leaves the record without a state
+		if (FAILED(code) || !rec.m_pState)
+			dx10_state_create_failed("sampler", code);
 	}
 }
 
@@ -214,6 +201,9 @@ void dx10SamplerStateCache::SetMipLODBias(float uiMipLODBias)
         StateRecord& rec = m_StateArray[i];
         StateDecs desc;
 
+        if (!rec.m_pState) // coop: its create failed (as in SetMaxAnisotropy)
+            continue;
+
         rec.m_pState->GetDesc(&desc);
 
         desc.MipLODBias = m_uiMipLODBias;
@@ -221,7 +211,9 @@ void dx10SamplerStateCache::SetMipLODBias(float uiMipLODBias)
 
         // This can cause fragmentation if called too often
         rec.m_pState->Release();
-        CreateState(desc, &rec.m_pState);
+        const HRESULT code = CreateState(desc, &rec.m_pState); // coop: a failure leaves the record without a state
+        if (FAILED(code) || !rec.m_pState)
+            dx10_state_create_failed("sampler", code);
     }
 }
 

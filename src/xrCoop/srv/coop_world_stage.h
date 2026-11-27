@@ -1,11 +1,11 @@
-// Anomaly Coop — the staging file of a new world, coop_new_world.ltx (docs/plans/2026-11-12-split-levels-native.md §4.2, stage 5). The
+// Anomaly Coop — the staging file of a new world, coop_new_world.ltx. The
 // creator chose a world in the game's new world screen (or in the launcher); the world server, started with
 //   -coop_dedicated <port> -coop_hidden -coop_new -coop_stage <file>
 // reads this file before its world starts (coop_dedicated.cpp first_frame): the game's record is built from it (coop_srv_dedicated.script
 // stage_new_world -> coop_game_settings.stage_new), and the creator's character is made from [creator] when he joins with the operator's
 // token (coop_join.cpp host_make_creator), without the choice window. After a successful stage the server renames the file to <file>.used.
-// Pure C++17, header-only, no engine dependencies: used by xrGame (coop_dedicated.cpp, coop_newchar.h) and by the unit-test exe. The game's
-// Lua (stage 6b) and the launcher (Rust, rl-core) write it; this comment is the contract.
+// Pure C++17, header-only, no engine dependencies: used by xrGame (coop_dedicated.cpp) and by the unit-test exe. The game's
+// Lua and the launcher (Rust, rl-core) write it; this comment is the contract.
 //
 // ---------------------------------------------------------------- the format
 //
@@ -32,7 +32,7 @@
 //                              factors), s (other values of the save); path 1..kMaxKeyBytes-2 bytes. The value is text, at most
 //                              kMaxValueBytes bytes: o / m / c as the game writes them, g / e / s a number or true / false.
 // [creator] (optional, once). Without it nobody gets a character from the file: the creator chooses in the window like anybody.
-//   name       his character's name, 0..64 bytes of text. (Today the character is named by the player's nick; see the report of stage 5.)
+//   name       his character's name, 0..64 bytes of text. (The character is named by the player's nick.)
 //   icon       his character's icon, empty or 1..64 of a-z A-Z 0-9 _ . -
 //   loadout    the item sections he gets, comma separated, one entry per copy, the free kit included (as the stock screen's
 //              new_game_loadout): each entry 1..64 of a-z A-Z 0-9 _ . -, empty entries are dropped, at most kMaxLoadout entries. The server
@@ -55,11 +55,13 @@
 #include <utility>
 #include <vector>
 
+#include "../coop_protocol.h"
+#include "../coop_text.h"
+
 namespace coop
 {
 namespace world_stage
 {
-constexpr char kFileName[] = "coop_new_world.ltx";
 constexpr char kUsedSuffix[] = ".used";
 
 constexpr size_t kMaxFileBytes = 256 * 1024;
@@ -70,7 +72,8 @@ constexpr size_t kMaxValueBytes = 1024;
 constexpr size_t kMaxName = 64; // a name of text: [world] name, [creator] name
 constexpr size_t kMaxTitle = 64; // coop_game_record.script MAX_TITLE
 constexpr size_t kMaxWord = 64; // a word: faction, id, icon, map, a loadout entry (kMaxCharName of the protocol)
-constexpr size_t kMaxLoadout = 64; // CharChoiceMsg::kMaxBuy (coop_newchar.h checks it)
+constexpr size_t kMaxLoadout = 64;
+static_assert(kMaxLoadout == CharChoiceMsg::kMaxBuy, "a loadout of the staging file fits one choice");
 constexpr int64_t kMaxMoney = 10000000;
 constexpr int kMaxPreset = 3; // difficulty, economy: 1..3
 
@@ -119,22 +122,8 @@ struct Stage
 
 namespace detail
 {
-inline bool blank(char c) { return c == ' ' || c == '\t'; }
-
-inline std::string trim(const std::string& s)
-{
-	size_t a = 0, b = s.size();
-	while (a < b && blank(s[a]))
-		++a;
-	while (b > a && blank(s[b - 1]))
-		--b;
-	return s.substr(a, b - a);
-}
-
-inline bool word_char(char c)
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
-}
+// The words of a staging line are separated by spaces and tabs only.
+inline std::string trim(std::string_view s) { return std::string(ascii::trim(s, ascii::space_or_tab)); }
 
 // 1..kMaxWord word characters (protocol char_name_valid); `id` also refuses '.', so that an id is a file's stem and no "..".
 inline bool word(const std::string& s, bool dots = true)
@@ -142,7 +131,7 @@ inline bool word(const std::string& s, bool dots = true)
 	if (s.empty() || s.size() > kMaxWord)
 		return false;
 	for (char c : s)
-		if (!word_char(c) || (!dots && c == '.'))
+		if (!ascii::name_char(c) || (!dots && c == '.'))
 			return false;
 	return true;
 }
@@ -412,7 +401,7 @@ inline bool parse(const std::string& text, Stage& out, std::string& why)
 inline std::string write(const Stage& s)
 {
 	auto val = [](const std::string& v) {
-		const bool quote = !v.empty() && (detail::blank(v.front()) || detail::blank(v.back()) || v.front() == '"');
+		const bool quote = !v.empty() && (ascii::space_or_tab(v.front()) || ascii::space_or_tab(v.back()) || v.front() == '"');
 		return quote ? "\"" + v + "\"" : v;
 	};
 	auto flag_text = [](Flag f) { return f == Flag::On ? "1" : "0"; };

@@ -10,7 +10,7 @@
 #include "script_binder_object_wrapper.h"
 #include "script_game_object.h"
 #include "xrServer_Objects_ALife.h"
-#include "coop/coop_lua_errors.h" // Anomaly Coop (2026-11)
+#include "coop/coop_lua_errors.h"
 
 CScriptBinderObjectWrapper::CScriptBinderObjectWrapper(CScriptGameObject* object) :
 	CScriptBinderObject(object)
@@ -43,7 +43,7 @@ void CScriptBinderObjectWrapper::reload_static(CScriptBinderObject* script_binde
 
 bool CScriptBinderObjectWrapper::net_Spawn(SpawnType DC)
 {
-	// Anomaly Coop (2026-11): a Lua error survived in net_spawn (a mod's on-spawn callback, say) keeps the object, as the
+	// coop: a Lua error survived in net_spawn (a mod's on-spawn callback, say) keeps the object, as the
 	// rest of the binder could not be told apart from a refusal: false would make the engine reject the spawn (no actor, an
 	// NPC missing on one machine). Outside a co-op session such an error is the stock fatal.
 	const uint64_t survived = coop::lua_errors::survived_on_this_thread();

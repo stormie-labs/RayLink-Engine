@@ -1,4 +1,4 @@
-// Anomaly Coop — W9 link hold: when the frame pump keeps the session link held (the transport's keep-alive thread
+// Anomaly Coop — the link hold: when the frame pump keeps the session link held (the transport's keep-alive thread
 // answers the peers for a main thread that is busy loading) and when it lets the link go; the hold word of the
 // transport (sealed for good by a crash); how long the host's joins wait for its own level to come up.
 // Pure C++17, header-only, no engine dependencies: used by coop::Manager::frame, net::Transport, coop_join.cpp and by
@@ -20,8 +20,7 @@ constexpr uint32_t kLoadHoldMs = 120000;
 // A player's machine that has just gone live (kSettleMs): the level's online objects come to it only now (Server: the map
 // server's, through the world server; Co-op: the host's), and one frame of them (their visuals and weapon textures, the
 // net_spawn of their scripts, on the worker thread the main thread joins before its network pump) can stall past the
-// silence timeout. b57h Server stand 2026-11-21 (feed_server): a GAMMA client, live on l05_bar at 10:53:15, ran one frame
-// from about 10:53:26.5 to 10:53:46; its hold had gone with the precache and the world server dropped it after its 10 s.
+// silence timeout (a frame of some 20 s after going live was seen), so the hold stays for this stretch.
 // A hang in this stretch goes silent kLoadHoldMs after its last frame, as in a load; a crash at once (the sealed hold).
 constexpr uint32_t kSettleMs = 60000;
 // FrameState::live_ms of a machine that is no live player (not live yet, a host, a server's ghost).
@@ -34,8 +33,8 @@ struct FrameState
 	bool precache_frames = false; // the first frames after a load: precache, the first update of every script
 	bool joining_world = false; // a client between "world received" and live
 	// This process crashed (coop_manager.cpp on_crash, any thread). The main thread may still run a frame or a load
-	// stage before the crash dialog stops it; a hold armed there kept the crashed player "connected" for kLoadHoldMs
-	// (review of the live fixes, 2026-10-23). For good: nothing holds the link after a crash.
+	// stage before the crash dialog stops it; a hold armed there would keep the crashed player "connected" for
+	// kLoadHoldMs. For good: nothing holds the link after a crash.
 	bool crashed = false;
 	// How long this machine has played live in the session (kNotLive: not live, or no player plays here).
 	uint32_t live_ms = kNotLive;
@@ -50,19 +49,18 @@ constexpr bool may_arm(bool crashed) { return !crashed; }
 // True: arm the hold again for kLoadHoldMs. False: release it: this machine plays normally, its frames pump the
 // network, and from now on a stall (a hang, a crash) must look like silence to the peers.
 // The last load step is not the end of a load: the first frames after it (precache, the first update of every
-// script, a client's role swap until it is live) can each stall longer than the silence timeout. Live check
-// 2026-10-23: a GAMMA client was dropped by the host there, after its hold was released by its first frame. Nor is
-// going live: the first frames of play bring the level's online objects (settling, kSettleMs).
+// script, a client's role swap until it is live) can each stall longer than the silence timeout, so the hold is not
+// released by the first frame. Nor is going live: the first frames of play bring the level's online objects (settling, kSettleMs).
 inline bool keep_held(const FrameState& s)
 {
 	return may_arm(s.crashed) && (s.load_steps_queued || s.precache_frames || s.joining_world || settling(s.live_ms));
 }
 
-// The hold of one transport (net::Transport) as one atomic word: 0 = released, kSealed = released for good (this
-// process crashed), anything else = the steady-clock ms until which the link is held. Review of protocol 8: the frame
-// pump and the load stages read the crash flag and then armed the hold, and a crash on another thread in between left
-// it armed for kLoadHoldMs. Here the check and the arm are one compare-exchange: an arm either lands before the seal
-// (which wipes it) or sees the seal and does nothing, whatever its caller read before. Any thread.
+// The hold of one transport (net::Transport) as one atomic word: 0 = released, kSealed = released for good (this process
+// crashed), anything else = the steady-clock ms until which the link is held. Reading the crash flag and then arming the hold
+// would leave it armed for kLoadHoldMs after a crash on another thread in between. Here the check and the arm are one
+// compare-exchange: an arm either lands before the seal (which wipes it) or sees the seal and does nothing, whatever its caller
+// read before. Any thread.
 class HoldWord
 {
 public:
@@ -96,12 +94,12 @@ private:
 	std::atomic<uint64_t> m_word{0};
 };
 
-// Host: a JoinRequest that comes while the host's own level is coming up waits for it (coop_join.cpp precache_wait):
-// a world save then would stall those frames further. The engine's precache (Device.dwPrecacheFrame) is no end signal
-// on its own: it counts down only in the focused window (xrEngine/device.cpp End) and starts again on a device reset
-// (Device_destroy.cpp), so an unfocused host never served those joins and the client dropped after 5 min (review of
-// protocol 8). The wait ends with the precache or kLimitMs after the first frame of it the join code saw (load steps
-// run without frames, so that is after the level is up). Main thread; any monotonic ms clock.
+// Host: a JoinRequest that comes while the host's own level is coming up waits for it (coop_join.cpp precache_wait): a world save
+// then would stall those frames further. The engine's precache (Device.dwPrecacheFrame) is no end signal on its own: it counts
+// down only in the focused window (xrEngine/device.cpp End) and starts again on a device reset (Device_destroy.cpp), so an
+// unfocused host never served those joins and the client dropped after 5 min. The wait ends with the precache or kLimitMs after
+// the first frame of it the join code saw (load steps run without frames, so that is after the level is up). Main thread; any
+// monotonic ms clock.
 class PrecacheWait
 {
 public:

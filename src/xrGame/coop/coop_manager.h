@@ -25,9 +25,10 @@ const char* phase_name(Phase p);
 
 class Mode; // xrCoop/coop_mode.h
 
-// F3a split levels: the roles of this process are flags, ProcessRole in xrCoop/coop_roles.h. S4: the session's mode gives them
-// (Mode::roles: the co-op host host_roles(), the world server dedicated_roles(), a map server map_server_roles() in every phase but
-// off, a client client_roles()); a client before its Welcome, whose mode is not known yet, has client_roles(); off = none.
+// The roles of this process are flags, ProcessRole in xrCoop/coop_roles.h. The session's mode gives them
+// (Mode::roles: the co-op host host_roles(), the world server dedicated_roles(), a map server map_server_roles()
+// in every phase but off, a client client_roles()); a client before its Welcome, whose mode is not known yet,
+// has client_roles(); off = none.
 u8 roles_of(Phase p);
 
 class Manager
@@ -40,10 +41,10 @@ public:
 
 	bool start_host(u16 port);
 	bool start_client(const char* address, u16 port);
-	// F3a: this process is a map server (the key -coop_mapserver, xrCoop/coop_mapserver_rules.h): it connects to the host's process.
+	// This process is a map server (the key -coop_mapserver, xrCoop/srv/coop_mapserver_rules.h): it connects to the host's process.
 	bool start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& token);
 	void stop(const char* reason);
-	// TZ R38: the game's own teardown (on_app_end): the sessions end there, while the engine and the log are up, not in the
+	// The game's own teardown (on_app_end): the sessions end there, while the engine and the log are up, not in the
 	// destructor of this static inside the CRT's exit, after the log has closed. Main thread.
 	void app_end();
 
@@ -54,11 +55,11 @@ public:
 	Phase phase() const { return m_phase; }
 	void set_phase(Phase p); // also sets the roles (roles_of)
 	bool active() const { return m_phase != Phase::Off; }
-	// F3a T4: the roles of this process (ProcessRole flags), set with the phase.
+	// The roles of this process (ProcessRole flags), set with the phase.
 	bool has_role(ProcessRole r) const { return (m_roles & u8(r)) != 0; }
 	u8 roles() const { return m_roles; }
-	// Until a module is moved over, the old names keep their meaning (§1.1): is_host() is the world server (the phase
-	// Hosting), is_client() a client of that world (a client in any phase after transport start, and a map server: is_mirror()
+	// The old role names, until their last callers ask the mode (docs/MODES.md section 3): is_host() is the world server (the
+	// phase Hosting), is_client() a client of that world (a client in any phase after transport start, and a map server: is_mirror()
 	// below is the question "are my objects copies", is_map_authority() "is the host's half of a level mine").
 	bool is_host() const { return has_role(ProcessRole::WorldServer); }
 	bool is_client() const { return has_role(ProcessRole::WorldClient); }
@@ -72,7 +73,7 @@ public:
 	// The connection to the world server: this process's session, on a map server its bridge.
 	Session& world_session() { return m_map_server ? m_world : m_session; }
 	PeerId self() const { return m_session.self(); }
-	// F3a T4: the internal channel of the host's process (xrCoop/coop_local_link.h): its world server's session sees the
+	// The internal channel of the host's process (xrCoop/coop_local_link.h): its world server's session sees the
 	// host player as peer 0 on it, and it is the host player's Endpoint (the client-side handlers). Attached for the
 	// life of the process; it passes only the messages moved onto it (link_enabled). Main thread.
 	LocalLink& local_link() { return m_link; }
@@ -95,7 +96,7 @@ private:
 	void install_session_callbacks();
 	// What a session does for a process that is a client of the world: a client's session, the bridge of a map server.
 	void install_world_callbacks(Session& s);
-	// S4 (docs/MODES.md section 4, xrCoop/coop_mode.h): the session's mode `m` (the switchboard's answer to a start) goes in and
+	// (docs/MODES.md section 4, xrCoop/coop_mode.h) The session's mode `m` (the switchboard's answer to a start) goes in and
 	// installs its own handler tables (every module's install_server / install_client on the endpoints of its process: the co-op
 	// host the server's on the session and the client's on the host player's LocalLink; the world server the server's and the
 	// map servers'; a map server the server's on the session of its level and the client's on its bridge). What a table had
@@ -104,18 +105,18 @@ private:
 	// A client (player and mirror) from its start: the Core's client tables on the session connected to the host, the same for
 	// both modes. Its mode comes with the Welcome (enter_mode_of_welcome) and adds none.
 	void install_client_tables();
-	// Protocol 33: a client's mode is the one its Welcome says, in before any game message of the session runs.
+	// A client's mode is the one its Welcome says, in before any game message of the session runs.
 	void enter_mode_of_welcome(SessionMode said);
 	void autostart();
 	SessionConfig make_config(u16 port);
 
 	LocalLink m_link; // declared before m_session: it outlives the session it is attached to
-	Session m_world; // F3a: a map server's bridge to the host's process (m_session hosts its level); declared first: it outlives it
+	Session m_world; // a map server's bridge to the host's process (m_session hosts its level); declared first: it outlives it
 	Session m_session;
 	Phase m_phase = Phase::Off;
-	u64 m_live_since_ms = 0; // W9: when this machine last went live (link_hold::FrameState::live_ms)
+	u64 m_live_since_ms = 0; // when this machine last went live (link_hold::FrameState::live_ms)
 	u8 m_roles = 0; // ProcessRole flags, set with the phase
-	bool m_map_server = false; // F3a: started with -coop_mapserver
+	bool m_map_server = false; // started with -coop_mapserver
 	PlayerKey m_key{};
 	bool m_key_loaded = false;
 	Manifest m_manifest;
@@ -124,7 +125,7 @@ private:
 
 inline Manager& mgr() { return Manager::get(); }
 
-// F3a split levels, the roles of this process (xrCoop/coop_roles.h, §1.1). The old names keep their meaning: is_host() =
+// The roles of this process (xrCoop/coop_roles.h). The old names keep their meaning: is_host() =
 // is_world_server() (and the map authority and a player), is_client() = a client of the host's world (a player and a mirror, or a
 // map server). Main thread.
 inline bool is_world_server() { return mgr().has_role(ProcessRole::WorldServer); }
@@ -133,13 +134,13 @@ inline bool is_player() { return mgr().has_role(ProcessRole::Player); }
 inline bool is_mirror() { return mgr().has_role(ProcessRole::Mirror); }
 inline bool is_live_mirror() { return is_mirror() && mgr().is_live_client(); } // a mirror in the world, the old is_live_client()
 inline bool is_map_server() { return mgr().has_role(ProcessRole::MapServer); } // started with -coop_mapserver
-// The actor of this process is nobody: a map server's, the dedicated host's (plan §1.6). Before a session too: a dedicated host has none yet.
+// The actor of this process is nobody: a map server's, the dedicated host's. Before a session too: a dedicated host has none yet.
 inline bool ghost_actor() { return is_map_server() || g_coop_dedicated; }
 
-// Level-change review (owner 2026-10-23, xrCoop/coop_world_gate.h): the level this machine plays is UP: constructed and
+// (xrCoop/coop_world_gate.h) The level this machine plays is UP: constructed and
 // loaded (g_pGameLevel->bReady: set at the end of IGame_Level::Load, cleared first thing in CLevel::net_Stop), the ALife
 // simulator and the local actor exist. g_pGameLevel alone says nothing: IGame_Level::IGame_Level() sets it at the START of
-// the construction and ai().get_alife() is set at the start of the simulator's constructor (live 2026-10-23: a handler met
+// the construction and ai().get_alife() is set at the start of the simulator's constructor (a handler would meet
 // ai().alife() null inside CLevel::CLevel()). Actor() may be called in an up world only: it asserts on GameID(). Main thread.
 bool world_up();
 // A level exists but is not up: it is being built or torn down. A pass that cleans up "no level at all" itself still runs
@@ -150,12 +151,9 @@ bool world_gap();
 void register_console_commands();
 // Engine hook, see CGamePersistent::OnFrame.
 void on_frame();
-// Engine hook (TZ R38), CGamePersistent::OnAppEnd: the first step of the game's teardown, in every kind of process.
+// Engine hook, CGamePersistent::OnAppEnd: the first step of the game's teardown, in every kind of process.
 void on_app_end();
-// F3a T5, coop_mapserver_stats.cpp: a map server's line in the log every 60 s, and the console command.
-void mapserver_stats_frame();
-void mapserver_stats_register_console();
-// Engine hooks (W9): this thread is about to block and will not pump the network for a while: a level is torn
+// Engine hooks: this thread is about to block and will not pump the network for a while: a level is torn
 // down or loaded, a save is written (CLevel::net_Stop, CGamePersistent::Start, every CGamePersistent::LoadTitle
 // stage, CALifeStorageManager::save). In a session the link is held alive from a helper thread until this machine
 // plays normally again: no load step queued, precache frames done, a client live (coop_link_hold.h; Manager::frame

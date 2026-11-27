@@ -17,10 +17,10 @@
 #include "alife_registry_wrappers.h"
 #include "script_callback_ex.h"
 #include "game_object_space.h"
-#include "coop/coop_story.h" // Anomaly Coop
-#include "xrCoop/coop_mode.h" // Anomaly Coop (R32 §8a A7, O6): the level side an info of a non-actor object is told to
+#include "coop/coop_story.h"
+#include "xrCoop/coop_mode.h" // coop: the level side an info of a non-actor object is told to
 
-// Anomaly Coop (R32 §8a A7, O6; temp/r30/design/R32-final.md): an info portion of a non-actor object was given or taken here, after
+// coop: an info portion of a non-actor object was given or taken here, after
 // the registry changed (one it had already, or never had, says nothing: the echo of GE_INFO_TRANSFER is quiet). A process that leads
 // the object's level apart from its world has a level side (mode().level(): a map server, whose journal carries Info up to the
 // world's record); the others have none and say nothing (the co-op host and client, the world server, a player of a server world,
@@ -64,7 +64,7 @@ void CInventoryOwner::OnEvent(NET_Packet& P, u16 type)
 bool CInventoryOwner::OnReceiveInfo(shared_str info_id) const
 {
 	VERIFY(info_id.size());
-	if (coop::story::on_info(this, info_id, true)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_info(this, info_id, true)) // coop: a co-op client asks the host instead
 		return false;
 	//добавить запись в реестр
 	KNOWN_INFO_VECTOR& known_info = m_known_info_registry->registry().objects();
@@ -73,7 +73,7 @@ bool CInventoryOwner::OnReceiveInfo(shared_str info_id) const
 		known_info.push_back(/*INFO_DATA(*/info_id/*, Level().GetGameTime())*/);
 	else
 		return false;
-	coop_info_up(this, info_id, true); // Anomaly Coop (R32 §8a A7, O6)
+	coop_info_up(this, info_id, true); // coop: the level side carries it up
 
 #ifdef DEBUG
 	if(psAI_Flags.test(aiInfoPortion))
@@ -101,7 +101,7 @@ void CInventoryOwner::DumpInfo() const
 void CInventoryOwner::OnDisableInfo(shared_str info_id) const
 {
 	VERIFY(info_id.size());
-	if (coop::story::on_info(this, info_id, false)) // Anomaly Coop: a co-op client asks the host instead
+	if (coop::story::on_info(this, info_id, false)) // coop: a co-op client asks the host instead
 		return;
 	//удалить запись из реестра
 
@@ -115,7 +115,7 @@ void CInventoryOwner::OnDisableInfo(shared_str info_id) const
 	KNOWN_INFO_VECTOR_IT it = std::find_if(known_info.begin(), known_info.end(), CFindByIDPred(info_id));
 	if (known_info.end() == it) return;
 	known_info.erase(it);
-	coop_info_up(this, info_id, false); // Anomaly Coop (R32 §8a A7, O6)
+	coop_info_up(this, info_id, false); // coop: the level side carries it up
 }
 
 void CInventoryOwner::TransferInfo(shared_str info_id, bool add_info) const

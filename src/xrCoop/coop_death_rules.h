@@ -1,8 +1,8 @@
-// Anomaly Coop — death rules (F3, CHECKPOINTS_DEATH.md §3): the host's death settings and their wire form, which items
+// Anomaly Coop — death rules (CHECKPOINTS_DEATH.md §3): the host's death settings and their wire form, which items
 // a death takes from the character, the wipe test and the per-player tracker that makes sure one death is handled once
-// (also across a leave/return and a world reload), and the decisions of the host's death flow around it (F3 Task 8: the
+// (also across a leave/return and a world reload), and the decisions of the host's death flow around it (the
 // respawn debt, the answer to an Alive report, the worn-items tail of a client's Dead report, the HUD format check) and
-// hardcore's way back (F3 Task 10: "out" kept by the world, the request of a new character, the retirement of the old).
+// hardcore's way back ("out" kept by the world, the request of a new character, the retirement of the old).
 // The host decides everything here; the engine layer only feeds in what it sees and carries out the answer.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
@@ -32,9 +32,9 @@ enum class Mode : uint8_t
 	Rollback = 2
 };
 
-// What happens to the lost items. Drop: the share goes into a bag (a coop_death_stash) at the body, Ruling L-1; loose
+// What happens to the lost items. Drop: the share goes into a bag (a coop_death_stash) at the body, loose
 // at the body only when no bag can be made. Corpse: the whole backpack goes into such a stash. Lose: the share is gone.
-// Keep (build 10, the owner's request of 2026-10-23): nothing is taken, no bag, no PDA mark; the money, the wear and
+// Keep: nothing is taken, no bag, no PDA mark; the money, the wear and
 // the rank go by their own rules. (death::plan_losses, coop_death_items.h)
 enum class Drop : uint8_t
 {
@@ -64,19 +64,19 @@ inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 }
 } // namespace detail
 
-// Build 10, coop_death_share: the host's multiplier of the loss shares of drop and lose, in % (100 = the ltx shares as
+// coop_death_share: the host's multiplier of the loss shares of drop and lose, in % (100 = the ltx shares as
 // they are; scale_shares). Corpse and keep do not use it.
 constexpr float kShareDefaultPct = 100.0f;
 constexpr float kShareMaxPct = 200.0f;
 constexpr uint32_t kShareMaxByte = 200; // Rules::share_pct on the wire
 
-// Protocol 28, the party byte that closes Rules: what a map server judges a hit and a downed player by. It has no game record, the
+// The party byte that closes Rules: what a map server judges a hit and a downed player by. It has no game record, the
 // world's rules come to it here (coop_friendly_fire, coop_npc_finish_downed).
 constexpr uint8_t kPartyFriendlyFire = 1;
 constexpr uint8_t kPartyFinishDowned = 2;
 
 // The host's death settings; one copy, sent to every client (Msg::DeathRules). The defaults are the plan's numbers
-// (Ruling 22): T = 30 s, contusion 10 min, 10 % of the money, 10 % wear, no rank or reputation loss.
+//T = 30 s, contusion 10 min, 10 % of the money, 10 % wear, no rank or reputation loss.
 struct Rules
 {
 	Mode mode = Mode::Checkpoint;
@@ -86,7 +86,7 @@ struct Rules
 	uint32_t delay_ms = 30000;     // T: how long a dead player waits for the others before the respawn
 	uint32_t contusion_s = 600;    // the debuff after a respawn
 	uint8_t money_pct = 10, wear_pct = 10, rank_pct = 0;
-	uint8_t share_pct = 100; // build 10, coop_death_share: drop and lose take ltx share x share_pct / 100 (scale_shares)
+	uint8_t share_pct = 100; // coop_death_share: drop and lose take ltx share x share_pct / 100 (scale_shares)
 	bool friendly_fire = true; // coop_friendly_fire
 	bool finish_downed = false; // coop_npc_finish_downed
 
@@ -99,7 +99,7 @@ struct Rules
 	}
 
 	// mode, drop (u8), bleedout_ms (u32), revive_health (f32), delay_ms (u32), contusion_s (u32), money, wear, rank,
-	// share (u8), party (u8). Build 10: drop 3 = keep; protocol 28: the party byte closes the packet.
+	// share (u8), party (u8). Drop 3 = keep; the party byte closes the packet.
 	void write(Writer& w) const
 	{
 		w.u8(static_cast<uint8_t>(mode));
@@ -286,7 +286,7 @@ inline std::vector<uint16_t> pick_losses(const std::vector<Candidate>& items, co
 	return out;
 }
 
-// The shares a drop or lose death picks with (build 10, coop_death_share): each ltx share x pct / 100, cut to 0..1.
+// The shares a drop or lose death picks with (coop_death_share): each ltx share x pct / 100, cut to 0..1.
 // `pct` is cut to 0..kShareMaxPct first (NaN and a negative count as 0: nothing is lost); a share that is not a number,
 // or negative, counts as 0.
 inline Shares scale_shares(const Shares& base, float pct)
@@ -315,16 +315,25 @@ inline bool is_wipe(const std::vector<uint8_t>& lives_of_present_players)
 	return true;
 }
 
+// No death: the tracker's "no death decided" and the fall a new-life order names. An owner's counter never produces it.
+constexpr uint16_t kNoSeq = 0xffff;
+// The owner's counter of his falls after `s`: it skips kNoSeq.
+inline uint16_t next_seq(uint16_t s)
+{
+	++s;
+	return s == kNoSeq ? 0 : s;
+}
+
 // One per player. Makes each death count once: `decided_seq` is the sequence number (a u16 counter of the player's
 // current actor) of the last death the host acted on. It survives a leave/return and a reload of the world while the
 // player is dead, so the items are never taken twice for one death; on_alive clears it. 0xffff is the guard "no death
 // decided": the counter of the actor must never produce it.
 struct Tracker
 {
-	uint16_t decided_seq = 0xffff;
+	uint16_t decided_seq = kNoSeq;
 	uint64_t respawn_at = 0;   // host clock of the respawn; 0 = not waiting
 	bool respawn_due = false;  // the player left while dead: respawn when they are back
-	bool hardcore_out = false; // out of the run until his player starts a new character (F3 Task 10)
+	bool hardcore_out = false; // out of the run until his player starts a new character
 };
 
 enum class Action : uint8_t
@@ -342,7 +351,7 @@ inline Action on_died(Tracker& t, uint16_t seq, uint64_t now_ms, const Rules& r)
 		return Action::None;
 	t.decided_seq = seq;
 	t.respawn_due = false;
-	if (r.mode == Mode::Hardcore || t.hardcore_out) // F3 Task 10: out already (learn_out) costs nothing again, any mode
+	if (r.mode == Mode::Hardcore || t.hardcore_out) // out already (learn_out) costs nothing again, any mode
 	{
 		t.hardcore_out = true;
 		t.respawn_at = 0;
@@ -418,20 +427,20 @@ inline bool on_world_replaced(Tracker& t)
 // "none decided" guard because the client's death counter starts again from 0 with every new actor (a respawn, a
 // world change, a rejoin): the next death of the new actor can carry the same number as the last one of the old actor
 // and must not be taken for it. (A reload of the world while the player is dead is on_world_replaced, which keeps
-// `decided_seq` until they stand up.) F3 review round 1, finding 1.
+// `decided_seq` until they stand up.)
 inline void on_alive(Tracker& t)
 {
 	t.respawn_at = 0;
 	t.respawn_due = false;
-	t.decided_seq = 0xffff;
+	t.decided_seq = kNoSeq;
 }
 
-// ---------------------------------------------------------------- the host's death flow (F3 Task 8, fix round 1 I-2)
+// ---------------------------------------------------------------- the host's death flow
 
 // survival::Life numbers (coop_survival.h), as is_wipe takes them.
 constexpr uint8_t kLifeAlive = 0, kLifeWounded = 1, kLifeDead = 2, kLifeSpectating = 3, kLifeRespawning = 4;
 
-// Build 10 (the owner's live test of build 9): how a player's character lies by his life, the same for his avatar on the
+// How a player's character lies by his life, the same for his avatar on the
 // other machines and for his own actor (the overhead and spectator cameras show it). Standing: his own motions play.
 enum class BodyPose : uint8_t
 {
@@ -449,7 +458,7 @@ inline BodyPose body_pose(uint8_t life)
 	return BodyPose::Standing; // alive, or a number no Life has
 }
 
-// Live 2026-10-25 (owner): "when somebody dies for good while lying there is no animation of his death". The dead pose is
+// The dead pose is
 // a looping wounded idle (stalkers have no death motions, they fall as ragdolls): a dead body breathed like a wounded one.
 // It makes its last move and lies still kDeathStillMs after the death (a clock that went back: still at once).
 constexpr uint64_t kDeathStillMs = 1000;
@@ -465,7 +474,7 @@ inline bool look_locked(uint8_t life)
 	return life == kLifeDead || life == kLifeSpectating || life == kLifeRespawning;
 }
 
-// Live 2026-10-30 (owner): "monsters keep at you after you go down". Nobody hunts a player out of the run. A wounded one
+// Nobody hunts a player out of the run. A wounded one
 // bleeds out on his own and a teammate may still get him up: a stalker may finish him, a monster leaves him and turns to
 // whoever is standing.
 inline bool out_of_fight(uint8_t life)
@@ -486,7 +495,7 @@ inline bool enemy_leaves(uint8_t life, bool stalker, bool finish_downed)
 	return (stalker && finish_downed) ? out_of_fight(life) : monster_leaves(life);
 }
 
-// The respawn a character is owed in his world (fix round 1, M-1 and M-3). The engine keeps it with the character (his
+// The respawn a character is owed in his world. The engine keeps it with the character (his
 // custom data), so a save written while he is dead or evacuated carries it to the world loaded from that save (a level
 // change, an autosave restore), and a new game or another save does not have it. Set when the host decides a checkpoint
 // death; paid when the owner reports Respawning: the order reached him and he applied it (the wear included), so a
@@ -512,8 +521,8 @@ enum class AliveStep : uint8_t
 // The owner reports `t`'s character alive. A respawn is owed when the tracker waited for his return (on_returned) or
 // the world keeps a debt for him (`debt`, debt_after_report); `ordered`: a respawn order for this report's seq is out
 // already (an Alive that crossed it on the wire must not get a second one). on_returned runs before on_alive, which
-// forgets the death. Ruling F3-7: a character out of a hardcore run stays out whatever the mode is now and however often
-// he rejoins: Spectate, never a respawn. F3 Task 10: his way back is a new character (on_new_character), and the world
+// forgets the death. A character out of a hardcore run stays out whatever the mode is now and however often
+// he rejoins: Spectate, never a respawn. His way back is a new character (on_new_character), and the world
 // keeps him out across a level change or a load (learn_out).
 inline AliveStep on_alive_report(Tracker& t, bool debt, bool ordered)
 {
@@ -524,7 +533,7 @@ inline AliveStep on_alive_report(Tracker& t, bool debt, bool ordered)
 	return (returned || debt) && !ordered ? AliveStep::Respawn : AliveStep::None;
 }
 
-// Ruling F3-4: the tail of a client's Dead report, {u8 n, n x u16 item}: the items in his slots and on his belt, host
+// The tail of a client's Dead report, {u8 n, n x u16 item}: the items in his slots and on his belt, host
 // numbering. A proxy (an NPC: no outfit, no belt) cannot show them to the host.
 constexpr uint8_t kMaxWornIds = 40; // 18 slots at most, a belt of a few artefacts: more is a modified client
 
@@ -567,9 +576,9 @@ inline WornTail read_worn(Reader& r, std::vector<uint16_t>& out)
 	return WornTail::Ok;
 }
 
-// ---------------------------------------------------------------- hardcore: out of the run, a new character (F3 Task 10)
+// ---------------------------------------------------------------- hardcore: out of the run, a new character
 
-// T8 review: "out of a hardcore run" is kept with the character in the world ([coop_death] out = 1 in his custom data),
+// "out of a hardcore run" is kept with the character in the world ([coop_death] out = 1 in his custom data),
 // as the respawn debt is. The host's trackers start over with every world it serves (a level change, a load), so the
 // tracker alone forgot it and an out player came back alive after the next level change. The character carries it into
 // every world saved after his death; a new game or a save from before it has none. The engine reads it before each
@@ -596,11 +605,11 @@ inline NewCharVerdict on_new_character(const Tracker& t, bool retiring)
 	return t.hardcore_out ? NewCharVerdict::Start : NewCharVerdict::NotOut;
 }
 
-// F3a T7 R1: the fall a new-life order names: none (the tracker's "no death decided", never an owner's counter), so a
+// The fall a new-life order names: none (the tracker's "no death decided", never an owner's counter), so a
 // standing or dead owner never takes it (take_respawn) - a repeat that comes after he stood up moves nobody.
-constexpr uint16_t kNewLifeSeq = 0xffff;
+constexpr uint16_t kNewLifeSeq = kNoSeq;
 
-// F3a T7 R1: what an owner takes from a Respawn order (Msg::PlayerRevive OpRespawn, coop_survival apply_respawn).
+// What an owner takes from a Respawn order (Msg::PlayerRevive OpRespawn, coop_survival apply_respawn).
 enum class RespawnTake : uint8_t
 {
 	Stale, // nothing: an older fall, or a life no respawn is for
@@ -609,7 +618,7 @@ enum class RespawnTake : uint8_t
 };
 
 // Dead or Alive: a respawn when the order names his fall (`my_seq`, never kNewLifeSeq). Spectating: the only Respawn a
-// spectator is ever sent is his new life (Ruling F3-7: out of the run nobody is respawned), so the fall it names is not
+// spectator is ever sent is his new life (out of the run nobody is respawned), so the fall it names is not
 // compared - the world's records start over with a world and may not know his. Wounded or Respawning: stale.
 inline RespawnTake take_respawn(uint8_t life, uint16_t my_seq, uint16_t order_seq)
 {
@@ -620,7 +629,7 @@ inline RespawnTake take_respawn(uint8_t life, uint16_t my_seq, uint16_t order_se
 	return RespawnTake::Stale;
 }
 
-// F3a T7 R1: the world's last order of the host player's new life (kept with his record of this world: a new world
+// The world's last order of the host player's new life (kept with his record of this world: a new world
 // starts it over).
 struct NewLife
 {
@@ -638,7 +647,7 @@ inline bool new_life_lost(uint8_t life, bool out, bool retiring, const NewLife& 
 	return !last.sent || now_ms >= last.at + retry_ms;
 }
 
-// Review R2 of T9: a retiring character keeps his key and his player until his stash has his things. A pending stash
+// A retiring character keeps his key and his player until his stash has his things. A pending stash
 // knows its owner by the key when both sides have one, else by the player who plays him (same_owner,
 // coop_death_items.h). Taking the key off, or sending his player away to make the new character (host_rejoin_peer: the
 // old character then has no player, and create_proxy gives the key to the new one), while the stash still waits would
@@ -648,7 +657,7 @@ enum class RetireStep : uint8_t
 	Wait, // his stash is pending: nothing of him changes yet
 	Finish, // the stash is done (or none was needed): the key goes, his player makes a new character, he leaves the world
 	Void, // the character is gone (another world, released already): nothing left to do
-	Cancel // fix round 1, I1: his things are still on him and he would be released with them: not now, he stays out
+	Cancel // his things are still on him and he would be released with them: not now, he stays out
 };
 
 // What became of the stash of a retiring character (death::host_stash_outcome).
@@ -656,11 +665,11 @@ enum class StashOutcome : uint8_t
 {
 	Pending, // it still waits for his things
 	Done, // filled, dropped at the body instead, or none was needed (nothing to move)
-	GaveUp // T9 StashStep::GiveUp: his player stayed away while it was online, or he is someone else now: his things
+	GaveUp // his player stayed away while it was online, or he is someone else now: his things
 	       // are still on him
 };
 
-// F3a: a character on a map server's level retires there (his body and his things are its objects) and the world server waits for its
+// A character on a map server's level retires there (his body and his things are its objects) and the world server waits for its
 // word. No word by then, the map server gone with it: his things stay on him, the same as a stash that gave up.
 constexpr uint64_t kRemoteStashWaitMs = 630000; // the stash itself may wait kStashAwayWaitMs for a player who left, and half a minute
 
@@ -672,8 +681,8 @@ inline StashOutcome remote_stash_outcome(bool answered, bool things_stay, uint64
 }
 
 // `released`: the character leaves the world when he retires (a client's); the host's actor stays and keeps whatever
-// the stash could not take. `items_left`: world items still on him (the server's word, after the stash). Fix round 1,
-// I1: a client's character whose stash gave up, or who still carries world items, is not retired - the key, the player
+// the stash could not take. `items_left`: world items still on him (the server's word, after the stash). A client's
+// character whose stash gave up, or who still carries world items, is not retired - the key, the player
 // and the character stay, he is still out of the run and may ask again (better than his things going with him).
 inline RetireStep retire_step(bool character_here, StashOutcome stash, bool items_left, bool released)
 {
@@ -686,7 +695,7 @@ inline RetireStep retire_step(bool character_here, StashOutcome stash, bool item
 	return RetireStep::Finish;
 }
 
-// Fix round 1, C1: the custom data of a character retired by retire_custom_data. His release is confirmed by his entity
+// The custom data of a character retired by retire_custom_data. His release is confirmed by his entity
 // being gone; the id may meanwhile name another character (his player's new one), so only an entity that still says
 // this is the old one.
 inline bool is_retired(const std::string& text)
@@ -695,7 +704,7 @@ inline bool is_retired(const std::string& text)
 	return checkpoint::ini_get(text, "coop", "retired", v) && v == "1";
 }
 
-// Ruling F3-10: a retirement is no farm. The new character of a retired key starts with no kit and no faction money
+// A retirement is no farm. The new character of a retired key starts with no kit and no faction money
 // unless the host turns coop_hardcore_new_kit on; every other new key gets the kit as before.
 inline bool new_character_bare(bool retired_key, bool new_kit_option)
 {
@@ -703,14 +712,14 @@ inline bool new_character_bare(bool retired_key, bool new_kit_option)
 }
 
 // The custom data of a retired character: every `key` line of [coop] goes, so find_key_value finds no player for him and
-// his player's next join makes a new character (protocol 8), and `retired = 1` says why. The rest stays as it is.
+// his player's next join makes a new character, and `retired = 1` says why. The rest stays as it is.
 inline void retire_custom_data(std::string& text)
 {
 	checkpoint::ini_erase(text, "coop", "key");
 	checkpoint::ini_set(text, "coop", "retired", "1");
 }
 
-// Ruling F3-9: coop_max_new_characters (Ruling F2-10 b, limits::NewCharacters) stops new player keys, with which the
+// coop_max_new_characters (limits::NewCharacters) stops new player keys, with which the
 // joins could be spammed for kits. A key that had a character - in this session, or one that retired in this world -
 // is the same player starting again: it neither checks nor spends the limit (else a hardcore group got stuck after a
 // session's worth of deaths; starting again gains nothing over dying). `had_character`: such a key; `limit_admits`:
@@ -732,9 +741,9 @@ inline NewKeyCharge new_key_charge(bool had_character, bool limit_admits)
 // The retired keys of a world are kept in the host actor's custom data, [coop_retired] <digest> = 1 (the retired
 // character is released, his key with him), so a player away when his character retired, or one coming in a later
 // session, is still known. One line per player key; only a key digest (kKeyDigestDigits lowercase hex, as
-// coop::kKeyDigestHexDigits, coop_session.h) is a key here. Fix round 1, I2: the actor's custom data goes into one
+// coop::kKeyDigestHexDigits, coop_session.h) is a key here. The actor's custom data goes into one
 // 16 KB NET_Packet with every save (CSE_ALifeObject::STATE_Write), so at most kMaxRetiredKeys are kept, the oldest
-// noted goes first (that key only spends a slot of coop_max_new_characters again, Ruling F3-9).
+// noted goes first (that key only spends a slot of coop_max_new_characters again).
 constexpr size_t kKeyDigestDigits = 64;
 constexpr unsigned kMaxRetiredKeys = 64; // about 4.4 KB of custom data
 constexpr const char* kRetiredSection = "coop_retired";
@@ -811,7 +820,7 @@ inline bool one_conversion(const char* fmt, char conv)
 		}
 	return percents == 1 && ok;
 }
-// A hit after the fall is over (live 2026-11-01). NPCs keep shooting a body on the host as long as they see it, and what they
+// A hit after the fall is over. NPCs keep shooting a body on the host as long as they see it, and what they
 // fired lands after the owner has gone: "back at your camp" and the next line a shot in the leg. Nothing counts while he is
 // dead, out of the run or on his way back, nor for kRespawnShieldMs after he stands up at the respawn point.
 constexpr uint32_t kRespawnShieldMs = 5000;

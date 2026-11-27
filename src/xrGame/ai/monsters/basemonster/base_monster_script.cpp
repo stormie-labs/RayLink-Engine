@@ -7,7 +7,7 @@
 #include "../../../ai_object_location.h"
 #include "../../../sound_player.h"
 #include "../../../ai_monster_space.h"
-#include "../../../coop/coop_ai.h" // Anomaly Coop: player_down
+#include "../../../coop/coop_ai.h" // coop: player_down
 #include "../state_manager.h"
 
 #include "../../../ai_debug.h"
@@ -451,7 +451,7 @@ bool CBaseMonster::bfAssignMonsterAction(CScriptEntityAction* tpEntityAction)
 
 		break;
 	case eGA_Attack:
-		// Anomaly Coop: a player who is down gets no attack state, it would run without an enemy (CMonsterEnemyManager::update)
+		// coop: a player who is down gets no attack state, it would run without an enemy (CMonsterEnemyManager::update)
 		if (pE && !pE->getDestroy() && pE->g_Alive() && !coop::npc_ai::player_down(pE))
 		{
 			EnemyMan.force_enemy(pE);

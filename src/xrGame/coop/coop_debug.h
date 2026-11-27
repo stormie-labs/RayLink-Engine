@@ -1,4 +1,5 @@
-// Anomaly Coop — the server's debug in the engine (docs/DEBUG_DESIGN.md §B, work package 1; protocol 29).
+// Anomaly Coop — the server's debug in the engine (docs/DEBUG_DESIGN.md §B), and the diagnostics of any process
+// (coop_ini_stats, coop_memory_map).
 //
 // Debug is a right of the server, as sv_cheats. The world server (the host's process, or the dedicated host) keeps the state: on or off,
 // who switched it, each player's personal flags. The key -dbg of the process that starts hosting switches it on (Core.isDebug, an exact
@@ -10,7 +11,7 @@
 //   - coop.sync requests named coop.dbg.* are refused while the debug is off, all but coop.dbg.view (coop_sync_api.cpp on_request);
 //   - god: the authority of a player's level drops the PlayerHit of a player with the flag (coop_requests.cpp stalker_hit); his own
 //     machine sets AF_GODMODE on its actor (and AF_UNLIMITEDAMMO for the ammo flag) from DebugState, and takes back only what it set;
-//   - invisible (work package 4): the AI of the authority of a player's level leaves him out as the stock ai_ignore_actor leaves out the
+//   - invisible: the AI of the authority of a player's level leaves him out as the stock ai_ignore_actor leaves out the
 //     actor (coop_ai.cpp npc_ai::debug_unseen: memory, enemy choice); a monster's stamina blow asks the god of the player it lands on
 //     (npc_ai::player_god), not the process's GodMode();
 //   - the engine's own cheats of the -dbg key (g_god, run_string, ...) are refused on a player's machine in a session; the world server's
@@ -19,7 +20,9 @@
 //
 // Lua (coop.debug, on every machine):
 //   coop.debug.state() -> { on = bool, source = "off" | "key" | "console", serial = n, operator = bool, mine = bits,
-//                           flags = { [peer] = bits, ... } }      the world server's own state there, the last DebugState elsewhere
+//                           actor = bits, flags = { [peer] = bits, ... } }      the world server's own state there, the last
+//                           DebugState elsewhere; actor: the god and ammo bits this process's actor has now (AF_GODMODE,
+//                           AF_UNLIMITEDAMMO), whoever set them; mine: what the server's row asks for this player
 //   coop.debug.flags(peer) -> bits (1 god, 2 ammo, 4 invisible; 0: none, or debug off)
 //   coop.debug.set_flags(peer, bits | {god = bool, ammo = bool, invis = bool}) -> true | false, why     the world server only; a key that
 //                           is absent keeps its bit; refused while the debug is off ("debug is off") and for a peer that is no player
@@ -52,7 +55,7 @@ void on_session_started();
 // actor are taken back, unless keep_own_flags_through_next_reset was called right before (flags_taken_at_reset).
 void reset();
 // A player's machine, right before the sync::reset of a world replaced inside the session (coop_join.cpp: the host's SessionReset,
-// the group's load): that reset keeps the flags this machine set; the DebugState at the end of the join decides (b57i creator10_server).
+// the group's load): that reset keeps the flags this machine set; the DebugState at the end of the join decides.
 void keep_own_flags_through_next_reset();
 // The world server: a player left, his flags go.
 void on_peer_left(PeerId peer);
@@ -74,7 +77,9 @@ bool refuses_request(const std::string& name);
 // console_commands.cpp: the engine's cheats of the -dbg key; true = refused (and said in the log), the command must not run.
 bool refuse_local_cheat(const char* command);
 
-// coop_debug, coop_dbg; from coop::register_console_commands.
+// What the process's memory is made of, as the system sees it (coop_memory_map; a server's first stats line).
+void log_address_space();
+// coop_debug, coop_dbg, coop_ini_stats, coop_memory_map; from coop::register_console_commands.
 void register_console();
 // coop.debug.*; from the coop script registrator (coop_script.cpp register_raw).
 void register_lua(lua_State* L);

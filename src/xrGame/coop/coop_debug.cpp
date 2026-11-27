@@ -56,11 +56,11 @@ void say(const char* line)
 
 void say(const std::string& line) { say(line.c_str()); }
 
-// This process is a client that holds the host's rights of a world server (plan 2026-11-12 §2.3).
+// This process is a client that holds the host's rights of a world server.
 bool operator_here() { return mgr().active() && !mode().decides_world() && mgr().session().self_host_rights(); }
 
 // The operator's console: the line goes to the world server as an OperatorCommand; the server checks it again and answers. The
-// mode checks and sends it (H-OPCMD: a player of a server world; INTEG-C), this keeps the lines.
+// mode checks and sends it (a player of a server world), this keeps the lines.
 void send_to_server(const std::string& line)
 {
 	switch (mode().send_operator_command(line))
@@ -378,12 +378,16 @@ int fail(lua_State* L, const char* why)
 	return 2;
 }
 
-// coop.debug.state() -> {on, source, serial, operator, mine, flags = {[peer] = bits}}
+// coop.debug.state() -> {on, source, serial, operator, mine, actor, flags = {[peer] = bits}}
 int l_state(lua_State* L)
 {
 	const bool ws = keeps_debug_flags();
 	const StateMsg m = ws ? g_server.message() : seen_or_empty();
-	lua_createtable(L, 0, 6);
+	lua_createtable(L, 0, 7);
+	// What this process's actor has now (AF_GODMODE, AF_UNLIMITEDAMMO). Lua cannot read it otherwise: the console's g_god exists
+	// only in a process started with -dbg, and a player's machine has no -dbg.
+	lua_pushnumber(L, lua_Number(actor_flags()));
+	lua_setfield(L, -2, "actor");
 	lua_pushboolean(L, m.on ? 1 : 0);
 	lua_setfield(L, -2, "on");
 	lua_pushstring(L, source_name(m.source));
@@ -491,7 +495,7 @@ int l_say(lua_State* L)
 	return 0;
 }
 
-// coop.debug.unseen(id) -> bool (work package 4; coop_npc_combat asks it in xr_combat_ignore.is_enemy for every enemy candidate)
+// coop.debug.unseen(id) -> bool (coop_npc_combat asks it in xr_combat_ignore.is_enemy for every enemy candidate)
 int l_unseen(lua_State* L)
 {
 	bool yes = false;
@@ -504,9 +508,42 @@ int l_unseen(lua_State* L)
 	lua_pushboolean(L, yes ? 1 : 0);
 	return 1;
 }
+
+// Where the items of the configs live: the CInifile objects alive now by file, the largest
+// first, and the DLTX cache of parsed files. A report for the log; it changes nothing.
+class CCC_CoopIniStats : public IConsole_Command
+{
+public:
+	CCC_CoopIniStats(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override
+	{
+		xr_vector<CInifile::LiveRow> rows;
+		u64 instances = 0, sections = 0, items = 0, distinct = 0;
+		CInifile::LiveStats(rows, instances, sections, items, distinct);
+		u64 cache_files = 0, cache_bytes = 0, cache_sections = 0;
+		CInifile::GetCacheStats(cache_files, cache_bytes, cache_sections);
+		::Msg("[coop] coop_ini_stats: %llu ini objects alive in %u files: %llu sections, %llu items, of them %llu in memory once "
+		      "(%llu MB, %u bytes an item; the rest is shared with another object); the cache of parsed files: %llu files, "
+		      "%llu sections, %llu MB by its own count",
+		    instances, u32(rows.size()), sections, items, distinct, distinct * sizeof(CInifile::Item) / (1024 * 1024),
+		    u32(sizeof(CInifile::Item)), cache_files, cache_sections, cache_bytes / (1024 * 1024));
+		const size_t shown = rows.size() < 30 ? rows.size() : 30;
+		for (size_t i = 0; i < shown; ++i)
+			::Msg("[coop]   %9llu items %7llu sections x%-4u %s", rows[i].items, rows[i].sections, rows[i].instances, rows[i].file.c_str());
+	}
+	void Info(TInfo& I) override { xr_strcpy(I, "this process: the ini objects alive by file, the largest first, and the cache of parsed files"); }
+};
+
+class CCC_CoopMemoryMap : public IConsole_Command
+{
+public:
+	CCC_CoopMemoryMap(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
+	void Execute(LPCSTR) override { log_address_space(); }
+	void Info(TInfo& I) override { xr_strcpy(I, "this process: committed memory by kind and the largest private allocations"); }
+};
 } // namespace
 
-// ---------------------------------------------------------------- the operator of a world server (plan 2026-11-12 §2.3)
+// ---------------------------------------------------------------- the operator of a world server
 
 // Declared in coop_dedicated.cpp (run_for), the one caller. `rest`: what follows "coop_dbg " in a line that passed op::command_verdict.
 // The line runs as a request of the operator's peer, never as the server's console: coop_debug_server.operator_console(line, parsed,
@@ -689,10 +726,84 @@ bool refuse_local_cheat(const char* command)
 	return false;
 }
 
+// What the process's memory is made of, as the system sees it (a server's private memory is far more than the engine's own
+// heap, and the heap alone does not say what the rest is). Committed memory by kind: private (heaps, stacks,
+// VirtualAlloc), mapped files, images of the exe and its DLLs; then the largest private allocations, each as the whole range one
+// VirtualAlloc made. A report for the log; it changes nothing.
+void log_address_space()
+{
+	struct Block
+	{
+		u64 base = 0;
+		u64 committed = 0;
+		u64 reserved = 0;
+	};
+	xr_vector<Block> blocks;
+	u64 private_mb = 0, mapped_mb = 0, image_mb = 0, reserved_mb = 0;
+	MEMORY_BASIC_INFORMATION info;
+	for (const u8* p = nullptr; VirtualQuery(p, &info, sizeof(info)) == sizeof(info);)
+	{
+		const u64 size = u64(info.RegionSize);
+		if (info.State == MEM_COMMIT)
+		{
+			if (info.Type == MEM_PRIVATE)
+				private_mb += size;
+			else if (info.Type == MEM_MAPPED)
+				mapped_mb += size;
+			else
+				image_mb += size;
+		}
+		else if (info.State == MEM_RESERVE)
+			reserved_mb += size;
+		if (info.State != MEM_FREE && info.Type == MEM_PRIVATE)
+		{
+			const u64 base = u64(reinterpret_cast<uintptr_t>(info.AllocationBase));
+			if (blocks.empty() || blocks.back().base != base)
+			{
+				Block b;
+				b.base = base;
+				blocks.push_back(b);
+			}
+			(info.State == MEM_COMMIT ? blocks.back().committed : blocks.back().reserved) += size;
+		}
+		const u8* next = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
+		if (next <= p)
+			break; // the end of the address space
+		p = next;
+	}
+	const u64 mb = 1024 * 1024;
+	::Msg("[coop] coop_memory_map: committed: private %llu MB, mapped files %llu MB, images %llu MB; reserved and not committed "
+	      "%llu MB; %u private allocations",
+	    private_mb / mb, mapped_mb / mb, image_mb / mb, reserved_mb / mb, u32(blocks.size()));
+	// by size: how many allocations of each size class, and how much they hold
+	static const u64 kClass[] = {1 * mb, 4 * mb, 16 * mb, 64 * mb, 256 * mb, ~u64(0)};
+	static const char* const kName[] = {"under 1 MB", "1-4 MB", "4-16 MB", "16-64 MB", "64-256 MB", "256 MB and more"};
+	u32 count[6] = {};
+	u64 total[6] = {};
+	for (const Block& b : blocks)
+		for (int i = 0; i < 6; ++i)
+			if (b.committed < kClass[i])
+			{
+				++count[i];
+				total[i] += b.committed;
+				break;
+			}
+	for (int i = 0; i < 6; ++i)
+		if (count[i])
+			::Msg("[coop]   private allocations %-15s %6u, %5llu MB", kName[i], count[i], total[i] / mb);
+	std::sort(blocks.begin(), blocks.end(), [](const Block& a, const Block& b) { return a.committed > b.committed; });
+	const size_t shown = blocks.size() < 12 ? blocks.size() : 12;
+	for (size_t i = 0; i < shown; ++i)
+		::Msg("[coop]   %5llu MB committed, %5llu MB more reserved, at %016llx", blocks[i].committed / mb, blocks[i].reserved / mb,
+		    blocks[i].base);
+}
+
 void register_console()
 {
 	CMD1(CCC_CoopDebug, "coop_debug");
 	CMD1(CCC_CoopDbg, "coop_dbg");
+	CMD1(CCC_CoopIniStats, "coop_ini_stats");
+	CMD1(CCC_CoopMemoryMap, "coop_memory_map");
 }
 
 void register_lua(lua_State* L)

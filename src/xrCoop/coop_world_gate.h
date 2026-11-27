@@ -1,8 +1,7 @@
 // Anomaly Coop — game messages for a world that is not there.
 //
-// Live crash 2026-10-23 20:00 (build 9, GAMMA): a client at a level exit asked the group to change level; while the host
-// built the new level (CLevel::CLevel() in the log) the session kept pumping (CGamePersistent::OnFrame -> Session::update
-// -> run_pending), a PlayerVitals reached coop_equip.cpp store_vitals and ai().alife() had no simulator: access violation.
+// While the host builds a new level (CLevel::CLevel()) the session keeps pumping (CGamePersistent::OnFrame -> Session::update
+// -> run_pending): a PlayerVitals reaching coop_equip.cpp store_vitals would find ai().alife() without a simulator.
 // The same window opens at a load, at a client's entry (a client in the main menu, choosing a character, gets what the
 // host sends everybody) and in the main menu. 100+ call sites of ai().alife() / Level() / Actor() cannot each carry the
 // right check, so the session carries one rule for all game messages:
@@ -90,14 +89,14 @@ inline Need need_of(Msg type)
 	case Msg::RestState:
 	case Msg::RestSleep:
 	case Msg::PlayerRules: // survival rules: stored
-	case Msg::DebugState: // protocol 29: the newest state is kept, the flags are the process's (psActorFlags), no world needed
+	case Msg::DebugState: // the newest state is kept, the flags are the process's (psActorFlags), no world needed
 	case Msg::PlayerDied: // relay and a log line
 
-	// --- F3a: the tables and the barrier keep their own books (coop_levels, coop_join), a map server's state is a number
+	// --- the tables and the barrier keep their own books (coop_levels, coop_join), a map server's state is a number
 	case Msg::LevelMap: // the newest table is kept; a loading client applies it when its world is there
 	case Msg::LevelMoveResult: // the answer to a request of a player who is in a world
 	case Msg::LevelFlush: // a map server answers from its own world; a hole there means it is loading
-	case Msg::LevelJournalAck: // R32 W3: the world's answer to a journal batch, applied by the map server in order
+	case Msg::LevelJournalAck: // the world's answer to a journal batch, applied by the map server in order
 	case Msg::Tunnel: // the inner packet passes its own need_of when it is taken out
 	case Msg::MapServerState:
 	case Msg::MapServerOrder:
@@ -129,12 +128,12 @@ inline Need need_of(Msg type)
 	case Msg::ZoneState: // the host sends the zones again when a client is live (host_on_peer_ready)
 	case Msg::MoneyBalance: // the host sends the balance again when its player is live (host_on_peer_in_world)
 	case Msg::DeathMarker:
-	case Msg::MonsterEffect: // audit A5: an effect of a moment, on a monster of a world that is up
-	case Msg::LevelXferDown: // F3a: the world server repeats it until it is acknowledged
+	case Msg::MonsterEffect: // an effect of a moment, on a monster of a world that is up
+	case Msg::LevelXferDown: // the world server repeats it until it is acknowledged
 	case Msg::LevelBrain: // 1 Hz, the next one replaces it
 	case Msg::LevelHash: // every 10 s
-	case Msg::VehicleInput: // F5: the driver sends his keys again at a change and every 200 ms
-	case Msg::VehicleState: // F5: the decider sends a car's state again; a car of a world that is gone is nobody's
+	case Msg::VehicleInput: // the driver sends his keys again at a change and every 200 ms
+	case Msg::VehicleState: // the decider sends a car's state again; a car of a world that is gone is nobody's
 	case Msg::LevelResync: return Need::Drop;
 
 	// --- requests, reports of a change and the host's ordered deltas
@@ -172,14 +171,14 @@ inline Need need_of(Msg type)
 	case Msg::TradeOp:
 	case Msg::CheckpointClaim:
 	case Msg::RestRequest:
-	case Msg::LevelMove: // F3a: a player's leave is a request that changes the world; it waits in a hole, not dropped
-	case Msg::LevelSnapshot: // F3a: a map server's state and its halves of a transfer are deltas, in order
+	case Msg::LevelMove: // a player's leave is a request that changes the world; it waits in a hole, not dropped
+	case Msg::LevelSnapshot: // a map server's state and its halves of a transfer are deltas, in order
 	case Msg::LevelEntity:
-	case Msg::LevelJournal: // R32 W3: a map server's ordered journal batch, held in a hole like LevelEntity
+	case Msg::LevelJournal: // a map server's ordered journal batch, held in a hole like LevelEntity
 	case Msg::LevelXferUp:
-	case Msg::LoadReady: // F3a: the same epoch is played after the world is up (plan §1.5 step 7)
-	case Msg::VehicleReq: // F5: a request for a seat, as ReqTake; the decider checks the body and the car when it runs
-	case Msg::VehicleSeat: // F5: the decider's ordered answer, as ReqResult (a player who comes to the map gets the seats again)
+	case Msg::LoadReady: // the same epoch is played after the world is up
+	case Msg::VehicleReq: // a request for a seat, as ReqTake; the decider checks the body and the car when it runs
+	case Msg::VehicleSeat: // the decider's ordered answer, as ReqResult (a player who comes to the map gets the seats again)
 	case Msg::StateDumpRequest: return Need::Hold;
 
 	default: break;

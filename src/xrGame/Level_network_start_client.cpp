@@ -249,11 +249,8 @@ bool CLevel::net_start_client6()
 			pApp->LoadEnd();
 			return true;
 		}
-		if (!g_dedicated_server || g_coop_headless)
-		{
-			g_hud->Load();
-			g_hud->OnConnected();
-		}
+		g_hud->Load();
+		g_hud->OnConnected();
 
 #ifdef DEBUG
 		Msg("--- net_start_client6");

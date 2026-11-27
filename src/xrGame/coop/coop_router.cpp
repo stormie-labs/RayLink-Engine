@@ -1,28 +1,29 @@
-// Anomaly Coop — callback router (F2 T10, review R5 I4) and binder router (F2 T11). See coop_router.h and
-// xrCoop/coop_routes.h.
+// Anomaly Coop — callback router and binder router. See coop_router.h and xrCoop/coop_routes.h.
 //
-// R32 W2a (temp/r30/design/R32-final.md §1 W2a, §8): the code scope and the writer gate of script writes, next to runs_now.
+// The code scope and the writer gate of script writes, next to runs_now:
 //   - Scope: coop_route.script registers every wrapper it makes with its domain (coop.route.scoped(wrapper, domain)); the table is
 //     kept in the Lua registry, weak-keyed. The scope of the running code is the domain of the innermost registered wrapper on the
 //     live Lua stack (coop.route.scope(); writer_refuses below), so a Lua error leaves nothing stale.
-//   - Gate: writer_refuses(call, op, target) is what alife_simulator_script.cpp and level_script.cpp ask after today's call gate. The
+//   - Gate: writer_refuses(call, op, target) is what alife_simulator_script.cpp and level_script.cpp ask after the call gate. The
 //     co-op host, a player's machine and single player get false at once (calls::decide_writer_gate: Run, Mirror). The world server
 //     and a map server compute the target's root (writing::root_facts_of), its writer (Mode::writer_of), the scope, and the pure
 //     verdict (writer::gate); Refuse, Ask and Order are counted per (call, script) with one log line each (the census, coop_status),
-//     and so is a world server's create that runs into a led map from code that may run on its map server as well (calls::census_note,
-//     §9.2 "WS unknown-scope writes into a led level").
-//     Under coop_writer_gate = enforce a Refuse is refused; Ask and Order have no engine path yet and keep today's code (counted).
-//   - Setting: the console command coop_writer_gate = log | enforce (register_console; log in the first build).
-// The declarations live in the stock files that call them until coop_router.h gets them (the lead's file).
+//     and so is a world server's create that runs into a led map from code that may run on its map server as well
+//     (calls::census_note).
+//     Only under coop_writer_gate = enforce is a Refuse refused; the default is log, which refuses nothing. Ask and Order have no
+//     engine path: they keep the call gate's answer in both settings (counted).
+//   - Setting: the console command coop_writer_gate = log | enforce (register_console; log by default).
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_router.h"
 #include "coop_manager.h"
 #include "coop_net.h"
-#include "coop_writer.h" // R32 W2a: writing::root_facts_of
+#include "coop_writer.h" // writing::root_facts_of
 #include "coop_levels.h"
-#include "xrCoop/coop_calls.h"
+#include "coop_lua.h" // lua_api::arg_whole_u32
+#include "xrCoop/coop_lua_errors.h" // lua_errors::LogBudget
 #include "xrCoop/coop_mode.h"
+#include "xrCoop/coop_text.h"
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -33,6 +34,7 @@
 #include "../../xrEngine/xr_ioc_cmd.h"
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,36 +69,42 @@ struct BinderSlot
 
 struct State
 {
-	bool loaded = false;
+	// Set under g_lock once the ltx files are read, cleared by install(); read without the lock first (load_overrides, every binder
+	// update on a mirror): a true there means the table is complete.
+	std::atomic<bool> loaded{false};
 	routes::Table table;
 	std::vector<std::string> none_functions;
 	std::vector<std::string> files; // read, in order
 	u32 rules = 0;
 	u32 binder_rules = 0; // (binding, method) rules of [binder_host]
 	u32 errors = 0;
-	// Table::route lowercases both names and scans the prefixes: a handler is routed once when it is registered, and
+	// Table::rule lowercases both names and scans the prefixes: a handler is routed once when it is registered, and
 	// a pair seen before (one script's many time events) is answered from here.
 	std::unordered_map<std::string, Domain> cache; // callback '\1' script, as Lua gave them
 	u64 cache_flushes = 0;
 	u64 routed[routes::Counters::kDomains] = {}; // of() answers by domain since install
 	routes::Counters counters;
+	lua_errors::LogBudget batch_refusals{8}; // note_batch's lines of refused rows: the first ones, then one in a hundred
 	// Binders: one slot per distinct script_binding string; the binder asks with the address of its shared_str, which
 	// the slot pins, so the second ask is a pointer lookup.
 	std::vector<BinderSlot> binder_slots;
 	std::unordered_map<std::string, size_t> binder_by_name; // binding as written -> slot
 	std::unordered_map<const char*, size_t> binder_by_ptr;  // address of the binding string -> slot
-	// R32 W2a: what the writer gate refused, asked or ordered (or would have, under log), and the world's creates that ran into a led
-	// map, per (kind, call, script)
+	// What the writer gate refused, asked or ordered (or would have, under log), and the world's creates that ran into a led map, per
+	// (kind, call, script)
 	calls::WriterCensus census;
-	// R32 W2a: the kind of a new object of a class (section_kind), per factory class; a constant of the process (the classes are
+	// The kind of a new object of a class (section_kind), per factory class; a constant of the process (the classes are
 	// registered once), so install and reset keep it
 	std::unordered_map<CLASS_ID, calls::Target> class_kinds;
 };
 
 State g;
 xrCriticalSection g_lock;
+// This process's coop_writer_gate: log until the console command says otherwise (CCC_WriterGate). Read by the script gate and by
+// the id steps of xrServer (writer_gate()).
+std::atomic<calls::WriterGate> g_writer_gate{calls::WriterGate::Log};
 
-// --- R32 W2a: the code scope ---
+// --- the code scope ---
 
 constexpr int kScopeDepth = 64; // Lua frames looked at for the innermost wrapper and the calling script
 char g_scope_key = 0; // its address keys the wrapper -> domain table in the Lua registry
@@ -119,21 +127,24 @@ bool helper_script(const std::string& key)
 	return key == "_g" || key == "axr_main" || key == "coop_route" || key.compare(0, 6, "utils_") == 0;
 }
 
-// What the Lua stack of L says about the running code: the domain of the innermost registered wrapper (empty: no wrapper), and the
-// script that made the engine call: the innermost Lua function that is no helper's, else the innermost one ("?" when there is none).
+// What the Lua stack of L says about the running code: the domain of the innermost registered wrapper (empty: no wrapper), and, when
+// asked for (with_script), the script that made the engine call: the innermost Lua function that is no helper's, else the innermost
+// one ("?" when there is none or when not asked for). Without the script the walk reads no frame's source.
 struct StackFacts
 {
 	std::string domain;
 	std::string script = "?";
 };
 
-StackFacts stack_facts(lua_State* L)
+StackFacts stack_facts(lua_State* L, bool with_script)
 {
 	StackFacts out;
 	if (!L)
 		return out;
 	const int top = lua_gettop(L);
 	const bool have_table = push_scopes(L);
+	if (!have_table && !with_script)
+		return out;
 	const int base = lua_gettop(L);
 	bool script_found = false;
 	std::string innermost;
@@ -142,9 +153,9 @@ StackFacts stack_facts(lua_State* L)
 		lua_Debug ar;
 		if (!lua_getstack(L, level, &ar))
 			break;
-		if (!lua_getinfo(L, "Sf", &ar)) // pushes the function of that frame
+		if (!lua_getinfo(L, with_script ? "Sf" : "f", &ar)) // pushes the function of that frame
 			continue;
-		if (!script_found && ar.what && xr_strcmp(ar.what, "C") && ar.source && *ar.source)
+		if (with_script && !script_found && ar.what && xr_strcmp(ar.what, "C") && ar.source && *ar.source)
 		{
 			std::string key = routes::script_key(ar.source);
 			if (innermost.empty())
@@ -177,7 +188,7 @@ StackFacts stack_facts(lua_State* L)
 	return out;
 }
 
-// --- R32 W2a: the writer gate ---
+// --- the writer gate ---
 
 const char* root_kind_name(writer::RootKind k)
 {
@@ -260,7 +271,7 @@ void census_line(const char* call, writer::WriteOp op, const calls::WriteTarget&
 	const char* outcome = kind == calls::CensusKind::RunIntoLed
 	    ? "ran in every setting: a create into a map a map server leads, from code that may run there as well (a double: a route line)"
 	    : d.act == calls::WriteAct::Refuse                                     ? "refused"
-	    : d.act == calls::WriteAct::Today && setting == calls::WriterGate::Log ? "counted only (coop_writer_gate log)"
+	    : d.act == calls::WriteAct::KeepCallGate && setting == calls::WriterGate::Log ? "counted only (coop_writer_gate log)"
 	                                                                           : "kept: no engine path for an ask or an order yet";
 	::Msg("[coop] writer gate: %s %s%s%s%s%s of %s: %s, verdict %s, written by %s%s, %s, from %s; %s (the rest of this call and script "
 	      "only count in coop_status)",
@@ -276,19 +287,19 @@ public:
 	CCC_WriterGate(LPCSTR name) : IConsole_Command(name) {}
 	void Execute(LPCSTR args) override
 	{
-		calls::WriterGate setting = calls::writer_gate_setting().load();
+		calls::WriterGate setting = g_writer_gate.load();
 		if (!calls::parse_writer_gate(args ? args : "", setting))
 		{
 			InvalidSyntax();
 			return;
 		}
-		calls::writer_gate_setting().store(setting);
+		g_writer_gate.store(setting);
 		::Msg("[coop] coop_writer_gate %s", calls::writer_gate_name(setting));
 	}
-	void Status(TStatus& S) override { xr_strcpy(S, calls::writer_gate_name(calls::writer_gate_setting().load())); }
+	void Status(TStatus& S) override { xr_strcpy(S, calls::writer_gate_name(g_writer_gate.load())); }
 	void Info(TInfo& I) override
 	{
-		xr_strcpy(I, "the writer gate of script writes (R32 W2a): log (counts in coop_status what it would refuse, ask or order) | enforce");
+		xr_strcpy(I, "the writer gate of script writes: log (counts in coop_status what it would refuse, ask or order) | enforce");
 	}
 	void fill_tips(vecTips& tips, u32 /*mode*/) override
 	{
@@ -299,11 +310,10 @@ public:
 
 bool iends_with(std::string_view s, std::string_view suffix)
 {
-	return s.size() >= suffix.size() && routes::detail::iequals(s.substr(s.size() - suffix.size()), suffix);
+	return s.size() >= suffix.size() && ascii::iequals(s.substr(s.size() - suffix.size()), suffix);
 }
+} // namespace
 
-// coop_route.ltx first, then coop_route_*.ltx, then coop_compat_*.ltx, each group by name. file_list_open, not
-// file_list_open_ex: a checked rescan drops the subfolders of configs (coop_main.script used to note the same).
 std::vector<std::string> route_files(bool& have_main)
 {
 	std::vector<std::string> extra, compat;
@@ -315,12 +325,12 @@ std::vector<std::string> route_files(bool& have_main)
 		{
 			if (!name)
 				continue;
-			const std::string n = routes::detail::lowered(name);
+			const std::string n = ascii::lowered(name);
 			if (n == "coop_route.ltx")
 				have_main = true;
-			else if (routes::detail::istarts_with(n, "coop_route_") && iends_with(n, ".ltx"))
+			else if (ascii::istarts_with(n, "coop_route_") && iends_with(n, ".ltx"))
 				extra.push_back(n);
-			else if (routes::detail::istarts_with(n, "coop_compat_") && iends_with(n, ".ltx"))
+			else if (ascii::istarts_with(n, "coop_compat_") && iends_with(n, ".ltx"))
 				compat.push_back(n);
 		}
 		FS.file_list_close(list);
@@ -335,6 +345,8 @@ std::vector<std::string> route_files(bool& have_main)
 	return files;
 }
 
+namespace
+{
 using IniLines = std::vector<std::pair<std::string, std::string>>;
 
 // The `name = value` lines of a section, in file order; empty when the section is not there.
@@ -375,12 +387,12 @@ void read_file(const std::string& name)
 			if (g.errors++ < kErrorsLogged)
 				::Msg("! [coop] configs\\%s: %s", name.c_str(), e.c_str());
 	}
-	// F3a multilevel: the behaviour of online objects, the keys of two sections (routes::Table::level_behaviour)
+	// the behaviour of online objects, the keys of two sections (routes::Table::level_behaviour)
 	for (const auto& line : section_lines(ini, "level_scripts"))
 		g.table.add_level_script(line.first);
 	for (const auto& line : section_lines(ini, "level_callbacks"))
 		g.table.add_level_callback(line.first);
-	// F2 T11: [binder_host], `script_binding = method, method`
+	// [binder_host], `script_binding = method, method`
 	if (ini.section_exist(routes::kBinderHostSection))
 	{
 		std::vector<std::string> errors;
@@ -403,7 +415,7 @@ void read_file(const std::string& name)
 			LPCSTR value = nullptr;
 			if (!ini.r_line(kNoneSection, int(i), &key, &value) || !key || !*key)
 				continue;
-			const std::string fn(routes::detail::trimmed(key));
+			const std::string fn(ascii::trim(key, ascii::space_or_eol));
 			if (!fn.empty() && std::find(g.none_functions.begin(), g.none_functions.end(), fn) == g.none_functions.end())
 				g.none_functions.push_back(fn);
 		}
@@ -411,7 +423,9 @@ void read_file(const std::string& name)
 	g.files.push_back(name);
 }
 
-// Under g_lock.
+// Under g_lock. routes::Table::rule through the cache: a handler is routed once when it is registered, and a pair seen before (one
+// script's many time events) is answered from here. The cache holds only the table's answers and is cleared whenever the table is
+// loaded again.
 Domain route_of(std::string_view callback, const std::string& script)
 {
 	std::string key;
@@ -420,9 +434,7 @@ Domain route_of(std::string_view callback, const std::string& script)
 	const auto it = g.cache.find(key);
 	if (it != g.cache.end())
 		return it->second;
-	Domain d = g.table.route(callback, script);
-	if (d == Domain::Host && g.table.level_behaviour(callback, script))
-		d = Domain::Level; // runs where Host runs, and on a map server
+	const Domain d = g.table.rule(callback, script);
 	if (g.cache.size() >= kCacheMax)
 	{
 		g.cache.clear();
@@ -449,11 +461,28 @@ bool arg_string(lua_State* L, int idx, std::string_view& out)
 	return true;
 }
 
-// The functions below never raise a Lua error on bad arguments (R-11.4): a wrong call from an addon gets nil / true /
+// The functions below never raise a Lua error on bad arguments: a wrong call from an addon gets nil / true /
 // nothing, like the rest of the coop namespace.
 
-// coop.route.of(callback, func) -> domain, script
-int l_of(lua_State* L)
+// The script key of the Lua function at `idx` ("[C]" for a C function), "?" for anything else.
+std::string script_of(lua_State* L, int idx)
+{
+	if (lua_type(L, idx) != LUA_TFUNCTION)
+		return "?";
+	lua_Debug ar;
+	lua_pushvalue(L, idx);
+	if (!lua_getinfo(L, ">S", &ar)) // pops the function
+		return "?";
+	return ar.what && !xr_strcmp(ar.what, "C") ? std::string("[C]") : routes::script_key(ar.source ? ar.source : "");
+}
+
+// coop.route.of(callback, func) and coop.route.rule_of(callback, func) -> domain, script: both answer routes::Table::rule for the same
+// input.
+// of (Traced) routes a handler as it is registered: the answer goes through the route cache and counts in the routed totals of
+// coop_status. rule_of is a script asking its own rule: no cache entry, no count. An empty callback asks for the script alone (its key
+// and its rule), which is no handler: of neither caches nor counts it either.
+template <bool Traced>
+int l_rule(lua_State* L)
 {
 	std::string_view callback;
 	if (!arg_string(L, 1, callback))
@@ -462,24 +491,18 @@ int l_of(lua_State* L)
 		return 1;
 	}
 	load_overrides();
-	std::string script = "?";
-	if (lua_type(L, 2) == LUA_TFUNCTION)
-	{
-		lua_Debug ar;
-		lua_pushvalue(L, 2);
-		if (lua_getinfo(L, ">S", &ar)) // pops the function
-			script = ar.what && !xr_strcmp(ar.what, "C") ? std::string("[C]") : routes::script_key(ar.source ? ar.source : "");
-	}
+	const std::string script = script_of(L, 2);
 	Domain d = Domain::Owner;
 	{
 		xrCriticalSectionGuard guard(g_lock);
-		if (callback.empty()) // review M4: coop_route.script_of only asks the script; not a handler, not cached
-			d = g.table.route(callback, script);
-		else
+		const bool traced = Traced && !callback.empty();
+		if (traced)
 		{
 			d = route_of(callback, script);
 			++g.routed[size_t(d)];
 		}
+		else
+			d = g.table.rule(callback, script);
 	}
 	lua_pushstring(L, routes::domain_name(d));
 	lua_pushlstring(L, script.data(), script.size());
@@ -507,7 +530,7 @@ int l_note(lua_State* L)
 		!routes::parse_outcome(outcome, o))
 		return 0;
 	arg_string(L, 3, script);
-	arg_string(L, 4, callback); // review M2: skips are kept per (callback, script)
+	arg_string(L, 4, callback); // skips are kept per (callback, script)
 	xrCriticalSectionGuard guard(g_lock);
 	g.counters.note(d, o, script, callback);
 	return 0;
@@ -531,7 +554,7 @@ int l_none_functions(lua_State* L)
 	return 1;
 }
 
-// coop.route.scoped(wrapper, domain): R32 W2a, the wrapper's code runs in that domain ("host", "owner", "view", "level", "none", or
+// coop.route.scoped(wrapper, domain): the wrapper's code runs in that domain ("host", "owner", "view", "level", "none", or
 // calls::kUnknownScope). Anything else is ignored.
 int l_scoped(lua_State* L)
 {
@@ -552,7 +575,7 @@ int l_scoped(lua_State* L)
 // coop.route.scope() -> the domain of the innermost registered wrapper on this Lua stack, nil outside any.
 int l_scope(lua_State* L)
 {
-	const StackFacts f = stack_facts(L);
+	const StackFacts f = stack_facts(L, false);
 	if (f.domain.empty())
 		lua_pushnil(L);
 	else
@@ -560,7 +583,83 @@ int l_scope(lua_State* L)
 	return 1;
 }
 
-// --- F2 T11: binders ---
+// coop.route.note_batch bounds: one call takes at most kNoteBatchRows rows, a row counts at most kNoteBatchMax calls. A batch is what
+// one frame of wrapped handlers ran, far below both; the bound keeps the router lock to kNoteBatchRows single additions.
+constexpr int kNoteBatchRows = 256;
+constexpr double kNoteBatchMax = double(1u << 20);
+
+// coop.route.note_batch({ {domain, outcome, count[, script[, callback]]}, ... }) -> rows counted. A row counts what `count` calls of
+// coop.route.note(domain, outcome, script, callback) count, all rows under one lock. A row that is not of that shape (an unknown
+// domain or outcome, a count that is no whole number 1 .. kNoteBatchMax) and every row past the first kNoteBatchRows are refused:
+// counted and logged, not noted.
+// No allocation: the rows are read into a fixed array whose names are views of the Lua strings, which the argument table holds for
+// the whole call (LuaJIT does not move strings).
+int l_note_batch(lua_State* L)
+{
+	struct Row
+	{
+		Domain d = Domain::Owner;
+		Outcome o = Outcome::Ran;
+		uint32_t count = 0;
+		std::string_view script, callback;
+	};
+	Row rows[kNoteBatchRows];
+	int noted = 0;
+	int refused = 0;
+	if (lua_type(L, 1) == LUA_TTABLE)
+	{
+		const int n = int(lua_objlen(L, 1));
+		const int read = n < kNoteBatchRows ? n : kNoteBatchRows;
+		refused = n - read;
+		for (int i = 1; i <= read; ++i)
+		{
+			lua_rawgeti(L, 1, i);
+			const int row = lua_gettop(L);
+			bool ok = false;
+			if (lua_type(L, row) == LUA_TTABLE)
+			{
+				for (int k = 1; k <= 5; ++k)
+					lua_rawgeti(L, row, k);
+				std::string_view name, outcome;
+				Row& r = rows[noted];
+				r = Row();
+				if (arg_string(L, row + 1, name) && arg_string(L, row + 2, outcome) && routes::parse_domain(name, r.d) &&
+					routes::parse_outcome(outcome, r.o) && lua_api::arg_whole_u32(L, row + 3, kNoteBatchMax, r.count) && r.count > 0)
+				{
+					arg_string(L, row + 4, r.script);
+					arg_string(L, row + 5, r.callback);
+					++noted;
+					ok = true;
+				}
+			}
+			lua_settop(L, row - 1);
+			if (!ok)
+				++refused;
+		}
+	}
+	bool log = false;
+	u64 refusals = 0;
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		for (int i = 0; i < noted; ++i)
+		{
+			const Row& r = rows[i];
+			g.counters.note(r.d, r.o, r.script, r.callback, r.count);
+		}
+		if (refused > 0)
+		{
+			log = g.batch_refusals.allow();
+			refusals = g.batch_refusals.count();
+		}
+	}
+	if (log)
+		::Msg("! [coop] routes: note_batch refused %d row(s) (malformed, or past %d per call) (#%llu)", refused, kNoteBatchRows,
+			refusals);
+	lua_pushnumber(L, lua_Number(noted));
+	return 1;
+}
+
+// --- binders ---
 
 // Under g_lock. The slot of a binding: made on the first ask, with the actions resolved against the table. A reference
 // into g.binder_slots lives until the next call of this function.
@@ -591,7 +690,7 @@ BinderSlot& binder_slot(const char* binding)
 void install()
 {
 	xrCriticalSectionGuard guard(g_lock);
-	g.loaded = false;
+	g.loaded.store(false);
 	g.table.clear();
 	g.none_functions.clear();
 	g.files.clear();
@@ -615,15 +714,16 @@ void reset()
 	g.counters.clear();
 	for (BinderSlot& b : g.binder_slots)
 		std::fill(std::begin(b.skipped), std::end(b.skipped), u64(0));
-	g.census.clear(); // R32 W2a: a session's census, its lines again
+	g.census.clear(); // a session's census, its lines again
 }
 
 void load_overrides()
 {
+	if (g.loaded.load(std::memory_order_acquire))
+		return; // the hot path (every binder update on a mirror): no lock once read; every reader of the table takes g_lock itself
 	xrCriticalSectionGuard guard(g_lock);
-	if (g.loaded)
+	if (g.loaded.load(std::memory_order_relaxed))
 		return;
-	g.loaded = true;
 	bool have_main = false;
 	for (const std::string& name : route_files(have_main))
 		read_file(name);
@@ -635,20 +735,23 @@ void load_overrides()
 	g.binder_by_ptr.clear();
 	::Msg("[coop] callback routes: %u rule(s) and %u binder rule(s) from %u file(s), %u none function(s), %u ltx error(s)",
 		g.rules, g.binder_rules, u32(g.files.size()), u32(g.none_functions.size()), g.errors);
+	g.loaded.store(true, std::memory_order_release);
 }
 
 void register_lua(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
-		{"of", &l_of},
+		{"of", &l_rule<true>},
 		{"runs", &l_runs},
 		{"note", &l_note},
 		{"none_functions", &l_none_functions},
-		{"scoped", &l_scoped}, // R32 W2a
+		{"scoped", &l_scoped},
 		{"scope", &l_scope},
+		{"rule_of", &l_rule<false>},
+		{"note_batch", &l_note_batch},
 		{nullptr, nullptr},
 	};
-	// R32 W2a: the wrapper -> domain table of this state, weak-keyed (a wrapper goes with its handler); made once per state, so a second
+	// The wrapper -> domain table of this state, weak-keyed (a wrapper goes with its handler); made once per state, so a second
 	// registration keeps the marks of the wrappers made before it
 	if (!push_scopes(L))
 	{
@@ -685,7 +788,7 @@ bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarg
 		return false; // single player: the stock game writes everything
 	const writer::ProcessKind kind = writer::process_kind(is_mirror(), mode().decides_world(), mode().leads_level());
 	if (kind == writer::ProcessKind::Whole || kind == writer::ProcessKind::Mirror)
-		return false; // the co-op host writes everything; a player's machine keeps today's verdict (calls::decide; the golden table)
+		return false; // the co-op host writes everything; a player's machine follows the call gate's verdict
 	if (!ai().get_alife())
 		return false;
 	const u16 own = levels::my_level();
@@ -698,13 +801,15 @@ bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarg
 	}
 	else
 		root = writer::RootFacts{writer::RootKind::Resident, writer::kNoId, target.level}; // a create with no parent: its new root
-	const StackFacts stack = stack_facts(ai().script_engine().lua());
+	const StackFacts stack = stack_facts(ai().script_engine().lua(), true);
 	const writer::CodeScope scope = stack.domain.empty() ? writer::CodeScope::Unknown : calls::scope_of_domain(stack.domain);
 	const bool on_own_level = kind == writer::ProcessKind::Level && root.level != writer::kNoLevel && root.level == own;
-	const calls::WriterGate setting = calls::writer_gate_setting().load();
+	const calls::WriterGate setting = g_writer_gate.load();
 	const writer::Writer root_writer = mode().writer_of(root);
 	writer::Writer who = root_writer;
-	calls::WriteFacts facts{kind, who, scope, on_own_level, calls::is_ghost(root, mode().actor_is_player())};
+	const bool on_other_level = kind == writer::ProcessKind::Level && root.level != writer::kNoLevel && root.level != own;
+	calls::WriteFacts facts{kind, who, scope, on_own_level, calls::is_ghost(root, mode().actor_is_player()), on_other_level,
+	    target.kind != calls::Target::Object};
 	calls::WriteDecision d = calls::decide_writer_gate(facts, op, calls::Gate::Run, setting);
 	// a new root that is a unit is this process's own (new_root_writer): asked only where the resident's answer would not run, so the
 	// section is read only then
@@ -715,7 +820,7 @@ bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarg
 		facts.writer = who;
 		d = calls::decide_writer_gate(facts, op, calls::Gate::Run, setting);
 	}
-	// the census (§9.2): what the gate does not run here, and the world's creates into a led map from code that may run there as well
+	// the census: what the gate does not run here, and the world's creates into a led map from code that may run there as well
 	// (counted with the root's writer from before new_root_writer: a level-code squad on a led map is the world's own unit, yet that
 	// map's server runs the same code)
 	const calls::CensusNote note = calls::census_note(kind, root_writer, op, scope, d.verdict);
@@ -729,9 +834,14 @@ bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarg
 	return d.gate == calls::Gate::Refuse;
 }
 
+calls::WriterGate writer_gate()
+{
+	return g_writer_gate.load();
+}
+
 void register_console()
 {
-	CMD1(CCC_WriterGate, "coop_writer_gate"); // R32 W2a
+	CMD1(CCC_WriterGate, "coop_writer_gate");
 }
 
 routes::BinderAction binder_action(const char* binding, BinderMethod method)
@@ -752,7 +862,7 @@ routes::BinderAction binder_action(const char* binding, BinderMethod method)
 void print_status()
 {
 	xrCriticalSectionGuard guard(g_lock);
-	if (!g.loaded)
+	if (!g.loaded.load())
 	{
 		::Msg("[coop] routes: no handler routed yet (coop_route*.ltx is read on the first registration)");
 		return;
@@ -773,7 +883,7 @@ void print_status()
 		::Msg("[coop] routes:   %-5s ran %llu, skipped %llu, errors %llu", routes::domain_name(d), t.ran, t.skipped,
 			t.errors);
 	}
-	// Review M2: per (callback, script). A handler skipped every frame tops the first list; a rare one (a use, a key
+	// Per (callback, script). A handler skipped every frame tops the first list; a rare one (a use, a key
 	// press) shows in the second, the pairs skipped for the first time most recently.
 	const std::vector<std::pair<std::string, u64>> top = g.counters.top_skipped(kTopSkipped);
 	std::string line;
@@ -787,7 +897,7 @@ void print_status()
 	::Msg("[coop] routes: latest new skips %s (%u pair(s) skipped so far)", line.empty() ? "(none)" : line.c_str(),
 		u32(g.counters.pairs_tracked()));
 
-	// F2 T11: the binder rules. skipped = host-only calls a client did not make (the Lua guards of
+	// The binder rules. skipped = host-only calls a client did not make (the Lua guards of
 	// coop_client_binders.script count their errors in their own [coop-binders] lines).
 	std::vector<std::pair<std::string, u64>> rows;
 	u64 skipped = 0;
@@ -807,10 +917,10 @@ void print_status()
 		line += (line.empty() ? "" : ", ") + rows[i].first + " " + std::to_string(rows[i].second);
 	::Msg("[coop] binders: most skipped %s", line.empty() ? "(none)" : line.c_str());
 
-	// R32 W2a: the census of the writer gate (what the stand reads before coop_writer_gate enforce)
+	// The census of the writer gate (what the stand reads before coop_writer_gate enforce)
 	const calls::WriterCensus::Totals& c = g.census.totals();
 	::Msg("[coop] writer gate: coop_writer_gate %s | refuse %llu, ask %llu, order %llu, run into led %llu (%u call/script pair(s)%s)",
-		calls::writer_gate_name(calls::writer_gate_setting().load()), c.refuse, c.ask, c.order, c.led, u32(g.census.keys()),
+		calls::writer_gate_name(g_writer_gate.load()), c.refuse, c.ask, c.order, c.led, u32(g.census.keys()),
 		g.census.dropped() ? ", more than the table keeps" : "");
 	line.clear();
 	for (const std::pair<std::string, u64>& s : g.census.top(kTopSkipped))

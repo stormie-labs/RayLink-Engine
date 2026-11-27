@@ -6,7 +6,7 @@
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_alife.h"
-#include "coop_callgate.h" // F2 T12
+#include "coop_callgate.h"
 #include "xrCoop/coop_relay_rules.h"
 #include "xrCoop/coop_sky_jump.h"
 
@@ -183,7 +183,7 @@ struct State
 State g;
 sky::JumpNote g_sky_jumps; // outside State (an atomic): noted on any thread, taken by frame() on the main thread
 
-// S4 (docs/MODES.md section 4, P-E): the sky of a map that a process leads while another one decides the world (a map server): its
+// The sky of a map that a process leads while another one decides the world (a map server): its
 // own step, level_sky_frame, apart from the co-op host's host_weather_frame. The same fingerprint, period and joiners as there.
 struct LevelSky
 {
@@ -426,41 +426,48 @@ void host_weather_frame(u64 now)
 	host_send_weather(*e, kInvalidPeer, g.weather_dirty ? Lane::Reliable : Lane::Unreliable);
 }
 
-// Full state to every player who just finished loading the world (right before JoinComplete,
-// which coop_join sends after sync::host_end_join; the periodic refresh covers the rest).
-void host_join_frame(bool with_time)
+// send(peer) for every player who finished loading the world since the last call. `joining` holds the joined players seen
+// loading it; one who is no longer joined leaves it. send() only sends: the session's table of players stays as it is.
+template <class Send> void join_frame(xr_set<PeerId>& joining, Send send)
 {
-	const std::vector<PeerInfo> peers = mgr().session().peers();
-	for (auto it = g.joining.begin(); it != g.joining.end();)
+	const Session& s = mgr().session();
+	for (auto it = joining.begin(); it != joining.end();)
 	{
 		bool present = false;
-		for (const PeerInfo& p : peers)
-			present = present || (p.id == *it && p.state == PeerState::Joined);
-		it = present ? std::next(it) : g.joining.erase(it);
+		s.for_each_joined([&](const PeerInfo& p) { present = present || (p.id == *it && p.state == PeerState::Joined); });
+		it = present ? std::next(it) : joining.erase(it);
 	}
-	for (const PeerInfo& p : peers)
+	s.for_each_joined([&](const PeerInfo& p)
 	{
 		if (p.state != PeerState::Joined)
-			continue;
+			return;
 		if (sync::host_peer_joining(p.id))
 		{
-			g.joining.insert(p.id);
-			continue;
+			joining.insert(p.id);
+			return;
 		}
-		if (!g.joining.erase(p.id))
-			continue;
-		if (with_time)
-			host_send_time(p.id);
+		if (joining.erase(p.id))
+			send(p.id);
+	});
+}
+
+// Full state to every player who just finished loading the world (right before JoinComplete,
+// which coop_join sends after sync::host_end_join; the periodic refresh covers the rest).
+void host_join_frame()
+{
+	join_frame(g.joining, [](PeerId peer)
+	{
+		host_send_time(peer);
 		if (CEnvironment* e = env_ready())
-			host_send_weather(*e, p.id, Lane::Reliable);
-	}
+			host_send_weather(*e, peer, Lane::Reliable);
+	});
 }
 
 void host_frame(u64 now)
 {
 	if (!alife_ready())
 		return;
-	host_join_frame(true);
+	host_join_frame();
 	host_time_frame(now);
 	host_weather_frame(now);
 }
@@ -487,28 +494,11 @@ void level_send_weather(CEnvironment& e, PeerId to, Lane lane)
 // The sky to every player of the map who just finished loading it (the time is not this process's: the world server sends it).
 void level_join_frame()
 {
-	const std::vector<PeerInfo> peers = mgr().session().peers();
-	for (auto it = g_level_sky.joining.begin(); it != g_level_sky.joining.end();)
+	join_frame(g_level_sky.joining, [](PeerId peer)
 	{
-		bool present = false;
-		for (const PeerInfo& p : peers)
-			present = present || (p.id == *it && p.state == PeerState::Joined);
-		it = present ? std::next(it) : g_level_sky.joining.erase(it);
-	}
-	for (const PeerInfo& p : peers)
-	{
-		if (p.state != PeerState::Joined)
-			continue;
-		if (sync::host_peer_joining(p.id))
-		{
-			g_level_sky.joining.insert(p.id);
-			continue;
-		}
-		if (!g_level_sky.joining.erase(p.id))
-			continue;
 		if (CEnvironment* e = env_ready())
-			level_send_weather(*e, p.id, Lane::Reliable);
-	}
+			level_send_weather(*e, peer, Lane::Reliable);
+	});
 }
 
 void host_on_time_request(PeerId from, Reader& r)
@@ -678,7 +668,7 @@ void client_frame(u64 now)
 	const bool live = mgr().is_live_client();
 	if (live && !g.was_live)
 	{
-		// (Re)entered the world: apply what we hold (P6: kept while loading, applied now).
+		// (Re)entered the world: apply what we hold (kept while loading, applied now).
 		g.time_applied = false;
 		g.time_pending = g.have_time;
 		g.weather_pending = g.have_weather;
@@ -810,11 +800,11 @@ void frame()
 	else
 		client_frame(now);
 	sky_frame(); // after client_frame (its clock correction); the host's jumps came before (rest::frame, scripts, console)
-	// a map server's sky: its mode's frame runs level_sky_frame (S4, srv/coop_srv_mode.cpp)
+	// a map server's sky: its mode's frame runs level_sky_frame (srv/coop_srv_mode.cpp)
 }
 
-// F3a: time is the world server's, the sky of a map is its authority's: one cycle, the section of this map. A map server's mode
-// calls it every frame of its session while its world is up (S4: its own step, not the co-op host's host_weather_frame).
+// Time is the world server's, the sky of a map is its authority's: one cycle, the section of this map. A map server's mode
+// calls it every frame of its session while its world is up (its own step, not the co-op host's host_weather_frame).
 void level_sky_frame(u64 now)
 {
 	level_join_frame();
@@ -899,8 +889,8 @@ bool intercept_time_jump(u32 days, u32 hours, u32 mins)
 	}
 	if (!mgr().active())
 		return false;
-	// F2 T12: the call gate decides (world with the TimeRequest path; an ltx override may run it here). Round 1: a host
-	// command being applied changes nothing here, as before T12.
+	// The call gate decides (world with the TimeRequest path; an ltx override may run it here). A host command being applied
+	// changes nothing here.
 	callgate::Args args;
 	args.runs_while_applying = false;
 	const calls::Gate gate = callgate::client_gate("level:change_game_time", nullptr, args);
@@ -933,8 +923,8 @@ bool refuse_script_weather(const char* name)
 	}
 	if (!mgr().active())
 		return false;
-	// F2 T12: the call gate decides and logs (world, no request path: the host decides the weather). Round 1: a host
-	// command being applied changes nothing here, as before T12.
+	// The call gate decides and logs (world, no request path: the host decides the weather). A host command being applied
+	// changes nothing here.
 	callgate::Args args;
 	args.runs_while_applying = false;
 	if (callgate::client_gate(name, nullptr, args) == calls::Gate::Run)
@@ -963,8 +953,8 @@ bool refuse_engine_time_factor(float factor)
 {
 	if (!mgr().active() || fsimilar(factor, 1.f))
 		return false;
-	// The refusal is the rule, not a fault: a mod that stops the clock while its window is open asks again every time (the owner's
-	// log of 2026-11-13 had twelve red lines of it). One plain line for the first of them, then one for every fiftieth.
+	// The refusal is the rule, not a fault: a mod that stops the clock while its window is open asks again every time (a
+	// session's log can hold a dozen of them). One plain line for the first of them, then one for every fiftieth.
 	static u32 s_refused = 0;
 	if (s_refused++ % 50 == 0)
 		::Msg("[coop] time_factor %.3f refused: slow motion is off in a co-op session (%u so far)", factor, s_refused);

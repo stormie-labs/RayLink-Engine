@@ -310,7 +310,7 @@ protected:
 
 
 public:
-	// Anomaly Coop: read-only orientation for network snapshots (coop/coop_players.cpp)
+	// coop: read-only orientation for network snapshots (coop/coop_players.cpp)
 	float coop_model_yaw() const { return r_model_yaw; }
 	const SRotation& coop_torso() const { return unaffected_r_torso; }
 
@@ -340,7 +340,7 @@ public:
 
 	void g_SetAnimation(u32 mstate_rl);
 	void g_SetSprintAnimation(u32 mstate_rl, MotionID& head, MotionID& torso, MotionID& legs);
-	// Anomaly Coop (build 10): forget the motions g_SetAnimation played, so that its next call plays them again (it
+	// coop: forget the motions g_SetAnimation played, so that its next call plays them again (it
 	// plays a cycle only when the MotionID changes). The co-op calls it when the actor stands up after a lying pose.
 	void ResetAnimationCache();
 public:

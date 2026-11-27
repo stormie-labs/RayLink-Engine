@@ -1,11 +1,13 @@
-// Anomaly Coop — call router gate (F2 T12, MOD_LAYER.md §2.3). See coop_callgate.h and xrCoop/coop_calls.h.
+// Anomaly Coop — call router gate (MOD_LAYER.md §2.3). See coop_callgate.h and xrCoop/coop_calls.h.
 #include "stdafx.h"
 #include "coop_callgate.h"
 #include "coop_manager.h"
 #include "coop_events.h"
+#include "coop_world.h" // server_entity
 #include "coop_entities.h" // client_applying
 #include "xrCoop/coop_mode.h"
 #include "coop_requests.h" // lua_client
+#include "coop_router.h" // route_files
 #include "coop_story.h" // applying
 #include "xrCoop/coop_validate.h"
 #include "xrServer_Objects_ALife_Monsters.h"
@@ -43,44 +45,6 @@ struct State
 State g;
 xrCriticalSection g_lock;
 
-bool iends_with(std::string_view s, std::string_view suffix)
-{
-	return s.size() >= suffix.size() && calls::detail::iequals(s.substr(s.size() - suffix.size()), suffix);
-}
-
-// coop_route.ltx first, then coop_route_*.ltx, then coop_compat_*.ltx, each group by name: the router's files and
-// order (coop_router.cpp route_files), so one file can hold both a mod's callback routes and its call classes.
-std::vector<std::string> override_files()
-{
-	std::vector<std::string> extra, compat;
-	bool have_main = false;
-	xr_vector<LPSTR>* list = FS.file_list_open("$game_config$", FS_ListFiles | FS_RootOnly);
-	if (list)
-	{
-		for (LPSTR name : *list)
-		{
-			if (!name)
-				continue;
-			const std::string n = calls::detail::lowered(name);
-			if (n == "coop_route.ltx")
-				have_main = true;
-			else if (calls::detail::istarts_with(n, "coop_route_") && iends_with(n, ".ltx"))
-				extra.push_back(n);
-			else if (calls::detail::istarts_with(n, "coop_compat_") && iends_with(n, ".ltx"))
-				compat.push_back(n);
-		}
-		FS.file_list_close(list);
-	}
-	std::sort(extra.begin(), extra.end());
-	std::sort(compat.begin(), compat.end());
-	std::vector<std::string> files;
-	if (have_main)
-		files.emplace_back("coop_route.ltx");
-	files.insert(files.end(), extra.begin(), extra.end());
-	files.insert(files.end(), compat.begin(), compat.end());
-	return files;
-}
-
 // One file's [call_classes] into the table. Under g_lock.
 void read_file(const std::string& name)
 {
@@ -117,8 +81,8 @@ void read_file(const std::string& name)
 	g.files.push_back(name);
 }
 
-// Counts the decision and logs a refusal while the name's budget lasts (the first kLoggedPerName of each name, review
-// M7). Under g_lock.
+// Counts the decision and logs a refusal while the name's budget lasts (the first kLoggedPerName of each name). Under
+// g_lock.
 void note(const char* name, Gate gate, const char* why, u16 target, const char* what)
 {
 	g.counters.note(name, gate);
@@ -144,17 +108,16 @@ const char* why_refused(CallClass cls, bool own)
 // own: decided by the caller; target: for the log only (0xffff = none). The decision itself is calls::decide.
 Gate decide(const char* name, bool own, u16 target, const Args& args)
 {
-	// Review M5: one condition for every gate, the alife() ones' before: a client in the host's world (LoadingWorld,
-	// Live). The host, single player and a client whose own world still runs while the host's downloads run everything.
+	// One condition for every gate: a client in the host's world (LoadingWorld, Live). The host, single player and a client whose own world still runs while the host's downloads run everything.
 	if (!name || !requests::lua_client())
 		return Gate::Run;
 	load_overrides();
-	// P8 on the client side too: a bad number is not run here nor sent to the host
+	// a bad number is not run here nor sent to the host
 	string128 bad;
 	bad[0] = 0;
 	if (args.pos && !validate::vec_finite(*args.pos))
 		xr_strcpy(bad, "the position is not a number");
-	else if (args.id != kNoId && !events::find_entity(args.id))
+	else if (args.id != kNoId && !world::server_entity(args.id))
 		xr_sprintf(bad, "object %u is not in this world", args.id);
 	// a host command being applied (an engine apply scope, the host's story) runs: it is the host's change
 	const bool applying = args.runs_while_applying && (entities::client_applying() || story::applying());
@@ -162,7 +125,7 @@ Gate decide(const char* name, bool own, u16 target, const Args& args)
 	const CallClass cls = g.classes.class_of(name);
 	Gate gate = calls::decide(cls, true, applying, own, calls::has_request_path(name, own), !bad[0]);
 	if (mode().leads_level())
-		gate = calls::decide_leading(name, gate, !bad[0]); // F3a: the objects of its level are its own
+		gate = calls::decide_leading(name, gate, !bad[0]); // the objects of its level are its own
 	note(name, gate, gate != Gate::Refuse ? nullptr : (bad[0] ? bad : why_refused(cls, own)), target, args.what);
 	return gate;
 }
@@ -172,7 +135,7 @@ bool is_own(u16 id) { return id != kNoId && (id == kActor || events::root_of(id)
 
 bool own_destroy(u16 id)
 {
-	CSE_Abstract* e = events::find_entity(id);
+	CSE_Abstract* e = world::server_entity(id);
 	const bool free_item = e && e->ID_Parent == kNoId && !smart_cast<CSE_ALifeCreatureAbstract*>(e);
 	return calls::own_destroy(e != nullptr, is_own(id), free_item);
 }
@@ -231,7 +194,8 @@ void load_overrides()
 	if (g.loaded)
 		return;
 	g.loaded = true;
-	for (const std::string& name : override_files())
+	bool have_main = false; // the router says it when coop_route.ltx is missing
+	for (const std::string& name : router::route_files(have_main))
 		read_file(name);
 	::Msg("[coop] call classes: %u export(s) in the table, %u override(s) from %u file(s) (%u for unknown names), "
 		  "%u ltx error(s)",

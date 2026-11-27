@@ -1,4 +1,4 @@
-// Anomaly Coop — a player with a new key chooses his character before the world (protocol 8, owner 2026-10-23).
+// Anomaly Coop — a player with a new key chooses his character before the world.
 //
 // Host (coop_join.cpp): a JoinRequest of a key the world has no character for is answered with Msg::CharOffer, and the
 // player is choosing (Choosers) until his Msg::CharChoice comes. The host's Lua (coop_menu_char.host_plan_character)
@@ -7,7 +7,7 @@
 // reason; a player who does not choose in kChoiceTimeoutMs is dropped.
 // Client (coop_join.cpp): shows the offer in the choice window (coop_menu_char.join_offer, main menu) and sends what
 // the window gives back (join_choice) as a CharChoice.
-// Protocol 9: the faction is the world's (CharOffer::faction), character_faction below; the host ignores the client's.
+// The faction is the world's (CharOffer::faction), character_faction below; the host ignores the client's.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "coop_protocol.h"
-#include "srv/coop_world_stage.h"
 
 namespace coop
 {
@@ -27,12 +26,12 @@ namespace newchar
 // Host: how long a player may keep the choice window open. He holds a player slot and a join in flight meanwhile.
 constexpr uint64_t kChoiceTimeoutMs = 10ull * 60 * 1000;
 
-// F3a (split levels): every player is on the host's level until then, so a faction start on another level puts a new
-// character next to the host (coop_join host_place). F3a turns this on and lets him start on his faction's level.
+// Every player starts on the host's level: a faction start on another level puts a new character next to the host
+// (coop_join host_place).
 constexpr bool kOwnLevels = false;
 
 // The point the host's Lua picked for a new character can be used: it is a point of the game graph (`valid`) and on the
-// host's level, or (F3a) on any level.
+// host's level, or on any level.
 // own_levels: a dedicated host, its own level is the service level and nobody starts there.
 constexpr bool point_usable(bool valid, bool on_host_level, bool own_levels = kOwnLevels)
 {
@@ -138,7 +137,7 @@ inline std::string buy_csv(const CharChoiceMsg& c)
 	return out;
 }
 
-// Protocol 9 (owner, 2026-10-23): the faction is part of the world; a client does not choose it. The faction of a new
+// The faction is part of the world; a client does not choose it. The faction of a new
 // character, on the host: the world's (the host picked it when it made the game), else the host's own character's (a save
 // from before the world had one), else stalker. A candidate counts only if it is a name (char_name_valid): an empty
 // string ("no level", "no Actor() yet", no record) or a corrupt one is passed over.
@@ -155,12 +154,10 @@ inline std::string character_faction(const std::string& world, const std::string
 	return "stalker";
 }
 
-// ---------------------------------------------------------------- plan 2026-11-12 stage 5: the creator's character from [creator]
+// ---------------------------------------------------------------- the creator's character from [creator]
 // The world server staged its new world from coop_new_world.ltx (coop_world_stage.h). The creator chose his character in the new world
 // screen already: when he joins first, the host makes it from the record's `creator` (coop_join.cpp host_make_creator) instead of the
 // choice window. Everybody else, and the creator in every other case, gets the window (CharOffer) as before.
-static_assert(world_stage::kMaxLoadout == CharChoiceMsg::kMaxBuy, "a loadout of the staging file fits one choice");
-
 struct CreatorFacts
 {
 	constexpr CreatorFacts() : host_rights(false) {}

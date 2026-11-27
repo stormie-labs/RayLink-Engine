@@ -16,7 +16,7 @@
 #include "ui/UIXmlInit.h"
 #include "ui/UIHelper.h"
 #include "ui/UIInventoryUtilities.h"
-#include "../xrEngine/xr_IOConsole.h" // Anomaly Coop: rs_screenmode for the UI build log line
+#include "../xrEngine/xr_IOConsole.h" // coop: rs_screenmode for the UI build log line
 //////////////////////////////////////////////////////////////////////////
 
 CUIZoneMap::CUIZoneMap()
@@ -35,7 +35,7 @@ void CUIZoneMap::Init()
 	CUIXml uiXml;
 	uiXml.Load(CONFIG_PATH, UI_PATH, "zone_map.xml");
 
-	// Anomaly Coop: one line per game UI build (level load, a resolution change, reload_hud_xml): the XML variant of
+	// coop: one line per game UI build (level load, a resolution change, reload_hud_xml): the XML variant of
 	// every UI file follows the device size at this moment (ui_size_policy.h), the minimap's shows where it lands.
 	{
 		RECT rc = {};

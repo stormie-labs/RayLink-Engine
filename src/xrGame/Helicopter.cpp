@@ -398,12 +398,12 @@ void CHelicopter::UpdateCL()
 {
 	inherited::UpdateCL();
 	CExplosive::UpdateCL();
-	coop::presence::on_heli_state(this, coop_flags(), GetfHealth(), coop_aim()); // Anomaly Coop: the host's scripts run the machine
-	if (state() != CHelicopter::eDead && coop::objects::client_drive_pose(this)) // Anomaly Coop: the host flies and shoots
+	coop::presence::on_heli_state(this, coop_flags(), GetfHealth(), coop_aim()); // coop: the host's scripts run the machine
+	if (state() != CHelicopter::eDead && coop::objects::client_drive_pose(this)) // coop: the host flies and shoots
 	{
 		if (PPhysicsShell())
 			PPhysicsShell()->SetTransform(XFORM(), mh_unspecified);
-		if (m_engineSound._feedback()) // audit H2: the rotor flies with it
+		if (m_engineSound._feedback()) // coop: the rotor flies with it
 			m_engineSound.set_position(XFORM().c);
 		coop_update_weapons();
 		UpdateHeliParticles();

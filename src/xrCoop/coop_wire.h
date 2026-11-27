@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,30 +18,87 @@ public:
 	Writer() = default;
 	explicit Writer(size_t reserve) { m_buf.reserve(reserve); }
 
-	void u8(uint8_t v);
-	void u16(uint16_t v);
-	void u32(uint32_t v);
-	void u64(uint64_t v);
-	void i32(int32_t v);
-	void f32(float v);
+	void u8(uint8_t v) { m_buf.push_back(v); }
+	void u16(uint16_t v) { put_le(v); }
+	void u32(uint32_t v) { put_le(v); }
+	void u64(uint64_t v) { put_le(v); }
+	void i32(int32_t v) { u32(static_cast<uint32_t>(v)); }
+	void f32(float v)
+	{
+		static_assert(sizeof(uint32_t) == sizeof(float), "float must be 32 bit");
+		uint32_t bits;
+		std::memcpy(&bits, &v, sizeof(bits));
+		u32(bits);
+	}
 	void boolean(bool v) { u8(v ? 1 : 0); }
 	// Unsigned LEB128.
-	void varu(uint64_t v);
+	void varu(uint64_t v)
+	{
+		while (v >= 0x80)
+		{
+			m_buf.push_back(uint8_t(v) | 0x80);
+			v >>= 7;
+		}
+		m_buf.push_back(uint8_t(v));
+	}
 	// varu length + raw bytes. Strings longer than kMaxString are truncated.
 	void str(std::string_view s);
-	void bytes(const void* data, size_t size);
-	void vec3(const float v[3]);
+	void bytes(const void* data, size_t size)
+	{
+		if (!size || !data)
+			return;
+		const uint8_t* p = static_cast<const uint8_t*>(data);
+		m_buf.insert(m_buf.end(), p, p + size);
+	}
+	void vec3(const float v[3])
+	{
+		f32(v[0]);
+		f32(v[1]);
+		f32(v[2]);
+	}
 	// Angle in radians quantized to 16 bits over [0, 2*pi).
 	void angle16(float radians);
+
+	// Rewrites the u16 / u32 already written at byte `at` (a header whose value is known only at the end: a count, a size).
+	// The bytes at [at, at + 2 or 4) must have been written.
+	void patch_u16(size_t at, uint16_t v)
+	{
+		m_buf[at] = uint8_t(v);
+		m_buf[at + 1] = uint8_t(v >> 8);
+	}
+	void patch_u32(size_t at, uint32_t v)
+	{
+		for (size_t i = 0; i < 4; ++i)
+			m_buf[at + i] = uint8_t(v >> (8 * i));
+	}
 
 	const std::vector<uint8_t>& data() const { return m_buf; }
 	const uint8_t* ptr() const { return m_buf.data(); }
 	size_t size() const { return m_buf.size(); }
 	void clear() { m_buf.clear(); }
 
+	// The bytes varu(v) writes.
+	static size_t varu_size(uint64_t v)
+	{
+		size_t n = 1;
+		for (; v >= 0x80; v >>= 7)
+			++n;
+		return n;
+	}
+
 	static constexpr size_t kMaxString = 64 * 1024;
 
 private:
+	// The bytes of `v`, least significant first, appended with one growth of the buffer.
+	template <class U> void put_le(U v)
+	{
+		const size_t at = m_buf.size();
+		m_buf.resize(at + sizeof(U));
+		uint8_t* p = m_buf.data() + at;
+		for (size_t i = 0; i < sizeof(U); ++i)
+			p[i] = uint8_t(v >> (8 * i));
+	}
+
 	std::vector<uint8_t> m_buf;
 };
 

@@ -9,7 +9,7 @@
 #include "stdafx.h"
 #include "alife_switch_manager.h"
 #include "coop/coop_entities.h"
-#include "xrCoop/coop_mode.h" // Anomaly Coop: the session's mode answers the hooks below (docs/MODES.md section 4)
+#include "xrCoop/coop_mode.h" // coop: the session's mode answers the hooks below (docs/MODES.md section 4)
 #include "xrServer_Objects_ALife.h"
 #include "alife_graph_registry.h"
 #include "alife_object_registry.h"
@@ -112,9 +112,9 @@ void CALifeSwitchManager::switch_online(CSE_ALifeDynamicObject* object)
 //	if (psAI_Flags.test(aiALife))
 		Msg						("[LSS][%d] Going online [%d][%s][%d] ([%f][%f][%f] : [%f][%f][%f]), on '%s'",Device.dwFrame,Device.dwTimeGlobal,object->name_replace(), object->ID,VPUSH(graph().actor()->o_Position),VPUSH(object->o_Position), "*SERVER*");
 #endif
-		if (coop::mode().online_elsewhere(object->ID)) return; // Anomaly Coop: a map server computes it, nothing of it is here
+		if (coop::mode().online_elsewhere(object->ID)) return; // coop: a map server computes it, nothing of it is here
 		object->switch_online();
-		coop::entities::host_on_switch(object, true); // Anomaly Coop
+		coop::entities::host_on_switch(object, true); // coop: the clients follow the switch
 	STOP_PROFILE
 }
 
@@ -125,10 +125,10 @@ void CALifeSwitchManager::switch_offline(CSE_ALifeDynamicObject* object)
 //	if (psAI_Flags.test(aiALife))
 		Msg							("[LSS][%d] Going offline [%d][%s][%d] ([%f][%f][%f] : [%f][%f][%f]), on '%s'",Device.dwFrame,Device.dwTimeGlobal,object->name_replace(), object->ID,VPUSH(graph().actor()->o_Position),VPUSH(object->o_Position), "*SERVER*");
 #endif
-		if (coop::mode().online_elsewhere(object->ID)) return; // Anomaly Coop: a map server computes it, nothing of it is here
+		if (coop::mode().online_elsewhere(object->ID)) return; // coop: a map server computes it, nothing of it is here
 		object->switch_offline();
-		coop::entities::host_on_switch(object, false); // Anomaly Coop
-		coop::mode().switched_offline(object->ID); // Anomaly Coop: a map server gives it back to the world server
+		coop::entities::host_on_switch(object, false); // coop: the clients follow the switch
+		coop::mode().switched_offline(object->ID); // coop: a map server gives it back to the world server
 	STOP_PROFILE
 }
 

@@ -1,19 +1,18 @@
-// Anomaly Coop — the waiting point of a level change (owner 2026-10-23 20:08: "a place where you wait for your allies to
-// go to the next level, with the name of the level, and nicer; when we get to split levels it goes away").
+// Anomaly Coop — the waiting point of a level change: a place where the group waits for each other before the next level.
 //
-// Until the split levels of F3a every player is on the host's level and the whole group changes level together. The
+// In the co-op every player is on the host's level and the whole group changes level together. The
 // stock exit zone is where the group meets for that: a player who stands in the zone of an exit is READY for it (his
 // "claim"); when every player who is in the world is ready for the same exit the group goes, by the path
 // coop_accept_transition always took. A player may step back out of the zone and so withdraw. Any level change of the
 // host's own (the stock zone, the "go?" dialog, jump_to_level of a guide) goes through the same board while somebody else
 // is in the session (coop_join.cpp host_gate_level_change).
 //
-// The live test of 2026-10-24 (owner: "we wait for the second player as long as it takes while we stand in the transition
-// radius; the screen darkens only when we actually start moving; holding a key for a quick transition is fine, but only for
-// those who are NOT standing in the transition zone"): no countdown, no "go now" key of the host, the darkening at the go
-// only (every moving player's, the host player's too: the board's Going state, coop_hud_transition.script), a key held by a
-// player who is not at the exit = he comes along ("consent"), and the stock route exits (sr_teleport restrictors whose drop
-// point lies in a level changer) are that changer's exit while a player stands in them (no fade, no teleport).
+// The group waits for every player as long as it takes while they stand in the transition radius; the screen darkens only when
+// the move starts; a key for a quick transition is only for those who are NOT standing in the transition zone: no countdown, no
+// "go now" key of the host, the darkening at the go only (every moving player's, the host player's too: the board's Going state,
+// coop_hud_transition.script), a key held by a player who is not at the exit = he comes along ("consent"), and the stock route
+// exits (sr_teleport restrictors whose drop point lies in a level changer) are that changer's exit while a player stands in them
+// (no fade, no teleport).
 //
 // The rule (docs in the report, tests/test_transition_wait.cpp):
 //  - who must be ready: every player in the world and alive. A downed, dead or spectating player does not block (he cannot
@@ -36,16 +35,15 @@
 //    distances, it needs the world);
 //  - a guide trip (kGuideGoal: no exit zone, the host's script asked for the move) has the host as its first claim and
 //    the others confirm it; it lapses after kGuideLifeMs without everybody's yes.
-// Wire (protocol 11): TransitionVote = u8 op + u16 level changer (host numbering; kNoChanger = no exit, a "ready" without
+// Wire: TransitionVote = u8 op + u16 level changer (host numbering; kNoChanger = no exit, a "ready" without
 // one confirms the guide trip) + for VoteRoute a u16 route restrictor; TransitionState (host -> all) = StateMsg below, at most
 // every kStateEveryMs while the board is not idle, plus once when it goes idle.
 //
-// F3a T8 (docs/plans/2026-10-24-f3a-split-levels.md §1.2, §1.5, §1.10):
+// 
 //  - the host player is a client of his own world server over the local link: he is peer 0 of the server's players(), a
 //    member like any other, and his claim comes as a TransitionVote that goes through the same rule as a remote client's
 //    (apply_vote); his placard reads the TransitionState of the link;
-//  - (the together entry of split levels, members on another map, is gone with the hybrid: owner 2026-11-18. The board is the
-//    co-op's, everybody stands on the host's map; the high bit of a row's mark byte stays reserved);
+//  - the board is the co-op's: everybody stands on the host's map (the high bit of a row's mark byte stays reserved);
 //  - the simultaneous load of a group transition: on "go" the world server writes the shared save of the transition, gives
 //    it the next world epoch and sends every moving client LoadWait {Prepared} and the save BEFORE its own reload; all load
 //    at once, each loading screen stays (LoadScreen) until the server says Enter (PreparedLoad over levels::LoadBarrier):
@@ -62,14 +60,15 @@
 #include <utility>
 #include <vector>
 
-#include "coop_load_barrier.h" // F3a T3: levels::LoadBarrier, kLoadWaitMs
+#include "coop_ids.h"
+#include "coop_load_barrier.h" // levels::LoadBarrier, kLoadWaitMs
 #include "coop_protocol.h" // Writer, Reader, Msg, kMaxPeerSlots
 
 namespace coop
 {
 namespace transition
 {
-constexpr uint16_t kNoChanger = 0xffff;
+constexpr uint16_t kNoChanger = kNoId;
 constexpr uint32_t kGuideGoal = 0x10000; // one guide trip at a time (a goal is a level changer id, or this)
 constexpr uint32_t kLoadWaitMs = 60000; // a player who is still loading holds the group this long at most
 constexpr uint32_t kGuideLifeMs = 60000; // a guide trip lives this long without everybody's yes
@@ -81,7 +80,7 @@ constexpr uint32_t kIntentSettleMs = 1200; // a client waits this long for the h
 constexpr uint32_t kStateEveryMs = 500; // the host's TransitionState while the board is not idle
 constexpr uint16_t kUnknownDist = 0xffff;
 constexpr size_t kMaxLevelName = 64; // a stock level name is "l01_escape"
-// 2026-10-24: the go. The board's Going state reaches every player (the host player over the local link) and his screen
+// The go. The board's Going state reaches every player (the host player over the local link) and his screen
 // darkens (sleep_fade.ppe, coop_hud_transition.script); the host's own level change starts this long after it, so that the
 // darkening is on the screen before the host's process stops drawing while it writes the transition's save.
 constexpr uint32_t kGoFadeMs = 1000;
@@ -95,6 +94,7 @@ constexpr uint32_t kNoPlace = 0xffffffffu;
 constexpr uint32_t kRoutePlace = 0x20000u;
 constexpr uint32_t kTripPlace = 0x40000u; // the point the one who asked for a trip stood at when he asked (DistFn)
 
+// A level changer as a goal of the board: its object id, always below the guide and place goals (kGuideGoal, kRoutePlace).
 inline uint32_t goal_of_exit(uint16_t changer) { return changer; }
 inline bool is_guide(uint32_t goal) { return goal == kGuideGoal; }
 inline uint32_t place_of_route(uint16_t restrictor) { return kRoutePlace | restrictor; }
@@ -135,8 +135,8 @@ struct Member
 	bool remote = true; // a client: his claim lapses without a refresh (the host player's, over the local link, never does)
 };
 
-// A high bit of a row's mark byte on the wire: he comes along from afar ("go with the group", 2026-10-24). The layout stays
-// 7 bytes a row. 0x80 is reserved (the player on another map of the hybrid, build 57 and before): a row with it is refused.
+// A high bit of a row's mark byte on the wire: he comes along from afar ("go with the group"). The layout stays
+// 7 bytes a row. 0x80 is reserved: a row with it is refused.
 constexpr uint8_t kRowConsent = 0x40;
 
 struct Row
@@ -297,22 +297,8 @@ public:
 			}
 		}
 		// 3. the exit that leads: the oldest claim
-		bool have_lead = false;
 		uint32_t lead = 0;
-		{
-			uint64_t best_since = 0;
-			uint32_t best_id = 0;
-			for (const auto& c : m_claims)
-			{
-				if (!have_lead || c.second.since < best_since || (c.second.since == best_since && c.first < best_id))
-				{
-					have_lead = true;
-					lead = c.second.goal;
-					best_since = c.second.since;
-					best_id = c.first;
-				}
-			}
-		}
+		const bool have_lead = leading(lead);
 		const bool forced = m_forced;
 		const uint32_t forced_goal = m_forced_goal;
 		m_forced = false; // a force is for this tick only
@@ -390,7 +376,7 @@ public:
 		}
 		else
 			m_loading = false;
-		// 7. nobody is missing: the group goes on this tick (owner 2026-10-24: no waiting timer)
+		// 7. nobody is missing: the group goes on this tick
 		return go(st);
 	}
 
@@ -435,10 +421,10 @@ private:
 
 // ---------------------------------------------------------------- messages
 
-// Client -> host (Msg::TransitionVote, protocol 11): u8 op, u16 level changer in HOST numbering, and for VoteRoute a u16
+// Client -> host (Msg::TransitionVote): u8 op, u16 level changer in HOST numbering, and for VoteRoute a u16
 // route restrictor (host numbering). Ready at an exit (the host checks the exit, that the player is in the world and within
 // kReachM of it), Ready without an exit = "yes" to the host's guide trip, Cancel = "not any more" (the changer is not read),
-// Consent = "go with the group" to that exit from afar (2026-10-24: no distance, only to an exit somebody else stands at),
+// Consent = "go with the group" to that exit from afar (no distance, only to an exit somebody else stands at),
 // Route = he stands in a route restrictor whose drop point lies in that exit's changer (within kReachM of the restrictor).
 enum VoteOp : uint8_t
 {
@@ -476,7 +462,7 @@ struct VoteMsg
 	}
 };
 
-// F3a T8: what the world server knows of the sender of a TransitionVote when it takes it (coop_join.cpp reads it from its
+// What the world server knows of the sender of a TransitionVote when it takes it (coop_join.cpp reads it from its
 // world). The same for every sender, the host player (peer 0, over the local link) included.
 struct VoteFacts
 {
@@ -524,14 +510,14 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 		goal = goal_of_exit(v.changer);
 		if (v.op == VoteConsent)
 		{
-			// 2026-10-24: one who is not at the exit comes along, from anywhere; to an exit somebody else stands at
+			// One who is not at the exit comes along, from anywhere; to an exit somebody else stands at
 			if (!b.anchored(goal, from))
 				return Verdict::NotWaited;
 			place = kNoPlace;
 		}
 		else if (v.op == VoteRoute)
 		{
-			// 2026-10-24: the route restrictor is the exit's mark (its drop point is in the changer, maybe far behind it): he
+			// The route restrictor is the exit's mark (its drop point is in the changer, maybe far behind it): he
 			// is measured against the restrictor, as against the zone of the changer itself
 			if (!f.route_known)
 				return Verdict::NoRoute;
@@ -541,7 +527,7 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 		}
 		else
 		{
-			// T12 review (Ruling 18): only within kReachM of the exit (an unknown distance is no claim)
+			// Only within kReachM of the exit (an unknown distance is no claim)
 			if (!(f.dist >= 0.f && f.dist <= kReachM))
 				return Verdict::TooFar;
 			place = goal;
@@ -560,8 +546,8 @@ inline Verdict apply_vote(Board& b, uint32_t from, const VoteMsg& v, const VoteF
 
 // Host -> all (Msg::TransitionState): the board as every machine's placard shows it. `level` is the stock name of the level
 // the leading exit leads to ("l01_escape"; the Lua side translates it), empty when the exit has none (read: unknown).
-//   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms (always 0 since the
-//   countdown is gone, 2026-10-24: the layout of protocol 11 stays), u32 load_ms,
+//   u8 state, u8 kind (0 exit, 1 guide), u16 changer, str level, u16 ready, u16 total, u32 countdown_ms (always 0: there is no
+//   countdown, the field keeps the layout), u32 load_ms,
 //   u8 n, n x { u32 player, u8 mark (| kRowConsent: comes along; 0x80 reserved), u16 dist_m }
 struct StateMsg
 {
@@ -570,7 +556,7 @@ struct StateMsg
 	uint16_t changer = kNoChanger;
 	std::string level;
 	uint16_t ready = 0, total = 0;
-	uint32_t countdown_ms = 0; // always 0 (the layout of protocol 11)
+	uint32_t countdown_ms = 0; // always 0 (kept for the layout)
 	uint32_t load_ms = 0;
 	std::vector<Row> rows;
 
@@ -646,8 +632,8 @@ inline StateMsg state_message(const Status& s, const std::string& level)
 
 // ---------------------------------------------------------------- the hold at the exit
 
-// A player who waits at an exit does not walk off the edge of the level (the live test of 2026-10-23: a client at an exit
-// went past the map and the host refused every state of his, "position outside the level"). While he waits, the place he
+// A player who waits at an exit does not walk off the edge of the level (past the map the host
+// would refuse every state of his, "position outside the level"). While he waits, the place he
 // stood at last inside the zone and on the map is remembered; if he is off the map (zone or not) he is put back there. A
 // step back into the level, out of the zone, is his way to withdraw: nothing holds him there. Not waiting: nothing is held
 // (the stock level edge) and the memory is gone.
@@ -758,9 +744,9 @@ struct Intent
 	void reset() { last = 0; }
 };
 
-// ---------------------------------------------------------------- route exits (2026-10-24)
+// ---------------------------------------------------------------- route exits
 
-// The stock route exits of Anomaly / G.A.M.M.A. are space restrictors (sr_teleport_sections.ltx, logic
+// The stock route exits of Anomaly are space restrictors (sr_teleport_sections.ltx, logic
 // scripts\sr_teleport_logic.ltx: on_actor_inside = %=sr_teleport%) whose effect fades the screen and, 3 s later, puts the
 // actor at the route's drop point, which lies inside the real level changer. In a session with company that is no exit of
 // the group's: the fade comes when one walks up, and everybody who walks up is put at the same point. Instead the player's
@@ -843,7 +829,7 @@ private:
 	std::vector<Entry> m_entries;
 };
 
-// ---------------------------------------------------------------- F3a T8: the simultaneous load of a group transition
+// ---------------------------------------------------------------- the simultaneous load of a group transition
 
 static_assert(kLoadWaitMs == levels::kLoadWaitMs, "the board's loaders' minute and the load barrier's are the same minute");
 constexpr uint32_t kLoadReadyRepeatMs = 3000; // a player on a held screen says LoadReady again this often (a hole may eat it)
@@ -864,7 +850,7 @@ inline bool saves_handed(uint64_t chunk_bytes, uint64_t chunks, uint64_t data_to
 // R1 5: a prepared load whose reload has not come: `pending` (the next world is the transition's), `since` (the pump
 // ended, 0 not yet), `old_world_up` (the world of the go still runs). A level being built runs frames too, the first one when
 // the new CLevel exists, and on a machine short of memory that frame came 40 s after the go: the load was called off under
-// itself (live 2026-11-01: the host held 90 s on "Waiting for: serge", the client lost the connection and joined again).
+// itself.
 inline bool reload_overdue(bool pending, uint64_t since, uint64_t now, bool old_world_up)
 {
 	return pending && old_world_up && since != 0 && now >= since + kReloadWatchMs;
@@ -1105,7 +1091,7 @@ struct LoadScreen
 	void reset() { *this = LoadScreen(); }
 };
 
-// ---------------------------------------------------------------- F5-VEH-6 (rv_F5-VEH-6 blocker 2): the seat goes before the world
+// ---------------------------------------------------------------- the seat goes before the world
 
 // A player's machine leaves its world only after its own actor is out of a managed seat (coop_join.cpp, tests/
 // test_vehicle_travel_order.cpp). Co-op: the host released every seat before LoadWait Prepared, but the release and the save of the

@@ -9,7 +9,7 @@
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Items.h"
 #include "xrServer_Objects_ALife_Monsters.h"
-#include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_events.h"
 
 void xrServer::Process_event(NET_Packet& P, ClientID sender)
 {
@@ -180,7 +180,7 @@ void xrServer::Process_event(NET_Packet& P, ClientID sender)
 			string256 tmp;
 			P.r_stringZ(tmp);
 			visual->set_visual(tmp);
-			coop::events::host_on_visual(receiver->ID); // Anomaly Coop: a creature's new model -> clients
+			coop::events::host_on_visual(receiver->ID); // coop: a creature's new model -> clients
 		}
 		break;
 	case GE_DIE:
@@ -228,7 +228,7 @@ void xrServer::Process_event(NET_Packet& P, ClientID sender)
 #endif // #ifndef MASTER_GOLD
 
 			game->on_death(e_dest, e_src);
-			coop::events::host_on_death(id_dest, id_src); // Anomaly Coop: -> clients
+			coop::events::host_on_death(id_dest, id_src); // coop: -> clients
 
 			xrClientData* c_src = e_src->owner; // клиент, чей юнит убил
 

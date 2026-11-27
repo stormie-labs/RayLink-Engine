@@ -18,7 +18,7 @@ protected:
 	CScriptBinderObject* m_object;
 
 private:
-	// Anomaly Coop (F2 T11): the script_binding of the section this binder was made from (empty for a binder Lua attached
+	// coop: the script_binding of the section this binder was made from (empty for a binder Lua attached
 	// by hand), the key of the binder router (coop/coop_router.h). A shared_str: the router's cache is keyed by its address.
 	shared_str m_script_binding;
 

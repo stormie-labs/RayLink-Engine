@@ -1,5 +1,5 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, passengers (F5-VEH-5, build 58, docs/VEHICLES.md sections 4, 5 and 12).
+// Anomaly Coop — vehicles for players, passengers (docs/VEHICLES.md sections 4, 5 and 12).
 //
 // A stock car has the driver's place alone; the passenger places come from configs\coop_vehicles.ltx (a section per car section,
 // the pure parser and transforms: xrCoop/coop_vehicle_seats.h). Two halves live here:
@@ -12,20 +12,20 @@
 //     follows the copy's seat every frame, the first-person camera sits at the seat's eye with a free look within the stock car
 //     camera's limits, the movement keys do nothing and the use key asks out (VehicleReq exit, as F in his car does for a driver).
 //     The record of the seat gone (released, lost, the session's world gone), he stands up as CActor::detach_Vehicle stands the
-//     driver up: at the decider's point when VehicleSeat released carried one (ride_exit_point, rv_F5-VEH-5), else at the door of
+//     driver up: at the decider's point when VehicleSeat released carried one (ride_exit_point), else at the door of
 //     his seat, or the nearest free point beside the car, found as the decider finds it for his proxy (coop_vehicles_seat.cpp
-//     exit_position), on this machine's copy. A ride keeps the world it sat in (rv_F5-VEH-5 blocker 1): of another world or of a
+//     exit_position), on this machine's copy. A ride keeps the world it sat in: of another world or of a
 //     session that is over it answers no hook and is forgotten; sync::reset stands a seated one up (ride_session_over).
 // Nothing here knows the mode: the requests go up through the client's record (RideLink, coop_vehicles.h) and the mode's delivery.
-// No shooting from a passenger's seat in build 58. Main thread only.
+// No shooting from a passenger's seat. Main thread only.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_vehicles.h"
 #include "coop_vehicles_ride.h"
 #include "coop_manager.h"
 #include "coop_join.h"
-#include "coop_dialog.h"
-#include "coop_script.h" // rv_F5-VEH-5: actor_on_detach_vehicle when the copy is gone
+#include "coop_hud_text.h"
+#include "coop_script.h" // actor_on_detach_vehicle when the copy is gone
 #include "xrCoop/coop_vehicle_seats.h"
 #include "xrCoop/coop_vehicle_drive_rules.h"
 
@@ -415,9 +415,9 @@ bool stand_up(CActor* a, CCar* car, const Fvector& at, bool box_test)
 
 	if (car)
 		a->callback(GameObject::eDetachVehicle)(car->lua_game_object());
-	else // rv_F5-VEH-5: the copy is gone; the flags G.A.M.M.A.'s mods keep from the callback clear all the same (move_effects
-		// MovementAllowed, LevelChangeCars / YACS InCar). Straight to SendScriptCallback with nil, not through the stock binder: its
-		// handler (bind_stalker_ext.actor_on_detach_vehicle) calls obj:section() after it, a Lua error on nil
+	else // the copy is gone; the flags mods keep from the callback clear all the same (movement allowed, in a car). Straight to
+		// SendScriptCallback with nil, not through the stock binder: its handler (bind_stalker_ext.actor_on_detach_vehicle) calls
+		// obj:section() after it, a Lua error on nil
 		script::queue_callback("actor_on_detach_vehicle", {script::cb_nil()});
 	return true;
 }
@@ -427,7 +427,7 @@ void forget()
 	g = Ride();
 }
 
-// rv_F5-VEH-5 blocker 1: the seat is this world's. The stock actor's hooks run in every process and world, ride_frame only inside a
+// The seat is this world's. The stock actor's hooks run in every process and world, ride_frame only inside a
 // session (sync::frame): a ride of another world (a load, a level change) or of a session that is over answers nothing.
 bool on_here() { return g.on && g.world == join::world_generation(); }
 
@@ -510,7 +510,7 @@ void begin(CActor* a, u32 now)
 			++g_c.no_car;
 			g.due = false;
 			::Msg("! [coop] vehicle: car %u of the passenger's seat %u is not here: asking out", u32(car_id), u32(seat));
-			dialog::hud_message("st_coop_f5_vehicles_ride_no_car", "The vehicle is not here: you get out");
+			hud_text::say("st_coop_f5_vehicles_ride_no_car", "The vehicle is not here: you get out");
 			if (g.link.ask_out)
 				g.link.ask_out();
 		}
@@ -522,7 +522,7 @@ void begin(CActor* a, u32 now)
 		++g_c.no_seat;
 		g.due = false;
 		::Msg("! [coop] vehicle: car %u has no seat %u here (configs\\coop_vehicles.ltx, its model): asking out", u32(car_id), u32(seat));
-		dialog::hud_message("st_coop_f5_vehicles_ride_no_seat", "This seat is not known here: you get out");
+		hud_text::say("st_coop_f5_vehicles_ride_no_seat", "This seat is not known here: you get out");
 		if (g.link.ask_out)
 			g.link.ask_out();
 		return;
@@ -562,7 +562,7 @@ void begin(CActor* a, u32 now)
 	refresh_exit(car, now, true);
 	++g_c.rides;
 	::Msg("[coop] vehicle: in car %u seat %u (a passenger)", u32(car_id), u32(seat));
-	dialog::hud_message("st_coop_f5_vehicles_ride_on", "You ride as a passenger: the use key gets you out");
+	hud_text::say("st_coop_f5_vehicles_ride_on", "You ride as a passenger: the use key gets you out");
 }
 } // namespace
 

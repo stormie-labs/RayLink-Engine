@@ -22,7 +22,7 @@
 #include "client_spawn_manager.h"
 #include "memory_manager.h"
 #include "../xrEngine/IGame_Persistent.h"
-#include "coop/coop_ai.h" // Anomaly Coop (protocol 29): debug_unseen
+#include "coop/coop_ai.h" // coop: debug_unseen
 
 #ifndef MASTER_GOLD
 #	include "actor.h"
@@ -96,7 +96,7 @@ void CHitMemoryManager::reload(LPCSTR section)
 void CHitMemoryManager::add(float amount, const Fvector& vLocalDir, const CObject* who, s16 element)
 {
 	PROF_EVENT("HitMemory::add");
-	if (coop::npc_ai::debug_unseen(who)) // Anomaly Coop (protocol 29): the server's debug, invisible to the AI (ai_ignore_actor per player)
+	if (coop::npc_ai::debug_unseen(who)) // coop: the server's debug, invisible to the AI (ai_ignore_actor per player)
 		return;
 #ifndef MASTER_GOLD
 	if (who && smart_cast<CActor const*>(who) && psAI_Flags.test(aiIgnoreActor))
@@ -168,7 +168,7 @@ void CHitMemoryManager::add(float amount, const Fvector& vLocalDir, const CObjec
 
 void CHitMemoryManager::add(const CHitObject& _hit_object)
 {
-	if (coop::npc_ai::debug_unseen(_hit_object.m_object)) // Anomaly Coop (protocol 29): invisible to the AI (ai_ignore_actor per player)
+	if (coop::npc_ai::debug_unseen(_hit_object.m_object)) // coop: invisible to the AI (ai_ignore_actor per player)
 		return;
 #ifndef MASTER_GOLD
 	if (_hit_object.m_object && smart_cast<CActor const*>(_hit_object.m_object) && psAI_Flags.test(aiIgnoreActor))
@@ -391,8 +391,7 @@ void CHitMemoryManager::load(IReader& packet)
 			delayed_object.m_object_id,
 			m_object->ID());
 		if (!spawn_callback || !spawn_callback->m_object_callback)
-			if (!g_dedicated_server || g_coop_headless)
-				Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
+			Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
 #ifdef DEBUG
 		else {
 			if (spawn_callback && spawn_callback->m_object_callback) {

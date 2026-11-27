@@ -368,21 +368,20 @@ void CHangingLamp::ResetLanim()
 	if (light_ambient)
 		light_ambient->set_color(amb_clr);
 
-	const bool was_on = IsOn(); // Anomaly Coop: a flicker's end lights the lamp on every machine by itself
-	isFlickering = true; // not a word of its own
-	TurnOn();
+	const bool was_on = IsOn(); // coop: a flicker's end lights the lamp on every machine by itself
 	isFlickering = false;
+	TurnOn(false);
 	if (!was_on)
 		coop::lamps::on_changed(this, true);
 }
 
 
-void CHangingLamp::TurnOn()
+void CHangingLamp::TurnOn(bool relay)
 {
 	if (!Alive())
 		return;
 
-	const bool was_on = IsOn(); // Anomaly Coop (audit W2)
+	const bool was_on = IsOn(); // coop: a switch to on is relayed once
 	Fvector p = XFORM().c;
 	light_render->set_position(p);
 	light_render->set_active(true);
@@ -443,8 +442,8 @@ void CHangingLamp::TurnOn()
 
 	processing_activate();
 	m_bState = 1;
-	if (!was_on && !isFlickering)
-		coop::lamps::on_changed(this); // Anomaly Coop (audit W2): a flicker is each machine's own
+	if (relay && !was_on && !isFlickering) // coop: a flicker is each machine's own
+		coop::lamps::on_changed(this);
 }
 
 void CHangingLamp::TurnOff()
@@ -467,10 +466,10 @@ void CHangingLamp::TurnOff()
 	processing_deactivate();
 	m_bState = 0;
 	if (!isFlickering)
-		coop::lamps::on_changed(this); // Anomaly Coop (audit W2)
+		coop::lamps::on_changed(this); // coop: a flicker is each machine's own
 }
 
-// Anomaly Coop (audit W2): the host's word (coop_lamps.cpp). A dead lamp stays dead here too: no flicker, no script lights it.
+// coop: the host's word (coop_lamps.cpp). A dead lamp stays dead here too: no flicker, no script lights it.
 void CHangingLamp::coop_set(bool on, bool dead)
 {
 	if (dead)
@@ -504,7 +503,7 @@ void CHangingLamp::Hit(SHit* pHDS)
 	if (bWasAlive && (!Alive()))
 	{
 		TurnOff();
-		coop::lamps::on_changed(this); // Anomaly Coop (audit W2): dead, also when it was off already
+		coop::lamps::on_changed(this); // coop: dead, also when it was off already
 	}
 }
 
@@ -579,7 +578,7 @@ BOOL CHangingLamp::UsedAI_Locations()
 	return (FALSE);
 }
 
-// Anomaly Coop (audit W2): a lamp of the world is the host's: a client's script does not switch its copy, the host's word
+// coop: a lamp of the world is the host's: a client's script does not switch its copy, the host's word
 // comes as LampState (coop_lamps.h).
 static void coop_script_turn_on(CHangingLamp* lamp)
 {

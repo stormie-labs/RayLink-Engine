@@ -5,19 +5,22 @@
 #include "coop_net.h"
 #include "coop_sync.h"
 #include "coop_script.h"
-#include "coop_autosave.h" // F3
-#include "xrCoop/coop_mode.h" // S4: the session's mode, the switchboard of the two layers
-#include "xrCoop/srv/coop_operator.h" // protocol 31: the operator's token
-#include "coop_dialog.h" // hud_message_n: the host-silence line
-#include "coop_health_ledger.h" // live 2026-11-09: the own actor's health ledger
-#include "coop_lua_errors.h" // 2026-11: Lua errors survived in a session
+#include "coop_autosave.h"
+#include "xrCoop/coop_mode.h" // the session's mode, the switchboard of the two layers
+#include "xrCoop/coop_mode_stamp.h"
+#include "xrCoop/srv/coop_operator.h" // the operator's token
+#include "coop_hud_text.h" // say_n: the host-silence line
+#include "coop_health_ledger.h"
+#include "coop_lua_errors.h"
+#include "xrCoop/coop_hash.h"
 #include "xrCoop/coop_link_hold.h"
+#include "xrCoop/coop_silence_pause.h"
+#include "xrCoop/coop_text.h"
 #include "../../xrCore/raylink_version.h" // build_id names the engine build
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include "xrCoop/coop_silence_pause.h"
 
 string64 g_coop_nick = "";
 
@@ -29,32 +32,29 @@ enum class SilenceEnd { HostAnswered, StoppedWaiting };
 void host_silence_off(SilenceEnd reason); // below, by Manager::frame
 void log_line(const char* line) { ::Msg("%s", line); }
 
-// W9: silence before a peer is dropped. A process that stops pumping without a hold (crash dialog, hang) is gone
-// after this; ENet rounds it up to its next retransmission (10-16 s). Was 120 s, which kept a crashed client
-// "connected" for two minutes.
+// Silence before a peer is dropped. A process that stops pumping without a hold (crash dialog, hang) is gone after this;
+// ENet rounds it up to its next retransmission (10-16 s), so a crashed client does not stay "connected" for long.
 constexpr u32 kPeerTimeoutMs = 10000;
-// Live 2026-10-24 (owner): "if the server does not answer, everything freezes on the client and he cannot move; out only
-// after 30 seconds". A live client whose host has said nothing (not even an acknowledgement) for kHostSilenceFreezeMs
-// pauses its game and shows the seconds left; the host back - it runs on. A client's own silence timeout is
-// kHostSilenceLeaveMs: then on_disconnected takes him out of the host's world (join::on_session_lost). The count ends the
-// session itself: ENet lets go anywhere up to twice its timeout (live 2026-11-01: the line stood at 0 from 30 s to 51.6 s).
+// A live client whose host has said nothing (not even an acknowledgement) for kHostSilenceFreezeMs pauses its game and
+// shows the seconds left; the host back, it runs on. A client's own silence timeout is kHostSilenceLeaveMs: then
+// on_disconnected takes him out of the host's world (join::on_session_lost). The count ends the session itself: ENet lets
+// go anywhere up to twice its timeout.
 constexpr u32 kHostSilenceFreezeMs = 2000;
 constexpr u32 kHostSilenceLeaveMs = 30000;
-// W9: how long one loading activity holds the link (re-armed by every load stage and by every frame until this machine
-// plays normally again, coop_link_hold.h): the longest single stage we wait for, e.g. the texture upload of a big
-// level on a slow disk.
+// How long one loading activity holds the link (re-armed by every load stage and by every frame until this machine plays
+// normally again, coop_link_hold.h): the longest single stage we wait for, e.g. the texture upload of a big level on a
+// slow disk.
 constexpr u32 kLoadHoldMs = link_hold::kLoadHoldMs;
 
-// R1 I2: a crash (FATAL dialog, access violation) must look like silence to the peers at once. Without it a client
-// that crashed while loading stays "connected", his character in the world, until the load hold runs out
-// (kLoadHoldMs), and his restarted game cannot take his place before. Installed while a session runs (only a session
-// holds the link), in front of the handler that was there (the console's cvar dump).
+// A crash (FATAL dialog, access violation) must look like silence to the peers at once. Without it a client that crashed
+// while loading stays "connected", his character in the world, until the load hold runs out (kLoadHoldMs), and his
+// restarted game cannot take his place before. Installed while a session runs (only a session holds the link), in front
+// of the handler that was there (the console's cvar dump).
 crashhandler* g_next_crash_handler = nullptr;
 bool g_crash_hook_exit_registered = false;
-// Set by on_crash (any thread), never cleared: no frame and no load stage holds the link after a crash (review of the
-// live fixes: the next frame of the main thread armed the hold again for kLoadHoldMs; link_hold::FrameState::crashed).
-// The flag only spares the work: the guarantee is the sealed hold (Session::seal_connection_hold), since a caller that
-// read the flag just before on_crash still arms (review of protocol 8).
+// Set by on_crash (any thread), never cleared: no frame and no load stage holds the link after a crash
+// (link_hold::FrameState::crashed). The flag only spares the work: the guarantee is the sealed hold
+// (Session::seal_connection_hold), since a caller that read the flag just before on_crash still arms.
 std::atomic<bool> g_crashed{false};
 
 // Every crash path of xrDebug runs it: FATAL / R_ASSERT (backend, before the crash save), an access violation
@@ -87,15 +87,13 @@ void set_crash_hook(bool on)
 // At exit with a session still running: off before Manager (and its Session) is destroyed.
 void remove_crash_hook() { set_crash_hook(false); }
 
-// "-key value" from the command line; false if absent. Value is empty if the key has none.
+// "-key value" from the command line (the key as a whole word, ascii::find_key); false if absent. Value is empty if the
+// key has none.
 bool cmd_param(LPCSTR key, xr_string& value)
 {
-	const char* p = Core.Params ? strstr(Core.Params, key) : nullptr;
+	const char* p = ascii::find_key(Core.Params, key);
 	if (!p)
 		return false;
-	p += xr_strlen(key);
-	if (*p && *p != ' ')
-		return false; // a longer key with the same prefix
 	while (*p == ' ')
 		++p;
 	value.clear();
@@ -106,8 +104,8 @@ bool cmd_param(LPCSTR key, xr_string& value)
 	return true;
 }
 
-// Test automation without input devices (P8): flags make an instance host, connect,
-// dump its status and take screenshots on its own.
+// Test automation without input devices: flags make an instance host, connect, dump its status and take screenshots on its
+// own.
 struct AutoStart
 {
 	bool parsed = false;
@@ -122,21 +120,17 @@ struct AutoStart
 	u64 next_status = 0;
 	u32 shots_every_s = 0;
 	u64 next_shot = 0;
-	// S4: the world server's autostart (-coop_dedicated) and a map server's start (-coop_mapserver) are the server layer's boot
-	// (srv/coop_srv_mode.cpp, coop::boot_layers); when a layer owns this process's sessions, host and connect here stay off
+	// The layers' own starts are their boots (coop::boot_layers); when a layer owns this process's sessions, host and connect
+	// here stay off
 	bool layer_owns = false;
 	bool said = false; // the autostart line went to the log
 } g_auto;
 
-u64 fnv1a(const void* data, size_t size, u64 h = 14695981039346656037ull)
+// A manifest entry's hash: FNV-1a 64 of the size's bytes.
+template <typename T>
+u64 size_hash(const T& size)
 {
-	const u8* p = static_cast<const u8*>(data);
-	for (size_t i = 0; i < size; ++i)
-	{
-		h ^= p[i];
-		h *= 1099511628211ull;
-	}
-	return h;
+	return fnv1a64(reinterpret_cast<const uint8_t*>(&size), sizeof(size));
 }
 
 // Path relative to the game root, lowercase, backslashes.
@@ -174,7 +168,7 @@ u8 roles_of(Phase p)
 {
 	if (p == Phase::Off)
 		return 0;
-	// S4: the session's mode says them; a client before its Welcome (no mode yet) is a client of the world whatever its mode
+	// the session's mode says them; a client before its Welcome (no mode yet) is a client of the world whatever its mode
 	const u8 roles = mode().roles();
 	return roles ? roles : client_roles();
 }
@@ -188,9 +182,9 @@ Manager& Manager::get()
 Manager::Manager()
 {
 	m_session.set_log(&log_line);
-	m_session.set_world_gate([this] { return world_state(); }); // level-change review: messages for a missing world
-	// F3a T4: the host player's link, for the life of the process (a session that does not host leaves it alone). Only
-	// the messages moved onto it pass (link_enabled; none yet): the host keeps its direct paths until T7 moves them.
+	m_session.set_world_gate([this] { return world_state(); }); // messages for a missing world
+	// The host player's link, for the life of the process (a session that does not host leaves it alone). Only the
+	// messages moved onto it pass (link_enabled): the others take the host's direct paths.
 	m_link.set_gate(&link_enabled);
 	m_session.attach_local(&m_link);
 	install_session_callbacks();
@@ -219,17 +213,23 @@ void Manager::set_phase(Phase p)
 	::Msg("[coop] phase %s -> %s", phase_name(m_phase), phase_name(p));
 	m_phase = p;
 	if (p == Phase::Live)
-		m_live_since_ms = now_ms(); // W9: the first stretch of play holds the link (link_hold::kSettleMs)
+		m_live_since_ms = now_ms(); // the first stretch of play holds the link (link_hold::kSettleMs)
 	if (p == Phase::Off)
-		reset_mode(); // S4: the session's mode goes with it; none until the next start
-	m_roles = roles_of(p); // F3a T4
-	set_crash_hook(p != Phase::Off); // R1 I2: a crash releases the link hold
+	{
+		reset_mode(); // the session's mode goes with it; none until the next start
+		// Every end of a session (stop, a disconnect, a refusal) comes here, and frame() steps the host's silence only
+		// before Off: a pause still taken would hold the device until a later session's first frame.
+		host_silence_off(SilenceEnd::StoppedWaiting);
+	}
+	m_roles = roles_of(p);
+	g_mode_stamp.bump(); // the session's phase and this process's roles (and at Off its mode)
+	set_crash_hook(p != Phase::Off); // a crash releases the link hold
 	if (p != Phase::Off && !g_crash_hook_exit_registered)
 	{
 		g_crash_hook_exit_registered = true;
 		std::atexit(&remove_crash_hook); // registered after Manager's construction: runs before its destructor
 	}
-	// G18: a session world never stands still. A pause from before the session (new game, menu) is lifted
+	// A session world never stands still. A pause from before the session (new game, menu) is lifted
 	// when this machine starts hosting or enters the world; in the session CanBePaused() refuses new ones.
 	if ((p == Phase::Hosting || p == Phase::Live) && Device.Paused())
 		Device.Pause(FALSE, TRUE, TRUE, "coop_session");
@@ -238,7 +238,7 @@ void Manager::set_phase(Phase p)
 const char* Manager::build_id()
 {
 	// Same exe on both sides is the supported setup; engine build + protocol + compile stamp identify it
-	// ("RayLink Engine b28 p16 Oct 29 2026 17:05:12": the build mismatch refusal shows both sides' ids).
+	// (engine version, "p" protocol, compile date and time: the build mismatch refusal shows both sides' ids).
 	static string128 id = "";
 	if (!id[0])
 		xr_sprintf(id, "%s p%u %s %s", RAYLINK_ENGINE_VERSION, kProtocolVersion, __DATE__, __TIME__);
@@ -292,7 +292,7 @@ const Manifest& Manager::manifest()
 	{
 		ManifestEntry e;
 		e.path = relative_to_root(a.path.c_str()).c_str();
-		e.hash = fnv1a(&a.size, sizeof(a.size));
+		e.hash = size_hash(a.size);
 		m_manifest.push_back(std::move(e));
 	}
 	// Loose files in gamedata (addons). Name + size: cheap and catches different versions. A text file is read for its size
@@ -318,7 +318,7 @@ const Manifest& Manager::manifest()
 				size = long(manifest_lf_size(static_cast<const uint8_t*>(text->pointer()), size_t(text->length())));
 				FS.r_close(text);
 			}
-		e.hash = fnv1a(&size, sizeof(size));
+		e.hash = size_hash(size);
 		m_manifest.push_back(std::move(e));
 	}
 	m_manifest_ready = true;
@@ -343,23 +343,22 @@ SessionConfig Manager::make_config(u16 port)
 
 void Manager::install_session_callbacks()
 {
-	m_session.on_peer_joined = [this](const PeerInfo& p)
+	m_session.on_peer_joined = [](const PeerInfo& p)
 	{
+		g_mode_stamp.bump(); // a peer of the session: where / decider of him and the facade's player answers
 		::Msg("[coop] player joined: #%u '%s' %s", p.id, p.nick.c_str(), p.address.c_str());
-		if (active() && mode().decides_world())
-			join::on_peer_joined(p);
-		sync::on_peer_joined(p);
 	};
 	m_session.on_peer_left = [](PeerId id, const std::string& reason)
 	{
+		g_mode_stamp.bump();
 		::Msg("[coop] player left: #%u (%s)", id, reason.c_str());
 		sync::on_peer_left(id);
 		if (net::host())
 			join::on_peer_left(id);
 		else
-			diag::arm_destroyed_object_stacks(); // F0 final review (task 14): his avatar leaves this world too
+			diag::arm_destroyed_object_stacks(); // his avatar leaves this world too
 	};
-	// The world server's operator lines go to its console from its mode's install (srv/coop_srv_mode.cpp, srv::SessionSrv).
+	// The world server's operator lines go to its console from its mode's install.
 	install_world_callbacks(m_session);
 	install_world_callbacks(m_world);
 	m_world.on_peer_joined = nullptr; // a map server's players are its level's, from the host's table
@@ -367,8 +366,8 @@ void Manager::install_session_callbacks()
 	m_world.set_log(&log_line);
 	m_world.set_world_gate([this] { return world_state(); });
 
-	// F3a T4: what the modules set up once per process (settings, console commands, the route and call-gate tables); the
-	// handler tables are installed by the session's mode when a session starts (enter_mode, S4).
+	// What the modules set up once per process (settings, the route and call-gate tables); the handler tables are installed
+	// by the session's mode when a session starts (enter_mode).
 	sync::init();
 }
 
@@ -376,10 +375,10 @@ void Manager::install_world_callbacks(Session& session)
 {
 	session.on_welcome = [this, &session](const WelcomeMsg& w)
 	{
-		// protocol 33: the session's mode is known from here on (Session::session_mode; S4: start_client installs it)
+		// the session's mode is known from here on (Session::session_mode)
 		::Msg("[coop] accepted by host '%s' as #%u, session %s", w.host_nick.c_str(), w.slot, session_mode_name(w.mode));
 		if (&session == &m_session) // the own session's Welcome starts a mode; a map server's bridge (m_world) does not
-			enter_mode_of_welcome(w.mode); // S4: before any game message of the session (a map server's mode came with its start)
+			enter_mode_of_welcome(w.mode); // before any game message of the session (a map server's mode came with its start)
 		set_phase(Phase::Handshaked);
 		join::on_welcome(w);
 	};
@@ -398,17 +397,17 @@ void Manager::install_world_callbacks(Session& session)
 			for (const auto& s : diff.differ) ::Msg("  different:    %s", s.c_str());
 		}
 		// -coop_connect retries only what changes by itself (the host still loading, a lost answer). Anything else
-		// refuses every retry and pops the refusal window again every few seconds (live check 2026-10-23).
+		// refuses every retry and pops the refusal window again every few seconds.
 		if (r.reason != RejectReason::HostNotReady && r.reason != RejectReason::Timeout && !g_auto.connect.empty())
 		{
 			::Msg("[coop] autostart: no more connection attempts after this refusal");
 			g_auto.connect.clear();
 		}
-		script::on_rejected(r.reason, r.text.c_str(), diff); // W3d: refusal window (R-1.3, R-1.4)
+		script::on_rejected(r.reason, r.text.c_str(), diff); // the refusal window
 		join::on_session_lost(r.text.c_str());
-		Mode& was = mode(); // S4: set_phase(Off) puts none back
+		Mode& was = mode(); // set_phase(Off) puts none back
 		set_phase(Phase::Off);
-		was.session_over(); // F3a: a map server has no menu to go back to
+		was.session_over(); // a map server has no menu to go back to
 	};
 	session.on_disconnected = [this, &session](const std::string& reason)
 	{
@@ -417,13 +416,12 @@ void Manager::install_world_callbacks(Session& session)
 			::Msg("[coop] the host closed the session: %s", reason.c_str());
 		else
 			::Msg("! [coop] disconnected: %s", reason.c_str());
-		host_silence_off(SilenceEnd::StoppedWaiting);
-		script::on_session_end(reason.c_str(), end_code.c_str()); // W4 menu: last error in the co-op window
+		script::on_session_end(reason.c_str(), end_code.c_str()); // the last error in the co-op window
 		join::on_session_lost(reason.c_str());
 		sync::reset();
-		Mode& was = mode(); // S4: set_phase(Off) puts none back
+		Mode& was = mode(); // set_phase(Off) puts none back
 		set_phase(Phase::Off);
-		was.session_over(); // F3a: a map server without its host's process is nobody's
+		was.session_over(); // a map server without its host's process is nobody's
 	};
 	session.on_chat = [](PeerId from, const std::string& text)
 	{
@@ -451,6 +449,7 @@ bool Manager::enter_mode(Mode* m)
 	}
 	if (!install_mode(*m))
 		return false;
+	g_mode_stamp.bump(); // the session's mode answers from here on
 	::Msg("[coop] mode: %s", m->name());
 	m_session.clear_handlers();
 	m_world.clear_handlers();
@@ -480,6 +479,7 @@ void Manager::enter_mode_of_welcome(SessionMode said)
 	}
 	if (!install_mode(*m))
 		return;
+	g_mode_stamp.bump(); // the Welcome's mode answers from here on
 	::Msg("[coop] mode: %s", m->name());
 	ModeTables tables{m_session, m_world, m_link};
 	m->install(tables); // a client's mode adds no table: the Core's are there from its start
@@ -495,17 +495,18 @@ bool Manager::start_host(u16 port)
 	if (!join::host_can_start())
 		return false;
 
-	// S4: the co-op host, or the world server (its own keys: the server layer takes the start); the mode installs its tables
+	// the co-op host, or the world server (its own keys: the server layer takes the start); the mode installs its tables
 	Mode* m = mode_for(Entry::Host, SessionMode::None);
 	if (!enter_mode(m))
 		return false;
 	std::string err;
 	SessionConfig cfg = make_config(port);
-	m->configure(cfg); // protocol 31 / 33: whether its seat plays, the Welcome's mode; the world server's operator token
+	m->configure(cfg); // whether its seat plays, the Welcome's mode; the world server's operator token
 	if (!m_session.host(cfg, &err))
 	{
 		::Msg("! [coop] cannot host on port %u: %s", port, err.c_str());
 		reset_mode();
+		g_mode_stamp.bump(); // the start failed: none answers again
 		return false;
 	}
 	set_phase(Phase::Hosting);
@@ -521,16 +522,16 @@ bool Manager::start_client(const char* address, u16 port)
 		::Msg("! [coop] already in a session (%s), use coop_disconnect first", phase_name(m_phase));
 		return false;
 	}
-	install_client_tables(); // F3a T4; S4: its mode comes with the Welcome
+	install_client_tables(); // its mode comes with the Welcome
 	std::string err;
 	SessionConfig cfg = make_config(port);
 	cfg.peer_timeout_ms = kHostSilenceLeaveMs; // the client waits for a silent host this long (frozen meanwhile)
-	// protocol 31, plan 2026-11-12 §2.2: the creator's game presents the token of its own world server. Only to this PC: a token
-	// is worth nothing anywhere else, and no other host has to see it.
+	// The creator's game presents the token of its own world server. Only to this PC: a token is worth nothing anywhere else,
+	// and no other host has to see it.
 	op::Token operator_token;
-	// This PC is a literal 127.a.b.c and nothing else (op::loopback_literal: "127.0.0.1.evil.example" is another machine, security
-	// review 2026-11-12). The token is this process's own key -coop_operator (a launcher, a test): the game starts no world server
-	// of its own any more (owner 2026-11-18, the server only from the launcher).
+	// This PC is a literal 127.a.b.c and nothing else (op::loopback_literal: "127.0.0.1.evil.example" is another machine). The
+	// token is this process's own key -coop_operator (a launcher, a test): the game starts no world server of its own, the
+	// server comes only from the launcher.
 	const bool own_key = address && op::loopback_literal(address) && op::find_token(Core.Params, operator_token);
 	if (own_key)
 		cfg.hello_token = operator_token;
@@ -549,7 +550,7 @@ bool Manager::start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& 
 {
 	if (active())
 		return false;
-	Mode* m = mode_for(Entry::MapServer, SessionMode::Server); // S4: the server layer's map server
+	Mode* m = mode_for(Entry::MapServer, SessionMode::Server); // the server layer's map server
 	if (!enter_mode(m))
 		return false;
 	m_map_server = true;
@@ -565,6 +566,7 @@ bool Manager::start_map_server(u16 port, const std::array<u8, kHelloTokenSize>& 
 		::Msg("! [coop] map server: cannot connect to the host's process on port %u: %s", port, err.c_str());
 		m_map_server = false;
 		reset_mode();
+		g_mode_stamp.bump(); // the start failed: none answers again
 		return false;
 	}
 	set_phase(Phase::Connecting);
@@ -577,11 +579,11 @@ void Manager::stop(const char* reason)
 	g_auto.connect.clear(); // leaving is meant: autostart does not go back
 	if (!active())
 		return;
-	autosave::host_on_session_end(); // F3: the host's last world save of the session, while the level still runs
+	autosave::host_on_session_end(); // the host's last world save of the session, while the level still runs
 	m_session.shutdown(reason);
 	if (m_map_server)
 		m_world.shutdown(reason);
-	script::on_session_end(reason); // W4 menu: last error in the co-op window
+	script::on_session_end(reason); // the last error in the co-op window
 	join::on_session_lost(reason);
 	sync::reset();
 	set_phase(Phase::Off);
@@ -629,7 +631,7 @@ void Manager::autostart()
 		if (cmd_param("-coop_shots", v))
 			g_auto.shots_every_s = (u32)atoi(v.c_str());
 	}
-	// S4: the layers' boots (coop_mode.cpp): the server's reads -coop_dedicated / -coop_mapserver once and makes its own starts
+	// the layers' boots (coop_mode.cpp): each reads its own keys once and makes its own starts
 	if (boot_layers() && !g_auto.layer_owns)
 	{
 		g_auto.layer_owns = true;
@@ -646,8 +648,8 @@ void Manager::autostart()
 	const u64 now = now_ms();
 	const bool level_ready = g_pGameLevel && g_actor && !Device.dwPrecacheFrame && ai().get_alife();
 
-	// INTEG-C (rv_A-S6-E-net fix 1): an address a layer was asked to join from outside the game (the co-op's invite,
-	// hostplay/coop_hostplay_steam.cpp), before a session as during one, into the retries below
+	// an address a layer was asked to join from outside the game (the co-op's invite), before a session as during one, into
+	// the retries below
 	std::string invite, via;
 	if (layer_join_request(invite, via))
 	{
@@ -667,7 +669,6 @@ void Manager::autostart()
 		}
 	}
 
-	// S4: the world server's autostart (it tries until its world is up) is the server layer's boot (srv/coop_srv_mode.cpp)
 	if (g_auto.host && !g_auto.host_done && !active() && level_ready)
 	{
 		g_auto.host_done = true;
@@ -695,7 +696,7 @@ void Manager::autostart()
 	{
 		g_auto.next_status = now + u64(g_auto.status_every_s) * 1000;
 		print_status();
-		if (world_up()) // level-change review: Level().Objects of a level that is not up has nothing to count
+		if (world_up()) // Level().Objects of a level that is not up has nothing to count
 			sync::dump_state("summary");
 	}
 	if (g_auto.shots_every_s && level_ready && now >= g_auto.next_shot)
@@ -749,28 +750,41 @@ void host_silence_step()
 	if (left != g_silence_shown)
 	{
 		g_silence_shown = left;
-		dialog::hud_message_n("st_coop_host_silent", "No connection to the host - waiting %u s", left);
+		hud_text::say_n("st_coop_host_silent", "No connection to the host - waiting %u s", left);
 	}
 }
 } // namespace
 
+// The mode stamp (xrCoop/coop_mode_stamp.h, coop.mode_stamp in Lua) is bumped where an answer of the mode facade can change:
+// - here, at the start of every frame, in every process, in a session or not;
+// - set_phase: the session starts, stops or changes its phase, the roles of this process change, Off puts the none mode back;
+// - enter_mode / enter_mode_of_welcome: a mode is installed; a failed start that put none back;
+// - the session's on_peer_joined / on_peer_left: a peer joins or leaves (a map server's players of its level, carried by its world,
+//   come the same way);
+// - after each update of the session and of a map server's world link below, and after sync::frame: what the messages of that update
+//   and the mode layer's frame changed;
+// - coop_levels.cpp at each change of the levels' table, of its split and of this process's view of them (a character changes its
+//   level, a seat goes, a world is replaced);
+// - srv/coop_mapserver.cpp when a map-server link appears or goes;
+// - coop_script.cpp register_raw: a Lua state is made (a level starts or is loaded).
 void Manager::frame()
 {
-	autostart(); // the Core's keys, then the layers' boots (S4: the server's runs dedicated::frame, reads its keys, makes its starts)
+	g_mode_stamp.bump();
+	PROF_EVENT("coop/coop_manager/frame");
+	autostart(); // the Core's keys, then the layers' boots (each reads its own keys and makes its own starts)
 	if (m_phase == Phase::Off)
 		return;
-	// W9: the link stays held until this machine plays normally again, not just until its last load step: the first
-	// frames after a load (precache, the first update of every script, a client's way to live) can each stall longer
-	// than the silence timeout (live check 2026-10-23: a GAMMA client was dropped there). Until then every frame
-	// re-arms the hold, so a hang still goes silent kLoadHoldMs after its last frame; a crash releases it at once and
-	// for good (on_crash seals it: this arm is refused even if the crash came after the read of g_crashed). Afterwards a
-	// stall must look like silence to the peers.
+	// The link stays held until this machine plays normally again, not just until its last load step: the first frames
+	// after a load (precache, the first update of every script, a client's way to live) can each stall longer than the
+	// silence timeout. Until then every frame re-arms the hold, so a hang still goes silent kLoadHoldMs after its last
+	// frame; a crash releases it at once and for good (on_crash seals it: this arm is refused even if the crash came after
+	// the read of g_crashed). Afterwards a stall must look like silence to the peers.
 	link_hold::FrameState fs;
 	fs.load_steps_queued = !g_loading_events.empty();
 	fs.precache_frames = g_pGameLevel && Device.dwPrecacheFrame != 0;
 	fs.joining_world = m_phase == Phase::LoadingWorld;
 	fs.crashed = g_crashed.load();
-	if (m_phase == Phase::Live && mode().actor_is_player()) // b57h: the level's online objects come after live
+	if (m_phase == Phase::Live && mode().actor_is_player()) // the level's online objects come after live
 	{
 		const u64 live_for = now_ms() - m_live_since_ms;
 		fs.live_ms = live_for < u64(link_hold::kNotLive) ? u32(live_for) : link_hold::kNotLive - 1;
@@ -779,23 +793,26 @@ void Manager::frame()
 	if (m_map_server)
 	{
 		m_world.update(now_ms()); // the world server first: what a player said comes down in its Tunnels
+		g_mode_stamp.bump();
 		if (m_phase == Phase::Off)
 			return;
 		m_session.set_world_epoch(m_world.world_epoch());
 	}
 	m_session.update(now_ms());
-	host_silence_step(); // live 2026-10-24: a silent host freezes the client
+	g_mode_stamp.bump();
+	host_silence_step(); // a silent host freezes the client
 	join::frame();
 	sync::frame();
-	health_ledger::frame(); // live 2026-11-09: who lowered the own actor's health (a diagnostic line)
+	g_mode_stamp.bump(); // the mode layer's own frame ran inside sync::frame (seats, the levels' map, the transfers)
+	health_ledger::frame(); // who lowered the own actor's health (a diagnostic line)
 }
 
 void Manager::print_status() const
 {
 	::Msg("[coop] build '%s', protocol %u", build_id(), kProtocolVersion);
 	::Msg("[coop] phase %s, self #%u, nick '%s'", phase_name(m_phase), m_session.self(), nick());
-	::Msg("[coop] mode %s", mode().name()); // S4: the session's (xrCoop/coop_mode.h), none outside one
-	lua_errors::print_status(); // 2026-11: also outside a session (the switch, what was survived before)
+	::Msg("[coop] mode %s", mode().name()); // the session's (xrCoop/coop_mode.h), none outside one
+	lua_errors::print_status(); // also outside a session (the switch, what was survived before)
 	if (!active())
 		return;
 	::Msg("[coop] silence timeout %u ms, keep-alive services %llu", kPeerTimeoutMs, m_session.keepalive_services());
@@ -807,7 +824,7 @@ void Manager::print_status() const
 		::Msg("[coop] netsim: lag %u ms, jitter %u ms, loss %.1f%%", sim.lag_ms, sim.jitter_ms, sim.loss * 100.f);
 	if (mode().decides_world())
 	{
-		// F3a T4: the host player's LocalLink; "refused" are the messages not moved onto it yet (the host's direct paths)
+		// the host player's LocalLink; "refused" are the messages not moved onto it (the host's direct paths)
 		const LocalLink::Stats& ls = m_link.stats();
 		::Msg("[coop] local link (the host player): to the server %llu, to the host player %llu, refused %llu (not moved "
 		      "onto the link), queued %u / %u, oversize %llu, overflow %llu, stale %llu (an older world)",
@@ -820,7 +837,7 @@ void Manager::print_status() const
 		::Msg("[coop]   %-18s out %6llu msg %9llu B | in %6llu msg %9llu B", msg_name(type), s.sent_count,
 		    s.sent_bytes, s.recv_count, s.recv_bytes);
 	}
-	// Level-change review: game messages that met a world that was not there (xrCoop/coop_world_gate.h)
+	// game messages that met a world that was not there (xrCoop/coop_world_gate.h)
 	const Session::WorldGateStats gs = m_session.world_gate_stats();
 	const char* world_now = "up";
 	switch (world_state())
@@ -845,14 +862,13 @@ void Manager::print_status() const
 
 void on_frame()
 {
-	Manager::get().frame(); // a server's process: its stats line too, from the server's boot (S4, A-S4H)
+	Manager::get().frame();
 }
 
-// TZ R38 (RL-N8HP-7FDG): a quit with a session up left the session to the Manager's static destructor: its Bye, its transport and the
-// transport's keep-alive thread ended inside the CRT's exit, after the log had closed, among the destructors of everything else; what
-// went wrong there was seen by nobody and ended the process with code 1. They end here now, the same Session::shutdown in the order of
-// the members' destruction (m_session before m_world), with the engine and the log up; the destructor finds both idle. The world
-// server stopped its session before its quit (dedicated::quit_now); a map server, a co-op host and a client end theirs here.
+// A quit with a session up ends the sessions here, with the engine and the log up, not in the Manager's static destructor inside
+// the CRT's exit (its Bye, its transport and the keep-alive thread would end after the log closed, unseen). The same
+// Session::shutdown in the order of the members' destruction (m_session before m_world); the destructor finds both idle. The
+// world server stopped its session before its quit; a map server, a co-op host and a client end theirs here.
 void Manager::app_end()
 {
 	if (active())
@@ -877,6 +893,6 @@ bool skip_keypress_on_load()
 {
 	if (net::client())
 		return true;
-	return Core.Params && (strstr(Core.Params, "-coop_host") || strstr(Core.Params, "-coop_connect"));
+	return ascii::find_key(Core.Params, "-coop_host") || ascii::find_key(Core.Params, "-coop_connect");
 }
 } // namespace coop

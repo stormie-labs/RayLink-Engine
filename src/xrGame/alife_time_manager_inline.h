@@ -10,7 +10,7 @@
 
 IC void CALifeTimeManager::set_time_factor(float time_factor)
 {
-	if (!coop::worldstate::allow_time_factor_change(time_factor)) // Anomaly Coop: on a client the host owns the clock
+	if (!coop::worldstate::allow_time_factor_change(time_factor)) // coop: on a client the host owns the clock
 		return;
 	m_game_time = game_time();
 	m_start_time = Device.dwTimeGlobal;
@@ -42,7 +42,7 @@ IC void CALifeTimeManager::change_game_time(u32 value)
 	m_game_time += value;
 }
 
-// Anomaly Coop: absolute set, used only by coop/coop_worldstate.cpp on a client to follow the host clock
+// coop: absolute set, used only by coop/coop_worldstate.cpp on a client to follow the host clock
 IC void CALifeTimeManager::coop_set_game_time(ALife::_TIME_ID game_time, float time_factor)
 {
 	m_game_time = game_time;

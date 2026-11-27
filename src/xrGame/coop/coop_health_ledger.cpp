@@ -1,7 +1,7 @@
-// Anomaly Coop (live 2026-11-09, a diagnostic: it only logs): the health ledger of this machine's own actor. See
-// coop_health_ledger.h here and xrCoop/coop_health_ledger.h (the rules, the line, the unit tests). The condition update and
-// the scripts may run on the GameThread worker (mt_Scheduler) and the line is written on the main thread: every touch of
-// the ledger is under g_lock, never held across a call out.
+// A diagnostic that only logs, off unless the console's coop_health_ledger is 1: the health ledger of this machine's own
+// actor. See coop_health_ledger.h here and xrCoop/coop_health_ledger.h (the rules, the line, the unit tests). The
+// condition update and the scripts may run on the GameThread worker (mt_Scheduler) and the line is written on the main
+// thread: every touch of the ledger is under g_lock, never held across a call out.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_health_ledger.h"
@@ -14,6 +14,8 @@
 #include "Actor.h"
 #include "ActorCondition.h"
 #include "entity_alive.h"
+#include "../../xrEngine/XR_IOConsole.h"
+#include "../../xrEngine/xr_ioc_cmd.h"
 
 #include <cmath>
 #include <string>
@@ -26,10 +28,11 @@ std::atomic<const CEntityCondition*> g_own_condition{nullptr};
 
 namespace
 {
+int g_coop_health_ledger = 0; // console coop_health_ledger: 1 = the ledger books and writes its lines
 xrCriticalSection g_lock;
 Ledger g_ledger;
 
-bool on() { return mgr().active() && mode().actor_is_player(); }
+bool on() { return g_coop_health_ledger && mgr().active() && mode().actor_is_player(); }
 
 bool own(const CEntity* who) { return who && g_actor && who == static_cast<const CEntity*>(g_actor) && on(); }
 
@@ -170,8 +173,23 @@ HitScope::~HitScope()
 	g_ledger.hit_end();
 }
 
+void register_console() { CMD4(CCC_Integer, "coop_health_ledger", &g_coop_health_ledger, 0, 1); }
+
 void frame()
 {
+	static bool s_was_on = false; // main thread only
+	if (!g_coop_health_ledger)
+	{
+		g_own_condition.store(nullptr, std::memory_order_relaxed);
+		if (s_was_on)
+		{
+			xrCriticalSectionGuard guard(g_lock);
+			g_ledger.stop(); // switched off: a window left open would span the time it was off
+		}
+		s_was_on = false;
+		return;
+	}
+	s_was_on = true;
 	if (!mode().actor_is_player())
 	{
 		g_own_condition.store(nullptr, std::memory_order_relaxed);

@@ -5,8 +5,8 @@
 #include "../../../actor.h"
 #include "../../../../xrPhysics/icolisiondamageinfo.h"
 #include "inventory_item.h"
-#include "../../../coop/coop_remote.h" // Anomaly Coop
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F4)
+#include "../../../coop/coop_remote.h"
+#include "../../../coop/coop_monster_fx.h"
 
 CPolterTele::CPolterTele(CPoltergeist* polter) : inherited(polter), m_pmt_object_collision_damage(0.5f)
 {
@@ -52,11 +52,11 @@ void CPolterTele::update_schedule()
 {
 	inherited::update_schedule();
 
-	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: no local tele-throw from puppets
+	if (coop::remote::is_remote_creature(m_object)) return; // coop: no local tele-throw from puppets
 	if (!m_object->g_Alive() || m_object->get_actor_ignore())
 		return;
 
-	Fvector const actor_pos = m_object->detection_target()->Position(); // Anomaly Coop: the player it senses
+	Fvector const actor_pos = m_object->detection_target()->Position(); // coop: the player it senses
 	float const dist2actor = actor_pos.distance_to(m_object->Position());
 
 	if (dist2actor > m_pmt_distance)
@@ -233,7 +233,7 @@ bool CPolterTele::tele_raise_objects()
 	tele_objects.reserve(20);
 
 	// получить список объектов вокруг врага
-	CEntityAlive* const target = m_object->detection_target(); // Anomaly Coop: the player it senses
+	CEntityAlive* const target = m_object->detection_target(); // coop: the player it senses
 	tele_find_objects(tele_objects, target->Position());
 
 	// получить список объектов вокруг монстра
@@ -339,7 +339,7 @@ void CPolterTele::tele_fire_objects()
             const float fire_time = hobj->Position().distance_to(enemy_pos) / m_pmt_fly_velocity;
 			hobj->set_collision_hit_callback(xr_new<SCollisionHitCallback>(m_object, m_pmt_object_collision_damage));
 			m_object->CTelekinesis::fire_t(hobj, enemy_pos, fire_time);
-			coop::monster_fx::host_throw(hobj, m_object, m_pmt_object_collision_damage); // Anomaly Coop (audit F4)
+			coop::monster_fx::host_throw(hobj, m_object, m_pmt_object_collision_damage); // coop: the clients see the throw
 			return;
 		}
 	}

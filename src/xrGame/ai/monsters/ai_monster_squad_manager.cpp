@@ -88,7 +88,7 @@ void CMonsterSquadManager::register_member(u8 team_id, u8 squad_id, u8 group_id,
 
 void CMonsterSquadManager::remove_member(u8 team_id, u8 squad_id, u8 group_id, CEntity* e)
 {
-	// Anomaly Coop (live 2026-10-24, a client's crash here): a monster that was never registered under these ids has no
+	// coop: a monster that was never registered under these ids has no
 	// squad to leave - the release build read past the vectors (get_squad only VERIFYs the ids).
 	CMonsterSquad* squad = get_squad(team_id, squad_id, group_id);
 	if (!squad)
@@ -105,7 +105,7 @@ void CMonsterSquadManager::remove_member(u8 team_id, u8 squad_id, u8 group_id, C
 CMonsterSquad* CMonsterSquadManager::get_squad(u8 team_id, u8 squad_id, u8 group_id)
 {
 	if (team_id >= team.size() || squad_id >= team[team_id].size() || group_id >= team[team_id][squad_id].size())
-		return nullptr; // Anomaly Coop: no such squad (callers check; update() already did)
+		return nullptr; // coop: no such squad (callers check; update() already did)
 	return team[team_id][squad_id][group_id];
 }
 

@@ -8,8 +8,8 @@
 #include "poltergeist_movement.h"
 #include "../../../detail_path_manager.h"
 #include "../monster_velocity_space.h"
-#include "../../../coop/coop_ai.h" // Anomaly Coop: nearest_player, is_player
-#include "../../../coop/coop_remote.h" // Anomaly Coop
+#include "../../../coop/coop_ai.h" // coop: nearest_player, is_player
+#include "../../../coop/coop_remote.h"
 #include "../../../level.h"
 #include "../../../level_debug.h"
 #include "../control_animation_base.h"
@@ -194,7 +194,7 @@ void CPoltergeist::update_detection()
 	//-------------------------------------------------------------------
 	// calculate detection level and turn on/off post processing effect
 	//-------------------------------------------------------------------
-	// Anomaly Coop (audit A4, 2026-10-24): the senses follow the nearest player, not only the host's actor (a client's
+	// coop: the senses follow the nearest player, not only the host's actor (a client's
 	// character was never detected: the poltergeist stayed at rest next to him). Without a session: the actor, as before.
 	CEntityAlive* target = coop::npc_ai::nearest_player(Position(), get_detection_far_range());
 	if (!target)
@@ -259,11 +259,11 @@ void CPoltergeist::update_detection()
 	}
 }
 
-// Anomaly Coop: nothing for a player who is down, no flames, no thrown objects (detection_target falls back on the host's actor)
+// coop: nothing for a player who is down, no flames, no thrown objects (detection_target falls back on the host's actor)
 bool CPoltergeist::get_actor_ignore() const
 {
 	return m_actor_ignore || coop::npc_ai::player_down(detection_target()) ||
-	    coop::npc_ai::debug_unseen(detection_target()); // protocol 29: the server's debug, invisible to the AI
+	    coop::npc_ai::debug_unseen(detection_target()); // coop: the server's debug, invisible to the AI
 }
 
 CEntityAlive* CPoltergeist::detection_target() const
@@ -429,7 +429,7 @@ void CPoltergeist::Die(CObject* who)
 		{
 			setVisible(true);
 			if (coop::remote::is_remote_creature(this))
-				m_current_position = Position(); // Anomaly Coop (audit F5a): a puppet never moved it, it is the spawn point
+				m_current_position = Position(); // coop: a puppet never moved it, it is the spawn point
 
 			if (PPhysicsShell())
 			{
@@ -455,7 +455,7 @@ void CPoltergeist::Hit(SHit* pHDS)
 {
 	ability()->on_hit(pHDS);
 
-	if (pHDS->who == Actor() || coop::npc_ai::is_player(pHDS->who)) // Anomaly Coop: a client's shot wakes it too
+	if (pHDS->who == Actor() || coop::npc_ai::is_player(pHDS->who)) // coop: a client's shot wakes it too
 	{
 		m_current_detection_level = m_detection_max_level;
 		if (pHDS->who)

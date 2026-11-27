@@ -10,7 +10,7 @@
 #include "uigamecustom.h"
 #include "inventory_item.h"
 #include "coop/coop_trade.h"
-#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
+#include "xrCoop/coop_container_rules.h"
 
 CInventoryBox::CInventoryBox()
 {
@@ -62,7 +62,7 @@ void CInventoryBox::OnEvent(NET_Packet& P, u16 type)
 			CObject* itm = Level().Objects.net_Find(id);
 			xr_vector<u16>::iterator it;
 			it = std::find(m_items.begin(), m_items.end(), id);
-			// Anomaly Coop (O1-container, b56 RL-QHQ3-2TUG): erase only an id the box lists, detach only its own child. On a
+			// coop: erase only an id the box lists, detach only its own child. On a
 			// co-op client "taken out" may come for an item the box never took or that is no game object here: the stock
 			// erase(end()) (VERIFY is debug-only) memmoved -2 bytes, and H_SetParent(NULL) took another holder's item
 			const coop::container::BoxStep step =
@@ -98,7 +98,7 @@ void CInventoryBox::UpdateCL()
 
 void CInventoryBox::net_Destroy()
 {
-	coop::trade::on_inv_box_destroy(*this); // Anomaly Coop: an open search window lets go of the box first (L-1 round 2)
+	coop::trade::on_inv_box_destroy(*this); // coop: an open search window lets go of the box first
 	inherited::net_Destroy();
 }
 

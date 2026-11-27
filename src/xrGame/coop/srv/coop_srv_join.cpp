@@ -1,12 +1,11 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the server's part of the join (S6 pattern P-G, unit A-S6J; temp/b58/s6_map/net.md, docs/contracts/coop_mode_api.md
-// section 7 H-JOIN). What coop_join.cpp did for a world server, a map server and a player of a server world only, moved here as it was:
+// Anomaly Coop — the server's part of the join (docs/contracts/coop_mode_api.md section 7 H-JOIN): what the join does for a world
+// server, a map server and a player of a server world only:
 // - the world server: its handlers on its session (join_install_world, after the Core's join::install_server). A bridge's JoinRequest
 //   gets the world its map server loads (the save its held players loaded, or a new one), a bridge's WorldLoaded ends that join, and a
 //   player's LevelMove is his move alone to another level (docs/SPLIT_LEVELS.md §2 decision 5, scenario 1). The facts of its world its
 //   autostart waits for (world_facts).
 // - a map server: its world server's SessionReset ends its process.
-// - a player of a server world: the feed lines "went to" / "came from" (S5, xrCoop/srv/coop_srv_feed_rules.h).
+// - a player of a server world: the feed lines "went to" / "came from" (xrCoop/srv/coop_srv_feed_rules.h).
 // The Core's join asks the session's mode where it did these (xrCoop/coop_mode.h H-JOIN: join_from_bridge, join_save, level_ready,
 // on_world_live, load_text; Layer::place_ghost) and gives these parts what they are made of (coop_join.h, "the Core's parts of the
 // server's join"). Only the server's modes call this file (srv/coop_srv_mode.cpp).
@@ -98,8 +97,8 @@ std::string translated(const char* id)
 
 // ---------------------------------------------------------------- the world server: a map server's world
 
-// F3a: a map server asks for its world. It is a client's join without a character: the save the players it starts for loaded, or a fresh
-// one; the world's changes since wait in its queue (sync::host_begin_join at its start) and reach it after it loaded.
+// A map server uses the client join flow without a character and loads its players' save or a fresh one.
+// sync::host_begin_join queues world changes from the start so the map server receives them after loading.
 void serve_bridge(PeerId bridge)
 {
 	// a world that is not up yet: it waits for it, as a player's join does
@@ -263,8 +262,8 @@ void on_level_move(PeerId from, Reader& r)
 	{
 	case levels::MoveVerdict::Go: break;
 	case levels::MoveVerdict::Board:
-		// A level entered together waits at the group's waiting point (the co-op's). Since S2 (no "story maps together") a server world
-		// has none: effective_gate(.., split) folds Together into BetterTogether and decide_move never says Board here. Were it ever to,
+		// A level entered together waits at the group's waiting point (the co-op's). A server world has none:
+		// effective_gate folds Together into BetterTogether and decide_move never says Board here. Were it ever to,
 		// the move is refused rather than left waiting for a board nobody runs.
 		::Msg("! [coop] '%s' asks to leave for level '%s', which the group enters together: no waiting point in a server world, refused",
 		    nick_of(from).c_str(), level_name_of(to_graph).c_str());
@@ -273,7 +272,7 @@ void on_level_move(PeerId from, Reader& r)
 	case levels::MoveVerdict::RefuseCap: send_move_result(from, m.seq, Result::Refused, Result::Cap, target); return;
 	case levels::MoveVerdict::RefuseInvalid: send_move_result(from, m.seq, Result::Refused, Result::Gate, target); return;
 	}
-	// In this order (recon §2.6): what he held is home, his character stands on the new level, the world he gets says so.
+	// Return the player's held units first, then teleport the character so the rejoin snapshot shows the new level.
 	levels::host_player_moves(from, target);
 	alife_rw().teleport_object(proxy->ID, to_graph, to_node, to_pos);
 	proxy->o_Angle = to_dir;
@@ -348,6 +347,7 @@ void join_install_world(Session& s)
 
 void join_world_frame()
 {
+	PROF_EVENT("coop/coop_srv_join/join_world_frame");
 	if (g_world.map_wait.empty())
 		return;
 	const std::vector<PeerId> waiting = g_world.map_wait;
@@ -371,6 +371,7 @@ void feed_start()
 
 void feed_frame()
 {
+	PROF_EVENT("coop/coop_srv_join/feed_frame");
 	const u64 now = mgr().now_ms();
 	if (now < g_feed.next_at)
 		return;

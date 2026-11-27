@@ -107,14 +107,14 @@ void CHudItem::Load(LPCSTR section)
 void CHudItem::PlaySound(LPCSTR alias, const Fvector& position)
 {
 	m_sounds.PlaySound(alias, position, object().H_Root(), !!GetHUDmode());
-	coop::presence::on_item_sound(&object(), alias, position); // Anomaly Coop (audit F6)
+	coop::presence::on_item_sound(&object(), alias, position); // coop: the other players hear it
 }
 
 //Alundaio: Play at index
 void CHudItem::PlaySound(LPCSTR alias, const Fvector& position, u8 index)
 {
 	m_sounds.PlaySound(alias, position, object().H_Root(), !!GetHUDmode(), false, index);
-	coop::presence::on_item_sound(&object(), alias, position); // Anomaly Coop (audit F6)
+	coop::presence::on_item_sound(&object(), alias, position); // coop: the other players hear it
 }
 
 //-Alundaio

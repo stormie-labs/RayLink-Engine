@@ -1,12 +1,12 @@
-// Anomaly Coop — the roles of a process (docs/plans/2026-10-24-f3a-split-levels.md §1.1) as flags. They replace the pair host /
+// Anomaly Coop — the roles of a process as flags. They replace the pair host /
 // client: every check "am I the host" is one of the roles below, whichever the code needs.
 //   WorldServer   the host's process: the world, offline, time, story, money, the save, the registry of levels;
 //   MapAuthority  the process that computes a level: the objects, the AI, the physics, the requests of the players on it. The
 //                 host's process for the host's level, a map server for every other level with players. Never a client: the
-//                 owner's decision of 2026-10-24, repeated 2026-11-01 ("the maps are on one side only, the host's");
+//                 maps are on one side only, the host's;
 //   Player        the host's process (the host player, a client of its own world server over the LocalLink) and a client;
 //   Mirror        a client, on every level: its objects are copies of the authority's;
-//   MapServer     a background process of the host's PC without a player (the key -coop_mapserver, the plan's Mk);
+//   MapServer     a background process of the host's PC without a player (the key -coop_mapserver);
 //   WorldClient   a process that asks the world server for everything of the world: a client, a map server.
 // Until a module is moved over, the old names keep their meaning: is_host() is WorldServer, is_client() is WorldClient; a
 // module's "host" half of a map asks is_map_authority(), which the host's process and a map server answer.

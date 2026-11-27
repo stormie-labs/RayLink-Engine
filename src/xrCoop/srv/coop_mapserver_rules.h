@@ -1,6 +1,6 @@
-// Anomaly Coop — the map servers, the pure part (docs/plans/2026-10-24-f3a-split-levels.md §1.1, §1.3, §1.8). The owner's decision of
-// 2026-10-24: every map is computed on the host's PC. A level with players and without the host is led by a background process of
-// the same exe, Mk; it connects to the host's process over the loopback, the players of its level are virtual peers on it, and a
+// Anomaly Coop — the map servers, the pure part.
+// Every map is computed on the host's PC. A level with players and without the host is led by a background process of
+// the same exe, a map server; it connects to the host's process over the loopback, the players of its level are virtual peers on it, and a
 // client talks to the host's process alone. This header holds what the engine only has to carry out:
 //   - bridges       the peer ids of the map servers on the host's session: no player slots;
 //   - Args          the key -coop_mapserver <level> <gvid> <port> <token>, both ways;
@@ -8,7 +8,7 @@
 //   - hello_verdict who may connect as a map server;
 //   - route_incoming, bridge_takes, map_server_sends: which message goes where;
 //   - VirtualPeers  who stands on a map server's level, from the world server's LevelMap: who came, who is in, who left.
-// Pure C++17, header-only, no engine dependencies: used by xrGame (coop/coop_mapserver.cpp, coop/coop_trunk.cpp), by the session and
+// Pure C++17, header-only, no engine dependencies: used by xrGame (coop/srv/coop_mapserver.cpp, coop/srv/coop_trunk.cpp), by the session and
 // by the unit-test exe.
 #pragma once
 
@@ -20,9 +20,11 @@
 #include <string>
 #include <vector>
 
+#include "../coop_text.h"
 #include "coop_levels_wire.h"
 #include "../coop_protocol.h"
 #include "coop_scope.h"
+#include "coop_token.h"
 
 namespace coop
 {
@@ -64,7 +66,8 @@ private:
 
 // ---------------------------------------------------------------- the key
 
-using Token = std::array<uint8_t, kHelloTokenSize>;
+using srv::Token;
+using srv::token_hex;
 
 // -coop_mapserver <level> <gvid> <port> <token>: the level it leads (game graph level id), the vertex its ghost stands on, the
 // port of the host's process, the token it proves itself with.
@@ -78,70 +81,24 @@ struct Args
 
 constexpr char kKey[] = "-coop_mapserver";
 
-inline std::string token_hex(const Token& t)
-{
-	static const char* const digits = "0123456789abcdef";
-	std::string out;
-	out.reserve(t.size() * 2);
-	for (const uint8_t b : t)
-	{
-		out.push_back(digits[b >> 4]);
-		out.push_back(digits[b & 15]);
-	}
-	return out;
-}
-
 namespace detail
 {
-inline int hex_value(char c)
-{
-	if (c >= '0' && c <= '9')
-		return c - '0';
-	if (c >= 'a' && c <= 'f')
-		return c - 'a' + 10;
-	return -1;
-}
-
 // A whole number up to `max` that ends at a blank or at the end of the text. Moves `p` past it and the blanks after it.
 inline bool read_number(const char*& p, uint32_t max, uint32_t& out)
 {
-	uint32_t v = 0;
 	const char* q = p;
-	while (*q >= '0' && *q <= '9')
-	{
-		v = v * 10 + uint32_t(*q - '0');
-		if (v > max)
-			return false;
+	while (ascii::digit(*q))
 		++q;
-	}
-	if (q == p || (*q && *q != ' '))
+	uint64_t v = 0;
+	if (!ascii::parse_decimal(std::string_view(p, size_t(q - p)), max, v, ascii::kAnyDigits, true) || (*q && *q != ' '))
 		return false;
-	out = v;
+	out = uint32_t(v);
 	while (*q == ' ')
 		++q;
 	p = q;
 	return true;
 }
 } // namespace detail
-
-// Exactly 32 lowercase hex digits (the engine's command line is lowercase), ending at a blank or at the end of the text.
-inline bool parse_token(const char* p, Token& out)
-{
-	Token t{};
-	for (size_t i = 0; i < t.size(); ++i)
-	{
-		const int hi = detail::hex_value(p[i * 2]);
-		const int lo = hi < 0 ? -1 : detail::hex_value(p[i * 2 + 1]);
-		if (lo < 0)
-			return false;
-		t[i] = uint8_t(hi << 4 | lo);
-	}
-	const char end = p[t.size() * 2];
-	if (end && end != ' ')
-		return false;
-	out = t;
-	return true;
-}
 
 // The arguments of the key anywhere in a command line. False, `out` as it was: no such key, or anything wrong with it. A longer
 // key with the same beginning is not this one.
@@ -168,7 +125,7 @@ inline bool parse_args(const char* params, Args& out)
 	    !detail::read_number(p, 0xFFFF, port) || port == 0)
 		return false;
 	Args a;
-	if (!parse_token(p, a.token))
+	if (!srv::parse_bridge_token(p, a.token))
 		return false;
 	a.level = uint16_t(level);
 	a.graph = uint16_t(graph);
@@ -189,11 +146,9 @@ inline std::string key_text(const Args& a)
 // The value of -fsltx in a command line, "fsgame.ltx" (the engine's default) without one.
 inline std::string fsltx_of(const char* params)
 {
-	static const char kFs[] = "-fsltx ";
-	const char* p = params ? std::strstr(params, kFs) : nullptr;
+	const char* p = ascii::find_key(params, "-fsltx");
 	if (!p)
 		return "fsgame.ltx";
-	p += sizeof(kFs) - 1;
 	while (*p == ' ')
 		++p;
 	std::string out;
@@ -283,7 +238,7 @@ inline std::string map_server_user_ltx(const std::string& text)
 {
 	static const char* const kOwn[][2] = {{"rs_screenmode", "windowed"}, {"vid_mode", "640x480"}, {"g_always_active", "on"}};
 	// What only a game started with -dbg registers (console_commands.cpp) and saves: a server without the key said "Unknown command"
-	// for each of them at every start (the owner's map servers, 2026-11-13). No server needs them: they are left out.
+	// for each of them at every start. No server needs them: they are left out.
 	static const char* const kDebugOnly[] = {"g_god", "g_unlimitedammo", "ph_gravity", "log_missing_ini", "g_end_modif"};
 	std::string out;
 	for (size_t line = 0; line < text.size();)
@@ -348,12 +303,47 @@ inline bool loopback_address(const std::string& ip_port) { return ip_port.compar
 //   a world message       here; the ones that touch his body go to the authority of his level too;
 //   a map message         there, and here only what the world keeps of him for the save and the HUD. While his map server is not
 //                         connected there is nobody to act on it: it is dropped, as a stream is;
+//   his repair            (StateDumpRequest, answered_by_his_map_server) there alone while his map server is connected, here
+//                         alone before its bridge connects and after it drops: one answer. While his map server loads he is
+//                         held on the loading screen and asks nothing, so the world's answer is not expected for him in play;
+//                         the stamp of a weapon in his map server's answer reaches the world on its way up;
 //   with split off, or on the host's level, everything as always.
 struct Incoming
 {
 	bool here = true;
 	bool tunnel = false;
 };
+
+// ONE process answers a player's repair. A StateDumpRequest of a player on a map server's level kept
+// and answered by the world server (kept_from_every_level) and tunnelled to and answered by that map server (install_server,
+// coop_entities.cpp: decides_world() || leads_level()). Each answer is an EntitySpawn of its own process (send_subtree ->
+// write_spawn), and write_clone_initial stamps a magazined weapon there with that process's instance (clone_export keeps the first
+// stamp it gave): the player got two spawns with two stamps. The one that matched his copy took him off the retry list
+// (reconcile::Retry::done), the other failed its stage and put him back on it (Retry::add, a new 20 s), so the weapon was asked
+// for again every 2 s with two answers each time; the item riders (jam, camo) keep a strict instance and were refused under the
+// other stamp. While the bridge of his map server is up, that map server alone answers, because the facts he asks about are its:
+//   - he compares his registry with ITS digest and roster (EntityHash reaches him from it only, level_passes; his EntityResync is
+//     tunnelled only): only its copy closes the difference he asked about. Online on a map and the uses of what is online there
+//     are no facts of the world (coop_entities.cpp mapless_row): the world's EntitySwitch and EntitySpawn of an object online at a
+//     map server say "offline" (online_here: Mode::online_elsewhere), the map server's spawn is marked online at his level on its
+//     way up (mark_spawn_of_your_level). The spawns follow the same choice: the world sends that level's players no copy
+//     of a map server's spawn (host_spawn_from_leader);
+//   - an object of another map and the world's own: the map server is a client of the world for them and repairs its copy against
+//     it, so its answer carries the world's word one hop later, as the roster he compares with does.
+// Without that bridge nobody else would answer, and the world's copy does, as before: only before the bridge connects and after it
+// drops. While the map server loads, its players are held on the loading screen (the LoadWait barrier, docs/SPLIT_LEVELS.md, the
+// life of a map server) and ask nothing; when it drops they load anew (host_rejoin_level). The world's answer is therefore not
+// expected for a player in play (at most a repair asked in the moment between the drop and his new load). Only this request: his
+// data the world keeps (vitals, equipment, items) still goes both ways, and what a map server asks its world
+// (map_server_asks_the_world) never comes through here (coop_trunk.cpp host_incoming takes a bridge's messages first).
+// The stamp: the world's Lua keeps the item data (coop_economy_core.script owns_world), and a weapon nobody had stamped
+// before gets its stamp from the map server's answer. The world's copy takes it from that spawn on its way up (coop_trunk.cpp
+// trunk_host_on_tunnel -> requests::adopt_spawn_stamp -> clone_take_stamp, the stamp alone), so a strict rider under it (jam, camo)
+// is taken there too; a weapon the world had stamped otherwise keeps the world's stamp (the parts still pass by the alias,
+// parts_alias). Not solved: a copy the map server's spawn never reached still holds the save's weapon (no stamp, its instance the
+// name), and its strict riders and SE vars of that weapon are refused wherever the stamp is held, the world's copy now included, and
+// it refuses theirs (tests/lua/test_srv_rider_stamp.lua, known limit).
+inline bool answered_by_his_map_server(Msg type) { return type == Msg::StateDumpRequest; }
 
 inline Incoming route_incoming(Msg type, bool split, bool on_host_level, bool has_bridge)
 {
@@ -363,18 +353,18 @@ inline Incoming route_incoming(Msg type, bool split, bool on_host_level, bool ha
 	const Scope scope = scope_of(type);
 	if (route(scope, false) == Route::TunnelToServer)
 	{
-		out.here = kept_from_every_level(type);
 		out.tunnel = has_bridge;
+		out.here = kept_from_every_level(type) && !(out.tunnel && answered_by_his_map_server(type));
 	}
 	else if (scope == Scope::World)
 		out.tunnel = has_bridge && also_to_level_authority(type);
 	return out;
 }
 
-// TZ R32 W3 (protocol 34, world-view D2): what the world server tells every map server beyond the registry of every level. A death:
+// What the world server tells every map server beyond the registry of every level. A death:
 // the stock death chain runs on every copy (to_bridges dropped it, so a map server never heard of a death on a level it does not
 // lead); the roster's digest: a map server is a client of the world for every object it does not write, and repairs its copy
-// against it (W5). The players of another level do not get them (level_passes, coop_scope.h: the co-op's rows stay).
+// against it. The players of another level do not get them (level_passes, coop_scope.h: the co-op's rows stay).
 inline bool world_tells_map_servers(Msg type)
 {
 	switch (type)
@@ -394,7 +384,7 @@ inline bool bridge_takes(Msg type)
 	return scope == Scope::World || (scope == Scope::Map && (reaches_every_level(type) || world_tells_map_servers(type)));
 }
 
-// TZ R32 W5 (protocol 34; the verifier's probe_mk_rules.cpp case A): a map server asks its world for what it misses of the objects
+// A map server asks its world for what it misses of the objects
 // it does not write: an entity (StateDumpRequest: a squad it misses at a switch, a holder to refetch, client_ask_entity) and the
 // rows of a bucket whose digest differs (EntityResync). The world server answers them itself (they are no tunnel's).
 inline bool map_server_asks_the_world(Msg type)

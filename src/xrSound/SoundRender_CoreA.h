@@ -82,6 +82,7 @@ public:
 	// EFX Slots
 	void LoadEffect();
 	void DestroyEffect();
+	void run_silent(LPCSTR why); // no sound device: the silent core from here on
 
 public:
 	CSoundRender_CoreA();

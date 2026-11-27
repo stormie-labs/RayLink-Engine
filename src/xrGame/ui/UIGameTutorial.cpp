@@ -12,7 +12,7 @@
 #include "../UIGameCustom.h"
 #include "UIActorMenu.h"
 #include "UIPdaWnd.h"
-#include "../coop/coop_join.h" // Anomaly Coop: world_generation
+#include "../coop/coop_join.h" // coop: world_generation
 #include "xrCoop/coop_ui_rules.h"
 
 extern ENGINE_API BOOL bShowPauseString;
@@ -23,7 +23,7 @@ void CallFunction(shared_str const& func)
 	bool functor_exists = ai().script_engine().functor(func.c_str(), functor_to_call);
 	THROW3(functor_exists, "Cannot find script function described in tutorial item ", func.c_str());
 	if (!functor_exists)
-		Msg("! tutorial: no script function %s", func.c_str()); // Anomaly Coop: THROW3 says nothing in Release
+		Msg("! tutorial: no script function %s", func.c_str()); // coop: THROW3 says nothing in Release
 	if (functor_to_call.is_valid())
 		functor_to_call();
 }
@@ -109,7 +109,7 @@ CUISequencer::CUISequencer() : m_id(coop::ui_rules::next_tutorial_id(last_tutori
 }
 
 extern BOOL g_bootComplete;
-// Anomaly Coop: the file, read again for the Lua state of a new world (coop::ui_rules::tutorials_xml_reusable)
+// coop: the file, read again for the Lua state of a new world (coop::ui_rules::tutorials_xml_reusable)
 static CUIXml& tutorials_xml()
 {
     static CUIXml uiXml;

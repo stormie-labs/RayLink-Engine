@@ -74,11 +74,11 @@ public:
 	void BoostTelepaticProtection(const float value);
 	void BoostChemicalBurnProtection(const float value);
 	BOOSTER_MAP GetCurBoosterInfluences() { return m_booster_influences; };
-	// Anomaly Coop (build 56): takes every booster away, its effect AND its entry. The script export ClearAllBoosters used to
+	// coop: takes every booster away, its effect AND its entry. The script export ClearAllBoosters used to
 	// subtract the effects and then clear a COPY of the list (the getter above returns one), so each booster stayed in the list
 	// and was subtracted a second time when it ran out: the parameter stayed negative by its value until the next world load.
 	void ClearBoosters();
-	// Anomaly Coop (build 56): a client's actor is built from the HOST's client data. For a player who brings no condition
+	// coop: a client's actor is built from the HOST's client data. For a player who brings no condition
 	// of his own (a join, a rejoin): what no report puts back goes - the boosters with their effect, the alcohol, the
 	// medicine at work, the once-per-game flags, the morale.
 	void DropLoadedExtras();

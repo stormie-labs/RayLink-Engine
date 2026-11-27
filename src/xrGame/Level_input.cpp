@@ -72,7 +72,7 @@ void CLevel::IR_OnMouseWheel(int direction)
 #endif
 	/* avo: end */
 
-	if (!CurrentGameUI()) return; // Anomaly Coop: see IR_OnMouseMove
+	if (!CurrentGameUI()) return; // coop: see IR_OnMouseMove
 	if (CurrentGameUI()->IR_UIOnMouseWheel(direction)) return;
 	if (Device.Paused()
 #ifdef DEBUG
@@ -122,7 +122,7 @@ void CLevel::IR_OnMouseMove(int dx, int dy)
     /* avo: end */
 #endif // INPUT_CALLBACKS
 
-	// Anomaly Coop: a client's level takes the mouse while it loads, before the HUD exists (crash here, live 2026-10-31)
+	// coop: a client's level takes the mouse while it loads, before the HUD exists
 	if (!CurrentGameUI()) return;
 	if (CurrentGameUI()->IR_UIOnMouseMove(dx, dy)) return;
 	if (Device.Paused() && !IsDemoPlay()
@@ -213,7 +213,7 @@ void CLevel::IR_OnKeyboardPress(int key)
         if (Device.editor())	return;
 #endif // INGAME_EDITOR
 
-		// Anomaly Coop (audit H4): the toggle below goes by the device's word, which never turns where the clock cannot stop
+		// coop: the toggle below goes by the device's word, which never turns where the clock cannot stop
 		if (!g_block_pause && (IsGameTypeSingle() || IsDemoPlay()) && coop::pause_key_acts(g_pGamePersistent->CanBePaused()))
 		{
 #ifdef DEBUG
@@ -685,7 +685,7 @@ void CLevel::IR_OnMouseStop(int /**axis/**/, int /**value/**/)
 void CLevel::IR_OnActivate()
 {
 	if (!pInput) return;
-	// Anomaly Coop: IGame_Level::Load captures input before the level is ready; replaying held movement keys
+	// coop: IGame_Level::Load captures input before the level is ready; replaying held movement keys
 	// then ran the Lua key hook on a world still loading (access violation in lua_next on a co-op client
 	// whose join started while the player held a key). Nothing to move yet: replay only in a ready level.
 	if (!bReady) return;

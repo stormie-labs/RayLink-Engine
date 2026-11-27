@@ -1,4 +1,4 @@
-// Anomaly Coop — presence of other players (WP8). See coop_presence.h.
+// Anomaly Coop — presence of other players. See coop_presence.h.
 #include "stdafx.h"
 #include "coop_presence.h"
 #include "coop_survival.h"
@@ -59,7 +59,7 @@ enum Kind : u8
 	KindShot = 0,
 	KindReload = 1,
 	KindLauncher = 2,
-	// host -> clients only (audits 2026-10-31): the rest of what its creatures and machines do
+	// host -> clients only: the rest of what its creatures and machines do
 	KindNpcSound = 3, // a weapon sound other than the shot: ammo = relay::weapon_sound_index
 	KindFlinch = 4, // a hit's flinch. A stalker: ammo = bone, pos = in the bone's space, dir = the hit's. A monster: ammo = EHitSide
 	KindHeliGun = 5,
@@ -148,19 +148,21 @@ Cache& cache()
 int g_nametags = 1;
 int g_nametags_dist = 1;
 
-// HUD v2.1 name tags (owner 2026-10-23 "presentable, the distance under the name, the transparency plays"): what a tag
-// shows and how strongly is xrCoop/coop_nametag.h; here the data of a frame and the drawing.
+// Name tags: what a tag shows and how strongly is xrCoop/coop_nametag.h; here the data of a frame and the drawing.
+// No allocation per frame: the tags and the player list keep their capacity, a tag's nick points into g_tag_players.
 struct Tag
 {
 	Fvector pos{}; // the point over the head: the tag stacks upwards from it
-	xr_string nick;
-	xr_string line; // the distance, or "0:42  34 m" for a wounded one; empty: no line
+	const char* nick = ""; // the nick of its entry in g_tag_players, valid until the next build_tags
+	char line[64] = {}; // the distance, or "0:42  34 m" for a wounded one; empty: no line
 	nametag::State state = nametag::State::Alive;
 	float dist = 0.f;
 	bool behind_wall = false;
 	u32 rgb = 0xffffff; // the player's colour
 };
 xr_vector<Tag> g_tags;
+// Every player of the session, self included (slot_rule = order counts every player), as build_tags last listed them.
+xr_vector<survival::PlayerRef> g_tag_players;
 
 // [coop_hud_layout] tag_* lines over the header's defaults, read once per session (reset() forgets them).
 nametag::Params g_tag_params;
@@ -176,7 +178,7 @@ struct TagIcons
 };
 TagIcons* g_tag_icons = nullptr;
 
-// W5 C2.3: a tag behind static geometry is hidden; one ray per tag every ~150-200 ms.
+// A tag behind static geometry is hidden; one ray per tag every ~150-200 ms.
 constexpr u32 kOcclusionCheckMs = 150;
 constexpr u32 kOcclusionStaggerMs = 10; // + (id % 6) * 10: tags do not all cast in the same frame
 constexpr u32 kOcclusionMaxHits = 4; // see-through surfaces skipped before giving up
@@ -187,14 +189,14 @@ struct Sight
 };
 xr_map<u16, Sight> g_sight; // by local id of the player character
 
-// W5: shared player palette (W6 "allies UI", system.ltx section [coop_player_colors] in mod_system_coop.ltx):
-// color_0..color_7 = "r,g,b", slot = the player's session peer id % 8 (host 0); optional slot_rule = order (index
+// The shared player palette (system.ltx section [coop_player_colors] in mod_system_coop.ltx):
+// color_0..color_16 = "r,g,b", slot = the player's session peer id % kPaletteSize (host 0); optional slot_rule = order (index
 // among the session's players sorted by peer id); down / dead = colors of a wounded / dead player. Read once per
-// session; without the section (or a key) the tags keep their old colors.
+// session; without the section (or a key) the tags keep the default colors.
 constexpr u32 kTagDefaultRgb = 0xc8f0c8;
 constexpr u32 kTagDownRgb = 0xff9a3c;
 constexpr u32 kTagDeadRgb = 0xa0a0a0;
-constexpr u32 kPaletteSize = kMaxPeerSlots; // F5-SEAT-2: color_0..color_16, a colour for every peer id of the wire (0..16)
+constexpr u32 kPaletteSize = kMaxPeerSlots; // color_0..color_16, a colour for every peer id of the wire (0..16)
 struct Palette
 {
 	bool loaded = false;
@@ -213,7 +215,7 @@ struct Stats
 	u64 npc_sounds_out = 0, npc_sounds_in = 0, flinches_out = 0, flinches_in = 0, heli_events_in = 0;
 } g_stat;
 
-// Host: each client's own budget, measured from its character (audit W3), and the last shot of each shooter (audit M5).
+// Host: each client's own budget, measured from its character, and the last shot of each shooter.
 struct ClientBudget
 {
 	relay::ShotBudget shots;
@@ -224,14 +226,6 @@ xr_map<u16, u64> g_last_shot;
 xr_map<u16, relay::HeliReport> g_heli; // under g_lock
 
 bool live() { return mode().decides_world() || mgr().is_live_client(); }
-
-CGameObject* object_here(u16 local_id)
-{
-	if (!g_pGameLevel || local_id == 0xffff)
-		return nullptr;
-	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(local_id));
-	return o && !o->getDestroy() ? o : nullptr;
-}
 
 // ---------------------------------------------------------------- effects
 
@@ -339,13 +333,13 @@ void fire_bullets(CAI_Stalker* avatar, CWeapon* w, const ShotEvent& e, const Fve
 
 void play(u16 avatar_id, const ShotEvent& e)
 {
-	CAI_Stalker* av = smart_cast<CAI_Stalker*>(object_here(avatar_id));
+	CAI_Stalker* av = smart_cast<CAI_Stalker*>(world::object_here(avatar_id));
 	if (!av)
 	{
 		++g_stat.no_avatar;
 		return;
 	}
-	CWeapon* w = smart_cast<CWeapon*>(object_here(join::to_local(e.weapon)));
+	CWeapon* w = smart_cast<CWeapon*>(world::object_here(join::to_local(e.weapon)));
 	if (!w)
 	{
 		++g_stat.no_weapon;
@@ -358,7 +352,7 @@ void play(u16 avatar_id, const ShotEvent& e)
 	{
 		play_weapon_sound(sect, "snd_reload", nullptr, av, body, SOUND_TYPE_WEAPON_RECHARGING);
 		++g_stat.reloads_in;
-		npc_ai::on_player_reload(avatar_id); // audit F3c: a burer's shield drops for it
+		npc_ai::on_player_reload(avatar_id); // a burer's shield drops for it
 		return;
 	}
 
@@ -372,18 +366,17 @@ void play(u16 avatar_id, const ShotEvent& e)
 	++g_stat.shots_in;
 	if (e.kind == KindLauncher)
 	{
-		// the grenade itself is a world entity (thrown items, WP7): only the launch is heard here
+		// the grenade itself is a world entity (thrown items): only the launch is heard here
 		play_weapon_sound(sect, "snd_shoot_grenade", "snd_shoot", av, origin, SOUND_TYPE_WEAPON_SHOOTING);
 		return;
 	}
 	const bool silenced = (e.flags & FlagSilenced) != 0;
-	// Live 2026-10-29 (b28): the weapon's own collection, as CWeaponMagazined::PlaySoundShot of a non-actor plays it.
-	// GAMMA's snd_shoot is mostly a layer section (snd_1_layer...), not a file, so reading the line as a file was silent
-	// ("avatar sound 'wpn_gsh18_snd_shoot' not found"); layers, variants and on_before_play_hud_sound now apply.
+	// The weapon's own collection, as CWeaponMagazined::PlaySoundShot of a non-actor plays it: a modded snd_shoot is often a
+	// layer section (snd_1_layer...), not a file, and layers, variants and on_before_play_hud_sound apply.
 	w->PlaySound(silenced ? "sndSilencerShot" : "sndShot", origin);
 	play_particles(sect, silenced ? "silencer_flame_particles" : "flame_particles", origin, e.dir);
 	play_particles(sect, silenced ? "silencer_smoke_particles" : "smoke_particles", origin, e.dir);
-	// An NPC's hits come from the host; its bullets here are the picture and the sound of the shot (audit W3, H3: whine, marks).
+	// An NPC's hits come from the host; its bullets here are the picture and the sound of the shot (whine, marks).
 	if (world::is_player_character(av) || (e.flags & FlagBullets))
 		fire_bullets(av, w, e, origin);
 }
@@ -409,7 +402,7 @@ void play_flinch(CGameObject* go, const ShotEvent& e)
 // Client: what the host's creature or machine `id` did.
 void play_event(u16 id, const ShotEvent& e)
 {
-	CGameObject* go = object_here(id);
+	CGameObject* go = world::object_here(id);
 	if (!go)
 	{
 		++g_stat.no_avatar;
@@ -417,7 +410,7 @@ void play_event(u16 id, const ShotEvent& e)
 	}
 	if (e.kind == KindNpcSound)
 	{
-		CHudItem* item = smart_cast<CHudItem*>(object_here(join::to_local(e.weapon)));
+		CHudItem* item = smart_cast<CHudItem*>(world::object_here(join::to_local(e.weapon)));
 		LPCSTR alias = relay::weapon_sound_alias(e.ammo);
 		if (!item || !alias)
 		{
@@ -451,7 +444,7 @@ void play_event(u16 id, const ShotEvent& e)
 
 // ---------------------------------------------------------------- network
 
-// Audit M5: a shot that opens a burst, a reload, a launcher: a lost one has nothing after it to cover the silence.
+// A shot that opens a burst, a reload, a launcher: a lost one has nothing after it to cover the silence.
 bool firm(const ShotEvent& e, u16 shooter)
 {
 	if (e.kind != KindShot && e.kind != KindHeliGun)
@@ -470,9 +463,11 @@ void to_players(const Writer& w, Lane lane, PeerId except = kInvalidPeer)
 		net::host_broadcast(Msg::PlayerShot, w, lane, except);
 		return;
 	}
-	for (const PeerInfo& p : mgr().session().peers())
+	mgr().session().for_each_joined([&](const PeerInfo& p)
+	{
 		if (p.state == PeerState::Joined && p.id != except && !sync::host_peer_joining(p.id))
 			net::host_send(p.id, Msg::PlayerShot, w, lane);
+	});
 }
 
 void send(ShotEvent& e)
@@ -526,21 +521,21 @@ void on_shot_msg(PeerId from, Reader& r)
 relay::Vec vec_of(const Fvector& v) { return relay::Vec{v.x, v.y, v.z}; }
 
 // Host: an event of its NPC or machine (shooter, host numbering) to every player it concerns, as each one's distance and
-// budget allow (audits W3, W8, M5): a firefight at a distance is sound and flame, thinned; a fight around him brings its
+// budget allow: a firefight at a distance is sound and flame, thinned; a fight around him brings its
 // bullets. The bullets take no bandwidth, one flag in the shot, but a client's frame: they stay limited as well.
 void send_npc(const ShotEvent& e)
 {
 	const u64 now = mgr().now_ms();
 	const bool fire = e.kind == KindShot || e.kind == KindHeliGun;
 	const bool opens = fire && firm(e, e.shooter);
-	for (const PeerInfo& p : mgr().session().peers())
+	mgr().session().for_each_joined([&](const PeerInfo& p)
 	{
 		if (p.state != PeerState::Joined || sync::host_peer_joining(p.id))
-			continue;
+			return;
 		const u16 proxy = join::proxy_of_peer(p.id);
 		CObject* o = proxy != 0xffff ? Level().Objects.net_Find(proxy) : nullptr;
 		if (!o)
-			continue;
+			return;
 		const Fvector& character = o->Position();
 		const float dist = character.distance_to(e.at);
 		ClientBudget& budget = g_budgets[p.id];
@@ -576,7 +571,7 @@ void send_npc(const ShotEvent& e)
 		if (!go)
 		{
 			++g_stat.npc_shots_far;
-			continue;
+			return;
 		}
 		Writer w(40);
 		out.write(w);
@@ -589,7 +584,7 @@ void send_npc(const ShotEvent& e)
 			++g_stat.npc_sounds_out;
 		else if (e.kind == KindFlinch)
 			++g_stat.flinches_out;
-	}
+	});
 }
 
 void send_pending()
@@ -766,14 +761,13 @@ void build_tags()
 	if (!g_nametags)
 		return;
 	load_tag_settings();
-	xr_vector<survival::PlayerRef> players;
-	survival::collect_players(players, true); // self too: slot_rule = order counts every player
+	survival::collect_players(g_tag_players, true);
 	const Fvector& cam = Device.vCameraPosition;
-	for (const survival::PlayerRef& p : players)
+	for (const survival::PlayerRef& p : g_tag_players)
 	{
 		if (p.self)
 			continue;
-		CGameObject* o = object_here(p.local_id);
+		CGameObject* o = world::object_here(p.local_id);
 		if (!o || !o->getVisible())
 			continue;
 		const survival::Life life = survival::life_of(p.local_id);
@@ -795,12 +789,10 @@ void build_tags()
 		tag.nick = p.nick.c_str();
 		tag.dist = dist;
 		tag.behind_wall = behind_wall;
-		tag.rgb = player_rgb(p.peer, players);
-		char line[64];
-		nametag::format_line(line, sizeof(line), tag.state, g_nametags_dist != 0, dist,
+		tag.rgb = player_rgb(p.peer, g_tag_players);
+		nametag::format_line(tag.line, sizeof(tag.line), tag.state, g_nametags_dist != 0, dist,
 		    tag.state == nametag::State::Wounded ? survival::bleed_left_ms(p.local_id) : 0, g_unit_m.c_str(),
 		    g_unit_km.c_str());
-		tag.line = line;
 		g_tags.push_back(tag);
 	}
 }
@@ -816,7 +808,7 @@ void on_weapon_shot(CWeapon* w)
 	ShotEvent e; // shooter 0xffff: the local actor's own shot (send() fills it in)
 	if (parent != Level().CurrentEntity())
 	{
-		// Live 2026-10-29 (b28): "the client does not hear NPCs shoot". A puppet never fires (no brain, its object handler
+		// A client hears the NPCs shoot. A puppet never fires (no brain, its object handler
 		// held at idle / strapped), so the host relays its own NPCs' shots. Avatars and proxies belong to their players.
 		CGameObject* npc = smart_cast<CGameObject*>(parent);
 		if (!(mode().decides_world() || mode().leads_level()) || !npc || npc->ID() == 0 || !remote::is_puppet_type(npc) ||
@@ -956,7 +948,7 @@ void init() { items::set_weapon_fired_handler(&on_weapon_shot); }
 void install_server(Session& s)
 {
 	s.on(Msg::PlayerShot, &on_shot_msg);
-	sound::install_server(s); // W5 C2: NPC sounds and avatar steps ride on presence (no own line in coop_sync)
+	sound::install_server(s); // NPC sounds and avatar steps ride on presence (no own line in coop_sync)
 	lamps::install_server(s);
 }
 
@@ -972,7 +964,7 @@ void register_console()
 	CMD4(CCC_Integer, "coop_nametags", &g_nametags, 0, 1);
 	CMD4(CCC_Integer, "coop_nametags_dist", &g_nametags_dist, 0, 1);
 	sound::register_console();
-	requests::register_console(); // W5 C2.1 (coop_client_hit_perks)
+	requests::register_console(); // coop_client_hit_perks
 }
 
 void reset()
@@ -987,6 +979,7 @@ void reset()
 	g_reload_weapon = 0xffff;
 	g_reload_state = 0;
 	g_tags.clear();
+	g_tag_players.clear();
 	g_sight.clear();
 	g_palette = Palette(); // re-read: the next session may run with another mod list
 	g_tag_params_loaded = false; // the tag_* lines too
@@ -998,6 +991,7 @@ void reset()
 
 void frame()
 {
+	PROF_EVENT("coop/coop_presence/frame");
 	sound::frame();
 	if (!world_up() || !live()) // world gate: no tags while the level is built or torn down
 	{
@@ -1083,7 +1077,7 @@ void render_hud()
 {
 	if (g_tags.empty() || !g_nametags)
 		return;
-	CGameFont* fn = UI().Font().pFontLetterica18Russian; // the nick (Cyrillic; GAMMA's Tactical Fonts replace it)
+	CGameFont* fn = UI().Font().pFontLetterica18Russian; // the nick (Cyrillic; a font mod may replace it)
 	CGameFont* fl = UI().Font().pFontLetterica16Russian; // the line under it
 	if (!fn)
 		fn = UI().Font().pFontArial14;
@@ -1111,12 +1105,12 @@ void render_hud()
 		    nametag::look(tag.state, tag.dist, tag.behind_wall, now, tag.rgb, g_palette.down, g_palette.dead, P);
 		const float aim = nametag::aim_factor(x - W * 0.5f, y - H * 0.5f, H, tag.state, P);
 		const float icon = lk.icon_px * ui;
-		const bool has_line = !tag.line.empty();
+		const bool has_line = tag.line[0] != 0;
 		const nametag::Stack st = nametag::stack(y, nick_h, line_h, icon, P.gap_px * ui, has_line);
 		tag_icon(lk.icon, x, st.icon_cy, icon * lk.icon_scale, nametag::argb(lk.icon_alpha * aim, lk.icon_rgb));
 		if (has_line)
-			tag_text(fl, x, floorf(st.line_y), tag.line.c_str(), lk.line_rgb, lk.line_alpha * aim, P);
-		tag_text(fn, x, floorf(st.nick_y), tag.nick.c_str(), lk.nick_rgb, lk.alpha * aim, P);
+			tag_text(fl, x, floorf(st.line_y), tag.line, lk.line_rgb, lk.line_alpha * aim, P);
+		tag_text(fn, x, floorf(st.nick_y), tag.nick, lk.nick_rgb, lk.alpha * aim, P);
 	}
 	// shared UI fonts: leave them as found (queued lines keep their alignment)
 	fn->SetAligment(CGameFont::alLeft);

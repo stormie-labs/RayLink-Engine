@@ -14,7 +14,7 @@
 #include "../../../level_graph.h"
 #include "../../../ai_space.h"
 #include "../../../ai_object_location.h"
-#include "../../../coop/coop_ai.h" // Anomaly Coop: player_jumping
+#include "../../../coop/coop_ai.h" // coop: player_jumping
 #include "../../../actor.h"
 
 #ifdef _DEBUG
@@ -411,7 +411,7 @@ u32 CAI_Dog::get_attack_rebuild_time()
 bool CAI_Dog::can_use_agressive_jump(const CObject* enemy)
 {
 	float delta_y = 0.8f;
-	if (coop::npc_ai::player_jumping(enemy)) // Anomaly Coop (audit F3d): any player, not only the host's actor
+	if (coop::npc_ai::player_jumping(enemy)) // coop: any player, not only the host's actor
 	{
 		delta_y += 0.8f;
 	}

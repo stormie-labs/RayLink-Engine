@@ -62,8 +62,8 @@
 #include "alife_simulator.h"
 #include "alife_object_registry.h"
 
-#include "xrCoop/coop_prefetch_life.h" // Anomaly Coop: SPAWN_ANTIFREEZE prefetch thread life
-#include "xrCoop/srv/coop_operator.h" // Anomaly Coop: op::redact, the command line in the log
+#include "xrCoop/coop_prefetch_life.h" // coop: SPAWN_ANTIFREEZE prefetch thread life
+#include "xrCoop/srv/coop_operator.h" // coop: op::redact, the command line in the log
 
 #ifdef DEBUG
 #include "level_debug.h"
@@ -84,7 +84,7 @@ u32 lvInterpSteps = 0;
 BOOL spawn_antifreeze = TRUE;
 BOOL spawn_antifreeze_debug = FALSE;
 
-// Anomaly Coop: the thread's life is per level and outlives nothing (xrCoop/coop_prefetch_life.h). The stock code had
+// coop: the thread's life is per level and outlives nothing (xrCoop/coop_prefetch_life.h). The stock code had
 // one static event for every level, a stop flag and a lock inside the CLevel, and ~CLevel freed the containers before it
 // signalled the thread, without waiting: a batch in flight wrote into freed memory (0xC0000374 at level change).
 struct PrefetchLock // xrSRWLock with the names of std::shared_mutex
@@ -343,7 +343,7 @@ CLevel::CLevel() :
     Msg("CLevel::CLevel() Spawn Antifreeze initialized");
 #endif
 
-    Msg("%s", coop::op::redact(Core.Params).c_str()); // Anomaly Coop: one-time tokens stay out of the log
+    Msg("%s", coop::op::redact(Core.Params).c_str()); // coop: one-time tokens stay out of the log
     //crash_saving::save_impl = crash_saving::_save_impl; // CLevel ready, we can save now
 }
 
@@ -394,7 +394,7 @@ CLevel::~CLevel()
     xr_delete(game_events);
 
 #ifdef SPAWN_ANTIFREEZE
-    // Anomaly Coop: stop the ProcessPrefetchEvents thread and wait until it has left, then free what it used. The stock
+    // coop: stop the ProcessPrefetchEvents thread and wait until it has left, then free what it used. The stock
     // code freed the containers first and signalled after, without waiting: a batch in flight wrote into freed memory.
     {
         const u32 stop_started = GetTickCount();
@@ -568,7 +568,7 @@ void CLevel::cl_Process_Event(u16 dest, u16 type, NET_Packet& P)
 #endif
             ok = false;
         }
-        // Anomaly Coop (O1-container, builds 56-57): the holder hears "taken out" only of a child that is a game object
+        // coop: the holder hears "taken out" only of a child that is a game object
         // here. In single player every child of an online holder is one; on a co-op client it may be none (its spawn was
         // dropped, its entity is gone), and a box then erased the end of its list, a trader read a null item
         // (xrCoop/coop_container_rules.h)
@@ -655,7 +655,7 @@ void CLevel::ProcessPrefetchEvents(void* args)
     LevelPrefetchLife* life = events->life;
     delete events;
 
-    // Anomaly Coop: the stock loop, with the stop protocol of coop_prefetch_life.h (stop flag and signal resets under the
+    // coop: the stock loop, with the stop protocol of coop_prefetch_life.h (stop flag and signal resets under the
     // level's lock, early stop between models, no write once closing, `exited` set as the very last action)
     coop::prefetch::run(*life, work);
 }
@@ -765,8 +765,8 @@ void CLevel::ProcessGameEvents()
 
 //AVO: spawn antifreeze implementation, originally by alpet, reritten by demonized
 #ifdef SPAWN_ANTIFREEZE
-			// Anomaly Coop: a map server has no load screen to keep g_bootComplete down while the level's first spawns come: postponed,
-			// its zones would update before the actor stands (live 2026-11-01, GAMMA: drx_da_main, db.actor nil on every load)
+			// coop: a map server has no load screen to keep g_bootComplete down while the level's first spawns come: postponed,
+			// its zones would update before the actor stands (a level script would meet db.actor nil on every load)
 			if (spawn_antifreeze && g_bootComplete && (!g_dedicated_server || g_actor))
 			{
 				// Postpone M_EVENT for postponed spawns

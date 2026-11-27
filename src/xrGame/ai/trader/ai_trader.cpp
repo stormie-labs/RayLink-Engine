@@ -23,9 +23,9 @@
 #include "../../game_object_space.h"
 #include "trader_animation.h"
 #include "../../../xrServerEntities/clsid_game.h"
-#include "../../coop/coop_trade.h" // Anomaly Coop
-#include "../../coop/coop_remote.h" // Anomaly Coop (WP1)
-#include "xrCoop/coop_container_rules.h" // Anomaly Coop (O1-container)
+#include "../../coop/coop_trade.h"
+#include "../../coop/coop_remote.h"
+#include "xrCoop/coop_container_rules.h"
 
 CAI_Trader::CAI_Trader()
 {
@@ -186,7 +186,7 @@ void CAI_Trader::OnEvent(NET_Packet& P, u16 type)
 			Obj->H_SetParent(this);
 			inventory().Take(smart_cast<CGameObject*>(Obj), false, false);
 		}
-		else if (coop::trade::trader_local_logic()) // Anomaly Coop: a client mirrors the host, never rejects
+		else if (coop::trade::trader_local_logic()) // coop: a client mirrors the host, never rejects
 		{
 			NET_Packet P;
 			u_EventGen(P, GE_OWNERSHIP_REJECT, ID());
@@ -202,7 +202,7 @@ void CAI_Trader::OnEvent(NET_Packet& P, u16 type)
 			bool just_before_destroy = !P.r_eof() && P.r_u8();
 			bool dont_create_shell = (type == GE_TRADE_SELL) || just_before_destroy;
 
-			// Anomaly Coop (O1-container, b57 RL-WKWE-CPCY): drop only a found item this trader's inventory lists. On a co-op
+			// coop: drop only a found item this trader's inventory lists. On a co-op
 			// client "taken out" may come for an item that is no game object here (stock read a null item, at net_Stop too),
 			// and DropItem of another inventory's item would wipe that inventory's pointer and take it off its real holder
 			CInventoryItem* item = Obj ? smart_cast<CInventoryItem*>(Obj) : nullptr;
@@ -227,7 +227,7 @@ void CAI_Trader::feel_touch_new(CObject* O)
 {
 	if (!g_Alive()) return;
 	if (Remote()) return;
-	if (!coop::trade::trader_local_logic()) return; // Anomaly Coop: the host's trader picks items up
+	if (!coop::trade::trader_local_logic()) return; // coop: the host's trader picks items up
 
 	// Now, test for game specific logical objects to minimize traffic
 	CInventoryItem* I = smart_cast<CInventoryItem*>(O);
@@ -246,7 +246,7 @@ void CAI_Trader::DropItemSendMessage(CObject* O)
 {
 	if (!O || !O->H_Parent() || (this != O->H_Parent()))
 		return;
-	if (!coop::trade::trader_local_logic()) return; // Anomaly Coop: the host's trader drops items
+	if (!coop::trade::trader_local_logic()) return; // coop: the host's trader drops items
 
 	Msg("Dropping item!");
 	// We doesn't have similar weapon - pick up it
@@ -261,7 +261,7 @@ void CAI_Trader::shedule_Update(u32 dt)
 	inherited::shedule_Update(dt);
 	UpdateInventoryOwner(dt);
 
-	if (coop::remote::is_remote_creature(this)) return; // Anomaly Coop (WP1): host-driven puppet
+	if (coop::remote::is_remote_creature(this)) return; // coop: host-driven puppet
 	if (GetScriptControl()) ProcessScripts();
 	else Think();
 }
@@ -305,7 +305,7 @@ void CAI_Trader::UpdateCL()
 	inherited::UpdateCL();
 	sound().update(Device.fTimeDelta);
 
-	if (coop::remote::update_cl(this)) return; // Anomaly Coop (WP1): host-driven puppet
+	if (coop::remote::update_cl(this)) return; // coop: host-driven puppet
 
 	if (!GetScriptControl() && !bfScriptAnimation())
 		animation().update_frame();

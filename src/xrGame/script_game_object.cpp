@@ -47,9 +47,9 @@
 #include "InventoryBox.h"
 #include "Pda.h"
 #include "player_hud.h"
-#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
-#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): who changed the own actor's health
-#include "coop/coop_items.h" // Anomaly Coop: TZ R32 W8.1, a setter on the decider is the item's new baseline
+#include "coop/coop_callgate.h"
+#include "coop/coop_health_ledger.h" // coop: who changed the own actor's health
+#include "coop/coop_items.h" // coop: a setter on the decider is the item's new baseline
 #include "script_attachment_manager.h"
 #include "CustomDevice.h"
 
@@ -125,10 +125,8 @@ BIND_FUNCTION10(&object(), CScriptGameObject::Group, CEntity, g_Group, int, -1);
 BIND_FUNCTION10(&object(), CScriptGameObject::GetFOV, CEntityAlive, ffGetFov, float, -1);
 BIND_FUNCTION10(&object(), CScriptGameObject::GetRange, CEntityAlive, ffGetRange, float, -1);
 
-// Anomaly Coop (F2 T12 round 1 gate, review list item 2; round 2: the other change_*, R1-M1): the health properties and
-// change_* of another's
-// creature are the host's on a client (refused: a "corpse" here that the host does not have, a heal the host never
-// sees; healing an NPC from a client is NPC sync, F2 T22). Our actor's run. A BIND_FUNCTION01 with the gate after the
+// coop: the health properties and change_* of another's creature are the host's on a client (refused: a "corpse" here
+// that the host does not have, a heal the host never sees; healing an NPC from a client is NPC sync). Our actor's run. A BIND_FUNCTION01 with the gate after the
 // class check.
 #define COOP_GATED_BIND_FUNCTION01(Z, A, B, C, F, I, N) \
 	DECLARE_FUNCTION11(A, void, F) \
@@ -138,7 +136,7 @@ BIND_FUNCTION10(&object(), CScriptGameObject::GetRange, CEntityAlive, ffGetRange
 	CALL_FUNCTION01(C, I)
 
 BIND_FUNCTION10(&object(), CScriptGameObject::GetHealth, CEntityAlive, conditions().GetHealth, float, -1);
-// Anomaly Coop (live 2026-11-09, a diagnostic): health and change_health are COOP_GATED_BIND_FUNCTION01 written out (the
+// coop: health and change_health are COOP_GATED_BIND_FUNCTION01 written out (the
 // same macros, the same call), plus the health ledger (coop/coop_health_ledger.h): which script changed the own actor's
 // health, `health = v` by what it changed, change_health(v) by what it queued for the next condition update.
 DECLARE_FUNCTION11(CScriptGameObject::SetHealth, void, float)
@@ -1036,7 +1034,7 @@ void CScriptGameObject::SetCondition(float val)
 	}
 	val -= inventory_item->GetCondition();
 	inventory_item->ChangeCondition(val);
-	coop::items::decider_wrote(inventory_item, coop::owner::Setter::Condition); // Anomaly Coop: TZ R32 W8.1, the decider's write
+	coop::items::decider_wrote(inventory_item, coop::owner::Setter::Condition); // coop: the decider's write
 }
 
 float CScriptGameObject::GetPowerCritical() const

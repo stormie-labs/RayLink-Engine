@@ -1,8 +1,8 @@
 #include "stdafx.h"
 #include "MainMenu.h"
 #include "coop/coop_manager.h"
-#include "xrCoop/coop_ui_rules.h" // Anomaly Coop
-#include "UIGameCustom.h" // Anomaly Coop
+#include "xrCoop/coop_ui_rules.h"
+#include "UIGameCustom.h"
 #include "UI/UIDialogWnd.h"
 #include "ui/UIMessageBoxEx.h"
 #include "../xrEngine/xr_IOConsole.h"
@@ -77,8 +77,8 @@ CMainMenu::CMainMenu()
 	g_btnHint = NULL;
 	g_statHint = NULL;
 	m_deactivated_frame = 0;
-	m_lua_retry = false; // Anomaly Coop
-	m_lua_retried = false; // Anomaly Coop
+	m_lua_retry = false; // coop: one retry of a failed Lua menu
+	m_lua_retried = false;
 
 	m_sPatchURL = "";
 	//m_pGameSpyFull					= NULL;
@@ -100,38 +100,35 @@ CMainMenu::CMainMenu()
 	GetCDKeyFromRegistry();
 	m_demo_info_loader = NULL;
 
-	if (!g_dedicated_server || g_coop_headless) // Anomaly Coop: CUIButton and CUIStatic read these unchecked
+	g_btnHint = xr_new<CUIButtonHint>();
+	g_statHint = xr_new<CUIButtonHint>();
+	//m_pGameSpyFull					= xr_new<CGameSpy_Full>();
+
+	for (u32 i = 0; i < u32(ErrMax); i++)
 	{
-		g_btnHint = xr_new<CUIButtonHint>();
-		g_statHint = xr_new<CUIButtonHint>();
-		//m_pGameSpyFull					= xr_new<CGameSpy_Full>();
-
-		for (u32 i = 0; i < u32(ErrMax); i++)
-		{
-			CUIMessageBoxEx* pNewErrDlg;
-			INIT_MSGBOX(pNewErrDlg, ErrMsgBoxTemplate[i]);
-			m_pMB_ErrDlgs.push_back(pNewErrDlg);
-		}
-
-		m_pMB_ErrDlgs[PatchDownloadSuccess]->AddCallbackStr("button_yes", MESSAGE_BOX_YES_CLICKED,
-		                                                    CUIWndCallback::void_function(
-			                                                    this, &CMainMenu::OnRunDownloadedPatch));
-		m_pMB_ErrDlgs[PatchDownloadSuccess]->AddCallbackStr("button_yes", MESSAGE_BOX_OK_CLICKED,
-		                                                    CUIWndCallback::void_function(
-			                                                    this, &CMainMenu::OnConnectToMasterServerOkClicked));
-
-		m_pMB_ErrDlgs[DownloadMPMap]->AddCallbackStr("button_copy", MESSAGE_BOX_COPY_CLICKED,
-		                                             CUIWndCallback::void_function(
-			                                             this, &CMainMenu::OnDownloadMPMap_CopyURL));
-		m_pMB_ErrDlgs[DownloadMPMap]->AddCallbackStr("button_yes", MESSAGE_BOX_YES_CLICKED,
-		                                             CUIWndCallback::void_function(this, &CMainMenu::OnDownloadMPMap));
-
-		//m_account_mngr			= xr_new<gamespy_gp::account_manager>		(m_pGameSpyFull->GetGameSpyGP());
-		//m_login_mngr			= xr_new<gamespy_gp::login_manager>			(m_pGameSpyFull);
-		//m_profile_store			= xr_new<gamespy_profile::profile_store>	(m_pGameSpyFull);
-		//m_stats_submitter		= xr_new<gamespy_profile::stats_submitter>	(m_pGameSpyFull);
-		//m_atlas_submit_queue	= xr_new<atlas_submit_queue>				(m_stats_submitter);
+		CUIMessageBoxEx* pNewErrDlg;
+		INIT_MSGBOX(pNewErrDlg, ErrMsgBoxTemplate[i]);
+		m_pMB_ErrDlgs.push_back(pNewErrDlg);
 	}
+
+	m_pMB_ErrDlgs[PatchDownloadSuccess]->AddCallbackStr("button_yes", MESSAGE_BOX_YES_CLICKED,
+	                                                    CUIWndCallback::void_function(
+		                                                    this, &CMainMenu::OnRunDownloadedPatch));
+	m_pMB_ErrDlgs[PatchDownloadSuccess]->AddCallbackStr("button_yes", MESSAGE_BOX_OK_CLICKED,
+	                                                    CUIWndCallback::void_function(
+		                                                    this, &CMainMenu::OnConnectToMasterServerOkClicked));
+
+	m_pMB_ErrDlgs[DownloadMPMap]->AddCallbackStr("button_copy", MESSAGE_BOX_COPY_CLICKED,
+	                                             CUIWndCallback::void_function(
+		                                             this, &CMainMenu::OnDownloadMPMap_CopyURL));
+	m_pMB_ErrDlgs[DownloadMPMap]->AddCallbackStr("button_yes", MESSAGE_BOX_YES_CLICKED,
+	                                             CUIWndCallback::void_function(this, &CMainMenu::OnDownloadMPMap));
+
+	//m_account_mngr			= xr_new<gamespy_gp::account_manager>		(m_pGameSpyFull->GetGameSpyGP());
+	//m_login_mngr			= xr_new<gamespy_gp::login_manager>			(m_pGameSpyFull);
+	//m_profile_store			= xr_new<gamespy_profile::profile_store>	(m_pGameSpyFull);
+	//m_stats_submitter		= xr_new<gamespy_profile::stats_submitter>	(m_pGameSpyFull);
+	//m_atlas_submit_queue	= xr_new<atlas_submit_queue>				(m_stats_submitter);
 
 	Device.seqFrame.Add(this,REG_PRIORITY_LOW - 1000);
 }
@@ -178,10 +175,10 @@ extern bool IsGameTypeSingle();
 
 #include "..\..\xrEngine\x_ray.h"
 
-// Anomaly Coop: true while the open menu left the level in seqFrame (co-op session when it opened). Decided
+// coop: true while the open menu left the level in seqFrame (co-op session when it opened). Decided
 // when the menu opens and kept until it closes: a session may start or end meanwhile, and the close and the
 // save screenshot must undo exactly what the open did.
-static bool g_coop_menu_world_running = false; // Anomaly Coop
+static bool g_coop_menu_world_running = false;
 
 void CMainMenu::Activate(bool bActivate)
 {
@@ -192,10 +189,10 @@ void CMainMenu::Activate(bool bActivate)
 		(m_screenshotFrame == Device.dwFrame + 1))
 		return;
 
-	// Anomaly Coop: in a session the menu behaves like multiplayer: the world keeps running for everybody
-	if (bActivate) // Anomaly Coop
-		g_coop_menu_world_running = coop::mgr().active(); // Anomaly Coop
-	bool b_is_single = IsGameTypeSingle() && !g_coop_menu_world_running; // Anomaly Coop
+	// coop: in a session the menu behaves like multiplayer: the world keeps running for everybody
+	if (bActivate)
+		g_coop_menu_world_running = coop::mgr().active();
+	bool b_is_single = IsGameTypeSingle() && !g_coop_menu_world_running;
 
 	if (g_dedicated_server && bActivate) return;
 
@@ -216,10 +213,10 @@ void CMainMenu::Activate(bool bActivate)
 
 		if (!ReloadUI())
 		{
-			// Anomaly Coop (2026-11-17): no menu, nothing will take the pause above off: sounds stayed paused, and a second
+			// coop: no menu, nothing will take the pause above off: sounds stayed paused, and a second
 			// opening paused them twice
 			Device.Pause(FALSE, FALSE, TRUE, "mm_activate1_failed");
-			// Anomaly Coop (2026-11-17, RL-K958-GVST): with no world this is the end of the road, the player has a black
+			// coop: with no world this is the end of the road, the player has a black
 			// window. The menu after a world runs in that world's Lua state (a new one is made only when a world starts),
 			// with all its scripts and whatever they left: db.actor of a destroyed actor, a state a swallowed exception
 			// left half unwound. OnFrame makes a new state, as a world's start does, and opens the menu as the game's start
@@ -257,7 +254,7 @@ void CMainMenu::Activate(bool bActivate)
         else
             Console->Execute("stat_memory");
 
-		// 1-console 2-cursor 3-tutorial. Anomaly Coop: over a loading screen a group holds (xrCoop/coop_ui_rules.h)
+		// 1-console 2-cursor 3-tutorial. coop: over a loading screen a group holds (xrCoop/coop_ui_rules.h)
 		Device.seqRender.Add(this, coop::ui_rules::menu_render_priority(load_screen_renderer.IsActive()));
 
 	}
@@ -304,7 +301,7 @@ void CMainMenu::Activate(bool bActivate)
 			bShowPauseString = m_Flags.test(flRestorePauseStr);
 		}
 
-		// Anomaly Coop: for a dialog that wants it. A load closes the menu too, and the level it was shown for is gone by then
+		// coop: for a dialog that wants it. A load closes the menu too, and the level it was shown for is gone by then
 		const CUIDialogWnd* top = g_pGameLevel && CurrentGameUI() ? CurrentGameUI()->TopInputReceiver() : nullptr;
 		if (coop::ui_rules::cursor_back_after_menu(!!m_Flags.test(flRestoreCursor), top && top->NeedCursor()))
 			GetUICursor().Show();
@@ -333,7 +330,7 @@ bool CMainMenu::ReloadUI()
 		m_Flags.set(flActive | flNeedChangeCapture,FALSE);
 		return false;
 	}
-	m_lua_retried = false; // Anomaly Coop
+	m_lua_retried = false; // coop: a new start dialog may be retried once again
 	xr_delete(m_startDialog);
 	m_startDialog = smart_cast<CUIDialogWnd*>(dlg);
 	VERIFY(m_startDialog);
@@ -524,7 +521,7 @@ extern void restart_all(); // alife_simulator.cpp: what a world's start does to 
 
 void CMainMenu::OnFrame()
 {
-	// Anomaly Coop (2026-11-17, RL-K958-GVST): see Activate
+	// coop: see Activate
 	if (m_lua_retry)
 	{
 		m_lua_retry = false;
@@ -554,7 +551,7 @@ void CMainMenu::OnFrame()
 
 		if (g_pGameLevel && m_Flags.test(flActive))
 		{
-			if (!g_coop_menu_world_running) // Anomaly Coop: in a session the level never left seqFrame
+			if (!g_coop_menu_world_running) // coop: in a session the level never left seqFrame
 				Device.seqFrame.Remove(g_pGameLevel);
 			Device.seqRender.Remove(g_pGameLevel);
 		};
@@ -585,7 +582,7 @@ extern u32 g_screenmode;
 
 void CMainMenu::OnDeviceCreate()
 {
-	Device.UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	Device.UpdateCursorClip(true); // coop: free cursor in windowed menus
 }
 
 
@@ -601,7 +598,7 @@ void CMainMenu::Screenshot(IRender_interface::ScreenshotMode mode, LPCSTR name)
 		xr_strcpy(m_screenshot_name, name);
 		if (g_pGameLevel && m_Flags.test(flActive))
 		{
-			if (!g_coop_menu_world_running) // Anomaly Coop: a second entry, then the Remove above would freeze the world
+			if (!g_coop_menu_world_running) // coop: a second entry, then the Remove above would freeze the world
 				Device.seqFrame.Add(g_pGameLevel);
 			Device.seqRender.Add(g_pGameLevel);
 		};

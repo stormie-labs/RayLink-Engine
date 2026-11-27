@@ -1,30 +1,29 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the world's acceptance of what a map server reports (TZ Р32, temp/r30/design/R32-final.md §1 W2b, W3; §7 WP3;
-// §8a A5, A6; R32-addendum-gaps2.md P1).
+// Anomaly Coop — the world's acceptance of what a map server reports.
 //
-// Before: the world server checked a Spawn only for the slice and a free id, dropped a Destroy of an object marked online elsewhere
-// or of a root on another map, and applied Died and Parent by id alone. So the world kept a member a map server had released
-// (D1, G3), took a death of another object under a reused id (cleanup M3), dropped the item of a placement while it kept the
-// placed object (P1). Now one rule decides every entry of a map server's journal before the world applies it
-// (srv/coop_levels_alife.cpp host_apply_fact):
+// Checking a Spawn only for the slice and a free id, or Died and Parent by id alone, would keep a member a map server released,
+// take a death of another object under a reused id, drop the item of a placement while keeping the placed object. One rule
+// decides every entry of a map server's journal before the world applies it (srv/coop_levels_alife.cpp host_apply_fact):
 //   a fact (Spawn, Destroy, Died, Parent, State, Item, Tent, Stash, Logic, Joined, Left, Info) is taken when the sender writes the
 //     object (for a Spawn the new object's root, for a Parent and a Joined both the old and the new root), the object is the one
-//     the world has under that id (section crc, the keeper generation of the unit at its root: A6), and the entry is not past the
-//     sender's fence (W4);
+//     the world has under that id (section crc, the keeper generation of the unit at its root), and the entry is not past the
+//     sender's fence;
 //   an ask (release, info of an object the sender does not write) is taken when the world writes the object and its root stands
 //     on the sender's map;
 //   the journal's own ops (Money, Carry, Done, Flushed, IdAsk) are no object's: each has its own rule where it is applied.
-// A refusal names its reason (journal::Why): the journal's Ack carries it back and the sender repairs towards the world (W2b).
-// R32 fix package A: a Spawn with no holder is the sender's only while it leads its map or stops (rootless_spawn_writer, A2); the
-// world's release of what a map server released follows release_plan (A5); a Left it accepted follows leave_plan (§8a A17, fix round
-// 2).
+// The departure flood: a Parent to the holder the object has here already changes nothing; it is taken as a repeat
+// whoever sent it (unchanged_parent), after the checks of the fence, the object and its identity, before the writer's.
+// A refusal names its reason (journal::Why): the journal's Ack carries it back and the sender repairs towards the world.
+// A Spawn with no holder is the sender's only while it leads its map or stops (rootless_spawn_writer); a body report of a
+// character its sender does not write is decided by his seat (body_report_by_seat), and a State as a whole by body_report (taken,
+// crossed his move, refused); the world's release of what a map server released follows release_plan; a Left it accepted follows
+// leave_plan.
 // Pure C++17, header-only: the engine and the unit-test exe (tests/test_levels_accept.cpp).
 #pragma once
 
 #include <cstdint>
 
 #include "../coop_writer_rules.h"
-#include "coop_levels_wire.h"
+#include "coop_journal_wire.h"
 
 namespace coop
 {
@@ -63,10 +62,11 @@ inline Kind kind_of(uint8_t op)
 	return Kind::Own;
 }
 
-// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of the unit at
-// its root (A6; 0 for a root that is no unit the sender holds) match (writer::same_object). One allowance: a unit the sender made
-// (its SpawnPrepare is registered here under `spawn_gen`, and the unit has not moved since: gen_here == spawn_gen) is named with
-// gen 0 by a sender that has not heard the world's Ack yet: it is the same unit. A unit granted again since is another.
+// Is the object a report names the object the world has under that id? Its section crc and the keeper generation of its root (the
+// sender's hold of that root whatever it is now, 0 when the sender does not hold it: levels::root_gen) match
+// (writer::same_object). One allowance: a unit the sender made (its SpawnPrepare is registered here under `spawn_gen`, and the unit
+// has not moved since: gen_here == spawn_gen) is named with gen 0 by a sender that has not heard the world's Ack yet: it is the same
+// unit. A unit granted again since is another.
 inline bool identity(uint16_t crc_here, uint16_t crc_report, uint32_t gen_here, uint32_t gen_report, uint32_t spawn_gen)
 {
 	if (writer::same_object(crc_here, crc_report, gen_here, gen_report))
@@ -76,7 +76,7 @@ inline bool identity(uint16_t crc_here, uint16_t crc_report, uint32_t gen_here, 
 
 // A new object with no parent stands where it is made: what a map server makes stands on its own map (a resident, or a unit born
 // there under its slice); a unit that stands on no map yet (no game vertex) is born by it as well. Another map is not its to make:
-// a map server never writes another map (W2a).
+// a map server never writes another map.
 inline bool spawn_on_senders_map(uint16_t spawn_level, uint16_t sender_level)
 {
 	return sender_level != writer::kNoLevel && (spawn_level == sender_level || spawn_level == writer::kNoLevel);
@@ -89,7 +89,7 @@ struct Facts
 	PeerId sender = kInvalidPeer; // the bridge of the map server that sent it
 	uint16_t sender_level = writer::kNoLevel; // the map it leads
 	uint32_t epoch = 0; // the seq of the batch the entry came in
-	uint32_t fence = writer::kNoFence; // the sender's fence for this object's root (W4): kNoFence for none
+	uint32_t fence = writer::kNoFence; // the sender's fence for this object's root: kNoFence for none
 	bool exists = false; // the world has an object under the entry's id (a Spawn: under the new object's id)
 	bool ghost = false; // the root is the ghost (actor 0 where the actor plays nobody)
 	bool same = true; // identity() of the object here and the entry's head (a Spawn: the object here, for a repeat)
@@ -97,18 +97,41 @@ struct Facts
 	                                          // Joined: of the old root; a Left: of the squad)
 	bool two_roots = false; // a Parent, a Joined: writer_new must be the sender too
 	writer::Writer writer_new = writer::nobody(); // the writer of the new root (the new parent's, the squad joined)
-	bool id_in_slice = false; // a Spawn: the id is the sender's to make (its slice, or a block this world gave it: W9)
+	bool id_in_slice = false; // a Spawn: the id is the sender's to make (its slice, or a block this world gave it)
 	uint16_t root_level = writer::kNoLevel; // an ask: the map the object's root stands on
-	// R32 fix A2: a Spawn with no holder. Its writer is not `writer` above but rootless_spawn_writer(): the map it stands on
+	// A Spawn with no holder. Its writer is not `writer` above but rootless_spawn_writer(): the map it stands on
 	// (`spawn_level`, kNoLevel for a unit born at no vertex yet) and whether the sender writes the residents of its own map now
-	// (`sender_leads`: its server Leads or Stops, writer::writes, §8a A4; a Starting one does not). `writer` is then the world's
+	// (`sender_leads`: its server Leads or Stops, writer::writes; a Starting one does not). `writer` is then the world's
 	// writer of the residents of the map the object stands on (of the sender's map for one at no map).
 	bool rootless = false;
 	uint16_t spawn_level = writer::kNoLevel;
 	bool sender_leads = false;
+	// A Parent: the object is in that holder here already (unchanged_parent).
+	bool unchanged = false;
+	// The root is a player's character (writer::RootKind::Character, the ghost aside): a State of it is his body report
+	// (body_report_by_seat).
+	bool character = false;
 };
 
-// R32 fix A2 (W1.2c, §8a A4): only a map server that leads its map, or stops, writes the map's residents; one that is still
+// The departure flood (Server). A map server switches a leaving player's character offline: the stock switch rejects every
+// item with a hook and takes each back without one, and a map server whose snapshot did not list his character sent a Parent of each
+// to the same character. The world writes the parked character by then, so it refused each as not the writer, and each refusal's
+// repair (Fetch: StateDumpRequest Replace) destroyed and made the item again on that map server: 100-300 items per departure. A
+// Parent into the holder the object has here already changes nothing whoever sends it: a repeat, never a refusal. A Parent to the
+// ground is never one: it carries the place the object was put down at.
+inline bool unchanged_parent(uint16_t parent_here, uint16_t to)
+{
+	return to != wire::kNoObject && parent_here == to;
+}
+
+// The sender writes the object's root, and for a Parent or a Joined the new root as well.
+inline bool sender_writes(const Facts& f)
+{
+	const writer::Writer sender = writer::other(f.sender);
+	return f.writer == sender && (!f.two_roots || f.writer_new == sender);
+}
+
+// Only a map server that leads its map, or stops, writes the map's residents; one that is still
 // Starting (in session, loading its world before it says Ready) does not, and neither does one that leads another map. The writer
 // of a new object with no holder:
 //   on the sender's map, or at no map yet (a unit the sender bore at no vertex): the sender while it writes its map's residents,
@@ -121,7 +144,7 @@ inline writer::Writer rootless_spawn_writer(const Facts& f)
 	return f.writer;
 }
 
-// R32 fix A5: what the world does with an object a map server that writes it released (a Destroy, an Ask of a release). The facts
+// What the world does with an object a map server that writes it released (a Destroy, an Ask of a release). The facts
 // of the object here:
 struct ReleaseFacts
 {
@@ -177,7 +200,7 @@ inline ReleasePlan release_plan(const ReleaseFacts& f)
 	return p;
 }
 
-// R32 §8a A17 (fix round 2 of package A, verifier findings 2 and 4): what the world does with a Left it accepted (the sender writes the
+// what the world does with a Left it accepted (the sender writes the
 // squad). The facts of the creature here:
 struct LeaveFacts
 {
@@ -227,7 +250,7 @@ struct Verdict
 inline Verdict taken(bool repeat = false) { return Verdict{true, 0, repeat}; }
 inline Verdict refused(journal::Why why) { return Verdict{false, uint8_t(why), false}; }
 
-// The rule (W2b), first match wins.
+// The rule, first match wins.
 inline Verdict accepts(const Facts& f)
 {
 	const Kind kind = kind_of(f.op);
@@ -253,7 +276,7 @@ inline Verdict accepts(const Facts& f)
 	if (f.op == wire::LevelEntityHead::Spawn)
 	{
 		if (f.ghost)
-			return refused(journal::Ghost); // nothing is made under the ghost (W1.5)
+			return refused(journal::Ghost); // nothing is made under the ghost
 		if (!f.id_in_slice)
 			return refused(journal::IdRange);
 		if (f.exists)
@@ -268,9 +291,82 @@ inline Verdict accepts(const Facts& f)
 		return refused(journal::Ghost);
 	if (!f.same)
 		return refused(journal::Identity);
-	if (f.writer != sender || (f.two_roots && f.writer_new != sender))
+	if (f.op == wire::LevelEntityHead::Parent && f.unchanged)
+		return taken(true); // the departure flood: it changes nothing, so there is nothing to refuse and nothing to repair
+	if (!sender_writes(f))
 		return refused(journal::NotWriter);
 	return taken();
+}
+
+// A body report (State) of a player's character that its sender does not write. The rule of the character's seat
+// (writer::world_seat) makes the world the writer of a parked character and the new map's server the writer of a re-seated one, at
+// once on his move, while the map server he left hears of it only from the next LevelMap; the report it journaled in between (one
+// a second) reaches the world after that. The acceptance refuses such a report as not the writer before the verdict on the body
+// (wire::body_report_verdict) that tells a crossing from a fault is reached, so that verdict decides it instead. Every other reason
+// (no object, the ghost, another object, past the fence) stays a refusal.
+inline bool body_report_by_seat(const Facts& f, const Verdict& v)
+{
+	return f.op == wire::LevelEntityHead::State && f.character && !v.ok && v.why == uint8_t(journal::NotWriter);
+}
+
+// What the world reads off a body report and off its own books for wire::body_report_verdict.
+struct BodyFacts
+{
+	bool read = false; // the report read whole
+	bool known = false; // the world has the object
+	bool online_here = false;
+	bool player_character = false;
+	uint16_t body_level = wire::kNoLevel; // the level of the report's vertex
+	uint16_t sender_level = wire::kNoLevel;
+	uint16_t seat_level = wire::kNoLevel; // the level of his player's seat (kNoLevel: parked, between two levels)
+	bool position_valid = false;
+};
+
+// What becomes of a body report at the world:
+//   Taken    its sender writes him: the world places his character (`why` 0);
+//   Crossed  it crossed his move within the grace (wire::kBodyCrossedGraceMs): a fact applied without effect. No refusal goes back
+//            in the journal's Ack and neither side prints "!": the sender did nothing wrong, and a refusal would print one on the
+//            map server for every departure whose report crossed it;
+//   Refused  a fault of its sender: by the acceptance (`by_acceptance`, `why` its reason, its line is the acceptance's) or by the
+//            verdict on the body (`why` journal::Refused, the world's line names the facts), a crossing past the grace among them.
+enum class BodyOutcome : uint8_t
+{
+	Taken,
+	Crossed,
+	Refused,
+};
+
+struct BodyDecision
+{
+	BodyOutcome outcome = BodyOutcome::Refused;
+	uint8_t why = 0; // journal::Why when refused
+	bool by_acceptance = false;
+	uint64_t crossed_ms = 0; // how long the run of crossed reports of this character has lasted (0: none or its first)
+};
+
+// The one decision on a State of a map server's journal (srv/coop_levels_xfer.cpp host_take_body): the acceptance, then the
+// verdict on the body for a report the acceptance took or handed to his seat (body_report_by_seat), then the grace of a crossing
+// (`run`: this character's run of crossed reports, `now` in ms).
+inline BodyDecision body_report(const Facts& f, const BodyFacts& b, wire::BodyCrossing& run, uint64_t now)
+{
+	const Verdict v = accepts(f);
+	if (!v.ok && !body_report_by_seat(f, v))
+		return BodyDecision{BodyOutcome::Refused, v.why, true, 0};
+	wire::BodyReport r = wire::body_report_verdict(b.read, b.known, b.online_here, b.player_character, b.body_level, b.sender_level,
+	    b.seat_level, b.position_valid, v.ok);
+	uint64_t crossed_ms = 0;
+	if (r == wire::BodyReport::Crossed)
+	{
+		crossed_ms = wire::body_crossing_age(run, b.sender_level, b.seat_level, now);
+		r = wire::body_crossing_verdict(crossed_ms); // a map server that never hears he left is at fault
+	}
+	switch (r)
+	{
+	case wire::BodyReport::Take: return BodyDecision{BodyOutcome::Taken, 0, false, 0};
+	case wire::BodyReport::Crossed: return BodyDecision{BodyOutcome::Crossed, 0, false, crossed_ms};
+	default: break;
+	}
+	return BodyDecision{BodyOutcome::Refused, uint8_t(journal::Refused), false, crossed_ms};
 }
 } // namespace accept
 } // namespace levels

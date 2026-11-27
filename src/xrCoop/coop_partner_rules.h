@@ -1,5 +1,5 @@
-// Anomaly Coop — which windows let go of an inventory owner, and when (O2-partner; crash reports RL-8CGN-EU7U and RL-AYXZ-JTV4 of
-// build 56, triage 2026-11-23). The talk window (CUITalkWnd::m_pOthersInvOwner), the actor menu (CUIActorMenu::m_pPartnerInvOwner)
+// Anomaly Coop — which windows let go of an inventory owner, and when. The talk window (CUITalkWnd::m_pOthersInvOwner), the
+// actor menu (CUIActorMenu::m_pPartnerInvOwner)
 // and the actor's talk (CInventoryOwner::m_pTalkPartner) keep raw pointers to the NPC, the trader or the corpse they show, and read
 // them every frame and on their close. Stock closes them when the level stops (CLevel::net_Stop, HideShownDialogs), but in a session
 // a partner can go first: its decider releases it or takes it offline, or this machine's world is replaced. The windows let go of it

@@ -78,6 +78,11 @@ private:
 #endif // USE_HEAD_BONE_PART_FAKE
 
 private:
+	// coop: the missing torso motion this stalker reported last; a frame that repeats it skips the process-wide report set
+	shared_str m_missing_torso_visual;
+	string128 m_missing_torso_motion{};
+
+private:
 	float m_previous_speed;
 	float m_target_speed;
 	float m_last_non_zero_speed;

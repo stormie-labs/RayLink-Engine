@@ -1,11 +1,11 @@
 // Anomaly Coop — the console window of the dedicated host (docs/DEDICATED_HOST.md). A real Windows console: the exe is a GUI program, so the
 // window comes from AllocConsole. A thread reads it, line by line, with the editing and the history of the console itself; the game's main
-// thread takes the lines (xrGame/coop/coop_dedicated.cpp). The game's log comes through the logger's callback, filtered by
-// xrCoop/coop_dedicated_rules.h log_shown. Closing the window or Ctrl+C asks the game to save and quit.
+// thread takes the lines (coop_dedicated.cpp). The game's log comes through the logger's callback, filtered by
+// xrCoop/srv/coop_dedicated_rules.h log_shown. Closing the window or Ctrl+C asks the game to save and quit.
 //
 // A standard input that is a pipe or a file at the start (a launcher, a test) is read beside the window.
-// -coop_hidden (plan 2026-11-12 stage 1): no window at all, only that input; its end (the launcher or the host's game died) is quit.
-// With it, a standard output that is a pipe or a file gets, in UTF-8, the lines the window would show and the @rl lines (stage 2).
+// -coop_hidden: no window at all, only that input; its end (the launcher or the host's game died) is quit.
+// With it, a standard output that is a pipe or a file gets, in UTF-8, the lines the window would show and the @rl lines.
 // Text in the game is cp1251, the window speaks UTF-16: the conversion is here.
 #pragma once
 
@@ -15,21 +15,26 @@ namespace coop_console
 {
 // WinMain, before the engine's core: the log of the whole start shows.
 ENGINE_API void open();
-ENGINE_API bool is_open();
-// The logger's callback. Any thread.
+// The logger's callback. Any thread, never blocks: the line is queued for the window and the output (coop_line_writer.h).
 ENGINE_API void log_line(const char* line);
 // 0 errors, 1 the session (the default), 2 everything.
 ENGINE_API void set_log_level(int level);
 ENGINE_API int log_level();
 // Writes a line whatever the log level: answers to the operator.
 ENGINE_API void print(const char* line);
-// -coop_hidden with a redirected standard output (plan 2026-11-12 stage 2): an "@rl ..." line for the parent
-// (xrCoop/coop_world_server_rules.h format), on that output only, never in the log or the window. Any thread, never blocks.
+// -coop_hidden with a redirected standard output: an "@rl ..." line for the parent
+// (xrCoop/srv/coop_world_server_rules.h format), on that output only, never in the log or the window. Any thread, never blocks.
 ENGINE_API void rl_line(const char* line);
 // That output is on: -coop_hidden, a pipe or a file, and the parent has not closed it.
 ENGINE_API bool output_on();
 // Waits up to `ms` until every line queued so far is written (the last lines before the process exits). False: not all of it.
 ENGINE_API bool flush_output(unsigned ms);
+// The same for the window: its lines are written by a thread of their own, so a paused window holds that thread and never the game.
+ENGINE_API bool flush_window(unsigned ms);
+// The quit, after both flushes: the window and the pipe take no more lines, and no later call waits on their writers (ExitProcess may
+// kill a writer's thread inside its lock; a line the logger hands over after this point returns at once). What a flush left queued is
+// still written while the process ends: the parent's "down" is not thrown away by a flush that ran out of time.
+ENGINE_API void stop_output();
 ENGINE_API void set_title(const char* title);
 // Main thread: the next line typed, false if there is none.
 ENGINE_API bool next_line(char* out, size_t size);

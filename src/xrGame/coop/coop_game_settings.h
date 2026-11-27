@@ -18,7 +18,6 @@
 //                                                     reason "not_allowed" (not a game rule), "bad_value" (not a plain
 //                                                     token), "unknown" (the console has no such command or shows a value
 //                                                     that cannot be written back)
-//   coop.game.release_cvars() -> restored             the machine's values back (also done when the level is left)
 //   coop.game.machine_cvar(name) -> string|nil        the machine's value while a game value is set, else nil
 //   coop.game.set_world_faction(f) -> bool            false (unchanged) when f is not a character name
 //   coop.game.world_faction() -> string               "" when the world has no group

@@ -1,6 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop - the wander path of a moving anomaly zone across machines (F4 G11-2, review m19:1: the "Ghost" of Dynamic
-// Anomalies Overhaul).
+// Anomaly Coop - the wander path of a moving anomaly zone across machines.
 //
 // DAO (drx_da_main.script anomalies_spawn_functions.zone_mine_ghost) gives each Ghost a path around the point it spawned at: a
 // start angle i of {0, 45, 90, 135, 180}, a step of i of {1, 2, 3}, a step of j that depends on it ({2, 3} / {1, 3} / {2, 4}),
@@ -34,6 +32,8 @@
 #include <numeric>
 #include <vector>
 
+#include "coop_hash.h"
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -58,7 +58,7 @@ constexpr uint64_t kPendingTtlMs = 300000; // a viewer keeps a path for a copy t
 
 struct Path
 {
-	uint16_t id = 0xFFFF; // the zone: host numbering on the wire, local after the viewer maps it
+	uint16_t id = kNoId; // the zone: host numbering on the wire, local after the viewer maps it
 	uint32_t section_hash = 0;
 	float origin[3] = {0.f, 0.f, 0.f}; // the point it spawned at (DAO: the binder's spawn_position)
 	uint16_t i0 = 0; // start angle of i, degrees
@@ -193,14 +193,8 @@ inline bool same_zone(uint32_t sent_hash, uint32_t copy_hash, const float origin
 	return std::isfinite(d2) && d2 <= kMaxOriginShift * kMaxOriginShift;
 }
 
-// FNV-1a of a section name (the same hash coop_objects puts on its Rest entries).
-inline uint32_t name_hash(const char* s)
-{
-	uint32_t h = 2166136261u;
-	for (; s && *s; ++s)
-		h = (h ^ uint8_t(*s)) * 16777619u;
-	return h;
-}
+// The section hash of a path. Transitional: coop_objects.cpp still calls it; it goes when that file calls fnv1a32.
+inline uint32_t name_hash(const char* s) { return fnv1a32(s); }
 
 inline void write_path(Writer& w, const Path& p, uint32_t phase)
 {

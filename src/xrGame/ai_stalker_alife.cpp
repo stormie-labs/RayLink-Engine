@@ -267,10 +267,10 @@ void CAI_Stalker::select_items()
 
 void CAI_Stalker::update_sell_info()
 {
-	// Anomaly Coop: built once per frame while nothing is taken or dropped (OnItemTake / OnItemDrop clear the flag).
+	// coop: built once per frame while nothing is taken or dropped (OnItemTake / OnItemDrop clear the flag).
 	// CInventory::AddAvailableItems asks can_sell for every item of a stalker trader, and a full rebuild per item made
-	// every fill of the engine trade window O(n^2): the window a co-op client always trades in (G.A.M.M.A.'s Lua window
-	// never calls this), a visible hitch on a G.A.M.M.A. trader's stock (live 2026-10-29).
+	// every fill of the engine trade window O(n^2): the window a co-op client always trades in (a mod's Lua window may
+	// never call this), a visible hitch on a large trader's stock.
 	if (m_sell_info_actuality && m_sell_info_frame == Device.dwFrame)
 		return;
 
@@ -302,7 +302,7 @@ bool CAI_Stalker::can_sell(CInventoryItem* item)
 	xr_vector<CTradeItem>::const_iterator I = std::find(m_temp_items.begin(), m_temp_items.end(), item->object().ID());
 	if (I == m_temp_items.end())
 	{
-		// Anomaly Coop: not in this frame's list (taken before OnItemTake ran): build it again; still missing - not ours
+		// coop: not in this frame's list (taken before OnItemTake ran): build it again; still missing - not ours
 		m_sell_info_actuality = false;
 		update_sell_info();
 		I = std::find(m_temp_items.begin(), m_temp_items.end(), item->object().ID());

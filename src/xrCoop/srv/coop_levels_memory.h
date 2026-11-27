@@ -1,27 +1,24 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the world server's memory guard for its map servers (build 50's physical look, O6's commit look). Pure C++17,
+// Anomaly Coop — the world server's memory guard for its map servers (the physical look and the commit look). Pure C++17,
 // header-only: the engine (srv/coop_mapserver.cpp check_memory, host_frame) and the unit-test exe use it.
 //
-// Report #938 (round after builds 55-58): a world server died of out-of-memory with 0.6 GB of commit free while the guard read the
-// physical memory alone (ullAvailPhys). Windows refuses an allocation when the commit limit (RAM plus page file) is reached, whatever
-// RAM is free; a map server commits 1.0-1.7 GB when it is up (vault "Память процессов игры", 2026-11-13: 1364 MB after the Lua arena
-// fix, 1737 before). So the guard also reads the commit left (ullAvailPageFile, which Windows gives as what this process may still
-// commit):
-//   physical low  no empty map server lingers (build 50's rule, coop_levels_dynamic.h memory_low);
+// The guard must not read the physical memory alone (ullAvailPhys): a world server can die of out-of-memory with commit nearly
+// gone and RAM free. Windows refuses an allocation when the commit limit (RAM plus page file) is reached, whatever RAM is free; a
+// map server commits 1.0-1.7 GB when it is up. So the guard also reads the commit left (ullAvailPageFile, which Windows gives as
+// what this process may still commit):
+//   physical low  no empty map server lingers (coop_levels_dynamic.h memory_low);
 //   commit low    no empty map server lingers either, and no map server starts: the start waits (it is no failure, it does not count
 //                 towards giving its level up) until the commit is back over kCommitBackBytes.
-// The numbers are an estimate from the 2026-11-13 measurements, not a measured limit (not checked on a 16 GB machine with a small page
+// The numbers are an estimate, not a measured limit (not checked on a 16 GB machine with a small page
 // file).
 //
-// O6 fix round (the verifier's findings), start_room below:
+// start_room below:
 //   loading ones  a map server takes its commit gradually over its 30-90 s load, the look is up to 2 s old and host_frame launches every
 //                 level that wants one in the same pass: each server still loading (Starting) counts as if it had its
 //                 kMapServerCommitBytes now, so two starts in one load window no longer pass one look together;
 //   a time limit  ullAvailPageFile is the room under the commit limit of now. A page file Windows manages grows only when the commit
-//                 charge comes near that limit (this PC 2026-11-23: limit 52184 MB = RAM 32636 MB + its page file 19547 MB,
-//                 AutomaticManagedPagefile on), so a commit left under the floor may be room nobody asked Windows for yet and a wait
-//                 could last for good. A wait for the commit alone (nothing else loads) ends after kCommitWaitMs: the start goes ahead,
-//                 unless it would leave this PC under 0.5 GB (kCommitHardBytes, report #938's ground): that one keeps waiting until the
+//                 charge comes near that limit (AutomaticManagedPagefile), so a commit left under the floor may be room nobody
+//                 asked Windows for yet and a wait could last for good. A wait for the commit alone (nothing else loads) ends after kCommitWaitMs: the start goes ahead,
+//                 unless it would leave this PC under 0.5 GB (kCommitHardBytes): that one keeps waiting until the
 //                 commit is back. Not checked on a real machine.
 #pragma once
 
@@ -67,10 +64,9 @@ inline bool short_of_memory(const MemoryLook& m) { return m.phys_low || m.commit
 // dies). start_room adds the servers still loading and the time limit of a wait.
 inline bool may_start_map_server(const MemoryLook& m) { return !m.commit_low; }
 
-// ---------------------------------------------------------------- O6 fix round: one start, asked every frame while it waits
+// ---------------------------------------------------------------- one start, asked every frame while it waits
 
-// Under this much commit left a start never goes by itself: it would leave this PC under 0.5 GB (report #938: 0.6 GB, and the world
-// server died).
+// Under this much commit left a start never goes by itself: it would leave this PC under 0.5 GB (with 0.6 GB a world server has died).
 constexpr uint64_t kCommitHardBytes = kMapServerCommitBytes + uint64_t(512) * 1024 * 1024;
 // A wait for the commit alone ends after this: an empty map server stops at once while the commit is short and is gone within its
 // kStopTimeoutMs (15 s); a minute covers that and the looks after it, and stays well under the load its players wait for anyway.

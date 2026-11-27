@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_protocol.h"
 #include "coop_writer_rules.h"
 
@@ -113,14 +114,14 @@ struct ModeAnswers
 	uint8_t roles; // the ProcessRole flags of this process in the session (xrCoop/coop_roles.h)
 };
 
-// H-ENTITYUP: what happened to an object of a level that its world hears of (LevelSide::level_entity_up). R32 (W3, §8): the kinds
+// What happened to an object of a level that its world hears of (LevelSide::level_entity_up). The kinds
 // of the map server's journal; the first four keep their values.
 enum class EntityUp : uint8_t
 {
 	Spawned, // registered here (other: unused)
 	Released, // gone here (other: unused)
-	Parent, // changed hands (other: the new parent, 0xffff for none)
-	Died, // died (other: the killer, 0xffff for none)
+	Parent, // changed hands (other: the new parent, kNoId for none)
+	Died, // died (other: the killer, kNoId for none)
 	Joined, // R32 W3: a member joined a squad (id: the squad, other: the member; stock register_member, host_on_member)
 	Left, // R32 W3: a member left a squad (id: the squad, other: the member; stock unregister_member)
 	Info, // R32 W3: an info portion of a non-actor object was given or taken (id: the object); the name does not ride this call
@@ -164,7 +165,7 @@ struct LevelSide
 	virtual void level_marker(const death::Marker& m) = 0;
 
 	// --- H-TRUNKPEER (coop_survival.cpp): the players of the level as its world's table names them.
-	virtual uint16_t level_character_of(PeerId peer) const = 0; // 0xffff: nobody of this level
+	virtual uint16_t level_character_of(PeerId peer) const = 0; // kNoId: nobody of this level
 	virtual PeerId level_peer_of(uint16_t character) const = 0; // kInvalidPeer: nobody of this level
 
 	// --- H-ENTITYUP (coop_entities.cpp, coop_events.cpp): the world hears what happened to an object of the level.
@@ -202,6 +203,8 @@ public:
 	virtual bool actor_is_player() const = 0;
 	virtual bool decides_world() const = 0;
 	virtual bool leads_level() const = 0;
+	// Do I decide here: the world, or the map this process has loaded. Outside a session (NoneMode) neither.
+	bool decides_here() const { return decides_world() || leads_level(); }
 	virtual bool group_travels() const = 0;
 	virtual uint8_t roles() const = 0;
 
@@ -230,7 +233,7 @@ public:
 	virtual void held_update() = 0; // the stock update of the offline objects a map server holds
 	virtual void switched_offline(uint16_t id) = 0; // an object went offline here
 	virtual bool takes_own_ids() const = 0; // new ids come from this process's own slice
-	virtual uint16_t own_free_id() = 0; // the next id of that slice, 0xffff when none is free
+	virtual uint16_t own_free_id() = 0; // the next id of that slice, kNoId when none is free
 
 	// --- A-S6-IF (S6): the hooks the S6 groups ask. Each answer below is "not mine", the answer of none (NoneMode keeps it); each
 	// mode of the two layers writes its own answer, the same one where it has nothing to do (tests/test_mode_s6_answers.cpp).
@@ -275,7 +278,7 @@ public:
 	// answers what its world's LevelMap said when his virtual peer left (tests/test_vehicle_departure.cpp).
 	virtual Departure departure(PeerId, uint16_t) const { return Departure::Disconnected; }
 
-	// --- R32 (temp/r30/design/R32-final.md §8, docs/contracts/coop_mode_api.md section 8): one writer per object.
+	// --- One writer per object (docs/contracts/coop_mode_api.md section 8).
 	// W1: who writes the object whose root the Core found (writer::root_of, its kind and map). A question about an object, as
 	// online_elsewhere is: each mode answers it with writer::writer_of from its own tables (who leads a map, who holds a unit,
 	// whose move fence is open). none and the co-op host: This; a co-op client: Other(its host); the world server and a map
@@ -327,7 +330,7 @@ public:
 	void held_update() override {}
 	void switched_offline(uint16_t) override {}
 	bool takes_own_ids() const override { return false; }
-	uint16_t own_free_id() override { return 0xffff; }
+	uint16_t own_free_id() override { return kNoId; }
 };
 
 // The holder: none until a mode is installed; once a mode is in, another one is refused until reset() (set once per session).

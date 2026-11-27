@@ -11,7 +11,10 @@
 #include "coop_instrument.h"
 #include "coop_vehicles.h" // F5-VEH-2: a seated player's character is not placed by his snapshots
 #include "coop_vehicles_state.h" // F5-VEH-4: a seated player's doll sits in the car
+#include "coop_wire_vec.h"
 #include "xrCoop/coop_validate.h"
+#include "xrCoop/coop_ids.h"
+#include "xrCoop/coop_player_touch_rules.h" // TZ P75: drop_stale
 
 #include "Level.h"
 #include "Actor.h"
@@ -75,19 +78,22 @@ bool refuse_state(const char* why)
 	return false;
 }
 
+void end_stream(Track& t)
+{
+	t.samples.clear();
+	t.have_offset = false;
+	t.applied_legs = t.applied_torso = t.applied_head = 0; // a respawned avatar replays the motions
+	t.driven = false;
+	t.mstate = 0;
+}
+
 void push_sample(u16 avatar, const State& s)
 {
 	Track& t = g_tracks[avatar];
 	++t.received;
 	const u64 now = mgr().now_ms();
 	if (t.have_offset && now - t.last_rx > kStreamGapMs)
-	{
-		t.samples.clear();
-		t.have_offset = false;
-		t.applied_legs = t.applied_torso = t.applied_head = 0; // a respawned avatar replays the motions
-		t.driven = false;
-		t.mstate = 0;
-	}
+		end_stream(t);
 	t.last_rx = now;
 	if (t.have_offset && s32(s.time_ms - t.last_remote_time) <= 0)
 	{
@@ -129,7 +135,7 @@ bool capture(State& s)
 	s.head = actor->m_current_head.val;
 	s.active_slot = u8(actor->inventory().GetActiveSlot());
 	PIItem active = actor->inventory().ActiveItem();
-	s.active_item = active ? join::to_host(active->object_id()) : 0xffff;
+	s.active_item = active ? join::to_host(active->object_id()) : kNoId;
 	s.instrument = capture_instrument();
 	return true;
 }
@@ -144,7 +150,7 @@ void host_on_player_state(PeerId from, Reader& r)
 	if (!s.read(r))
 		return;
 	const u16 proxy = join::proxy_of_peer(from);
-	if (proxy == 0xffff)
+	if (proxy == kNoId)
 		return;
 	// Identity comes from the authenticated peer. Movement/life interrupt even a dishonest instrument intent.
 	if (!instrument::stationary(s.mstate, s.vel.x, s.vel.y, s.vel.z,
@@ -221,10 +227,8 @@ bool interpolate(Track& t, u64 render_time, State& out)
 void State::write(Writer& w) const
 {
 	w.u32(time_ms);
-	float p[3] = {pos.x, pos.y, pos.z};
-	w.vec3(p);
-	float v[3] = {vel.x, vel.y, vel.z};
-	w.vec3(v);
+	put_vec(w, pos);
+	put_vec(w, vel);
 	w.angle16(body_yaw);
 	w.angle16(torso_yaw);
 	w.angle16(angle_normalize(torso_pitch));
@@ -240,7 +244,7 @@ void State::write(Writer& w) const
 bool State::read(Reader& r)
 {
 	time_ms = r.u32();
-	float p[3], v[3];
+	float p[3], v[3]; // the raw parts: validate:: checks them below
 	r.vec3(p);
 	r.vec3(v);
 	pos.set(p[0], p[1], p[2]);
@@ -301,7 +305,7 @@ void reset()
 void on_peer_left(PeerId id)
 {
 	const u16 avatar = (mode().decides_world() || mode().leads_level()) ? join::proxy_of_peer(id) : world::avatar_of(id);
-	if (avatar != 0xffff)
+	if (avatar != kNoId)
 	{
 		instrument_forget(avatar);
 		g_tracks.erase(avatar);
@@ -310,6 +314,7 @@ void on_peer_left(PeerId id)
 
 void frame()
 {
+	PROF_EVENT("coop/coop_players/frame");
 	equip_loading_frame(); // build 56: does nothing unless this is a client that is loading the world
 	const bool live = mode().decides_world() || mgr().is_live_client();
 	if (!live || !g_pGameLevel)
@@ -362,6 +367,7 @@ bool reported_speed(u16 avatar_id, float& speed)
 
 bool drive_avatar(CAI_Stalker* avatar)
 {
+	PROF_EVENT("coop/coop_players/drive_avatar");
 	if (vehicles::doll_frame(avatar))
 		return true; // F5-VEH-4: at his seat of the car (another machine's copy), the vehicle idle or hidden
 	if (vehicles::seated(avatar->ID()))
@@ -441,8 +447,16 @@ void on_avatar_visual_changed(u16 avatar_id)
 void on_object_spawn(u16 id)
 {
 	auto it = g_tracks.find(id);
-	if (it != g_tracks.end())
-		it->second.placed = false; // a new object: it stands where this world spawned it
+	if (it == g_tracks.end())
+		return;
+	Track& t = it->second;
+	t.placed = false; // a new object: it stands where this world spawned it
+	// TZ P75: snapshots of a stream that ended before it appeared are where he stood before (the host keeps a client's through
+	// its own world change, a player who stayed keeps those of one who left and came back): drive_avatar would hold the newest
+	// of them for a frame and the pair switched on there. Those of the stream he sends now stay (one may come before his object).
+	player_touch::drop_stale(t.samples, mgr().now_ms(), kStreamGapMs, [](const Sample& smp) { return smp.local_time; });
+	if (t.samples.empty())
+		end_stream(t); // as push_sample does after a gap: not driven, its motions replayed on the new object
 }
 
 bool placed(u16 avatar_id)

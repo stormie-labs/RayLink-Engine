@@ -1,4 +1,4 @@
-// Anomaly Coop — TZ R32 W8.1/W8.2: who wins a field of a player's item, the decider (its writer) or the owner (the player).
+// Anomaly Coop — who wins a field of a player's item, the decider (its writer) or the owner (the player).
 // The decider of a player's item keeps a baseline of it (coop_items.cpp Owned.data) and puts it back on its copy every 500 ms
 // (host_enforce): engine drift on that copy (an avatar firing for show) never becomes the item's state. A script's deliberate
 // setter on the decider (set_condition, set_remaining_uses) is not drift: it is the new baseline, its field versions move on
@@ -89,7 +89,7 @@ inline std::uint32_t versions_mask(const itemtags::FieldVersions& v)
 	return m;
 }
 
-// TZ R32 §8a A12: the decider's latest versions travel with the item (its spawn's initial state, a map server's ItemFacts). The
+// the decider's latest versions travel with the item (its spawn's initial state, a map server's ItemFacts). The
 // process the item arrives at (a new decider after a level move or a restart; the owner whose copy is built from that spawn)
 // takes them whole: the travelling state was made on exactly those versions.
 inline void arrive(itemtags::FieldVersions& here, const itemtags::FieldVersions& carried, std::uint32_t mask)
@@ -98,7 +98,7 @@ inline void arrive(itemtags::FieldVersions& here, const itemtags::FieldVersions&
 	itemtags::take(here, carried, mask & itemtags::kAll);
 }
 
-// ---------------------------------------------------------------- counters (W8.2, WP6 fix round: the portions of an eatable)
+// ---------------------------------------------------------------- counters (the portions of an eatable)
 // The uses are a counter: the decider takes doses off (a combat heal), the owner eats his own. Compared as absolute values by
 // version, a dose the owner ate inside the round trip of a decider's debit was lost: his report (made on the old version) was
 // refused and the push then overwrote his value with the decider's. So the uses travel as changes against the version they were
@@ -212,6 +212,25 @@ inline int owner_takes_uses(std::uint16_t applied, std::uint16_t pushed, bool ha
 	if (has_delta && has_mine && pushed != 0 && itemtags::next_version(applied) == pushed)
 		return clamp_counter(mine + delta, max_uses);
 	return push_value;
+}
+
+// Who holds an item at the end of its chain, as one view of this machine sees it: its game object's chain or its server entity's.
+enum class Holder : std::uint8_t
+{
+	Nobody, // the chain is the item alone (on the ground; or a game object its parent has not taken yet)
+	Me, // this machine's own character
+	Living, // a living creature: an NPC, a companion, another player's character
+	Other, // a corpse, a box, a stash
+};
+
+// A player's report of a world item he changed (coop_items.cpp send_foreign: a corpse's gun he unloaded). What his character holds
+// goes with his own scan; a living creature's things are its decider's (they change with every shot, the decider refuses them).
+// Both views are asked: a game object spawned a moment ago has no parent yet (its holder takes it through an event of a later
+// frame), while its server entity already names the holder.
+inline bool reports_foreign(Holder by_object, Holder by_entity)
+{
+	const auto keeps = [](Holder h) { return h == Holder::Me || h == Holder::Living; };
+	return !keeps(by_object) && !keeps(by_entity);
 }
 } // namespace owner
 } // namespace coop

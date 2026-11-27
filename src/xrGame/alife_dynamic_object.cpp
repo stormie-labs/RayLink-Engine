@@ -146,7 +146,7 @@ void CSE_ALifeDynamicObject::try_switch_online()
 			alife().scheduled().add(this);
 	}
 
-	// Anomaly Coop: on a client the host decides what is online; a player's character only while he is in the world
+	// coop: on a client the host decides what is online; a player's character only while he is in the world
 	const coop::SwitchVote vote = coop::switch_vote(this);
 	if (vote != coop::SwitchVote::Default)
 	{
@@ -169,7 +169,7 @@ void CSE_ALifeDynamicObject::try_switch_online()
 		return;
 	}
 
-	if (coop::observer_distance(o_Position) > alife().online_distance()) // Anomaly Coop: nearest player
+	if (coop::observer_distance(o_Position) > alife().online_distance()) // coop: nearest player
 	{
 		on_failed_switch_online();
 		return;
@@ -180,7 +180,7 @@ void CSE_ALifeDynamicObject::try_switch_online()
 
 void CSE_ALifeDynamicObject::try_switch_offline()
 {
-	// Anomaly Coop: on a client the host decides what is online; a player's character only while he is in the world
+	// coop: on a client the host decides what is online; a player's character only while he is in the world
 	const coop::SwitchVote vote = coop::switch_vote(this);
 	if (vote != coop::SwitchVote::Default)
 	{
@@ -198,7 +198,7 @@ void CSE_ALifeDynamicObject::try_switch_offline()
 		return;
 	}
 
-	if (coop::observer_distance(o_Position) <= alife().offline_distance()) // Anomaly Coop: nearest player
+	if (coop::observer_distance(o_Position) <= alife().offline_distance()) // coop: nearest player
 		return;
 
 	alife().switch_offline(this);

@@ -1,9 +1,9 @@
 // Anomaly Coop — the pause stock puts on a single player level that finished loading in a window without the focus
-// (xrEngine/device.cpp, "device pause on: application start"; it holds until the window is activated).
-// b57j stand, sp_smoke (2026-11-21): the new game loaded behind another window and stood paused for 2.5 minutes with
-// g_always_active on. Always-active keeps a window without the focus running everywhere else (CRenderDevice::OnWM_Activate:
-// not in fullscreen, g_screenmode 2), and now at the start too, with the same exception.
-// Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe (tests/test_device_rules.cpp).
+// (xrEngine/device.cpp, Pause(..., "application start"); it holds until the window is activated). A new game that loads
+// behind another window must not stand paused with g_always_active on. Always-active keeps a window without the focus running
+// everywhere else (CRenderDevice::OnWM_Activate: not in fullscreen, g_screenmode 2), and now at the start too, with the same
+// exception. Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe
+// (tests/test_device_rules.cpp).
 #pragma once
 
 namespace coop
@@ -23,12 +23,12 @@ inline bool prefer_matching_startup_monitor(bool exclusive_fullscreen, bool curs
 }
 
 // vid_monitor Auto before the device exists (xrEngine InitMonitor -> ResolveAutoStartupMonitor). Stock Auto is the display
-// under the cursor. The owner's start (2026-11-21 20:46): fullscreen 2560x1440 saved, the cursor on a portrait display
-// without that mode, DXGI fell back to its first mode and the world loaded at 800x1280. In exclusive fullscreen the one
+// under the cursor: with a fullscreen size saved and the cursor on a display without that mode, DXGI falls back to its
+// first mode (a world loaded at 800x1280). In exclusive fullscreen the one
 // display whose desktop is the saved size is taken when the cursor's display cannot show that size; none or several keep
 // the cursor's, and so do borderless and windowed. The cursor's display shows the size when its desktop is that size or
 // its mode list has it: 1920x1080 fullscreen on a 2560x1440 desktop is an ordinary choice, and a 1080p second display
-// must not take the game then (gate R38, 2026-11-22).
+// must not take the game then.
 struct startup_display
 {
 	unsigned desktop_width;

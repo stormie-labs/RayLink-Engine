@@ -1,7 +1,6 @@
-// Anomaly Coop — split levels, the rules (docs/plans/2026-10-24-f3a-split-levels.md §1.1, §1.5, §1.10, §3). Each player
-// may be on a different level. The world server's PC leads them all: a background map server (Mk) leads every level that has
-// players (owner 2026-11-18: the server mode only, no hybrid). This header is the pure part of that, with no engine in it:
-//   - Gate / effective_gate   how a level is entered (free, better together, together) and how split levels fold into it;
+// The rules of the levels of the server mode. Each player may be on a different level; the world server leads them all: a
+// background map server leads every level that has players. This header is the pure part of that, with no engine in it:
+//   - Gate / effective_gate   how a level is entered (free, better together, together) and how a move folds it;
 //   - Table                   who sits on which level: which process leads a level, whom its messages reach, who sees what;
 //   - decide_move             the verdict on a player's move: go, wait at the board, refused (the map-server cap);
 //   - ServerLife              the life of one map server: when to launch it, when to stop it (the pause, "linger");
@@ -16,14 +15,14 @@
 #include <utility>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_protocol.h"
 
 namespace coop
 {
 namespace levels
 {
-// A seat that is on no level (choosing a character, joining) and the level id nobody has.
-constexpr uint16_t kNoLevel = 0xffff;
+using coop::kNoLevel; // a seat that is on no level (choosing a character, joining)
 
 // The wire uses u16, but GameGraph::_LEVEL_ID is u8. Only a player who is off-map may use kNoLevel.
 constexpr uint16_t kMaxLevelId = 0xff;
@@ -69,8 +68,8 @@ bool receive_level_map(PeerId from, bool world_client, bool welcomed, Reader& r,
 
 // ---------------------------------------------------------------- gates
 
-// How a level is entered (docs/research/2026-10-24-story-levels-together.md §5). The numbers are the enum of the wire
-// (LevelMap: u8 gate); the words are those of configs/coop_levels_together.ltx and of coop.levels.set_gate.
+// How a level is entered. The numbers are the enum of the wire
+// (LevelMap: u8 gate); the words are those of configs/coop_levels_together.ltx.
 enum class Gate : uint8_t
 {
 	Free = 0, // nothing: a player goes where he wants, alone
@@ -101,20 +100,9 @@ inline bool parse_gate(std::string_view word, Gate& out)
 	return false;
 }
 
-// The gate that rules a move:
-//   split levels off     the group moves as one through the waiting point at every exit (the co-op): Together;
-//   split levels on      nobody is waited for, each player moves alone (owner 2026-11-18: no "story maps together"): a
-//                        Together level is only a suggestion, BetterTogether. Any other gate stands; a value that is none of
-//                        the three passes through and decide_move refuses it. With split levels off every value, valid or
-//                        not, becomes Together.
-inline Gate effective_gate(Gate g, bool split)
-{
-	if (!split)
-		return Gate::Together;
-	if (g == Gate::Together)
-		return Gate::BetterTogether;
-	return g;
-}
+// The gate that rules a move: nobody is waited for, each player moves alone, so a Together level is only a suggestion,
+// BetterTogether. Any other gate stands; a value that is none of the three passes through and decide_move refuses it.
+inline Gate effective_gate(Gate g) { return g == Gate::Together ? Gate::BetterTogether : g; }
 
 // ---------------------------------------------------------------- who is where
 
@@ -297,9 +285,9 @@ enum class ServerState : uint8_t
 	Lost, // the process died or hung: the world server resolves its journal, a new one starts if players wait
 };
 
-constexpr uint32_t kStartTimeoutMs = 240000; // a process that is not Ready by then is given up on (a GAMMA load takes minutes)
+constexpr uint32_t kStartTimeoutMs = 240000; // a process that is not Ready by then is given up on (a modded load takes minutes)
 constexpr uint32_t kStopTimeoutMs = 15000; // a process that has not exited by then after Stop is killed
-// The pause: coop_mapserver_linger = 600 s (build 50, the dynamic mode). It is the pause of the map emptied last; every other empty
+// The pause: coop_mapserver_linger = 600 s. It is the pause of the map emptied last; every other empty
 // map has at most kColdLingerMs (coop_levels_dynamic.h linger_of).
 constexpr uint32_t kDefaultLingerMs = 600000;
 constexpr uint32_t kFlushTimeoutMs = 3000; // a map server that has not sent its snapshot by then is left to its stream

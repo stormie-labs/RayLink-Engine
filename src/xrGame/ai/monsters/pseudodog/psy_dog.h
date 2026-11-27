@@ -17,7 +17,7 @@ class CPsyDog : public CAI_PseudoDog
 	// enemy transfered from phantom
 	CActor* m_enemy;
 
-	u32 m_coop_aura_next = 0; // Anomaly Coop (audit F11): a puppet's next look at the aura
+	u32 m_coop_aura_next = 0; // coop: a puppet's next look at the aura
 
 	// externals
 	u8 m_min_phantoms_count;
@@ -99,8 +99,8 @@ public:
 	virtual void Die(CObject* who);
 
 	void destroy_from_parent();
-	void appear_fx_on_actor(); // Anomaly Coop (audit A5): the leap's shake, on the machine of the player it is at
-	void coop_appear(); // Anomaly Coop (audit F11): the particles of its leap, on a puppet
+	void appear_fx_on_actor(); // coop: the leap's shake, on the machine of the player it is at
+	void coop_appear(); // coop: the particles of its leap, on a puppet
 private:
 	void destroy_me();
 	void try_to_register_to_parent();

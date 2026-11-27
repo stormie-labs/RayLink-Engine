@@ -1,6 +1,6 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — a player's own progress (rank, reputation, community) checked where his record is kept (F5-PRG-2, row 9 of F2,
-// TZ 6.4; temp/b58/f5_plan.md section 6). The API is coop_progress.h (F5-PROTO), the rules xrCoop/coop_progress_rules.h.
+// Anomaly Coop — a player's own progress (rank, reputation, community) checked where his record is kept. The API is
+// coop_progress.h, the rules xrCoop/coop_progress_rules.h.
 //
 // Who calls what:
 //   - coop_story.cpp handle_host, Msg::Progress: host_check(from, proxy, ...) before the report is stored (g_reported), put on the
@@ -11,13 +11,12 @@
 //   - sync::frame -> frame(): drops the players who left; sync::print_status -> print_status(); coop_script -> register_lua().
 // Both modes run the same code: the co-op host and the world server keep the record (story's handle_host runs there). The co-op
 // host has the player's body and the events; the world server has the saved character only and its budget comes from the map
-// servers' tallies (F5-PRG-4 merges them into coop_progress_check). The map servers only apply the rebroadcast (handle_client).
+// servers' tallies (coop_progress_check merges them). The map servers only apply the rebroadcast (handle_client).
 //
-// The budget: coop_progress_check.rank_budget(character) (F5-PRG-1: the points the keeper saw the player earn since its window
-// was last closed), asked only when a report raises rank or reputation; after a stored rise the window is closed with
-// rank_budget(character, true). Plus coop.progress.budget(peer, rank_points, reputation_points): points the ledger does not see,
-// pushed by a script of the keeper (kept kCreditMs). The community: coop.progress.community_ok(peer, community, index, character),
-// a function a script of the keeper sets (the coop_faction record, a disguise); none set: the community is not checked.
+// The budget: coop_progress_check.rank_budget(character) (the points the keeper saw the player earn since its window was last
+// closed), asked only when a report raises rank or reputation; after a stored rise the window is closed with
+// rank_budget(character, true). The community: coop.progress.community_ok(peer, community, index, character), a function a script
+// of the keeper sets (the coop_faction record, a disguise); none set: the community is not checked.
 //
 // coop_trust (gamedata/configs/mod_system_coop_trust.ltx, [coop_trust]: progress_rank, progress_reputation, progress_community,
 // else default, else "log"): "log" keeps the values as told and writes "[coop-trust] <name> would refuse ..."; "refuse" stores the
@@ -30,8 +29,10 @@
 #include "coop_manager.h"
 #include "coop_join.h"
 #include "xrCoop/coop_progress_rules.h"
-#include "xrCoop/coop_fight_fact.h" // INTEG-C: the bounds of a fight fact
-#include "xrCoop/coop_mode.h" // INTEG-C: only the process that decides the world applies a checked fight
+#include "xrCoop/coop_fight_fact.h" // the bounds of a fight fact
+#include "xrCoop/coop_mode.h" // only the process that decides the world applies a checked fight
+#include "xrCoop/coop_lua_fn.h"
+#include "coop_lua.h"
 
 #include <cmath>
 
@@ -50,7 +51,6 @@ namespace progress
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr u64 kSweepMs = 1000;
 constexpr u32 kLuaErrorLines = 8;
 
@@ -67,8 +67,8 @@ struct State
 	Counter rank, reputation, community;
 	u64 reports = 0, repeats = 0, baselines = 0, no_record = 0, no_world = 0, no_budget = 0, commits = 0;
 	u64 worlds = 0; // the book forgot an old world (Book::on_world: a load or a level change)
-	u64 community_unchecked = 0, lua_errors = 0, pushes = 0, pushes_refused = 0;
-	u64 fights_applied = 0, fights_refused = 0, fights_unhandled = 0, fights_apply_refused = 0; // INTEG-C: map servers' fight facts
+	u64 community_unchecked = 0, lua_errors = 0;
+	u64 fights_applied = 0, fights_refused = 0, fights_unhandled = 0, fights_apply_refused = 0; // map servers' fight facts
 	u64 last_sweep = 0;
 } g;
 
@@ -138,39 +138,31 @@ void lua_error_line(LPCSTR what, LPCSTR text)
 		::Msg("! [coop] progress: %s failed: %s", what, text ? text : "?");
 }
 
-// coop_progress_check.rank_budget(character [, true]) -> rank points, reputation points. 'none': no such module or function.
-constexpr LPCSTR kLuaBudget = "local c, commit = ...\n"
-							  "local ok, m = pcall(function() return coop_progress_check end)\n"
-							  "if not ok or type(m) ~= 'table' or type(m.rank_budget) ~= 'function' then return 'none' end\n"
-							  "local good, r, rep = pcall(m.rank_budget, c, commit)\n"
-							  "if not good then return 'error', tostring(r) end\n"
-							  "return r, rep\n";
-
+// coop_progress_check.rank_budget(character [, true]) -> rank points, reputation points. False: no such module or function, an error
+// (logged), or not two numbers.
 bool lua_window(u16 character, bool commit, Budget& out)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L)
-		return false;
-	const int top = lua_gettop(L);
 	bool known = false;
-	if (luaL_loadbuffer(L, kLuaBudget, xr_strlen(kLuaBudget), "@coop_progress_budget") == 0)
-	{
-		lua_pushinteger(L, int(character));
-		lua_pushboolean(L, commit ? 1 : 0);
-		if (lua_pcall(L, 2, 2, 0))
-			lua_error_line("rank_budget", lua_tostring(L, -1));
-		else if (lua_type(L, -2) == LUA_TNUMBER && lua_type(L, -1) == LUA_TNUMBER)
-		{
-			out.rank = points_of(double(lua_tonumber(L, -2)));
-			out.reputation = points_of(double(lua_tonumber(L, -1)));
-			known = true;
-		}
-		else if (lua_type(L, -2) == LUA_TSTRING && !xr_strcmp(lua_tostring(L, -2), "error"))
-			lua_error_line("rank_budget", lua_tostring(L, -1));
-	}
-	else
-		lua_error_line("the rank_budget chunk", lua_tostring(L, -1));
-	lua_settop(L, top);
+	std::string error;
+	const luafn::Fail f = luafn::call_named(ai().script_engine().lua(), "coop_progress_check", "rank_budget", nullptr,
+	    [&](lua_State* L)
+	    {
+		    lua_pushinteger(L, int(character));
+		    lua_pushboolean(L, commit ? 1 : 0);
+		    return 2;
+	    },
+	    2,
+	    [&](lua_State* L)
+	    {
+		    if (lua_type(L, -2) != LUA_TNUMBER || lua_type(L, -1) != LUA_TNUMBER)
+			    return;
+		    out.rank = points_of(double(lua_tonumber(L, -2)));
+		    out.reputation = points_of(double(lua_tonumber(L, -1)));
+		    known = true;
+	    },
+	    error);
+	if (f == luafn::Fail::LuaError)
+		lua_error_line("rank_budget", error.c_str());
 	return known;
 }
 
@@ -271,7 +263,7 @@ void say_community(const Counter& c, Trust mode, PeerId from, u16 character, int
 		    kTrustCommunity, u32(from), u32(character), cs(b), cs(t), c.failed, c.checked);
 }
 
-// coop.progress.on_verified_fight(epoch, fact, from, character, delta) -> true | false (INTEG-C): the keeper's script checks a map
+// coop.progress.on_verified_fight(epoch, fact, from, character, delta) -> true | false: the keeper's script checks a map
 // server's fight fact and applies it; 'none': no such function (no keeper script here).
 constexpr LPCSTR kLuaFight = "local e, q, from, c, delta = ...\n"
 							 "local ok, f = pcall(function() local p = coop and coop.progress; return type(p) == 'table' and p.on_verified_fight or nil end)\n"
@@ -280,7 +272,7 @@ constexpr LPCSTR kLuaFight = "local e, q, from, c, delta = ...\n"
 							 "if not good then return 'error', tostring(v) end\n"
 							 "return v == true and 'yes' or 'no'\n";
 
-// coop.progress.apply_verified_fight(peer, character, delta) -> true | false (INTEG-C, F5-PRG-4): the keeper's script checked a map
+// coop.progress.apply_verified_fight(peer, character, delta) -> true | false: the keeper's script checked a map
 // server's fight fact (coop_srv_progress.script); the delta goes into the base of his record and to his machine. Only where the world is
 // decided, for a whole peer whose character it is, a whole delta within a fact's bounds (xrCoop/coop_fight_fact.h).
 int l_apply_verified_fight(lua_State* L)
@@ -294,7 +286,7 @@ int l_apply_verified_fight(lua_State* L)
 		if (whole && p >= 0.0 && p < double(kInvalidPeer) && c >= 1.0 && c < double(kNoId) && d != 0.0 &&
 		    d >= -double(fight::kMaxDelta) && d <= double(fight::kMaxDelta) && join::proxy_of_peer(PeerId(p)) == u16(c))
 			ok = host_apply_fight(PeerId(p), u16(c), int(d));
-		// F5-REV-1 S3: the record here (the world server's alife object) never sees the fight: the keeper's credit carries it into
+		// The record here (the world server's alife object) never sees the fight: the keeper's credit carries it into
 		// the budget of the put-back and of his next report, as the co-op host's record carries its own fights
 		if (ok)
 			g.book.credit_keeper(u32(p), u16(c), int64_t(d), mgr().now_ms());
@@ -303,54 +295,13 @@ int l_apply_verified_fight(lua_State* L)
 	lua_pushboolean(L, ok ? 1 : 0);
 	return 1;
 }
-
-// coop.progress.budget(peer, rank_points, reputation_points) -> true | false. Points the keeper saw the player earn that the
-// ledger of coop_progress_check does not hold (a script's own reward); kept for him kCreditMs. Numbers out of range count 0.
-int l_budget(lua_State* L)
-{
-	bool ok = false;
-	if (mgr().active() && lua_type(L, 1) == LUA_TNUMBER)
-	{
-		const double p = double(lua_tonumber(L, 1));
-		if (p >= 0.0 && p < double(kInvalidPeer) && p == std::floor(p))
-		{
-			const s64 rank = lua_type(L, 2) == LUA_TNUMBER ? points_of(double(lua_tonumber(L, 2))) : 0;
-			const s64 reputation = lua_type(L, 3) == LUA_TNUMBER ? points_of(double(lua_tonumber(L, 3))) : 0;
-			if (g.book.on_world(join::host_world_epoch()))
-				++g.worlds; // the points are this world's: the book forgets the old one first
-			ok = g.book.add_credit(u32(p), rank, reputation, mgr().now_ms());
-		}
-	}
-	++(ok ? g.pushes : g.pushes_refused);
-	lua_pushboolean(L, ok ? 1 : 0);
-	return 1;
-}
 } // namespace
 
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_pushstring(L, "progress");
-	lua_rawget(L, -2);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_newtable(L);
-		lua_pushstring(L, "progress");
-		lua_pushvalue(L, -2);
-		lua_rawset(L, -4); // coop.progress = {}
-	}
-	lua_pushcfunction(L, &l_budget);
-	lua_setfield(L, -2, "budget"); // community_ok is the keeper's script's to set
-	lua_pushcfunction(L, &l_apply_verified_fight);
-	lua_setfield(L, -2, "apply_verified_fight"); // INTEG-C; on_verified_fight is the keeper's script's to set
-	lua_pop(L, 2);
+	// community_ok and on_verified_fight are the keeper's script's to set; no table coop: coop_script logs it
+	static const luaL_Reg kFns[] = {{"apply_verified_fight", &l_apply_verified_fight}, {nullptr, nullptr}};
+	lua_api::fill(L, "progress", kFns);
 }
 
 bool host_fight_fact(PeerId from, u32 epoch, u32 fact, u16 character, int delta)
@@ -465,7 +416,7 @@ void frame()
 
 void reset()
 {
-	g = State(); // F5-REV-1 note 2: the book, its world and the counters are one session's (the settings are read again)
+	g = State(); // the book, its world and the counters are one session's (the settings are read again)
 }
 
 void print_status()
@@ -479,9 +430,9 @@ void print_status()
 	::Msg("[coop] progress: players %u, checks asked %llu (reports and put-backs; the stored values again %llu, first after a "
 	      "join %llu, no record %llu, no world %llu), "
 	      "no budget source %llu, windows closed %llu, community not checked (no coop.progress.community_ok) %llu, Lua errors "
-	      "%llu, coop.progress.budget %llu (refused %llu), old worlds forgotten %llu",
+	      "%llu, old worlds forgotten %llu",
 	    u32(g.book.size()), g.reports, g.repeats, g.baselines, g.no_record, g.no_world, g.no_budget, g.commits,
-	    g.community_unchecked, g.lua_errors, g.pushes, g.pushes_refused, g.worlds);
+	    g.community_unchecked, g.lua_errors, g.worlds);
 	::Msg("[coop] progress: fight facts of map servers applied %llu, refused %llu (no keeper script %llu), applications refused %llu",
 	    g.fights_applied, g.fights_refused, g.fights_unhandled, g.fights_apply_refused);
 }

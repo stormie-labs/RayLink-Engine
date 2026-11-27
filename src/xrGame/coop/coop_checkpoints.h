@@ -53,7 +53,7 @@ void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void frame(); // main thread, every frame (sync::frame)
 void print_status(); // coop_status section (sync::print_status)
 void register_console(); // from coop::register_console_commands
-// Fills coop.checkpoint; called by coop_checkpoints_script_registrator once the `coop` table exists.
+// Fills coop.checkpoint; called by script::register_raw once the `coop` table exists.
 void register_lua(lua_State* L);
 
 // --- host (in a session; false / nothing otherwise). Messages and callbacks go out from frame(), so these may run
@@ -101,10 +101,3 @@ void host_record_sources(xr_vector<SourceRef>& out);
 bool get(u16 local_id, checkpoint::Record& out);
 } // namespace checkpoints
 } // namespace coop
-
-// Script export entry (export_classes, right after coop_script_registrator made the `coop` table): coop.checkpoint
-// and coop.rest (coop_checkpoints_lua.cpp).
-struct coop_checkpoints_script_registrator
-{
-	DECLARE_SCRIPT_REGISTER_FUNCTION
-};

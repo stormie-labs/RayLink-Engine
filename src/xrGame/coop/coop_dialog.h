@@ -12,10 +12,10 @@
 //                                      [u8 reason]            5 not willing + why (xrCoop/coop_talks.h)
 //   DialogUnlock      client -> host   u16 npc                   release (talk window closed)
 //                     host -> client   u16 npc                   lock revoked (timeout, NPC gone)
-// Host: grants when nobody else (the host included) holds the NPC; a player holds at most one lock. B8 (build 10): a
-// client's request is also judged by the host's meet rules for THAT client's character (Lua coop_npc_meet.talk_verdict:
-// wounded, hostile and fighting, the stock "use" rules where the running game applies them); a refusal is "not willing"
-// with the reason. The client's puppet only mirrors a talk flag, it is not asked.
+// Host: grants when nobody else (the host included) holds the NPC; a player holds at most one lock. A client's request is
+// also judged by the host's meet rules for THAT client's character (Lua coop_npc_meet.talk_verdict: wounded, hostile and
+// fighting, the stock "use" rules where the running game applies them); a refusal is "not willing" with the reason. The
+// client's puppet only mirrors a talk flag, it is not asked.
 // Locks are released on DialogUnlock, when the holder leaves, and after 120 s without a keep-alive
 // (clients refresh every 30 s while talking). The host's own talk takes the lock at once and is
 // refused while a client holds the NPC. Repeats change nothing (P6).
@@ -38,8 +38,8 @@ class Endpoint;
 
 namespace dialog
 {
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void frame(); // main thread, every frame
 void reset(); // session started / ended / world replaced
 void on_peer_left(PeerId id); // host: drop the locks of a player that left
@@ -52,18 +52,18 @@ void print_status();
 // Also usable as an early hook in CActor::RunTalkDialog (before OfferTalk) by the core.
 bool may_start_talk(CInventoryOwner* partner, bool disable_break);
 
-// W11, host: the player holding the talk lock of NPC `npc` (host numbering), kHostPeer for the host's own
+// Host: the player holding the talk lock of NPC `npc` (host numbering), kHostPeer for the host's own
 // talk, kInvalidPeer if nobody (or not the host). The NPC meet logic (Lua coop.talk_holder) stands the NPC
 // still and turns it to a client that talks to it on his machine.
 PeerId host_talk_holder(u16 npc);
 
-// F2 T1, client: the NPC whose talk lock we hold (host numbering), 0xffff if none. Money changes made meanwhile go to
+// Client: the NPC whose talk lock we hold (host numbering), kNoId if none. Money changes made meanwhile go to
 // the host as dialog changes (coop_money); they are sent before the lock is released.
 u16 client_partner();
-// F2 T1, host: the NPC whose talk lock player `peer` holds (host numbering, kHostPeer: the host's own talk), 0xffff if
+// Host: the NPC whose talk lock player `peer` holds (host numbering, kHostPeer: the host's own talk), kNoId if
 // none or not the host.
 u16 host_lock_of(PeerId peer);
-// Ruling F2-34 (F2 T12 round 2), host: player `peer` holds the talk lock of `npc` (host numbering) now, or his lock on
+// Host: player `peer` holds the talk lock of `npc` (host numbering) now, or his lock on
 // it ended no more than `window_ms` ago (released, replaced, timed out, the NPC gone; xrCoop/coop_talks.h). False on a
 // client. Lua coop.talk_recent: coop_npc_companions takes a recruit only right after a talk.
 bool host_talked_recently(PeerId peer, u16 npc, u32 window_ms);
@@ -76,11 +76,5 @@ bool on_talk_window_open(CInventoryOwner* partner, bool disable_break);
 bool talk_window_refused();
 // CUITalkWnd::Show(false): releases the lock held for this talk.
 void on_talk_window_closed();
-
-// Short HUD line (and a console line) for the local player. `string_id` is looked up in the string
-// table; if it is missing, `fallback` is shown. Shared by coop_trade.
-void hud_message(const char* string_id, const char* fallback);
-// The same HUD line with one number: the translation of `string_id` (or `fallback`) is a format with one %u. No log line.
-void hud_message_n(const char* string_id, const char* fallback, u32 n);
 } // namespace dialog
 } // namespace coop

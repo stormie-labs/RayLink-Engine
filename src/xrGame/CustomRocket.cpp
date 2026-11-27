@@ -18,7 +18,7 @@
 #include "../Include/xrRender/RenderVisual.h"
 //#include "CalculateTriangle.h"
 #include "actor.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 #ifdef DEBUG
 #include "PHDebug.h"
 #include "game_base_space.h"
@@ -372,7 +372,7 @@ void CCustomRocket::PlayContact()
 
 	Position().set(m_contact.pos);
 	m_contact.contact = false;
-	if (coop::objects::explosion_visual_only(this)) setVisible(FALSE); // Anomaly Coop: client copy; the host's detonation follows
+	if (coop::objects::explosion_visual_only(this)) setVisible(FALSE); // coop: client copy; the host's detonation follows
 
 }
 
@@ -663,7 +663,7 @@ void CCustomRocket::OnEvent(NET_Packet& P, u16 type)
 	{
 	case GE_GRENADE_EXPLODE:
 		{
-			if (m_eState != eCollide && (OnClient() || coop::objects::explosion_visual_only(this))) // Anomaly Coop: stop a client copy still in flight
+			if (m_eState != eCollide && (OnClient() || coop::objects::explosion_visual_only(this))) // coop: stop a client copy still in flight
 			{
 				CCustomRocket::Contact(Position(), Direction());
 			};

@@ -1,13 +1,13 @@
-// Anomaly Coop — a client's pause while the host is silent. In a session the clock refuses to stop (G18,
-// CGamePersistent::CanBePaused), so the device reads as not paused while the sound is: the end follows what was taken here,
-// not what the device says. Going by the device left every sound then playing paused for good (live 2026-10-31).
+// Anomaly Coop — a client's pause while the host is silent. In a session the clock refuses to stop
+// (CGamePersistent::CanBePaused), so the device reads as not paused while the sound is: the end follows what was taken here,
+// not what the device says. Going by the device left every sound then playing paused for good.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
 namespace coop
 {
-// The Pause key flips the device by its own word (Level_input.cpp). Where the clock cannot stop (a session, G18) that word
-// never turns, so every press would take the sound's pause and none give it back: the key does nothing there (audit H4).
+// The Pause key flips the device by its own word (Level_input.cpp). Where the clock cannot stop (a session) that word
+// never turns, so every press would take the sound's pause and none give it back: the key does nothing there.
 inline bool pause_key_acts(bool clock_can_stop) { return clock_can_stop; }
 
 struct SilencePause

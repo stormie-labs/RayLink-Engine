@@ -150,21 +150,11 @@ void CHelicopter::OnShot()
 	};
 
 	FireBullet(fire_pos, fire_dir, fireDispersionBase, m_CurrentAmmo, ID(), ID(), OnServer(), ::Random.randI(0, 30));
-
-	StartShotParticles();
-	if (m_bLightShotEnabled)
-		Light_Start();
-
-
-	StartFlameParticles();
-	StartSmokeParticles(fire_pos, zero_vel);
-	OnShellDrop(fire_pos, zero_vel);
-
-	m_layered_sounds.PlaySound("sndShoot", fire_pos, this, false);
-	coop::presence::on_heli_shot(this, fire_pos, fire_dir); // Anomaly Coop (audits H2, W8)
+	play_shot_fx(fire_pos);
+	coop::presence::on_heli_shot(this, fire_pos, fire_dir); // coop: the clients' copies fire with it
 }
 
-// Anomaly Coop (audits H2, W3, W8): the host's shot on a client's copy, the stock OnShot without its decisions. Its bullets
+// coop: the host's shot on a client's copy, the stock OnShot without its decisions. Its bullets
 // deal no damage: the host's did. Between the shots the barrel follows the aim in the host's reports (coop_state).
 void CHelicopter::coop_shot(const Fvector& pos, const Fvector& dir, bool bullets)
 {
@@ -178,13 +168,19 @@ void CHelicopter::coop_shot(const Fvector& pos, const Fvector& dir, bool bullets
 	CShootingObject::FireStart();
 	if (bullets)
 		FireBullet(pos, dir, fireDispersionBase, m_CurrentAmmo, ID(), ID(), false, ::Random.randI(0, 30));
+	play_shot_fx(pos);
+}
+
+// What a shot shows and sounds after its bullet: the stock OnShot and a client's copy of the host's shot share it.
+void CHelicopter::play_shot_fx(const Fvector& fire_pos)
+{
 	StartShotParticles();
 	if (m_bLightShotEnabled)
 		Light_Start();
 	StartFlameParticles();
-	StartSmokeParticles(pos, zero_vel);
-	OnShellDrop(pos, zero_vel);
-	m_layered_sounds.PlaySound("sndShoot", pos, this, false);
+	StartSmokeParticles(fire_pos, zero_vel);
+	OnShellDrop(fire_pos, zero_vel);
+	m_layered_sounds.PlaySound("sndShoot", fire_pos, this, false);
 }
 
 void CHelicopter::coop_rocket(const Fvector& pos)
@@ -192,7 +188,7 @@ void CHelicopter::coop_rocket(const Fvector& pos)
 	m_layered_sounds.PlaySound("sndRocket", pos, this, false);
 }
 
-// Anomaly Coop: UpdateWeapons of a client's copy: what it keeps up around the host's shots.
+// coop: UpdateWeapons of a client's copy: what it keeps up around the host's shots.
 void CHelicopter::coop_update_weapons()
 {
 	const bool firing = Device.dwTimeGlobal < m_coop_aim_until;
@@ -396,7 +392,7 @@ void CHelicopter::startRocket(u16 idx)
 		m_last_launched_rocket = idx;
 
 		m_layered_sounds.PlaySound("sndRocket", xform.c, this, false);
-		coop::presence::on_heli_rocket(this, xform.c); // Anomaly Coop (audit H2)
+		coop::presence::on_heli_rocket(this, xform.c); // coop: the clients' copies launch with it
 	}
 }
 

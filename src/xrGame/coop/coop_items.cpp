@@ -8,9 +8,12 @@
 #include "coop_alife.h"
 #include "coop_trade.h"
 #include "coop_requests.h"
+#include "coop_events.h"
+#include "coop_world.h"
 #include "coop_writer.h" // R32 W1: writing::writes (only the item's writer pushes its own value back)
 
 #include <algorithm>
+#include <array>
 #include <mutex>
 
 #include "ai_space.h"
@@ -38,6 +41,7 @@
 #include "xrCoop/coop_item_tags.h"
 #include "xrCoop/coop_initial_rules.h" // TZ R32 W8.3: uses in the stock client_data of an entity
 #include "xrCoop/coop_owner_rules.h" // TZ R32 W8.1/W8.2: the decider's deliberate write, the owner's report field by field
+#include "xrCoop/coop_reconcile.h" // link_state_mirrors: a map server takes its world's answer to its roster repair
 #include "xrCoop/coop_ledger.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_spawn.h"
@@ -50,7 +54,6 @@ namespace items
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr u8 kBlobVersion = 1;
 constexpr u32 kScanMs = 500; // periodic owner scan
 constexpr u32 kModifyScanMs = 100; // scan after an inventory change, at most this often
@@ -179,6 +182,7 @@ struct Stats
 	u64 facts_taken = 0; // TZ R32 W8.3: the world, ItemFacts of a decider or an owner written into the entity
 	u64 rejoin_dropped = 0; // #480: host, states of a peer whose rejoin is under way (his character nobody's): his resync says them again
 	u64 gift_late = 0; // host, the giver's last state of an item he has just given to another player (late_report_of_gift)
+	u64 link_mirrored = 0, link_dropped = 0; // deciding with a link to a host: its states taken as a copy, the rest (on_link_item_state)
 };
 Stats g_stats;
 
@@ -263,7 +267,14 @@ struct Left
 	u64 time = 0;
 };
 xr_map<u16, Left> g_left; // items that just left a player's character
-xr_map<u16, xr_vector<u16>> g_proxy_items; // proxy -> sorted children
+// A player's character and its items as host_track_proxies saw them last.
+struct ProxyItems
+{
+	xr_vector<u16> children; // the entity's children in its own order: the same list again needs no sort
+	xr_vector<u16> sorted; // the same ids, sorted (binary_search)
+};
+xr_map<u16, ProxyItems> g_proxy_items; // proxy -> its items
+xr_vector<u16> g_track_sorted; // host_track_proxies: the new sorted list of a character that changed (its capacity is kept)
 xr_map<u16, u32> g_unload_used; // weapon -> rounds spawned from it since its last state
 struct Stream
 {
@@ -310,22 +321,7 @@ float dequant(u16 q) { return float(q) / 65535.f; }
 
 bool same_str(const shared_str& a, const char* b) { return a.c_str() && b && !xr_strcmp(a.c_str(), b); }
 
-CSE_Abstract* find_entity(u16 id)
-{
-	if (id == kNoId || !ai().get_alife())
-		return nullptr;
-	return ai().alife().objects().object(id, true);
-}
-
-CInventoryItem* find_item(u16 id)
-{
-	if (id == kNoId || !g_pGameLevel)
-		return nullptr;
-	CObject* o = Level().Objects.net_Find(id);
-	if (!o || o->getDestroy())
-		return nullptr;
-	return smart_cast<CInventoryItem*>(o);
-}
+CInventoryItem* find_item(u16 id) { return smart_cast<CInventoryItem*>(world::object_here(id)); }
 
 // Top-level owner of a server entity (itself if it lies in the world).
 u16 entity_root(CSE_Abstract* e)
@@ -335,7 +331,7 @@ u16 entity_root(CSE_Abstract* e)
 	for (int depth = 0; parent != kNoId && depth < 8; ++depth)
 	{
 		id = parent;
-		CSE_Abstract* p = find_entity(parent);
+		CSE_Abstract* p = world::alife_entity(parent);
 		if (!p)
 			break;
 		parent = p->ID_Parent;
@@ -1061,7 +1057,7 @@ void apply_entity(CSE_Abstract* e, const ItemData& d, bool ammo_only)
 			ii->m_fCondition = dequant(d.cond);
 		// Not on the host: there the owner's GE_INSTALL_UPGRADE (relayed by WP2) adds it to the
 		// server entity, and CSE_ALifeInventoryItem::add_upgrade is FATAL on a duplicate.
-		if (d.has_upgrades && !(mode().decides_world() || mode().leads_level()))
+		if (d.has_upgrades && !mode().decides_here())
 			ii->m_upgrades = spawn_upgrade_list(e->s_name, d.upgrades, false); // net_Spawn installs them
 	}
 	if (d.has_box)
@@ -1123,7 +1119,7 @@ void send_state(CInventoryItem* item, const Blob& blob)
 {
 	Writer w(blob.size() + 48);
 	write_state(w, join::to_host(item->object_id()), item->object().cNameSect().c_str(), 0, blob);
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 		net::host_broadcast(Msg::ItemState, w);
 	else
 		net::client_send(Msg::ItemState, w);
@@ -1167,7 +1163,12 @@ void drain_forgotten()
 		g_applied.erase(id);
 		g_facts_source.erase(id);
 		for (auto& proxy : g_proxy_items)
-			proxy.second.erase(std::remove(proxy.second.begin(), proxy.second.end(), id), proxy.second.end());
+		{
+			xr_vector<u16>& children = proxy.second.children;
+			children.erase(std::remove(children.begin(), children.end(), id), children.end());
+			xr_vector<u16>& sorted = proxy.second.sorted;
+			sorted.erase(std::remove(sorted.begin(), sorted.end(), id), sorted.end());
+		}
 		for (auto it = g_logged_tags.begin(); it != g_logged_tags.end();)
 			it = u16(*it >> 8) == id ? g_logged_tags.erase(it) : std::next(it);
 	}
@@ -1213,7 +1214,7 @@ void scan_local(bool send_all)
 	CActor* actor = Actor();
 	if (!actor || actor->getDestroy())
 		return;
-	const bool host = mode().decides_world() || mode().leads_level();
+	const bool host = mode().decides_here();
 	xr_set<u16> present;
 	Blob blob;
 	for (PIItem item : actor->inventory().m_all)
@@ -1285,6 +1286,41 @@ void scan_local(bool send_all)
 	}
 }
 
+owner::Holder holder_of(const CObject* root)
+{
+	const CEntityAlive* alive = smart_cast<const CEntityAlive*>(root);
+	return alive && alive->g_Alive() ? owner::Holder::Living : owner::Holder::Other;
+}
+
+// The holder by the item's game object chain.
+owner::Holder holder_by_object(CInventoryItem* item, const CActor* actor)
+{
+	const CObject* root = item->object().H_Root();
+	if (actor && root == actor)
+		return owner::Holder::Me;
+	if (root == &item->object())
+		return owner::Holder::Nobody;
+	return holder_of(root);
+}
+
+// The holder by the item's server entity chain: its holder's game object when it has one (an online creature's entity lags
+// behind its game object), else the holder's entity.
+owner::Holder holder_by_entity(u16 id, const CActor* actor)
+{
+	CSE_Abstract* e = world::alife_entity(id);
+	if (!e)
+		return owner::Holder::Nobody;
+	const u16 root = entity_root(e);
+	if (root == id)
+		return owner::Holder::Nobody;
+	if (actor && root == actor->ID())
+		return owner::Holder::Me;
+	if (const CObject* o = g_pGameLevel ? Level().Objects.net_Find(root) : nullptr)
+		return holder_of(o);
+	const CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(world::alife_entity(root));
+	return c && c->g_Alive() ? owner::Holder::Living : owner::Holder::Other;
+}
+
 // Touched items that are not ours: a corpse's / stash's / ground gun the player unloaded.
 void send_foreign(xr_vector<u16>& touched)
 {
@@ -1297,11 +1333,8 @@ void send_foreign(xr_vector<u16>& touched)
 	for (u16 id : touched)
 	{
 		CInventoryItem* item = find_item(id);
-		if (!item || (actor && item->object().H_Root() == actor))
-			continue;
-		// NPCs reloading on the host: their things are pushed when a player gets them.
-		const CEntityAlive* holder = smart_cast<const CEntityAlive*>(item->object().H_Root());
-		if (holder && holder->g_Alive())
+		// Own items go with scan_local; NPCs' things (reloading on the host, a companion's kit) are pushed when a player gets them.
+		if (!item || !owner::reports_foreign(holder_by_object(item, actor), holder_by_entity(id, actor)))
 			continue;
 		capture_blob(item, blob);
 		send_state(item, blob);
@@ -1333,7 +1366,7 @@ bool client_apply(u16 id, const char* section, u8 flags, const Blob& blob)
 	drain_made_here();
 	if (requests::client_lease_waiting(id))
 		return true; // the initial replacement envelope is the only state allowed across this fence
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e)
 		return false;
 	ItemData d;
@@ -1520,13 +1553,13 @@ Access host_access(PeerId from, u16 proxy, CSE_Abstract* e)
 		return Access::Late;
 	// Left in this very frame (WP2 applied the move before host_track_proxies noticed it).
 	auto pit = g_proxy_items.find(proxy);
-	if (pit != g_proxy_items.end() && std::binary_search(pit->second.begin(), pit->second.end(), e->ID))
+	if (pit != g_proxy_items.end() && std::binary_search(pit->second.sorted.begin(), pit->second.sorted.end(), e->ID))
 		return Access::Late;
-	CSE_Abstract* r = find_entity(root);
+	CSE_Abstract* r = world::alife_entity(root);
 	if (CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(r))
 		if (c->g_Alive())
 			return Access::Denied; // a living creature's things are not for players to change
-	CSE_Abstract* p = find_entity(proxy);
+	CSE_Abstract* p = world::alife_entity(proxy);
 	if (!p || !r || p->o_Position.distance_to(r->o_Position) > kForeignRange)
 		return Access::Denied;
 	return Access::Foreign;
@@ -1542,7 +1575,7 @@ bool late_report_of_gift(PeerId from, u16 proxy, u16 id)
 	if (it != g_left.end() && it->second.peer == from && mgr().now_ms() - it->second.time <= kGraceMs)
 		return true;
 	const auto pit = g_proxy_items.find(proxy);
-	return pit != g_proxy_items.end() && std::binary_search(pit->second.begin(), pit->second.end(), id);
+	return pit != g_proxy_items.end() && std::binary_search(pit->second.sorted.begin(), pit->second.sorted.end(), id);
 }
 
 struct Caps
@@ -1720,7 +1753,7 @@ void note_facts(u16 id, u8 source)
 // the owner alone. The owner applies the tags whose version he has not applied yet (coop_owner_rules.h push_applies).
 void host_push_decider(u16 id, PeerId peer, u32 mask)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	auto ow = g_owned.find(id);
 	if (!e || ow == g_owned.end() || peer == kInvalidPeer)
 		return;
@@ -1827,7 +1860,7 @@ void host_on_state(PeerId from, Reader& r)
 		reject(Reason::NoProxy, from, id, nullptr);
 		return;
 	}
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e)
 	{
 		++g_stats.rejected[u32(Reason::Missing)]; // destroyed meanwhile (eaten, emptied): normal
@@ -2051,7 +2084,7 @@ void host_on_spawn_ammo(PeerId from, Reader& r)
 		reject(Reason::NoProxy, from, weapon_id, "ammo spawn");
 		return;
 	}
-	CSE_Abstract* we_abstract = find_entity(weapon_id);
+	CSE_Abstract* we_abstract = world::alife_entity(weapon_id);
 	CSE_ALifeItemWeapon* we = smart_cast<CSE_ALifeItemWeapon*>(we_abstract);
 	if (!we)
 	{
@@ -2119,7 +2152,7 @@ void host_on_spawn_ammo(PeerId from, Reader& r)
 // Push the host's state of an item that just came into a player's hands (stale there?).
 void host_push(u16 id, PeerId peer)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
 		return;
 	CInventoryItem* item = find_item(id);
@@ -2144,7 +2177,8 @@ void host_push(u16 id, PeerId peer)
 
 void host_track_proxies(u64 now)
 {
-	xr_set<u16> seen;
+	std::array<u16, kMaxPeerSlots> seen;
+	size_t seen_count = 0;
 	for (PeerId peer = 1; peer < kMaxPeerSlots; ++peer)
 	{
 		const u16 proxy = join::proxy_of_peer(peer);
@@ -2155,20 +2189,22 @@ void host_track_proxies(u64 now)
 		}
 		if (sync::host_peer_joining(peer))
 		{
-			seen.insert(proxy); // keep the old list: changes during the join are pushed after it
+			seen[seen_count++] = proxy; // keep the old list: changes during the join are pushed after it
 			continue;
 		}
 		CSE_ALifeDynamicObject* pe = ai().alife().objects().object(proxy, true);
 		if (!pe)
 			continue;
-		seen.insert(proxy);
-		xr_vector<u16> cur = pe->children;
-		std::sort(cur.begin(), cur.end());
+		seen[seen_count++] = proxy;
 		auto it = g_proxy_items.find(proxy);
 		if (it == g_proxy_items.end())
 		{
+			ProxyItems items;
+			items.children = pe->children;
+			items.sorted = pe->children;
+			std::sort(items.sorted.begin(), items.sorted.end());
 			// First sight (session start, new player): the host copy is the baseline.
-			for (u16 id : cur)
+			for (u16 id : items.sorted)
 			{
 				CInventoryItem* item = find_item(id);
 				if (!item)
@@ -2176,15 +2212,22 @@ void host_track_proxies(u64 now)
 				Owned& o = g_owned[id];
 				o.peer = peer;
 				capture_object(item, o.data);
-				ledger::host_keeps_own_upgrades(o.data); // F2 T5 fix round 1: the host's list, not enforced
+				ledger::host_keeps_own_upgrades(o.data); // the host's list, not enforced
 				o.stuck = false;
 			}
-			g_proxy_items.emplace(proxy, cur);
+			g_proxy_items.emplace(proxy, std::move(items));
 			continue;
 		}
-		if (it->second == cur)
+		if (it->second.children == pe->children)
 			continue;
-		for (u16 id : it->second)
+		it->second.children = pe->children;
+		xr_vector<u16>& cur = g_track_sorted;
+		cur.assign(pe->children.begin(), pe->children.end());
+		std::sort(cur.begin(), cur.end());
+		xr_vector<u16>& was = it->second.sorted;
+		if (was == cur)
+			continue; // the same items in another order
+		for (u16 id : was)
 			if (!std::binary_search(cur.begin(), cur.end(), id))
 			{
 				Left& l = g_left[id];
@@ -2196,12 +2239,14 @@ void host_track_proxies(u64 now)
 					g_owned.erase(ow);
 			}
 		for (u16 id : cur)
-			if (!std::binary_search(it->second.begin(), it->second.end(), id))
+			if (!std::binary_search(was.begin(), was.end(), id))
 				host_push(id, peer);
-		it->second.swap(cur);
+		was.swap(cur);
 	}
+	const auto first_seen = seen.begin();
+	const auto end_seen = seen.begin() + seen_count;
 	for (auto it = g_proxy_items.begin(); it != g_proxy_items.end();)
-		it = seen.count(it->first) ? std::next(it) : g_proxy_items.erase(it);
+		it = std::find(first_seen, end_seen, it->first) != end_seen ? std::next(it) : g_proxy_items.erase(it);
 }
 
 // The host copy of a player's item must stay what the player said: anything on the host that
@@ -2212,7 +2257,7 @@ void host_enforce(u64 now)
 	{
 		// A (re)joining player gets the host's world as it is now (after a load: the save's state);
 		// his state from before must not be forced onto it. His resync after the join sets it again.
-		if (!find_entity(it->first) || sync::host_peer_joining(it->second.peer))
+		if (!world::alife_entity(it->first) || sync::host_peer_joining(it->second.peer))
 		{
 			it = g_owned.erase(it);
 			continue;
@@ -2226,7 +2271,7 @@ void host_enforce(u64 now)
 			{
 				const Applying applying;
 				apply_object(item, it->second.data, false);
-				if (CSE_Abstract* e = find_entity(it->first))
+				if (CSE_Abstract* e = world::alife_entity(it->first))
 					apply_entity(e, it->second.data, false);
 				++g_stats.enforced;
 				capture_object(item, cur);
@@ -2244,7 +2289,7 @@ void host_enforce(u64 now)
 	for (auto it = g_left.begin(); it != g_left.end();)
 		it = now - it->second.time > kGraceMs ? g_left.erase(it) : std::next(it);
 	for (auto it = g_releasing.begin(); it != g_releasing.end();)
-		it = find_entity(*it) ? std::next(it) : g_releasing.erase(it);
+		it = world::alife_entity(*it) ? std::next(it) : g_releasing.erase(it);
 }
 } // namespace
 
@@ -2275,13 +2320,43 @@ bool hold_state_of_joining(PeerId from, const Reader& at)
 	return true;
 }
 
+u32 g_link_state_log = 0; // the lines of on_link_item_state, bounded
+
+// ItemState on this process's link to its host, when this process decides here as well: the world's answer to its own roster repair
+// of an item it does not write (reconcile::link_state_mirrors). Its copy takes the writer's word as a mirror does; nothing on this
+// link is a player's report (host_on_state).
+void on_link_item_state_deciding(Reader& r, Op op)
+{
+	Reader at = r;
+	const u16 id = join::to_local(at.u16());
+	if (!at.ok())
+		return;
+	const bool writes_here = writing::writes(id);
+	const bool mirrors = reconcile::link_state_mirrors(op == Op::State, writes_here);
+	if (mirrors)
+		++g_stats.link_mirrored;
+	else
+		++g_stats.link_dropped;
+	if (g_link_state_log < 16)
+	{
+		++g_link_state_log;
+		CSE_Abstract* e = world::alife_entity(id);
+		const u16 root = e ? entity_root(e) : kNoId;
+		CSE_Abstract* holder = root != kNoId && root != id ? world::alife_entity(root) : nullptr;
+		::Msg("[coop-items] item state of %u [%s] from the world, held by %u [%s]: %s", id, e ? e->s_name.c_str() : "not here",
+		    root, holder ? holder->s_name.c_str() : "nobody", mirrors ? "taken as its copy" : writes_here ? "ours, kept" : "no state");
+	}
+	if (mirrors && !events::dropped_before_live(Msg::ItemState, g_stats.dropped_before_live))
+		client_on_state(r);
+}
+
 // ItemState, in both tables (F3a T4: the lambda of the old install, unchanged)
 void on_item_state(PeerId from, Reader& r)
 {
 	const Op op = Op(r.u8());
 	if (!r.ok())
 		return;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		// Precaching a freshly loaded world: states and unloads made in the old one are dropped
 		// (the pump runs before join::frame() marks the peers as joining).
@@ -2297,11 +2372,8 @@ void on_item_state(PeerId from, Reader& r)
 	}
 	else if (!mode().decides_world() && op == Op::State)
 	{
-		// R2 I2 (rules::live_only): a state from before we are live is of the window between Welcome and
-		// JoinRequest or of a world we left; the save we load is newer. Kept pending, it would be applied over it.
-		if (rules::live_only(Msg::ItemState) && !mgr().is_live_client())
-			++g_stats.dropped_before_live;
-		else
+		// A state from before we are live is older than the save we load: kept pending, it would be applied over it.
+		if (!events::dropped_before_live(Msg::ItemState, g_stats.dropped_before_live))
 			client_on_state(r);
 	}
 }
@@ -2317,7 +2389,7 @@ void host_on_peer_in_world(PeerId peer)
 	xr_vector<HeldState> held;
 	held.swap(it->second);
 	g_join_held.erase(it);
-	if (!(mode().decides_world() || mode().leads_level()) || !ai().get_alife() || Device.dwPrecacheFrame)
+	if (!mode().decides_here() || !ai().get_alife() || Device.dwPrecacheFrame)
 		return; // another world meanwhile: what he said belongs to the one before (on_item_state drops the same)
 	for (const HeldState& h : held)
 	{
@@ -2334,7 +2406,24 @@ void host_on_peer_in_world(PeerId peer)
 	}
 }
 
-void install_client(Endpoint& e) { e.on(Msg::ItemState, &on_item_state); }
+namespace
+{
+// ItemState on the link to this process's host. A process that decides nothing is the host's client (on_item_state); one that also
+// decides here hears its world's answers to its roster repairs there (on_link_item_state_deciding).
+void on_link_item_state(PeerId from, Reader& r)
+{
+	if (!mode().decides_here())
+	{
+		on_item_state(from, r);
+		return;
+	}
+	const Op op = Op(r.u8());
+	if (r.ok() && ai().get_alife() && !Device.dwPrecacheFrame)
+		on_link_item_state_deciding(r, op);
+}
+} // namespace
+
+void install_client(Endpoint& e) { e.on(Msg::ItemState, &on_link_item_state); }
 
 void reset()
 {
@@ -2388,7 +2477,7 @@ void writer_set_staged(CInventoryItem* item, u8 before, u8 uses)
 		decider_wrote(item, owner::Setter::Uses);
 		return;
 	}
-	if (!(mode().decides_world() || mode().leads_level()) || !writing::writes(id))
+	if (!mode().decides_here() || !writing::writes(id))
 		return; // a copy sets its own object only
 	itemtags::FieldVersions& latest = g_versions[id];
 	itemtags::bump(latest, itemtags::Uses);
@@ -2428,6 +2517,7 @@ void apply_staged_uses()
 
 void frame()
 {
+	PROF_EVENT("coop/coop_items/frame");
 	drain_forgotten();
 	xr_vector<u16> touched;
 	xr_vector<SpawnReq> spawns;
@@ -2439,7 +2529,7 @@ void frame()
 		scan_now = g_scan_now;
 		g_scan_now = false;
 	}
-	const bool host = mode().decides_world() || mode().leads_level();
+	const bool host = mode().decides_here();
 	const bool live_client = mgr().is_live_client();
 	if ((!host && !live_client) || !g_pGameLevel || !ai().get_alife())
 	{
@@ -2520,7 +2610,7 @@ void print_status()
 	      "%llu authority (%llu kept ours), %llu ignored, %u pending (%llu dropped)",
 	    s.sent, s.foreign_sent, s.spawns_sent, s.received, s.applied, s.authority_applied, s.authority_skipped,
 	    s.ignored, (u32)g_pending.size(), s.pending_dropped);
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		u32 stuck = 0;
 		for (const auto& it : g_owned)
@@ -2542,9 +2632,12 @@ void print_status()
 	}
 	::Msg("[coop]   items: %llu upgrades dropped before a loading install (unknown, out of order, group taken)",
 	    s.upgrades_dropped);
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 		::Msg("[coop]   items of joining players: %llu state(s) kept, %llu taken when the join ended (%u peer(s) waiting)",
 		    s.join_held, s.join_taken, (u32)g_join_held.size());
+	if (s.link_mirrored || s.link_dropped)
+		::Msg("[coop]   items from the host's link while deciding here: %llu state(s) taken as a copy, %llu dropped",
+		    s.link_mirrored, s.link_dropped);
 	// TZ R32 W8 (WP6): the decider's writes and the owners' reports field by field, the world's facts.
 	::Msg("[coop]   items W8: %llu deliberate writes, %llu decider pushes, %llu stale fields refused, %llu stale uses rebased; "
 	      "owner: %llu pushes applied (%llu kept doses of his own); world facts: %llu taken, %llu refused; %u uses staged",
@@ -2573,7 +2666,7 @@ void print_inventory()
 		capture_object(item, d);
 		if (!d.has_main && !d.has_box) continue;
 		const u16 id = item->object_id();
-		CSE_Abstract* e = find_entity(id);
+		CSE_Abstract* e = world::alife_entity(id);
 		::Msg("[coop-inventory] id=%u host=%u section=%s parent=%u root=%u cond=%u mag=%u box=%u pending=%u",
 		    id, join::to_host(id), item->object().cNameSect().c_str(), e ? e->ID_Parent : kNoId,
 		    e ? entity_root(e) : kNoId, d.cond, d.main_count, d.box, requests::client_lease_waiting(id) ? 1u : 0u);
@@ -2645,7 +2738,7 @@ void client_send_state_now(u16 local_id)
 
 void host_silencer_detached(u16 id, PeerId owner)
 {
-	CSE_Abstract* entity = find_entity(id);
+	CSE_Abstract* entity = world::alife_entity(id);
 	CInventoryItem* item = find_item(id);
 	if (!entity || !item)
 		return;
@@ -2973,7 +3066,7 @@ u32 state_digest(CSE_Abstract* e, bool with_uses)
 
 void host_send_state(PeerId to, u16 id)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
 		return;
 	CInventoryItem* item = find_item(id);
@@ -3001,7 +3094,7 @@ void host_send_contents(PeerId to, u16 holder)
 
 bool level_item_state(u16 id, std::string& section, std::vector<u8>& blob)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
 		return false;
 	CInventoryItem* item = find_item(id);
@@ -3042,7 +3135,7 @@ void level_item_tell(u16 id, const std::string& section, const std::vector<u8>& 
 bool host_take_level_state(u16 id, const char* section, const u8* data, size_t size, const char*& why)
 {
 	why = nullptr;
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	if (!e || !smart_cast<CSE_ALifeInventoryItem*>(e))
 	{
 		why = "no such item";
@@ -3096,7 +3189,7 @@ bool entity_write_uses(CSE_Abstract* e, u8 uses)
 	const float cond = ii->m_fCondition;
 	std::vector<u8> cd(e->client_data.begin(), e->client_data.end());
 	const initial::UsesStore how =
-	    initial::uses_store(cd, nullptr, uses, e->ID_Parent != 0xffff, may_make_client_data(e->s_name));
+	    initial::uses_store(cd, nullptr, uses, e->ID_Parent != kNoId, may_make_client_data(e->s_name));
 	if (!initial::store_uses(cd, how, nullptr, uses, &cond, may_make_client_data(e->s_name)))
 		return false;
 	e->client_data.assign(cd.begin(), cd.end());
@@ -3126,7 +3219,7 @@ bool staged_uses(u16 id, u8& uses)
 bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t size, const char*& why)
 {
 	why = nullptr;
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	CSE_ALifeInventoryItem* ii = e ? smart_cast<CSE_ALifeInventoryItem*>(e) : nullptr;
 	if (!ii)
 	{
@@ -3157,11 +3250,14 @@ bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t si
 		return false;
 	}
 	host_sanitize(e, item, facts); // the upgrade list in an order the engine takes, a scope index in range
-	// W8.3: the uses of an item with no object here go into its client_data, decided before anything is written: what cannot be
-	// stored refuses the whole entry (an honest Refused, nothing half applied; finding 1). The writer's own bytes of its object come
-	// first: they carry the binder's bytes a scripted section needs (G.A.M.M.A.'s multi-use kits and drinks, [booster_multi]).
+	// The uses of an item with no object here go into its client_data, decided before anything is written. The writer's own bytes of
+	// its object come first: they carry the binder's bytes a scripted section needs (multi-use kits and drinks, [booster_multi]). What
+	// the entity cannot keep (a scripted section with no client_data and no usable bytes of the writer's object, or an item on the
+	// ground, whose client_data is its physics state) waits in g_staged_uses for the item's next spawn (its initial state, state_of)
+	// and its next game object here, as apply_to_entity keeps the uses of an initial state.
 	std::vector<u8> cd;
 	const bool store = facts.has_uses && !item;
+	bool stage = false;
 	if (store)
 	{
 		if (!is_eatable_section(e->s_name) || !initial::uses_ok(facts.uses, section_max_uses(e->s_name)))
@@ -3174,13 +3270,8 @@ bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t si
 		const float cond = facts.has_cond ? dequant(facts.cond) : ii->m_fCondition;
 		const std::vector<u8>* stock = d.has_client_data ? &d.client_data : nullptr;
 		const bool may_make = may_make_client_data(e->s_name);
-		const initial::UsesStore how = initial::uses_store(cd, stock, facts.uses, e->ID_Parent != 0xffff, may_make);
-		if (!initial::store_uses(cd, how, stock, facts.uses, &cond, may_make))
-		{
-			why = "the uses cannot be stored (a scripted section and no bytes of the writer's object, or an item on the ground)";
-			++g_stats.facts_refused;
-			return false;
-		}
+		const initial::UsesStore how = initial::uses_store(cd, stock, facts.uses, e->ID_Parent != kNoId, may_make);
+		stage = !initial::store_uses(cd, how, stock, facts.uses, &cond, may_make);
 	}
 	// §8a A12: the writer's versions of the item are the world's now (they go out with its next spawn's initial state).
 	if (d.has_versions)
@@ -3196,7 +3287,9 @@ bool host_take_item_facts(u16 id, const char* section, const u8* data, size_t si
 			apply_object(item, facts, false);
 		apply_entity(e, facts, false);
 	}
-	if (store)
+	if (store && stage)
+		stage_uses(id, facts.uses);
+	else if (store)
 	{
 		e->client_data.assign(cd.begin(), cd.end());
 		g_staged_uses.erase(id);
@@ -3213,7 +3306,7 @@ void decider_wrote(CInventoryItem* item, owner::Setter what)
 {
 	if (!item || item->object().getDestroy())
 		return;
-	if (!(mode().decides_world() || mode().leads_level()))
+	if (!mode().decides_here())
 		return; // a mirror's setter changes its own copy (the writer gate, W2)
 	if (g_applying > 0)
 		return; // inside the apply of an owner's state or of the decider's baseline
@@ -3239,7 +3332,7 @@ void decider_wrote(CInventoryItem* item, owner::Setter what)
 		++g_stats.deliberate;
 		const PeerId peer = ow->second.peer;
 		host_push_decider(id, peer, mask); // the owner, in this frame
-		if (CSE_Abstract* e = find_entity(id))
+		if (CSE_Abstract* e = world::alife_entity(id))
 		{
 			apply_entity(e, itemtags::only_tags(now, mask), false);
 			host_send_view(id, e, item, nullptr, 0, peer); // the other players' copies
@@ -3252,14 +3345,14 @@ void decider_wrote(CInventoryItem* item, owner::Setter what)
 
 itemtags::FieldVersions item_versions(u16 id)
 {
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 		return versions_in(g_versions, id);
 	return versions_in(g_applied, id);
 }
 
 void item_versions_arrive(u16 id, const itemtags::FieldVersions& v, u32 mask)
 {
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		owner::arrive(g_versions[id], v, mask);
 		g_uses_history.erase(id); // changes of this process's numbering are no changes of the arrived one
@@ -3270,7 +3363,7 @@ void item_versions_arrive(u16 id, const itemtags::FieldVersions& v, u32 mask)
 
 void host_upgrade_sold(u16 id, PeerId owner)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::alife_entity(id);
 	CSE_ALifeInventoryItem* ii = e ? smart_cast<CSE_ALifeInventoryItem*>(e) : nullptr;
 	if (!ii)
 		return;

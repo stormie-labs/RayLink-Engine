@@ -1,4 +1,4 @@
-// Anomaly Coop — call router gate (MOD_LAYER.md §2.3, F2 T12). The one place where a client decides what an engine
+// Anomaly Coop — call router gate (MOD_LAYER.md §2.3). The one place where a client decides what an engine
 // function called from Lua does there: run it (the stock code), send it to the host (the function's request path) or
 // refuse it. The classes are xrCoop/coop_calls.h (kCalls, a row for every export) with the [call_classes] overrides of
 // configs\coop_route*.ltx and coop_compat_*.ltx; this module finds the target's owner, checks the arguments, loads the
@@ -6,22 +6,22 @@
 //
 // A gated engine function asks first and does what the answer says:
 //   switch (callgate::client_gate("game_object:give_money", &object())) { Run: stock; Request: path; Refuse: return }
-// Gated now (each hook says "Anomaly Coop (F2 T12 ...)"):
+// Gated now:
 //   alife_simulator_script.cpp  alife:create, create_ammo, clone_weapon, register, release, kill_entity,
-//                               teleport_object, set_switch_online, set_switch_offline (coop_requests.cpp lua_*);
-//                               round 1: give_info, disable_info (our actor: the story path), set_interactive,
+//                               teleport_object, set_switch_online, set_switch_offline (coop_requests.cpp lua_*),
+//                               give_info, disable_info (our actor: the story path), set_interactive,
 //                               add/remove_in/out_restriction, remove_all_restrictions
 //   level_script.cpp            level:set_weather, set_weather_fx, set_weather_smooth, set_weather_weight,
-//                               start_weather_fx_from_time, stop_weather_fx, change_game_time (coop_worldstate.cpp);
-//                               round 1: set_game_difficulty, spawn_item, spawn_phantom
+//                               start_weather_fx_from_time, stop_weather_fx, change_game_time (coop_worldstate.cpp),
+//                               set_game_difficulty, spawn_item, spawn_phantom
 //   script_game_object*.cpp     game_object:transfer_item, give_money, kill, set_npc_position, give_info_portion,
 //                               disable_info_portion, set_relation, set_goodwill, force_set_goodwill, change_goodwill,
-//                               set_community_goodwill, attach_vehicle (a car, coop_events.cpp client_refuse_vehicle);
-//                               round 1: transfer_money, take_item, enable_level_changer, the properties health,
+//                               set_community_goodwill, attach_vehicle (a car, coop_events.cpp client_refuse_vehicle),
+//                               transfer_money, take_item, enable_level_changer, the properties health,
 //                               psy_health, power, satiety, radiation, morale, bleeding, change_health, set_health_ex,
-//                               buy_supplies, destroy_object; round 2: change_psy_health, change_power, change_satiety,
+//                               buy_supplies, destroy_object, change_psy_health, change_power, change_satiety,
 //                               change_radiation, change_morale
-//   HangingLamp.cpp             hanging_lamp:turn_on, turn_off (audit W2: the host's word comes as LampState, coop_lamps.h)
+//   HangingLamp.cpp             hanging_lamp:turn_on, turn_off (the host's word comes as LampState, coop_lamps.h)
 // Every other export runs as in single player; its row only documents it until it gets a hook.
 //
 // Host, single player and a client before the host's world (its own world still runs while the host's downloads):
@@ -29,9 +29,9 @@
 // A map server answers the same, except that a call on an object of its level runs (calls::decide_leading).
 //   - Arguments that fail (a position that is not a number, an id this world does not have) are refused.
 //   - While the client applies a host command (an engine apply scope entities::ClientApply, or the host's story:
-//     story::applying) a call runs: it is the host's change (the event router still drops echoes, R4 4).
+//     story::applying) a call runs: it is the host's change (the event router still drops echoes).
 //     Args::runs_while_applying = false keeps the class rules then (the alife() spawn and ALife gates, weather and
-//     time: their behaviour before T12). Our Lua mirrors are NOT covered (review R1-M2): coop_npc_meet and
+//     time). Our Lua mirrors are NOT covered: coop_npc_meet and
 //     coop_npc_world get the host's events through coop_script deliver_inbox, outside both scopes, and call
 //     enable_talk / disable_talk / enable_trade / set_start_dialog / explode / enable_anomaly ... Those must stay
 //     without a gate until the mirrors run under an apply scope (a Lua coop.apply(fn) over ClientApply, say).
@@ -54,12 +54,12 @@ namespace callgate
 {
 using calls::Gate;
 
-// Arguments the gate checks on a client before the call runs or goes to the host (P8, review R6 I-2: NaN passed the
-// clamps and the id checks). Unset fields are not checked.
+// Arguments the gate checks on a client before the call runs or goes to the host (NaN passes clamps and id checks).
+// Unset fields are not checked.
 struct Args
 {
 	const Fvector* pos = nullptr; // must be finite (validate::vec_finite)
-	u16 id = u16(-1);             // must name an object of this machine's world (events::find_entity)
+	u16 id = u16(-1);             // must name an object of this machine's world (world::server_entity)
 	const char* what = nullptr;   // for the log line only: the section of a spawn, ...
 	bool runs_while_applying = true; // a host command being applied runs (false: the class rules still apply)
 };

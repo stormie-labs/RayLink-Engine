@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players (F5-VEH-2, docs/VEHICLES.md §7-§10): the decider's pure half.
+// Anomaly Coop — vehicles for players (docs/VEHICLES.md §7-§10): the decider's pure half.
 //
 // The decider of a player's level (the co-op host; in the Server mode the map server of his level) seats players in cars,
 // drives a client's car without an Owner and lets him out. What it does is the same in both modes; these rules do not know
@@ -28,6 +27,7 @@
 
 #include "coop_mode.h"
 #include "coop_protocol.h"
+#include "coop_text.h"
 #include "coop_vehicle_rules.h"
 
 namespace coop
@@ -64,26 +64,6 @@ struct DriveCall
 	bool operator==(const DriveCall& o) const { return key == o.key && press == o.press; }
 	bool operator!=(const DriveCall& o) const { return !(*this == o); }
 };
-
-inline const char* drive_key_name(DriveKey k)
-{
-	switch (k)
-	{
-	case DriveKey::Forward: return "forward";
-	case DriveKey::Back: return "back";
-	case DriveKey::Left: return "left";
-	case DriveKey::Right: return "right";
-	case DriveKey::Brake: return "brake";
-	case DriveKey::TransUp: return "trans_up";
-	case DriveKey::TransDown: return "trans_down";
-	case DriveKey::Fire: return "fire";
-	case DriveKey::WeaponSwitch: return "weapon_switch";
-	case DriveKey::Engine: return "engine";
-	case DriveKey::Lights: return "lights";
-	case DriveKey::Aim: return "aim";
-	}
-	return "?";
-}
 
 struct HeldKey
 {
@@ -151,7 +131,7 @@ inline std::vector<DriveCall> plan_drive(const InputStep& s, bool has_weapon, bo
 // ---------------------------------------------------------------- attach / detach of a driver who is not the Owner
 
 // What the decider does to a car when a client takes or leaves seat 0. Every line of CCar::attach_Actor / detach_Actor
-// (Car.cpp as read 2026-11-20) with kept / dropped and why; coop_vehicles_seat.cpp runs the kept steps in this order.
+// (Car.cpp) with kept / dropped and why; coop_vehicles_seat.cpp runs the kept steps in this order.
 enum class CarStep : uint8_t
 {
 	None, // a dropped line
@@ -221,7 +201,7 @@ constexpr const char* kTrustDefaultKey = "default";
 
 enum class TrustMode : uint8_t
 {
-	Log, // write what would be refused, let it through (build 57/58: every new check)
+	Log, // write what would be refused, let it through
 	Refuse,
 	Off, // the check does not run
 };
@@ -237,28 +217,16 @@ inline const char* trust_mode_name(TrustMode m)
 	return "?";
 }
 
-namespace detail
-{
-// no strcmp here: the engine marks it deprecated (C4995, xrCore)
-inline bool same_text(const char* a, const char* b)
-{
-	for (; *a && *a == *b; ++a, ++b)
-	{
-	}
-	return *a == *b;
-}
-} // namespace detail
-
 // "log" | "refuse" | "off" (the values coop_trust.script accepts); anything else leaves `out` and returns false.
 inline bool parse_trust_mode(const char* text, TrustMode& out)
 {
 	if (!text)
 		return false;
-	if (detail::same_text(text, "log"))
+	if (ascii::equal(text, "log"))
 		out = TrustMode::Log;
-	else if (detail::same_text(text, "refuse"))
+	else if (ascii::equal(text, "refuse"))
 		out = TrustMode::Refuse;
-	else if (detail::same_text(text, "off"))
+	else if (ascii::equal(text, "off"))
 		out = TrustMode::Off;
 	else
 		return false;
@@ -361,8 +329,8 @@ inline Release departure_release(Departure gone, bool on_map)
 
 // Release(0): he stays. The first that holds, in this order: Disconnect / LeftLevel, CarGone, CarDestroyed, Death, Wounded
 // (the car's end is told before what it did to him: an explosion sets b_exploded in the frame it hits; its blast comes
-// later, Explosive.cpp GenExplodeEvent). A player gone from the session: how he left, as the mode says (VEH-DISC; before it a map
-// server's drop of the virtual peer of a player who quit was LeftLevel, review rv_F5-VEH-7 blocker 2). In the session with another
+// later, Explosive.cpp GenExplodeEvent). A player gone from the session: how he left, as the mode says (not LeftLevel for a
+// map server's drop of the virtual peer of a player who quit). In the session with another
 // character: replaced_release. In the session, not on this map: LeftLevel (the co-op: he loads the world again).
 inline Release release_reason(const SitterFacts& f)
 {
@@ -384,7 +352,7 @@ inline Release release_reason(const SitterFacts& f)
 }
 
 // The facts the session and the mode give of one seated player (release_by_facts, coop_vehicles_seat.cpp): `joined` his peer is a
-// joined peer of the session that seated him, `plays` the character that peer plays now (0xffff: none), `character` the one that
+// joined peer of the session that seated him, `plays` the character that peer plays now (kNoId: none), `character` the one that
 // sits. The mode is asked about the player only: is he on this map, and, once his peer is gone, how it left.
 inline void session_facts(SitterFacts& f, const Mode& m, PeerId peer, uint16_t character, bool joined, uint16_t plays)
 {

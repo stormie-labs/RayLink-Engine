@@ -25,15 +25,10 @@ namespace
 {
 constexpr size_t kChannels = size_t(Lane::Count);
 
-std::mutex g_enet_mutex;
+std::mutex g_enet_mutex; // the library's reference count (enet_initialize / enet_deinitialize)
 int g_enet_refs = 0;
 
-// One lock for all ENet state of the process: the owner thread and keep-alive threads take turns.
-// Recursive: a few wrappers call each other.
-std::recursive_mutex g_io;
-using IoLock = std::lock_guard<std::recursive_mutex>;
-
-// Owner 2026-10-24: "frames must not affect the ping". The helper keeps the link prompt between the owner's frames:
+// Frames must not affect the ping. The helper keeps the link prompt between the owner's frames:
 // acks and pings go out within ~1 ms of a packet (the engine runs the Windows timer at 1 ms), and what the owner sent
 // leaves at once instead of at its next frame. RTT is the network's again, not network + both sides' frame times.
 constexpr uint32_t kKeepAliveTickMs = 1; // helper thread wake-up period
@@ -78,6 +73,82 @@ void ENET_CALLBACK packet_free_cb(ENetPacket* p)
 		while (!bytes.compare_exchange_weak(cur, next));
 	}
 	delete box;
+}
+
+// Every queued command was transmitted at least once. Under the I/O lock.
+bool idle(const ENetPeer* peer)
+{
+	return enet_list_empty(&peer->outgoingCommands) && enet_list_empty(&peer->outgoingSendReliableCommands);
+}
+
+// True when ENet's next event is a DISCONNECT: the first peer in the dispatch queue with something to hand out
+// (enet_protocol_dispatch_incoming_commands' order) is a zombie.
+bool disconnect_next(ENetHost* host)
+{
+	for (ENetListIterator it = enet_list_begin(&host->dispatchQueue); it != enet_list_end(&host->dispatchQueue);
+		it = enet_list_next(it))
+	{
+		const ENetPeer* peer = reinterpret_cast<const ENetPeer*>(it); // dispatchList is ENetPeer's first member
+		switch (peer->state)
+		{
+		case ENET_PEER_STATE_ZOMBIE:
+			return true;
+		case ENET_PEER_STATE_CONNECTION_PENDING:
+		case ENET_PEER_STATE_CONNECTION_SUCCEEDED:
+			return false;
+		case ENET_PEER_STATE_CONNECTED:
+			if (!enet_list_empty(&peer->dispatchedCommands))
+				return false;
+			break;
+		default:
+			break;
+		}
+	}
+	return false;
+}
+
+// The connection `link` (its ENet connectID) is still the peer's, and the owner has not reset or closed it.
+bool link_alive(const ENetPeer* peer, uint32_t link)
+{
+	if (peer->connectID != link)
+		return false;
+	switch (peer->state)
+	{
+	case ENET_PEER_STATE_CONNECTED:
+	case ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT: // the remote's goodbye
+	case ENET_PEER_STATE_ZOMBIE:
+		return true;
+	default: // reset, or closing on the owner's word (disconnect, disconnect_later)
+		return false;
+	}
+}
+
+// An ENet event as the owner gets it (a packet's bytes are copied and the packet freed).
+void take_event(ENetEvent& e, Event& ev)
+{
+	ev.peer = e.peer;
+	ev.channel = e.channelID;
+	ev.data = e.data;
+	switch (e.type)
+	{
+	case ENET_EVENT_TYPE_CONNECT:
+		ev.type = Event::Type::Connect;
+		break;
+	case ENET_EVENT_TYPE_DISCONNECT:
+		ev.type = Event::Type::Disconnect;
+		break;
+	case ENET_EVENT_TYPE_RECEIVE:
+		ev.type = Event::Type::Receive;
+		if (e.packet)
+		{
+			ev.bytes.assign(e.packet->data, e.packet->data + e.packet->dataLength);
+			enet_packet_destroy(e.packet);
+		}
+		break;
+	default:
+		ev.type = Event::Type::None;
+		break;
+	}
 }
 } // namespace
 
@@ -125,14 +196,18 @@ bool Transport::listen(uint16_t port, uint32_t max_peers, std::string* err)
 	m_enet_ref = true;
 	if (max_peers == 0)
 		max_peers = 1;
-	IoLock io(g_io);
 	if (max_peers > ENET_PROTOCOL_MAXIMUM_PEER_ID)
 		max_peers = ENET_PROTOCOL_MAXIMUM_PEER_ID;
 
 	ENetAddress addr;
 	addr.host = ENET_HOST_ANY;
 	addr.port = port;
-	m_host = enet_host_create(&addr, max_peers, kChannels, 0, 0);
+	{
+		IoLock io(m_io);
+		m_host = enet_host_create(&addr, max_peers, kChannels, 0, 0);
+		if (m_host)
+			m_traffic = std::make_unique<TrafficSlot[]>(m_host->peerCount);
+	}
 	if (!m_host)
 	{
 		if (err)
@@ -140,7 +215,6 @@ bool Transport::listen(uint16_t port, uint32_t max_peers, std::string* err)
 		destroy();
 		return false;
 	}
-	m_traffic = std::make_unique<TrafficSlot[]>(m_host->peerCount);
 	keepalive_start();
 	return true;
 }
@@ -170,8 +244,15 @@ PeerHandle Transport::connect(const std::string& address, uint16_t port, std::st
 		destroy();
 		return nullptr;
 	}
-	IoLock io(g_io);
-	m_host = enet_host_create(nullptr, 1, kChannels, 0, 0);
+	ENetPeer* peer = nullptr;
+	{
+		IoLock io(m_io);
+		m_host = enet_host_create(nullptr, 1, kChannels, 0, 0);
+		if (m_host)
+			peer = enet_host_connect(m_host, &addr, kChannels, 0);
+		if (peer)
+			m_traffic = std::make_unique<TrafficSlot[]>(m_host->peerCount);
+	}
 	if (!m_host)
 	{
 		if (err)
@@ -179,7 +260,6 @@ PeerHandle Transport::connect(const std::string& address, uint16_t port, std::st
 		destroy();
 		return nullptr;
 	}
-	ENetPeer* peer = enet_host_connect(m_host, &addr, kChannels, 0);
 	if (!peer)
 	{
 		if (err)
@@ -187,7 +267,6 @@ PeerHandle Transport::connect(const std::string& address, uint16_t port, std::st
 		destroy();
 		return nullptr;
 	}
-	m_traffic = std::make_unique<TrafficSlot[]>(m_host->peerCount);
 	keepalive_start();
 	return peer;
 }
@@ -197,7 +276,7 @@ void Transport::destroy()
 	keepalive_stop(); // before the host goes: the helper must not service a destroyed host
 	if (m_host)
 	{
-		IoLock io(g_io);
+		IoLock io(m_io);
 		enet_host_destroy(m_host);
 		m_host = nullptr;
 		m_traffic.reset();
@@ -210,76 +289,6 @@ void Transport::destroy()
 	}
 }
 
-// True when ENet's next event is a DISCONNECT: the first peer in the dispatch queue with something to hand out
-// (enet_protocol_dispatch_incoming_commands' order) is a zombie.
-static bool disconnect_next(ENetHost* host)
-{
-	for (ENetListIterator it = enet_list_begin(&host->dispatchQueue); it != enet_list_end(&host->dispatchQueue);
-		it = enet_list_next(it))
-	{
-		const ENetPeer* peer = reinterpret_cast<const ENetPeer*>(it); // dispatchList is ENetPeer's first member
-		switch (peer->state)
-		{
-		case ENET_PEER_STATE_ZOMBIE:
-			return true;
-		case ENET_PEER_STATE_CONNECTION_PENDING:
-		case ENET_PEER_STATE_CONNECTION_SUCCEEDED:
-			return false;
-		case ENET_PEER_STATE_CONNECTED:
-			if (!enet_list_empty(&peer->dispatchedCommands))
-				return false;
-			break;
-		default:
-			break;
-		}
-	}
-	return false;
-}
-
-// The connection `link` (its ENet connectID) is still the peer's, and the owner has not reset or closed it.
-static bool link_alive(const ENetPeer* peer, uint32_t link)
-{
-	if (peer->connectID != link)
-		return false;
-	switch (peer->state)
-	{
-	case ENET_PEER_STATE_CONNECTED:
-	case ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT: // the remote's goodbye
-	case ENET_PEER_STATE_ZOMBIE:
-		return true;
-	default: // reset, or closing on the owner's word (disconnect, disconnect_later)
-		return false;
-	}
-}
-
-// An ENet event as the owner gets it (a packet's bytes are copied and the packet freed).
-static void take_event(ENetEvent& e, Event& ev)
-{
-	ev.peer = e.peer;
-	ev.channel = e.channelID;
-	ev.data = e.data;
-	switch (e.type)
-	{
-	case ENET_EVENT_TYPE_CONNECT:
-		ev.type = Event::Type::Connect;
-		break;
-	case ENET_EVENT_TYPE_DISCONNECT:
-		ev.type = Event::Type::Disconnect;
-		break;
-	case ENET_EVENT_TYPE_RECEIVE:
-		ev.type = Event::Type::Receive;
-		if (e.packet)
-		{
-			ev.bytes.assign(e.packet->data, e.packet->data + e.packet->dataLength);
-			enet_packet_destroy(e.packet);
-		}
-		break;
-	default:
-		ev.type = Event::Type::None;
-		break;
-	}
-}
-
 int Transport::service(Event& ev, uint32_t wait_ms)
 {
 	if (!m_host)
@@ -288,7 +297,7 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 	ENetEvent e;
 	int rc;
 	{
-		IoLock io(g_io);
+		IoLock io(m_io);
 		m_last_service_ms.store(steady_ms(), std::memory_order_relaxed);
 		while (!m_inbox.empty()) // what the helper took out of ENet comes first: the order stays ENet's
 		{
@@ -314,7 +323,7 @@ int Transport::service(Event& ev, uint32_t wait_ms)
 
 void Transport::flush()
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (m_host)
 		enet_host_flush(m_host);
 }
@@ -346,22 +355,54 @@ Packet Transport::make_packet(Lane lane, uint16_t type, const uint8_t* a, size_t
 	return out;
 }
 
+bool Transport::owns(PeerHandle peer) const
+{
+	return m_host && peer && peer->host == m_host;
+}
+
+bool Transport::submit(PeerHandle peer, Lane lane, ENetPacket* packet)
+{
+	if (!owns(peer) || peer->state != ENET_PEER_STATE_CONNECTED || enet_peer_send(peer, enet_uint8(lane), packet) < 0)
+		return false;
+	count_traffic(peer, packet->dataLength, 0);
+	return true;
+}
+
 bool Transport::send(PeerHandle peer, Lane lane, Packet&& packet)
 {
 	ENetPacket* p = packet.m_p;
 	packet.m_p = nullptr;
 	if (!p)
 		return false;
-	IoLock io(g_io);
-	if (!m_host || !peer || peer->state != ENET_PEER_STATE_CONNECTED
-		|| enet_peer_send(peer, enet_uint8(lane), p) < 0)
-	{
-		enet_packet_destroy(p);
+	IoLock io(m_io);
+	if (submit(peer, lane, p))
+		return true;
+	enet_packet_destroy(p);
+	return false;
+}
+
+Transport::Fanout::Fanout(Transport& transport, Lane lane, Packet&& packet) : m_tp(transport), m_lane(lane), m_p(packet.m_p)
+{
+	packet.m_p = nullptr;
+	if (m_p)
+		++m_p->referenceCount; // not shared yet: no ENet call has seen it
+}
+
+Transport::Fanout::~Fanout()
+{
+	if (!m_p)
+		return;
+	IoLock io(m_tp.m_io); // ENet drops its references under the same lock
+	if (--m_p->referenceCount == 0)
+		enet_packet_destroy(m_p);
+}
+
+bool Transport::Fanout::send(PeerHandle peer)
+{
+	if (!m_p)
 		return false;
-	}
-	if (peer->host == m_host && peer->incomingPeerID < m_host->peerCount)
-		count_traffic(peer, p->dataLength, 0);
-	return true;
+	IoLock io(m_tp.m_io);
+	return m_tp.submit(peer, m_lane, m_p);
 }
 
 void Transport::count_traffic(PeerHandle peer, uint64_t out, uint64_t in)
@@ -396,7 +437,7 @@ void Transport::count_traffic_event(const ENetEvent& event)
 std::vector<Transport::Traffic> Transport::traffic(const std::vector<PeerHandle>& peers) const
 {
 	std::vector<Traffic> out(peers.size());
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (!m_host)
 		return out;
 	const uint64_t tick = steady_ms() / kTrafficBucketMs;
@@ -425,7 +466,7 @@ void Transport::set_timeouts(PeerHandle peer, uint32_t timeout_ms)
 {
 	if (!peer)
 		return;
-	IoLock io(g_io);
+	IoLock io(m_io);
 	// ENet's congestion throttle drops a share of unreliable packets whenever the measured RTT spikes. In a game that
 	// pumps the network from the main thread a frame hitch (level load, GC) looks exactly like that, and snapshot
 	// streams would die for seconds on a perfectly good link. Deceleration 0 switches the throttle off: the
@@ -439,80 +480,80 @@ void Transport::set_timeouts(PeerHandle peer, uint32_t timeout_ms)
 
 void Transport::disconnect_later(PeerHandle peer)
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (peer)
 		enet_peer_disconnect_later(peer, 0);
 }
 
 void Transport::disconnect_now(PeerHandle peer)
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (peer)
 		enet_peer_disconnect_now(peer, 0);
 }
 
 void Transport::reset(PeerHandle peer)
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (peer)
 		enet_peer_reset(peer);
 }
 
-void* Transport::user(PeerHandle peer)
+void* Transport::user(PeerHandle peer) const
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	return peer ? peer->data : nullptr;
 }
 
 void Transport::set_user(PeerHandle peer, void* p)
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	if (peer)
 		peer->data = p;
 }
 
-bool Transport::outgoing_idle(PeerHandle peer)
+bool Transport::outgoing_idle(PeerHandle peer) const
 {
 	if (!peer)
 		return true;
-	IoLock io(g_io);
-	return enet_list_empty(&peer->outgoingCommands) && enet_list_empty(&peer->outgoingSendReliableCommands);
+	IoLock io(m_io);
+	return idle(peer);
 }
 
-bool Transport::all_acked(PeerHandle peer)
+bool Transport::all_acked(PeerHandle peer) const
 {
 	if (!peer)
 		return true;
-	IoLock io(g_io);
-	return outgoing_idle(peer) && enet_list_empty(&peer->sentReliableCommands);
+	IoLock io(m_io);
+	return idle(peer) && enet_list_empty(&peer->sentReliableCommands);
 }
 
-uint32_t Transport::rtt_ms(PeerHandle peer)
+uint32_t Transport::rtt_ms(PeerHandle peer) const
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	return peer ? peer->roundTripTime : 0;
 }
 
-float Transport::packet_loss(PeerHandle peer)
+float Transport::packet_loss(PeerHandle peer) const
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	return peer ? float(peer->packetLoss) / float(ENET_PEER_PACKET_LOSS_SCALE) : 0.f;
 }
 
-uint32_t Transport::ms_since_receive(PeerHandle peer)
+uint32_t Transport::ms_since_receive(PeerHandle peer) const
 {
-	IoLock io(g_io);
+	IoLock io(m_io);
 	// lastReceiveTime is stamped on every acknowledgement the peer sends (0 = none yet).
 	if (!peer || !peer->lastReceiveTime)
 		return UINT32_MAX;
 	return ENET_TIME_DIFFERENCE(enet_time_get(), peer->lastReceiveTime);
 }
 
-std::string Transport::address_of(PeerHandle peer)
+std::string Transport::address_of(PeerHandle peer) const
 {
 	if (!peer)
 		return std::string();
-	IoLock io(g_io);
+	IoLock io(m_io);
 	char ip[64] = {};
 	if (enet_address_get_host_ip(&peer->address, ip, sizeof(ip)) != 0)
 		std::strcpy(ip, "?");
@@ -567,8 +608,8 @@ void Transport::keepalive_loop()
 		const bool alive = m_last_service_ms.load(std::memory_order_relaxed) + kOwnerAliveMs > now;
 		if (!alive && !m_hold.held(now))
 			continue; // a stalled owner without a hold (released, expired) must look dead to its peers
-		// Never wait for the lock: the owner (or another transport's helper) is using ENet right now.
-		std::unique_lock<std::recursive_mutex> io(g_io, std::try_to_lock);
+		// Never wait for the lock: the owner is using this host right now.
+		std::unique_lock<std::mutex> io(m_io, std::try_to_lock);
 		if (!io.owns_lock() || !m_host)
 			continue;
 		// Acks, pings, sends, receives, timeouts. With no event structure ENet queues every state change (a timeout

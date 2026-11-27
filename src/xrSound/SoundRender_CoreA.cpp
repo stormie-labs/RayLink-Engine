@@ -365,6 +365,15 @@ void CSoundRender_CoreA::switch_device(LPCSTR device_name)
 	Msg("SOUND: Switched to device: %s", deviceDesc.name);
 }
 
+// Anomaly Coop: a game without a sound device plays on without sound instead of quitting (a remote desktop session that
+// has not brought its audio up yet, a headset pulled out at the launch): the silent core of a map server. The device list
+// stays, so the options still show an empty one; a device that comes later is taken at the next start.
+void CSoundRender_CoreA::run_silent(LPCSTR why)
+{
+	Msg("~ SOUND: %s: the game runs without sound until it is started again", why);
+	psSoundSilent = true;
+}
+
 void CSoundRender_CoreA::_initialize(int stage)
 {
 	if (psSoundSilent)
@@ -384,10 +393,7 @@ void CSoundRender_CoreA::_initialize(int stage)
 		pDeviceList = xr_new<ALDeviceList>();
 
 		if (0 == pDeviceList->GetNumDevices())
-		{
-			CHECK_OR_EXIT(0, "OpenAL: Can't create sound device.");
-			xr_delete(pDeviceList);
-		}
+			run_silent("OpenAL lists no sound device");
 		return;
 	}
 
@@ -407,8 +413,8 @@ void CSoundRender_CoreA::_initialize(int stage)
 	pDevice = alcOpenDevice(deviceDesc.name_al);
 	if (pDevice == nullptr)
 	{
-		CHECK_OR_EXIT(0, "SOUND: OpenAL: Failed to create device.");
-		bPresent = FALSE;
+		run_silent("OpenAL could not open the sound device");
+		_initialize(stage);
 		return;
 	}
 
@@ -419,10 +425,10 @@ void CSoundRender_CoreA::_initialize(int stage)
 	// Create context
 	pContext = alcCreateContext(pDevice, NULL);
 	if (pContext == nullptr) {
-		CHECK_OR_EXIT(0, "SOUND: OpenAL: Failed to create context.");
-		bPresent = FALSE;
 		alcCloseDevice(pDevice);
 		pDevice = nullptr;
+		run_silent("OpenAL could not create a context on the sound device");
+		_initialize(stage);
 		return;
 	}
 

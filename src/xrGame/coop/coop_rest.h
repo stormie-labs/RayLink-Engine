@@ -80,7 +80,7 @@ void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void frame(); // main thread, every frame (sync::frame)
 void print_status(); // coop_status section (sync::print_status)
 void register_console(); // from coop::register_console_commands
-// Fills coop.rest; called by coop_checkpoints_script_registrator once the `coop` table exists.
+// Fills coop.rest; called by script::register_raw once the `coop` table exists.
 void register_lua(lua_State* L);
 
 // Rest state of the player whose character has `local_id` on this machine (0 = me). Awake if unknown.

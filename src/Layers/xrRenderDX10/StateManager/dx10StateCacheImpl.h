@@ -50,11 +50,13 @@ dx10StateCache<IDeviceState, StateDecs>
 
 	if (!pResult)
 	{
-		StateRecord rec;
-		rec.m_crc = crc;
-		CreateState(desc, &rec.m_pState);
-		pResult = rec.m_pState;
-		m_StateArray.push_back(rec);
+		// coop: a failed create keeps no record (dx10StateRecords.h): the caller gets null as before, the next one asks again
+		const dx10_state_records::Added added =
+			dx10_state_records::add(m_StateArray, crc, [&](IDeviceState** state) { return CreateState(desc, state); });
+		if (added.index == dx10_state_records::not_found)
+			dx10_state_create_failed(dx10_state_kind(static_cast<const IDeviceState*>(nullptr)), added.code);
+		else
+			pResult = m_StateArray[added.index].m_pState;
 	}
 
 	return pResult;
@@ -65,30 +67,10 @@ IDeviceState*
 dx10StateCache<IDeviceState, StateDecs>
 ::FindState(const StateDecs& desc, u32 StateCRC)
 {
-	u32 res = 0xffffffff;
-	for (u32 i = 0; i < m_StateArray.size(); ++i)
-	{
-		if (m_StateArray[i].m_crc == StateCRC)
-		{
-			StateDecs descCandidate;
-			m_StateArray[i].m_pState->GetDesc(&descCandidate);
-			//if ( !memcmp(&descCandidate, &desc, sizeof(desc)) )
-			if (descCandidate == desc)
-				//break;
-				//	TEST
-			{
-				res = i;
-				break;
-			}
-			//else
-			//{
-			//	VERIFY(0);
-			//}
-		}
-	}
-
-	if (res != 0xffffffff)
-		return m_StateArray[res].m_pState;
+	const size_t index = dx10_state_records::find(m_StateArray, desc, StateCRC,
+		[](const StateDecs& a, const StateDecs& b) { return a == b; });
+	if (index != dx10_state_records::not_found)
+		return m_StateArray[index].m_pState;
 	else
 		return NULL;
 	/*

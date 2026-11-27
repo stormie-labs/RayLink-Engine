@@ -1,6 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop - weapon state riders follow the concrete weapon (F4 G3-1c, the engine part of group G3: findings m01:2,
-// the 3DSS camo of a weapon, and m27:5, the Lua jam type of arti_jamming; temp/b58/out/G3-1b.md, RV-G3-1.md).
+// Anomaly Coop - weapon state riders follow the concrete weapon (a weapon's camo and its Lua jam type kept by mods).
 //
 // gamedata/scripts/coop_mods_item_state.script keeps both as item riders: the holder's machine writes them and sends them in
 // the economy's se channel, whose receiver on the deciding process checks the sender against the item's holder. Two engine

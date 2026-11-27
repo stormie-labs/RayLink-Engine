@@ -1,6 +1,6 @@
 #include "stdafx.h"
 #include "pch_script.h"
-// F3a split levels: the transfers of ownership in the engine (plan §1.7), between the world server and a map server.
+// The transfers of ownership in the engine, between the world server and a map server.
 //
 // World server: the Keeper (xrCoop/coop_levels_keeper.h) over the bridges of the map servers. A map server's half comes as LevelXferUp,
 // the world server's goes as LevelXferDown; after every packet the changes the keeper reports go into ALife (coop_levels_alife.cpp).
@@ -17,7 +17,7 @@
 // what was destroyed, what it made under its own ids (xrCoop/coop_levels_keeper.h leader_ids_of). What the binders of its static objects
 // keep goes up when it changed, the last time at the end of the hand-over (xrCoop/coop_levels_logic.h).
 //
-// The auditor (plan §1.7): every 10 s it sends the hash of what it writes; a bucket that differs from the ledger is asked for in
+// The auditor: every 10 s it sends the hash of what it writes; a bucket that differs from the ledger is asked for in
 // full and goes through xfer::audit and heal, with the loud log line. Console coop_levels_audit asks at once.
 //
 // Not done yet (docs/SPLIT_LEVELS.md §7a): the journal in the save (requirement 2): marks are not saved, so a host's load takes
@@ -31,18 +31,21 @@
 #include "../coop_join.h"
 #include "../coop_manager.h"
 #include "coop_mapserver.h"
-#include "coop_dedicated.h" // R32 W7.2: dedicated::on() (xfer_load: the world server takes its save's done-records)
-#include "coop_levels_alife.h" // R32 W2b: host_accept_print_status
+#include "coop_dedicated.h" // dedicated::on() (xfer_load: the world server takes its save's done-records)
+#include "coop_levels_alife.h" // host_accept_print_status
 #include "../coop_money.h"
 #include "../coop_net.h"
-#include "../coop_script.h" // R32 W7.2: coop_op_done (script::queue_callback)
+#include "../coop_script.h" // coop_op_done (script::queue_callback)
 #include "../coop_survival.h"
 #include "../coop_world.h"
+#include "../coop_writer.h" // writing::root_facts_of, the root and its kind as the world reads them (held_gen_of)
 #include "xrCoop/srv/coop_levels_keeper.h"
+#include "xrCoop/srv/coop_levels_accept.h" // the decision on a body report (host_take_body)
 #include "xrCoop/srv/coop_levels_audit.h"
-#include "xrCoop/srv/coop_levels_journal.h" // R32 W3: the map server's journal, its batches and the world's Ack
+#include "xrCoop/srv/coop_levels_journal.h" // the map server's journal, its batches and the world's Ack
+#include "xrCoop/srv/coop_levels_root_gen.h" // the gen at a root, one rule with the world (same_as)
 #include "xrCoop/srv/coop_session_srv.h"
-#include "xrCoop/coop_reconcile.h" // R32 W5: a refused change is repaired with StateDumpRequest Replace
+#include "xrCoop/coop_reconcile.h" // a refused change is repaired with StateDumpRequest Replace
 
 #include "ai_space.h"
 #include "alife_simulator.h"
@@ -74,14 +77,17 @@ constexpr u32 kBodyEveryMs = 1000; // the players' places in the world server's 
 constexpr u32 kBodyFreshMs = 5000; // what it said of a body counts this long
 constexpr u32 kFeedPerRound = 64; // ... at most this many squads to one map server in a round
 constexpr u32 kReserveEveryMs = 5000; // world server: the map servers' ids are kept out of its generator again, this often
-constexpr u32 kAuditEveryMs = 10000; // a map server's hash of what it holds, this often (plan §1.7)
+constexpr u32 kAuditEveryMs = 10000; // a map server's hash of what it holds, this often
 constexpr u32 kScheduledPerRound = 8; // a map server: offline objects it holds that get their stock update in one ALife update
+constexpr u32 kWithHolderLines = 8; // a map server: log lines of Destroys left out with their holder (journal::journals_destroy)
+constexpr size_t kDepartedMax = 4096; // a map server: items left out with a departed character whose Destroy is awaited (g.departed)
 constexpr u32 kJournalChunk = 0xC0C0; // of the ALife save; the stock reader looks for its own chunks and never sees it
-constexpr u32 kDoneChunk = 0xC0C1; // R32 W7.2: the world's done-records (journal::done::Store), the same way
+constexpr u32 kDoneChunk = 0xC0C1; // the world's done-records (journal::done::Store), the same way
 // The world hands a record's answer to Lua as one callback argument (coop_op_done): a record never holds more than that.
 static_assert(journal::done::kMaxAnswer <= script::kMaxCallbackStr, "a done-record's answer fits one callback argument");
 static_assert(journal::done::kMaxAnswer <= journal::DoneBody::kMaxAnswer, "a done-record fits a Done entry");
-constexpr u32 kLootWatchMs = 10000; // a map server: loot is looked at this long after it fell (GAMMA's ItemProcessor is done by then)
+// A map server watches dropped loot for this long so it can report changes through the end of item processing.
+constexpr u32 kLootWatchMs = 10000;
 constexpr u32 kLootLookMs = 500; // ... this often
 constexpr u32 kLootPerFrame = 16; // ... at most this many told in one frame (a body with a full backpack takes a few frames)
 constexpr size_t kLootWatchedMax = 2048; // ... and no more watched at once: a battle of a hundred bodies is not worth more
@@ -99,17 +105,17 @@ struct State
 	u32 reserved_world = 0; // join::world_generation() the map servers' ids were kept out of
 	u64 reserve_next = 0;
 	std::string journal; // of the save just loaded (kept through a session start: a hosted save is loaded first)
-	// R32 W7.2: the done-records of the save just loaded (kDoneChunk), kept through a session start as `journal` (xfer_reset leaves it).
+	// The done-records of the save just loaded (kDoneChunk), kept through a session start as `journal` (xfer_reset leaves it).
 	// The world server takes them as its store on its next frame (host_adopt_done), a map server raises those of its level on the first
-	// frame of its world (client_replay_done). The rules are journal::done::Loaded's (FE1).
+	// frame of its world (client_replay_done). The rules are journal::done::Loaded's.
 	journal::done::Loaded done_loaded;
-	// §8a A22 open item (a), O6: a map server says Ready once the records its replay queued reached its Lua (xfer_replay_heard)
+	// A map server says Ready once the records its replay queued reached its Lua (xfer_replay_heard)
 	journal::done::ReplayGate replay_gate;
 	struct Body
 	{
 		BodyFacts facts;
 		u64 at = 0;
-		LevelId level = wire::kNoLevel; // Build 57 round 2 (review S1): the level of the map server that told it
+		LevelId level = wire::kNoLevel; // the level of the map server that told it
 	};
 	std::map<u16, Body> bodies; // what the map servers say of the bodies of their players
 	u32 body_reports = 0, body_refused = 0; // LevelEntity State heard, and thrown away
@@ -119,18 +125,18 @@ struct State
 	std::map<LevelId, u64> logic_at; // when each level last said what its objects keep
 	u32 logic_taken = 0, logic_refused = 0;
 	u32 items_taken = 0, items_refused = 0; // LevelEntity Item: the wear of loot on a map server's level
-	// R32 W3: the journals of the map servers (host_on_level_journal)
+	// The journals of the map servers (host_on_level_journal)
 	journal::Receiver received; // the last batch applied of each bridge
 	u32 batches_in = 0, batches_repeated = 0, batches_gap = 0, batches_malformed = 0, batches_late = 0;
-	u32 batches_starting = 0; // fix A3: applied from a map server before its Ready
+	u32 batches_starting = 0; // applied from a map server before its Ready
 	u32 entries_in = 0, entries_refused = 0;
-	u32 carry_in = 0, done_in = 0, flushed_in = 0, id_asks_in = 0, id_blocks_out = 0; // the journal's own ops (WP10, WP11, WP9)
-	// R32 W7.2 (§8a A21 E-1): the done-records of numbered ops, per level (host_take_done), in the world's save (kDoneChunk)
+	u32 carry_in = 0, done_in = 0, flushed_in = 0, id_asks_in = 0, id_blocks_out = 0; // the journal's own ops
+	// The done-records of numbered ops, per level (host_take_done), in the world's save (kDoneChunk)
 	journal::done::Store done;
 	std::map<LevelId, u64> done_at; // when each level last gave a new record: a save older than that lacks it (logic_came_since)
 	u32 done_kept = 0, done_repeats = 0, done_refused = 0;
 	u32 legacy_entity = 0; // LevelEntity facts of a peer that still sends them (one exe: none expected)
-	IdGrants id_grants; // W9: the id blocks given to each bridge
+	IdGrants id_grants; // the id blocks given to each bridge
 	// map server
 	std::unique_ptr<xfer::Holder> holder;
 	xrCriticalSection lock; // the vote may run on the game thread's ALife update
@@ -142,25 +148,32 @@ struct State
 		wire::LevelEntityHead::Op op;
 		u16 a; // the object (this machine's numbering)
 		u16 b; // its new holder, its killer
-		journal::ObjectHead head; // R32 A6: the object's root as the world still sees it when it applies the entry (see the hooks)
+		journal::ObjectHead head; // the object's root as the world still sees it when it applies the entry (see the hooks)
 		std::string info; // Info: the info portion; Done: the answer
-		journal::ParentBefore before; // Parent: where it stood before this move (review WP4 #2)
-		u32 origin = 0, seq = 0; // Done (R32 W7.2): the op's number
+		journal::ParentBefore before; // Parent: where it stood before this move
+		u32 origin = 0, seq = 0; // Done: the op's number
 	};
 	xr_vector<Up> up; // what happened to the objects of his level, in order
 	bool flushing = false; // client_flush_up runs: a send_up inside it sends the batch so far, it does not flush again
-	journal::HeldMemory memory; // R32 A6: where the held creatures' children and the held squads' members stood (client_remember_held)
+	journal::HeldMemory memory; // where the held creatures' children and the held squads' members stood (client_remember_held)
 	std::set<u16> quiet; // local ids a refused create's repair releases now: the world never had them, their Destroy is not journaled
-	journal::ReleasesUnderWay releasing; // §8a A17 (fix round 2): local ids whose release is under way: never adopted at their Left
+	// Local ids whose Parent out of a departed player's character was left out (journal::journals_move_out_of_character): their
+	// Destroy is left out too (the world keeps them in him). At most kDepartedMax; past it a Destroy goes up and the world refuses it.
+	std::set<u16> departed;
+	journal::ReleasesUnderWay releasing; // local ids whose release is under way: never adopted at their Left
 	u32 holder_world = 0; // join::world_generation() of g.holder: what the old world queued means nothing in the next
-	// R32 W3: the level journal (one LevelJournal per frame on the lane of LevelXferUp) and the world's answers
+	// The level journal (one LevelJournal per frame on the lane of LevelXferUp) and the world's answers
 	journal::Batcher batch;
 	u32 journal_acked = 0; // the highest batch the world acknowledged
 	u32 journal_batches = 0, journal_entries = 0, journal_refusals = 0, journal_bad = 0;
 	u32 repairs_released = 0, repairs_fetched = 0, repairs_none = 0;
-	u32 done_queued = 0, done_replayed = 0; // R32 W7.2: Done entries queued here, records of its level raised from its save
-	// R32 W9: his ids, the slice and the world's blocks. An empty pool gives leader_free_id no id; what a create does then is
-	// xrServer::CoopMayCreate's and PerformIDgen's (xrServer.h, package E: refused at its start under coop_writer_gate = enforce)
+	u32 parents_unchanged = 0; // Parents left out, back where they stood (ParentNet::unchanged)
+	u32 parents_unregistered = 0; // Parent hooks of xrServer entities outside this ALife, left out (journal::journals_parent)
+	u32 parents_departed = 0, destroys_departed = 0; // moves out of a departed player's character and their Destroys, left out
+	u32 destroys_with_holder = 0; // Destroys of children released with their holder, left out (journal::journals_destroy)
+	u32 done_queued = 0, done_replayed = 0; // Done entries queued here, records of its level raised from its save
+	// His ids, the slice and the world's blocks. An empty pool gives leader_free_id no id; what a create does then is
+	// xrServer::CoopMayCreate's and PerformIDgen's (xrServer.h: refused at its start under coop_writer_gate = enforce)
 	IdPool ids;
 	u16 ids_slice = 0; // the slice the pool was made for
 	u64 ids_check_next = 0;
@@ -168,7 +181,7 @@ struct State
 	bool ids_out = false; // his pool was empty once (logged once)
 	std::map<u16, u64> refused_until;
 	// Squads the world server recalled (recall): offline here until then, whoever stands by them. A friend of the leader who stays by
-	// his companions would keep them online for good, and they would never go after him (testers 2026-11-13).
+	// his companions would keep them online for good, and they would never go after him.
 	std::map<u16, u64> pinned;
 	xr_vector<u16> recalls; // recalled since the last frame: offline and home at the next one
 	u32 recalled = 0, recall_sent = 0, recall_kept = 0; // recalls heard, gave back for one, votes a pin turned to offline
@@ -186,7 +199,7 @@ struct State
 	u32 logic_told = 0;
 	u64 logic_told_bytes = 0;
 	u32 creates = 0, removes = 0, refusals = 0;
-	// Loot of its level whose state only it knows (testers 2026-11-13: a dead NPC's gun was 100 % on the world server and in the
+	// Loot of its level whose state only it knows (a dead NPC's gun was 100 % on the world server and in the
 	// players' hands). death_manager wears it in the death callback, ItemProcessor a few frames later: each is looked at for a
 	// while and goes up, and to the players of this level, whenever its state differs from what was said of it.
 	struct Watch
@@ -207,8 +220,8 @@ struct State
 } g;
 
 // A map server: its holder is of this world: the terms on which the writer rule counts its holds (xfer_authors, xfer_born). Also while
-// it hands everything back (fix round 2, verifier finding 3): a unit on its way home is its until the world's Ack, as the world's keeper
-// says (W1.3, the writer changes only at the fence); the hand-back stops the switch vote and the scheduler (xfer_stock_rules,
+// it hands everything back: a unit on its way home is its until the world's Ack, as the world's keeper
+// says (the writer changes only at the fence); the hand-back stops the switch vote and the scheduler (xfer_stock_rules,
 // xfer_scheduled), not its writing. Under g.lock.
 bool holder_writes()
 {
@@ -277,9 +290,9 @@ void host_on_xfer_up(PeerId from, Reader& r)
 	host_apply_changes();
 }
 
-// ---------------------------------------------------------------- R32 W3: the map server's level journal
+// ---------------------------------------------------------------- the map server's level journal
 
-// A map server: the journal so far goes up now, in batches under 1 MiB (A11), on the lane of LevelXferUp (client_send_all: with the
+// A map server: the journal so far goes up now, in batches under 1 MiB, on the lane of LevelXferUp (client_send_all: with the
 // hooks' ups queued so far). Under g.lock.
 void client_send_journal()
 {
@@ -300,28 +313,20 @@ void client_send_journal()
 	}
 }
 
-// R32 A6: the keeper generation of the unit at the object's root as this map server's holder holds it; 0 when that root is no unit
-// it holds. The root: up its holders (8 at most), then a creature's squad (m_group_id, A5). Under g.lock.
+// The keeper generation of the object's root as this map server's holder holds it, whatever that root is now (a unit,
+// or the body of one held here that died: levels::root_gen, the world's rule as well); 0 when it does not hold the root. The root and
+// its kind come from writing::root_facts_of, the function the world reads them with (srv/coop_levels_alife.cpp root_seen, same_as):
+// up its holders (8 at most), then a creature's squad (m_group_id), and the kind is that root's own, so a member counts as its
+// squad (a unit) on both sides, whatever the member is. Under g.lock.
 u32 held_gen_of(const CSE_ALifeDynamicObject* e)
 {
 	if (!e || !g.holder)
 		return 0;
-	const CSE_ALifeDynamicObject* root = e;
-	for (int depth = 0; root->ID_Parent != 0xffff && depth < 8; ++depth)
-	{
-		const CSE_ALifeDynamicObject* up = ai().alife().objects().object(root->ID_Parent, true);
-		if (!up)
-			break;
-		root = up;
-	}
-	u16 unit = root->ID;
-	const CSE_ALifeMonsterAbstract* m = smart_cast<const CSE_ALifeMonsterAbstract*>(root);
-	if (m && m->m_group_id != 0xffff)
-		unit = m->m_group_id;
-	return g.holder->gen(join::to_host(unit));
+	const writer::RootFacts root = writing::root_facts_of(e->ID);
+	return root_gen(root.kind, g.holder->gen(join::to_host(root.root)));
 }
 
-// The head of a per-object entry (A13): the object's id in the world's numbering, its section crc, the generation of its root.
+// The head of a per-object entry: the object's id in the world's numbering, its section crc, the generation of its root.
 // Under g.lock.
 journal::ObjectHead head_of(u16 local_id)
 {
@@ -336,7 +341,7 @@ journal::ObjectHead head_of(u16 local_id)
 	return h;
 }
 
-// R32 A6 (review WP4 #2): the head of a Parent entry: the item, and the generation of the root it had before this move, as the world
+// The head of a Parent entry: the item, and the generation of the root it had before this move, as the world
 // still sees it when it applies the entry (coop_levels_alife.cpp object_facts reads root_seen(item) before host_apply_parent). The
 // hook comes after the move, so `before` (HeldMemory) says where it stood: on the ground, its own root; with a holder, that holder's
 // root now (a change of that root since came up first: a Died, a Left); not known, no held creature held it at the end of the last
@@ -357,7 +362,7 @@ journal::ObjectHead head_before_move(u16 item, const journal::ParentBefore& befo
 	return h;
 }
 
-// R32 A6 (review WP4 #1): a Died or a Destroy of a creature: the squad its head names and where it goes in g.up (journal::creature_place).
+// A Died or a Destroy of a creature: the squad its head names and where it goes in g.up (journal::creature_place).
 // The stock death chain (se_stalker:on_death -> squad:on_npc_death -> remove_npc -> unregister_member) and a script's remove_npc take a
 // member out of its squad here before the hook runs; the world still has it in that squad until it applies the entry. Under g.lock.
 journal::CreaturePlace place_of_creature(u16 local_id, journal::ObjectHead& h)
@@ -374,10 +379,11 @@ journal::CreaturePlace place_of_creature(u16 local_id, journal::ObjectHead& h)
 	return p;
 }
 
-// R32 A6: where things stood under this map server's held units at the end of the frame (journal::HeldMemory): the children of every
-// held creature (a held squad's members, a held creature of no squad) and the members of every held squad. A Parent hook that comes
-// later finds the old holder here (its children lack the item by then), a Died or a Destroy finds the squad the death chain or
-// remove_npc took the member out of. Children of children are not listed: an item in an item that moves names gen 0. Under g.lock.
+// Where things stood under this map server's held units at the end of the frame (journal::HeldMemory): the children of every
+// held creature (a held squad's members, a held creature of no squad) and of every character its players play here (the departure
+// flood, below), and the members of every held squad. A Parent hook that comes later finds the old holder here (its children lack the
+// item by then), a Died or a Destroy finds the squad the death chain or remove_npc took the member out of. Children of children are
+// not listed: an item in an item that moves names gen 0. Under g.lock.
 void client_remember_held()
 {
 	g.memory.begin();
@@ -406,13 +412,23 @@ void client_remember_held()
 		else if (smart_cast<const CSE_ALifeCreatureAbstract*>(e))
 			children_of(e);
 	}
+	// And the children of the characters of the players of this level. A player who leaves it (quits,
+	// drops, takes an exit) has his character switched offline here (join::on_peer_left -> take_offline, the same id as here): every item
+	// rejected with a hook, taken back without one (add_offline_impl). Listed, each is back where it stood at the flush and is left out
+	// (journal::ParentNet); unlisted, each went up as a Parent to the same character, which the world, writing the parked character by
+	// then, refused as not the writer, and each repair (Fetch) made the item again here. His virtual peer leaves the trunk in the next
+	// frame's world update and his character goes offline in its session update, both before that frame's flush and before this
+	// snapshot is taken again; should that order change, the world still takes such a Parent as a repeat (accept::unchanged_parent).
+	for (const auto& it : mapserver::trunk_peers().on())
+		if (const CSE_ALifeDynamicObject* played = ai().alife().objects().object(it.second.proxy, true))
+			children_of(played);
 }
 
-// R32 §8a A17: a creature left a squad this map server writes (local ids), alive and here: it inherits the squad's hold at once
+// A creature left a squad this map server writes (local ids), alive and here: it inherits the squad's hold at once
 // (Holder::adopt), so no moment passes in which nobody writes it (its switch vote, the writer rule) and every head after the Left
 // names its root with the gen the world gives it when it applies the same Left (Ledger::adopt). A squad that is not written here
 // yet (its Spawn waits in this frame's journal) adopts it at the flush. A dead one (the death chain's Left) is nobody's unit: its
-// body is a resident. One whose release is under way (fix round 2, finding 1: the Released hook ran first) is never adopted: its
+// body is a resident. One whose release is under way (the Released hook ran first) is never adopted: its
 // Destroy, journaled, releases it on the world from the squad. The rule: journal::adopts_at_left. Under g.lock.
 void client_adopt_left(u16 squad, u16 member, u64 now)
 {
@@ -430,7 +446,7 @@ void client_adopt_left(u16 squad, u16 member, u64 now)
 		g.holder->adopt(id, unit, std::vector<u8>(), now);
 }
 
-// R32 §8a A17: the death or the release of `local_id` goes before the Left of its squad that the stock chain queued first
+// The death or the release of `local_id` goes before the Left of its squad that the stock chain queued first
 // (journal::creature_place): the world applies it while the creature is still in that squad, so the creature never became a unit
 // of its own there. Its adoption at that Left (client_adopt_left) is undone here. Under g.lock.
 void client_unadopt(u16 local_id)
@@ -466,8 +482,8 @@ void journal_body(u8 op, const B& body, u16 id)
 void client_flush_up();
 
 // A map server: everything queued so far goes up now: the hooks' ups into the journal (client_flush_up), then the journal. send_up
-// calls it before every transfer packet, so every fact queued before that packet is applied on the world before it (W3: a Spawn
-// before its SpawnPrepare, a frame's facts before its hand-back; review WP4 #3: the rejects of a squad's items that the stock switch
+// calls it before every transfer packet, so every fact queued before that packet is applied on the world before it (a Spawn
+// before its SpawnPrepare, a frame's facts before its hand-back: the rejects of a squad's items that the stock switch
 // queued before its ReleasePrepare, with the generation the world has until that packet). A send_up inside client_flush_up sends the
 // batch so far: the entries before that transfer packet. Under g.lock.
 void client_send_all()
@@ -480,7 +496,7 @@ void client_send_all()
 void send_up(const std::vector<xfer::Packet>& out)
 {
 	if (!out.empty())
-		client_send_all(); // the facts before the transfer (W3)
+		client_send_all(); // the facts before the transfer
 	for (const xfer::Packet& p : out)
 	{
 		wire::LevelXferUpMsg m;
@@ -650,7 +666,7 @@ void client_loot(u64 now)
 			++it;
 			continue;
 		}
-		// R32 W3: the journal's ItemFacts, source Loot (the layout of ItemState and its source byte)
+		// The journal's ItemFacts, source Loot (the layout of ItemState and its source byte)
 		journal::ItemFactsBody body;
 		body.item = join::to_host(it->first);
 		body.section = section;
@@ -670,9 +686,9 @@ void client_loot(u64 now)
 	}
 }
 
-// What happened on its level goes into the journal (R32 W3), in order, so that a spawn comes before what follows it. The head of a
-// move, a death and a release is the one its hook took: the root the world still sees when it applies the entry (A6; review WP4 #1,
-// #2); the head of the rest is the object as it stands now. Under g.lock.
+// What happened on its level goes into the journal, in order, so that a spawn comes before what follows it. The head of a
+// move, a death and a release is the one its hook took: the root the world still sees when it applies the entry;
+// the head of the rest is the object as it stands now. Under g.lock.
 void client_flush_up()
 {
 	using Head = wire::LevelEntityHead;
@@ -682,13 +698,13 @@ void client_flush_up()
 	due.swap(g.up); // send_up below may run hooks that queue more: the next client_send_all takes them
 	const bool was_flushing = g.flushing;
 	g.flushing = true;
-	// §8a A17 (fix round 2): a release that is over took its object out of the registry: its mark goes (one under way stays); with no
+	// A release that is over took its object out of the registry: its mark goes (one under way stays); with no
 	// ALife no object stands at all
 	if (ai().get_alife())
 		g.releasing.prune([](u16 local_id) { return ai().alife().objects().object(local_id, true) != nullptr; });
 	else
 		g.releasing.clear();
-	journal::ParentNet net; // review WP4 #2: one Parent of an object per flush, from where it stood to where it stands now
+	journal::ParentNet net; // one Parent of an object per flush, from where it stood to where it stands now
 	for (const State::Up& u : due)
 	{
 		CSE_ALifeDynamicObject* e = ai().alife().objects().object(u.a, true);
@@ -701,7 +717,18 @@ void client_flush_up()
 			// Where it stands now, not what the hook saw: a holder that goes offline rejects every child on the way and takes
 			// it back without a word (add_offline_impl), as the host's own flush nets out (events::host_flush).
 			const u16 holder = e ? e->ID_Parent : u.b;
-			if (net.send(u.a, u.before, holder))
+			const bool sends = net.send(u.a, u.before, holder);
+			// out of a player's character no player plays here any more: the world keeps it in him (with its Destroy, below)
+			const CSE_ALifeDynamicObject* from = sends && u.before.known && u.before.parent != 0xffff ?
+			    ai().alife().objects().object(u.before.parent, true) : nullptr;
+			const bool from_character = from && world::is_player_character(from);
+			if (sends && !journal::journals_move_out_of_character(from_character, from_character && writing::writes(from->ID)))
+			{
+				++g.parents_departed;
+				if (g.departed.size() < kDepartedMax)
+					g.departed.insert(u.a);
+			}
+			else if (sends)
 			{
 				w.u16(join::to_host(u.a));
 				w.u16(holder == 0xffff ? u16(0xffff) : join::to_host(holder));
@@ -738,6 +765,11 @@ void client_flush_up()
 			}
 			if (net.unborn_here(u.a))
 				continue; // the world never heard of it
+			if (g.departed.erase(u.a))
+			{
+				++g.destroys_departed; // its holder's world keeps it in him
+				continue;
+			}
 			w.u16(join::to_host(u.a));
 			journal_object(Head::Destroy, u.head, w);
 			break;
@@ -776,7 +808,7 @@ void client_flush_up()
 			body.squad = join::to_host(u.a);
 			body.member = join::to_host(u.b);
 			journal_body(u8(u.op), body, body.member);
-			// §8a A17: a creature it held on its own goes with a squad it writes from now on (the world drops its record at this
+			// A creature it held on its own goes with a squad it writes from now on (the world drops its record at this
 			// Joined); one that left a squad it writes is its own, also when that squad's spawn was flushed only now (above)
 			if (u.op == Head::Joined && g.holder->authors(body.squad))
 				g.holder->forget(body.member);
@@ -787,7 +819,7 @@ void client_flush_up()
 		case Head::Info:
 		{
 			if (u.a == 0 || (e && world::is_player_character(e)))
-				continue; // a player's infos are his story's, the ghost is nobody (W1.5)
+				continue; // a player's infos are his story's, the ghost is nobody
 			journal::InfoBody body;
 			body.id = join::to_host(u.a);
 			body.on = u.b ? 1 : 0;
@@ -797,8 +829,8 @@ void client_flush_up()
 		}
 		case Head::Item:
 		{
-			// W8.3: the writer's own change of an item it writes (level_item_facts_up); the facts are read from the item here now.
-			// Fix A8 (WP6 x WP4): its source is what items::note_facts recorded before it raised this up (Decider: a script's set,
+			// The writer's own change of an item it writes (level_item_facts_up); the facts are read from the item here now.
+			// Its source is what items::note_facts recorded before it raised this up (Decider: a script's set,
 			// an upgrade sold; Owner: the owner's own use the writer took), read once whether the item is still here or not; nothing
 			// recorded (0) is a writer's word all the same: Decider, never the wear-only Loot path
 			const u8 noted = items::level_facts_source(u.a);
@@ -820,7 +852,7 @@ void client_flush_up()
 		}
 		case Head::Done:
 		{
-			// R32 W7.2: a numbered op's answer (journal_done), after the facts of its effect queued before it: the same batch
+			// A numbered op's answer (journal_done), after the facts of its effect queued before it: the same batch
 			journal::DoneBody body;
 			body.origin = u.origin;
 			body.op = u.seq;
@@ -831,6 +863,7 @@ void client_flush_up()
 		default: continue;
 		}
 	}
+	g.parents_unchanged += net.unchanged(); // what the snapshot let it leave out
 	g.flushing = was_flushing;
 }
 
@@ -871,7 +904,7 @@ void client_body(u64 now)
 		const CSE_ALifeDynamicObject* e = ai().alife().objects().object(it.second.proxy, true);
 		if (!e || !e->m_bOnline)
 			continue;
-		Writer w(48); // R32 W3: the journal's State (the head names his character), on the reliable lane with the frame's facts
+		Writer w(48); // the journal's State (the head names his character), on the reliable lane with the frame's facts
 		w.u16(it.second.proxy);
 		float pos[3] = {e->o_Position.x, e->o_Position.y, e->o_Position.z};
 		float ang[3] = {e->o_Angle.x, e->o_Angle.y, e->o_Angle.z};
@@ -884,9 +917,9 @@ void client_body(u64 now)
 		facts.fight = body && checkpoints::sources::in_combat(body) ? 1 : 0;
 		const u16 lock = dialog::host_lock_of(it.first);
 		facts.talking = lock != 0xffff ? 1 : 0;
-		facts.partner = lock != 0xffff ? join::to_host(lock) : wire::kNoObject; // Build 57 (protocol 33): whom he talks to
+		facts.partner = lock != 0xffff ? join::to_host(lock) : wire::kNoObject; // whom he talks to
 		facts.place = u8(checkpoints::sources::rest_place(it.second.proxy, facts.source));
-		// Build 57 (owner 2026-11-18): the base whose ground he stands on, by this level's geometry (the world server decides)
+		// The base whose ground he stands on, by this level's geometry (the world server decides)
 		checkpoints::sources::map_server_footing(it.second.proxy, body ? body->Position() : e->o_Position, facts.footing);
 		facts.write(w);
 		journal_object(wire::LevelEntityHead::State, head_of(u16(it.second.proxy)), w);
@@ -955,7 +988,7 @@ void client_look(u16 id)
 		return;
 	}
 	{
-		xrCriticalSectionGuard guard(g.lock); // R32 W3: the journal's Logic (this runs outside the frame's lock: it is Lua)
+		xrCriticalSectionGuard guard(g.lock); // the journal's Logic (this runs outside the frame's lock: it is Lua)
 		journal_object(wire::LevelEntityHead::Logic, head_of(id), w);
 	}
 	++g.logic_told;
@@ -982,7 +1015,7 @@ void send_resync(PeerId to, u32 mask, u32 round = 0)
 	++g.audits;
 }
 
-// R32 W5.2: the members of a squad in this process's registry (the world's numbering on the world server, this machine's on a map
+// The members of a squad in this process's registry (the world's numbering on the world server, this machine's on a map
 // server), false for no squad.
 bool members_of(u16 local_id, std::vector<u16>& out)
 {
@@ -1007,7 +1040,7 @@ void host_on_level_hash(PeerId from, Reader& r)
 	his.n = m.n;
 	his.set = m.set;
 	std::copy(std::begin(m.bucket), std::end(m.bucket), std::begin(his.bucket));
-	// R32 W5.2: a held squad hashes with the digest of its members on both sides
+	// A held squad hashes with the digest of its members on both sides
 	const u32 mask = g.keeper.differs(from, his, [](uint16_t id) -> uint64_t {
 		std::vector<u16> members;
 		return members_of(id, members) ? srv::members_digest(members) : 0;
@@ -1016,9 +1049,9 @@ void host_on_level_hash(PeerId from, Reader& r)
 		send_resync(from, mask);
 }
 
-// R32 W5.2: the world takes the member list of a squad from the map server that holds it (the writer): a listed member it lacks in the
+// The world takes the member list of a squad from the map server that holds it (the writer): a listed member it lacks in the
 // squad joins it, a member it has that the writer does not list leaves it. Each change is a Joined or a Left entry through the world's
-// one acceptance (host_apply_fact; review WP4 #9): a creature joins only when that map server also writes where it comes from (no
+// one acceptance (host_apply_fact): a creature joins only when that map server also writes where it comes from (no
 // squad of another writer loses it: two map servers that both list it would take it from each other every round), it must be a
 // living creature the world has, and a Left needs the writer of the squad.
 bool host_heal_member(PeerId from, u8 op, u16 squad, u16 member)
@@ -1030,7 +1063,7 @@ bool host_heal_member(PeerId from, u8 op, u16 squad, u16 member)
 	if (!journal::body_entry(op, body, e))
 		return false;
 	uint8_t why = 0;
-	if (host_apply_heal(from, e, why, g.received.last(u32(from))) == ApplyVerdict::Refused) // fix round 2: a Left takes it home
+	if (host_apply_heal(from, e, why, g.received.last(u32(from))) == ApplyVerdict::Refused) // a Left takes it home
 	{
 		++audit_members_refused; // host_apply_fact named it in the log
 		return false;
@@ -1082,7 +1115,7 @@ void host_on_report(PeerId from, Reader& r)
 		::Msg("%s", xfer::describe(f).c_str());
 }
 
-// The digest of the members of a held squad (R32 W5.2), 0 for anything else. Under g.lock.
+// The digest of the members of a held squad, 0 for anything else. Under g.lock.
 uint64_t held_members_digest(u16 id)
 {
 	std::vector<u16> members;
@@ -1093,7 +1126,7 @@ uint64_t held_members_digest(u16 id)
 	return srv::members_digest(members);
 }
 
-// R32 W9: below the low-water mark the map server asks the world for another block of ids (IdAsk in its journal, answered in the
+// Below the low-water mark the map server asks the world for another block of ids (IdAsk in its journal, answered in the
 // Ack), again after kIdAskAgainMs while none came. Looked at every 2 s; the count stops at the mark. Under g.lock.
 void client_ids(u64 now)
 {
@@ -1114,8 +1147,8 @@ void client_ids(u64 now)
 		::Msg("[coop] levels: %u free id(s) left in this map server's pool, another block is asked for", u32(free));
 }
 
-// The auditor's question: the hash of what it writes, on the lane of its transfers (R9: everything sent before it was heard). Fix A9:
-// the frame's facts go first (client_send_all: the hooks' ups, then the journal), so the world has applied every Joined and Left this
+// The auditor's question: the hash of what it writes, on the lane of its transfers (everything sent before it was heard).
+// The frame's facts go first (client_send_all: the hooks' ups, then the journal), so the world has applied every Joined and Left this
 // hash's member digests count before it compares them. Under g.lock.
 void client_audit(u64 now)
 {
@@ -1125,7 +1158,7 @@ void client_audit(u64 now)
 	client_send_all();
 	std::vector<xfer::Entry> mine = Keeper::bare(g.holder->report());
 	for (xfer::Entry& e : mine)
-		e.digest = held_members_digest(e.id); // R32 W5.2: the content, not only who writes what
+		e.digest = held_members_digest(e.id); // the content, not only who writes what
 	const xfer::LevelHash h = xfer::hash_of(mine);
 	wire::LevelHashMsg m;
 	m.level = my_level();
@@ -1146,10 +1179,10 @@ void client_on_resync(PeerId from, Reader& r)
 	xrCriticalSectionGuard guard(g.lock);
 	if (!g.holder)
 		return;
-	client_send_all(); // the facts queued so far first: the world applies them before it compares this report (R9)
+	client_send_all(); // the facts queued so far first: the world applies them before it compares this report
 	wire::LevelReportBody body;
 	body.buckets = m.mask;
-	std::vector<srv::MemberRow> members; // R32 W5.2: the member list of each held squad of these buckets
+	std::vector<srv::MemberRow> members; // the member list of each held squad of these buckets
 	for (const xfer::Entry& e : g.holder->report())
 		if (m.mask & (1u << xfer::bucket_of(e.id)))
 		{
@@ -1176,9 +1209,9 @@ void client_on_resync(PeerId from, Reader& r)
 	net::client_send(Msg::LevelEntity, w);
 }
 
-// LevelEntity keeps Report alone (the answer to LevelResync). R32 W3: every fact of a map server comes in its LevelJournal. One exe
+// LevelEntity keeps Report alone (the answer to LevelResync). Every fact of a map server comes in its LevelJournal. One exe
 // serves every role (protocol 34: a Dev 57 exe cannot join), so a LevelEntity fact can come only from a fault; applying it here would
-// pass by the world's acceptance (W2b: writer, identity, fence), so it is counted and named in the log instead, never applied.
+// pass by the world's acceptance (writer, identity, fence), so it is counted and named in the log instead, never applied.
 void host_on_level_entity(PeerId from, Reader& r)
 {
 	using Head = wire::LevelEntityHead;
@@ -1197,7 +1230,7 @@ void host_on_level_entity(PeerId from, Reader& r)
 		    journal::op_name(head.op), mapserver::bridge_index(from), g.legacy_entity);
 }
 
-// R32 W3, W9: what the world gives a map server for an IdAsk: a block of its own free ids below the slices, kept out of its generator
+// What the world gives a map server for an IdAsk: a block of its own free ids below the slices, kept out of its generator
 // from now on (host_keep_id_blocks). False: none left, or that bridge holds kIdBlocksEach.
 bool host_give_id_block(PeerId bridge, IdBlock& out)
 {
@@ -1237,7 +1270,7 @@ void host_forget_id_blocks(PeerId bridge)
 				server.FreeID(u16(id), Device.TimerAsync());
 }
 
-// What one journal entry the world took or refused changes besides it (review WP4 #6): a Logic entry taken is what that level's
+// What one journal entry the world took or refused changes besides it: a Logic entry taken is what that level's
 // objects keep after the held save, so serve_bridge serves a fresh save to the next map server of that level (logic_came_since);
 // the status counts of the logic, the loot wear and the refused objects of map servers.
 void host_count_entry(PeerId from, u8 op, bool taken)
@@ -1268,7 +1301,7 @@ void host_count_entry(PeerId from, u8 op, bool taken)
 	}
 }
 
-// R32 W7.2 (§8a A21 E-1): a Done entry of the map server behind `from`, batch `seq`: the store keeps the record for that map server's
+// A Done entry of the map server behind `from`, batch `seq`: the store keeps the record for that map server's
 // level, the first answer of an op standing (a repeat changes nothing and is no refusal), and a new record goes to the world's Lua as
 // coop_op_done(origin, seq, answer) (coop_srv_mode.script -> coop_ops_done.heard: the world's ledger, its save). The level is marked:
 // a held save older than this record is not served to the level's next map server (logic_came_since), which then gets the record in
@@ -1311,7 +1344,7 @@ void host_take_done(PeerId from, const journal::Entry& e, u32 seq, std::vector<w
 	}
 }
 
-// R32 W3: a map server's journal batch. Read whole first (LevelJournalMsg::read refuses a malformed batch whole: nothing of it is
+// A map server's journal batch. Read whole first (LevelJournalMsg::read refuses a malformed batch whole: nothing of it is
 // applied), then every entry in order through the world's one apply (host_apply_fact: acceptance, then the apply), the journal's own
 // ops here; every batch is answered with LevelJournalAck {upto, the refused entries, an id block for an IdAsk}. A repeated batch is
 // answered again and applied never.
@@ -1328,7 +1361,7 @@ void host_on_level_journal(PeerId from, Reader& r)
 			    g.batches_malformed);
 		return; // its seq is not known: the map server's unacknowledged count says so
 	}
-	// Fix A3: a map server still Starting (in session, before its Ready) may make objects while it loads its world: its batches are
+	// A map server still Starting (in session, before its Ready) may make objects while it loads its world: its batches are
 	// applied and answered like any other, the writer rule refuses what it may not write yet and its repair settles it. A bridge no
 	// map names any more is on its way out: what was on its way counts for nothing (as LevelXferUp).
 	if (!journal::applies_batch_of(g.keeper.connected(from), mapserver::bridge_of(mapserver::level_of_bridge(from)) == from))
@@ -1354,15 +1387,15 @@ void host_on_level_journal(PeerId from, Reader& r)
 			++g.entries_in;
 			switch (e.op)
 			{
-			case Head::Carry: // W6: the module carry (WP10) has no consumer in this build yet
+			case Head::Carry: // the module carry has no consumer: counted, said once
 				if (g.carry_in++ == 0)
 					::Msg("* [coop] levels: journal Carry heard from map server %u, nobody takes it yet (R32 WP10)", mapserver::bridge_index(from));
 				continue;
-			case Head::Done: // W7.2 (A21 E-1): the level's done-record of a numbered op, the first answer standing
+			case Head::Done: // the level's done-record of a numbered op, the first answer standing
 				++g.done_in;
 				host_take_done(from, e, m.seq, refusals);
 				continue;
-			case Head::Flushed: // W4: FlushRound is not wired in this build yet (WP9)
+			case Head::Flushed: // no flush round waits for it: counted, said once
 				if (g.flushed_in++ == 0)
 					::Msg("* [coop] levels: journal Flushed heard from map server %u, no flush round waits yet (R32 WP9)",
 					    mapserver::bridge_index(from));
@@ -1436,7 +1469,7 @@ void host_feed(u64 now)
 }
 } // namespace
 
-bool host_take_body(PeerId from, LevelId level, Reader& r)
+accept::BodyDecision host_take_body(PeerId from, LevelId level, Reader& r, const accept::Facts& f)
 {
 	const u16 proxy = r.u16();
 	float pos[3], ang[3];
@@ -1448,32 +1481,39 @@ bool host_take_body(PeerId from, LevelId level, Reader& r)
 	facts.read(r); // a short one fails r below
 	CSE_ALifeDynamicObject* e = (world_up() && r.ok()) ? ai().alife().objects().object(proxy, true) : nullptr;
 	// a report that crossed his move: his seat says where he is, not the map server that has not heard yet
+	accept::BodyFacts b;
+	b.read = r.ok();
+	b.known = e != nullptr;
+	b.online_here = e && e->m_bOnline;
+	b.player_character = e && world::is_player_character(e);
+	b.body_level = level_of_vertex(graph);
+	b.sender_level = level;
+	b.seat_level = level_of_player(join::peer_of_proxy(proxy));
+	b.position_valid = _valid(pos[0]) && _valid(pos[1]) && _valid(pos[2]);
+	// the run of this character's crossed reports: only a crossing starts one (a Take ends it, a session end clears them all)
+	const bool had_run = g.crossings.count(proxy) != 0;
+	const accept::BodyDecision d = accept::body_report(f, b, g.crossings[proxy], mgr().now_ms());
+	if (!had_run && d.outcome != accept::BodyOutcome::Crossed)
+		g.crossings.erase(proxy);
+	if (d.outcome == accept::BodyOutcome::Refused && d.by_acceptance)
+		return d; // the caller's refusal line
 	++g.body_reports;
-	const LevelId body_level = level_of_vertex(graph);
-	const LevelId seat = level_of_player(join::peer_of_proxy(proxy));
-	wire::BodyReport verdict = wire::body_report_verdict(r.ok(), e != nullptr, e && e->m_bOnline, e && world::is_player_character(e),
-	    body_level, level, seat, _valid(pos[0]) && _valid(pos[1]) && _valid(pos[2]));
-	u64 crossed_ms = 0;
-	if (verdict == wire::BodyReport::Crossed)
+	if (d.outcome == accept::BodyOutcome::Crossed)
 	{
-		crossed_ms = wire::body_crossing_age(g.crossings[proxy], level, seat, mgr().now_ms());
-		verdict = wire::body_crossing_verdict(crossed_ms); // a map server that never hears he left is at fault
-	}
-	if (verdict == wire::BodyReport::Crossed)
-	{
-		// honest (stand b57g creator10_server): he left that level, its map server hears it from the next LevelMap
+		// honest: he left that level, its map server hears it from the next LevelMap
 		if (++g.body_crossed <= 3)
 			::Msg("[coop] levels: a body report of object %u crossed his move: of level %u, he is on %u now, dropped", u32(proxy),
-			    u32(body_level), u32(seat));
-		return false;
+			    u32(b.body_level), u32(b.seat_level));
+		return d;
 	}
-	if (verdict != wire::BodyReport::Take)
+	if (d.outcome != accept::BodyOutcome::Taken)
 	{
 		if (++g.body_refused <= 3)
-			::Msg("! [coop] levels: a body report of object %u refused: read %d, here %d, online %d, level %u of %u, seat %u, off his seat "
-			      "%llu ms",
-			    u32(proxy), r.ok() ? 1 : 0, e ? 1 : 0, (e && e->m_bOnline) ? 1 : 0, u32(body_level), u32(level), u32(seat), crossed_ms);
-		return false;
+			::Msg("! [coop] levels: a body report of object %u refused: read %d, here %d, online %d, level %u of %u, seat %u, sender "
+			      "writes him %d, off his seat %llu ms",
+			    u32(proxy), b.read ? 1 : 0, b.known ? 1 : 0, b.online_here ? 1 : 0, u32(b.body_level), u32(level), u32(b.seat_level),
+			    accept::sender_writes(f) ? 1 : 0, d.crossed_ms);
+		return d;
 	}
 	g.crossings.erase(proxy);
 	Fvector p, a;
@@ -1483,20 +1523,20 @@ bool host_take_body(PeerId from, LevelId level, Reader& r)
 	State::Body& body = g.bodies[proxy];
 	body.facts.fight = facts.fight != 0;
 	body.facts.talking = facts.talking != 0;
-	// Build 57 (protocol 33): the NPC of his talk there, while he talks, and only an object this world has (a creature of that level
+	// The NPC of his talk there, while he talks, and only an object this world has (a creature of that level
 	// is an object of the world under the same id)
 	const u16 partner = wire::kept_partner(facts);
 	body.facts.partner = partner != wire::kNoObject && ai().alife().objects().object(partner, true) ? partner : wire::kNoObject;
 	body.facts.place = facts.place;
 	body.facts.source = facts.source;
-	// Build 57 (owner 2026-11-18): the footing is kept only when it names a base of this world on the level of its sender
-	// (sources::host_footing: refused ones are counted, the first few logged); else he stands on no base. Round 3 (review S5):
-	// the body position of this same report must stand on that base's ground too.
+	// The footing is kept only when it names a base of this world on the level of its sender
+	// (sources::host_footing: refused ones are counted, the first few logged); else he stands on no base.
+	// The body position of this same report must stand on that base's ground too.
 	body.facts.footing =
 	    checkpoints::sources::host_footing(facts.footing, level, pos) ? facts.footing : checkpoint::base::Footing();
 	body.at = mgr().now_ms();
-	body.level = level; // Build 57 round 2 (review S1): body_facts answers only while he is on this level
-	return true;
+	body.level = level; // body_facts answers only while he is on this level
+	return d;
 }
 
 std::vector<u16> squads_at(PeerId bridge)
@@ -1514,7 +1554,7 @@ std::vector<u16> squads_at(PeerId bridge)
 bool body_facts(u16 proxy, BodyFacts& out)
 {
 	const auto it = g.bodies.find(proxy);
-	// Build 57 round 2 (review S1): fresh, and told by the map server of the level he is on now (a report of the level he has
+	// Fresh, and told by the map server of the level he is on now (a report of the level he has
 	// just left says nothing of where he is: checkpoint::base::facts_current)
 	if (it == g.bodies.end() ||
 	    !checkpoint::base::facts_current(it->second.level, level_of_player(join::peer_of_proxy(proxy)), it->second.at,
@@ -1536,7 +1576,7 @@ void subtree_of(const CSE_ALifeDynamicObject* e, std::vector<u16>& out, int dept
 		subtree_of(ai().alife().objects().object(child, true), out, depth + 1);
 }
 
-// R32 W2b, W5, W9: a map server hears the world's answer to its journal. Every batch up to `upto` is applied but the rows; each row is
+// A map server hears the world's answer to its journal. Every batch up to `upto` is applied but the rows; each row is
 // repaired towards the world (journal::repair_of): a create the world refused is released here with its id kept reserved, a change
 // or a removal it refused is asked for again (StateDumpRequest Replace: the world's EntitySpawn or EntityDestroy replaces the copy).
 // An id block joins the pool.
@@ -1574,7 +1614,7 @@ void client_on_journal_ack(PeerId from, Reader& r)
 			case journal::Repair::ReleaseKeepId:
 				if (f.id != wire::kNoObject)
 				{
-					g.ids.reserve(f.id); // W9: refused ids stay reserved
+					g.ids.reserve(f.id); // refused ids stay reserved
 					release.push_back(f.id);
 				}
 				break;
@@ -1586,11 +1626,20 @@ void client_on_journal_ack(PeerId from, Reader& r)
 			}
 			if (g.journal_refusals <= 8 || g.journal_refusals % 100 == 0)
 			{
-				// O6 (reports #1644-#1649): the object as this map server has it (its section, its parent in the world's numbering)
+				// The object as this map server has it (its section, its parent in the world's numbering)
 				const CSE_ALifeDynamicObject* mine =
 				    f.id != wire::kNoObject && ai().get_alife() ? ai().alife().objects().object(join::to_local(f.id), true) : nullptr;
-				const std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
+				std::string note = journal::object_note(mine != nullptr, mine ? mine->s_name.c_str() : nullptr, 0,
 				    mine && mine->ID_Parent != 0xffff ? join::to_host(mine->ID_Parent) : wire::kNoObject, false, wire::kNoObject);
+				if (f.why == journal::Identity && mine && f.op != wire::LevelEntityHead::Parent)
+				{
+					// The gen this map server names the object's root with NOW, next to the world's line (root gen here, sent:
+					// the gen of the head is there, this side keeps no copy of it). Not for a Parent: its head named the root the
+					// thing left, and by now it stands in its new root (a player's character: always 0), so the number says nothing.
+					char gen[48];
+					std::snprintf(gen, sizeof(gen), ", root gen now %u", held_gen_of(mine));
+					note += gen;
+				}
 				::Msg("! [coop] levels: the world refused %s of object %u in batch %u (%u so far): %s; %s", journal::op_name(f.op), u32(f.id),
 				    f.seq, g.journal_refusals, journal::why_name(f.why), note.c_str());
 			}
@@ -1602,7 +1651,7 @@ void client_on_journal_ack(PeerId from, Reader& r)
 		CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(join::to_local(id), true) : nullptr;
 		if (!e || world::is_player_character(e))
 			continue;
-		// what its holder registered (fix A6: its own lock, whatever world the writer rule asks of): a unit it holds goes out on the
+		// what its holder registered (its own lock, whatever world the writer rule asks of): a unit it holds goes out on the
 		// transfer lane, or its SpawnPrepare would register a unit the world never had
 		bool held = false;
 		{
@@ -1614,7 +1663,7 @@ void client_on_journal_ack(PeerId from, Reader& r)
 		else
 		{
 			// The world has no such object: no Destroy of it or of what it holds goes up (xfer_on_released skips them), but this
-			// level's players are told (no ClientApply: host_records relays the release to them, review WP4 #10)
+			// level's players are told (no ClientApply: host_records relays the release to them)
 			std::vector<u16> subtree;
 			subtree_of(e, subtree);
 			{
@@ -1639,7 +1688,7 @@ void client_on_journal_ack(PeerId from, Reader& r)
 }
 } // namespace
 
-// O6 (§8a A22 open item a): the done-records this map server's replay raised reached its Lua (or it raised none); until then
+// The done-records this map server's replay raised reached its Lua (or it raised none); until then
 // mapserver::server_frame does not say Ready, so no player it lets in retries an op ahead of the ledger's record. Main thread.
 bool xfer_replay_heard()
 {
@@ -1647,36 +1696,7 @@ bool xfer_replay_heard()
 	return g.replay_gate.settled();
 }
 
-uint32_t journal_unacked()
-{
-	xrCriticalSectionGuard guard(g.lock);
-	return g.batch.last_seq() > g.journal_acked ? g.batch.last_seq() - g.journal_acked : 0;
-}
-
-bool journal_carry(const std::string& blob)
-{
-	if (!is_map_server() || blob.empty())
-		return false;
-	// W6: a part of at most kMaxPart bytes each; the whole goes in the journal of this frame, in order
-	const size_t part = journal::CarryBody::kMaxPart;
-	const size_t total = (blob.size() + part - 1) / part;
-	if (total > 0xffff)
-		return false;
-	xrCriticalSectionGuard guard(g.lock);
-	for (size_t i = 0; i < total; ++i)
-	{
-		journal::CarryBody b;
-		b.part = u16(i);
-		b.total = u16(total);
-		const size_t at = i * part;
-		const size_t n = blob.size() - at < part ? blob.size() - at : part;
-		b.blob.assign(blob.begin() + ptrdiff_t(at), blob.begin() + ptrdiff_t(at + n));
-		journal_body(wire::LevelEntityHead::Carry, b, wire::kNoObject);
-	}
-	return true;
-}
-
-// R32 W7.2 (§8a A21 E-1): the Done entry goes into g.up behind the ups of the op's effect its hooks queued so far, so client_flush_up
+// The Done entry goes into g.up behind the ups of the op's effect its hooks queued so far, so client_flush_up
 // writes it after them into the same batch (never straight into g.batch, ahead of them). No holder of this world yet (its first frame
 // clears g.up) or the hand-over over (logic_hand_over sent the last batch): it would never go up, so the ledger keeps the answer here.
 bool journal_done(uint32_t origin, uint32_t seq, const std::string& answer)
@@ -1698,7 +1718,7 @@ void xfer_install_server(Session& s)
 {
 	s.on(Msg::LevelXferUp, &host_on_xfer_up);
 	s.on(Msg::LevelEntity, &host_on_level_entity);
-	s.on(Msg::LevelJournal, &host_on_level_journal); // R32 W3
+	s.on(Msg::LevelJournal, &host_on_level_journal);
 	s.on(Msg::LevelHash, &host_on_level_hash);
 }
 
@@ -1706,7 +1726,7 @@ void xfer_install_client(Endpoint& e)
 {
 	e.on(Msg::LevelXferDown, &client_on_xfer_down);
 	e.on(Msg::LevelResync, &client_on_resync);
-	e.on(Msg::LevelJournalAck, &client_on_journal_ack); // R32 W2b, W9
+	e.on(Msg::LevelJournalAck, &client_on_journal_ack);
 }
 
 void xfer_audit_now()
@@ -1739,9 +1759,9 @@ void xfer_reset()
 	g.items_taken = 0;
 	g.items_refused = 0;
 	g.items_told = 0;
-	g.received.clear(); // R32 W3: every bridge numbers its journal from 1 again
-	g.id_grants.clear(); // R32 W9: a new world gives its blocks again
-	g.done.clear(); // R32 W7.2: the store of the world's save comes back on the next frame (host_adopt_done: done_loaded is kept)
+	g.received.clear(); // every bridge numbers its journal from 1 again
+	g.id_grants.clear(); // a new world gives its blocks again
+	g.done.clear(); // the store of the world's save comes back on the next frame (host_adopt_done: done_loaded is kept)
 	g.done_at.clear();
 	g.done_kept = 0;
 	g.done_repeats = 0;
@@ -1753,7 +1773,7 @@ void xfer_reset()
 	g.logic_told_bytes = 0;
 	xrCriticalSectionGuard guard(g.lock);
 	g.holder.reset();
-	g.replay_gate.reset(); // O6: no replay waits for a Ready of a session that is over
+	g.replay_gate.reset(); // no replay waits for a Ready of a session that is over
 	g.asks.clear();
 	g.gives.clear();
 	g.gone.clear();
@@ -1769,12 +1789,13 @@ void xfer_reset()
 	g.scheduled_at = 0;
 	g.up.clear();
 	g.flushing = false;
-	g.memory.begin(); // R32 A6
+	g.memory.begin();
 	g.quiet.clear();
-	g.releasing.clear(); // §8a A17 (fix round 2)
-	g.batch.reset(); // R32 W3
+	g.departed.clear();
+	g.releasing.clear();
+	g.batch.reset();
 	g.journal_acked = 0;
-	g.ids_slice = 0; // R32 W9: the pool is made again for the next world's slice
+	g.ids_slice = 0; // the pool is made again for the next world's slice
 	g.ids_check_next = 0;
 	g.ids_out = false;
 	g.reserved_world = 0;
@@ -1795,8 +1816,8 @@ void xfer_host_connect(PeerId peer)
 void xfer_host_disconnect(PeerId peer)
 {
 	g.manual_audit.disconnect(peer);
-	g.received.forget(u32(peer)); // R32 W3: its next connection numbers its journal from 1
-	host_forget_id_blocks(peer); // R32 W9
+	g.received.forget(u32(peer)); // its next connection numbers its journal from 1
+	host_forget_id_blocks(peer);
 	if (!g.keeper.connected(peer))
 		return;
 	const size_t held = g.keeper.held_by(peer);
@@ -1814,7 +1835,7 @@ void xfer_save(IWriter& out)
 	out.open_chunk(kJournalChunk);
 	out.w(text.data(), u32(text.size()));
 	out.close_chunk();
-	// R32 W7.2 (§8a A21 E-1): the done-records of every level. The save a starting map server is served (serve_bridge) is its snapshot:
+	// The done-records of every level. The save a starting map server is served (serve_bridge) is its snapshot:
 	// it raises those of its level (client_replay_done); the world server takes them back at its next load (host_adopt_done).
 	if (!g.done.empty())
 	{
@@ -1829,7 +1850,7 @@ void xfer_save(IWriter& out)
 void xfer_load(IReader& in)
 {
 	g.journal.clear();
-	// R32 W7.2: the done-records of this save (none: an empty store), for the frame that takes them (host_adopt_done, client_replay_done).
+	// The done-records of this save (none: an empty store), for the frame that takes them (host_adopt_done, client_replay_done).
 	// Only the world server (-coop_dedicated, from its start) and a map server take them (journal::done::loads_records); a co-op process
 	// and a player's machine never look for the chunk and have nothing pending. A chunk the file cuts short is handed over as unreadable.
 	const bool reads = journal::done::loads_records(dedicated::on(), is_map_server());
@@ -1888,7 +1909,7 @@ void client_replay_done()
 	}
 	if (!records.empty())
 	{
-		g.replay_gate.queued(Device.dwFrame); // O6: Ready waits for a later frame whose script delivery handed them to Lua
+		g.replay_gate.queued(Device.dwFrame); // Ready waits for a later frame whose script delivery handed them to Lua
 		::Msg("[coop] levels: %u done-record(s) of level %u from the world's save handed to the ledger", u32(records.size()), u32(level));
 	}
 }
@@ -1896,9 +1917,10 @@ void client_replay_done()
 
 void xfer_host_frame()
 {
+	PROF_EVENT("coop/coop_levels_xfer/xfer_host_frame");
 	if (!world_up() || !ai().get_alife())
 		return;
-	host_adopt_done(); // R32 W7.2: the done-records of the save it loaded
+	host_adopt_done(); // the done-records of the save it loaded
 	if (!g.journal.empty())
 	{
 		const bool ok = g.keeper.resume(g.journal);
@@ -1913,9 +1935,9 @@ void xfer_host_frame()
 	{
 		// again every few seconds: what a map server made under its ids and destroyed goes back to this generator with the entity
 		if (g.reserved_world != join::world_generation())
-			g.id_grants.clear(); // R32 W9: the blocks of an earlier world are nobody's
+			g.id_grants.clear(); // the blocks of an earlier world are nobody's
 		host_reserve_leader_ids(g.reserved_world != join::world_generation());
-		host_keep_id_blocks(); // R32 W9: and the blocks given to the map servers
+		host_keep_id_blocks(); // and the blocks given to the map servers
 		g.reserved_world = join::world_generation();
 		g.reserve_next = now + kReserveEveryMs;
 	}
@@ -1926,6 +1948,7 @@ void xfer_host_frame()
 
 void xfer_client_frame()
 {
+	PROF_EVENT("coop/coop_levels_xfer/xfer_client_frame");
 	if (!world_up() || !ai().get_alife())
 		return;
 	const u64 now = mgr().now_ms();
@@ -1938,24 +1961,25 @@ void xfer_client_frame()
 			g.asks.clear();
 			g.gives.clear();
 			g.up.clear();
-			g.batch.reset(); // R32 W3: what the old world queued means nothing in the next
+			g.batch.reset(); // what the old world queued means nothing in the next
 			g.journal_acked = 0;
-			g.ids_slice = 0; // R32 W9: the pool of the next world (leader_free_id makes it)
+			g.ids_slice = 0; // the pool of the next world (leader_free_id makes it)
 			g.refused_until.clear();
 			g.settling.clear();
 			g.watched.clear();
 			g.pinned.clear();
 			g.recalls.clear();
 			g.quiet.clear();
-			g.releasing.clear(); // §8a A17 (fix round 2)
-			client_remember_held(); // R32 A6: nothing held yet in this world
-			g.replay_gate.reset(); // O6: a new world's replay arms it again
-			client_replay_done(); // R32 W7.2: its level's done-records from the world's save, before it says Ready and serves anybody
+			g.departed.clear();
+			g.releasing.clear();
+			client_remember_held(); // nothing held yet in this world
+			g.replay_gate.reset(); // a new world's replay arms it again
+			client_replay_done(); // its level's done-records from the world's save, before it says Ready and serves anybody
 		}
-		// O6 (§8a A22 open item a): was this frame's script delivery able to run (coop_script.cpp lua_ready(): the level and the actor,
+		// Was this frame's script delivery able to run (coop_script.cpp lua_ready(): the level and the actor,
 		// which world_up() above reads, and a live session)? Then it handed the replay of an earlier frame to Lua whole.
 		g.replay_gate.frame(Device.dwFrame, net::live());
-		client_flush_up(); // R32 W3: what the hooks queued since the last frame, before this frame's transfers (review WP4 #3)
+		client_flush_up(); // what the hooks queued since the last frame, before this frame's transfers
 		client_recalls(now);
 		client_requests(now);
 		send_up(g.holder->tick(now));
@@ -1968,11 +1992,11 @@ void xfer_client_frame()
 	}
 	client_logic(now); // outside the lock: this is Lua, and what it does comes back through the hooks below
 	xrCriticalSectionGuard guard(g.lock);
-	client_send_all(); // R32 W3: one LevelJournal for the frame's facts (send_up sent the part before a transfer already)
-	client_remember_held(); // R32 A6: where things stand under the held units now, for the hooks until the next frame
+	client_send_all(); // one LevelJournal for the frame's facts (send_up sent the part before a transfer already)
+	client_remember_held(); // where things stand under the held units now, for the hooks until the next frame
 }
 
-// S4 (A-S4H): the stock hooks ask the session's mode (xrCoop/coop_mode.h); only a map server's mode (srv/coop_srv_mode.cpp) calls
+// The stock hooks ask the session's mode (xrCoop/coop_mode.h); only a map server's mode (srv/coop_srv_mode.cpp) calls
 // logic_may_update, xfer_scheduled, xfer_on_switched_offline and leader_free_id, only the world server's online_at_server. They ask no
 // mode themselves any more: a co-op process never reaches them.
 bool logic_may_update(CGameObject* object)
@@ -2003,7 +2027,7 @@ void logic_hand_over()
 			client_look(id);
 	{
 		xrCriticalSectionGuard guard(g.lock);
-		client_send_all(); // R32 W3: the last looks and the facts queued before them go up now, before the hand-over goes on
+		client_send_all(); // the last looks and the facts queued before them go up now, before the hand-over goes on
 	}
 	g.logic_over = true;
 	::Msg("[coop] levels: what the objects of this level keep: %u said of %u watched, %llu bytes", g.logic_told, u32(g.book.watched()), g.logic_told_bytes);
@@ -2014,7 +2038,7 @@ bool logic_looking() { return g.looking; }
 bool logic_came_since(LevelId level, u64 at)
 {
 	const auto it = g.logic_at.find(level);
-	// R32 W7.2: a done-record of the level after that save too: the level's next map server gets it only in a fresh save (xfer_save)
+	// A done-record of the level after that save too: the level's next map server gets it only in a fresh save (xfer_save)
 	const auto done = g.done_at.find(level);
 	return logic::save_is_stale(at, it != g.logic_at.end(), it != g.logic_at.end() ? it->second : 0) ||
 	    logic::save_is_stale(at, done != g.done_at.end(), done != g.done_at.end() ? done->second : 0);
@@ -2034,8 +2058,8 @@ bool online_at_server(u16 id)
 	return m && m->m_group_id != 0xffff && g.keeper.away(m->m_group_id);
 }
 
-// Fix A6: the writer rule asks it from any thread (ALife runs on its own, mt_alife): under the transfers' lock, and only of a holder
-// of this world (holder_writes: also through its hand-back, fix round 2).
+// The writer rule asks it from any thread (ALife runs on its own, mt_alife): under the transfers' lock, and only of a holder
+// of this world (holder_writes: also through its hand-back).
 bool xfer_authors(u16 local_id)
 {
 	xrCriticalSectionGuard guard(g.lock);
@@ -2051,6 +2075,15 @@ bool xfer_born(u16 local_id)
 		return false;
 	const CSE_ALifeDynamicObject* e = ai().alife().objects().object(local_id, true);
 	return e && transfers(e);
+}
+
+bool xfer_made_here(u16 local_id)
+{
+	if (!is_map_server())
+		return false;
+	const u16 first = leader_ids_of(mapserver::bridge_index(mgr().self()));
+	xrCriticalSectionGuard guard(g.lock);
+	return id_is_senders(local_id, first, IdGrants(), 0) || (g.ids_slice == first && g.ids.owns(local_id));
 }
 
 PeerId holder_of(u16 id)
@@ -2094,7 +2127,7 @@ void host_member_joined(PeerId bridge, u16 member)
 		g.keeper.drop_own(member, u32(bridge), mgr().now_ms());
 }
 
-// R32 W9 (review WP4 #4): may `bridge`'s map server make an object under `id`? Of its slice, or of a block this world gave it for an
+// May `bridge`'s map server make an object under `id`? Of its slice, or of a block this world gave it for an
 // IdAsk (g.id_grants). The world's acceptance of a Spawn asks it (coop_levels_alife.cpp host_apply_fact: f.id_in_slice).
 bool host_id_is_senders(PeerId bridge, u16 id)
 {
@@ -2222,18 +2255,32 @@ void xfer_on_released(u16 local_id)
 	if (!is_map_server() || entities::client_applying())
 		return;
 	xrCriticalSectionGuard guard(g.lock);
-	g.releasing.released(local_id); // §8a A17 (fix round 2, finding 1): the Left its release raises next adopts nothing
-	if (g.quiet.count(local_id))
-		return; // a create the world refused, released by its repair: the world never had it
-	// R32 A6: the head now, while the object is still there (the frame's flush finds it gone). A member a script's remove_npc took out
-	// of its squad first names that squad and goes before the Left of it, which the world's release makes needless (review WP4 #1)
+	g.releasing.released(local_id); // the Left its release raises next adopts nothing
+	// A child released with its holder: the stock release raised the holder's hook first (its Destroy is queued), and the world's
+	// release of that holder takes this child too (journal::journals_destroy)
+	const CSE_ALifeDynamicObject* released = ai().get_alife() ? ai().alife().objects().object(local_id, true) : nullptr;
+	const bool with_holder = released && released->ID_Parent != 0xffff && g.releasing.under_way(released->ID_Parent);
+	if (!journal::journals_destroy(g.quiet.count(local_id) != 0, with_holder))
+	{
+		if (with_holder && !g.quiet.count(local_id) && ++g.destroys_with_holder <= kWithHolderLines)
+		{
+			const CSE_ALifeDynamicObject* holder = ai().alife().objects().object(released->ID_Parent, true);
+			::Msg("[coop] levels: the Destroy of %u [%s] is left out: released with its holder %u [%s], whose release the world runs "
+			      "(%u so far%s)",
+			    u32(local_id), released->name(), u32(released->ID_Parent), holder ? holder->name() : "?", g.destroys_with_holder,
+			    g.destroys_with_holder == kWithHolderLines ? "; the rest only count in srv_levels_status" : "");
+		}
+		return; // a create the world refused, released by its repair: the world never had it; or one its holder's release takes
+	}
+	// The head now, while the object is still there (the frame's flush finds it gone). A member a script's remove_npc took out
+	// of its squad first names that squad and goes before the Left of it, which the world's release makes needless
 	State::Up u{wire::LevelEntityHead::Destroy, local_id, 0xffff, head_of(local_id), {}};
 	const journal::CreaturePlace p = place_of_creature(local_id, u.head);
 	g.up.insert(g.up.begin() + ptrdiff_t(p.at), u);
 	if (p.before_left)
 	{
 		g.up.erase(g.up.begin() + ptrdiff_t(p.at + 1));
-		client_unadopt(local_id); // §8a A17: the world releases it from its squad: the flush journals its Destroy (no transfer lane)
+		client_unadopt(local_id); // the world releases it from its squad: the flush journals its Destroy (no transfer lane)
 	}
 }
 
@@ -2242,9 +2289,16 @@ void up_parent(u16 item, u16 new_parent)
 	if (!is_map_server() || entities::client_applying())
 		return;
 	xrCriticalSectionGuard guard(g.lock);
-	if (g.quiet.count(item))
+	// An object of this map server's ALife only (journal::journals_parent): an xrServer entity outside it (an NPC's bolt) is no object of the
+	// world's, and a refused create's repair releases what the world never had
+	const bool registered = ai().get_alife() && ai().alife().objects().object(item, true) != nullptr;
+	if (!journal::journals_parent(registered, g.quiet.count(item) != 0))
+	{
+		if (!registered)
+			++g.parents_unregistered;
 		return;
-	// R32 A6 (review WP4 #2): the hook comes after the move; the head names the root before it, the root the world still sees
+	}
+	// The hook comes after the move; the head names the root before it, the root the world still sees
 	const journal::ParentBefore before = g.memory.moved(item, new_parent);
 	g.up.push_back(State::Up{wire::LevelEntityHead::Parent, item, new_parent, head_before_move(item, before), {}, before});
 }
@@ -2254,13 +2308,13 @@ void up_died(u16 victim, u16 killer)
 	if (!is_map_server() || entities::client_applying() || victim == 0)
 		return;
 	xrCriticalSectionGuard guard(g.lock);
-	// R32 A6 (review WP4 #1): the death chain took a member out of its squad before this hook; the world has not run it yet. The head
+	// The death chain took a member out of its squad before this hook; the world has not run it yet. The head
 	// names that squad, and the Died goes before the Left the member hook queued (the world's own death chain takes it out after)
 	State::Up u{wire::LevelEntityHead::Died, victim, killer, head_of(victim), {}};
 	const journal::CreaturePlace p = place_of_creature(victim, u.head);
 	g.up.insert(g.up.begin() + ptrdiff_t(p.at), u);
 	if (p.before_left)
-		client_unadopt(victim); // §8a A17: it dies in its squad on the world, its body is nobody's unit
+		client_unadopt(victim); // it dies in its squad on the world, its body is nobody's unit
 }
 
 void up_spawned(u16 id)
@@ -2268,13 +2322,13 @@ void up_spawned(u16 id)
 	if (!is_map_server())
 		return;
 	xrCriticalSectionGuard guard(g.lock);
-	g.releasing.spawned(id); // §8a A17 (fix round 2): a new object under the id, whoever made it: nothing of it is on its way out
+	g.releasing.spawned(id); // a new object under the id, whoever made it: nothing of it is on its way out
 	if (entities::client_applying())
 		return;
 	g.up.push_back(State::Up{wire::LevelEntityHead::Spawn, id, 0xffff, head_of(id), {}});
 }
 
-// R32 W3 (world-view D3): a member joined or left a squad of its level (stock register_member / unregister_member, through
+// A member joined or left a squad of its level (stock register_member / unregister_member, through
 // LevelSide::level_entity_up Joined / Left).
 void up_member(u16 squad, u16 member, bool joined)
 {
@@ -2285,10 +2339,10 @@ void up_member(u16 squad, u16 member, bool joined)
 		return; // a create the world refused, released by its repair: the world never had it, nor its memberships (as up_parent)
 	g.up.push_back(State::Up{joined ? wire::LevelEntityHead::Joined : wire::LevelEntityHead::Left, squad, member, journal::ObjectHead(), {}});
 	if (!joined)
-		client_adopt_left(squad, member, mgr().now_ms()); // §8a A17: it inherits the squad's hold now, before any later hook names it
+		client_adopt_left(squad, member, mgr().now_ms()); // it inherits the squad's hold now, before any later hook names it
 }
 
-// R32 W3 (companions G5): an info portion of a non-actor object it writes was given or taken (LevelSide::level_info_up).
+// An info portion of a non-actor object it writes was given or taken (LevelSide::level_info_up).
 void up_info(u16 id, const char* info, bool on)
 {
 	if (!is_map_server() || entities::client_applying() || !info || !*info)
@@ -2297,7 +2351,7 @@ void up_info(u16 id, const char* info, bool on)
 	g.up.push_back(State::Up{wire::LevelEntityHead::Info, id, u16(on ? 1 : 0), journal::ObjectHead(), info});
 }
 
-// R32 W8.3: the state of an item it writes changed (LevelSide::level_item_facts_up); the facts are read at the frame's flush.
+// The state of an item it writes changed (LevelSide::level_item_facts_up); the facts are read at the frame's flush.
 void up_item_facts(u16 id)
 {
 	if (!is_map_server() || entities::client_applying())
@@ -2313,7 +2367,7 @@ void up_money(PeerId peer, s64 delta, bool trade)
 {
 	if (!is_map_server())
 		return;
-	Writer w(16); // R32 W3: the journal's Money (no head: a player's book is no object)
+	Writer w(16); // the journal's Money (no head: a player's book is no object)
 	w.u32(peer);
 	w.u64(u64(delta));
 	w.u8(trade ? 1 : 0);
@@ -2341,12 +2395,12 @@ void up_stash(u16 character, bool things_stay)
 	g.up.push_back(State::Up{wire::LevelEntityHead::Stash, character, u16(things_stay ? 1 : 0), head_of(character), {}});
 }
 
-// R32 W9: the next id of this map server's pool (its slice and the world's blocks), 0xffff when none is free: never an id of the stock
+// The next id of this map server's pool (its slice and the world's blocks), 0xffff when none is free: never an id of the stock
 // generator by this function. The pool is made for the slice of this map server's number the first time and again when that number
 // changes or the world does (xfer_client_frame); a low pool asks the world for a block (client_ids), an empty one at its next look.
-// W9 "no fallback" (review WP4 #5, closed by package E): the create is not refused here but at its start. A script create, a spawn
+// No fallback: the create is not refused here but at its start. A script create, a spawn
 // packet and Process_spawn ask xrServer::CoopMayCreate first, which refuses under coop_writer_gate = enforce (nothing is created) and
-// lets it go on under log (the first build). What still reaches PerformIDgen with an empty pool (a create under log, a stock chain that
+// lets it go on under log. What still reaches PerformIDgen with an empty pool (a create under log, a stock chain that
 // already runs such as an object's supplies, a create of coop's own C++) gets the stock generator's id through the logged
 // CoopTookStockId, never silently: the world refuses its Spawn (IdRange) and the repair releases it one round trip later.
 u16 leader_free_id()
@@ -2419,7 +2473,7 @@ void xfer_print_status()
 		::Msg("[coop] levels: objects of map servers refused %u", g.spawns_refused);
 		::Msg("[coop] levels: what static objects keep: %u taken, %u refused", g.logic_taken, g.logic_refused);
 		::Msg("[coop] levels: the wear of loot on map servers' levels: %u taken, %u refused", g.items_taken, g.items_refused);
-		host_accept_print_status(); // R32 W2b: the journal's entries taken and refused
+		host_accept_print_status(); // the journal's entries taken and refused
 		::Msg("[coop] levels: journal batches %u (repeated %u, after a gap %u, malformed %u, late %u, before Ready %u), entries %u, refused %u; "
 		      "carry %u, flushed %u (no consumer yet); id asks %u, blocks given %u; LevelEntity facts not applied %u",
 		    g.batches_in, g.batches_repeated, g.batches_gap, g.batches_malformed, g.batches_late, g.batches_starting, g.entries_in,
@@ -2438,6 +2492,15 @@ void xfer_print_status()
 	    g.journal_batches, g.journal_entries, g.journal_acked, g.batch.last_seq(), g.journal_refusals, g.repairs_released,
 	    g.repairs_fetched, g.repairs_none, g.journal_bad + g.batch.dropped(), u32(g.ids.size()), u32(g.ids.reserved_count()),
 	    g.id_blocks_in, g.ids_empty);
+	::Msg("[coop] levels: Parent entries left out, back where they stood (a holder or a player's character went offline here): %u",
+	    g.parents_unchanged);
+	::Msg("[coop] levels: Parent hooks of entities outside this map server's ALife left out (an NPC's bolt: the world never has it): %u",
+	    g.parents_unregistered);
+	::Msg("[coop] levels: moves out of a player's character no player plays here any more left out: %u, their Destroys %u (the world "
+	      "keeps them in him)",
+	    g.parents_departed, g.destroys_departed);
+	::Msg("[coop] levels: Destroys of objects released with their holder left out (the world's release of the holder takes them): %u",
+	    g.destroys_with_holder);
 	::Msg("[coop] levels: done-records journaled %u, raised from the world's save %u", g.done_queued, g.done_replayed);
 	if (g.holder)
 		::Msg("[coop] levels: holding %u object(s), %s, granted %u, taken back %u, refused %u, retries %llu",

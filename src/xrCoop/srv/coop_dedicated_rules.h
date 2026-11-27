@@ -1,4 +1,4 @@
-// Anomaly Coop — the dedicated host, the pure part (docs/plans/2026-10-24-f3a-split-levels.md §12, docs/DEDICATED_HOST.md). The world server
+// Anomaly Coop — the dedicated host, the pure part. The world server
 // without a window and without a player: the key -coop_dedicated. Its actor is a ghost on the service level fake_start, so for the session
 // it is a host who stands on a level of his own and plays nothing; every level with players has a map server, and everybody who plays is
 // an ordinary client. This header holds what the engine only has to carry out:
@@ -21,6 +21,9 @@
 #include <string>
 #include <vector>
 
+#include "../coop_ids.h"
+#include "../coop_text.h"
+
 namespace coop
 {
 namespace dedicated
@@ -29,14 +32,13 @@ constexpr char kKey[] = "-coop_dedicated";
 constexpr char kNewKey[] = "-coop_new";
 constexpr char kLoadKey[] = "-coop_load";
 // The same save, its name as hex digits of its bytes: what a parent process writes (world_server::command_line, the launcher). The engine
-// reads its command line as raw text, quotes mean nothing to it, so a name written as text could read as a key (security review
-// 2026-11-12).
+// reads its command line as raw text, quotes mean nothing to it, so a name written as text could read as a key.
 constexpr char kLoadHexKey[] = "-coop_load_hex";
-constexpr char kHiddenKey[] = "-coop_hidden"; // plan 2026-11-12 stage 1: run by the launcher, no window of its own
-constexpr char kStageKey[] = "-coop_stage"; // plan 2026-11-12 stage 5: the new world's staging file (coop_world_stage.h), with -coop_new
+constexpr char kHiddenKey[] = "-coop_hidden"; // run by the launcher, no window of its own
+constexpr char kStageKey[] = "-coop_stage"; // the new world's staging file (coop_world_stage.h), with -coop_new
 constexpr char kLastSave[] = "last"; // -coop_load last: the newest save of this folder
 constexpr char kServiceLevel[] = "fake_start"; // where the ghost stands: nothing of the game happens there
-constexpr uint16_t kDefaultPort = 27960; // coop::kDefaultPort, this header is included by the engine without the protocol
+using coop::kDefaultPort;
 
 enum class World : uint8_t
 {
@@ -57,21 +59,9 @@ struct Args
 
 namespace detail
 {
-inline bool blank(char c) { return c == ' ' || c == '\t'; }
-
-// `key` as a word of `params`: at the start or after a blank, and ending with the word. The pointer past it, or nullptr.
-inline const char* find_key(const char* params, const char* key)
-{
-	const size_t n = std::strlen(key);
-	for (const char* p = params; p && (p = std::strstr(p, key)) != nullptr; p += n)
-		if ((p == params || blank(p[-1])) && (p[n] == '\0' || blank(p[n])))
-			return p + n;
-	return nullptr;
-}
-
 inline const char* skip_blanks(const char* p)
 {
-	while (blank(*p))
+	while (ascii::space_or_tab(*p))
 		++p;
 	return p;
 }
@@ -91,21 +81,21 @@ inline std::string read_name(const char* p)
 	}
 	for (; *p; ++p)
 	{
-		if (blank(*p) && p[1] == '-' && p[2] >= 'a' && p[2] <= 'z')
+		if (ascii::space_or_tab(*p) && p[1] == '-' && p[2] >= 'a' && p[2] <= 'z')
 			break;
 		out.push_back(*p);
 	}
-	while (!out.empty() && blank(out.back()))
+	while (!out.empty() && ascii::space_or_tab(out.back()))
 		out.pop_back();
 	return out;
 }
 } // namespace detail
 
 // The key in a command line. It decides the headless start in xrEngine before anything else runs.
-inline bool has_key(const char* params) { return params && detail::find_key(params, kKey) != nullptr; }
+inline bool has_key(const char* params) { return params && ascii::find_key(params, kKey) != nullptr; }
 
 // -coop_hidden in a command line.
-inline bool has_hidden_key(const char* params) { return params && detail::find_key(params, kHiddenKey) != nullptr; }
+inline bool has_hidden_key(const char* params) { return params && ascii::find_key(params, kHiddenKey) != nullptr; }
 
 // What the console of the dedicated host is. Without -coop_hidden it is what it always was: a window of its own, and a standard input that is
 // a pipe or a file read beside it, whose end means nothing. With it there is no window; the input is the launcher's pipe and its end means the
@@ -115,7 +105,7 @@ struct ConsolePlan
 	bool window = true; // AllocConsole, the window's own line editing
 	bool read_input = false; // a thread reads the standard input
 	bool eof_quits = false; // the end of that input is quit
-	// plan 2026-11-12 stage 2: the log lines the window would show and the @rl lines (coop_world_server_rules.h) go to the standard output.
+	// The log lines the window would show and the @rl lines (coop_world_server_rules.h) go to the standard output.
 	// Only with -coop_hidden and an output that is a pipe or a file: the window stays as it was, and a hidden host nobody reads writes nothing.
 	bool write_output = false;
 };
@@ -150,7 +140,7 @@ inline bool read_hex_name(const char* p, std::string& out)
 	};
 	p = skip_blanks(p);
 	std::string name;
-	for (; *p && !blank(*p); p += 2)
+	for (; *p && !ascii::space_or_tab(*p); p += 2)
 	{
 		const int hi = digit(p[0]);
 		const int lo = p[1] ? digit(p[1]) : -1;
@@ -172,32 +162,30 @@ inline bool read_hex_name(const char* p, std::string& out)
 inline bool parse_args(const char* params, Args& out, std::string& why)
 {
 	Args a;
-	const char* after = params ? detail::find_key(params, kKey) : nullptr;
+	const char* after = params ? ascii::find_key(params, kKey) : nullptr;
 	if (!after)
 	{
 		why = "no key -coop_dedicated";
 		return false;
 	}
 	const char* p = detail::skip_blanks(after);
-	if (*p >= '0' && *p <= '9')
+	if (ascii::digit(*p))
 	{
-		uint32_t v = 0;
-		for (; *p >= '0' && *p <= '9'; ++p)
-		{
-			v = v * 10 + uint32_t(*p - '0');
-			if (v > 65535)
-				break;
-		}
-		if (v == 0 || v > 65535 || (*p && !detail::blank(*p)))
+		const char* end = p;
+		while (ascii::digit(*end))
+			++end;
+		uint64_t v = 0;
+		if (!ascii::parse_decimal(std::string_view(p, size_t(end - p)), 65535, v, ascii::kAnyDigits, true) || v == 0 ||
+			(*end && !ascii::space_or_tab(*end)))
 		{
 			why = "the port must be 1..65535";
 			return false;
 		}
 		a.port = uint16_t(v);
 	}
-	const char* fresh = detail::find_key(params, kNewKey);
-	const char* load = detail::find_key(params, kLoadKey);
-	const char* load_hex = detail::find_key(params, kLoadHexKey);
+	const char* fresh = ascii::find_key(params, kNewKey);
+	const char* load = ascii::find_key(params, kLoadKey);
+	const char* load_hex = ascii::find_key(params, kLoadHexKey);
 	if (fresh && (load || load_hex))
 	{
 		why = "-coop_new and -coop_load exclude each other";
@@ -230,7 +218,7 @@ inline bool parse_args(const char* params, Args& out, std::string& why)
 		}
 	}
 	// Stage 5: -coop_stage <file>, one word up to the next blank (world_server::command_line refuses a path with a blank or a quote).
-	if (const char* stage = detail::find_key(params, kStageKey))
+	if (const char* stage = ascii::find_key(params, kStageKey))
 	{
 		if (a.world != World::New)
 		{
@@ -238,7 +226,7 @@ inline bool parse_args(const char* params, Args& out, std::string& why)
 			return false;
 		}
 		const char* v = detail::skip_blanks(stage);
-		for (; *v && !detail::blank(*v); ++v)
+		for (; *v && !ascii::space_or_tab(*v); ++v)
 			a.stage.push_back(*v);
 		if (a.stage.empty() || a.stage[0] == '-' || a.stage.find('"') != std::string::npos)
 		{
@@ -256,7 +244,7 @@ inline bool parse_args(const char* params, Args& out, std::string& why)
 // regardless of case, so that its log and <file>.used keep the name the parent wrote. Otherwise (a key from commandline.txt) the lower-case one.
 inline std::string stage_original_case(const char* params, const char* raw, const std::string& stage)
 {
-	const char* after = params ? detail::find_key(params, kStageKey) : nullptr;
+	const char* after = params ? ascii::find_key(params, kStageKey) : nullptr;
 	if (!after || !raw || stage.empty())
 		return stage;
 	const size_t at = size_t(detail::skip_blanks(after) - params);
@@ -360,13 +348,13 @@ struct Parsed
 
 inline Parsed parse_line(std::string s)
 {
-	// A UTF-8 BOM before the first line of a pipe (PowerShell writes one): "Unknown command: <BOM>coop_status" (live, 2026-11-01).
+	// A UTF-8 BOM before the first line of a pipe (PowerShell writes one): without this: "Unknown command: <BOM>coop_status".
 	if (s.compare(0, 3, "\xEF\xBB\xBF") == 0)
 		s.erase(0, 3);
-	while (!s.empty() && (detail::blank(s.back()) || s.back() == '\r' || s.back() == '\n'))
+	while (!s.empty() && ascii::space_or_eol(s.back()))
 		s.pop_back();
 	size_t from = 0;
-	while (from < s.size() && detail::blank(s[from]))
+	while (from < s.size() && ascii::space_or_tab(s[from]))
 		++from;
 	s.erase(0, from);
 	Parsed out;
@@ -485,7 +473,7 @@ inline const char* wait_code(Wait w)
 
 constexpr uint64_t kHostRetryMs = 5000; // after the first refusal
 constexpr uint64_t kHostRetryMaxMs = 30000; // the waits double up to this
-constexpr uint64_t kHostGiveUpMs = 15 * 60 * 1000; // from the first frame with a level: a GAMMA new world takes minutes, never fifteen
+constexpr uint64_t kHostGiveUpMs = 15 * 60 * 1000; // from the first frame with a level: a modded new world takes minutes, never fifteen
 
 // The autostart of the dedicated host's session, called every frame while there is none. It tries the moment the world is up, after a refusal
 // again later, says every new reason to wait once, and gives up loudly when the world has had kHostGiveUpMs since its level came. Without a
@@ -562,7 +550,7 @@ private:
 	Wait m_said = Wait::None;
 };
 
-// Which lines of the log the window shows. The log of a GAMMA start is tens of thousands of lines, the operator wants the session: 0 errors
+// Which lines of the log the window shows. The log of a modded start is tens of thousands of lines, the operator wants the session: 0 errors
 // only, 1 the session and the errors, 2 everything.
 constexpr int kLogDefault = 1;
 

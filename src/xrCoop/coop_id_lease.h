@@ -1,4 +1,4 @@
-// Anomaly Coop — leased object ids (F2 T12b, Ruling F2-8; docs/research/f2-client-create-ids.md §5).
+// Anomaly Coop — leased object ids (docs/research/f2-client-create-ids.md §5).
 // A client that creates an item in its own inventory (alife():create, create(.., false) + register, clone_weapon) gets an
 // object at once, under an id the host lent it beforehand; the host creates the item with that same id (ReqSpawn marker
 // 0xC7, coop_spawn.h) or refuses, and the client then takes its object back.
@@ -12,6 +12,8 @@
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
+#include "coop_bucket.h"
+#include "coop_ids.h"
 #include "coop_protocol.h"
 
 #include <algorithm>
@@ -31,8 +33,8 @@ namespace coop
 {
 namespace lease
 {
-constexpr uint16_t kNoId = 0xffff;
-constexpr size_t kLeaseSize = 48; // ids a client holds: 16 clients x 48 = 768 of 65534 (F5-SEAT-1)
+using coop::kNoId;
+constexpr size_t kLeaseSize = 48; // ids a client holds: 16 clients x 48 = 768 of 65534
 constexpr size_t kMaxIdsPerMsg = 64; // IdLease / IdLeaseAck carry at most this many
 constexpr uint32_t kMinFreeBlocks = 4; // the host leases nothing while its generator has fewer non-empty blocks
 constexpr size_t kMaxGivenBack = 4 * kLeaseSize; // per player and world: past this he gets no new ids (churn)
@@ -41,11 +43,11 @@ constexpr uint32_t kRetryStepMs = 50; // ... a little later each time, ...
 constexpr uint32_t kRetryMaxMs = 250; // ... never later than this
 constexpr uint32_t kMaxRetries = 40; // about 10 s of RateLimited answers: then the create is taken back
 constexpr uint32_t kAckGapMs = 250; // a client sends at most one IdLeaseAck per this (the host's row: 8, 4 a second)
-// Round 2 (review N1): a request the host neither answered nor queued in kAnswerTimeoutMs is asked again with the same id
+// A request the host neither answered nor queued in kAnswerTimeoutMs is asked again with the same id
 // (coop_requests.cpp kResultTimeoutMs), kMaxResends times; then the create is taken back.
 constexpr uint64_t kAnswerTimeoutMs = 10000;
 constexpr uint32_t kMaxResends = 3;
-// Round 2 (review N1): a client sends ReqSpawn no faster than the host takes it (coop_requests.cpp CatSpawn: 20 a second
+// A client sends ReqSpawn no faster than the host takes it (coop_requests.cpp CatSpawn: 20 a second
 // after 40 in a row; the session's row {ReqSpawn, 80, 25} drops what is over it without an answer): half the host's
 // burst in a row, one per kSpawnPaceMs after (a little slower than its 50 ms: the network bunches messages up).
 constexpr uint32_t kSpawnPaceBurst = 20;
@@ -54,7 +56,7 @@ constexpr uint32_t kSpawnPaceMs = 60;
 constexpr uint32_t kDestroyPaceBurst = 30;
 constexpr uint32_t kDestroyPaceMs = 40;
 
-// 0 is the actor of every machine, 0xffff no id: neither is ever leased.
+// 0 is the actor of every machine, kNoId no id: neither is ever leased.
 inline bool leasable(uint16_t id) { return id != 0 && id != kNoId; }
 
 // The wait before the next try of a create the host answered RateLimited `tries` times.
@@ -68,7 +70,7 @@ inline uint32_t retry_delay(uint32_t tries)
 // creation, so only what the clone is worth more counts (a scope variant); a detached scope comes as an item of its own.
 inline uint32_t clone_cost(uint32_t clone, uint32_t source) { return clone > source ? clone - source : 0; }
 
-// Round 2 (review N3): a clone keeps to its weapon's variants - the same section, or one base (parent_section; a section
+// A clone keeps to its weapon's variants - the same section, or one base (parent_section; a section
 // without one is its own base), or one is the other's base: a scope or magnifier variant, a jam cleared. Another weapon
 // would turn the source's rounds into its own ammo for the price difference.
 inline bool clone_family(std::string_view source, std::string_view source_parent, std::string_view clone,
@@ -79,12 +81,11 @@ inline bool clone_family(std::string_view source, std::string_view source_parent
 	return source == clone || source_base == clone_base || source_base == clone || clone_base == source;
 }
 
-// 2026-11-08 live report (GAMMA): a client could not fit an upgrade kit (PP Vityaz), the host could. A weapon kit (GAMMA's
-// mod_system_weapon_addons_upg_kits.ltx, 3DSS weapon_kit) is a scope-style addon whose variant is a weapon of its own:
-// item_weapon.attach_scope clones the bare weapon B into B_<kit>, and B_<kit> names itself in parent_section (its own
-// sights are its variants: wpn_vityaz_vitup_eot), so clone_family does not see B in it. Such an attach keeps to the
-// weapon's variants as stock attach_scope makes them: B its own base (parent_section = B), the clone named B_<addon>,
-// <addon> one of the comma-separated entries of B's `scopes` (check_scope; blanks around an entry do not count).
+// A client must be able to fit an upgrade kit as the host can. A weapon kit (a mod's weapon_kit section) is a scope-style addon
+// whose variant is a weapon of its own: item_weapon.attach_scope clones the bare weapon B into B_<kit>, and B_<kit> names itself
+// in parent_section (its own sights are its variants: wpn_vityaz_vitup_eot), so clone_family does not see B in it. Such an attach
+// keeps to the weapon's variants as stock attach_scope makes them: B its own base (parent_section = B), the clone named
+// B_<addon>, <addon> one of the comma-separated entries of B's `scopes` (check_scope; blanks around an entry do not count).
 inline bool addon_variant(std::string_view source, std::string_view source_parent, std::string_view source_scopes,
     std::string_view clone)
 {
@@ -118,30 +119,13 @@ class Pacer
 public:
 	bool take(uint64_t now)
 	{
-		if (!m_started)
-		{
-			m_started = true;
-			m_tokens = double(Burst);
-			m_at = now;
-		}
-		else if (now > m_at)
-		{
-			m_tokens += double(now - m_at) / double(IntervalMs);
-			if (m_tokens > double(Burst))
-				m_tokens = double(Burst);
-			m_at = now;
-		}
-		if (m_tokens < 1.)
-			return false;
-		m_tokens -= 1.;
-		return true;
+		m_bucket.refill(now, double(Burst), [](uint64_t ms) { return double(ms) / double(IntervalMs); });
+		return m_bucket.take();
 	}
-	void reset() { m_started = false; }
+	void reset() { m_bucket = TokenBucket(); }
 
 private:
-	bool m_started = false;
-	double m_tokens = 0.;
-	uint64_t m_at = 0;
+	TokenBucket m_bucket;
 };
 using SpawnPacer = Pacer<kSpawnPaceBurst, kSpawnPaceMs>;
 using DestroyPacer = Pacer<kDestroyPaceBurst, kDestroyPaceMs>;
@@ -431,7 +415,7 @@ enum class Outcome : uint8_t
 };
 
 // The creates of this client the host has not answered yet, by id.
-// Round 2 (review N1): every request sent for a create is remembered (a resend gets a new seq): the Ok of any of them
+// Every request sent for a create is remembered (a resend gets a new seq): the Ok of any of them
 // confirms it - the host made it under one, and refuses the others as not his any more; a refusal decides only for the
 // latest one. A request the host put into its budget queue (ReqResult Queued) waits for its answer, however long: a
 // second request with its id would queue twice. Any other request without an answer for kAnswerTimeoutMs is asked again
@@ -445,13 +429,13 @@ public:
 		uint16_t id = kNoId;
 		uint16_t source = kNoId; // a clone: the weapon it replaces (the host releases it with the clone's creation)
 		uint32_t seq = 0; // of the latest request in flight; 0 = in our own outbox, or waiting for its retry
-		std::vector<uint32_t> seqs; // every request sent for it (round 2)
+		std::vector<uint32_t> seqs; // every request sent for it
 		uint32_t tries = 0; // RateLimited answers so far
-		uint32_t resends = 0; // requests asked again for want of an answer (round 2)
+		uint32_t resends = 0; // requests asked again for want of an answer
 		uint64_t retry_at = 0; // when due again (waiting)
-		uint64_t sent_at = 0; // when the latest request went out (round 2)
+		uint64_t sent_at = 0; // when the latest request went out
 		bool waiting = false; // a retry is due at retry_at
-		bool queued = false; // the host keeps it in its budget queue (round 2)
+		bool queued = false; // the host keeps it in its budget queue
 	};
 
 	// What due() found: requests to send again (the caller queues them and calls sent(id, 0, now)), and creates to take
@@ -483,7 +467,7 @@ public:
 			s.seqs.push_back(seq);
 	}
 
-	// Round 2: the host put request `seq` into its budget queue (not an answer yet). False: no request of ours.
+	// The host put request `seq` into its budget queue (not an answer yet). False: no request of ours.
 	bool queued(uint32_t seq)
 	{
 		Spec* s = by_seq(seq);
@@ -522,7 +506,7 @@ public:
 		return Outcome::RolledBack;
 	}
 
-	// The retries whose time has come, and (round 2) the requests without an answer for kAnswerTimeoutMs that the host
+	// The retries whose time has come, and the requests without an answer for kAnswerTimeoutMs that the host
 	// did not queue: asked again, or after kMaxResends taken back (their records go).
 	Due due(uint64_t now)
 	{
@@ -554,7 +538,7 @@ public:
 	}
 
 	bool pending(uint16_t id) const { return m_specs.count(id) != 0; }
-	// Round 1 (review C1): the first id of `ids` whose create the host has not answered (an action about it waits for
+	// The first id of `ids` whose create the host has not answered (an action about it waits for
 	// the answer: Held), kNoId if none.
 	uint16_t first_pending(std::initializer_list<uint16_t> ids) const
 	{
@@ -563,7 +547,7 @@ public:
 				return id;
 		return kNoId;
 	}
-	// Guards for consuming/replacing an item also wait for a pending removal (R32 W7).
+	// Guards for consuming/replacing an item also wait for a pending removal.
 	bool waiting(uint16_t id, bool removing = false) const { return removing || pending(id) || is_source(id); }
 	bool can_queue_mutation(uint16_t id, bool mirror_live, bool fenced) const
 	{
@@ -603,7 +587,7 @@ private:
 	std::map<uint16_t, Spec> m_specs;
 };
 
-// Round 1 (review C1): the requests about an item of ours the host has not created yet (its create waits in the host's
+// The requests about an item of ours the host has not created yet (its create waits in the host's
 // budget queue, or for a retry after RateLimited). Sent before the create, the host refuses them (Missing) and creates
 // the item later: a duplicate. They wait here by the id they wait for, in order: released at the host's Ok, dropped at
 // a rollback (the item goes itself).
@@ -749,7 +733,7 @@ private:
 	std::map<uint16_t, Entry> m_pending;
 };
 
-// Round 1 (review I2): rolled-back entities kept a while after their release (a script may still hold one) and freed
+// Rolled-back entities kept a while after their release (a script may still hold one) and freed
 // later - but only in the world they were released in: a new world closed the Lua state their script objects live in,
 // and freeing one then runs a destructor in it (an access violation). Those are forgotten instead (a small leak).
 template <class T>

@@ -144,7 +144,7 @@ void CTrade::StartTradeEx(CInventoryOwner* pInvOwner)
 	StartTrade();
 }
 
-// Anomaly Coop: price a trade for a player's proxy as for the actor
+// coop: price a trade for a player's proxy as for the actor
 // (a remote player's character on the host is a stalker; GetItemPrice picks buy or sell factors only for the actor).
 void CTrade::SetActorPartner(CInventoryOwner* player)
 {

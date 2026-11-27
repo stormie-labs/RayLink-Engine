@@ -11,28 +11,35 @@
 #include "coop_survival.h"
 #include "coop_players.h" // players::avatar_safemode (coop_equip.cpp)
 #include "coop_instrument.h"
-#include "coop_dialog.h" // W11: dialog::host_talk_holder
-#include "coop_requests.h" // R3 В2 review: requests::lua_explode_as
-#include "coop_writer.h" // R32 W1: writing::lua_writes
-#include "coop_trade.h" // trade::lua_search_window
-#include "coop_money.h" // F2 T1: money::register_lua
-#include "coop_router.h" // F2 T10: router::register_lua (coop.route)
-#include "coop_sync_api.h" // F2 T14: syncapi::register_lua (coop.sync)
-#include "coop_game_settings.h" // Game settings T2: game::register_lua (coop.game)
-#include "coop_levels.h" // F3a: levels::register_lua (coop.levels, the roles)
-#include "coop_debug.h" // protocol 29: debug::register_lua (coop.debug)
-#include "coop_objects.h" // G11-2: objects::register_lua (coop.zone_path)
-#include "xrCoop/coop_mode.h" // S4: register_layers_lua (the server's srv.*)
-#include "coop_vehicles.h" // F5: vehicles::register_lua (coop.vehicle)
-#include "coop_progress.h" // F5: progress::register_lua (coop.progress)
-#include "coop_initial_state.h" // TZ R32 W8.4: items::register_lua (coop.items.set_initial)
-#include "coop_player_touch.h" // TZ P50: player_touch::register_lua (coop.player_touch_zones)
+#include "coop_dialog.h" // dialog::host_talk_holder
+#include "coop_requests.h" // requests::lua_explode_as, lua_lease_ids, lua_lease_waiting
+#include "coop_writer.h" // writing::lua_writes
+#include "coop_trade.h" // trade::lua_search_window, lua_trade_deal
+#include "coop_money.h" // the tables of the other modules: their register_lua
+#include "coop_router.h"
+#include "coop_sync_api.h"
+#include "coop_game_settings.h"
+#include "coop_levels.h"
+#include "coop_debug.h"
+#include "coop_objects.h"
+#include "coop_vehicles.h"
+#include "coop_progress.h"
+#include "coop_initial_state.h"
+#include "coop_player_touch.h"
+#include "coop_checkpoints.h"
+#include "coop_rest.h"
+#include "coop_autosave.h"
+#include "coop_lua.h" // lua_api: the registrar, the argument readers
+#include "xrCoop/coop_lua_fn.h" // luafn: the protected call of <module>.<fn>, the message handler
+#include "xrCoop/coop_lua_errors.h" // lua_errors::line_allowed: the log budget
+#include "xrCoop/coop_mode.h" // register_layers_lua (the server's srv.*)
+#include "xrCoop/coop_mode_stamp.h" // coop.mode_stamp
 #include "xrCoop/srv/coop_mapserver_rules.h" // mapserver::is_bridge: Lua events of the map servers
-#include "xrCoop/coop_limits.h" // F2 T14: limits::Pacer (Ruling F2-14)
-#include "xrCoop/coop_roster.h" // plan 2026-11-12 stage 3: who is listed as a player, who has the host's badge
+#include "xrCoop/coop_limits.h" // limits::Pacer
+#include "xrCoop/coop_roster.h" // who is listed as a player, who has the host's badge
 #include "xrCoop/srv/coop_operator.h" // op::kMaxLine, op::allowed: coop.operator_command
 #include "xrCoop/coop_task_audience.h" // task_audience::kMaxMembers: coop.story_task_audience
-#include "xrCoop/coop_item_rider_rules.h" // F4 G3-1c: riders::ReleaseBook behind coop.event_tick / coop.released_after
+#include "xrCoop/coop_item_rider_rules.h" // riders::ReleaseBook behind coop.event_tick / coop.released_after
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -61,7 +68,7 @@ namespace
 constexpr size_t kMaxName = WorldEventReservations::kMaxName;
 constexpr size_t kMaxPayload = 16 * 1024;
 constexpr size_t kMaxOutbox = 512; // events queued by Lua, sent in frame()
-constexpr size_t kMaxInbox = 4096; // events waiting for Lua (P6): a level's load fills them, 512 lost the oldest
+constexpr size_t kMaxInbox = 4096; // events waiting for Lua until this machine is in the world: a level's load fills them
 constexpr size_t kMaxInboxBytes = 4 * 1024 * 1024; // and their payloads (16 KB each at the most)
 constexpr size_t kMaxChat = 64;
 constexpr u32 kDeliverPerFrame = 64;
@@ -83,7 +90,7 @@ struct Incoming
 	PeerId from = kInvalidPeer;
 	std::string name, payload;
 	u64 t_ms = 0;
-	u64 tick = 0; // F4 G3-1c: its place among the arrivals and the releases of entities here (g_tick)
+	u64 tick = 0; // its place among the arrivals and the releases of entities here (g_tick)
 };
 
 struct ChatLine
@@ -93,24 +100,14 @@ struct ChatLine
 	PeerId from = kInvalidPeer; // the sender's peer, kInvalidPeer if not known
 };
 
-// Engine facts for Lua (W5), queued by engine code, delivered from frame().
+// An engine callback for Lua: SendScriptCallback(name, args...), queued by engine code (queue_callback), delivered from frame().
 struct EngineEvent
 {
-	enum Kind : u8
-	{
-		TransitionVote, // coop_main.on_transition_vote(text = nick)
-		ActorRevived, // SendScriptCallback("coop_actor_revived", peer, text = medkit section or nil)
-		ContainerOpened, // SendScriptCallback("coop_on_container_opened", peer, id)
-		Callback, // F3: SendScriptCallback(name, args...) (queue_callback)
-	} kind = TransitionVote;
-	std::string text;
-	PeerId peer = kInvalidPeer;
-	u16 id = 0xffff;
+	std::string name;
+	std::vector<CallbackArg> args; // at most kMaxCallbackArgs
 	u64 t_ms = 0;
-	std::string name; // Callback
-	std::vector<CallbackArg> args; // Callback, at most kMaxCallbackArgs
 };
-constexpr size_t kMaxEngineEvents = 1024; // parity audit D10: only a dropped checkpoint is read again by Lua
+constexpr size_t kMaxEngineEvents = 1024; // a dropped one is told to Lua in coop_events_lost (deliver_lost)
 // send_script_callback reserves 16 Lua stack slots: traceback, SendScriptCallback, the name, then the arguments.
 static_assert(kMaxCallbackArgs + 3 <= 16, "queue_callback arguments must fit the stack send_script_callback checks");
 
@@ -121,20 +118,20 @@ struct Stats
 	u64 relayed = 0; // host: client events forwarded to other clients
 	u64 delivered = 0; // coop_main.on_event calls that returned normally
 	u64 send_rejected = 0; // coop.send_event refused (bad args, not ready, to myself, queue full)
-	u64 send_held = 0; // F2 T14 (Ruling F2-14): frames a client held events back for the host's rate limit
+	u64 send_held = 0; // frames a client held events back for the host's rate limit
 	u64 drop_invalid = 0; // malformed / bad name / payload too big / bad target
-	u64 drop_not_ready = 0; // host: sender is still loading the world (P6)
+	u64 drop_not_ready = 0; // host: sender is still loading the world
 	u64 drop_world_only = 0; // reserved events refused before a relay rewrites their sender
 	u64 drop_overflow = 0; // inbox or chat queue full
 	u64 drop_stale = 0; // waited too long for Lua
 	u64 lua_errors = 0; // Lua error inside coop_main.on_event / on_chat / print_status
 	u64 lua_missing = 0; // coop_main or the function is missing
 	u64 chat_delivered = 0;
-	u64 engine_events = 0, engine_delivered = 0, engine_dropped = 0; // W5 engine callbacks
-	u64 engine_invalid = 0; // F3: queue_callback refused (bad name, too many or too long arguments)
+	u64 engine_events = 0, engine_delivered = 0, engine_dropped = 0; // engine callbacks
+	u64 engine_invalid = 0; // queue_callback refused (bad name, too many or too long arguments)
 };
 
-// Host refusal waiting for a dialog (R-1.3, R-1.4). Kept outside Stats: reset() must not drop it.
+// Host refusal waiting for a dialog. Kept outside Stats: reset() must not drop it.
 struct Rejection
 {
 	bool pending = false;
@@ -154,7 +151,7 @@ struct UiStats
 	u64 stash_cleared = 0; // session ended with stashed values
 };
 
-// Co-op menu (W4): what the window shows besides the live session, and "host when the next world is loaded".
+// Co-op menu: what the window shows besides the live session, and "host when the next world is loaded".
 // Survives reset(); main thread only (console, menu callbacks, frame pump).
 struct MenuMemo
 {
@@ -195,7 +192,7 @@ std::deque<Incoming> g_inbox;
 size_t g_inbox_bytes = 0;
 u64 g_lua_back_ms = 0; // the last frame Lua was not ready (a load)
 u32 g_lost_events = 0; // dropped since Lua was last told (coop_events_lost)
-// F4 G3-1c (xrCoop/coop_item_rider_rules.h): one counter orders the events reaching the inbox and the releases of entities
+// One counter (xrCoop/coop_item_rider_rules.h) orders the events reaching the inbox and the releases of entities
 // on this process, so Lua can tell a rider that waited while its weapon was released and replaced under the same name.
 // Never reset: a tick only orders. Releases come on any game thread (coop_entities.cpp host_on_entity_released).
 std::atomic<u64> g_tick{0};
@@ -209,8 +206,9 @@ UiStats g_ui;
 std::map<std::string, std::string> g_stash; // survives reset(): cleared by the pump when the session ends
 size_t g_stash_bytes = 0;
 
-// First lines in full, then every 100th, so a broken addon cannot flood the log.
-bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+// The log budget of each counted kind of line (lua_errors::line_allowed): first lines in full, then every 100th, so a broken
+// addon cannot flood the log.
+constexpr u64 kLogBurst = 10;
 
 bool valid_name(const char* s, size_t n) { return WorldEventReservations::valid_name(s, n); }
 
@@ -233,86 +231,27 @@ void write_event(Writer& w, PeerId origin, s32 target, const std::string& name, 
 
 // --- calling Lua -------------------------------------------------------------------------------
 
-int lua_traceback(lua_State* L)
-{
-	const char* msg = lua_tostring(L, 1);
-	if (!msg)
-		msg = "(error object is not a string)";
-	lua_pushstring(L, "debug");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_getfield(L, -1, "traceback");
-	if (!lua_isfunction(L, -1))
-	{
-		lua_pop(L, 2);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_pushstring(L, msg);
-	lua_pushinteger(L, 2);
-	lua_call(L, 2, 1);
-	return 1;
-}
-
-// Pushes <module>.<fn>; false (stack unchanged) if the script or the function does not exist.
-bool push_handler(lua_State* L, const char* module, const char* fn)
-{
-	lua_getglobal(L, module); // _G.__index auto-loads gamedata/scripts/<module>.script
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return false;
-	}
-	lua_getfield(L, -1, fn);
-	lua_remove(L, -2);
-	if (!lua_isfunction(L, -1))
-	{
-		lua_pop(L, 1);
-		return false;
-	}
-	return true;
-}
-
-// Protected call of <module>.<fn>(args pushed by push_args). Never throws, never leaves the stack dirty.
+// Protected call of <module>.<fn>(args pushed by push_args), the module loaded on first use. Never throws, never leaves the stack
+// dirty. A missing module or function and a Lua error are counted and logged.
 template <typename PushArgs>
 bool call_module(const char* module, const char* fn, PushArgs push_args)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L)
-		return false;
-	const int top = lua_gettop(L);
-	if (!lua_checkstack(L, 16))
-		return false;
-	lua_pushcfunction(L, &lua_traceback);
-	const int errfunc = lua_gettop(L);
-	if (!push_handler(L, module, fn))
+	std::string error;
+	const luafn::Fail f = luafn::call_named(ai().script_engine().lua(), module, fn, &luafn::traceback, push_args, 0,
+	    [](lua_State*) {}, error);
+	if (f == luafn::Fail::Missing)
 	{
 		++g_stats.lua_missing;
-		if (log_allowed(g_stats.lua_missing))
+		if (lua_errors::line_allowed(g_stats.lua_missing, kLogBurst))
 			::Msg("! [coop] lua: %s.%s is missing (gamedata/scripts/%s.script not installed?)", module, fn, module);
-		lua_settop(L, top);
-		return false;
 	}
-	const int nargs = push_args(L);
-	bool ok = true;
-	if (lua_pcall(L, nargs, 0, errfunc) != 0)
+	else if (f == luafn::Fail::LuaError)
 	{
-		ok = false;
 		++g_stats.lua_errors;
-		if (log_allowed(g_stats.lua_errors))
-		{
-			const char* err = lua_tostring(L, -1);
-			::Msg("! [coop] lua error in %s.%s (#%llu, session continues): %s", module, fn, g_stats.lua_errors,
-			    err ? err : "?");
-		}
+		if (lua_errors::line_allowed(g_stats.lua_errors, kLogBurst))
+			::Msg("! [coop] lua error in %s.%s (#%llu, session continues): %s", module, fn, g_stats.lua_errors, error.c_str());
 	}
-	lua_settop(L, top);
-	return ok;
+	return f == luafn::Fail::None;
 }
 
 template <typename PushArgs>
@@ -332,13 +271,13 @@ bool send_script_callback(const char* name, PushArgs push_args)
 	const int top = lua_gettop(L);
 	if (!lua_checkstack(L, 16))
 		return false;
-	lua_pushcfunction(L, &lua_traceback);
+	lua_pushcfunction(L, &luafn::traceback);
 	const int errfunc = lua_gettop(L);
 	lua_getglobal(L, "SendScriptCallback");
 	if (!lua_isfunction(L, -1))
 	{
 		++g_stats.lua_missing;
-		if (log_allowed(g_stats.lua_missing))
+		if (lua_errors::line_allowed(g_stats.lua_missing, kLogBurst))
 			::Msg("! [coop] lua: SendScriptCallback is missing, '%s' not fired", name);
 		lua_settop(L, top);
 		return false;
@@ -350,7 +289,7 @@ bool send_script_callback(const char* name, PushArgs push_args)
 	{
 		ok = false;
 		++g_stats.lua_errors;
-		if (log_allowed(g_stats.lua_errors))
+		if (lua_errors::line_allowed(g_stats.lua_errors, kLogBurst))
 		{
 			const char* err = lua_tostring(L, -1);
 			::Msg("! [coop] lua error in callback %s (#%llu, session continues): %s", name, g_stats.lua_errors,
@@ -372,7 +311,7 @@ void deliver_later(PeerId from, std::string&& name, std::string&& payload)
 		g_inbox.pop_front();
 		++g_stats.drop_overflow;
 		++g_lost_events;
-		if (log_allowed(g_stats.drop_overflow))
+		if (lua_errors::line_allowed(g_stats.drop_overflow, kLogBurst))
 			::Msg("! [coop] script event queue full, oldest event dropped");
 	}
 	Incoming e;
@@ -404,12 +343,12 @@ bool read_event(PeerId from, Reader& r, PeerId& wire_origin, s32& target, std::s
 	if (r.ok() && r.remaining() == 0 && valid_name(name.data(), name.size()) && payload.size() <= kMaxPayload)
 		return true;
 	++g_stats.drop_invalid;
-	if (log_allowed(g_stats.drop_invalid))
+	if (lua_errors::line_allowed(g_stats.drop_invalid, kLogBurst))
 		::Msg("! [coop] malformed script event from #%u dropped", from);
 	return false;
 }
 
-// The world server (the host's process): a player's event. F3a T7: the host player's comes from peer 0 over the internal
+// The world server (the host's process): a player's event. The host player's comes from peer 0 over the internal
 // channel (his coop.send_event to 0); the Lua of the host's process is the world server's and the host player's at once,
 // so an event to 0 from either side is one delivery there, with from = 0.
 void server_on_script_event(PeerId from, Reader& r)
@@ -419,7 +358,7 @@ void server_on_script_event(PeerId from, Reader& r)
 	std::string name, payload;
 	if (!read_event(from, r, wire_origin, target, name, payload) || !decides_world())
 		return;
-	// P6: players can send after loading. A joined connection without a player can report immediately.
+	// Players can send after loading. A joined connection without a player can report immediately.
 	const Session& session = mgr().session();
 	const bool player = session.peer(from) != nullptr;
 	const bool bridge = from != kHostPeer && !player && session.joined(from);
@@ -428,14 +367,14 @@ void server_on_script_event(PeerId from, Reader& r)
 	if (!ready)
 	{
 		++g_stats.drop_not_ready;
-		if (log_allowed(g_stats.drop_not_ready))
+		if (lua_errors::line_allowed(g_stats.drop_not_ready, kLogBurst))
 			::Msg("! [coop] script event '%s' from #%u dropped: sender is not in the world yet", name.c_str(), from);
 		return;
 	}
 	if (g_world_events.blocks_relay(bridge, name))
 	{
 		++g_stats.drop_world_only;
-		if (log_allowed(g_stats.drop_world_only))
+		if (lua_errors::line_allowed(g_stats.drop_world_only, kLogBurst))
 			::Msg("! [coop] world-only script event '%s' from #%u dropped", name.c_str(), from);
 		return;
 	}
@@ -446,7 +385,7 @@ void server_on_script_event(PeerId from, Reader& r)
 	{
 		if (bridge)
 		{
-			// B-REV F7: a map server's "everybody" is the players (its flush_outbox never sends -1: it gives each player his
+			// A map server's "everybody" is the players (its flush_outbox never sends -1: it gives each player his
 			// own copy). Never the other map servers: they would take the copy, origin 0, as the world's word.
 			for (const PeerInfo& p : session.peers())
 				host_relay(origin, s32(p.id), name, payload, from);
@@ -461,14 +400,14 @@ void server_on_script_event(PeerId from, Reader& r)
 	else if (target < 0 || PeerId(target) == from || !mgr().session().peer(PeerId(target)))
 	{
 		++g_stats.drop_invalid;
-		if (log_allowed(g_stats.drop_invalid))
+		if (lua_errors::line_allowed(g_stats.drop_invalid, kLogBurst))
 			::Msg("! [coop] script event '%s' from #%u to #%d dropped: no such player", name.c_str(), from, target);
 	}
 	else
 		host_relay(origin, target, name, payload, from);
 }
 
-// A client: an event the world server relays. F3a T7: in the host's process the world server delivered every event its
+// A client: an event the world server relays. In the host's process the world server delivered every event its
 // Lua is to get already (server_on_script_event): the copy a broadcast puts on the internal channel is not delivered
 // twice, only a remote client takes it.
 void client_on_script_event(PeerId from, Reader& r)
@@ -484,7 +423,7 @@ void client_on_script_event(PeerId from, Reader& r)
 	deliver_later(wire_origin, std::move(name), std::move(payload));
 }
 
-// F2 T14 (Ruling F2-14): a client sends events only as fast as the host takes them (kClientRateRules ScriptEvent): the
+// A client sends events only as fast as the host takes them (kClientRateRules ScriptEvent): the
 // host drops what exceeds its limit and the sender never learns of it, so an event over it waits here for a later frame
 // instead (send_event refuses only when this queue is full).
 limits::Pacer g_pacer;
@@ -499,7 +438,7 @@ void flush_outbox()
 	{
 		if (client && !g_pacer.take(Msg::ScriptEvent, mgr().now_ms()))
 		{
-			++g_stats.send_held; // F2 T14: the rest goes in a later frame, in order
+			++g_stats.send_held; // the rest goes in a later frame, in order
 			break;
 		}
 		Outgoing o = std::move(g_outbox.front());
@@ -513,7 +452,7 @@ void flush_outbox()
 		write_event(w, mgr().self(), o.target, o.name, o.payload);
 		if (host)
 		{
-			// F3a T7: to every other player, the host player being the sender; to 0, over the internal channel to the
+			// to every other player, the host player being the sender; to 0, over the internal channel to the
 			// world server, which delivers it to the one Lua of the host's process (server_on_script_event)
 			if (o.target == kTargetAll)
 				net::host_broadcast(Msg::ScriptEvent, w, Lane::Reliable, kHostPeer);
@@ -545,6 +484,7 @@ void flush_outbox()
 
 void deliver_inbox()
 {
+	PROF_EVENT("coop/coop_script/deliver_inbox");
 	u32 budget = kDeliverPerFrame;
 	const u64 now = mgr().now_ms();
 	while (!g_inbox.empty() && budget-- > 0)
@@ -556,11 +496,11 @@ void deliver_inbox()
 		{
 			++g_stats.drop_stale;
 			++g_lost_events;
-			if (log_allowed(g_stats.drop_stale))
+			if (lua_errors::line_allowed(g_stats.drop_stale, kLogBurst))
 				::Msg("! [coop] script event '%s' from #%u is too old, dropped", e.name.c_str(), e.from);
 			continue;
 		}
-		g_delivering = e.tick; // F4 G3-1c: coop.event_tick() names this event's arrival while Lua handles it
+		g_delivering = e.tick; // coop.event_tick() names this event's arrival while Lua handles it
 		const bool ok = call_lua("on_event", [&e](lua_State* L)
 		{
 			lua_pushlstring(L, e.name.data(), e.name.size());
@@ -576,6 +516,7 @@ void deliver_inbox()
 
 void deliver_chat()
 {
+	PROF_EVENT("coop/coop_script/deliver_chat");
 	const u64 now = mgr().now_ms();
 	while (!g_chat.empty())
 	{
@@ -604,16 +545,11 @@ void push_engine_event(EngineEvent&& e)
 {
 	if (g_engine.size() >= kMaxEngineEvents)
 	{
-		// F3 T2 review: a dropped event is not sent again (Lua re-reads the state, e.g. coop.checkpoint.get); say which.
-		const EngineEvent& old = g_engine.front();
-		static const char* const kEventNames[] = {"on_transition_vote", "coop_actor_revived", "coop_on_container_opened"};
-		static_assert(sizeof(kEventNames) / sizeof(kEventNames[0]) == size_t(EngineEvent::Callback), "F3 T6 R1 M-4: one name per kind before Callback");
-		const char* what = old.kind == EngineEvent::Callback ? old.name.c_str() :
-			old.kind < EngineEvent::Callback ? kEventNames[old.kind] : "?";
+		// A dropped event is not sent again (Lua re-reads the state, e.g. coop.checkpoint.get): say which.
 		++g_stats.engine_dropped;
 		++g_lost_events;
-		if (log_allowed(g_stats.engine_dropped))
-			::Msg("! [coop] engine event queue full (%u): '%s' dropped", u32(kMaxEngineEvents), what);
+		if (lua_errors::line_allowed(g_stats.engine_dropped, kLogBurst))
+			::Msg("! [coop] engine event queue full (%u): '%s' dropped", u32(kMaxEngineEvents), g_engine.front().name.c_str());
 		g_engine.pop_front();
 	}
 	e.t_ms = mgr().now_ms();
@@ -623,6 +559,7 @@ void push_engine_event(EngineEvent&& e)
 
 void deliver_engine()
 {
+	PROF_EVENT("coop/coop_script/deliver_engine");
 	const u64 now = mgr().now_ms();
 	while (!g_engine.empty())
 	{
@@ -634,62 +571,27 @@ void deliver_engine()
 			++g_lost_events;
 			continue;
 		}
-		bool ok = false;
-		switch (e.kind)
+		const bool ok = send_script_callback(e.name.c_str(), [&e](lua_State* L)
 		{
-		case EngineEvent::TransitionVote:
-			ok = call_lua("on_transition_vote", [&e](lua_State* L)
+			for (const CallbackArg& a : e.args)
 			{
-				lua_pushlstring(L, e.text.data(), e.text.size());
-				return 1;
-			});
-			break;
-		case EngineEvent::ActorRevived:
-			ok = send_script_callback("coop_actor_revived", [&e](lua_State* L)
-			{
-				if (e.peer == kInvalidPeer)
-					lua_pushnil(L);
-				else
-					lua_pushnumber(L, lua_Number(e.peer));
-				if (e.text.empty())
-					lua_pushnil(L);
-				else
-					lua_pushlstring(L, e.text.data(), e.text.size());
-				return 2;
-			});
-			break;
-		case EngineEvent::ContainerOpened:
-			ok = send_script_callback("coop_on_container_opened", [&e](lua_State* L)
-			{
-				lua_pushnumber(L, lua_Number(e.peer));
-				lua_pushnumber(L, lua_Number(e.id));
-				return 2;
-			});
-			break;
-		case EngineEvent::Callback:
-			ok = send_script_callback(e.name.c_str(), [&e](lua_State* L)
-			{
-				for (const CallbackArg& a : e.args)
+				switch (a.kind)
 				{
-					switch (a.kind)
-					{
-					case CallbackArg::Bool: lua_pushboolean(L, a.i != 0 ? 1 : 0); break;
-					case CallbackArg::Int: lua_pushinteger(L, lua_Integer(a.i)); break;
-					case CallbackArg::Str: lua_pushlstring(L, a.s.data(), a.s.size()); break;
-					case CallbackArg::Nil:
-					default: lua_pushnil(L); break;
-					}
+				case CallbackArg::Bool: lua_pushboolean(L, a.i != 0 ? 1 : 0); break;
+				case CallbackArg::Int: lua_pushinteger(L, lua_Integer(a.i)); break;
+				case CallbackArg::Str: lua_pushlstring(L, a.s.data(), a.s.size()); break;
+				case CallbackArg::Nil:
+				default: lua_pushnil(L); break;
 				}
-				return int(e.args.size());
-			});
-			break;
-		}
+			}
+			return int(e.args.size());
+		});
 		if (ok)
 			++g_stats.engine_delivered;
 	}
 }
 
-// Parity audit D10: what a queue dropped is not sent again. The ones that fell through are told in one number when the
+// What a queue dropped is not sent again. The ones that fell through are told in one number when the
 // queues have run dry, so a script with a resync of its own (coop_tasks) asks for it: coop_events_lost(count).
 void deliver_lost()
 {
@@ -720,21 +622,18 @@ int l_self_id()
 	return self == kInvalidPeer ? -1 : int(self);
 }
 
-bool arg_id(lua_State* L, int idx, lua_Number& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	out = lua_tonumber(L, idx);
-	return out >= 0 && out <= lua_Number(0xffffffffu);
-}
+// A number 0 .. 0xffffffff, fractions kept (each caller checks its own range and wholeness).
+bool arg_id(lua_State* L, int idx, lua_Number& out) { return lua_api::arg_number_in(L, idx, 0.0, double(0xffffffffu), out); }
 
-// Plan 2026-11-12 stage 3 (xrCoop/coop_roster.h): whether the host's seat is a player. A host knows its own (a dedicated host's is not), a
-// client from peer 0's row (Welcome flags HostSeatPlays); a session with no row 0 (a map server's) counts as an ordinary host.
+// Whether the host's seat is a player (xrCoop/coop_roster.h). A host knows its own (a dedicated host's is not), a client from peer 0's
+// row (Welcome flags HostSeatPlays); a session with no row 0 (a map server's) counts as an ordinary host. The rule of
+// roster::host_plays_in, read from the session's own row 0 without copying its rows.
 bool host_seat_plays()
 {
 	if (decides_world())
 		return mode().actor_is_player();
-	return roster::host_plays_in(mgr().session().peers(), true);
+	const PeerInfo* host = mgr().session().peer(kHostPeer);
+	return host ? host->plays : true;
 }
 
 // This machine's own row for the roster rules: it plays unless it is a host whose seat does not; a client holds the host's rights when
@@ -749,11 +648,11 @@ PeerInfo self_row(PeerId self)
 	return me;
 }
 
-// F5-SEAT-1: the `mstate` of a row of coop.players(): the movement flags (actor EMoveCommand: crouch, slow walk, sprint, jump, fall ...;
+// The `mstate` of a row of coop.players(): the movement flags (actor EMoveCommand: crouch, slow walk, sprint, jump, fall ...;
 // the 16 bits a PlayerState carries) of that player's latest snapshot, on a machine that holds his body: our own actor while it is a
 // player (mode().actor_is_player()), another player's character once a state of his drove it here (players::avatar_view; the state
 // it was last driven with, players::avatar_mstate). False elsewhere (a server's world has no body of his, a body never driven): the row
-// has no mstate. F5-COV-1 and F5-PRG-3 read it for the stance and the jumps.
+// has no mstate. The cover and the progress scripts read it for the stance and the jumps.
 bool row_mstate(bool own, u16 avatar, u32& out)
 {
 	if (own)
@@ -773,7 +672,7 @@ bool row_mstate(bool own, u16 avatar, u32& out)
 
 // coop.players() -> { {id=, nick=, avatar_id= (local numbering, nil if unknown), rtt=, loss= (0..1, the transport's
 // smoothed packet loss; 0 for ourselves), is_self=, is_host= (the host's badge: the playing host's row, or the operator's when the
-// host's seat plays no character), mstate= (F5-SEAT-1, row_mstate; nil where his body is not here)}, ... } (loss:
+// host's seat plays no character), mstate= (row_mstate; nil where his body is not here)}, ... } (loss:
 // scripts\coop_hud_netgraph). A seat that plays no character (a world server's own) is in no row (coop_roster.h).
 int l_players(lua_State* L)
 {
@@ -797,7 +696,7 @@ int l_players(lua_State* L)
 			lua_setfield(L, -2, "avatar_id");
 		}
 		u32 mstate = 0;
-		if (row_mstate(id == self, avatar, mstate)) // F5-SEAT-1
+		if (row_mstate(id == self, avatar, mstate))
 		{
 			lua_pushnumber(L, lua_Number(mstate));
 			lua_setfield(L, -2, "mstate");
@@ -810,7 +709,7 @@ int l_players(lua_State* L)
 		lua_setfield(L, -2, "is_self");
 		lua_pushboolean(L, roster::host_badge(row, host_plays));
 		lua_setfield(L, -2, "is_host");
-		// F3a: where he stands: the HUD says so of a player on another level, his markers and distance mean nothing here
+		// where he stands: the HUD says so of a player on another level, his markers and distance mean nothing here
 		const levels::LevelId level = levels::level_of_player(id);
 		if (level != levels::wire::kNoLevel)
 		{
@@ -824,12 +723,11 @@ int l_players(lua_State* L)
 	const PeerInfo me = self_row(self);
 	if (self != kInvalidPeer && roster::listed(me)) // a dedicated host is nobody in the list of the players
 		push_entry(me, mgr().nick(), 0, 0, 0.f); // our own actor is always id 0 here
-	for (const PeerInfo& p : mgr().session().peers())
+	mgr().session().for_each_joined([&push_entry, self](const PeerInfo& p)
 	{
-		if (p.id == self || !roster::listed(p))
-			continue;
-		push_entry(p, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms, p.packet_loss);
-	}
+		if (p.id != self && roster::listed(p))
+			push_entry(p, p.nick.c_str(), world::avatar_of(p.id), p.rtt_ms, p.packet_loss);
+	});
 	return 1;
 }
 
@@ -953,7 +851,7 @@ int l_peer_of_avatar(lua_State* L)
 	return 1;
 }
 
-// F0 final review (task 8): coop.owners_known() -> true once avatar_id / peer_of_avatar cover every player in the
+// coop.owners_known() -> true once avatar_id / peer_of_avatar cover every player in the
 // world (host: always; client: after the host's first AvatarList since it joined), false before and outside a session.
 int l_owners_known(lua_State* L)
 {
@@ -989,7 +887,7 @@ int l_to_local_id(lua_State* L)
 int send_fail(lua_State* L, const char* why)
 {
 	++g_stats.send_rejected;
-	if (log_allowed(g_stats.send_rejected))
+	if (lua_errors::line_allowed(g_stats.send_rejected, kLogBurst))
 		::Msg("! [coop] coop.send_event refused: %s", why);
 	lua_pushboolean(L, 0);
 	lua_pushstring(L, why);
@@ -1002,19 +900,6 @@ int l_reserve_world_event(lua_State* L)
 	size_t size = 0;
 	const char* name = lua_type(L, 1) == LUA_TSTRING ? lua_tolstring(L, 1, &size) : nullptr;
 	lua_pushboolean(L, g_world_events.reserve(name, size) ? 1 : 0);
-	return 1;
-}
-
-// coop.my_level() -> the game graph id of the level this process has loaded; nil while its world is built or torn down (the
-// guarded levels::my_level, the same answer as coop.levels.my_level). S6 (A-S6-L-worldb): the Core's flare cast asks it without
-// the server's table coop.levels.
-int l_own_level(lua_State* L)
-{
-	const levels::LevelId level = levels::my_level();
-	if (level == levels::wire::kNoLevel)
-		lua_pushnil(L);
-	else
-		lua_pushnumber(L, lua_Number(level));
 	return 1;
 }
 
@@ -1058,8 +943,8 @@ int l_send_event(lua_State* L)
 
 	const bool host = decides_world();
 	if (!host && !mgr().is_live_client())
-		return send_fail(L, "not in a co-op world"); // P6: sender must be ready
-	// F3a T7: in the host's process 0 is the world server and the host player at once (one Lua): an event to 0 goes over
+		return send_fail(L, "not in a co-op world"); // the sender must be in the world
+	// in the host's process 0 is the world server and the host player at once (one Lua): an event to 0 goes over
 	// the internal channel and comes back to this Lua with from = 0, as a client's event to the host does there.
 	const bool to_own_world = host && target == s32(kHostPeer);
 	const PeerId self = mgr().self();
@@ -1097,7 +982,7 @@ int l_send_chat(lua_State* L)
 	return 1;
 }
 
-// --- session stash and the refusal window (W3d) ---------------------------------------------------
+// --- session stash and the refusal window -------------------------------------------------------
 
 constexpr size_t kMaxStashTotal = 1024 * 1024;
 
@@ -1220,7 +1105,7 @@ int l_condition_carried(lua_State* L)
 	return 1;
 }
 
-// coop.event_tick() -> arrival, now. F4 G3-1c (xrCoop/coop_item_rider_rules.h): `arrival` is the tick of the event
+// coop.event_tick() -> arrival, now (xrCoop/coop_item_rider_rules.h): `arrival` is the tick of the event
 // coop_main.on_event is delivering (now, outside one), `now` the latest tick. They only order: coop.released_after
 // compares them with the releases of entities here (scripts\coop_mods_item_state).
 int l_event_tick(lua_State* L)
@@ -1271,18 +1156,6 @@ bool back_in_main_menu()
 	return menu && menu->IsActive();
 }
 
-void set_field(lua_State* L, const char* name, const std::string& v)
-{
-	lua_pushlstring(L, v.data(), v.size());
-	lua_setfield(L, -2, name);
-}
-
-void set_field(lua_State* L, const char* name, lua_Number v)
-{
-	lua_pushnumber(L, v);
-	lua_setfield(L, -2, name);
-}
-
 void set_list(lua_State* L, const char* name, const std::vector<std::string>& v)
 {
 	lua_newtable(L);
@@ -1308,17 +1181,17 @@ void deliver_rejection()
 	const bool ok = call_module("coop_ui", "on_rejected", [&r, &key, &log_path](lua_State* L)
 	{
 		lua_newtable(L);
-		set_field(L, "reason", std::string(reject_reason_name(r.reason)));
-		set_field(L, "code", lua_Number(u8(r.reason)));
-		set_field(L, "text", r.text);
+		lua_api::set_str(L, "reason", std::string(reject_reason_name(r.reason)));
+		lua_api::set_num(L, "code", lua_Number(u8(r.reason)));
+		lua_api::set_str(L, "text", r.text);
 		set_list(L, "missing", r.missing);
 		set_list(L, "extra", r.extra);
 		set_list(L, "differ", r.differ);
-		set_field(L, "missing_total", lua_Number(r.missing_total));
-		set_field(L, "extra_total", lua_Number(r.extra_total));
-		set_field(L, "differ_total", lua_Number(r.differ_total));
-		set_field(L, "key_path", key);
-		set_field(L, "log_path", log_path);
+		lua_api::set_num(L, "missing_total", lua_Number(r.missing_total));
+		lua_api::set_num(L, "extra_total", lua_Number(r.extra_total));
+		lua_api::set_num(L, "differ_total", lua_Number(r.differ_total));
+		lua_api::set_str(L, "key_path", key);
+		lua_api::set_str(L, "log_path", log_path);
 		return 1;
 	});
 	if (ok)
@@ -1337,13 +1210,13 @@ void deliver_end_notice()
 	call_module("coop_ui", "on_session_end", [&n](lua_State* L)
 	{
 		lua_newtable(L);
-		set_field(L, "code", n.code);
-		set_field(L, "text", n.text);
+		lua_api::set_str(L, "code", n.code);
+		lua_api::set_str(L, "text", n.text);
 		return 1;
 	});
 }
 
-// --- co-op menu (W4) -----------------------------------------------------------------------------
+// --- co-op menu ----------------------------------------------------------------------------------
 
 void menu_error(const char* code, const std::string& text, bool by_user)
 {
@@ -1417,8 +1290,8 @@ void menu_pending_frame()
 		menu_cancel_pending("a session is already running");
 		return;
 	}
-	// pending-host clock (owner, live 2026-10-23): choosing faction and gear in the new game screen took over 15 min and
-	// the session silently never opened. The main menu up is the start flow, not a forgotten request: no clock there.
+	// pending-host clock: choosing faction and gear in the new game screen can take over 15 min, and the session must still open
+	// then. The main menu up is the start flow, not a forgotten request: no clock there.
 	CMainMenu* pending_menu = MainMenu();
 	if (pending_menu && pending_menu->IsActive())
 		g_menu.pending_ms = now; // pending-host clock: counts from the moment the main menu is gone
@@ -1480,13 +1353,7 @@ void copy_capped(const std::vector<std::string>& from, std::vector<std::string>&
 	to.assign(from.begin(), from.begin() + ptrdiff_t(from.size() < kMaxListed ? from.size() : kMaxListed));
 }
 
-// --- co-op menu: Lua side (W4) -------------------------------------------------------------------
-
-void set_bool(lua_State* L, const char* name, bool v)
-{
-	lua_pushboolean(L, v ? 1 : 0);
-	lua_setfield(L, -2, name);
-}
+// --- co-op menu: Lua side ------------------------------------------------------------------------
 
 // Port argument: nil/none -> kDefaultPort, else an integer 1..65535; false if invalid.
 bool arg_port(lua_State* L, int idx, u16& port)
@@ -1496,10 +1363,8 @@ bool arg_port(lua_State* L, int idx, u16& port)
 		port = kDefaultPort;
 		return true;
 	}
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const lua_Number v = lua_tonumber(L, idx);
-	if (v < 1 || v > 65535 || v != lua_Number(s32(v)))
+	double v = 0.0;
+	if (!lua_api::arg_whole(L, idx, 1.0, 65535.0, v))
 		return false;
 	port = u16(v);
 	return true;
@@ -1512,39 +1377,41 @@ int fail2(lua_State* L, const char* why)
 	return 2;
 }
 
-// coop.session_info() -> table (see coop_script.h). Never fails, works in the main menu.
+// coop.session_info() -> { phase, active, host, client, live, self_id, nick, port, address, players = { {id, nick, rtt, loss, joined,
+// is_self, is_host, address}, ... }, max_players, default_port, last_error, last_error_code, last_error_age, last_by_user,
+// pending_host, pending_age } (fields that do not apply are absent). Never fails, works in the main menu.
 int l_session_info(lua_State* L)
 {
 	const Manager& m = mgr();
 	const u64 now = m.now_ms();
 	lua_newtable(L);
-	set_field(L, "phase", std::string(phase_name(m.phase())));
-	set_bool(L, "active", m.active());
-	set_bool(L, "host", decides_world());
-	set_bool(L, "client", net::client());
-	set_bool(L, "live", net::live());
-	set_field(L, "self_id", m.active() && m.self() != kInvalidPeer ? lua_Number(m.self()) : lua_Number(-1));
-	set_field(L, "nick", std::string(m.nick()));
-	// F5-SEAT-1: the session's seats, the mode's number (co-op 8, the server 16): a host's own config, a client's Welcome. Nil outside a
+	lua_api::set_str(L, "phase", std::string(phase_name(m.phase())));
+	lua_api::set_bool(L, "active", m.active());
+	lua_api::set_bool(L, "host", decides_world());
+	lua_api::set_bool(L, "client", net::client());
+	lua_api::set_bool(L, "live", net::live());
+	lua_api::set_num(L, "self_id", m.active() && m.self() != kInvalidPeer ? lua_Number(m.self()) : lua_Number(-1));
+	lua_api::set_str(L, "nick", std::string(m.nick()));
+	// the session's seats, the mode's number (co-op 8, the server 16): a host's own config, a client's Welcome. Nil outside a
 	// session and before the Welcome: the scripts say their own then (coop_menu.max_players)
 	if (const u32 seats = m.active() ? m.session().max_players() : 0)
-		set_field(L, "max_players", lua_Number(seats));
-	set_field(L, "default_port", lua_Number(kDefaultPort));
+		lua_api::set_num(L, "max_players", lua_Number(seats));
+	lua_api::set_num(L, "default_port", lua_Number(kDefaultPort));
 	if (m.active() && g_menu.port)
-		set_field(L, "port", lua_Number(g_menu.port));
+		lua_api::set_num(L, "port", lua_Number(g_menu.port));
 	if (net::client() && !g_menu.address.empty())
-		set_field(L, "address", g_menu.address);
+		lua_api::set_str(L, "address", g_menu.address);
 	if (!g_menu.last_error.empty())
 	{
-		set_field(L, "last_error", g_menu.last_error);
-		set_field(L, "last_error_code", g_menu.last_code);
-		set_field(L, "last_error_age", lua_Number(now - g_menu.last_ms));
-		set_bool(L, "last_by_user", g_menu.last_by_user);
+		lua_api::set_str(L, "last_error", g_menu.last_error);
+		lua_api::set_str(L, "last_error_code", g_menu.last_code);
+		lua_api::set_num(L, "last_error_age", lua_Number(now - g_menu.last_ms));
+		lua_api::set_bool(L, "last_by_user", g_menu.last_by_user);
 	}
 	if (g_menu.pending)
 	{
-		set_field(L, "pending_host", lua_Number(g_menu.pending_port));
-		set_field(L, "pending_age", lua_Number(now - g_menu.pending_ms));
+		lua_api::set_num(L, "pending_host", lua_Number(g_menu.pending_port));
+		lua_api::set_num(L, "pending_age", lua_Number(now - g_menu.pending_ms));
 	}
 
 	// players: this machine first, then the session's peers (client: host + the PeerList)
@@ -1556,15 +1423,15 @@ int l_session_info(lua_State* L)
 	{
 		const PeerId id = row.id;
 		lua_newtable(L);
-		set_field(L, "id", lua_Number(id));
-		set_field(L, "nick", std::string(nick ? nick : ""));
-		set_field(L, "rtt", lua_Number(rtt));
-		set_field(L, "loss", lua_Number(loss));
-		set_bool(L, "joined", joined);
-		set_bool(L, "is_self", self);
-		set_bool(L, "is_host", roster::host_badge(row, host_plays)); // plan 2026-11-12 stage 3 (coop_roster.h)
+		lua_api::set_num(L, "id", lua_Number(id));
+		lua_api::set_str(L, "nick", std::string(nick ? nick : ""));
+		lua_api::set_num(L, "rtt", lua_Number(rtt));
+		lua_api::set_num(L, "loss", lua_Number(loss));
+		lua_api::set_bool(L, "joined", joined);
+		lua_api::set_bool(L, "is_self", self);
+		lua_api::set_bool(L, "is_host", roster::host_badge(row, host_plays)); // coop_roster.h
 		if (address && *address)
-			set_field(L, "address", std::string(address));
+			lua_api::set_str(L, "address", std::string(address));
 		lua_rawseti(L, -2, ++index);
 	};
 	if (m.active())
@@ -1573,13 +1440,12 @@ int l_session_info(lua_State* L)
 		const PeerInfo me = self_row(self);
 		if (self != kInvalidPeer && roster::listed(me)) // a world server's own seat is no player (coop_roster.h)
 			push_player(me, m.nick(), 0, 0.f, true, true, nullptr);
-		for (const PeerInfo& p : m.session().peers())
+		m.session().for_each_joined([&push_player, self](const PeerInfo& p)
 		{
-			if (p.id == self || !roster::listed(p))
-				continue;
-			push_player(p, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
-			    decides_world() ? p.address.c_str() : nullptr);
-		}
+			if (p.id != self && roster::listed(p))
+				push_player(p, p.nick.c_str(), p.rtt_ms, p.packet_loss, p.state == PeerState::Joined, false,
+				    decides_world() ? p.address.c_str() : nullptr);
+		});
 	}
 	lua_setfield(L, -2, "players");
 	return 1;
@@ -1669,7 +1535,7 @@ int l_disconnect(lua_State* L)
 	return 1;
 }
 
-// --- W5 glue for the W4 scripts ---------------------------------------------------------------
+// --- glue for the menu and HUD scripts ---------------------------------------------------------
 
 // coop.spot_is_local(type) -> bool
 int l_spot_is_local(lua_State* L)
@@ -1848,19 +1714,7 @@ int l_bleed_left(lua_State* L)
 	return 1;
 }
 
-void set_num(lua_State* L, const char* name, lua_Number v)
-{
-	lua_pushnumber(L, v);
-	lua_setfield(L, -2, name);
-}
-
-void set_str(lua_State* L, const char* name, const char* v)
-{
-	lua_pushstring(L, v ? v : "");
-	lua_setfield(L, -2, name);
-}
-
-// HUD v2 part 2 (docs/HUD_V2.md, scripts\coop_hud_revive.script): coop.revive_progress() -> nil | table; nil without a session
+// coop.revive_progress() (docs/HUD_V2.md, scripts\coop_hud_revive.script) -> nil | table; nil without a session
 // or when I neither hold USE on a wounded teammate nor lie wounded myself. A table has only the parts that apply:
 //   reviving   = { peer, avatar_id, nick, progress 0..1, ms_left, item = "medkit"|"stimpack", section, sent }  I revive
 //                somebody (sent: the hold is over, the Request is out, up to 3 s until coop_revive_done)
@@ -1882,14 +1736,14 @@ int l_revive_progress(lua_State* L)
 	{
 		lua_newtable(L);
 		if (p.target_peer != kInvalidPeer)
-			set_num(L, "peer", lua_Number(p.target_peer));
+			lua_api::set_num(L, "peer", lua_Number(p.target_peer));
 		if (p.target_local != 0xffff)
-			set_num(L, "avatar_id", lua_Number(p.target_local));
-		set_str(L, "nick", p.target_nick.c_str());
-		set_num(L, "progress", lua_Number(p.reviving_fraction));
-		set_num(L, "ms_left", lua_Number(p.reviving_left_ms));
-		set_str(L, "item", p.item_kind);
-		set_str(L, "section", p.item_section.c_str());
+			lua_api::set_num(L, "avatar_id", lua_Number(p.target_local));
+		lua_api::set_str(L, "nick", p.target_nick.c_str());
+		lua_api::set_num(L, "progress", lua_Number(p.reviving_fraction));
+		lua_api::set_num(L, "ms_left", lua_Number(p.reviving_left_ms));
+		lua_api::set_str(L, "item", p.item_kind);
+		lua_api::set_str(L, "section", p.item_section.c_str());
 		lua_pushboolean(L, p.reviving_sent ? 1 : 0);
 		lua_setfield(L, -2, "sent");
 		lua_setfield(L, -2, "reviving");
@@ -1898,26 +1752,26 @@ int l_revive_progress(lua_State* L)
 	{
 		lua_newtable(L);
 		if (p.by_peer != kInvalidPeer)
-			set_num(L, "peer", lua_Number(p.by_peer));
+			lua_api::set_num(L, "peer", lua_Number(p.by_peer));
 		if (p.by_local != 0xffff)
-			set_num(L, "avatar_id", lua_Number(p.by_local));
-		set_str(L, "nick", p.by_nick.c_str());
-		set_num(L, "progress", lua_Number(p.by_fraction));
-		set_num(L, "ms_left", lua_Number(p.by_left_ms));
+			lua_api::set_num(L, "avatar_id", lua_Number(p.by_local));
+		lua_api::set_str(L, "nick", p.by_nick.c_str());
+		lua_api::set_num(L, "progress", lua_Number(p.by_fraction));
+		lua_api::set_num(L, "ms_left", lua_Number(p.by_left_ms));
 		lua_setfield(L, -2, "revived_by");
 	}
 	if (p.giving_up)
 	{
 		lua_newtable(L);
-		set_num(L, "progress", lua_Number(p.giveup_fraction));
-		set_num(L, "ms_left", lua_Number(p.giveup_left_ms));
+		lua_api::set_num(L, "progress", lua_Number(p.giveup_fraction));
+		lua_api::set_num(L, "ms_left", lua_Number(p.giveup_left_ms));
 		lua_setfield(L, -2, "give_up");
 	}
 	if (p.wounded)
 	{
 		lua_newtable(L);
-		set_num(L, "left_ms", lua_Number(p.bleed_left_ms));
-		set_num(L, "total_ms", lua_Number(p.bleed_total_ms));
+		lua_api::set_num(L, "left_ms", lua_Number(p.bleed_left_ms));
+		lua_api::set_num(L, "total_ms", lua_Number(p.bleed_total_ms));
 		lua_setfield(L, -2, "bleed");
 	}
 	return 1;
@@ -1978,7 +1832,7 @@ int l_avatar_headlamp(lua_State* L)
 	return 4;
 }
 
-// W11: coop.talk_holder(npc_id) -> peer id of the player talking to that NPC (host only; 0 = the host
+// coop.talk_holder(npc_id) -> peer id of the player talking to that NPC (host only; 0 = the host
 // himself), nil if nobody, on a client or without a session.
 int l_talk_holder(lua_State* L)
 {
@@ -1996,7 +1850,7 @@ int l_talk_holder(lua_State* L)
 	return 1;
 }
 
-// Ruling F2-34 (F2 T12 round 2): coop.talk_recent(peer, npc_id, ms) -> true if player `peer` holds the talk lock of
+// coop.talk_recent(peer, npc_id, ms) -> true if player `peer` holds the talk lock of
 // NPC npc_id (host numbering) now or held it no more than ms ago (ms within 0..60000); false otherwise, on a client and
 // on bad arguments. coop_npc_companions takes a client's recruit only right after a talk.
 int l_talk_recent(lua_State* L)
@@ -2018,28 +1872,68 @@ int l_protocol(lua_State* L)
 	return 1;
 }
 
+// A peer id from argument `idx`: a whole number 0 .. kInvalidPeer - 1.
+bool arg_peer_id(lua_State* L, int idx, PeerId& out)
+{
+	uint32_t v = 0;
+	if (!lua_api::arg_whole_u32(L, idx, double(kInvalidPeer - 1), v))
+		return false;
+	out = PeerId(v);
+	return true;
+}
+
+// coop.is_player_peer(from) -> bool: `from` is a player's slot (0 the host's seat, 1 .. kMaxPlayers the clients), not a map
+// server's link. Anything but a peer id: false.
+int l_is_player_peer(lua_State* L)
+{
+	PeerId peer = kInvalidPeer;
+	lua_pushboolean(L, arg_peer_id(L, 1, peer) && peer < kMaxPeerSlots ? 1 : 0);
+	return 1;
+}
+
+// coop.is_map_link(from) -> bool: `from` is no player's slot, so the link of a map server (the only connections whose ids lie past
+// the player slots; a map server's id is no slot by the protocol). Anything but a peer id: false.
+int l_is_map_link(lua_State* L)
+{
+	PeerId peer = kInvalidPeer;
+	lua_pushboolean(L, arg_peer_id(L, 1, peer) && peer >= kMaxPeerSlots ? 1 : 0);
+	return 1;
+}
+
+// coop.mode_stamp() -> integer: the same number on two calls only if no answer of the mode facade can have changed between them
+// (xrCoop/coop_mode_stamp.h; the places that bump it: Manager::frame). Exists in every process, in a session or not.
+int l_mode_stamp(lua_State* L)
+{
+	lua_pushnumber(L, lua_Number(g_mode_stamp.now()));
+	return 1;
+}
+
 void register_raw(lua_State* L)
 {
+	g_mode_stamp.bump(); // a new Lua state: a level starts or is loaded
 	static const luaL_Reg fns[] = {
 		{"players", &l_players},
-		{"server_link", &l_server_link}, // plan 2026-11-12 stage 3
+		{"server_link", &l_server_link},
 		{"has_host_rights", &l_has_host_rights},
 		{"operator_command", &l_operator_command},
 		{"members", &l_members},
 		{"avatar_of", &l_avatar_of},
 		{"peer_of_avatar", &l_peer_of_avatar},
+		{"is_player_peer", &l_is_player_peer},
+		{"is_map_link", &l_is_map_link},
+		{"mode_stamp", &l_mode_stamp},
 		{"owners_known", &l_owners_known},
 		{"to_host_id", &l_to_host_id},
 		{"to_local_id", &l_to_local_id},
 		{"send_event", &l_send_event},
 		{"reserve_world_event", &l_reserve_world_event},
-		{"my_level", &l_own_level}, // S6: the guarded level of this process (coop_world_fx)
+		{"my_level", &levels::lua_my_level}, // the Core's scripts ask it without the server's table coop.levels
 		{"send_chat", &l_send_chat},
 		{"stash_set", &l_stash_set},
 		{"stash_get", &l_stash_get},
 		{"world_epoch", &l_world_epoch},
 		{"condition_carried", &l_condition_carried},
-		{"event_tick", &l_event_tick}, // F4 G3-1c: weapon riders bound to the instance (scripts\coop_mods_item_state)
+		{"event_tick", &l_event_tick}, // weapon riders bound to the instance (scripts\coop_mods_item_state)
 		{"released_after", &l_released_after},
 		{"session_info", &l_session_info},
 		{"host", &l_host},
@@ -2049,7 +1943,7 @@ void register_raw(lua_State* L)
 		{"spot_is_local", &l_spot_is_local},
 		{"story_hold_infos", &l_story_hold_infos},
 		{"story_local_task", &l_story_local_task},
-		{"story_task_audience", &l_story_task_audience}, // plan 2026-11-16 task audience: who sees a task
+		{"story_task_audience", &l_story_task_audience}, // who sees a task
 		{"story_resend_tasks", &l_story_resend_tasks},
 		{"life_of", &l_life_of},
 		{"out_of_run", &l_out_of_run},
@@ -2057,51 +1951,46 @@ void register_raw(lua_State* L)
 		{"rollback_pending", &l_rollback_pending},
 		{"saves_open", &l_saves_open},
 		{"bleed_left", &l_bleed_left},
-		{"revive_progress", &l_revive_progress}, // HUD v2 part 2: the revive / give-up holds for scripts\coop_hud_revive
+		{"revive_progress", &l_revive_progress}, // the revive / give-up holds for scripts\coop_hud_revive
 		{"player_safemode", &l_player_safemode},
 		{"avatar_headlamp", &l_avatar_headlamp}, // scripts\coop_hud_glare
 		{"instrument", &players::lua_instrument},
-		{"talk_holder", &l_talk_holder}, // W11
-		{"talk_recent", &l_talk_recent}, // F2 T12 round 2 (Ruling F2-34)
+		{"talk_holder", &l_talk_holder},
+		{"talk_recent", &l_talk_recent},
 		{"protocol", &l_protocol},
-		{"explode_as", &coop::requests::lua_explode_as}, // R3 В2 review: a planted charge goes off as its planter
-		{"lease_ids", &coop::requests::lua_lease_ids}, // F2 T12b: ids this client can create its own items with now
-		{"lease_waiting", &coop::requests::lua_lease_waiting}, // F2 T12b round 1: an item that waits for the host
-		{"writes", &coop::writing::lua_writes}, // R32 W1: this process writes the object (coop_mode.writes)
+		{"explode_as", &coop::requests::lua_explode_as}, // a planted charge goes off as its planter
+		{"lease_ids", &coop::requests::lua_lease_ids}, // ids this client can create its own items with now
+		{"lease_waiting", &coop::requests::lua_lease_waiting}, // an item that waits for the host
+		{"writes", &coop::writing::lua_writes}, // this process writes the object (coop_mode.writes)
 		{"search_window", &coop::trade::lua_search_window}, // what Anomaly's Lua inventory searches now (scripts\coop_mods_items)
+		{"trade_deal", &coop::trade::lua_trade_deal}, // the deal of a copy's Lua trade window (scripts\coop_trade_window)
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
+	if (!lua_api::fill(L, nullptr, fns))
 	{
-		lua_pop(L, 1);
 		::Msg("! [coop] script namespace 'coop' was not created, Lua API unavailable");
 		return;
 	}
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_pop(L, 1);
-	money::register_lua(L); // F2 T1: coop.money_give / money_grant / money_set / money_of / talk_lock_of
-	router::register_lua(L); // F2 T10: coop.route.of / runs / note / none_functions (scripts\coop_route.script)
-	syncapi::register_lua(L); // F2 T14: coop.sync.* (coop_sync_api.h)
-	game::register_lua(L); // Game settings T2: coop.game.* (coop_game_settings.h)
+	money::register_lua(L); // coop.money_give / money_grant / money_set / money_of / talk_lock_of
+	router::register_lua(L); // coop.route.of / runs / note / none_functions (scripts\coop_route.script)
+	syncapi::register_lua(L); // coop.sync.* (coop_sync_api.h)
+	game::register_lua(L); // coop.game.* (coop_game_settings.h)
 	join::register_lua(L); // transition wait: coop.transition() (coop_join.cpp, scripts\coop_hud_transition.script)
-	levels::register_lua(L); // F3a: coop.levels.*, coop.is_world_server / is_map_authority / is_player / is_mirror (coop_levels.cpp)
-	register_layers_lua(L); // S4 (A-S4H): the layers' own tables: the server's srv.* (srv/coop_srv_script.cpp)
-	debug::register_lua(L); // protocol 29: coop.debug.* (coop_debug.h)
-	objects::register_lua(L); // G11-2: coop.zone_path (coop_objects.h)
-	vehicles::register_lua(L); // F5: coop.vehicle.status / exit (coop_vehicles.h)
-	progress::register_lua(L); // F5: coop.progress.budget / community_ok (coop_progress.h)
-	items::register_lua(L); // TZ R32 W8.4: coop.items.set_initial(id, t) (coop_initial_state.h)
-	player_touch::register_lua(L); // TZ P50: coop.player_touch_zones({id, ...}) (scripts\coop_transition_route.script)
+	levels::register_lua(L); // coop.levels.*, coop.is_world_server / is_player / is_mirror (coop_levels.cpp)
+	register_layers_lua(L); // the layers' own tables: the server's srv.* (srv/coop_srv_script.cpp)
+	debug::register_lua(L); // coop.debug.* (coop_debug.h)
+	objects::register_lua(L); // coop.zone_path (coop_objects.h)
+	vehicles::register_lua(L); // coop.vehicle.status / exit (coop_vehicles.h)
+	progress::register_lua(L); // coop.progress.* (coop_progress.h)
+	items::register_lua(L); // coop.items.set_initial(id, t) (coop_initial_state.h)
+	player_touch::register_lua(L); // coop.player_touch_zones({id, ...}) (scripts\coop_transition_route.script)
+	checkpoints::register_lua(L); // coop.checkpoint.* (coop_checkpoints.h)
+	rest::register_lua(L); // coop.rest.* (coop_rest.h)
+	autosave::register_lua(L); // coop.autosave.* (coop_autosave.h): the Restore window, coop_saves.script
 }
 } // namespace
 
-// F3a T7: ScriptEvent goes both ways (Either): each side has its own function, so that the host player's copy on the
+// ScriptEvent goes both ways (Either): each side has its own function, so that the host player's copy on the
 // internal channel never runs the world server's part.
 void install_server(Session& s)
 {
@@ -2122,7 +2011,7 @@ void reset()
 	g_chat.clear();
 	g_engine.clear();
 	g_stats = Stats();
-	g_pacer.reset(); // F2 T14
+	g_pacer.reset();
 	std::lock_guard<std::mutex> lock(g_release_lock);
 	g_releases.clear_kept();
 }
@@ -2154,6 +2043,7 @@ void unkeep_instance(u16 id)
 
 void frame()
 {
+	PROF_EVENT("coop/coop_script/frame");
 	if (!mgr().active())
 	{
 		if (!g_outbox.empty() || !g_inbox.empty() || !g_chat.empty() || !g_engine.empty())
@@ -2172,31 +2062,13 @@ void frame()
 	deliver_lost();
 }
 
-void on_transition_vote(const char* nick)
-{
-	EngineEvent e;
-	e.kind = EngineEvent::TransitionVote;
-	e.text = nick && *nick ? nick : "?";
-	push_engine_event(std::move(e));
-}
-
 void on_actor_revived(uint32_t reviver_peer, const char* medkit_section)
 {
-	EngineEvent e;
-	e.kind = EngineEvent::ActorRevived;
-	e.peer = reviver_peer;
-	e.text = medkit_section ? medkit_section : "";
-	push_engine_event(std::move(e));
+	queue_callback("coop_actor_revived", {reviver_peer == kInvalidPeer ? cb_nil() : cb_int(reviver_peer),
+	                                         medkit_section && *medkit_section ? cb_str(medkit_section) : cb_nil()});
 }
 
-void on_container_opened(uint32_t peer, u16 container_id)
-{
-	EngineEvent e;
-	e.kind = EngineEvent::ContainerOpened;
-	e.peer = peer;
-	e.id = container_id;
-	push_engine_event(std::move(e));
-}
+void on_container_opened(uint32_t peer, u16 container_id) { queue_callback("coop_on_container_opened", {cb_int(peer), cb_int(container_id)}); }
 
 CallbackArg cb_nil() { return CallbackArg(); }
 
@@ -2239,13 +2111,12 @@ void queue_callback(const char* name, std::initializer_list<CallbackArg> args)
 	if (!ok)
 	{
 		++g_stats.engine_invalid;
-		if (log_allowed(g_stats.engine_invalid))
+		if (lua_errors::line_allowed(g_stats.engine_invalid, kLogBurst))
 			::Msg("! [coop] engine callback '%.64s' dropped: bad name, %u arguments (max %u) or a string over %u bytes",
 			    name ? name : "(null)", u32(args.size()), u32(kMaxCallbackArgs), u32(kMaxCallbackStr));
 		return;
 	}
 	EngineEvent e;
-	e.kind = EngineEvent::Callback;
 	e.name.assign(name, n);
 	e.args.assign(args.begin(), args.end());
 	push_engine_event(std::move(e));
@@ -2348,7 +2219,7 @@ void print_status()
 	    s.delivered);
 	::Msg("[coop-lua] refused sends %llu, held for the host's rate %llu frames | dropped: invalid %llu, sender not ready "
 	      "%llu, overflow %llu, stale %llu, world-only %llu",
-	    s.send_rejected, s.send_held, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale, s.drop_world_only); // F2 T14
+	    s.send_rejected, s.send_held, s.drop_invalid, s.drop_not_ready, s.drop_overflow, s.drop_stale, s.drop_world_only);
 	::Msg("[coop-lua] lua errors %llu, missing handlers %llu, chat lines shown %llu | queued: out %u, in %u, chat %u",
 	    s.lua_errors, s.lua_missing, s.chat_delivered, (u32)g_outbox.size(), (u32)g_inbox.size(), (u32)g_chat.size());
 	::Msg("[coop-lua] stash %u keys / %u bytes (dropped at session end %llu) | refusals %llu: shown %llu, failed %llu, "
@@ -2362,7 +2233,7 @@ void print_status()
 	if (lua_ready())
 	{
 		call_lua("print_status", [](lua_State*) { return 0; });
-		call_module("coop_settings", "print_status", [](lua_State*) { return 0; }); // host-owned settings (W3d)
+		call_module("coop_settings", "print_status", [](lua_State*) { return 0; }); // host-owned settings
 	}
 }
 } // namespace script
@@ -2380,6 +2251,6 @@ void coop_script_registrator::script_register(lua_State* L)
 		def("self_id", &coop::script::l_self_id)
 	];
 	// Functions with arguments are plain C functions: a wrong argument from an addon returns nil/false
-	// instead of a luabind "no matching overload" error, which is fatal in this engine (R-11.4).
+	// instead of a luabind "no matching overload" error, which is fatal in this engine.
 	coop::script::register_raw(L);
 }

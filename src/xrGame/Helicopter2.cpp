@@ -44,7 +44,7 @@ void CHelicopter::TurnLighting(bool bOn)
 
 void CHelicopter::TurnEngineSound(bool bOn)
 {
-	m_coop_engine_on = bOn; // Anomaly Coop (audit H2): a volume cannot be read back
+	m_coop_engine_on = bOn; // coop: a volume cannot be read back
 	if (bOn)
 		m_engineSound.set_volume(1.0f);
 	else
@@ -118,10 +118,10 @@ void CHelicopter::ExplodeHelicopter()
 	CExplosive::GenExplodeEvent(Position(), Fvector().set(0.f, 1.f, 0.f));
 	m_brokenSound.stop();
 	m_layered_sounds.PlaySound("sndExplode", Position(), this, false);
-	coop::presence::on_heli_blast(this); // Anomaly Coop (audit W8)
+	coop::presence::on_heli_blast(this); // coop: the clients' copies blow up with it
 }
 
-// Anomaly Coop (audits H2, W8): a client's copy of the host's machine. The explosion itself comes as any other (coop_objects).
+// coop: a client's copy of the host's machine. The explosion itself comes as any other (coop_objects).
 void CHelicopter::coop_blast()
 {
 	m_brokenSound.stop();
@@ -376,7 +376,7 @@ void CHelicopter::DieHelicopter()
 
 		///PPhysicsShell()=P_build_Shell	(this,false);
 		PPhysicsShell()->EnabledCallbacks(TRUE);
-		if (!coop::is_mirror()) // Anomaly Coop (audit W8): the wreck blows up on the host's contact
+		if (!coop::is_mirror()) // coop: the wreck blows up on the host's contact
 			PPhysicsShell()->set_ObjectContactCallback(CollisionCallbackDead);
 		PPhysicsShell()->set_ContactCallback(ContactShotMark);
 	}
@@ -398,7 +398,7 @@ void CHelicopter::DieHelicopter()
 	m_engineSound.stop();
 	processing_deactivate();
 	m_dead = true;
-	coop::presence::on_heli_state(this, coop_flags(), 0.f, coop_aim()); // Anomaly Coop (audit W8): the last report
+	coop::presence::on_heli_state(this, coop_flags(), 0.f, coop_aim()); // coop: the last report
 }
 
 void SHeliEnemy::Load(LPCSTR section)

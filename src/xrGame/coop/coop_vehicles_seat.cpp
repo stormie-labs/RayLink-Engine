@@ -1,6 +1,6 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players (F5-VEH-2, docs/VEHICLES.md): the decider. Declarations: coop_vehicles.h; pure rules:
-// xrCoop/coop_vehicle_rules.h (F5-VEH-1) and xrCoop/coop_vehicle_drive_rules.h (this unit).
+// Anomaly Coop — vehicles for players (docs/VEHICLES.md): the decider. Declarations: coop_vehicles.h; pure rules:
+// xrCoop/coop_vehicle_rules.h and xrCoop/coop_vehicle_drive_rules.h.
 //
 // The process that decides for a player's level (the co-op host; in the Server mode the map server of his level, whose session
 // peers are the players there) seats players in cars, drives a client's car without an Owner and lets him out. The seat table
@@ -25,7 +25,8 @@
 #include "coop_join.h"
 #include "coop_players.h"
 #include "coop_survival.h"
-#include "coop_vehicles_ride.h" // F5-VEH-5: the passenger places (seat counts, seat_transform, the door of a seat)
+#include "coop_world.h"
+#include "coop_vehicles_ride.h" // the passenger places (seat counts, seat_transform, the door of a seat)
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_vehicle_drive_rules.h"
 
@@ -153,8 +154,6 @@ struct State
 
 State g;
 
-u64 now_ms() { return mgr().now_ms(); }
-
 TrustMode read_trust_mode(const char* name)
 {
 	// gamedata/configs/mod_system_coop_trust.ltx [coop_trust] (system.ltx includes mod_system_*.ltx): the line of the check,
@@ -179,21 +178,9 @@ bool trust(TrustCheck c, bool ok, const char* text)
 	return r.pass;
 }
 
-CCar* car_here(u16 id)
-{
-	if (id == kNoCar)
-		return nullptr;
-	CObject* o = Level().Objects.net_Find(id);
-	return o && !o->getDestroy() ? smart_cast<CCar*>(o) : nullptr;
-}
+CCar* car_here(u16 id) { return smart_cast<CCar*>(world::object_here(id)); }
 
-CAI_Stalker* body_here(u16 character)
-{
-	if (character == kNoCharacter)
-		return nullptr;
-	CObject* o = Level().Objects.net_Find(character);
-	return o && !o->getDestroy() ? smart_cast<CAI_Stalker*>(o) : nullptr;
-}
+CAI_Stalker* body_here(u16 character) { return smart_cast<CAI_Stalker*>(world::object_here(character)); }
 
 u16 own_character()
 {
@@ -209,8 +196,8 @@ bool decides_own_actor()
 	return g.installed && own != kNoCharacter && mode().decider_of(own) == Decider::This;
 }
 
-// Seats of a car: the driver's and the passenger places of configs/coop_vehicles.ltx for its section (F5-VEH-5); the driver's
-// alone without them (a stock car).
+// Seats of a car: the driver's and the passenger places of configs/coop_vehicles.ltx for its section
+// (coop_vehicles_ride.cpp); the driver's alone without them (a stock car).
 u8 seat_count(CCar* car) { return car_seat_count(car); }
 
 bool has_driver_place(CCar* car)
@@ -273,7 +260,7 @@ Fvector exit_position(CCar* car, const Sitter& s)
 		return s.car_pos;
 	Fvector stock = car->ExitPosition();
 	if (s.seat != kDriverSeat)
-		passenger_exit(car, s.seat, stock); // F5-VEH-5: a passenger's door (exit_<i>); the stock point when the seat has none here
+		passenger_exit(car, s.seat, stock); // a passenger's door (exit_<i>); the stock point when the seat has none here
 	const Fbox& box = car->BoundingBox();
 	Fvector half, local_centre, centre;
 	box.getradius(half);
@@ -417,13 +404,13 @@ void seated_now(u16 character, PeerId peer, CCar* car, u8 seat, bool own)
 		drive_on(*car);
 		Driver& d = g.drivers[character];
 		d = Driver();
-		d.track.start(car->ID(), u32(now_ms()));
+		d.track.start(car->ID(), u32(mgr().now_ms()));
 	}
 	if (!own)
 	{
 		park(character, s, car);
 		s.exit = exit_position(car, s); // save_position from the first frame
-		s.exit_at = now_ms();
+		s.exit_at = mgr().now_ms();
 	}
 	++g.stats.granted;
 	send_all(SeatMsg::granted(car->ID(), seat, character));
@@ -667,7 +654,7 @@ void on_request(PeerId from, Reader& r)
 	const u16 character = asker(from);
 	if (character == kNoCharacter)
 		return refuse(from, m.car, m.seat, kNoCharacter, Refusal::NoCharacter);
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	switch (m.op)
 	{
 	case ReqOp::Enter: on_enter(from, m, character, now); break;
@@ -695,7 +682,7 @@ void on_input(PeerId from, Reader& r)
 		++g.stats.inputs_not_driving; // not a verdict: dropped, always (docs/VEHICLES.md §6)
 		return;
 	}
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	const bool admitted = it->second.gate.admit(u32(now));
 	string256 text = "";
 	if (!admitted)
@@ -810,9 +797,10 @@ void park_all(u64 now)
 // A player who came to the map or finished loading it: a granted for every held seat, to him.
 void arrivals()
 {
-	std::vector<std::pair<PeerId, bool>> peers;
-	for (const PeerInfo& p : mgr().session().peers())
-		peers.push_back({p.id, p.state == PeerState::Joined && mode().where(p.id) == Where::Here});
+	static std::vector<std::pair<PeerId, bool>> peers; // scratch of this frame: cleared, not freed
+	peers.clear();
+	mgr().session().for_each_joined(
+	    [](const PeerInfo& p) { peers.push_back({p.id, p.state == PeerState::Joined && mode().where(p.id) == Where::Here}); });
 	for (const PeerId peer : g.arrivals.update(peers))
 		for (const auto& it : g.sitters)
 			send_to(peer, SeatMsg::granted(it.second.car, it.second.seat, it.first));
@@ -852,8 +840,8 @@ void server_frame()
 		g.world = world;
 		return;
 	}
-	const u64 now = now_ms();
-	// a load gives the host's own actor his car back through the stock: his row comes back here (rv_F5-VEH-2 should-fix)
+	const u64 now = mgr().now_ms();
+	// a load gives the host's own actor his car back through the stock: his row comes back here
 	if (CActor* a = Actor())
 		if (CCar* held = smart_cast<CCar*>(a->Holder()))
 			note_stock_owner(held);
@@ -873,7 +861,7 @@ bool seat_transform(CCar* car, u8 seat, Fmatrix& out)
 	if (!car)
 		return false;
 	if (seat != kDriverSeat)
-		return passenger_seat(car, seat, out); // F5-VEH-5: the passenger places of configs/coop_vehicles.ltx (coop_vehicles_ride.cpp)
+		return passenger_seat(car, seat, out); // the passenger places of configs/coop_vehicles.ltx (coop_vehicles_ride.cpp)
 	IKinematics* K = smart_cast<IKinematics*>(car->Visual());
 	if (!K)
 		return false;
@@ -981,7 +969,7 @@ void print_status()
 	for (u8 i = 0; i < TrustChecks; ++i)
 		trust_text += std::string(i ? ", " : "") + kTrustNames[i] + " [" + trust_mode_name(g.trust_mode[i]) + "] " +
 		    std::to_string(g.trust_count[i].failed) + "/" + std::to_string(g.trust_count[i].checked);
-	const std::string counters = stats_text(g.stats, g.inputs.rate(now_ms()));
+	const std::string counters = stats_text(g.stats, g.inputs.rate(mgr().now_ms()));
 	::Msg("[coop]   vehicles: %u seated in %u car(s) [car/seat=character:%s], %u driven by clients; %s; trust: %s", u32(g.table.seated()),
 	    u32(g.table.cars()), rows.empty() ? " none" : rows.c_str(), u32(g.drivers.size()), counters.c_str(), trust_text.c_str());
 }

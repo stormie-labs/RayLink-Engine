@@ -1,15 +1,17 @@
 // Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the server's console commands (docs/MODES.md section 6, "Консольные команды"; step S4 of
-// docs/plans/2026-11-18-two-modes.md, unit A-S4H): srv_levels_status, srv_levels_audit, srv_max_map_servers, srv_mapserver_linger,
-// srv_map_servers_rev. Moved from coop_levels.cpp (levels::register_console). Step S8 removes the old names for status and audit.
+// Anomaly Coop — the server's console commands (docs/MODES.md section 6, "Консольные команды"): srv_levels_status,
+// srv_levels_audit, srv_max_map_servers, srv_mapserver_linger, srv_map_servers_rev, srv_netstats, coop_mapserver_stats and the
+// dedicated host's operator commands (srv/coop_dedicated.cpp).
 //
-// The three settings are machine settings saved in user.ltx, under the srv_* name only (review A-REV-E-1, finding 7); their values live
-// where the levels read them (coop_levels.cpp, levels::g_coop_max_map_servers ...), so a value read under either name is the one in
-// force. The bounds are those of build 50 (levels::settle_machine_settings moves the old defaults once a machine).
+// The three settings are machine settings saved in user.ltx, under the srv_* name only; their values live where the levels read
+// them (coop_levels.cpp, levels::g_coop_max_map_servers ...), so a value read under either name is the one in force
+// (levels::settle_machine_settings moves the old defaults once a machine).
 // Registered once at the start of the process, with the Core's commands, by the server's layer (srv/coop_srv_mode.cpp
 // ServerLayer::register_console, through the switchboard: coop_mode.cpp register_layers_console).
 #include "stdafx.h"
 #include "coop/srv/coop_dedicated.h"
+#include "coop/srv/coop_mapserver_stats.h"
+#include "coop/srv/coop_srv_layer.h"
 #include "coop/coop_levels.h"
 #include "coop/coop_manager.h"
 #include "../../../xrEngine/XR_IOConsole.h"
@@ -20,7 +22,7 @@ namespace coop
 {
 namespace levels
 {
-extern int g_coop_map_servers_rev; // coop_levels.cpp: saved, the two above were moved to build 50's defaults
+extern int g_coop_map_servers_rev; // coop_levels.cpp: saved, the two above were moved to their current defaults
 } // namespace levels
 
 namespace srv
@@ -93,7 +95,7 @@ void register_console()
 	CMD4(CCC_Integer, "srv_max_map_servers", &levels::g_coop_max_map_servers, 0, 7);
 	// machine setting, seconds, default 600: how long the map emptied last stays; every other empty map at most 60 s, none with < 2 GB free
 	CMD4(CCC_Integer, "srv_mapserver_linger", &levels::g_coop_mapserver_linger, 0, 3600);
-	CMD4(CCC_Integer, "srv_map_servers_rev", &levels::g_coop_map_servers_rev, 0, 1); // saved: the two above were moved to build 50's defaults
+	CMD4(CCC_Integer, "srv_map_servers_rev", &levels::g_coop_map_servers_rev, 0, 1); // saved: the two above were moved to their current defaults
 	CMD1(CCC_SrvLevelsStatus, "srv_levels_status");
 	CMD1(CCC_SrvLevelsAudit, "srv_levels_audit");
 	if (dedicated::on())
@@ -105,6 +107,9 @@ void register_console()
 	CMD4(CCC_SrvOldName, "coop_max_map_servers", &levels::g_coop_max_map_servers, 0, 7);
 	CMD4(CCC_SrvOldName, "coop_mapserver_linger", &levels::g_coop_mapserver_linger, 0, 3600);
 	CMD4(CCC_SrvOldName, "coop_map_servers_rev", &levels::g_coop_map_servers_rev, 0, 1);
+
+	register_mapserver_stats_console();
+	dedicated::register_console(); // coop_players, coop_kick, coop_time, coop_world, coop_console_log
 }
 } // namespace srv
 } // namespace coop

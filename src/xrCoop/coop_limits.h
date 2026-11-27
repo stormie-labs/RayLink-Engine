@@ -1,11 +1,11 @@
-// Anomaly Coop — what a host takes from a client: message rates per type (F2 T3) and new player characters per
-// session (Ruling F2-10 b). The game installs the rates (coop_join install) and keeps the character count (coop_join).
-// F2 T14: a client paces itself by the same rates (Pacer; coop_script.cpp script events, coop_sync_api.cpp).
-// F2 T3b: the story, shot, item, trade, object and request messages got rows too (Ruling F2-15); F2 T3c: the player stream,
-// the life states and the chat (a core message, taken by Session::handle_chat) did too, and the story outbox of a client
+// Anomaly Coop — what a host takes from a client: message rates per type and new player characters per
+// session. The game installs the rates (coop_join install) and keeps the character count (coop_join).
+// A client paces itself by the same rates (Pacer; coop_script.cpp script events, coop_sync_api.cpp).
+// The story, shot, item, trade, object and request messages have rows too, and so do the player stream, the life states
+// and the chat (a core message, taken by Session::handle_chat); and the story outbox of a client
 // (Outbox) merges relations and keeps them in a lane of their own. Still without a row: the join lifecycle, TimeRequest,
 // the dialog choice, PlayerAnim / PlayerGrenade (no handler) and the blobs (their own limits).
-// Parity audit D11: ReqMoney is a Pacer's message now (coop_money.cpp client_flush).
+// ReqMoney is a Pacer's message now (coop_money.cpp client_flush).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -17,6 +17,7 @@
 #include <string>
 #include <utility>
 
+#include "coop_bucket.h"
 #include "coop_protocol.h"
 
 namespace coop
@@ -34,59 +35,59 @@ struct RateRule
 };
 
 constexpr RateRule kClientRateRules[] = {
-	// R2 I4: a client asks for an entity it misses (P3); a modified one could ask for the whole world in a loop, each
+	// A client asks for an entity it misses (P3); a modified one could ask for the whole world in a loop, each
 	// answer a full spawn packet. 20 per second after a burst.
 	{Msg::StateDumpRequest, 64, 50},
-	// Parity audit D1: the rows of a bucket whose digest differs twice in a row (coop_reconcile.h), each a few KB. A client
+	// The rows of a bucket whose digest differs twice in a row (coop_reconcile.h), each a few KB. A client
 	// that missed a stretch of the world differs in every bucket: one round in a row, then 4 a second.
 	{Msg::EntityResync, 32, 250},
-	// T12 review (Ruling 18): an honest client votes when it touches a level exit. Protocol 10 (the waiting point of a
+	// An honest client votes when it touches a level exit (the waiting point of a
 	// level change): ready when he steps into the zone, cancel when he steps out, "still here" every kClaimRefreshMs, and the
 	// client asks again only when the host's board does not show what he did (transition::Intent, paced by Pacer: 2 in a row,
 	// then one per 2.5 s). One per 2 s after a burst of 4 on the host.
 	{Msg::TransitionVote, 4, 2000},
-	// F2 T3: sent on a change and every 5 s, checked every 500 ms (coop_equip.cpp kEquipCheckMs, kEquipRefreshMs).
+	// Sent on a change and every 5 s, checked every 500 ms (coop_equip.cpp kEquipCheckMs, kEquipRefreshMs).
 	{Msg::PlayerEquip, 8, 400},
-	// F2 T3: every 2 s (coop_equip.cpp kVitalsMs).
+	// Every 2 s (coop_equip.cpp kVitalsMs).
 	{Msg::PlayerVitals, 4, 1000},
-	// F2 T3: map spots a player's game adds or removes (coop_story); a quest step adds a few at once.
+	// Map spots a player's game adds or removes (coop_story); a quest step adds a few at once.
 	{Msg::MapSpot, 32, 250},
-	// F2 T3: info portions a player's game gives (coop_story); a dialog or quest step gives a batch.
+	// Info portions a player's game gives (coop_story); a dialog or quest step gives a batch.
 	{Msg::InfoPortion, 64, 50},
-	// F2 T3: a full story resend for the client: after a hash mismatch (StoryHash every 10 s), at join, console.
+	// A full story resend for the client: after a hash mismatch (StoryHash every 10 s), at join, console.
 	{Msg::StoryResync, 4, 5000},
-	// F2 T3: Lua RPC of mods (coop_script), 50 per second after a burst.
+	// Lua RPC of mods (coop_script), 50 per second after a burst.
 	{Msg::ScriptEvent, 64, 20},
-	// F2 T3: one per money change of the player's own game (coop_money queue_change), 10 per second after a burst.
+	// One per money change of the player's own game (coop_money queue_change), 10 per second after a burst.
 	{Msg::ReqMoney, 32, 100},
-	// F2 T1 review: a talk lock is asked once per talk window opened (a request waits for its answer up to 10 s) and
+	// A talk lock is asked once per talk window opened (a request waits for its answer up to 10 s) and
 	// refreshed every 30 s while the talk lasts (coop_dialog.cpp kPendingTimeoutMs, kKeepAliveMs). 10 covers a player
 	// clicking an NPC that is busy, then one per second.
 	{Msg::DialogLock, 10, 1000},
-	// Protocol 8: a player with a new key sends his choice of character when he presses Done (the window waits for the
+	// A player with a new key sends his choice of character when he presses Done (the window waits for the
 	// answer); a refused choice is sent again after a change. Each one runs the host's Lua check and, when accepted, a
 	// world save. One per 2 s after a burst; a choice nobody asked for is ignored anyway (coop_join, newchar::Choosers).
 	{Msg::CharChoice, 4, 2000},
-	// F3: one per tent the player places (the stock use of a sleeping bag, an animation, then picking the tent up again
-	// before the next one); the host answers each claim at once - it puts the tent up or packs it up (F3a T7: the host
+	// One per tent the player places (the stock use of a sleeping bag, an animation, then picking the tent up again
+	// before the next one); the host answers each claim at once - it puts the tent up or packs it up (the host
 	// player's too, no claim waits for a tent any more). One per 2 s after a burst.
 	{Msg::CheckpointClaim, 4, 2000},
-	// F3: the player lies down at his rest spot or gets up (the doze window, any time); the plan's host limit is one
+	// The player lies down at his rest spot or gets up (the doze window, any time); the host's limit is one
 	// per second. 4 covers a quick lie down / get up / lie down.
 	{Msg::RestRequest, 4, 1000},
-	// F3: hardcore, one per death: the dead player holds USE 3 s (or coop_new_character) and the host stashes all his
+	// Hardcore, one per death: the dead player holds USE 3 s (or coop_new_character) and the host stashes all his
 	// gear and sends him the world again. A double press, then one per 5 s.
 	{Msg::NewCharacter, 2, 5000},
-	// F2 T14: coop.sync changes of a player's own data and of his items (a mod writes them on its events: a shot, an
+	// coop.sync changes of a player's own data and of his items (a mod writes them on its events: a shot, an
 	// item used, a perk; Lua protocols over coop.send_event move here), as many as script events.
 	{Msg::SyncSet, 64, 20},
-	// F2 T14: coop.sync.request runs a handler of the host's Lua; per handler name the host limits it again (20 in a row,
+	// coop.sync.request runs a handler of the host's Lua; per handler name the host limits it again (20 in a row,
 	// 10 per second by default, coop.sync.limit). 20 per second in all after a burst.
 	{Msg::SyncRequest, 32, 50},
 
-	// F2 T3b (Ruling F2-15): the rest of what a client sends. An honest sender is never dropped: a row is above the honest
+	// The rest of what a client sends. An honest sender is never dropped: a row is above the honest
 	// cadence of the sender's code, or, where the code does not bound it, at 4 x the best estimate (marked "estimate"
-	// here and in task-3b-report.md). The story outbox goes by Pacer (T14), so its rows only need to take what the
+	// here). The story outbox goes by Pacer, so its rows only need to take what the
 	// pacer lets out: a backlog waits in the outbox (coop_story.cpp flush_outbox).
 	// A quest step gives a few tasks at once and completes some (estimate: 8, about one a second), 4 x that.
 	{Msg::TaskUpdate, 32, 250},
@@ -99,14 +100,13 @@ constexpr RateRule kClientRateRules[] = {
 	// bounds it (estimate: 1200 rpm = 20 a second), plus one per reload. 4 x that, 32 in a row (1.6 s of full fire).
 	{Msg::PlayerShot, 32, 12},
 	// Entering the world sends the state of every item of the inventory in one frame, unpaced (coop_items.cpp:1725-1745,
-	// scan_local(true)), and a drop here is a silent loss of the inventory's state. Ruling F2-33: at least 4096 in a row.
-	// The weight does not bound a GAMMA inventory: the base max_weight is 35 kg, one carried item can add up to 124.8 kg
-	// (additional_inventory_weight), and GAMMA has 41 item lines of 0.01 kg and 38 of weight 0 (inv_weight in
-	// E:\GAMMA\mods, checked 2026-10-23). No real maximum is known (estimate: a hoarder 400-1000 items), so 4096 is a
-	// reserve, not a measure.
+	// scan_local(true)), and a drop here is a silent loss of the inventory's state: at least 4096 in a row.
+	// The weight does not bound a modded inventory: a carried item can add a lot of max_weight
+	// (additional_inventory_weight), and mods have item lines of 0.01 kg or of weight 0. No real maximum is known (estimate: a
+	// hoarder 400-1000 items), so 4096 is a reserve, not a measure.
 	// The rate stays that of the honest stream after the join: the changed items per scan, every 100 ms after a change
 	// (kModifyScanMs, :50), a weapon and its ammo box in a reload, estimate 20 a second, 100 a second here. A Pacer or
-	// batches in scan_local (T20) would let the burst come down.
+	// batches in scan_local would let the burst come down.
 	{Msg::ItemState, 4096, 10},
 	// One deal per press of the Sell, Buy or donate control (coop_trade.cpp:645): a human, estimate 8 presses in the first
 	// second then 5 a second, 4 x that.
@@ -136,10 +136,10 @@ constexpr RateRule kClientRateRules[] = {
 	// row, 4 x that. Each opening runs a callback of the host's Lua.
 	{Msg::ReqContainer, 32, 60},
 
-	// F2 T3c (T3b review I-1, I-2): the player stream, the life states and the chat. The host relays every one of them to the
+	// The player stream, the life states and the chat. The host relays every one of them to the
 	// other players (broadcast), so a modified client's flood is multiplied by the players there are.
 	// The movement: strictly one per kSendIntervalMs = 50 ms, time based, never a catch-up after a hitch (coop_players.cpp:26,
-	// :283, :294-296; the only sender), so 20 a second; the network may bunch them (a lag spike of 2 s: 40). The row is 4 x the
+	// 283, :294-296; the only sender), so 20 a second; the network may bunch them (a lag spike of 2 s: 40). The row is 4 x the
 	// rate and 3.2 s of the stream in a row. A dropped one costs nothing (Unreliable lane, the newest wins), but a log line
 	// "rate limit: PlayerState" for an honest player would send us looking for a fault that is not there.
 	{Msg::PlayerState, 64, 12},
@@ -150,7 +150,7 @@ constexpr RateRule kClientRateRules[] = {
 	// reliably (coop_survival.cpp:1563).
 	{Msg::PlayerWounded, 16, 250},
 	// A revive request is sent when the USE hold on a wounded teammate has lasted kReviveHoldMs = 3000 (coop_survival.cpp:61,
-	// :1639, :1664): one in 3 s at the most (estimate: 2 in a row, 1 in 3 s). 4 x that: 8 in a row, 1.33 a second.
+	// 1639, :1664): one in 3 s at the most (estimate: 2 in a row, 1 in 3 s). 4 x that: 8 in a row, 1.33 a second.
 	// HUD v2 part 2 (revive::Announcer, coop_revive_hold.h): the same row now also carries Begin and Cancel of the hold, and it
 	// was not raised: a reviver announces a hold after 250 ms of USE, at most one Begin per 2 s, and a Cancel only for an
 	// announced hold, so a Begin + Cancel (or Begin + Request) is a pair per 2 s at the most, one a second, below the row's
@@ -165,25 +165,25 @@ constexpr RateRule kClientRateRules[] = {
 	// line is dropped, counted, logged like the other rows, not logged as chat, not given to Lua (on_chat), not relayed.
 	{Msg::Chat, 20, 125},
 
-	// F2 T12b: ids a client gives back (coop_id_lease.h): the ones an object of his holds when a lease comes, and the id of
+	// Ids a client gives back (coop_id_lease.h): the ones an object of his holds when a lease comes, and the id of
 	// each create the host refused. The client sends at most one ack per kAckGapMs = 250 ms with everything gathered
 	// meanwhile (coop_requests.cpp client_pump_leases), so 4 a second; 8 in a row for a lag spike.
 	{Msg::IdLeaseAck, 8, 250},
 
-	// F3a split levels. A player asks to leave his level when he steps into an exit or takes a guide's trip; the world
+	// Split levels. A player asks to leave his level when he steps into an exit or takes a guide's trip; the world
 	// server answers each with LevelMoveResult, and a level change is a load of seconds: 4 in a row (a press and its
 	// retry), then one per second.
 	{Msg::LevelMove, 4, 1000},
-	// One per loading screen of the player (the epoch of the load barrier, plan §1.5); a reconnect repeats it once. 4 in a
+	// One per loading screen of the player (the epoch of the load barrier); a reconnect repeats it once. 4 in a
 	// row, then one per second.
 	{Msg::LoadReady, 4, 1000},
 
-	// Protocol 31: the operator's console lines (docs/plans/2026-11-12-split-levels-native.md §2.3). A human at a console or a
+	// The operator's console lines. A human at a console or a
 	// button of the "Co-op" window: 4 in a row, then one per second. A core message: Session takes the token itself
 	// (host_operator_command), before the length and the list are checked.
 	{Msg::OperatorCommand, 4, 1000},
 
-	// F5 (docs/VEHICLES.md sections 3 and 7; F5-VEH-4): a player's car, each row at about twice the honest top rate of its sender
+	// A player's car (docs/VEHICLES.md sections 3 and 7), each row at about twice the honest top rate of its sender
 	// (tests/test_vehicle_state.cpp vehicle_state_rate_rows_are_twice_the_honest_rate). Co-op: the host's session checks them. Server:
 	// the world server's session checks them on the player's connection, before it tunnels them to the map server of his level (the
 	// trunk is not limited again).
@@ -199,7 +199,7 @@ constexpr RateRule kClientRateRules[] = {
 	{Msg::VehicleInput, 24, 16},
 };
 
-// Protocol 31: the slot ids a client may hold, 1 .. kMaxClientSlots (= kMaxPlayers: a server's 16 clients, F5-SEAT-1). Every
+// The slot ids a client may hold, 1 .. kMaxClientSlots (= kMaxPlayers: a server's 16 clients). Every
 // peer check of the wire layouts and of the game is `peer < kMaxPeerSlots` (AvatarList, LevelMap, LoadWait, DebugState,
 // TransitionState, coop_monster_fx.cpp arrays, the loops of coop_ai.cpp / coop_alife.cpp / coop_items.cpp).
 constexpr uint32_t kMaxClientSlots = kMaxPeerSlots - 1;
@@ -215,12 +215,12 @@ inline uint32_t client_capacity(uint32_t max_players, bool host_plays)
 	return seats < kMaxClientSlots ? seats : kMaxClientSlots;
 }
 
-// Ruling F2-10 b: a client picks its own player key, and a key the host's world has no character for gets a new one:
+// A client picks its own player key, and a key the host's world has no character for gets a new one:
 // new keys farmed the starting kit and money, and every such character stays in the save for good. A session makes
-// at most the host setting coop_max_new_characters of them (g_coop_max_new_characters, coop_join; F2 T3 fix round 1:
-// a host whose session ran out raises it without a restart). A player whose key has a character in the world costs
-// nothing. Ruling F3-9: the limit is for keys that never had a character; a key that had one in this session, or whose
-// character retired in this world (hardcore, F3 Task 10: the same player starting again), neither checks nor spends it
+// at most the host setting coop_max_new_characters of them (g_coop_max_new_characters, coop_join; a host whose
+// session ran out raises it without a restart). A player whose key has a character in the world costs
+// nothing. The limit is for keys that never had a character; a key that had one in this session, or whose
+// character retired in this world (hardcore: the same player starting again), neither checks nor spends it
 // (coop_join, death::new_key_charge).
 constexpr uint32_t kNewCharactersDefault = 8;
 constexpr uint32_t kNewCharactersMin = 1;
@@ -236,7 +236,7 @@ inline std::string no_new_character_text(uint32_t max)
 }
 
 // Host: the player keys (digests) a session made a new character for. A key that got one already costs nothing
-// again: a load of a save from before he came takes his character away, and he gets a new one. Ruling F3-9: keys that
+// again: a load of a save from before he came takes his character away, and he gets a new one. Keys that
 // had a character before are not added here (coop_join, death::new_key_charge).
 class NewCharacters
 {
@@ -252,7 +252,7 @@ private:
 	std::set<std::string> m_keys; // at most kNewCharactersMax (admits)
 };
 
-// F2 T14 (Ruling F2-14): the client's side of kClientRateRules. The host drops what exceeds a rule and the sender never
+// The client's side of kClientRateRules. The host drops what exceeds a rule and the sender never
 // learns of it (a dropped InfoPortion or script event is lost for good), so a client holds such a message back in its
 // queue and sends it later instead. The host measures when a message arrives, and the network can bunch up messages
 // that left evenly (a lag spike delivers them together): the client goes slower than the rule, half its burst in a row,
@@ -275,7 +275,7 @@ inline Pace client_pace(const RateRule& r)
 	return {r.burst / 2 ? r.burst / 2 : 1, r.refill_ms + (r.refill_ms / 4 ? r.refill_ms / 4 : 1)};
 }
 
-// Parity audit D10: a Lua event that waited longer than `max_ms` for Lua is stale, but a client that has no Lua (it loads)
+// A Lua event that waited longer than `max_ms` for Lua is stale, but a client that has no Lua (it loads)
 // is not late: its clock starts when Lua is back. lua_back_ms: the last moment Lua was not ready.
 inline bool event_stale(uint64_t now_ms, uint64_t queued_ms, uint64_t lua_back_ms, uint64_t max_ms)
 {
@@ -283,7 +283,7 @@ inline bool event_stale(uint64_t now_ms, uint64_t queued_ms, uint64_t lua_back_m
 	return now_ms > from && now_ms - from > max_ms;
 }
 
-// A token bucket per message type, as the host's (Session::limit_rate) at client_pace. One per client machine.
+// A token bucket per message type, as the host's (Session::within_rate) at client_pace. One per client machine.
 class Pacer
 {
 public:
@@ -295,51 +295,31 @@ public:
 		if (!rule)
 			return true;
 		const Pace pace = client_pace(*rule);
-		Bucket& b = m_buckets[uint16_t(type)]; // at most one per rule
-		if (!b.started)
-		{
-			b.started = true;
-			b.tokens = double(pace.burst);
-			b.at = now_ms;
-		}
-		else if (now_ms > b.at)
-		{
-			const double refilled = b.tokens + double(now_ms - b.at) / double(pace.interval_ms);
-			b.tokens = refilled < double(pace.burst) ? refilled : double(pace.burst);
-			b.at = now_ms;
-		}
-		if (b.tokens < 1.)
-			return false;
-		b.tokens -= 1.;
-		return true;
+		TokenBucket& b = m_buckets[uint16_t(type)]; // at most one per rule
+		b.refill(now_ms, double(pace.burst), [&pace](uint64_t ms) { return double(ms) / double(pace.interval_ms); });
+		return b.take();
 	}
 	void reset() { m_buckets.clear(); }
 
 private:
-	struct Bucket
-	{
-		bool started = false;
-		double tokens = 0.;
-		uint64_t at = 0;
-	};
-	std::map<uint16_t, Bucket> m_buckets;
+	std::map<uint16_t, TokenBucket> m_buckets;
 };
 
-// F2 T3c (T3b review I-3): the outbox of a client's story messages (coop_story.cpp push_out / flush_outbox) as a pure queue.
+// The outbox of a client's story messages (coop_story.cpp push_out / flush_outbox) as a pure queue.
 // Two lanes with a cap each:
-//  - story: InfoPortion, MapSpot, TaskUpdate, in order, kMaxStoryOutbox (F2 T14 fix 1). What the pacer holds holds the rest
+//  - story: InfoPortion, MapSpot, TaskUpdate, in order, kMaxStoryOutbox. What the pacer holds holds the rest
 //    of the lane, as before: one lost or reordered info breaks a quest;
-//  - relations: Msg::Relation, kMaxRelationOutbox. GAMMA's Fluid Relations answers every stalker killed by a stalker with 8-15
-//    set_community_relation calls (game_relations.script:232-236, :361-455), sometimes dozens, and the pacer lets a relation
+//  - relations: Msg::Relation, kMaxRelationOutbox. A relations mod may answer every stalker killed by a stalker with many
+//    set_community_relation calls (dozens), and the pacer lets a relation
 //    out at 10 a second. In one queue they held the infos, spots and tasks behind them for seconds and, at the cap, took
 //    the room of every type. Now a relation waits in a lane of its own: it holds back no story message and a full lane
 //    drops only relations.
 // A relation that sets the relation of a pair of communities (RelReqCommRelation) is a fact "from -> to is v": a queued one of
-// the same pair is replaced by the newer value and keeps its place, so the lane holds at most one per pair (32 x 32 in
-// GAMMA) however many calls a fight makes, and the host ends with the value the game last set. Other relations (a goodwill
+// the same pair is replaced by the newer value and keeps its place, so the lane holds at most one per pair (32 x 32 with
+// 32 communities) however many calls a fight makes, and the host ends with the value the game last set. Other relations (a goodwill
 // to a player set or changed by a delta) are not facts of a pair: the order and the sum of deltas matter, they are not merged.
 constexpr size_t kMaxStoryOutbox = 4096;
-constexpr size_t kMaxRelationOutbox = 2048; // all 32 x 32 community pairs of GAMMA at once and room for the goodwill changes
+constexpr size_t kMaxRelationOutbox = 2048; // all 32 x 32 community pairs at once and room for the goodwill changes
 
 struct CommunityPair
 {

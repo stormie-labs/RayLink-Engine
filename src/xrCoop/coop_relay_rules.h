@@ -1,5 +1,5 @@
-// Anomaly Coop — what a client gets of the host's creatures and machines beyond their bodies, and how (parity audits
-// 2026-10-31: sound H2, H3, M5; world W2, W3, W8; objects F6, F7). The host is a client with direct access: a client hears and
+// Anomaly Coop — what a client gets of the host's creatures and machines beyond their bodies, and how (sound,
+// world, objects). The host is a client with direct access: a client hears and
 // sees what the host does, within what the wire can carry.
 //
 // Shots. A shot of a host NPC or helicopter is one small event, a firefight is many, and on the receiver each can spawn
@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -115,7 +116,7 @@ constexpr float kFirmSoundsPerSec = 6.f, kFirmSoundsBurst = 12.f;
 // A line a player follows, a dying creature's last sound: a lost one has no repeat.
 inline bool sound_matters(float length_sec, bool owner_dead) { return owner_dead || length_sec >= kLongSoundSec; }
 
-// --- the rest of what an NPC's weapon does (audit F6). A puppet's weapon has no state machine of its own, so the host names
+// --- the rest of what an NPC's weapon does. A puppet's weapon has no state machine of its own, so the host names
 // the sound; the show and hide sounds stay out: a puppet plays those itself (its object handler takes the host's hold).
 constexpr float kWeaponSoundRange = 60.f;
 constexpr uint8_t kNoWeaponSound = 0xff;
@@ -143,12 +144,12 @@ inline const char* weapon_sound_alias(uint8_t index)
 	return index < n ? names[index] : nullptr;
 }
 
-// --- flinches (audit F7): a hit's flinch is additive, so it is not in the mirrored animations; the host names the hit and
+// --- flinches: a hit's flinch is additive, so it is not in the mirrored animations; the host names the hit and
 // the puppet plays its own. Near players only, a fight is many hits.
 constexpr float kFlinchRange = 80.f;
 constexpr float kFlinchesPerSec = 12.f, kFlinchesBurst = 16.f;
 
-// --- a helicopter (audits H2, W8). The host's scripts run it: what a client copies goes out on change and every second.
+// --- a helicopter. The host's scripts run it: what a client copies goes out on change and every second.
 enum HeliFlags : uint8_t
 {
 	HeliEngine = 1, // TurnEngineSound
@@ -185,7 +186,7 @@ struct HeliReport
 	}
 };
 
-// --- lamps (audit W2)
+// --- lamps
 enum LampBits : uint8_t
 {
 	LampOn = 1,
@@ -199,7 +200,7 @@ constexpr size_t kMaxLampsPerMsg = 128;
 
 struct LampEntry
 {
-	uint16_t id = 0xFFFF;
+	uint16_t id = kNoId;
 	uint8_t state = 0;
 };
 
@@ -235,7 +236,7 @@ inline bool read_lamps(Reader& r, std::vector<LampEntry>& out)
 	return true;
 }
 
-// Msg::Thunderbolt (host -> clients, parity audit W5): str collection, f32 period, f32 duration, u32 seed. The seed is the
+// Msg::Thunderbolt (host -> clients): str collection, f32 period, f32 duration, u32 seed. The seed is the
 // bolt: the same picture, the same direction from each machine's camera, the same clap (CEffect_Thunderbolt::Bolt).
 struct BoltMsg
 {

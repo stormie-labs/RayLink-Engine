@@ -9,8 +9,8 @@
 #include "IKLimbsController.h"
 #include "GameObject.h"
 #include "../../xrServerEntities/script_engine.h"
-#include "coop/coop_sound.h" // Anomaly Coop
-#include "../xrEngine/sheduler_viewers.h" // Anomaly Coop: the host also looks at the players' characters
+#include "coop/coop_sound.h"
+#include "../xrEngine/sheduler_viewers.h" // coop: the host also looks at the players' characters
 
 #ifdef	DEBUG
 BOOL debug_step_info = FALSE;
@@ -164,7 +164,7 @@ void CStepManager::update(bool b_hud_view)
 		if (m_step_info.disable) return;
 		if (!m_blend) return;
 
-		// Anomaly Coop: the camera of the machine that runs the world, or a player's character nearer than it (host):
+		// coop: the camera of the machine that runs the world, or a player's character nearer than it (host):
 		// the steps of an NPC next to a client are played too, so the NPCs there hear them. Stock without a session.
 		float dist = shedule_viewers::nearest_distance(m_object->Position());
 		bool b_play = dist < 50.0f; //meters
@@ -194,7 +194,7 @@ void CStepManager::update(bool b_hud_view)
 				if (!material_picked)
 				{
 					mtl_pair = m_object->material().get_current_pair();
-					mtl_pair = coop::sound::step_pair(m_object, mtl_pair); // Anomaly Coop: puppets pick the ground under them
+					mtl_pair = coop::sound::step_pair(m_object, mtl_pair); // coop: puppets pick the ground under them
 
 					material_picked = true;
 				}
@@ -222,7 +222,7 @@ void CStepManager::update(bool b_hud_view)
 					{
 						m_step_sound.play_next(mtl_pair, m_object, m_step_info.params.step[i].power, b_hud_view);
 						object->FootStepCallback(m_step_info.params.step[i].power, b_play, is_on_ground(), b_hud_view);
-						coop::sound::on_step(object, mtl_pair, m_step_info.params.step[i].power); // Anomaly Coop: coop_avatar_step
+						coop::sound::on_step(object, mtl_pair, m_step_info.params.step[i].power); // coop: coop_avatar_step
 					}	
 				}
 

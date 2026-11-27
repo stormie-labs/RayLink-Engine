@@ -16,9 +16,9 @@
 #include "Inventory.h"
 #include "Weapon.h"
 #include "stalker_animation_data.h"
-#include "coop/coop_remote.h" // Anomaly Coop
-#include "coop/coop_ai.h" // Anomaly Coop: undrawn_tracks
-#include "ik_anim_state.h" // Anomaly Coop: checked_motion_def (RL-4BXZ-R24J)
+#include "coop/coop_remote.h"
+#include "coop/coop_ai.h" // coop: undrawn_tracks
+#include "ik_anim_state.h" // coop: checked_motion_def
 
 void CStalkerAnimationManager::play_delayed_callbacks()
 {
@@ -56,7 +56,7 @@ IC bool CStalkerAnimationManager::need_update() const
 
 IC void CStalkerAnimationManager::update_tracks()
 {
-	// Anomaly Coop: stock is need_update() alone; a map server, which draws nothing, advances them every frame (undrawn_tracks)
+	// coop: stock is need_update() alone; a map server, which draws nothing, advances them every frame (undrawn_tracks)
 	if (!coop::npc_ai::undrawn_tracks(need_update()))
 		return;
 
@@ -171,7 +171,7 @@ bool CStalkerAnimationManager::play_global()
 {
 	bool animation_movement_controller = false;
 	const MotionID& global_animation = assign_global_animation(animation_movement_controller);
-	// Anomaly Coop (RL-4BXZ-R24J): a global motion that names no def of this visual is no global motion
+	// coop: a global motion that names no def of this visual is no global motion
 	if (!global_animation || !checked_motion_def(m_skeleton_animated, global_animation))
 	{
 		clear_unsafe_callbacks();
@@ -192,10 +192,10 @@ IC void CStalkerAnimationManager::play_head()
 
 IC void CStalkerAnimationManager::play_torso()
 {
-	// Anomaly Coop (RL-4BXZ-R24J, build 51): a torso motion the visual has not (a shotgun's tri-state reload_1 / reload_2,
-	// an empty table) came as an invalid or garbage MotionID and faulted in PlayCycle; the stock catch(...) reset the
-	// pairs every frame and the IK met the freed blends (AV at ik_anim_state.cpp:80). Such a motion is replaced with the
-	// one the stalker plays with nothing in hands; a visual without even that keeps its torso still this frame.
+	// coop: a torso motion the visual has not (a shotgun's tri-state reload_1 / reload_2, an empty table) comes as an
+	// invalid or garbage MotionID and faults in PlayCycle; the stock catch(...) reset the pairs every frame and the IK met
+	// the freed blends. Such a motion is replaced with the one the stalker plays with nothing in hands; a visual without
+	// even that keeps its torso still this frame.
 	MotionID animation = assign_torso_animation();
 	if (!checked_motion_def(m_skeleton_animated, animation))
 	{
@@ -225,10 +225,15 @@ IC void CStalkerAnimationManager::play_torso()
 		}
 
 		const shared_str& visual = object().cNameVisual();
-		static xr_set<std::pair<shared_str, shared_str>> reported;
-		if (reported.emplace(visual, motion).second)
-			Msg("[coop] stalker [%s] visual [%s]: torso motion [%s] is missing", object().cName().c_str(),
-			    visual.c_str(), motion);
+		if (m_missing_torso_visual != visual || xr_strcmp(m_missing_torso_motion, motion))
+		{
+			m_missing_torso_visual = visual;
+			xr_strcpy(m_missing_torso_motion, motion);
+			static xr_set<std::pair<shared_str, shared_str>> reported;
+			if (reported.emplace(visual, motion).second)
+				Msg("[coop] stalker [%s] visual [%s]: torso motion [%s] is missing", object().cName().c_str(),
+				    visual.c_str(), motion);
+		}
 		animation = no_object_animation(body_state());
 		if (!checked_motion_def(m_skeleton_animated, animation))
 		{
@@ -296,7 +301,7 @@ void CStalkerAnimationManager::update_impl()
 
 void CStalkerAnimationManager::update()
 {
-	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: puppets play host motions
+	if (coop::remote::is_remote_creature(m_object)) return; // coop: puppets play host motions
 	START_PROFILE("stalker/client_update/animations")
 		try
 		{

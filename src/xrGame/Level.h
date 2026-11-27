@@ -62,7 +62,7 @@ struct prefetch_event
 };
 using prefetch_event_queue = xr_vector<prefetch_event>;
 using spawn_events_data_map = xr_unordered_flat_map<u16, prefetch_event>;
-struct LevelPrefetchLife; // Anomaly Coop: the prefetch thread's lock, events and stop flag (Level.cpp, coop_prefetch_life.h)
+struct LevelPrefetchLife; // coop: the prefetch thread's lock, events and stop flag (Level.cpp, coop_prefetch_life.h)
 
 class CLevel :
 	public IGame_Level,
@@ -261,7 +261,7 @@ public:
     spawn_events_data_map* spawn_events_data = nullptr;
 	prefetch_event_queue* prefetch_events = nullptr;
 	models_set* prefetched_models = nullptr;
-	// Anomaly Coop: the lock lives in prefetch_life on the heap, not in the level: the thread may outlive a level whose
+	// coop: the lock lives in prefetch_life on the heap, not in the level: the thread may outlive a level whose
 	// destructor timed out waiting for it (then the life is leaked with the containers, never freed under the thread)
 	xrSRWLock* prefetch_lock = nullptr;
     bool PostponedSpawn(u16 id);

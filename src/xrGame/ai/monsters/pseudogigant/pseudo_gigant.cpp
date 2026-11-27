@@ -20,9 +20,9 @@
 #include "script_hit.h"
 #include "pch_script.h"
 #include "../../script_game_object.h"
-#include "../../coop/coop_ai.h" // Anomaly Coop: is_remote_player
-#include "../../coop/coop_monster_fx.h" // Anomaly Coop: the kick on a remote player's machine
-#include "../../../coop/coop_sound.h" // Anomaly Coop (audit M2)
+#include "../../coop/coop_ai.h" // coop: is_remote_player
+#include "../../coop/coop_monster_fx.h" // coop: the kick on a remote player's machine
+#include "../../../coop/coop_sound.h"
 
 // demonized: Flag for damaging NPCs and other objects by the stomp attack
 BOOL pseudogiantCanDamageObjects = 1;
@@ -273,7 +273,7 @@ void CPseudoGigant::on_activate_control(ControlCom::EControlType type)
 	if (type == ControlCom::eControlThreaten)
 	{
 		m_sound_start_threaten.play_at_pos(this, get_head_position(this));
-		coop::sound::on_ability_sound(this, m_sound_start_threaten, get_head_position(this)); // Anomaly Coop (audit M2)
+		coop::sound::on_ability_sound(this, m_sound_start_threaten, get_head_position(this)); // coop: the clients hear it
 		m_time_next_threaten = time() + Random.randI(m_threaten_delay_min, m_threaten_delay_max);
 
 		// callback for start animation, will be triggered by everyone in radius
@@ -373,7 +373,7 @@ void CPseudoGigant::on_threaten_execute()
 	pos.set(Position());
 	pos.y += 0.1f;
 	m_sound_threaten_hit.play_at_pos(this, pos);
-	coop::sound::on_ability_sound(this, m_sound_threaten_hit, pos); // Anomaly Coop (audit M2)
+	coop::sound::on_ability_sound(this, m_sound_threaten_hit, pos); // coop: the clients hear it
 
 	// Interactive Grass FX
 	extern Fvector4 ps_ssfx_grass_interactive;
@@ -381,7 +381,7 @@ void CPseudoGigant::on_threaten_execute()
 
 	// играть партиклы
 	coop_dust(pos, Direction());
-	coop::monster_fx::host_shown_at(this, coop::monster_fx::kGiantDust, pos, Direction()); // Anomaly Coop (audit F11)
+	coop::monster_fx::host_shown_at(this, coop::monster_fx::kGiantDust, pos, Direction()); // coop: the clients see the dust
 
 	const CEntityAlive* enemy = EnemyMan.get_enemy();
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor *>(enemy));
@@ -395,7 +395,7 @@ void CPseudoGigant::on_threaten_execute()
 
 	if (!pA)
 	{
-		// Anomaly Coop (audit A5, 2026-10-24): a remote player's character - his machine plays the kick on its actor
+		// coop: a remote player's character - his machine plays the kick on its actor
 		// (camera, slow-down, the strike), kick_actor there
 		coop::monster_fx::host_send(enemy, this, coop::monster_fx::kGiantKick, 0, hit_value);
 		return;

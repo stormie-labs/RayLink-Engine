@@ -1,5 +1,5 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop - TZ P50 (Dev 58): collision between players is off where they appear and at level exits, and comes back when
+// Anomaly Coop - collision between players is off where they appear and at level exits, and comes back when
 // they move apart (the rule: xrCoop/coop_player_touch_rules.h).
 //
 // Runs where a person plays this process's actor (mode().actor_is_player()), for that actor against the characters of the other

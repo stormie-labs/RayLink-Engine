@@ -31,14 +31,15 @@
 
 // Anomaly Coop: the pool's containers are shared by the main thread, the spawn-prefetch thread (Level.cpp,
 // ProcessPrefetchEvents -> models_PrefetchOne) and the prefetch task of IGame_Persistent::Prefetch (models_Prefetch).
-// See ModelPool.h (PoolLock) and temp\modelpool\DESIGN.md.
+// See ModelPool.h (PoolLock).
 namespace
 {
-// Were CModelPool members written by whichever thread was loading or deleting a base: one thread's
-// "loading a base" (no child duplication) or "deleting a base" (discard children) leaked into the other thread's work.
+// Per thread: one thread's "loading a base" (no child duplication) or "deleting a base" (discard children) must not leak
+// into another thread's work.
 thread_local BOOL t_bForceDiscard = FALSE;
 thread_local BOOL t_bAllowChildrenDuplicate = TRUE;
 
+#if MODELPOOL_CONTENTION_DETECTOR
 // Contention detector: a line per distinct pair of entry points (waiter, holder), at most kMaxContentionLines.
 constexpr u32 kMaxContentionLines = 20;
 struct ContentionPair
@@ -50,6 +51,7 @@ ContentionPair g_contention_pairs[kMaxContentionLines]; // written only under Po
 u32 g_contention_pair_count = 0;                         // written only under PoolLock
 std::atomic<u32> g_contentions{ 0 };                     // every contended entry
 std::atomic<u32> g_contentions_reported{ 0 };            // value of g_contentions at the last summary line
+#endif
 
 // A damaged std::map / multimap (size says non-empty, the tree is empty) must not be erased or cleared: its nodes may
 // be freed already. Forget it instead: a fresh empty container is built over it, the old head node leaks.
@@ -62,6 +64,7 @@ void abandon_damaged(Container& c)
 
 class CModelPool::PoolGuard : xray::noncopyable
 {
+#if MODELPOOL_CONTENTION_DETECTOR
 public:
 	PoolGuard(CModelPool& pool, const char* where) : m_pool(pool)
 	{
@@ -111,6 +114,14 @@ private:
 	const char* m_report_where = nullptr;
 	const char* m_report_holder_where = nullptr;
 	u32 m_report_holder = 0;
+#else
+public:
+	PoolGuard(CModelPool& pool, const char* /*where*/) : m_pool(pool) { m_pool.PoolLock.Enter(); }
+	~PoolGuard() { m_pool.PoolLock.Leave(); }
+
+private:
+	CModelPool& m_pool;
+#endif
 };
 
 dxRender_Visual* CModelPool::Instance_Create(u32 type)
@@ -724,9 +735,11 @@ void CModelPool::ClearPool(BOOL b_complete)
 	}
 	taken.clear();
 
+#if MODELPOOL_CONTENTION_DETECTOR
 	const u32 contentions = g_contentions.load(std::memory_order_relaxed);
 	if (contentions != g_contentions_reported.exchange(contentions, std::memory_order_relaxed))
 		Msg("[coop] ModelPool: %u contended entries between threads so far (serialised by PoolLock)", contentions);
+#endif
 }
 
 void CModelPool::dump()

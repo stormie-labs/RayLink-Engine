@@ -25,9 +25,9 @@
 #include "../../../../xrCore/_vector3d_ext.h"
 #include "../control_direction_base.h"
 #include "../../script_game_object.h"
-#include "../../../coop/coop_sound.h" // Anomaly Coop (audit M2)
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F11)
-#include "../../../coop/coop_ai.h" // Anomaly Coop (protocol 29): player_god
+#include "../../../coop/coop_sound.h"
+#include "../../../coop/coop_monster_fx.h"
+#include "../../../coop/coop_ai.h" // coop: player_god
 
 bool CBurer::can_scan = true;
 
@@ -59,7 +59,7 @@ void CBurer::reinit()
 void CBurer::net_Destroy()
 {
 	if (m_coop_prepare_shown)
-		coop_gravi_prepare(false); // Anomaly Coop (audit F11): the host's stop will not come for a burer that left
+		coop_gravi_prepare(false); // coop: the host's stop will not come for a burer that left
 	inherited::net_Destroy();
     CTelekinesis::remove_object_callbacks();
 	CTelekinesis::deactivate();
@@ -249,7 +249,7 @@ void CBurer::CheckSpecParams(u32 spec_params)
 
 void xr_stdcall CBurer::StaminaHit()
 {
-	if (coop::npc_ai::player_god(Actor())) // Anomaly Coop (A.2 p. 7): the god of the player it lands on, was GodMode() of the process
+	if (coop::npc_ai::player_god(Actor())) // coop: the god of the player it lands on, was GodMode() of the process
 	{
 		return;
 	}
@@ -414,7 +414,7 @@ void CBurer::UpdateGraviObject()
 	else
 	{
 		::Sound->play_at_pos(sound_gravi_wave, 0, snd_pos);
-		// Anomaly Coop (audit M2): the world hears it; the target's machine flies its own wave (monster_fx::kBurerGravi)
+		// coop: the world hears it; the target's machine flies its own wave (monster_fx::kBurerGravi)
 		coop::sound::on_ability_sound(this, sound_gravi_wave, snd_pos, m_gravi_object.enemy);
 	}
 }
@@ -448,7 +448,7 @@ void CBurer::StartGraviPrepare()
 	CActor* pA = const_cast<CActor *>(smart_cast<const CActor*>(enemy));
 	if (!pA)
 	{
-		// Anomaly Coop (audit F11): at a remote player the glow gathers on his machine
+		// coop: at a remote player the glow gathers on his machine
 		if (coop::monster_fx::host_send(enemy, this, coop::monster_fx::kBurerGraviPrepare, 1, 0.f))
 			m_coop_prepare_target = enemy->ID();
 		return;
@@ -490,7 +490,7 @@ void CBurer::StartTeleObjectParticle(CGameObject* pO)
 	PP->StartParticles(particle_tele_object,
 	                   Fvector().set(0.0f, 0.1f, 0.0f),
 	                   pO->ID());
-	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 1, float(pO->ID())); // Anomaly Coop (audit F11)
+	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 1, float(pO->ID())); // coop: the clients see the glow
 }
 
 void CBurer::StopTeleObjectParticle(CGameObject* pO)
@@ -498,7 +498,7 @@ void CBurer::StopTeleObjectParticle(CGameObject* pO)
 	CParticlesPlayer* PP = smart_cast<CParticlesPlayer*>(pO);
 	if (!PP) return;
 	PP->StopParticles(particle_tele_object, BI_NONE, true);
-	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 0, float(pO->ID())); // Anomaly Coop (audit F11)
+	coop::monster_fx::host_shown(this, coop::monster_fx::kBurerTeleGlow, 0, float(pO->ID())); // coop: the clients see the glow end
 }
 
 void CBurer::Hit(SHit* pHDS)

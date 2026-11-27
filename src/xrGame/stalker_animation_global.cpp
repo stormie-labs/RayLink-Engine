@@ -58,7 +58,7 @@ MotionID CStalkerAnimationManager::global_critical_hit()
 		)
 	);
 
-	// Anomaly Coop (RL-4BXZ-R24J): both were VERIFY only. A critical wound with no weapon in hands (a missile, nothing)
+	// coop: both were VERIFY only. A critical wound with no weapon in hands (a missile, nothing)
 	// dereferenced NULL; a slot outside 1..3 or a wound type outside the table indexed m_global past the critical hit
 	// tables; a visual without N_critical_hit_* motions has an empty table (select read its [0]). No critical hit motion:
 	// the critical wound ends at once, the way it ends when its motion ends (the global pair's end callbacks,

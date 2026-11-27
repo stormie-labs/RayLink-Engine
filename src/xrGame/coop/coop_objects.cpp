@@ -13,7 +13,10 @@
 #include "coop_story.h"
 #include "coop_checkpoint_sources.h"
 #include "coop_survival.h" // build 51: life_of (zone_feels_player)
-#include "coop_vehicles.h" // F5-VEH-3: the copy of the car this player drives
+#include "coop_vehicles.h" // the copy of the car this player drives
+#include "coop_wire_vec.h"
+#include "coop_lua.h"
+#include "xrCoop/coop_hash.h"
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_validate.h"
 #include "xrCoop/coop_motion_rules.h"
@@ -21,7 +24,6 @@
 #include "xrCoop/coop_zone_path_rules.h" // F4 G11-2: the wander path of a moving zone (DAO's Ghost)
 #include "xrCoop/coop_throw_rules.h" // R32 W7 follow-up: no throw of a lease-pending item; a save flushes removals
 #include "coop_requests.h" // client_lease_waiting
-#include "xrCoop/coop_mode.h" // F4 G11-2: only the process that leads its map runs a path of its own
 
 #include "ai_space.h"
 #include "level_graph.h"
@@ -72,7 +74,6 @@ namespace objects
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr u16 kActor = 0;
 constexpr u32 kStreamIntervalMs = 66; // ~15 Hz physics samples
 constexpr u32 kInterpDelayMs = 100;
@@ -209,67 +210,21 @@ Counters g_c;
 
 // ---------------------------------------------------------------- shared helpers
 
-u32 hash_str(const char* s)
-{
-	u32 h = 2166136261u;
-	for (; s && *s; ++s)
-		h = (h ^ u8(*s)) * 16777619u;
-	return h;
-}
-
-u64 now_ms() { return mgr().now_ms(); }
-
-// R2 I2: a world message that comes before we are live is dropped (rules::live_only): it is from the window between
-// Welcome and JoinRequest or from a world we have left. Kept, it would be applied to the world we load.
-bool before_live(Msg type)
-{
-	if (!rules::live_only(type) || is_live_mirror())
-		return false;
-	++g_c.dropped_before_live;
-	return true;
-}
-
-CGameObject* find_go(u16 id)
-{
-	if (!g_pGameLevel || id == kNoId)
-		return nullptr;
-	CGameObject* go = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return go && !go->getDestroy() ? go : nullptr;
-}
-
-void put_vec(Writer& w, const Fvector& v)
-{
-	const float a[3] = {v.x, v.y, v.z};
-	w.vec3(a);
-}
-
-Fvector get_vec(Reader& r)
-{
-	float a[3];
-	r.vec3(a);
-	Fvector v;
-	v.set(a[0], a[1], a[2]);
-	return v;
-}
-
-u16 pack_unit(float f) { return u16(s16(iFloor(clampr(f, -1.f, 1.f) * 32767.f))); }
-float unpack_unit(u16 v) { return float(s16(v)) / 32767.f; }
-
 void put_quat(Writer& w, const Fquaternion& q)
 {
-	w.u16(pack_unit(q.x));
-	w.u16(pack_unit(q.y));
-	w.u16(pack_unit(q.z));
-	w.u16(pack_unit(q.w));
+	w.u16(u16(pack_unit(q.x)));
+	w.u16(u16(pack_unit(q.y)));
+	w.u16(u16(pack_unit(q.z)));
+	w.u16(u16(pack_unit(q.w)));
 }
 
 Fquaternion get_quat(Reader& r)
 {
 	Fquaternion q;
-	q.x = unpack_unit(r.u16());
-	q.y = unpack_unit(r.u16());
-	q.z = unpack_unit(r.u16());
-	q.w = unpack_unit(r.u16());
+	q.x = unpack_unit(s16(r.u16()));
+	q.y = unpack_unit(s16(r.u16()));
+	q.z = unpack_unit(s16(r.u16()));
+	q.w = unpack_unit(s16(r.u16()));
 	const float m = _sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
 	if (m < EPS_S)
 		q.identity();
@@ -324,7 +279,7 @@ public:
 		Writer out(m_body.size() + 16);
 		out.u8(m_kind);
 		if (m_timed)
-			out.u32(u32(now_ms()));
+			out.u32(u32(mgr().now_ms()));
 		if (m_count16)
 			out.u16(u16(m_count));
 		else
@@ -693,7 +648,7 @@ void release_fixed()
 {
 	for (auto& it : g_fixed)
 	{
-		CGameObject* go = find_go(it.first);
+		CGameObject* go = world::object_here(it.first);
 		CPhysicsShellHolder* sh = go ? go->cast_physics_shell_holder() : nullptr;
 		CPhysicsShell* shell = sh ? sh->PPhysicsShell() : nullptr;
 		if (!shell || shell != it.second.shell || !shell->isActive())
@@ -827,7 +782,7 @@ bool sample_at(const ClientBody& b, u64 t, xr_vector<Pose>& out)
 // host's online set is the rule here, coop_alife.cpp), otherwise a projectile shows up too late.
 void force_online(u16 id, ClientBody& b)
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (now - b.last_online_try < 500 || !ai().get_alife())
 		return;
 	b.last_online_try = now;
@@ -841,7 +796,8 @@ void force_online(u16 id, ClientBody& b)
 
 void client_scan()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/client_scan");
+	const u64 now = mgr().now_ms();
 	if (now - g_last_scan < kScanIntervalMs)
 		return;
 	g_last_scan = now;
@@ -857,7 +813,7 @@ void client_scan()
 	}
 	for (auto it = g_fixed.begin(); it != g_fixed.end();)
 	{
-		CGameObject* go = find_go(it->first);
+		CGameObject* go = world::object_here(it->first);
 		CPhysicsShellHolder* sh = go ? go->cast_physics_shell_holder() : nullptr;
 		if (!sh || sh->PPhysicsShell() != it->second.shell)
 			it = g_fixed.erase(it);
@@ -868,7 +824,8 @@ void client_scan()
 
 void client_apply_bodies()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/client_apply_bodies");
+	const u64 now = mgr().now_ms();
 	const u64 render = now > kInterpDelayMs ? now - kInterpDelayMs : 0;
 	// F5-VEH-3 (docs/VEHICLES.md section 14): the copy of the car this player drives shows the decider's latest pose extrapolated
 	// (<= kMaxExtrapolateMs), not the buffer kInterpDelayMs behind: his keys go there and back already
@@ -878,7 +835,7 @@ void client_apply_bodies()
 	{
 		const u16 id = it->first;
 		ClientBody& b = it->second;
-		CGameObject* go = find_go(id);
+		CGameObject* go = world::object_here(id);
 		if (!go)
 		{
 			if (!b.samples.empty())
@@ -912,7 +869,7 @@ void client_apply_bodies()
 		}
 		else if (b.rest_pending)
 		{
-			if (b.section_hash && b.section_hash != hash_str(go->cNameSect().c_str()))
+			if (b.section_hash && b.section_hash != fnv1a32(go->cNameSect().c_str()))
 				b.rest_pending = false; // the id belongs to another object now
 			else if (apply_poses(go, b.rest, false))
 			{
@@ -929,7 +886,7 @@ void client_apply_bodies()
 // A push of our actor into a kinematic body: ask the host to push it.
 void client_push_check()
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (now - g_last_push_check < kPushIntervalMs)
 		return;
 	g_last_push_check = now;
@@ -949,7 +906,7 @@ void client_push_check()
 	chest.y += 0.9f;
 	for (const auto& it : g_fixed)
 	{
-		CGameObject* go = find_go(it.first);
+		CGameObject* go = world::object_here(it.first);
 		if (!go || go->Position().distance_to(chest) > 6.f || smart_cast<CInventoryItem*>(go))
 			continue; // loose items are not walked aside
 		// Owner 2026-11-17 (build 51): only the host could push a corpse, a client walked into it as into a wall. A corpse's
@@ -1030,7 +987,7 @@ void apply_zone(CCustomZone* zone, const ZoneEntry& e)
 	{
 		ClientPhase& ph = g_torrid_client[zone->ID()];
 		ph.time = e.anim;
-		ph.received = now_ms();
+		ph.received = mgr().now_ms();
 	}
 	if (e.state >= u8(CCustomZone::eZoneStateMax))
 		return;
@@ -1050,10 +1007,11 @@ void apply_zone(CCustomZone* zone, const ZoneEntry& e)
 
 void client_apply_zones()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/client_apply_zones");
+	const u64 now = mgr().now_ms();
 	for (auto it = g_zone_pending.begin(); it != g_zone_pending.end();)
 	{
-		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(it->first));
+		CCustomZone* zone = smart_cast<CCustomZone*>(world::object_here(it->first));
 		if (zone && it->second.wait_blast && now - it->second.hold_since < kZoneBlastHoldMaxMs)
 			++it; // build 51 (P4): the zone has not passed the blast of the Blowout before it yet
 		else if (zone)
@@ -1096,7 +1054,7 @@ void client_apply_zones()
 
 bool apply_destroyed(const DestroyedEntry& d, u16 local_id)
 {
-	CGameObject* go = find_go(local_id);
+	CGameObject* go = world::object_here(local_id);
 	if (!go)
 		return false;
 	CDestroyablePhysicsObject* dpo = smart_cast<CDestroyablePhysicsObject*>(go);
@@ -1121,7 +1079,7 @@ bool apply_destroyed(const DestroyedEntry& d, u16 local_id)
 
 bool apply_broken(u16 local_id)
 {
-	CGameObject* go = find_go(local_id);
+	CGameObject* go = world::object_here(local_id);
 	if (!go)
 		return false;
 	if (!smart_cast<CBreakableObject*>(go))
@@ -1189,7 +1147,7 @@ void explode_fallback(const ExplodeEntry& x)
 // Plays the host's detonation on our copy of the object. False if the object is not here yet.
 bool apply_explode(const ExplodeEntry& x)
 {
-	CGameObject* go = find_go(join::to_local(x.id));
+	CGameObject* go = world::object_here(join::to_local(x.id));
 	CExplosive* ex = go ? go->cast_explosive() : nullptr;
 	if (!ex)
 		return false;
@@ -1209,7 +1167,8 @@ bool apply_explode(const ExplodeEntry& x)
 
 void client_apply_events()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/client_apply_events");
+	const u64 now = mgr().now_ms();
 	for (auto it = g_destroyed_pending.begin(); it != g_destroyed_pending.end();)
 	{
 		if (apply_destroyed(it->second.d, it->first) || now - it->second.received > 30000)
@@ -1266,7 +1225,7 @@ bool cycle_shown(IKinematicsAnimated* sa, const MotionID& m)
 // False: the copy is not here (yet).
 bool play_word(u16 id, HeldMotion& h, u64 now)
 {
-	CGameObject* go = find_go(id);
+	CGameObject* go = world::object_here(id);
 	IKinematicsAnimated* sa = cycle_visual(go);
 	if (!sa)
 		return false;
@@ -1299,7 +1258,7 @@ bool play_word(u16 id, HeldMotion& h, u64 now)
 // Every kCheckMs, and at once in the frame after a word came. A copy that is not here yet gets its word when it comes.
 void client_hold_motions()
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (now < g_next_motion_check)
 		return;
 	g_next_motion_check = now + motion::kCheckMs;
@@ -1337,7 +1296,7 @@ void apply_paths(u64 now)
 	for (auto it = g_paths.begin(); it != g_paths.end();)
 	{
 		PathRun& run = it->second;
-		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(it->first));
+		CCustomZone* zone = smart_cast<CCustomZone*>(world::object_here(it->first));
 		if (!zone)
 		{
 			if (run.zone || now - run.received > zonepath::kPendingTtlMs)
@@ -1396,7 +1355,7 @@ void host_take_paths(u64 now)
 	Batcher b(Msg::ZoneState, u8(ZoneKind::Paths), false, Lane::Reliable, kInvalidPeer, true);
 	for (const PathStart& s : starts)
 	{
-		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(s.p.id));
+		CCustomZone* zone = smart_cast<CCustomZone*>(world::object_here(s.p.id));
 		bool here = zone != nullptr;
 		if (here)
 		{
@@ -1423,7 +1382,8 @@ void host_take_paths(u64 now)
 
 void host_paths()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/host_paths");
+	const u64 now = mgr().now_ms();
 	host_take_paths(now);
 	apply_paths(now);
 }
@@ -1437,7 +1397,7 @@ u32 host_send_paths(PeerId to, u64 now)
 	Batcher b(Msg::ZoneState, u8(ZoneKind::Paths), false, Lane::Reliable, to, true);
 	for (const auto& it : g_paths)
 	{
-		if (!it.second.zone || !find_go(it.first))
+		if (!it.second.zone || !world::object_here(it.first))
 			continue; // its zone went this frame: apply_paths drops it
 		add_path(b, it.second, now);
 		++n;
@@ -1456,7 +1416,7 @@ void client_on_paths(Reader& r)
 		++g_c.paths_malformed;
 		return;
 	}
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (u16 k = 0; k < count; ++k)
 	{
 		zonepath::Path p;
@@ -1479,23 +1439,13 @@ void client_on_paths(Reader& r)
 	}
 }
 
-bool lua_whole(lua_State* L, int i, double lo, double hi, u32& out)
+// A coordinate of a wander path: a finite number strictly inside +-kMaxCoord.
+bool path_coord(lua_State* L, int i, float& out)
 {
-	if (lua_type(L, i) != LUA_TNUMBER)
+	double v = 0.0;
+	if (!lua_api::arg_number(L, i, v))
 		return false;
-	const double v = double(lua_tonumber(L, i));
-	if (!(v >= lo && v <= hi) || v != std::floor(v))
-		return false;
-	out = u32(v);
-	return true;
-}
-
-bool lua_finite(lua_State* L, int i, float& out)
-{
-	if (lua_type(L, i) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, i));
-	if (!(v > -double(zonepath::kMaxCoord) && v < double(zonepath::kMaxCoord))) // NaN and infinities too
+	if (!(v > -double(zonepath::kMaxCoord) && v < double(zonepath::kMaxCoord)))
 		return false;
 	out = float(v);
 	return true;
@@ -1509,18 +1459,21 @@ bool lua_finite(lua_State* L, int i, float& out)
 int l_zone_path(lua_State* L)
 {
 	zonepath::Path p;
-	u32 id = 0, i0 = 0, i_step = 0, j_step = 0;
-	bool ok = lua_gettop(L) >= 9 && lua_whole(L, 1, 0, 0xfffe, id) && lua_finite(L, 2, p.origin[0]) &&
-		lua_finite(L, 3, p.origin[1]) && lua_finite(L, 4, p.origin[2]) && lua_whole(L, 5, 0, zonepath::kCircle - 1, i0) &&
-		lua_whole(L, 6, 1, zonepath::kMaxIStep, i_step) && lua_whole(L, 7, 1, zonepath::kMaxJStep, j_step) &&
-		lua_finite(L, 8, p.x_mod) && lua_finite(L, 9, p.z_mod) && g_pGameLevel && mode().leads_level();
+	u16 id = kNoId;
+	u32 i0 = 0;
+	double i_step = 0.0, j_step = 0.0;
+	bool ok = lua_gettop(L) >= 9 && lua_api::arg_object_id(L, 1, id) && path_coord(L, 2, p.origin[0]) &&
+		path_coord(L, 3, p.origin[1]) && path_coord(L, 4, p.origin[2]) &&
+		lua_api::arg_whole_u32(L, 5, zonepath::kCircle - 1, i0) && lua_api::arg_whole(L, 6, 1, zonepath::kMaxIStep, i_step) &&
+		lua_api::arg_whole(L, 7, 1, zonepath::kMaxJStep, j_step) && path_coord(L, 8, p.x_mod) && path_coord(L, 9, p.z_mod) &&
+		g_pGameLevel && mode().leads_level();
 	if (ok)
 	{
-		p.id = u16(id);
+		p.id = id;
 		p.i0 = u16(i0);
 		p.i_step = u8(i_step);
 		p.j_step = u8(j_step);
-		const CCustomZone* zone = smart_cast<CCustomZone*>(find_go(p.id));
+		const CCustomZone* zone = smart_cast<CCustomZone*>(world::object_here(p.id));
 		ok = zone != nullptr;
 		if (ok)
 		{
@@ -1535,7 +1488,7 @@ int l_zone_path(lua_State* L)
 		ok = ok && g_ev_paths.size() < kMaxPathStarts;
 		if (ok)
 		{
-			g_ev_paths.push_back(PathStart{p, now_ms()});
+			g_ev_paths.push_back(PathStart{p, mgr().now_ms()});
 			++g_c.paths_started;
 		}
 		else
@@ -1549,7 +1502,7 @@ int l_zone_path(lua_State* L)
 
 u64 to_local_time(u32 remote)
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	const s64 offset = s64(now) - s64(remote);
 	if (!g_have_offset || offset < g_clock_offset)
 		g_clock_offset = offset;
@@ -1585,7 +1538,7 @@ void client_on_samples(Reader& r)
 	const u32 remote = r.u32();
 	const u8 count = r.u8();
 	const u64 local = to_local_time(remote);
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (u8 k = 0; k < count && r.ok(); ++k)
 	{
 		const u16 id = join::to_local(r.u16());
@@ -1626,7 +1579,7 @@ void client_on_rest(Reader& r)
 {
 	const u32 remote = r.u32();
 	const u8 count = r.u8();
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (u8 k = 0; k < count && r.ok(); ++k)
 	{
 		const u16 id = join::to_local(r.u16());
@@ -1660,7 +1613,7 @@ void client_on_state(PeerId, Reader& r)
 	// Every kind waits for Live: samples, rests and animations of the old world or our own would be applied to the
 	// bodies of the world we load (pending until then), destroyed / broken / explosions are stale visuals (the
 	// release itself arrives as EntityDestroy).
-	if (before_live(Msg::EntityState))
+	if (events::dropped_before_live(Msg::EntityState, g_c.dropped_before_live))
 		return;
 	const StateKind kind = StateKind(r.u8());
 	switch (kind)
@@ -1685,14 +1638,14 @@ void client_on_state(PeerId, Reader& r)
 				break;
 			ClientAnim& c = g_anim_client[a.id];
 			c.a = a;
-			c.received = now_ms();
+			c.received = mgr().now_ms();
 		}
 		break;
 	}
 	case StateKind::Motion:
 	{
 		const u8 count = r.u8();
-		const u64 now = now_ms();
+		const u64 now = mgr().now_ms();
 		for (u8 k = 0; k < count && r.ok(); ++k)
 		{
 			motion::Word w;
@@ -1725,14 +1678,14 @@ void client_on_state(PeerId, Reader& r)
 			break;
 		PendingDestroyed& p = g_destroyed_pending[join::to_local(d.id)];
 		p.d = d;
-		p.received = now_ms();
+		p.received = mgr().now_ms();
 		break;
 	}
 	case StateKind::Broken:
 	{
 		const u16 id = r.u16();
 		if (r.ok())
-			g_broken_pending[join::to_local(id)] = now_ms();
+			g_broken_pending[join::to_local(id)] = mgr().now_ms();
 		break;
 	}
 	case StateKind::Explode:
@@ -1746,7 +1699,7 @@ void client_on_state(PeerId, Reader& r)
 		if (!r.ok())
 			break;
 		p.x.section = sect.c_str();
-		p.received = now_ms();
+		p.received = mgr().now_ms();
 		g_explode_pending.push_back(p);
 		break;
 	}
@@ -1759,7 +1712,7 @@ void client_on_zones(PeerId, Reader& r)
 {
 	if (!is_mirror())
 		return;
-	if (before_live(Msg::ZoneState))
+	if (events::dropped_before_live(Msg::ZoneState, g_c.dropped_before_live))
 		return; // a zone phase of another world: the host sends ours when we are in (host_on_peer_ready)
 	const ZoneKind kind = ZoneKind(r.u8());
 	if (kind == ZoneKind::Paths)
@@ -1770,7 +1723,7 @@ void client_on_zones(PeerId, Reader& r)
 	if (kind != ZoneKind::Zones)
 		return;
 	const u16 count = r.u16();
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (u16 k = 0; k < count && r.ok(); ++k)
 	{
 		ZoneEntry e;
@@ -1806,7 +1759,7 @@ void client_on_zones(PeerId, Reader& r)
 CGameObject* proxy_go_of(PeerId peer, u16& proxy)
 {
 	proxy = join::proxy_of_peer(peer);
-	return proxy == kNoId ? nullptr : find_go(proxy);
+	return proxy == kNoId ? nullptr : world::object_here(proxy);
 }
 
 bool in_reach(CGameObject* proxy, const Fvector& p, float reach)
@@ -1821,7 +1774,7 @@ void host_on_use(PeerId from, Reader& r)
 		return;
 	u16 proxy;
 	CGameObject* who = proxy_go_of(from, proxy);
-	CGameObject* go = find_go(id);
+	CGameObject* go = world::object_here(id);
 	if (!who || !go || !smart_cast<CPhysicObject*>(go))
 		return;
 	if (!in_reach(who, go->Position(), kMaxReach + go->Radius()))
@@ -1843,7 +1796,7 @@ void host_on_push(PeerId from, Reader& r)
 		return; // malformed
 	u16 proxy;
 	CGameObject* who = proxy_go_of(from, proxy);
-	CGameObject* go = find_go(id);
+	CGameObject* go = world::object_here(id);
 	if (!who || !go || classify(go) != ObjKind::Body)
 		return;
 	CPhysicsShell* shell = go->cast_physics_shell_holder()->PPhysicsShell();
@@ -1853,7 +1806,7 @@ void host_on_push(PeerId from, Reader& r)
 	if (!e || !e->isActive() || !in_reach(who, e->XFORM().c, kMaxReach))
 		return;
 	u64& last = g_last_push[(u32(from) << 16) | id];
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (now - last < kPushIntervalMs / 2)
 		return;
 	last = now;
@@ -1921,12 +1874,12 @@ void host_on_throw(PeerId from, Reader& r)
 	CGameObject* who = proxy_go_of(from, proxy);
 	if (!who)
 		return refuse("no character");
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	// R3 В7: the missile is taken from the character's own inventory on the host, and the host decides what the
 	// throw uses up: a grenade (any missile but a bolt) always leaves the inventory, the client's "consume" flag is
 	// ignored (a client that keeps it loses it after kConsumeAfterMs). A bolt follows the thrower's limited-bolts
 	// option (CBolt__State runs on its machine): a bolt that stays is what stock gives anyway.
-	CSE_Abstract* he = events::find_entity(hand);
+	CSE_Abstract* he = world::server_entity(hand);
 	if (!he || he->ID_Parent != proxy)
 		return refuse("not in the player's inventory");
 	LPCSTR section = he->s_name.c_str();
@@ -1983,7 +1936,7 @@ void host_on_activate(PeerId from, Reader& r)
 		return;
 	u16 proxy;
 	CGameObject* who = proxy_go_of(from, proxy);
-	CArtefact* af = smart_cast<CArtefact*>(find_go(id));
+	CArtefact* af = smart_cast<CArtefact*>(world::object_here(id));
 	if (!who || !af || !af->H_Parent() || events::root_of(id) != proxy)
 		return;
 	af->ActivateArtefact();
@@ -1992,7 +1945,7 @@ void host_on_activate(PeerId from, Reader& r)
 
 void host_on_request(PeerId from, Reader& r)
 {
-	if (!(mode().decides_world() || mode().leads_level()) || !world_up() || sync::host_peer_joining(from)) // level-change review: second line behind the session's world gate
+	if (!mode().decides_here() || !world_up() || sync::host_peer_joining(from)) // a second line behind the session's world gate
 		return;
 	switch (RequestKind(r.u8()))
 	{
@@ -2015,17 +1968,17 @@ void consume_due(u64 now, bool saving); // below: the removal records of thrown 
 
 void host_apply_throws()
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (auto it = g_pending_throws.begin(); it != g_pending_throws.end();)
 	{
 		const PendingThrow& t = it->second;
-		CMissile* m = smart_cast<CMissile*>(find_go(it->first));
+		CMissile* m = smart_cast<CMissile*>(world::object_here(it->first));
 		CPhysicsShell* shell = m ? m->PPhysicsShell() : nullptr;
 		if (!shell || !shell->isActive())
 		{
 			if (now - t.created > kThrowApplyTimeoutMs)
 			{
-				host_destroy_entity(events::find_entity(it->first));
+				host_destroy_entity(world::server_entity(it->first));
 				::Msg("! [coop] thrown projectile %u never came online, removed", it->first);
 				it = g_pending_throws.erase(it);
 			}
@@ -2056,7 +2009,7 @@ void host_apply_throws()
 		shell->SetAirResistance(0.f, 0.f);
 		shell->set_DynamicScales(1.f, 1.f);
 		shell->SetAllGeomTraced();
-		CGameObject* thrower = find_go(t.proxy);
+		CGameObject* thrower = world::object_here(t.proxy);
 		if (CPhysicsShellHolder* holder = thrower ? thrower->cast_physics_shell_holder() : nullptr)
 		{
 			shell->add_ObjectContactCallback(CMissile::ExitContactCallback);
@@ -2091,7 +2044,7 @@ void consume_due(u64 now, bool saving)
 			continue;
 		}
 		// R3 В7: wherever the thrown item went meanwhile (dropped, stashed, handed over), it was thrown.
-		CSE_Abstract* e = events::find_entity(it->first);
+		CSE_Abstract* e = world::server_entity(it->first);
 		const bool same = e && e == it->second.entity && e->s_name == it->second.section;
 		if (throws::consume_at(saving, due, same) == throws::ConsumeAt::Remove)
 		{
@@ -2109,7 +2062,7 @@ void host_unsave_projectiles()
 		xrCriticalSectionGuard guard(g_lock);
 		list.swap(g_ev_projectiles);
 	}
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	for (const auto& p : list)
 	{
 		CSE_ALifeDynamicObject* e = ai().get_alife() ? ai().alife().objects().object(p.first, true) : nullptr;
@@ -2128,6 +2081,7 @@ void host_unsave_projectiles()
 
 void host_flush_events()
 {
+	PROF_EVENT("coop/coop_objects/host_flush_events");
 	xr_vector<ZoneEntry> zones;
 	xr_vector<AnimEntry> anims;
 	xr_vector<DestroyedEntry> destroyed;
@@ -2172,7 +2126,7 @@ void host_flush_events()
 	if (!motions.empty())
 	{
 		// the calls in the order the scripts made them (a section's cycle, then the next section's in the same frame)
-		const u64 now = now_ms();
+		const u64 now = mgr().now_ms();
 		Batcher b(Msg::EntityState, u8(StateKind::Motion), false, Lane::Reliable, kInvalidPeer);
 		for (MotionEvent& e : motions)
 		{
@@ -2221,7 +2175,7 @@ void host_flush_events()
 	{
 		if (ai().get_alife() && ai().alife().objects().object(id, true))
 			continue; // ALife object: coop_entities already sends it
-		if (CSE_Abstract* e = events::find_entity(id))
+		if (CSE_Abstract* e = world::server_entity(id))
 		{
 			events::host_relay_local_spawn(e);
 			++g_c.fragments_relayed;
@@ -2232,7 +2186,7 @@ void host_flush_events()
 void write_rest(Writer& w, CGameObject* go, const xr_vector<Pose>& poses)
 {
 	w.u16(go->ID());
-	w.u32(hash_str(go->cNameSect().c_str()));
+	w.u32(fnv1a32(go->cNameSect().c_str()));
 	w.u8(u8(poses.size()));
 	for (const Pose& p : poses)
 	{
@@ -2243,7 +2197,8 @@ void write_rest(Writer& w, CGameObject* go, const xr_vector<Pose>& poses)
 
 void host_stream()
 {
-	const u64 now = now_ms();
+	PROF_EVENT("coop/coop_objects/host_stream");
+	const u64 now = mgr().now_ms();
 	if (now - g_last_stream < kStreamIntervalMs)
 		return;
 	g_last_stream = now;
@@ -2331,7 +2286,7 @@ void host_stream()
 			continue;
 		--hb.rest_repeats;
 		hb.rest_again = now + kRestRepeatMs;
-		CGameObject* go = find_go(it.first);
+		CGameObject* go = world::object_here(it.first);
 		if (!go || classify(go) != ObjKind::Body || !capture(go->cast_physics_shell_holder(), poses))
 			continue;
 		Writer w(16 + poses.size() * 20);
@@ -2347,12 +2302,12 @@ void host_stream()
 	{
 		g_last_cleanup = now;
 		for (auto it = g_host_bodies.begin(); it != g_host_bodies.end();)
-			it = find_go(it->first) ? std::next(it) : g_host_bodies.erase(it);
+			it = world::object_here(it->first) ? std::next(it) : g_host_bodies.erase(it);
 		for (auto it = g_host_poses.begin(); it != g_host_poses.end();)
-			it = find_go(it->first) ? std::next(it) : g_host_poses.erase(it);
+			it = world::object_here(it->first) ? std::next(it) : g_host_poses.erase(it);
 		for (auto it = g_anim_host.begin(); it != g_anim_host.end();)
 		{
-			if (find_go(it->first))
+			if (world::object_here(it->first))
 				++it;
 			else
 			{
@@ -2362,9 +2317,9 @@ void host_stream()
 		}
 		xrCriticalSectionGuard guard(g_lock);
 		for (auto it = g_zone_switch_ms.begin(); it != g_zone_switch_ms.end();)
-			it = find_go(it->first) ? std::next(it) : g_zone_switch_ms.erase(it);
+			it = world::object_here(it->first) ? std::next(it) : g_zone_switch_ms.erase(it);
 		for (auto it = g_torrid_host.begin(); it != g_torrid_host.end();)
-			it = find_go(it->first) ? std::next(it) : g_torrid_host.erase(it);
+			it = world::object_here(it->first) ? std::next(it) : g_torrid_host.erase(it);
 	}
 }
 
@@ -2387,7 +2342,7 @@ ZoneEntry zone_entry_now(CCustomZone* zone, u64 now)
 // Animator phases of moving zones drift with frame timing: refresh them now and then (P5).
 void host_resend_torrid()
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (now - g_last_torrid < kTorridResendMs)
 		return;
 	g_last_torrid = now;
@@ -2402,7 +2357,7 @@ void host_resend_torrid()
 	Batcher b(Msg::ZoneState, u8(ZoneKind::Zones), false, Lane::Reliable, kInvalidPeer, true);
 	for (u16 id : ids)
 	{
-		CCustomZone* zone = smart_cast<CCustomZone*>(find_go(id));
+		CCustomZone* zone = smart_cast<CCustomZone*>(world::object_here(id));
 		if (!zone)
 			continue;
 		Writer w(16);
@@ -2427,7 +2382,7 @@ void client_frame()
 {
 	client_scan();
 	client_apply_zones();
-	apply_paths(now_ms()); // F4 G11-2: the authority's paths on the copies of its zones
+	apply_paths(mgr().now_ms()); // Zone copies follow the authority's paths.
 	client_apply_bodies();
 	client_apply_events();
 	client_push_check();
@@ -2437,13 +2392,12 @@ void client_frame()
 
 // ---------------------------------------------------------------- API
 
-// R32 PJ3 (WP8b): declared in coop_objects.h, so it lives outside the anonymous namespace (inside it the save's call did not
-// link: build 58, LNK2001)
+// Declared in coop_objects.h for the save, so it lives outside the anonymous namespace.
 void host_flush_consumes()
 {
-	if (!(mode().decides_world() || mode().leads_level()))
+	if (!mode().decides_here())
 		return;
-	consume_due(now_ms(), true);
+	consume_due(mgr().now_ms(), true);
 }
 
 void install_server(Session& s)
@@ -2459,23 +2413,16 @@ void install_client(Endpoint& e)
 
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return;
-	}
-	lua_pushcfunction(L, &l_zone_path);
-	lua_setfield(L, -2, "zone_path");
-	lua_pop(L, 1);
+	static const luaL_Reg fns[] = {{"zone_path", &l_zone_path}, {nullptr, nullptr}};
+	lua_api::fill(L, nullptr, fns);
 }
 
 void frame()
 {
+	PROF_EVENT("coop/coop_objects/frame");
 	if (!g_pGameLevel || !ai().get_alife())
 		return;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 		host_frame();
 	else if (is_live_mirror())
 		client_frame();
@@ -2535,9 +2482,9 @@ void reset()
 
 void host_on_peer_ready(PeerId id)
 {
-	if (!(mode().decides_world() || mode().leads_level()) || !world_up()) // level-change review: it walks Level().Objects, which a level in the making has not filled
+	if (!mode().decides_here() || !world_up()) // it walks Level().Objects, which a level in the making has not filled
 		return;
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	u32 zones = 0, bodies = 0, anims = 0;
 	{
 		Batcher b(Msg::ZoneState, u8(ZoneKind::Zones), false, Lane::Reliable, id, true);
@@ -2558,12 +2505,12 @@ void host_on_peer_ready(PeerId id)
 		xr_vector<Pose> poses;
 		for (const auto& it : g_host_bodies)
 		{
-			CGameObject* go = find_go(it.first);
+			CGameObject* go = world::object_here(it.first);
 			if (!go || classify(go) != ObjKind::Body || !capture(go->cast_physics_shell_holder(), poses))
 				continue;
 			Writer w(16 + poses.size() * 20);
 			w.u16(go->ID());
-			w.u32(hash_str(go->cNameSect().c_str()));
+			w.u32(fnv1a32(go->cNameSect().c_str()));
 			w.u8(u8(poses.size()));
 			for (const Pose& p : poses)
 			{
@@ -2578,7 +2525,7 @@ void host_on_peer_ready(PeerId id)
 		Batcher b(Msg::EntityState, u8(StateKind::Anim), false, Lane::Reliable, id);
 		for (const auto& it : g_anim_host)
 		{
-			if (!find_go(it.first))
+			if (!world::object_here(it.first))
 				continue;
 			AnimEntry a = it.second;
 			auto t = g_anim_host_ms.find(it.first);
@@ -2625,7 +2572,7 @@ bool is_host_driven(const CGameObject* obj)
 
 void print_status()
 {
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		::Msg("[coop]   objects out: %llu sample packets (%llu entries), %llu rests, %llu zone msgs, %llu anim msgs, "
 		    "%u moved bodies",
@@ -2677,9 +2624,9 @@ void physic_anim(CGameObject* obj, CBlend* blend)
 {
 	if (!obj || !blend || !mgr().active())
 		return;
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	const u16 id = obj->ID();
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		AnimEntry cur;
 		cur.id = id;
@@ -2795,11 +2742,11 @@ bool script_cycle_blocked(CGameObject* obj)
 
 void on_script_cycle(CGameObject* obj, const char* anim, bool mix_in)
 {
-	if (!obj || !anim || !*anim || !mgr().active() || !(mode().decides_world() || mode().leads_level()))
+	if (!obj || !anim || !*anim || !mgr().active() || !mode().decides_here())
 		return;
 	if (obj->H_Parent() || !smart_cast<CPhysicObject*>(obj) || xr_strlen(anim) > motion::kMaxCycleName)
 		return;
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	MotionEvent e;
 	e.w.id = obj->ID();
 	e.w.cycle = anim;
@@ -2825,7 +2772,7 @@ bool client_drive_pose(CGameObject* obj)
 	auto it = g_bodies.find(obj->ID());
 	if (it == g_bodies.end() || !it->second.pose_only || it->second.samples.empty())
 		return false;
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	xr_vector<Pose> poses;
 	if (!sample_at(it->second, now > kInterpDelayMs ? now - kInterpDelayMs : 0, poses) || poses.empty())
 		return false;
@@ -2851,7 +2798,7 @@ bool ph_destroy(CGameObject* obj, const SHit& fatal_hit)
 		return false;
 	if (is_mirror())
 		return true; // fragments are host entities; they arrive through WP2's EntityLocal relay
-	if (!(mode().decides_world() || mode().leads_level()) || !smart_cast<CDestroyablePhysicsObject*>(obj))
+	if (!mode().decides_here() || !smart_cast<CDestroyablePhysicsObject*>(obj))
 		return false;
 	DestroyedEntry d;
 	d.id = obj->ID();
@@ -2871,7 +2818,7 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 		return false;
 	if (is_mirror())
 		return true;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		g_ev_fragments.push_back(part->ID());
@@ -2881,7 +2828,7 @@ bool fragment_from_host(CGameObject* source, CGameObject* part)
 
 void on_break(CGameObject* obj)
 {
-	if (!obj || !(mode().decides_world() || mode().leads_level()))
+	if (!obj || !mode().decides_here())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_ev_broken.push_back(obj->ID());
@@ -2908,14 +2855,14 @@ int on_zone_state(CCustomZone* zone, u8 new_state)
 {
 	if (!zone)
 		return 0;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		ZoneEntry e;
 		e.id = zone->ID();
 		e.state = new_state;
 		e.campfire = campfire_flag(zone);
 		xrCriticalSectionGuard guard(g_lock);
-		g_zone_switch_ms[e.id] = now_ms();
+		g_zone_switch_ms[e.id] = mgr().now_ms();
 		auto ph = g_torrid_host.find(e.id);
 		if (ph != g_torrid_host.end())
 			e.anim = ph->second.time;
@@ -2967,12 +2914,12 @@ void zone_blast_passed(CCustomZone* zone)
 
 bool zone_feels_player(u16 id)
 {
-	if (id == kNoId || !mgr().active() || !(mode().decides_world() || mode().leads_level()))
+	if (id == kNoId || !mgr().active() || !mode().decides_here())
 		return false;
 	if (!world::is_player_proxy(id) || world::is_parked(id))
 		return false;
 	// a dead body, and a player who is down by the survival rules (wounded, bled out, spectating, respawning), wake nothing
-	const CEntityAlive* alive = smart_cast<CEntityAlive*>(find_go(id));
+	const CEntityAlive* alive = smart_cast<CEntityAlive*>(world::object_here(id));
 	if (!alive || !alive->g_Alive() || survival::is_down(survival::life_of(id)))
 		return false;
 	++g_c.zone_player_contacts;
@@ -2993,7 +2940,7 @@ bool campfire_turn_blocked(CGameObject* campfire, bool on)
 		return false;
 	if (is_mirror())
 		return g_zone_apply == 0; // the host lights and puts out fires
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		ZoneEntry e;
 		e.id = campfire->ID();
@@ -3012,7 +2959,7 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 		return dt;
 	const float length = anim.max_t - anim.min_t;
 	const float local = anim.t_current - anim.min_t;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		xrCriticalSectionGuard guard(g_lock);
 		TorridPhase& p = g_torrid_host[zone->ID()];
@@ -3025,7 +2972,7 @@ float zone_anim_dt(CCustomZone* zone, const SAnimParams& anim, float dt)
 	auto it = g_torrid_client.find(zone->ID());
 	if (it == g_torrid_client.end())
 		return dt;
-	float host = it->second.time + float(now_ms() - it->second.received) / 1000.f;
+	float host = it->second.time + float(mgr().now_ms() - it->second.received) / 1000.f;
 	host = fmodf(host, length);
 	float diff = host - local;
 	if (diff > length * 0.5f)
@@ -3060,7 +3007,7 @@ bool skip_fake_missile(CGameObject* missile) { return missile && is_mirror(); }
 
 void host_mark_projectile(CSE_Abstract* projectile)
 {
-	if (!projectile || !(mode().decides_world() || mode().leads_level()))
+	if (!projectile || !mode().decides_here())
 		return;
 	// The thrown copy becomes an ALife object when it leaves the hand (game_sv_Single::OnDetach), so
 	// coop_entities replicates its spawn and release; on_projectile_free() clears the flag again so it
@@ -3071,10 +3018,10 @@ void host_mark_projectile(CSE_Abstract* projectile)
 
 void on_projectile_free(CGameObject* missile)
 {
-	if (!missile || !(mode().decides_world() || mode().leads_level()) || !smart_cast<CMissile*>(missile->H_Parent()))
+	if (!missile || !mode().decides_here() || !smart_cast<CMissile*>(missile->H_Parent()))
 		return;
 	xrCriticalSectionGuard guard(g_lock);
-	g_ev_projectiles.emplace_back(missile->ID(), now_ms());
+	g_ev_projectiles.emplace_back(missile->ID(), mgr().now_ms());
 }
 
 bool throw_may_start(CMissile* missile)
@@ -3150,7 +3097,7 @@ bool explode_blocked(CGameObject* explosive)
 
 void on_explode(CGameObject* explosive, u16 initiator, const Fvector& pos, const Fvector& normal)
 {
-	if (!explosive || !(mode().decides_world() || mode().leads_level()))
+	if (!explosive || !mode().decides_here())
 		return;
 	ExplodeEntry x;
 	x.id = explosive->ID();

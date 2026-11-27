@@ -13,6 +13,8 @@
 #include "coop_survival.h"
 #include "coop_script.h"
 #include "xrCoop/coop_checkpoint_store.h"
+#include "xrCoop/coop_ids.h"
+#include "xrCoop/coop_lua_errors.h" // lua_errors::line_allowed
 #include "xrCoop/coop_checkpoint_base_rules.h" // Build 57: the respawn past the bed of a hostile base
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -30,6 +32,7 @@
 #include "alife_time_manager.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -44,11 +47,10 @@ using checkpoint::Record;
 using checkpoint::Slot;
 using checkpoint::kNoSource;
 
-constexpr u16 kNoId = 0xffff;
 constexpr const char* kChangedCallback = "coop_checkpoint_changed";
 static_assert(checkpoint::kNoSeat == levels::wire::kNoLevel, "rides_with_host is asked with level_of_player");
-// F3 T6 R1 I-1: how often the host reads every cached slot again, so a character that is gone or whose id another
-// character got is announced as cleared (the reads are a few hundred bytes of custom data each).
+// The host rereads every cached slot at this interval to announce a clear when a character disappears or its id is
+// reused. Each read takes a few hundred bytes of custom data.
 constexpr u64 kSweepMs = 1000;
 
 // Host setting (console coop_checkpoints_group): every player sees everyone's checkpoints (1) or only his own (0).
@@ -60,7 +62,8 @@ struct Host
 	u32 epoch = 0;
 	checkpoint::HostStore store; // cache of the slots (host numbering) and the changes frame() announces
 	Record arrival; // the host's own arrival point (actor custom data, key `arrival`)
-	xr_set<u16> in_world; // characters whose players were in the world at the last frame (at most kMaxPlayers)
+	xr_vector<u16> in_world; // sorted character ids from the last frame (at most kMaxPlayers)
+	xr_vector<u16> next_in_world; // scratch buffer reused when gathering the current frame
 	bool player_served = false; // F3a T7: the host player was in the world at the last frame (his list went to him)
 	int group_served = -1; // coop_checkpoints_group the players in the world were last served with
 	u64 next_sweep_ms = 0;
@@ -84,7 +87,7 @@ struct Stats
 };
 Stats g_stat;
 
-bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+constexpr u64 kLogBurst = 10; // a repeating line of this module: the first ones in full, then one in a hundred
 
 // ---------------------------------------------------------------- world helpers
 
@@ -111,14 +114,6 @@ std::string current_level()
 
 u64 game_time_ms() { return ai().get_alife() ? u64(ai().alife().time_manager().game_time()) : 0; }
 
-// The online object of a character here, nullptr if it is not in the world.
-CGameObject* object_here(u16 id)
-{
-	if (!g_pGameLevel || id == kNoId)
-		return nullptr;
-	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return o && !o->getDestroy() ? o : nullptr;
-}
 
 // The server entity that carries a character's custom data: the host's actor (0) or a player character; nullptr if
 // there is none (released, or never a player's).
@@ -213,7 +208,7 @@ const Slot* slot_of(u16 character)
 	if (g_host.store.observe(character, s))
 	{
 		++g_stat.vanished;
-		if (log_allowed(g_stat.vanished))
+		if (lua_errors::line_allowed(g_stat.vanished, kLogBurst))
 			::Msg("[coop] checkpoints: the record of character %u changed under the store (%s), announced", character,
 			    s.cur.valid() ? "another record" : "none any more");
 	}
@@ -333,7 +328,8 @@ bool ensure_loaded()
 	g_host.loaded = true;
 	g_host.epoch = epoch;
 	g_host.store.clear_cache(); // changes still queued go out (the host's own arrival of the level change)
-	g_host.in_world.clear(); // every player in this world gets the whole list again
+	g_host.in_world.clear_not_free(); // every player in this world gets the whole list again
+	g_host.next_in_world.clear_not_free();
 	g_host.player_served = false; // the host player too (F3a T7)
 	g_host.unreadable_told.clear();
 	const std::string level = current_level();
@@ -448,7 +444,7 @@ void arrivals_frame()
 		if (survival::life_of(proxy) != survival::Life::Alive || world::is_parked(proxy))
 			continue;
 		const bool away = mode().decider_of(proxy) == Decider::Other;
-		const CGameObject* o = away ? nullptr : object_here(proxy);
+		const CGameObject* o = away ? nullptr : world::object_here(proxy);
 		if (!away && !o)
 			continue;
 		const Record r = away ? record_far(proxy, Kind::Arrival, kNoSource) : record_here(o, Kind::Arrival, kNoSource);
@@ -473,13 +469,18 @@ void host_frame()
 	}
 	// Players who came into the world since the last frame (join::host_player_in_world turned true) get the whole
 	// list; with the group view switched everyone in the world is served again.
-	xr_set<u16> now;
-	for (const PeerInfo& p : mgr().session().peers())
+	auto& now = g_host.next_in_world;
+	now.clear_not_free();
+	mgr().session().for_each_joined([&now](const PeerInfo& p)
 	{
 		const u16 proxy = join::proxy_of_peer(p.id);
 		if (proxy != kNoId && join::host_player_in_world(proxy))
-			now.insert(proxy);
-	}
+		{
+			now.push_back(proxy);
+		}
+	});
+	std::sort(now.begin(), now.end());
+	now.erase(std::unique(now.begin(), now.end()), now.end());
 	const bool switched = g_host.group_served != -1 && g_host.group_served != int(group);
 	if (switched)
 	{
@@ -487,7 +488,7 @@ void host_frame()
 		refresh_all();
 	}
 	for (u16 proxy : now)
-		if (switched || !g_host.in_world.count(proxy))
+		if (switched || !std::binary_search(g_host.in_world.begin(), g_host.in_world.end(), proxy))
 		{
 			if (!switched)
 				slot_of(proxy); // his own slot as it is now (his copy may hold the camp of a former owner of the id)
@@ -537,7 +538,7 @@ void client_on_state(PeerId from, Reader& rd)
 	if (!checkpoint::read_state(rd, m))
 	{
 		++g_stat.malformed;
-		if (log_allowed(g_stat.malformed))
+		if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 			::Msg("! [coop] checkpoints: malformed CheckpointState from the host ignored");
 		return;
 	}
@@ -548,7 +549,7 @@ void client_on_state(PeerId from, Reader& rd)
 		if (local != 0)
 		{
 			++g_stat.malformed;
-			if (log_allowed(g_stat.malformed))
+			if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 				::Msg("! [coop] checkpoints: a refused claim of character %u is not mine, ignored", local);
 			return;
 		}
@@ -560,7 +561,7 @@ void client_on_state(PeerId from, Reader& rd)
 	if (!g_mirror.apply(local, m))
 	{
 		++g_stat.mirror_full;
-		if (log_allowed(g_stat.mirror_full))
+		if (lua_errors::line_allowed(g_stat.mirror_full, kLogBurst))
 			::Msg("! [coop] checkpoints: %u checkpoints kept, the one of character %u is ignored",
 			    u32(checkpoint::kMaxSlots), local);
 		return;
@@ -591,7 +592,7 @@ public:
 			::Msg("! [coop] coop_checkpoint_here: host only, in a co-op session");
 			return;
 		}
-		const CGameObject* me = object_here(0);
+		const CGameObject* me = world::object_here(0);
 		if (me && host_set(0, record_here(me, Kind::Rest, kNoSource), false))
 			::Msg("[coop] coop_checkpoint_here: a rest checkpoint is set where you stand");
 		else
@@ -625,6 +626,7 @@ void reset()
 
 void frame()
 {
+	PROF_EVENT("coop/coop_checkpoints/frame");
 	if (mode().decides_world())
 		host_frame();
 	if (is_player())
@@ -743,14 +745,14 @@ bool host_set(u16 character, const Record& r, bool elsewhere)
 	if (why)
 	{
 		++g_stat.refused;
-		if (log_allowed(g_stat.refused))
+		if (lua_errors::line_allowed(g_stat.refused, kLogBurst))
 			::Msg("[coop] checkpoint of character %u refused: %s (%s)", character, why, describe(r).c_str());
 		return false;
 	}
 	if (same)
 		return true; // counted in g_stat.same; no log line for every repeat
 	++g_stat.sets;
-	if (log_allowed(g_stat.sets)) // R1 M-3: a mod may set them in a loop
+	if (lua_errors::line_allowed(g_stat.sets, kLogBurst)) // a mod may set them in a loop
 		::Msg("[coop] checkpoint of character %u: %s", character, describe(r).c_str());
 	return true;
 }
@@ -774,7 +776,7 @@ void host_source_lost(u16 source)
 		store_slot(id, s);
 		g_host.store.change(id, s, true);
 		++g_stat.rollbacks;
-		if (log_allowed(g_stat.rollbacks))
+		if (lua_errors::line_allowed(g_stat.rollbacks, kLogBurst))
 			::Msg("[coop] checkpoint of character %u rolled back (source %u is gone): %s", id, source,
 			    describe(s.cur).c_str());
 	}
@@ -790,7 +792,7 @@ void host_set_arrival(u16 character, const Record& r)
 	if (!a.valid() || !apply_set(character, a))
 	{
 		++g_stat.refused;
-		if (log_allowed(g_stat.refused))
+		if (lua_errors::line_allowed(g_stat.refused, kLogBurst))
 			::Msg("! [coop] arrival point of character %u not set (%s)", character, describe(a).c_str());
 		return;
 	}
@@ -822,8 +824,8 @@ void host_on_level_change(const CSE_ALifeCreatureActor& actor)
 		return;
 	}
 	host_set_arrival(0, host);
-	// The players in the world as of the last frame (this runs inside the server's message handling, not between
-	// frames); xr_set keeps them in id order, so the spots do not depend on who connected first.
+	// The server handles this message using the previous frame's sorted in_world snapshot, so arrival spots do not
+	// depend on connection order.
 	xr_vector<u16> players;
 	for (u16 proxy : g_host.in_world)
 		players.push_back(proxy);
@@ -832,7 +834,7 @@ void host_on_level_change(const CSE_ALifeCreatureActor& actor)
 	for (u16 proxy : players)
 	{
 		const PeerId peer = join::peer_of_proxy(proxy);
-		if (!checkpoint::rides_with_host(levels::split(), join::host_soft_stays(peer), levels::level_of_player(peer), target))
+		if (!checkpoint::rides_with_host(mode().group_travels(), levels::level_of_player(peer), target))
 		{
 			++stay;
 			continue;
@@ -856,12 +858,11 @@ bool host_story(const char* reason)
 	for (u16 c : characters)
 	{
 		const bool living = survival::life_of(c) == survival::Life::Alive && (c == 0 || !world::is_parked(c));
-		const CGameObject* o = living ? object_here(c) : nullptr;
+		const CGameObject* o = living ? world::object_here(c) : nullptr;
 		const bool elsewhere = mode().decider_of(c) == Decider::Other;
 		const checkpoint::StoryFrom from = checkpoint::story_from(living, elsewhere, o != nullptr);
-		// Build 57 round 2 (lead 2026-11-18, review S3): a living player on a friendly base gets the base's record instead
-		// (Co-op: by his position here; Server: by the footing of his map server), so the same base again is Same: no tip,
-		// and the base does not write itself again 3 s later
+		// A living player on a friendly base gets the base's record, using his position in Co-op or map-server footing in
+		// Server. The same base yields Same, so there is no tip or repeat write after another 3 s.
 		checkpoint::Record bed;
 		if (from != checkpoint::StoryFrom::Nothing && sources::base_bed_record(c, bed))
 		{
@@ -876,7 +877,7 @@ bool host_story(const char* reason)
 		}
 	}
 	++g_stat.stories;
-	if (log_allowed(g_stat.stories)) // R1 M-3: coop.checkpoint.story is open to every addon
+	if (lua_errors::line_allowed(g_stat.stories, kLogBurst)) // coop.checkpoint.story is open to every addon
 		::Msg("[coop] checkpoints: story checkpoint '%.64s' for %u player(s)", reason ? reason : "", set);
 	return set != 0;
 }
@@ -921,7 +922,7 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 	if (bed_choice != checkpoint::base::BedChoice::Keep)
 	{
 		++g_stat.hostile_beds;
-		if (log_allowed(g_stat.hostile_beds))
+		if (lua_errors::line_allowed(g_stat.hostile_beds, kLogBurst))
 			::Msg("[coop] checkpoints: character %u: the base of his %s checkpoint is hostile to him, he comes back %s",
 			    character, bed_choice == checkpoint::base::BedChoice::DropPrev ? "previous" : "current",
 			    bed_choice == checkpoint::base::BedChoice::UsePrev ? "at his previous checkpoint" : "as without a checkpoint");
@@ -941,7 +942,7 @@ bool host_respawn_point(u16 character, const Fvector* anchor, const Fvector& bod
 	const bool anchor_ok = anchor && checkpoint::base::fallback_ok(hostile_ground, level, a);
 	const bool arrival_ok = arrival && checkpoint::base::fallback_ok(hostile_ground, level, g_host.arrival.pos);
 	if (hostile_ground && !anchor_ok && !arrival_ok && !checkpoint::base::fallback_ok(hostile_ground, level, b) &&
-	    log_allowed(g_stat.hostile_beds))
+	    lua_errors::line_allowed(g_stat.hostile_beds, kLogBurst))
 		::Msg("! [coop] checkpoints: character %u: no point off the hostile base to come back at, he comes back where he fell",
 		    character);
 	const checkpoint::Choice c =

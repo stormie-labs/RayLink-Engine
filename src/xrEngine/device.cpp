@@ -42,7 +42,7 @@
 #include "../xrCoop/coop_device_rules.h" // Anomaly Coop: the pause at the start honours g_always_active
 #include "IGame_Level.h"
 
-extern u32 g_screenmode; // Anomaly Coop: used by the pause at the start (End), declared again below
+extern u32 g_screenmode; // Anomaly Coop: used by the pause at the start (End)
 
 #include "Rain.h"
 
@@ -316,7 +316,6 @@ float GetMonitorRefresh()
 }
 
 extern int ps_framelimiter;
-extern u32 g_screenmode;
 extern int g_free_cursor; // Anomaly Coop: console g_free_cursor 0/1 (xr_ioc_cmd.cpp)
 
 CTimer FreezeTimer;
@@ -735,7 +734,7 @@ void CRenderDevice::FrameMove()
 	Device.seqFrame.Process(rp_Frame);
 	STOP_PROFILE;
 
-	// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23): a menu may have opened or closed this frame
+	// Anomaly Coop: free cursor in windowed menus: a menu may have opened or closed this frame
 	UpdateCursorClip();
 	
 	g_bLoaded = TRUE;
@@ -768,8 +767,6 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 
 		if (bTimer && (!g_pGamePersistent || g_pGamePersistent->CanBePaused()))
 		{
-			if (!g_pauseMngr().Paused()) // Anomaly Coop: diagnostics, who stops the game clock
-				Msg("~ device pause on: %s", reason ? reason : "?");
 			g_pauseMngr().Pause(true);
 #ifdef DEBUG
             if (!xr_strcmp(reason, "li_pause_key_no_clip"))
@@ -789,7 +786,6 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 	{
 		if (bTimer && g_pauseMngr().Paused())
 		{
-			Msg("~ device pause off: %s", reason ? reason : "?"); // Anomaly Coop: diagnostics
 			fTimeDelta = EPS_S + EPS_S;
 			g_pauseMngr().Pause(false);
 		}
@@ -820,7 +816,7 @@ bool CRenderDevice::Paused()
 	return g_pauseMngr().Paused();
 }
 
-// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+// Anomaly Coop: free cursor in windowed menus
 // The one place that calls ClipCursor while the game runs: the render layers, the screenmode console command, device
 // create / reset and the main menu all come here. cursor_should_clip() decides; ClipCursor runs only when the answer
 // or the client rectangle changes. `force` re-applies it regardless (after a reset, a resize or an activation the
@@ -859,7 +855,7 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 	BOOL fMinimized = (BOOL)HIWORD(wParam);
 	BOOL bActive = ((fActive != WA_INACTIVE) && (!fMinimized)) ? TRUE : FALSE;
 
-	m_window_focused = (bActive != FALSE); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	m_window_focused = (bActive != FALSE); // Anomaly Coop: free cursor in windowed menus
 
 	if (psDeviceFlags2.test(rsAlwaysActive) && g_screenmode != 2)
 	{
@@ -872,13 +868,13 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 			if (Device.b_hide_cursor)
 			{
 				ShowCursor(FALSE);
-				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus
 				pInput->OnAppActivate();
 			}
 			else
 			{
 				ShowCursor(TRUE);
-				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+				UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus
 				pInput->OnAppDeactivate();
 			}
 		}
@@ -900,7 +896,7 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
             if (!editor())
 # endif // #ifdef INGAME_EDITOR
 			ShowCursor(FALSE);
-			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus
 #endif // #ifndef DEDICATED_SERVER
 		}
 		else
@@ -908,7 +904,7 @@ void CRenderDevice::OnWM_Activate(WPARAM wParam, LPARAM lParam)
 			app_inactive_time_start = TimerMM.GetElapsed_ms();
 			Device.seqAppDeactivate.Process(rp_AppDeactivate);
 			ShowCursor(TRUE);
-			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+			UpdateCursorClip(true); // Anomaly Coop: free cursor in windowed menus
 		}
 	}
 }

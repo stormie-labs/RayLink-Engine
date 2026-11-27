@@ -58,7 +58,7 @@ void CIKLimbsController::LimbSetup()
 
 void CIKLimbsController::LimbCalculate(SCalculateData& cd)
 {
-	// Anomaly Coop (RL-4BXZ-R24J): the def is read only when the blend names one of this skeleton (ik_anim_state.h)
+	// coop: the def is read only when the blend names one of this skeleton (ik_anim_state.h)
 	CMotionDef* const legs_def = ik_blend_motion_def(cd.m_limb->KinematicsAnimated(), m_legs_blend);
 	cd.do_collide = legs_def && !legs_def->marks.empty(); //m_legs_blend->;
 	cd.m_limb->ApplyState(cd);

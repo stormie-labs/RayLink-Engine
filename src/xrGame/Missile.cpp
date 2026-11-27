@@ -27,7 +27,7 @@
 #include "ui/UIProgressShape.h"
 #include "ui/UIXmlInit.h"
 #include "physicsshellholder.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 
 CUIProgressShape* g_MissileForceShape = NULL;
 
@@ -189,14 +189,14 @@ void CMissile::OnHiddenItem()
 void CMissile::spawn_fake_missile()
 {
 	if (OnClient()) return;
-	if (coop::objects::skip_fake_missile(this)) return; // Anomaly Coop: a client's throw is made by the host
+	if (coop::objects::skip_fake_missile(this)) return; // coop: a client's throw is made by the host
 
 	if (!getDestroy())
 	{
 		CSE_Abstract* object = Level().spawn_item(
 			*cNameSect(),
 			Position(),
-			(g_dedicated_server && !g_coop_headless) ? u32(-1) : ai_location().level_vertex_id(),
+			ai_location().level_vertex_id(),
 			ID(),
 			true
 		);
@@ -204,7 +204,7 @@ void CMissile::spawn_fake_missile()
 		CSE_ALifeObject* alife_object = smart_cast<CSE_ALifeObject*>(object);
 		VERIFY(alife_object);
 		alife_object->m_flags.set(CSE_ALifeObject::flCanSave,FALSE);
-		coop::objects::host_mark_projectile(alife_object); // Anomaly Coop: the thrown copy is replicated as an entity
+		coop::objects::host_mark_projectile(alife_object); // coop: the thrown copy is replicated as an entity
 
 		NET_Packet P;
 		object->Spawn_Write(P,TRUE);
@@ -225,7 +225,7 @@ void CMissile::OnH_A_Chield()
 void CMissile::OnH_B_Independent(bool just_before_destroy)
 {
 	inherited::OnH_B_Independent(just_before_destroy);
-	if (!just_before_destroy) coop::objects::on_projectile_free(this); // Anomaly Coop: never saved once thrown
+	if (!just_before_destroy) coop::objects::on_projectile_free(this); // coop: never saved once thrown
 
 	if (!just_before_destroy)
 	{
@@ -649,7 +649,7 @@ bool CMissile::Action(u16 cmd, u32 flags)
 			m_constpower = true;
 			if (flags & CMD_START)
 			{
-				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // Anomaly Coop: not while its create is pending
+				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // coop: not while its create is pending
 				{
 					m_throw = true;
 					SwitchState(eThrowStart);
@@ -668,7 +668,7 @@ bool CMissile::Action(u16 cmd, u32 flags)
 			if (flags & CMD_START)
 			{
 				m_throw = false;
-				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // Anomaly Coop: not while its create is pending
+				if (GetState() == eIdle && coop::objects::throw_may_start(this)) // coop: not while its create is pending
 					SwitchState(eThrowStart);
 				else if (GetState() == eReady)
 				{

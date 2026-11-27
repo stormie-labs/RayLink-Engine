@@ -26,7 +26,7 @@
 #include "movement_manager.h"
 #include "agent_manager.h"
 #include "agent_enemy_manager.h"
-#include "coop/coop_ai.h" // Anomaly Coop
+#include "coop/coop_ai.h"
 
 u32 ENEMY_INERTIA_TIME_TO_SOMEBODY = 3000;
 u32 ENEMY_INERTIA_TIME_TO_ACTOR = 0;
@@ -79,7 +79,7 @@ bool CEnemyManager::useful(const CEntityAlive* entity_alive) const
 	PROF_EVENT("CEnemyManager::useful");
 	if (!entity_alive->g_Alive())
 		return (false);
-	// Anomaly Coop: a dead player's body is no enemy, and a monster leaves one who is down as well; a stalker only when the
+	// coop: a dead player's body is no enemy, and a monster leaves one who is down as well; a stalker only when the
 	// game rule coop_npc_finish_downed is off
 	if (coop::npc_ai::player_out_for(entity_alive, m_stalker != nullptr))
 		return (false);
@@ -178,12 +178,12 @@ float CEnemyManager::evaluate(const CEntityAlive* object) const
 		penalty -= 1000.f;
 
 	// if object is actor and he/she sees us
-	bool coop_player_sees = false; // Anomaly Coop
+	bool coop_player_sees = false; // coop: a remote player's character has no vision of its own
 	if (actor) {
 		if (actor->memory().visual().visible_now(m_object))
 			penalty -= (m_visible_enemy_bias_actor >= 0.f) ? m_visible_enemy_bias_actor : 900.f;
 	}
-	else if (coop::npc_ai::player_sees(object, m_object, coop_player_sees)) { // Anomaly Coop: a remote player weighs like the actor
+	else if (coop::npc_ai::player_sees(object, m_object, coop_player_sees)) { // coop: a remote player weighs like the actor
 		if (coop_player_sees)
 			penalty -= (m_visible_enemy_bias_actor >= 0.f) ? m_visible_enemy_bias_actor : 900.f;
 	}
@@ -315,10 +315,10 @@ bool CEnemyManager::change_from_wounded(const CEntityAlive* current, const CEnti
 
 IC bool CEnemyManager::enemy_inertia(const CEntityAlive* previous_enemy) const
 {
-	if (coop::npc_ai::is_player(m_selected)) // Anomaly Coop: every player, was smart_cast<CActor const*>
+	if (coop::npc_ai::is_player(m_selected)) // coop: every player, was smart_cast<CActor const*>
 		return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_TO_ACTOR));
 
-	if (previous_enemy && coop::npc_ai::is_player(previous_enemy)) // Anomaly Coop: every player
+	if (previous_enemy && coop::npc_ai::is_player(previous_enemy)) // coop: every player
 		return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_FROM_ACTOR));
 
 	return (Device.dwTimeGlobal <= (m_last_enemy_change + ENEMY_INERTIA_TIME_TO_SOMEBODY));
@@ -329,7 +329,7 @@ void CEnemyManager::on_enemy_change(const CEntityAlive* previous_enemy)
 	VERIFY(previous_enemy);
 	VERIFY(selected());
 
-	// Anomaly Coop: a player out of this fight is no one to go back to by inertia
+	// coop: a player out of this fight is no one to go back to by inertia
 	if (!previous_enemy->g_Alive() || coop::npc_ai::player_out_for(previous_enemy, m_stalker != nullptr))
 	{
 		m_last_enemy_change = Device.dwTimeGlobal;
@@ -419,7 +419,7 @@ bool CEnemyManager::need_update(const bool& only_wounded) const
 	if (!selected()->g_Alive())
 		return (true);
 
-	// Anomaly Coop: useful() judges only a new choice: one who went down while chosen would be shot until he is dead
+	// coop: useful() judges only a new choice: one who went down while chosen would be shot until he is dead
 	if (coop::npc_ai::player_out_for(selected(), m_stalker != nullptr))
 		return (true);
 

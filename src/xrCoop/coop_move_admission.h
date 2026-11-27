@@ -1,12 +1,11 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — admission of an item move into a container on the process that decides (F4 G6-1, finding m17:4).
+// Anomaly Coop — admission of an item move into a container on the process that decides.
 //
-// Hideout Furniture limits the weight of a stash only in the window of the player who moves an item
-// (stash_capacities.script:89-116, ActorMenu_on_item_before_move: a view callback, xrCoop/coop_routes.h): two players
-// filling one stash at once each saw the old weight, and the decider applied both (50 kg of 60, two moves of 6 kg: 62 kg).
+// A mod may limit the weight of a stash only in the window of the player who moves an item (ActorMenu_on_item_before_move:
+// a view callback, xrCoop/coop_routes.h): two players filling one stash at once would each see the old weight, and the
+// decider would apply both (50 kg of 60, two moves of 6 kg: 62 kg).
 // The decider now asks the mods' move rules (gamedata/scripts/coop_mods_move_limits.script admit, Lua) before apply_move of
 // a move into a container: a client's ReqTake / ReqTransfer (coop_requests.cpp host_move) and this process's own script and
-// window moves (host_transfer_item: G.A.M.M.A.'s ui_inventory moves items with transfer_item). The windows stay a preview.
+// window moves (host_transfer_item: a Lua inventory window moves items with transfer_item). The windows stay a preview.
 //
 // A move it let in reaches the container's game inventory - what the rules weigh, iterate_inventory_box - only when the game
 // event queue runs, a frame later. Until then it is held in the Ledger, and the rules get the count and the weight of the
@@ -21,7 +20,7 @@
 //
 // The same in both modes: whichever process applies the move - the co-op host, or in the Server mode the map server of the
 // player's level - keeps its own ledger for the containers of the map it leads; a player's machine never asks.
-// A move into a player's character is asked too, without the ledger (R32 WP18 P4, Route below); the ground is never asked.
+// A move into a player's character is asked too, without the ledger (Route below); the ground is never asked.
 //
 // Pure C++17, header-only, no engine dependencies: used by the engine (xrGame/coop/coop_requests.cpp) and the unit-test exe
 // (tests/test_move_admission.cpp).
@@ -31,6 +30,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include "coop_ids.h"
 
 namespace coop
 {
@@ -68,7 +69,7 @@ struct Pending
 	float weight = 0.f;
 };
 
-constexpr uint16_t kNoObject = 0xffff;
+constexpr uint16_t kNoObject = kNoId;
 constexpr uint32_t kMaxHeld = 8192; // every held move of this process, all containers (an item is held at most once)
 constexpr uint64_t kTtlMs = 5000; // a held move lands a frame later; one that never shows is dropped after this
 constexpr float kMaxWeight = 100000.f;
@@ -210,14 +211,13 @@ inline Verdict decide(Ledger& ledger, Answer answer, uint16_t container, uint16_
 	return ledger.hold(container, item, weight, now) ? Verdict::Ok : Verdict::Full;
 }
 
-// ---------------------------------------------------------------- R32 WP18 P4 (§8a A21 E-3): a move into a player
-// The Weapon Showcase display copy rule (coop_mods_hf.script hf_showcase_display) refuses every move of a display copy, but a
-// move whose destination root is a player was applied unasked, so a player could still pick one up (the mod's own veto runs
-// only on the picker's machine). Which question admitted_move puts a move to:
+// ---------------------------------------------------------------- a move into a player
+// A rule may refuse every move of an item (a mod's display copy). A move whose destination root is a player is asked too, or a
+// player could still pick one up (the mod's own veto runs only on the picker's machine). Which question admitted_move puts a move to:
 //   Stock       onto the ground: nothing is asked (the stock game's limits)
 //   Ask         into a character whose root is a player: the rules are asked with nothing pending, and nothing is settled,
 //               held or released (a player's game inventory is no rule's weight). Only a refusal stops the move; a let-in,
-//               no rule or a failed asking moves it as in the stock game. No installed rule but the display copy's refuses
+//               no rule or a failed asking moves it as in the stock game. No installed rule but such a veto refuses
 //               an ordinary pickup (tests/lua/test_move_rules_player.lua)
 //   AskAndHold  into any other container: asked with its held moves, a let-in is held (decide, above)
 enum class Route : uint8_t

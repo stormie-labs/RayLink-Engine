@@ -6,22 +6,26 @@
 #include "xrCoop/coop_mode.h"
 #include "coop_net.h"
 #include "coop_join.h"
-#include "coop_levels.h" // R32 W3: the echo of a map server's report (EchoOf, echo_now)
+#include "coop_levels.h" // the echo of a map server's report (EchoOf, echo_now)
 #include "coop_world.h"
 #include "coop_sync.h"
 #include "coop_entities.h"
 #include "coop_alife.h"
 #include "coop_remote.h"
-#include "coop_dialog.h"
+#include "coop_hud_text.h"
 #include "coop_story.h"
+#include "coop_money.h" // client_on_actor_money
 #include "coop_callgate.h" // F2 T12
 #include "coop_monster_fx.h" // audit A5
 #include "coop_items.h" // live report 2026-11-08: the owner's copy before a take
 #include "coop_vehicles.h" // F5-VEH-3: F at a car asks its decider for a seat
-#include "coop_vehicles_client.h" // F5-VEH-3: a script's attach that the call gate lets run asks the same
+#include "coop_vehicles_client.h" // a script's attach that the call gate lets run asks the same
+#include "coop_wire_vec.h"
+#include "xrCoop/coop_lua_errors.h" // lua_errors::LogBudget
 #include "xrCoop/coop_rules.h"
 #include "xrCoop/coop_reconcile.h"
 #include "xrCoop/coop_object_identity.h" // live RL-UGYE-3WGE: one id, one object on a mirror
+#include "xrCoop/coop_spawn_wait_rules.h" // TZ P104: a spawn waits while an object on its way out holds its id
 
 #include "Level.h"
 #include "Car.h"
@@ -50,7 +54,6 @@ void client_forget(u16 local_id);
 
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr u16 kActor = 0; // the local actor on every machine (the join swap keeps it at 0)
 constexpr u32 kPendingTimeoutMs = 15000;
 constexpr u32 kExtendMs = 30000; // D5: a holder change that timed out waits this much more, after asking again
@@ -132,10 +135,12 @@ struct IdentityCounters
 {
 	u64 spawns_stale = 0, spawns_other_kind = 0, spawns_duplicate = 0, exports_unregistered = 0, exports_other_kind = 0,
 	    updates_skipped = 0;
+	u64 spawns_waited = 0, spawns_made_after_wait = 0, spawns_gave_up = 0; // TZ P104 (xrCoop/coop_spawn_wait_rules.h)
 } g_ic;
+spawn_wait::WaitBook g_spawn_wait; // TZ P104: frames each id waited for the object that holds it (game thread)
+lua_errors::LogBudget g_spawn_wait_log{kLogBurst};
 
-u32 g_log_count = 0;
-bool log_allowed() { return ++g_log_count <= kLogBurst || (g_log_count % 100) == 0; }
+lua_errors::LogBudget g_log{kLogBurst};
 bool g_vehicle_note = false; // client: tell the player once per refused attempt (HUD from frame()); F5: a refused script attach
 
 bool router_on()
@@ -144,19 +149,10 @@ bool router_on()
 	return p == Phase::LoadingWorld || p == Phase::Live;
 }
 
-// Game object that is in the level and not going away.
-CGameObject* find_go(u16 id)
-{
-	if (id == kNoId || !g_pGameLevel)
-		return nullptr;
-	CGameObject* go = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return go && !go->getDestroy() ? go : nullptr;
-}
-
 // Game object the server accepts in an ownership event (see is_object_valid_on_svclient).
 CGameObject* valid_go(u16 id)
 {
-	CGameObject* go = find_go(id);
+	CGameObject* go = world::object_here(id);
 	return go && !go->object_removed() ? go : nullptr;
 }
 
@@ -165,7 +161,7 @@ bool is_ours(u16 id) { return id != kNoId && root_of(id) == kActor; }
 bool is_mirrored_creature(u16 id)
 {
 	return id != kActor && entities::is_mirrored(id) &&
-	    smart_cast<CSE_ALifeCreatureAbstract*>(find_entity(id)) != nullptr;
+	    smart_cast<CSE_ALifeCreatureAbstract*>(world::server_entity(id)) != nullptr;
 }
 
 void inject_item_event(u16 type, u16 dest, u16 item)
@@ -180,29 +176,6 @@ bool swallow(u64& counter)
 {
 	++counter;
 	return true;
-}
-
-// R2 I2: a world message that comes before we are live is dropped (rules::live_only): it is from the window between
-// Welcome and JoinRequest or from a world we have left. Applied, it would change our own world or the new one.
-bool before_live(Msg type)
-{
-	if (!rules::live_only(type) || mgr().is_live_client())
-		return false;
-	++g_c.dropped_before_live;
-	return true;
-}
-
-void put_vec(Writer& w, const Fvector& v)
-{
-	const float f[3] = {v.x, v.y, v.z};
-	w.vec3(f);
-}
-
-Fvector get_vec(Reader& r)
-{
-	float f[3] = {0.f, 0.f, 0.f};
-	r.vec3(f);
-	return Fvector().set(f[0], f[1], f[2]);
 }
 
 // ---------------------------------------------------------------- client router
@@ -233,7 +206,7 @@ bool filter_spawn(NET_Packet& P)
 	else
 	{
 		++g_c.spawns_refused;
-		if (log_allowed())
+		if (g_log.allow())
 			::Msg("[coop] client spawn of [%s] (parent %u) refused: world spawns are the host's job", section,
 			    e->ID_Parent);
 	}
@@ -253,19 +226,19 @@ bool echo_of(u16 id)
 
 bool on_take(u16 dest, u16 item, bool trade)
 {
-	CSE_Abstract* e = find_entity(item);
+	CSE_Abstract* e = world::server_entity(item);
 	if (!e)
 		return false; // not part of the host world: a purely local object
 	if (echo_of(item))
 		return swallow(g_c.echo_dropped);
-	requests::client_move(item, e->ID_Parent, dest, nullptr, trade ? 2 : 0);
+	requests::client_move(item, e->ID_Parent, dest, nullptr, trade ? requests::kMoveTrade : 0);
 	++g_c.moves_forwarded;
 	return true;
 }
 
 bool on_reject(u16 dest, u16 item, bool before_destroy, const Fvector* pos, bool trade)
 {
-	if (!find_entity(item))
+	if (!world::server_entity(item))
 		return false;
 	if (before_destroy)
 		return swallow(g_c.moves_blocked); // the GE_DESTROY that follows goes to the host
@@ -273,21 +246,21 @@ bool on_reject(u16 dest, u16 item, bool before_destroy, const Fvector* pos, bool
 		return swallow(g_c.echo_dropped);
 	// A thrown missile leaves the grenade/bolt that held it: local and immediate (the throw
 	// must not wait for the network); the host repeats it on its copy.
-	CGameObject* go = find_go(item);
-	if (go && smart_cast<CMissile*>(go) && smart_cast<CMissile*>(find_go(dest)) && is_ours(dest))
+	CGameObject* go = world::object_here(item);
+	if (go && smart_cast<CMissile*>(go) && smart_cast<CMissile*>(world::object_here(dest)) && is_ours(dest))
 	{
-		requests::client_move(item, dest, kNoId, pos, 1);
+		requests::client_move(item, dest, kNoId, pos, requests::kMoveLocal);
 		++g_c.moves_forwarded;
 		return false;
 	}
-	requests::client_move(item, dest, kNoId, pos, trade ? 2 : 0);
+	requests::client_move(item, dest, kNoId, pos, trade ? requests::kMoveTrade : 0);
 	++g_c.moves_forwarded;
 	return true;
 }
 
 bool on_destroy(u16 dest)
 {
-	CSE_Abstract* e = find_entity(dest);
+	CSE_Abstract* e = world::server_entity(dest);
 	if (!e)
 		return false; // not part of the host world
 	if (smart_cast<CSE_ALifeCreatureAbstract*>(e))
@@ -296,7 +269,7 @@ bool on_destroy(u16 dest)
 		return swallow(g_c.echo_dropped); // one of the two requests below, about a world object
 	if (is_ours(dest))
 	{
-		CGameObject* go = find_go(dest);
+		CGameObject* go = world::object_here(dest);
 		requests::client_destroy(dest, go && smart_cast<CEatableItem*>(go));
 		++g_c.destroys_forwarded;
 		return true; // the host releases it, its EntityDestroy removes it here (R-6.4)
@@ -321,19 +294,19 @@ bool on_hit(NET_Packet& P, u16 dest, u16 type)
 	{
 		// Falls, anomalies, radiation, our own explosions: local. A hit from a host-driven
 		// creature or another player's avatar arrives from the host as PlayerHit instead.
-		CGameObject* who = find_go(hit.whoID);
+		CGameObject* who = world::object_here(hit.whoID);
 		if (monster_fx::client_playing())
 		{
 			// Audit A5: a host monster's ability the host sent us plays here (a giant's kick): its strike lands now,
 			// authorised, instead of coming back through the local server where the hook would refuse it
-			requests::local_actor_hit(hit, who, find_go(hit.weaponID));
+			requests::local_actor_hit(hit, who, world::object_here(hit.weaponID));
 			return swallow(g_c.ability_hits);
 		}
 		if (who && who->ID() != kActor && sync::is_remote_driven(who))
 			return swallow(g_c.hits_blocked);
 		return false;
 	}
-	if (!find_entity(dest))
+	if (!world::server_entity(dest))
 		return false; // purely local object
 	// Only hits we caused are claims; anything else hitting a host object is the host's business.
 	const bool ours = hit.whoID == kActor || is_ours(hit.whoID);
@@ -401,7 +374,7 @@ bool filter_event(NET_Packet& P)
 	{
 		u16 item;
 		P.r_u16(item);
-		if (is_ours(dest) && find_entity(item))
+		if (is_ours(dest) && world::server_entity(item))
 		{
 			if (echo_of(item))
 				return swallow(g_c.echo_dropped);
@@ -411,7 +384,7 @@ bool filter_event(NET_Packet& P)
 				++g_c.launches_forwarded;
 			else
 			{
-				requests::client_move(item, dest, kNoId, nullptr, 1); // no rocket object here: the host drops its copy
+				requests::client_move(item, dest, kNoId, nullptr, requests::kMoveLocal); // no rocket object here: the host drops its copy
 				++g_c.launches_dropped;
 			}
 		}
@@ -425,7 +398,7 @@ bool filter_event(NET_Packet& P)
 		return on_hit(P, dest, type);
 	case GE_DIE:
 	case GE_ASSIGN_KILLER:
-		if (dest == kActor || !find_entity(dest))
+		if (dest == kActor || !world::server_entity(dest))
 			return false;
 		return swallow(g_c.deaths_blocked); // deaths of host creatures come as EntityDied
 	case GE_MONEY:
@@ -436,7 +409,7 @@ bool filter_event(NET_Packet& P)
 			// A change of our money goes to the host as a ReqMoney with a cause, a reaction to the host's story too:
 			// the host keeps the balance and bounds the change (F2 T1, protocol 7). A MoneyBalance applied here is a
 			// host command (entities::ClientApply) and never gets this far.
-			requests::client_money(money);
+			money::client_on_actor_money(money);
 		}
 		return false;
 	case GE_INSTALL_UPGRADE:
@@ -466,7 +439,7 @@ bool filter_event(NET_Packet& P)
 		// for a seat (VehicleReq); its VehicleSeat seats him in the copy (coop_vehicles_client.cpp).
 		u16 holder = kNoId;
 		P.r_u16(holder);
-		CGameObject* car = find_go(holder);
+		CGameObject* car = world::object_here(holder);
 		if (dest != kActor || !smart_cast<CCar*>(car))
 			return false; // mounted guns and other holders stay local
 		if (vehicles::client_on_use(car))
@@ -479,7 +452,7 @@ bool filter_event(NET_Packet& P)
 		// F5-VEH-3: F in the copy of a car asks its decider out; its VehicleSeat released says where he stands
 		u16 holder = kNoId;
 		P.r_u16(holder);
-		CGameObject* car = find_go(holder);
+		CGameObject* car = world::object_here(holder);
 		if (dest != kActor || !smart_cast<CCar*>(car))
 			return false; // mounted guns and other holders stay local
 		return vehicles::client_on_use(car) ? swallow(g_c.vehicles_asked) : false;
@@ -577,7 +550,7 @@ enum class Step : u8
 
 const char* entity_name(u16 id)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::server_entity(id);
 	return e ? e->name_replace() : "?";
 }
 
@@ -586,14 +559,14 @@ const char* entity_name(u16 id)
 // offline ones through ALife attach/detach. Never edits ID_Parent alone.
 Step step_parent(u16 item, const ParentTarget& t)
 {
-	CSE_Abstract* e = find_entity(item);
+	CSE_Abstract* e = world::server_entity(item);
 	if (!e)
 		return Step::Wait;
 	if (e->ID_Parent == t.parent)
 		return Step::Done;
 
 	entities::ClientApply scope;
-	CGameObject* go = find_go(item);
+	CGameObject* go = world::object_here(item);
 	if (go)
 	{
 		if (!valid_go(item))
@@ -689,7 +662,7 @@ void client_step_parents()
 				::Msg("[coop] item %u [%s]: holder %u not applied yet; retrying", join::to_host(item),
 				    entity_name(item), t.parent == kNoId ? kNoId : join::to_host(t.parent));
 			}
-			if (!t.dump_asked && !find_entity(item) && now - t.since > kDumpAfterMs)
+			if (!t.dump_asked && !world::server_entity(item) && now - t.since > kDumpAfterMs)
 			{
 				Writer w(4);
 				w.u16(join::to_host(item));
@@ -715,20 +688,20 @@ void client_step_parents()
 					w.u16(join::to_host(id));
 					// Default Spawn|Died cannot repair an existing item's wrong holder. Spawn only for what is missing here: its answer
 					// is the whole subtree (R32 W5.1; a client's own character would come back with all he carries: verify-D finding 2)
-					w.u8(reconcile::stalled_ask(find_entity(id) != nullptr));
+					w.u8(reconcile::stalled_ask(world::server_entity(id) != nullptr));
 					net::client_send(Msg::StateDumpRequest, w);
 				}
 				++it;
 				continue;
 			}
 			++g_c.parent_timeouts;
-			const bool item_here = find_entity(item) != nullptr;
+			const bool item_here = world::server_entity(item) != nullptr;
 			::Msg("%s[coop] item %u [%s]: could not move it to %u in time", item_here ? "! " : "",
 			    join::to_host(item), entity_name(item), t.parent == kNoId ? kNoId : join::to_host(t.parent));
 			// RL-UGYE-3WGE: no entity here but a game object under the id - one that outlived its entity. It writes no
 			// update any more (client_export_allowed), and an entity the host sends for the id gets its own object.
 			if (!item_here)
-				if (CGameObject* go = find_go(item))
+				if (CGameObject* go = world::object_here(item))
 					::Msg("! [coop] item %u: a game object [%s] stands here without its entity; it no longer speaks for the id",
 					    join::to_host(item), go->cNameSect().c_str());
 		}
@@ -740,11 +713,11 @@ void client_step_parents()
 
 bool step_death(u16 id, const DeathPending& d)
 {
-	CSE_Abstract* e = find_entity(id);
+	CSE_Abstract* e = world::server_entity(id);
 	if (!e)
 		return false;
 	entities::ClientApply scope;
-	if (CGameObject* go = find_go(id))
+	if (CGameObject* go = world::object_here(id))
 		remote::on_host_death(go, d.killer); // WP1: GE_DIE through the local server, then Die()
 	else if (CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(e))
 	{
@@ -787,21 +760,19 @@ void client_step_deaths()
 
 void client_on_entity_parent(PeerId, Reader& r)
 {
-	if (before_live(Msg::EntityParent))
+	if (dropped_before_live(Msg::EntityParent, g_c.dropped_before_live))
 		return;
 	const u16 item = join::to_local(r.u16());
 	const u16 old_h = r.u16();
 	const u16 new_h = r.u16();
 	ParentTarget t;
 	t.online = r.boolean();
-	float p[3];
-	r.vec3(p);
+	t.pos = get_vec(r);
 	t.exact_pos = (r.u8() & 1) != 0;
 	if (!r.ok() || item == kNoId)
 		return;
 	(void)old_h;
 	t.parent = new_h == kNoId ? kNoId : join::to_local(new_h);
-	t.pos.set(p[0], p[1], p[2]);
 	t.since = mgr().now_ms();
 	// A repair reply can repeat the same desired holder. Keep its original retry
 	// budget; otherwise every reply restarts the timeout and requests repeat forever.
@@ -820,7 +791,7 @@ void client_on_entity_parent(PeerId, Reader& r)
 
 void client_on_entity_died(PeerId, Reader& r)
 {
-	if (before_live(Msg::EntityDied))
+	if (dropped_before_live(Msg::EntityDied, g_c.dropped_before_live))
 		return;
 	const u16 victim = join::to_local(r.u16());
 	const u16 killer_h = r.u16();
@@ -837,7 +808,7 @@ void client_on_entity_died(PeerId, Reader& r)
 // changes the way the host's Lua changed it (GE_CHANGE_VISUAL to our server, ChangeVisual: bones, damage, animations).
 void client_on_entity_visual(PeerId, Reader& r)
 {
-	if (before_live(Msg::EntityVisual))
+	if (dropped_before_live(Msg::EntityVisual, g_c.dropped_before_live))
 		return;
 	EntityVisualMsg m;
 	if (!m.read(r))
@@ -845,7 +816,7 @@ void client_on_entity_visual(PeerId, Reader& r)
 	const u16 id = join::to_local(m.object);
 	if (id == kActor || id == kNoId)
 		return;
-	if (CGameObject* obj = find_go(id))
+	if (CGameObject* obj = world::object_here(id))
 	{
 		if (!remote::is_puppet_type(obj) || world::is_player_character(obj))
 			return; // players' characters change with PlayerEquip
@@ -855,7 +826,7 @@ void client_on_entity_visual(PeerId, Reader& r)
 		return;
 	}
 	// Offline here: the server entity brings the new model to the game object when it comes online.
-	if (CSE_Abstract* e = find_entity(id))
+	if (CSE_Abstract* e = world::server_entity(id))
 		if (CSE_Visual* visual = e->visual())
 			if (!world::is_player_character(e))
 			{
@@ -901,7 +872,7 @@ void client_launch_copy(u16 rocket, Reader& r)
 
 void client_on_entity_local(PeerId, Reader& r)
 {
-	if (before_live(Msg::EntityLocal))
+	if (dropped_before_live(Msg::EntityLocal, g_c.dropped_before_live))
 		return;
 	const u8 op = r.u8();
 	const u16 id = join::to_local(r.u16());
@@ -912,7 +883,7 @@ void client_on_entity_local(PeerId, Reader& r)
 	if (op == 1)
 	{
 		client_forget(id);
-		CGameObject* go = find_go(id);
+		CGameObject* go = world::object_here(id);
 		if (!go)
 			return; // never had it, or already gone
 		entities::ClientApply scope;
@@ -982,7 +953,7 @@ void on_player_died(PeerId from, Reader& r)
 	const u16 killer = r.u16();
 	if (!r.ok())
 		return;
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		character = join::proxy_of_peer(from);
 		if (character == kNoId || sync::host_peer_joining(from))
@@ -1019,7 +990,7 @@ void host_discard()
 // Protocol 17: the model a host creature took (Lua set_visual_name); a player's character has its own (PlayerEquip).
 void host_send_visual(u16 id)
 {
-	CGameObject* obj = find_go(id);
+	CGameObject* obj = world::object_here(id);
 	if (!obj || !remote::is_puppet_type(obj) || world::is_player_character(obj))
 		return;
 	EntityVisualMsg m;
@@ -1037,17 +1008,18 @@ void host_send_visual(u16 id)
 // (levels::passes_to) and its map server (the mode's delivery: reconcile::echo_reaches) have it from there. The rest as always.
 void relay(Msg type, const Writer& w, u16 echo)
 {
-	if (echo == reconcile::kNoEcho)
-	{
-		net::host_broadcast(type, w);
-		return;
-	}
-	const levels::EchoOf scope(echo);
-	net::host_broadcast(type, w);
+	levels::with_echo(echo, [&] { net::host_broadcast(type, w); });
 }
 
 void host_flush()
 {
+	PROF_EVENT("coop/coop_events/host_flush");
+	{
+		xrCriticalSectionGuard guard(g_lock);
+		if (g_parent_changes.empty() && g_drop_positions.empty() && g_deaths.empty() && g_local_destroyed.empty() &&
+		    g_visuals.empty())
+			return; // the idle frame: no containers made and freed
+	}
 	xr_map<u16, ParentChange> changes;
 	xr_map<u16, Fvector> drops;
 	xr_vector<Death> deaths;
@@ -1065,7 +1037,7 @@ void host_flush()
 		host_send_visual(id); // the snapshots already carry the new model's motion ids (coop_entities)
 	for (const auto& c : changes)
 	{
-		CSE_Abstract* e = find_entity(c.first);
+		CSE_Abstract* e = world::server_entity(c.first);
 		if (!e)
 			continue; // destroyed meanwhile: EntityDestroy/EntityLocal tells the clients
 		const u16 now = e->ID_Parent;
@@ -1076,7 +1048,7 @@ void host_flush()
 		if (exact != drops.end())
 			pos = exact->second;
 		else if (now == kNoId)
-			if (CSE_Abstract* holder = find_entity(c.second.old_parent))
+			if (CSE_Abstract* holder = world::server_entity(c.second.old_parent))
 				pos = holder->o_Position;
 		const CSE_ALifeObject* ao = smart_cast<const CSE_ALifeObject*>(e);
 		Writer w(24);
@@ -1084,8 +1056,7 @@ void host_flush()
 		w.u16(c.second.old_parent);
 		w.u16(now);
 		w.boolean(ao ? ao->m_bOnline : true);
-		const float p[3] = {pos.x, pos.y, pos.z};
-		w.vec3(p);
+		put_vec(w, pos);
 		w.u8(exact != drops.end() ? 1 : 0);
 		relay(Msg::EntityParent, w, c.second.echo);
 		++g_c.parent_sent;
@@ -1119,16 +1090,12 @@ void host_flush()
 
 // ---------------------------------------------------------------- API
 
-CSE_Abstract* find_entity(u16 id)
+bool dropped_before_live(Msg type, u64& dropped)
 {
-	if (id == kNoId)
-		return nullptr;
-	if (ai().get_alife())
-		if (CSE_ALifeDynamicObject* e = ai().alife().objects().object(id, true))
-			return e;
-	if (g_pGameLevel && Level().Server)
-		return Level().Server->ID_to_entity(id);
-	return nullptr;
+	if (!rules::live_only(type) || mgr().is_live_client())
+		return false;
+	++dropped;
+	return true;
 }
 
 u16 root_of(u16 id)
@@ -1136,7 +1103,7 @@ u16 root_of(u16 id)
 	u16 cur = id;
 	for (int depth = 0; depth < 8 && cur != kNoId; ++depth)
 	{
-		CSE_Abstract* e = find_entity(cur);
+		CSE_Abstract* e = world::server_entity(cur);
 		if (!e)
 			return depth == 0 ? kNoId : cur;
 		if (e->ID_Parent == kNoId)
@@ -1199,17 +1166,20 @@ void reset()
 	g_parent_targets.clear();
 	g_death_targets.clear();
 	g_death_asked.clear();
-	g_log_count = 0;
+	g_log = lua_errors::LogBudget{kLogBurst};
 	g_vehicle_note = false;
 	g_update_resync.clear();
 	g_spawn_once.reset();
 	g_export_once.reset();
 	g_update_once.reset();
+	g_spawn_wait.reset();
+	g_spawn_wait_log = lua_errors::LogBudget{kLogBurst};
 }
 
 void frame()
 {
-	if (mode().decides_world() || mode().leads_level())
+	PROF_EVENT("coop/coop_events/frame");
+	if (mode().decides_here())
 	{
 		if (world_up())
 			host_flush();
@@ -1224,14 +1194,14 @@ void frame()
 		if (g_vehicle_note)
 		{
 			g_vehicle_note = false;
-			dialog::hud_message("st_coop_f5_vehicles_refused", "Cannot get into the vehicle now"); // F5-VEH-3
+			hud_text::say("st_coop_f5_vehicles_refused", "Cannot get into the vehicle now");
 		}
 	}
 }
 
 void print_status()
 {
-	if (mode().decides_world() || mode().leads_level())
+	if (mode().decides_here())
 	{
 		::Msg("[coop]   events out: %llu parent changes, %llu deaths, %llu player deaths, local %llu spawns / %llu "
 		      "destroys (%u relayed alive), %llu player rocket launches, %llu creature visuals",
@@ -1260,6 +1230,10 @@ void print_status()
 	      "back %llu unregistered / %llu of another kind, update reads skipped %llu",
 	    g_ic.spawns_stale, g_ic.spawns_other_kind, g_ic.spawns_duplicate, g_ic.exports_unregistered,
 	    g_ic.exports_other_kind, g_ic.updates_skipped);
+	::Msg("[coop]   spawns that waited for the object holding their id: %llu waits, %llu made after waiting, %llu not "
+	      "made after %u frames, %u id(s) with a wait on record (TZ P104)",
+	    g_ic.spawns_waited, g_ic.spawns_made_after_wait, g_ic.spawns_gave_up, spawn_wait::kMaxWaitFrames,
+	    (u32)g_spawn_wait.size());
 }
 
 bool client_filter(NET_Packet& P)
@@ -1284,9 +1258,9 @@ bool note_actor_hit(const CActor* actor, const SHit* hit, bool blocked)
 bool actor_hit_blocked(const CActor* actor, const SHit* hit)
 {
 	if (survival::ignores_hits()) return true;
-	if (mode().decides_world() || mode().leads_level())
-		return requests::host_actor_hit_dropped(actor, hit); // R3 minor: friendly fire covers other players' explosions
-	if (!hit || !mgr().active() || mode().decides_world() || !router_on() || entities::client_applying() ||
+	if (mode().decides_here())
+		return requests::host_actor_hit_dropped(actor, hit); // friendly fire covers other players' explosions
+	if (!hit || !mgr().active() || !router_on() || entities::client_applying() ||
 	    monster_fx::client_playing())
 		return false; // audit A5: a host monster's ability played here on the host's word hurts us directly
 	const CGameObject* who = hit->who ? smart_cast<const CGameObject*>(hit->who) : nullptr;
@@ -1360,7 +1334,7 @@ void host_send_death(PeerId to, CSE_Abstract* e)
 	CSE_ALifeCreatureAbstract* c = smart_cast<CSE_ALifeCreatureAbstract*>(e);
 	if (!c)
 		return;
-	CEntityAlive* body = smart_cast<CEntityAlive*>(find_go(e->ID));
+	CEntityAlive* body = smart_cast<CEntityAlive*>(world::object_here(e->ID));
 	if (body ? !!body->g_Alive() : c->g_Alive())
 		return;
 	Writer w(8);
@@ -1379,7 +1353,7 @@ void client_forget(u16 local_id)
 
 void host_on_visual(u16 id)
 {
-	if (!(mode().decides_world() || mode().leads_level()) || id == kActor)
+	if (!mode().decides_here() || id == kActor)
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_visuals.insert(id);
@@ -1387,7 +1361,7 @@ void host_on_visual(u16 id)
 
 void host_on_destroy(const CSE_Abstract* entity)
 {
-	if (!entity || !(mode().decides_world() || mode().leads_level()))
+	if (!entity || !mode().decides_here())
 		return;
 	xrCriticalSectionGuard guard(g_lock);
 	g_last_holder.erase(entity->ID);
@@ -1397,7 +1371,7 @@ void host_on_destroy(const CSE_Abstract* entity)
 
 void host_relay_local_spawn(CSE_Abstract* entity)
 {
-	if (!entity || !(mode().decides_world() || mode().leads_level()))
+	if (!entity || !mode().decides_here())
 		return;
 	NET_Packet spawn;
 	entity->Spawn_Write(spawn, FALSE);
@@ -1424,7 +1398,7 @@ void host_set_drop_position(u16 item, const Fvector& pos)
 void host_relay_launch(u16 rocket, u16 launcher, const Fvector& pos, const Fvector& dir, const Fvector& vel,
     const Fvector& angular_vel, PeerId requester)
 {
-	if (!(mode().decides_world() || mode().leads_level()))
+	if (!mode().decides_here())
 		return;
 	Writer w(64);
 	w.u8(2);
@@ -1469,17 +1443,59 @@ u16 host_last_holder(u16 item)
 
 // ---------------------------------------------------------------- one id, one object on a mirror (RL-UGYE-3WGE)
 
-bool client_spawn_allowed(const CSE_Abstract* spawn)
+SpawnGate client_spawn_gate(const CSE_Abstract* spawn)
 {
 	if (!spawn || spawn->ID == kNoId || !g_pGameLevel || !Level().Server || !join::world_is_mirror())
-		return true;
+		return SpawnGate::Make;
 	const u16 id = spawn->ID;
 	CSE_Abstract* e = Level().Server->ID_to_entity(id);
 	const CObject* live = Level().Objects.net_Find(id);
 	const bool live_same_kind = live && !live->getDestroy() && live->cNameSect() == spawn->s_name;
 	const identity::Spawn v = identity::spawn_verdict(true, e != nullptr, e && e->s_name == spawn->s_name, live_same_kind);
-	if (v == identity::Spawn::Make)
-		return true;
+	// TZ P104 (Dev 64 crash, xrCoop/coop_spawn_wait_rules.h): the stock net_Spawn refuses a spawn while ANY object holds the
+	// id, and its soft fail runs the net_Destroy chain of a half-made object. An object marked by GE_DESTROY stays under its
+	// id until the destroy queue: the spawn waits for it, and a held item for its holder's dying object.
+	const spawn_wait::Holder self =
+	    spawn_wait::holder_of(live != nullptr, live && live->getDestroy(), live && live->cNameSect() == spawn->s_name);
+	const CObject* holder = spawn->ID_Parent == kNoId ? nullptr : Level().Objects.net_Find(spawn->ID_Parent);
+	const bool holder_leaving = holder && holder->getDestroy();
+	const u32 waited = g_spawn_wait.waited(id, Device.dwFrame);
+	// for the log lines: the object in the way (the one under its own id, else its holder's dying one)
+	const bool own_id_held = self != spawn_wait::Holder::None;
+	const CObject* in_way = own_id_held ? live : holder;
+	const char* in_way_sect = in_way ? in_way->cNameSect().c_str() : "none";
+	const char* in_way_state = in_way && in_way->getDestroy() ? "on its way out" : "staying, a stale copy";
+	switch (spawn_wait::decide(true, v, self, holder_leaving, waited))
+	{
+	case spawn_wait::Verdict::Make:
+		g_spawn_wait.done(id);
+		if (waited)
+		{
+			++g_ic.spawns_made_after_wait;
+			if (g_spawn_wait_log.allow())
+				::Msg("[coop] game object %u [%s] made after waiting %u frame(s) for the object that held its id",
+				    join::to_host(id), spawn->s_name.c_str(), waited);
+		}
+		return SpawnGate::Make;
+	case spawn_wait::Verdict::Wait:
+		g_spawn_wait.wait(id, Device.dwFrame);
+		++g_ic.spawns_waited;
+		if (!waited && g_spawn_wait_log.allow())
+			::Msg("[coop] game object %u [%s] waits for a next frame: %s is still held by [%s], %s (frame %u)",
+			    join::to_host(id), spawn->s_name.c_str(), own_id_held ? "its id" : "its holder's id", in_way_sect,
+			    in_way_state, Device.dwFrame);
+		return SpawnGate::Wait;
+	case spawn_wait::Verdict::GiveUp:
+		g_spawn_wait.done(id);
+		++g_ic.spawns_gave_up;
+		if (g_spawn_wait_log.allow())
+			::Msg("! [coop] game object %u [%s] not made: %s was still held by [%s], %s, after %u frames", join::to_host(id),
+			    spawn->s_name.c_str(), own_id_held ? "its id" : "its holder's id", in_way_sect, in_way_state, waited);
+		return SpawnGate::Refuse;
+	case spawn_wait::Verdict::Refuse:
+		g_spawn_wait.done(id);
+		break;
+	}
 	const char* why = "?";
 	switch (v)
 	{
@@ -1502,7 +1518,7 @@ bool client_spawn_allowed(const CSE_Abstract* spawn)
 	if (g_spawn_once.first(id))
 		::Msg("%s[coop] game object %u [%s] not made: %s (entity here: [%s])", v == identity::Spawn::OtherKind ? "! " : "",
 		    join::to_host(id), spawn->s_name.c_str(), why, e ? e->s_name.c_str() : "none");
-	return false;
+	return SpawnGate::Refuse;
 }
 
 bool client_export_allowed(CObject* obj)

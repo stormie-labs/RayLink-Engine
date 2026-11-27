@@ -1,9 +1,8 @@
-// Anomaly Coop — the wire layouts of the F3a messages (split levels; docs/plans/2026-10-24-f3a-split-levels.md §2.1,
-// protocol 11, Msg 0x01D0-0x01DF) and of the journal of a map server (TZ R32, protocol 34, Msg 0x01E0-0x01E1: LevelJournal,
-// LevelJournalAck, the bodies of namespace journal). One struct per message with write() and read(): read() takes nothing it cannot bound — a
-// count over its limit, an id or an enum out of range, a float that is not finite or beyond any level, a string that is not a
-// name, an id listed twice, a cut packet — and returns false with the message emptied; a message is read whole, and a packet
-// with bytes left over is the caller's to refuse (read_all in the tests).
+// The wire layouts of the messages between the world server, the map servers and the players of the server mode (Msg
+// 0x01D0-0x01DF; the journal of a map server, 0x01E0-0x01E1, is coop_journal_wire.h). One struct per message with write() and
+// read(): read() takes nothing it cannot bound — a count over its limit, an id or an enum out of range, a float that is not
+// finite or beyond any level, a string that is not a name, an id listed twice, a cut packet — and returns false with the
+// message emptied; a message is read whole, and a packet with bytes left over is the caller's to refuse (read_all in the tests).
 //
 // A writer never turns a message that is over a limit into one that reads: the formats with a limit (LevelMap, LevelXferUp and
 // Down, LevelBrain, Tunnel, LoadWait) have `bool fits() const` and `[[nodiscard]] bool write(Writer&) const`, which returns false
@@ -13,9 +12,8 @@
 // layouts have no limit to break and write() is void. A message within its limits is written and read back whole.
 //
 // Numbers of levels are game graph level ids (u16 on the wire, kNoLevel = none), players are session slots (PeerId < kMaxPeerSlots,
-// the host is 0), objects are ids in the world server's numbering. The enums are numbered here, in the order of the plan's
-// table where it lists names alone; the logic that sends and handles them keeps its own types (coop_xfer.h, coop_levels_rules.h,
-// coop_load_barrier.h) and converts at the engine's edge.
+// the host is 0), objects are ids in the world server's numbering. The enums are numbered here; the logic that sends and handles
+// them keeps its own types (coop_xfer.h, coop_levels_rules.h, coop_load_barrier.h) and converts at the engine's edge.
 //
 // Three formats carry the layout of an older message after a short header: LevelSnapshot (EntitySnapshot), LevelEntity (Entity*
 // or ItemState) and the packet of a Tunnel. Their *Head structs read the header off the front of the Reader and leave the body
@@ -32,7 +30,9 @@
 #include <utility>
 #include <vector>
 
-#include "../coop_checkpoint_base_rules.h" // Build 57 (owner 2026-11-18): Footing, the tail of LevelBodyFacts
+#include "../coop_hash.h"
+#include "../coop_checkpoint_base_rules.h" // Footing, the tail of LevelBodyFacts
+#include "../coop_ids.h"
 #include "../coop_levels_rules.h" // Gate: the byte of a LevelMap gate row
 #include "../coop_protocol.h"
 #include "../coop_wire.h"
@@ -43,15 +43,15 @@ namespace levels
 {
 namespace wire
 {
-constexpr uint16_t kNoLevel = 0xFFFF; // no level: a player still loading, an empty field
-constexpr uint16_t kNoObject = 0xFFFF; // no object id (the ids of the world server are u16)
+using coop::kNoLevel; // a player still loading, an empty field
+constexpr uint16_t kNoObject = kNoId; // the ids of the world server are u16
 constexpr uint32_t kNoNode = 0xFFFFFFFFu; // no level vertex
 
 // A full state of a level goes as a blob of this kind (LevelSnapshot with round > 0). Kind 1 is the world save
-// (coop_join.h BlobWorldSave); 2 is left for the prepared save of a simultaneous load (T8).
+// (coop_join.h BlobWorldSave); 2 is left for the prepared save of a simultaneous load.
 constexpr uint32_t kBlobLevelState = 3;
 
-constexpr size_t kMaxMapPlayers = kMaxPeerSlots; // a row per player slot of the session (seat 0 and clients 1 .. 16, F5-SEAT-1)
+constexpr size_t kMaxMapPlayers = kMaxPeerSlots; // a row per player slot of the session (seat 0 and clients 1 .. 16)
 constexpr size_t kMaxMapServers = 8; // the host's process and at most 7 map servers (coop_max_map_servers is 0..7)
 constexpr size_t kMaxMapGates = 128; // levels with a gate in one table
 constexpr size_t kMaxGateReason = 64; // a string id of the placard
@@ -62,11 +62,11 @@ constexpr size_t kMaxTunnelPacket = 0xFFFF; // a u16 length
 constexpr size_t kMaxBrainRows = 255; // squads, and assignments, in one LevelBrain (a u8 count each)
 constexpr float kMaxCoord = 1.0e6f; // meters: beyond any level, finite
 
-// The last gate a LevelMap row may carry: T3's Gate (coop_levels_rules.h: Free 0, BetterTogether 1, Together 2) is the enum of
+// The last gate a LevelMap row may carry: the Gate (coop_levels_rules.h: Free 0, BetterTogether 1, Together 2) is the enum of
 // that byte. A Gate added there is added here.
 constexpr uint8_t kLastGate = uint8_t(levels::Gate::Together);
 
-// State of a server, shared by LevelMap and MapServerState (order of the plan's table).
+// State of a server, shared by LevelMap and MapServerState.
 enum class ServerState : uint8_t
 {
 	Loading = 0,
@@ -119,12 +119,11 @@ inline bool read_tail(Reader& r, std::vector<uint8_t>& out, size_t max)
 // Wire: u8 flags, u8 n, n x {u32 peer, u16 level, u8 in_world, u16 proxy, u32 money}, u8 m, m x {u16 level, u8 server, u8 state},
 //       u8 g, g x {u16 level, u8 gate, str reason}.
 // A player row says on which level a player stands or is on his way to (kNoLevel: on none), whether he finished loading it and
-// which character he plays and what his balance is (protocol 20: a map server takes its virtual peers from these rows, and judges
-// a trade by that balance: the book is the world server's). A server row says that a map server leads a level, and its state. A
+// which character he plays and what his balance is (a map server takes its virtual peers from these rows, and judges a trade by
+// that balance: the book is the world server's). A server row says that a map server leads a level, and its state. A
 // gate row is the world server's verdict on entering a level (the Gate of coop_levels_rules.h: 0 .. kLastGate) and the string id
 // of the placard that says why; the game sends the levels whose gate is not open.
-// Reserved since build 57 (the hybrid is gone, owner 2026-11-18): flag bit 2 (the story levels entered together) and server kind 0
-// (the host's own process). Nothing writes them; a map with either is refused.
+// Reserved: flag bit 2 and server kind 0. Nothing writes them; a map with either is refused.
 struct LevelMapMsg
 {
 	enum Flags : uint8_t
@@ -444,8 +443,8 @@ struct LevelSnapshotHead
 };
 
 // LevelEntity wire: u8 op, then the layout of the Entity* message or ItemState that the op names. Reads the op; the body follows.
-// The ops are also those of a LevelJournal entry (protocol 34): Destroy .. Logic but Report, and the journal's own ops after Logic
-// (Joined .. Flushed, section 5 of temp/r30/design/R32-final.md). A LevelEntity carries Destroy .. Logic alone: read() refuses the
+// The ops are also those of a LevelJournal entry (coop_journal_wire.h): Destroy .. Logic but Report, and the journal's own ops
+// after Logic (Joined .. Flushed). A LevelEntity carries Destroy .. Logic alone: read() refuses the
 // journal's ops (they need the batch's order and its answer).
 struct LevelEntityHead
 {
@@ -463,7 +462,7 @@ struct LevelEntityHead
 		Tent = 8, // a tent or sleeping bag it put up for a player of its level, after its Spawn: u16 tent, u16 character
 		Stash = 9, // the stash of a retiring player of its level (OpStash) is over, after the Parent of his things: u16 character, u8 1: things stay on him
 		Logic = 10, // what the binder of a static object of its level would save: the layout of LevelLogicBody
-		// Protocol 34, LevelJournal only (namespace journal below has the bodies):
+		// LevelJournal only (coop_journal_wire.h has the bodies):
 		Joined = 11, // a member joined a squad (register_member): journal::MemberBody
 		Left = 12, // a member left a squad (unregister_member): journal::MemberBody
 		Info = 13, // an info portion of a non-actor object given or taken by its writer: journal::InfoBody
@@ -492,22 +491,20 @@ struct LevelEntityHead
 
 // The tail of LevelEntity State: what the authority of a level sees of a player's body and the world server does not, he is no object
 // there. `place` is checkpoints::sources::Place, `source` the object of that place.
-// Build 57 (owner 2026-11-18): `footing`, the base whose ground he stands on by the map server's geometry, with its point
-// (checkpoint::base::Footing: u8 kind, u16 ref, 3 floats, u32 lv, u16 gv, always sent). Read as sent; whether it is sound
-// (footing_ok) and names a base of the world is the world server's check. Protocol stays 32: LevelEntity goes only between the
-// host's process and the map servers it starts from its own exe (coop_mapserver.cpp launch: GetModuleFileNameA(nullptr)).
-// Build 57, protocol 33 (S3, owner's question: whom does he talk to there): `partner` right after `talking`, the NPC of his talk
-// lock there (dialog::host_lock_of) in the world server's numbering, kNoObject none. The world server keeps it only while he talks
-// (kept_partner) and only for an object it has; Lua coop.levels.talk_partner(peer). Wire: u8 fight, u8 talking, u16 partner,
+// `footing` is the base whose ground he stands on by the map server's geometry, with its point (checkpoint::base::Footing: u8
+// kind, u16 ref, 3 floats, u32 lv, u16 gv, always sent). Read as sent; whether it is sound (footing_ok) and names a base of the
+// world is the world server's check. `partner`, right after `talking`, is the NPC of his talk lock there (dialog::host_lock_of)
+// in the world server's numbering, kNoObject none. The world server keeps it only while he talks (kept_partner) and only for an
+// object it has; Lua coop.levels.talk_partner(peer). Wire: u8 fight, u8 talking, u16 partner,
 // u8 place, u16 source, the footing (21 bytes): 28 bytes.
 struct LevelBodyFacts
 {
 	uint8_t fight = 0;
 	uint8_t talking = 0; // he holds a talk lock there
-	uint16_t partner = kNoObject; // Build 57: the NPC of that lock
+	uint16_t partner = kNoObject; // the NPC of that lock
 	uint8_t place = 0;
 	uint16_t source = kNoObject;
-	checkpoint::base::Footing footing; // Build 57
+	checkpoint::base::Footing footing;
 
 	void write(Writer& w) const
 	{
@@ -554,9 +551,11 @@ inline uint16_t kept_partner(const LevelBodyFacts& f) { return f.talking != 0 ? 
 // (on_level_move: host_player_moves, then the teleport), while the map server he left hears it only from the next LevelMap;
 // a report it sent in between (every second, unreliable) names a body that is on another level now, or of a player who is
 // between two levels. Dropping it is right (placing it would pull his character back to the level he left) and honest: no
-// fault, no "!" (stand b57g creator10_server, 2026-11-21: trip 3 of 10). Refused: a fault of its sender - it does not read,
+// fault, no "!". The world's acceptance hands it here although its sender does not write him any more
+// (accept::body_report_by_seat). Taken only from the map server that writes him (`sender_writes`): a report of the level of his
+// seat from one that does not write him is no crossing. Refused: a fault of its sender - it does not read,
 // the world has no such object, the object is online here, it is no player character, its vertex is not on its sender's
-// level, its position is not a number, or the sender has no level.
+// level, its position is not a number, the sender has no level, or it reports his seat's level without writing him.
 enum class BodyReport : uint8_t
 {
 	Take,
@@ -565,12 +564,14 @@ enum class BodyReport : uint8_t
 };
 
 inline BodyReport body_report_verdict(bool read, bool known, bool online_here, bool player_character, uint16_t body_level,
-    uint16_t sender_level, uint16_t seat_level, bool position_valid)
+    uint16_t sender_level, uint16_t seat_level, bool position_valid, bool sender_writes)
 {
 	if (!read || !known || online_here || !player_character || sender_level == kNoLevel || body_level != sender_level ||
 	    !position_valid)
 		return BodyReport::Refused;
-	return seat_level == sender_level ? BodyReport::Take : BodyReport::Crossed;
+	if (seat_level != sender_level)
+		return BodyReport::Crossed;
+	return sender_writes ? BodyReport::Take : BodyReport::Refused;
 }
 
 // How long a map server may go on reporting a player whose seat left its level before it is its fault, not a crossing: the
@@ -802,8 +803,8 @@ struct LevelBrainMsg
 	struct Squad
 	{
 		uint16_t squad = 0;
-		uint16_t assigned = 0xFFFF;
-		uint16_t current = 0xFFFF;
+		uint16_t assigned = kNoId;
+		uint16_t current = kNoId;
 		uint8_t action = 0;
 		uint32_t stay_ms = 0;
 		std::string scripted;
@@ -811,8 +812,8 @@ struct LevelBrainMsg
 	struct Assign
 	{
 		uint16_t squad = 0;
-		uint16_t smart = 0xFFFF;
-		uint16_t old_smart = 0xFFFF;
+		uint16_t smart = kNoId;
+		uint16_t old_smart = kNoId;
 	};
 
 	std::vector<Squad> squads; // at most kMaxBrainRows
@@ -953,7 +954,7 @@ struct LevelResyncMsg
 // Wire: u32 peer, u8 flags, u16 len, packet[len]. The packet is a whole game message (its 2-byte type first) of a player of the
 // map server's level: toward the map server it is what the player sent, toward the host's process what the map server sends to
 // him (flag AllOnMap: to every player of the map, `peer` unused). `peer` is a session slot. Two flags say on which lane the host's
-// process sends it on (protocol 20; neither: Reliable). A Tunnel carries a game message only: not a session message and not another
+// process sends it on (neither: Reliable). A Tunnel carries a game message only: not a session message and not another
 // Tunnel. The length is the rest of the packet.
 struct TunnelMsg
 {
@@ -979,15 +980,18 @@ struct TunnelMsg
 	bool fits() const { return packet.size() <= kMaxTunnelPacket; }
 
 	// False, nothing written, for a longer packet: a packet cut to 65535 bytes would reach its handler as a whole message.
-	[[nodiscard]] bool write(Writer& w) const
+	[[nodiscard]] bool write(Writer& w) const { return write_raw(w, peer, flags, packet.data(), packet.size()); }
+
+	// The bytes write() writes for a packet the caller holds elsewhere, without copying it into a TunnelMsg first.
+	[[nodiscard]] static bool write_raw(Writer& w, uint32_t peer, uint8_t flags, const uint8_t* data, size_t size)
 	{
-		if (!fits())
+		if (size > kMaxTunnelPacket)
 			return false;
 		w.u32(peer);
 		w.u8(flags);
-		w.u16(uint16_t(packet.size()));
-		if (!packet.empty())
-			w.bytes(packet.data(), packet.size());
+		w.u16(uint16_t(size));
+		if (size != 0)
+			w.bytes(data, size);
 		return true;
 	}
 
@@ -1021,9 +1025,9 @@ struct TunnelMsg
 	}
 };
 
-// ---------------------------------------------------------------- the online byte of a spawn the trunk passes on (protocol 33)
+// ---------------------------------------------------------------- the online byte of a spawn the trunk passes on
 
-// Build 57, step S3 (TZ 6.3: the psy phantoms of a bloodsucker were unseen in the server mode). EntitySpawn (write_spawn,
+// EntitySpawn (write_spawn,
 // coop_entities.cpp) is u16 id, u16 parent, u8 online, ...; the online byte says the entity is online where the sender has it. A
 // player's machine brings a free entity that is in no level registry (a psy phantom: level.spawn_item with no game vertex) online
 // at its spawn only when that flag speaks of the level he stands on (xrCoop/coop_mirror.h placement, flag_of_this_level): true of a
@@ -1124,9 +1128,8 @@ struct MapServerOrderMsg
 // LoadWait wire: u8 state, u32 epoch, u16 level, u8 reason, u8 n, n x {u32 peer, u8 ready}. The barrier of a simultaneous load, as the
 // world server tells a player on his loading screen: Prepared (the world of this epoch is ready to be loaded: the save follows as a
 // blob), Waiting (who is ready now), Enter (everybody is: leave the screen), Cancel (the load is off). `level` is the level
-// of the epoch; `reason` says why a player loads: the group goes (Group). HostAlone and the states Away and Back were the hybrid's
-// (the host went alone, the host's move that nobody notices): reserved since build 57, nobody sends them, a player takes them for
-// nothing.
+// of the epoch; `reason` says why a player loads: the group goes (Group). HostAlone and the states Away and Back are
+// reserved: nobody sends them, a player takes them for nothing.
 struct LoadWaitMsg
 {
 	enum State : uint8_t
@@ -1219,813 +1222,6 @@ struct LoadReadyMsg
 			epoch = 0;
 			return false;
 		}
-		return true;
-	}
-};
-
-namespace detail
-{
-// The bytes Writer::varu writes for `v`.
-inline size_t varu_size(uint64_t v)
-{
-	size_t n = 1;
-	while (v >= 0x80)
-	{
-		v >>= 7;
-		++n;
-	}
-	return n;
-}
-} // namespace detail
-} // namespace wire
-
-// ---------------------------------------------------------------- the journal of a map server (protocol 34)
-
-// TZ R32 W3 (temp/r30/design/R32-final.md sections 1 and 5): one journal up. Every registry fact of a map server's frame goes into
-// one LevelJournal on the reliable lane (the lane of LevelXferUp: a frame's facts are applied before that frame's hand-back), and the
-// world server answers each batch with a LevelJournalAck. A batch is read whole before any entry is applied: one entry that does
-// not read refuses the batch, so a fault never applies half a frame.
-//
-// An entry is {u8 op, varu len, body[len]}; `op` is a LevelEntityHead::Op:
-//   per-object ops (names_object: Destroy, Parent, Died, State, Item, Spawn, Tent, Stash, Logic): body = ObjectHead {u16 id, u16
-//       section crc, u32 gen}, then today's LevelEntity layout of the op, whole. That layout starts with the same id (checked), so
-//       today's readers (coop_levels_xfer.cpp host_on_level_entity) take layout_of(entry) unchanged. Fixed layouts are checked to
-//       their size: Destroy {u16 id}, Parent {u16 item, u16 parent, vec3 pos}, Tent {u16 tent, u16 character}, Stash {u16
-//       character, u8 things stay}; Logic is LevelLogicBody, Item is ItemFactsBody (the ItemState layout plus a source byte);
-//       Died {u16 victim, u16 killer, state}, State {u16 character, ...} and Spawn (the EntitySpawn layout) end in a tail of their
-//       own readers.
-//   Money: today's layout {u32 peer, u64 delta, u8 trade}, no head (a player's book is no object).
-//   Joined, Left: MemberBody. Info: InfoBody. Ask: AskBody. IdAsk: no body. Carry: CarryBody. Done: DoneBody. Flushed: FlushedBody.
-//   Report (6) is no journal op: it stays a LevelEntity of its own (the answer to LevelResync).
-// The head's `gen` is the keeper generation of the unit at the object's root (W1.2: the squad of a member, the holder chain of an
-// item) as the sender holds it, 0 when that root is no unit it holds (W3: facts about a held unit carry its keeper generation and
-// are refused for an older grant; same_object, coop_writer_rules.h, compares it with the world's). Section 5 of the design names
-// the head `u16 id, u16 section crc` alone; the generation is the W3 / same_object half of an identity that it left out. The head's
-// `crc` is section_crc of the object's section (for a Spawn the new object's).
-namespace journal
-{
-constexpr size_t kMaxEntries = 16384; // entries of one batch (a surge frame: deaths, drops, item facts of some hundred NPCs)
-constexpr size_t kMaxBody = 64 * 1024; // one entry (an EntitySpawn with its spawn data is some KiB; a carry part is at most 60 KiB)
-constexpr size_t kMaxBatch = 8 * 1024 * 1024; // bytes of one batch (Session::send takes 16 MiB); a bigger frame goes as two batches
-constexpr uint8_t kLastOp = wire::LevelEntityHead::Flushed;
-
-// Why the world refused an entry (LevelJournalAck). The world's acceptance (coop_levels_accept.h) picks the reason.
-enum Why : uint8_t
-{
-	NotWriter = 1, // the sender does not write the object (for a Spawn the new object's root, for a Parent the old or the new root)
-	Identity = 2, // id, section crc or keeper generation differ from the world's object
-	PastFence = 3, // the entry came after the sender's fence (its level move, a grant handed back)
-	Unknown = 4, // the world has no such object
-	NotOwnLevel = 5, // an ask about an object whose root does not stand on the sender's level
-	IdRange = 6, // a spawn under an id that is not of the sender's slice, or that the world has under another object
-	Ghost = 7, // the target is the ghost actor: nobody
-	Malformed = 8, // the entry's layout does not read where the world reads it
-	Refused = 9, // the world's own rule refused it (a deal, a logic, a carry conflict)
-};
-constexpr uint8_t kLastWhy = Refused;
-
-// An op a journal carries: today's LevelEntity ops but Report, and the journal's own.
-inline bool known_op(uint8_t op) { return op <= kLastOp && op != wire::LevelEntityHead::Report; }
-
-// The ops whose body starts with an ObjectHead.
-inline bool names_object(uint8_t op)
-{
-	using H = wire::LevelEntityHead;
-	switch (op)
-	{
-	case H::Destroy:
-	case H::Parent:
-	case H::Died:
-	case H::State:
-	case H::Item:
-	case H::Spawn:
-	case H::Tent:
-	case H::Stash:
-	case H::Logic: return true;
-	default: break;
-	}
-	return false;
-}
-
-// For the logs; "?" for a value no op has.
-inline const char* op_name(uint8_t op)
-{
-	using H = wire::LevelEntityHead;
-	switch (op)
-	{
-	case H::Destroy: return "Destroy";
-	case H::Parent: return "Parent";
-	case H::Died: return "Died";
-	case H::State: return "State";
-	case H::Item: return "ItemFacts";
-	case H::Spawn: return "Spawn";
-	case H::Report: return "Report";
-	case H::Money: return "Money";
-	case H::Tent: return "Tent";
-	case H::Stash: return "Stash";
-	case H::Logic: return "Logic";
-	case H::Joined: return "Joined";
-	case H::Left: return "Left";
-	case H::Info: return "Info";
-	case H::Ask: return "Ask";
-	case H::IdAsk: return "IdAsk";
-	case H::Carry: return "Carry";
-	case H::Done: return "Done";
-	case H::Flushed: return "Flushed";
-	default: break;
-	}
-	return "?";
-}
-
-inline const char* why_name(uint8_t why)
-{
-	switch (why)
-	{
-	case NotWriter: return "not the writer";
-	case Identity: return "another object";
-	case PastFence: return "past the fence";
-	case Unknown: return "no such object";
-	case NotOwnLevel: return "not on its level";
-	case IdRange: return "id not of its slice";
-	case Ghost: return "the ghost";
-	case Malformed: return "malformed";
-	case Refused: return "refused";
-	default: break;
-	}
-	return "?";
-}
-
-// The u16 of an object's section in an ObjectHead and an AskBody: FNV-1a 32 of the name, its two halves xor-ed. Every process of a
-// session is one exe, so one name is one value everywhere; two sections may share a value (1 in 65536): the id and the keeper
-// generation are the rest of an identity.
-inline uint16_t section_crc(std::string_view section)
-{
-	uint32_t h = 2166136261u;
-	for (const char c : section)
-		h = (h ^ uint8_t(c)) * 16777619u;
-	return uint16_t((h >> 16) ^ (h & 0xFFFFu));
-}
-
-// The head of every per-object entry. Wire: u16 id, u16 crc, u32 gen.
-struct ObjectHead
-{
-	static constexpr size_t kSize = 2 + 2 + 4;
-
-	uint16_t id = wire::kNoObject;
-	uint16_t crc = 0;
-	uint32_t gen = 0;
-
-	void write(Writer& w) const
-	{
-		w.u16(id);
-		w.u16(crc);
-		w.u32(gen);
-	}
-
-	bool read(Reader& r)
-	{
-		ObjectHead tmp;
-		tmp.id = r.u16();
-		tmp.crc = r.u16();
-		tmp.gen = r.u32();
-		if (!r.ok() || tmp.id == wire::kNoObject)
-		{
-			*this = ObjectHead();
-			return false;
-		}
-		*this = tmp;
-		return true;
-	}
-};
-
-// One entry of a batch: its op and its body as sent (for a per-object op the head first). The frozen interface's journal::Entry
-// (host_apply_fact, coop_levels_alife.h).
-struct Entry
-{
-	uint8_t op = wire::LevelEntityHead::Destroy;
-	std::vector<uint8_t> body;
-
-	bool operator==(const Entry& o) const { return op == o.op && body == o.body; }
-};
-
-// Joined, Left: a squad and one member (stock CSE_ALifeOnlineOfflineGroup::register_member / unregister_member). Wire: u16 squad,
-// u16 member.
-struct MemberBody
-{
-	uint16_t squad = wire::kNoObject;
-	uint16_t member = wire::kNoObject;
-
-	bool fits() const { return squad != wire::kNoObject && member != wire::kNoObject && squad != member; }
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u16(squad);
-		w.u16(member);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		MemberBody tmp;
-		tmp.squad = r.u16();
-		tmp.member = r.u16();
-		if (!r.ok() || !tmp.fits())
-		{
-			*this = MemberBody();
-			return false;
-		}
-		*this = tmp;
-		return true;
-	}
-};
-
-// Info: an info portion of a non-actor object, given (on 1) or taken (on 0) by its writer. Wire: u16 id, u8 on, str info.
-struct InfoBody
-{
-	static constexpr size_t kMaxInfo = 256;
-
-	uint16_t id = wire::kNoObject;
-	uint8_t on = 1;
-	std::string info;
-
-	bool fits() const { return id != wire::kNoObject && on <= 1 && !info.empty() && wire::detail::printable(info, kMaxInfo); }
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u16(id);
-		w.u8(on);
-		w.str(info);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		InfoBody tmp;
-		tmp.id = r.u16();
-		tmp.on = r.u8();
-		tmp.info = r.str();
-		if (!r.ok() || !tmp.fits())
-		{
-			*this = InfoBody();
-			return false;
-		}
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// Ask: what a map server's script wants of an object of its level it does not write (W2a): the world executes it when it writes the
-// object and its root stands on the sender's level (W2b), and the map server does not apply it first. Wire: u8 what, u16 id, u16 crc
-// (section_crc of the object as the sender has it), then str info for GiveInfo and DisableInfo alone.
-struct AskBody
-{
-	enum What : uint8_t
-	{
-		Release = 1,
-		GiveInfo = 2,
-		DisableInfo = 3,
-	};
-
-	uint8_t what = Release;
-	uint16_t id = wire::kNoObject;
-	uint16_t crc = 0;
-	std::string info; // GiveInfo, DisableInfo: the info portion; empty for Release
-
-	bool names_info() const { return what == GiveInfo || what == DisableInfo; }
-
-	bool fits() const
-	{
-		if (what < Release || what > DisableInfo || id == wire::kNoObject)
-			return false;
-		return names_info() ? !info.empty() && wire::detail::printable(info, InfoBody::kMaxInfo) : info.empty();
-	}
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u8(what);
-		w.u16(id);
-		w.u16(crc);
-		if (names_info())
-			w.str(info);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		AskBody tmp;
-		tmp.what = r.u8();
-		tmp.id = r.u16();
-		tmp.crc = r.u16();
-		if (r.ok() && tmp.names_info())
-			tmp.info = r.str();
-		if (!r.ok() || !tmp.fits())
-		{
-			*this = AskBody();
-			return false;
-		}
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// Carry: part `part` of `total` of the leaves a map server carries from its modules' save_state to the world save (W6; the blob is
-// coop_srv_carry.script's). Wire: u16 part, u16 total, then the blob: the rest of the body, 1 .. kMaxPart bytes.
-struct CarryBody
-{
-	static constexpr size_t kMaxPart = 60 * 1024;
-
-	uint16_t part = 0;
-	uint16_t total = 1;
-	std::vector<uint8_t> blob;
-
-	bool fits() const { return total >= 1 && part < total && !blob.empty() && blob.size() <= kMaxPart; }
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u16(part);
-		w.u16(total);
-		w.bytes(blob.data(), blob.size());
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		*this = CarryBody();
-		CarryBody tmp;
-		tmp.part = r.u16();
-		tmp.total = r.u16();
-		if (!r.ok() || !wire::detail::read_tail(r, tmp.blob, kMaxPart) || !tmp.fits())
-			return false;
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// Done: a numbered op that consumes or pays ran here (W7), with the answer the executor recorded; the world keeps it with the effect
-// and hands it to the next map server. `origin` and `op` are the op's number {origin character, seq} as its Lua makes it. Wire:
-// u32 origin, u32 op, str answer (0 .. kMaxAnswer bytes).
-struct DoneBody
-{
-	static constexpr size_t kMaxAnswer = 8 * 1024;
-
-	uint32_t origin = 0;
-	uint32_t op = 0;
-	std::string answer;
-
-	bool fits() const { return answer.size() <= kMaxAnswer; }
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u32(origin);
-		w.u32(op);
-		w.str(answer);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		DoneBody tmp;
-		tmp.origin = r.u32();
-		tmp.op = r.u32();
-		tmp.answer = r.str();
-		if (!r.ok() || !tmp.fits())
-		{
-			*this = DoneBody();
-			return false;
-		}
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// Flushed: the answer to LevelFlush{round} (W4.1): every fact before it is in the journal. Wire: u32 round (>= 1, as FlushRound's).
-struct FlushedBody
-{
-	uint32_t round = 0;
-
-	bool fits() const { return round != 0; }
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u32(round);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		FlushedBody tmp;
-		tmp.round = r.u32();
-		if (!r.ok() || !tmp.fits())
-		{
-			*this = FlushedBody();
-			return false;
-		}
-		*this = tmp;
-		return true;
-	}
-};
-
-// ItemFacts (op Item of a journal, W8.3): the condition, uses, upgrades or addon flags of an item the map server writes changed,
-// players' items included. The layout of ItemState State after its op byte, plus the source of the change. Wire: u16 item, str
-// section, u8 flags, varu n, n bytes of the ItemState blob (1 .. kMaxBlob), u8 source.
-struct ItemFactsBody
-{
-	enum Source : uint8_t
-	{
-		Loot = 0, // the wear its level gave loot (the LevelEntity Item of protocol 33)
-		Decider = 1, // the writer's deliberate write (a script's set_condition, set_remaining_uses, an upgrade it installed)
-		Owner = 2, // the owner's report the writer took (his own use, on the latest version of the field: coop_item_tags.h fresh)
-	};
-	static constexpr size_t kMaxSection = 64;
-	static constexpr size_t kMaxBlob = 4096; // kMaxItemState (coop_spawn.h): the ItemState's own bound
-	static constexpr uint8_t kFlagAuthority = 1; // the one flag an ItemState has (coop_items.cpp kFlagAuthority)
-
-	uint16_t item = wire::kNoObject;
-	std::string section;
-	uint8_t flags = 0;
-	std::vector<uint8_t> blob;
-	uint8_t source = Loot;
-
-	bool fits() const
-	{
-		return item != wire::kNoObject && !section.empty() && wire::detail::printable(section, kMaxSection) &&
-		    (flags & ~kFlagAuthority) == 0 && !blob.empty() && blob.size() <= kMaxBlob && source <= Owner;
-	}
-
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u16(item);
-		w.str(section);
-		w.u8(flags);
-		w.varu(blob.size());
-		w.bytes(blob.data(), blob.size());
-		w.u8(source);
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		*this = ItemFactsBody();
-		ItemFactsBody tmp;
-		tmp.item = r.u16();
-		tmp.section = r.str();
-		tmp.flags = r.u8();
-		const uint64_t n = r.varu();
-		if (!r.ok() || n == 0 || n > kMaxBlob || n > r.remaining())
-			return false;
-		tmp.blob.resize(size_t(n));
-		if (!r.bytes(tmp.blob.data(), size_t(n)))
-			return false;
-		tmp.source = r.u8();
-		if (!r.ok() || !tmp.fits())
-			return false;
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// `r` reads as B with nothing left over.
-template <class B>
-bool reads_whole(Reader r, B& out)
-{
-	return out.read(r) && r.remaining() == 0;
-}
-
-// Does `body` read as the body of `op`? The batch's reader asks it of every entry before it keeps one, the writer and the builders
-// before they write one.
-inline bool body_ok(uint8_t op, const uint8_t* data, size_t size)
-{
-	using H = wire::LevelEntityHead;
-	if (!known_op(op) || size > kMaxBody)
-		return false;
-	Reader r(data, size);
-	if (names_object(op))
-	{
-		ObjectHead head;
-		if (!head.read(r))
-			return false;
-		const Reader layout(r.cursor(), r.remaining());
-		Reader peek = layout;
-		if (peek.u16() != head.id || !peek.ok())
-			return false; // today's layout starts with the object the head names
-		const size_t n = layout.remaining();
-		switch (op)
-		{
-		case H::Destroy: return n == 2;
-		case H::Parent: return n == 2 + 2 + 3 * 4;
-		case H::Tent: return n == 2 + 2;
-		case H::Stash: return n == 2 + 1;
-		case H::Died: return n >= 2 + 2;
-		case H::Item:
-		{
-			ItemFactsBody b;
-			return reads_whole(layout, b);
-		}
-		case H::Logic:
-		{
-			wire::LevelLogicBody b;
-			return reads_whole(layout, b);
-		}
-		default: return true; // State, Spawn: their tails are their own readers'
-		}
-	}
-	switch (op)
-	{
-	case H::Money:
-	{
-		const uint32_t peer = r.u32();
-		r.u64();
-		const uint8_t trade = r.u8();
-		return r.ok() && r.remaining() == 0 && wire::detail::slot_ok(peer) && trade <= 1;
-	}
-	case H::Joined:
-	case H::Left:
-	{
-		MemberBody b;
-		return reads_whole(r, b);
-	}
-	case H::Info:
-	{
-		InfoBody b;
-		return reads_whole(r, b);
-	}
-	case H::Ask:
-	{
-		AskBody b;
-		return reads_whole(r, b);
-	}
-	case H::IdAsk: return size == 0;
-	case H::Carry:
-	{
-		CarryBody b;
-		return reads_whole(r, b);
-	}
-	case H::Done:
-	{
-		DoneBody b;
-		return reads_whole(r, b);
-	}
-	case H::Flushed:
-	{
-		FlushedBody b;
-		return reads_whole(r, b);
-	}
-	default: break;
-	}
-	return false;
-}
-
-inline bool body_ok(uint8_t op, const std::vector<uint8_t>& body) { return body_ok(op, body.data(), body.size()); }
-
-// An entry of a per-object op: the head, then today's layout `layout` of the op (which starts with h.id). False, `out` empty, for
-// another op or for what body_ok refuses.
-inline bool object_entry(uint8_t op, const ObjectHead& h, const Writer& layout, Entry& out)
-{
-	out = Entry();
-	if (!names_object(op))
-		return false;
-	Writer w(ObjectHead::kSize + layout.size());
-	h.write(w);
-	w.bytes(layout.ptr(), layout.size());
-	if (!body_ok(op, w.ptr(), w.size()))
-		return false;
-	out.op = op;
-	out.body = w.data();
-	return true;
-}
-
-// An entry of an op without a head, from its body (MemberBody, InfoBody, AskBody, CarryBody, DoneBody, FlushedBody). False, `out`
-// empty, for a per-object op or a body the op does not take.
-template <class B>
-bool body_entry(uint8_t op, const B& body, Entry& out)
-{
-	out = Entry();
-	if (names_object(op))
-		return false;
-	Writer w;
-	if (!body.write(w) || !body_ok(op, w.ptr(), w.size()))
-		return false;
-	out.op = op;
-	out.body = w.data();
-	return true;
-}
-
-// The IdAsk entry: no body.
-inline Entry id_ask_entry()
-{
-	Entry e;
-	e.op = wire::LevelEntityHead::IdAsk;
-	return e;
-}
-
-// The head of a per-object entry. False (`h` cleared) for another op or a body without one.
-inline bool object_of(const Entry& e, ObjectHead& h)
-{
-	h = ObjectHead();
-	if (!names_object(e.op))
-		return false;
-	Reader r(e.body.data(), e.body.size());
-	return h.read(r);
-}
-
-// Today's LevelEntity layout of a per-object entry, after its head; an empty Reader for another op.
-inline Reader layout_of(const Entry& e)
-{
-	if (!names_object(e.op) || e.body.size() < ObjectHead::kSize)
-		return Reader(nullptr, 0);
-	return Reader(e.body.data() + ObjectHead::kSize, e.body.size() - ObjectHead::kSize);
-}
-} // namespace journal
-
-namespace wire
-{
-// ---------------------------------------------------------------- LevelJournal (0x01E0), LevelJournalAck (0x01E1), protocol 34
-
-// LevelJournal wire: u32 seq, u16 n, n x {u8 op, varu len, body[len]} (namespace journal above). `seq` counts the batches of one map
-// server from 1; a batch has 1 .. kMaxEntries entries and at most kMaxBatch bytes. read() checks every entry (journal::body_ok)
-// before it keeps any: a batch with one entry that does not read is refused whole (seq 0, no entries).
-struct LevelJournalMsg
-{
-	uint32_t seq = 0;
-	std::vector<journal::Entry> entries;
-
-	size_t wire_size() const
-	{
-		size_t n = 4 + 2;
-		for (const journal::Entry& e : entries)
-			n += 1 + detail::varu_size(e.body.size()) + e.body.size();
-		return n;
-	}
-
-	// What read() takes: a seq, 1 .. kMaxEntries entries that each read, kMaxBatch bytes at most.
-	bool fits() const
-	{
-		if (seq == 0 || entries.empty() || entries.size() > journal::kMaxEntries || wire_size() > journal::kMaxBatch)
-			return false;
-		for (const journal::Entry& e : entries)
-			if (!journal::body_ok(e.op, e.body))
-				return false;
-		return true;
-	}
-
-	// False, nothing written, for a batch read() would refuse: an entry that does not read would cost the world the whole frame.
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u32(seq);
-		w.u16(uint16_t(entries.size()));
-		for (const journal::Entry& e : entries)
-		{
-			w.u8(e.op);
-			w.varu(e.body.size());
-			w.bytes(e.body.data(), e.body.size());
-		}
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		*this = LevelJournalMsg();
-		const size_t start = r.remaining();
-		LevelJournalMsg tmp;
-		tmp.seq = r.u32();
-		const uint16_t n = r.u16();
-		// every entry is at least its op and a one-byte length: a count the packet cannot hold is refused before anything is kept
-		if (!r.ok() || tmp.seq == 0 || n == 0 || n > journal::kMaxEntries || size_t(n) * 2 > r.remaining())
-			return false;
-		tmp.entries.reserve(n);
-		for (uint16_t i = 0; i < n; ++i)
-		{
-			journal::Entry e;
-			e.op = r.u8();
-			const uint64_t len = r.varu();
-			if (!r.ok() || len > journal::kMaxBody || len > r.remaining())
-				return false;
-			e.body.resize(size_t(len));
-			if (len && !r.bytes(e.body.data(), size_t(len)))
-				return false;
-			if (!journal::body_ok(e.op, e.body))
-				return false;
-			tmp.entries.push_back(std::move(e));
-		}
-		if (start - r.remaining() > journal::kMaxBatch)
-			return false;
-		*this = std::move(tmp);
-		return true;
-	}
-};
-
-// LevelJournalAck wire: u32 upto, u8 n, n x {u32 seq, u8 op, u16 id, u8 why}, u8 has_block, [u16 first, u16 count]. Every batch of
-// the bridge up to `upto` is applied but the entries the rows name: the world refused them (journal::Why; `id` kNoObject for an op
-// that names no object), and the sender repairs toward the world (W2b: it releases what the world refused to create, keeping the
-// id reserved; it fetches what the world refused to change or remove). The block answers an IdAsk: the ids first .. first + count
-// - 1 are the sender's from now on (W9).
-struct LevelJournalAckMsg
-{
-	static constexpr size_t kMaxRefusals = 255; // a u8 count; more go in another Ack with the same upto
-
-	struct Refusal
-	{
-		uint32_t seq = 0;
-		uint8_t op = 0;
-		uint16_t id = kNoObject;
-		uint8_t why = 0;
-	};
-
-	uint32_t upto = 0;
-	std::vector<Refusal> refusals;
-	bool has_block = false;
-	uint16_t first = kNoObject;
-	uint16_t count = 0;
-
-	static bool refusal_ok(const Refusal& f, uint32_t upto)
-	{
-		return f.seq != 0 && f.seq <= upto && journal::known_op(f.op) && f.why >= 1 && f.why <= journal::kLastWhy;
-	}
-	// ids first .. first + count - 1, none of them kNoObject
-	static bool block_ok(uint16_t first, uint16_t count) { return count != 0 && uint32_t(first) + count <= kNoObject; }
-
-	// What read() takes: every Ack answers a batch (upto >= 1), its rows name batches it acknowledges, ops and reasons that exist.
-	bool fits() const
-	{
-		if (upto == 0 || refusals.size() > kMaxRefusals || (has_block && !block_ok(first, count)))
-			return false;
-		for (const Refusal& f : refusals)
-			if (!refusal_ok(f, upto))
-				return false;
-		return true;
-	}
-
-	// False, nothing written, for an Ack read() would refuse: a row cut away would be an entry the sender takes for applied.
-	[[nodiscard]] bool write(Writer& w) const
-	{
-		if (!fits())
-			return false;
-		w.u32(upto);
-		w.u8(uint8_t(refusals.size()));
-		for (const Refusal& f : refusals)
-		{
-			w.u32(f.seq);
-			w.u8(f.op);
-			w.u16(f.id);
-			w.u8(f.why);
-		}
-		w.u8(has_block ? 1 : 0);
-		if (has_block)
-		{
-			w.u16(first);
-			w.u16(count);
-		}
-		return true;
-	}
-
-	bool read(Reader& r)
-	{
-		*this = LevelJournalAckMsg();
-		LevelJournalAckMsg tmp;
-		tmp.upto = r.u32();
-		const uint8_t n = r.u8();
-		if (!r.ok() || tmp.upto == 0)
-			return false;
-		tmp.refusals.reserve(n);
-		for (uint8_t i = 0; i < n; ++i)
-		{
-			Refusal f;
-			f.seq = r.u32();
-			f.op = r.u8();
-			f.id = r.u16();
-			f.why = r.u8();
-			if (!r.ok() || !refusal_ok(f, tmp.upto))
-				return false;
-			tmp.refusals.push_back(f);
-		}
-		const uint8_t block = r.u8();
-		if (!r.ok() || block > 1)
-			return false;
-		tmp.has_block = block != 0;
-		if (tmp.has_block)
-		{
-			tmp.first = r.u16();
-			tmp.count = r.u16();
-			if (!r.ok() || !block_ok(tmp.first, tmp.count))
-				return false;
-		}
-		*this = std::move(tmp);
 		return true;
 	}
 };

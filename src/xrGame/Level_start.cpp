@@ -13,8 +13,8 @@
 #include "string_table.h"
 #include "UIGameCustom.h"
 #include "ui/UICDkey.h"
-#include "coop/coop_join.h" // Anomaly Coop: is_client_cache_save, client_loading_world
-#include "coop/coop_manager.h" // Anomaly Coop: the phase in the line of a dropped start
+#include "coop/coop_join.h" // coop: is_client_cache_save, client_loading_world
+#include "coop/coop_manager.h" // coop: the phase in the line of a dropped start
 
 int g_cl_save_demo = 0;
 extern XRCORE_API bool g_allow_heap_min;
@@ -159,7 +159,7 @@ bool CLevel::net_start2()
 	PROF_EVENT("CLevel::net_start2");
 	if (net_start_result_total && m_caServerOptions.size())
 	{
-		// Anomaly Coop (report RL-8VWD-XXXF, FATAL "Cannot find the specified saved game __raylink_client_world"): the start
+		// coop: the start
 		// of the client's cached copy of the host's world after the join stopped loading it (left, failed, timed out) is
 		// dropped; net_start6's ordinary failure branch goes to the main menu (ErrNoError: not the multiplayer menu).
 		if (coop::join::is_client_cache_save(g_pGamePersistent->m_game_params.m_game_or_spawn) &&
@@ -289,7 +289,7 @@ bool CLevel::net_start6()
 	else
 	{
 		Msg("! Failed to start client. Check the connection or level existance.");
-		if (g_coop_headless) // Anomaly Coop: no menu to fall back to: the host's process must see this one die, not wait for it
+		if (g_dedicated_server) // coop: no menu to fall back to: the host's process must see this one die, not wait for it
 			FATAL("[coop] map server: the level did not start");
 
 		if (m_connect_server_err == xrServer::ErrConnect && !psNET_direct_connect && !g_dedicated_server)
@@ -351,11 +351,8 @@ bool CLevel::net_start6()
 		return true;
 	}
 
-	if (!g_dedicated_server || g_coop_headless)
-	{
-		if (CurrentGameUI())
-			CurrentGameUI()->OnConnected();
-	}
+	if (CurrentGameUI())
+		CurrentGameUI()->OnConnected();
 
 	return true;
 }

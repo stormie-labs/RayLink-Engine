@@ -1,5 +1,4 @@
-// Anomaly Coop — world state owned by the host: one game clock and one sky for the group
-// (SPEC R-10.1, R-10.2, P5).
+// Anomaly Coop — world state owned by the host: one game clock and one sky for the group.
 //
 // Time:    the host sends TimeSync {ALife game time, ALife time factor, host clock, paused} every second
 //          and right after any jump (sleep, scripted skip, load, factor change). A client follows it only
@@ -19,8 +18,8 @@ class Endpoint;
 
 namespace worldstate
 {
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void frame(); // main thread, every frame while a session is active
 void reset(); // session started / ended
 void print_status();
@@ -35,24 +34,24 @@ bool allow_time_factor_change(float factor);
 // A jump of the game clock by delta_ms that the caller has just made (sky clock and ALife clock moved): level.change_game_time,
 // the shared sleep's skip_time, coop_time. Any thread; in a session the next frame() chooses both env sections of the sky again
 // for the new time when the jump is long (xrCoop/coop_sky_jump.h): the stock sky keeps its old sections until the next forced
-// weather change (live report 41.4: night at 10:30 after a sleep, day at 11:00). The engine's own clock jumps (a client
+// weather change (night at 10:30 after a sleep). The engine's own clock jumps (a client
 // following the host, the host's move) note themselves. No session: nothing.
 void note_time_jump(s64 delta_ms);
 
 // level.change_game_time (Anomaly sleep, fast travel, scripted skips).
 // Client in a session: true, the caller must not move time; a request goes to the host, which shows
-// "[coop] <nick> wants to sleep" (R-10.2 v1: the host decides, nothing else happens). The call gate (F2 T12,
-// "level:change_game_time") decides: Request as above, Refuse without a request, Run (an ltx override) false.
+// "[coop] <nick> wants to sleep" (the host decides, nothing else happens). The call gate
+// ("level:change_game_time") decides: Request as above, Refuse without a request, Run (an ltx override) false.
 // Host: false (the jump happens) and a TimeSync goes out at once. No session: false.
 bool intercept_time_jump(u32 days, u32 hours, u32 mins);
 
 // level.set_weather / set_weather_smooth / set_weather_weight / set_weather_fx /
-// start_weather_fx_from_time / stop_weather_fx; name is the call gate's ("level:set_weather", F2 T12).
+// start_weather_fx_from_time / stop_weather_fx; name is the call gate's ("level:set_weather").
 // Client in a session: true, the call is refused by the call gate (Anomaly weather scripts are random per machine).
 // Host: false, and a WeatherSync goes out at once. No session, or an ltx override: false.
 bool refuse_script_weather(const char* name);
 
-// CEffect_Thunderbolt (parity audit W5). A client in a session never schedules a bolt of his own: he draws the host's,
+// CEffect_Thunderbolt. A client in a session never schedules a bolt of his own: he draws the host's,
 // host_on_bolt sends each one with its seed. On each machine's own weather the sky would strike at other moments.
 bool bolts_follow();
 void host_on_bolt(const char* id, float period, float duration, u32 seed);

@@ -28,7 +28,7 @@
 #include "CharacterPhysicsSupport.h"
 #include "car_memory.h"
 #include "../xrphysics/IPHWorld.h"
-#include "coop/coop_vehicles.h" // Anomaly Coop (F5-VEH-3): a player's copy of a car stays kinematic
+#include "coop/coop_vehicles.h" // coop: a player's copy of a car stays kinematic
 BONE_P_MAP CCar::bone_map = BONE_P_MAP();
 
 //extern CPHWorld*	ph_world;
@@ -765,7 +765,7 @@ void CCar::detach_Actor()
 	if (!Owner()) return;
 	Owner()->setVisible(1);
 	CHolderCustom::detach_Actor();
-	if (!coop::vehicles::mirror_copy(this)) // Anomaly Coop (F5-VEH-3): a player's copy: its decider parks the car
+	if (!coop::vehicles::mirror_copy(this)) // coop: a player's copy: its decider parks the car
 	{
 	PPhysicsShell()->remove_ObjectContactCallback(ActorObstacleCallback);
 	NeutralDrive();
@@ -809,7 +809,7 @@ bool CCar::attach_Actor(CGameObject* actor)
 	m_sits_transforms.push_back(instance.mTransform);
 
 	OnCameraChange(ectFirst);
-	if (!coop::vehicles::mirror_copy(this)) // Anomaly Coop (F5-VEH-3): a player's copy stays kinematic, its decider drives the car
+	if (!coop::vehicles::mirror_copy(this)) // coop: a player's copy stays kinematic, its decider drives the car
 	{
 	PPhysicsShell()->Enable();
 	PPhysicsShell()->add_ObjectContactCallback(ActorObstacleCallback);
@@ -2212,7 +2212,7 @@ u16 CCar::Initiator()
 		return Owner()->ID();
 	}
 		//else if(CExplosive::Initiator()!=u16(-1))return CExplosive::Initiator();
-	// Anomaly Coop F5-VEH-2 (F5-REV-1 S2): a car a client drives has no Owner on the decider: what it does is its driver's (his
+	// coop: a car a client drives has no Owner on the decider: what it does is its driver's (his
 	// kills, relations, statistics), as the stock Owner's. Nothing is installed in single player and on a client: kNoCharacter.
 	const u16 coop_driver = coop::vehicles::driver_of(u16(ID()));
 	if (g_Alive() && coop_driver != coop::vehicles::kNoCharacter)

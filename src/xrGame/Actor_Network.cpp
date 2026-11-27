@@ -3,7 +3,7 @@
 #include "hudmanager.h"
 #include "Actor_Flags.h"
 #include "coop/coop_join.h"
-#include "coop/coop_players.h" // Anomaly Coop (build 56): own_actor_loaded
+#include "coop/coop_players.h" // coop: own_actor_loaded
 #include "inventory.h"
 #include "xrserver_objects_alife_monsters.h"
 #include "xrServer.h"
@@ -1402,7 +1402,7 @@ void CActor::load(IReader& input_packet)
 	input_packet.r_stringZ(g_quick_use_slots[1], sizeof(g_quick_use_slots[1]));
 	input_packet.r_stringZ(g_quick_use_slots[2], sizeof(g_quick_use_slots[2]));
 	input_packet.r_stringZ(g_quick_use_slots[3], sizeof(g_quick_use_slots[3]));
-	// Anomaly Coop (build 56): a client's actor is built from the HOST's save. What was just read is the host's; in a load
+	// coop: a client's actor is built from the HOST's save. What was just read is the host's; in a load
 	// that continues the player's world his own save, held by this process, is read over it (it calls this function again
 	// with nothing held: no recursion).
 	coop::players::own_actor_loaded(*this);

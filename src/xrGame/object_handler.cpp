@@ -171,8 +171,8 @@ bool CObjectHandler::goal_reached()
 void CObjectHandler::weapon_bones(int& b0, int& b1, int& b2) const
 {
 	CWeapon* weapon = smart_cast<CWeapon*>(inventory().ActiveItem());
-	// Anomaly Coop: the strapped state can outlive the weapon it was for, and a pistol has no strap bones: a null name reached
-	// LL_BoneID (host crash, live 2026-10-31). THROW3 below is empty in Release.
+	// coop: the strapped state can outlive the weapon it was for, and a pistol has no strap bones: a null name would reach
+	// LL_BoneID. THROW3 below is empty in Release.
 	if (!weapon || !weapon->can_be_strapped() || !planner().m_storage.property(ObjectHandlerSpace::eWorldPropertyStrapped))
 	{
 		if (weapon)

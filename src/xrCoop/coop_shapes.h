@@ -1,10 +1,12 @@
 // Anomaly Coop — distance from a point to the shapes of a space restrictor (spheres and boxes, as CShapeData keeps
-// them). The host lets a player vote for a level exit only near the exit's shapes (T12 review, Ruling 18).
+// them). The host lets a player vote for a level exit only near the exit's shapes.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
 #include <cmath>
 #include <limits>
+
+#include "coop_validate.h"
 
 namespace coop
 {
@@ -13,15 +15,10 @@ namespace shapes
 // "Nowhere near": the answer for anything that is not a number or not a shape.
 constexpr float kFar = std::numeric_limits<float>::infinity();
 
-namespace detail
-{
-inline bool finite3(const float v[3]) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
-} // namespace detail
-
 // Distance from p to the ball of center c and radius r; 0 inside or on it. kFar if a number is not finite or r < 0.
 inline float to_sphere(const float p[3], const float c[3], float r)
 {
-	if (!detail::finite3(p) || !detail::finite3(c) || !std::isfinite(r) || r < 0.f)
+	if (!validate::finite3(p) || !validate::finite3(c) || !std::isfinite(r) || r < 0.f)
 		return kFar;
 	const double dx = double(p[0]) - c[0], dy = double(p[1]) - c[1], dz = double(p[2]) - c[2];
 	const double d = std::sqrt(dx * dx + dy * dy + dz * dz) - double(r);
@@ -35,7 +32,7 @@ inline float to_sphere(const float p[3], const float c[3], float r)
 // 1 mm (a flat box has no inside to stand in).
 inline float to_box(const float p[3], const float i[3], const float j[3], const float k[3], const float c[3])
 {
-	if (!detail::finite3(p) || !detail::finite3(i) || !detail::finite3(j) || !detail::finite3(k) || !detail::finite3(c))
+	if (!validate::finite3(p) || !validate::finite3(i) || !validate::finite3(j) || !validate::finite3(k) || !validate::finite3(c))
 		return kFar;
 	const double d[3] = {double(p[0]) - c[0], double(p[1]) - c[1], double(p[2]) - c[2]};
 	const float* edges[3] = {i, j, k};

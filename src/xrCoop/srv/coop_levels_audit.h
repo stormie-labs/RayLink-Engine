@@ -1,7 +1,9 @@
 // Server ownership audit (A-S7N). Only the world server tracks rounds.
 #pragma once
 
-#include "coop_level_hash.h"
+#include "../coop_ids.h"
+#include "../coop_level_hash.h"
+#include "../coop_hash.h"
 #include "../coop_protocol.h"
 
 #include <algorithm>
@@ -39,19 +41,19 @@ inline bool read_audit_round(Reader& r, uint32_t& round)
 	return round != 0;
 }
 
-// ---------------------------------------------------------------- R32 W5.2: the auditor compares content (membership)
+// ---------------------------------------------------------------- the auditor compares content (membership)
 // The background hash and the report carried who writes what under which gen (id, gen) alone: a squad whose member list differs
 // between the world and the map server that holds it was never found. Now the hash of a held squad carries the digest of its
 // members on both sides (Keeper::differs with a digest), and the map server's report carries the member list of each squad in the
 // asked buckets; the world takes the writer's list (heal_members): a member the writer lists and the world's squad lacks joins it,
 // a member the world's squad has and the writer does not list leaves it.
 //
-// Report wire (protocol 34; one exe for every role): LevelEntity op=6: u32 mask, u16 n, n x {u16 id, u32 gen} (LevelReportBody),
+// Report wire (one exe for every role): LevelEntity op=6: u32 mask, u16 n, n x {u16 id, u32 gen} (LevelReportBody),
 // then the members: u16 m, m x {u16 squad, u8 k, k x u16 member}, then [u32 round] (write_audit_round). A squad with no member is
 // listed with k = 0.
 struct MemberRow
 {
-	uint16_t squad = 0xffff;
+	uint16_t squad = kNoId;
 	std::vector<uint16_t> members;
 };
 
@@ -66,12 +68,9 @@ inline uint64_t members_digest(std::vector<uint16_t> ids)
 		return 0;
 	std::sort(ids.begin(), ids.end());
 	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-	uint64_t h = 0xcbf29ce484222325ull;
+	uint64_t h = kFnv64Basis;
 	for (const uint16_t id : ids)
-	{
-		h = (h ^ (id & 0xffu)) * 0x100000001b3ull;
-		h = (h ^ (id >> 8)) * 0x100000001b3ull;
-	}
+		h = fnv1a64_step(fnv1a64_step(h, id & 0xffu), id >> 8);
 	return h == 0 ? 1 : h;
 }
 
@@ -82,7 +81,7 @@ struct MemberHeal
 	bool empty() const { return join.empty() && leave.empty(); }
 };
 
-// The world's member list towards the writer's (W5: the non-writer repairs towards the writer). Sorted, no repeats.
+// The world's member list towards the writer's (the non-writer repairs towards the writer). Sorted, no repeats.
 inline MemberHeal heal_members(std::vector<uint16_t> world, std::vector<uint16_t> writer)
 {
 	std::sort(world.begin(), world.end());
@@ -101,7 +100,7 @@ inline MemberHeal heal_members(std::vector<uint16_t> world, std::vector<uint16_t
 	if (rows.size() > kMaxMemberRows)
 		return false;
 	for (const MemberRow& row : rows)
-		if (row.squad == 0xffff || row.members.size() > kMaxMembers)
+		if (row.squad == kNoId || row.members.size() > kMaxMembers)
 			return false;
 	w.u16(uint16_t(rows.size()));
 	for (const MemberRow& row : rows)
@@ -129,13 +128,13 @@ inline bool read_members(Reader& r, std::vector<MemberRow>& rows)
 		MemberRow row;
 		row.squad = r.u16();
 		const uint8_t k = r.u8();
-		if (!r.ok() || row.squad == 0xffff || !seen.insert(row.squad).second || size_t(k) * 2 > r.remaining())
+		if (!r.ok() || row.squad == kNoId || !seen.insert(row.squad).second || size_t(k) * 2 > r.remaining())
 			return false;
 		row.members.reserve(k);
 		for (uint8_t j = 0; j < k; ++j)
 		{
 			const uint16_t id = r.u16();
-			if (!r.ok() || id == 0xffff)
+			if (!r.ok() || id == kNoId)
 				return false;
 			row.members.push_back(id);
 		}

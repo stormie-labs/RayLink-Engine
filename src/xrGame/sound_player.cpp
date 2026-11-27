@@ -20,7 +20,7 @@
 #include "profiler.h"
 #include "sound_collection_storage.h"
 #include "object_broker.h"
-#include "coop/coop_sound.h" // Anomaly Coop
+#include "coop/coop_sound.h"
 
 
 CSoundPlayer::CSoundPlayer(CObject* object)
@@ -134,7 +134,7 @@ void CSoundPlayer::update(float time_delta)
 
 void CSoundPlayer::remove_inappropriate_sounds(u32 sound_mask)
 {
-	const bool coop_cut = sound_mask && coop::sound::player_stops_recorded() && std::any_of(m_playing_sounds.begin(), m_playing_sounds.end(), [sound_mask](const CSoundSingle& s) { return (s.m_synchro_mask & sound_mask) != 0; }); // Anomaly Coop
+	const bool coop_cut = sound_mask && coop::sound::player_stops_recorded() && std::any_of(m_playing_sounds.begin(), m_playing_sounds.end(), [sound_mask](const CSoundSingle& s) { return (s.m_synchro_mask & sound_mask) != 0; }); // coop: a cut sound stops on the other machines too
 	m_playing_sounds.erase(
 		std::remove_if(
 			m_playing_sounds.begin(),
@@ -143,7 +143,7 @@ void CSoundPlayer::remove_inappropriate_sounds(u32 sound_mask)
 		),
 		m_playing_sounds.end()
 	);
-	if (coop_cut) coop::sound::on_player_sound_stop(m_object, sound_mask, sound_mask == m_sound_mask); // Anomaly Coop: set_sound_mask path when the masks are equal
+	if (coop_cut) coop::sound::on_player_sound_stop(m_object, sound_mask, sound_mask == m_sound_mask); // coop: set_sound_mask path when the masks are equal
 }
 
 void CSoundPlayer::update_playing_sounds()
@@ -176,7 +176,7 @@ bool CSoundPlayer::need_bone_data() const
 void CSoundPlayer::play(u32 internal_type, u32 max_start_time, u32 min_start_time, u32 max_stop_time, u32 min_stop_time,
                         u32 id)
 {
-	if (coop::sound::player_sound_blocked(m_object)) return; // Anomaly Coop: host creature sounds come from the host
+	if (coop::sound::player_sound_blocked(m_object)) return; // coop: host creature sounds come from the host
 	if (!check_sound_legacy(internal_type))
 		return;
 
@@ -244,7 +244,7 @@ void CSoundPlayer::play(u32 internal_type, u32 max_start_time, u32 min_start_tim
 	sound_single.m_stop_time = sound_single.m_start_time + iFloor(sound_single.m_sound->get_length_sec() * 1000.0f) +
 		random_time;
 	m_playing_sounds.push_back(sound_single);
-	coop::sound::on_player_sound(m_object, *sound_single.m_sound, sound_single.m_bone_id, sound.m_synchro_mask, sound_single.m_start_time); // Anomaly Coop
+	coop::sound::on_player_sound(m_object, *sound_single.m_sound, sound_single.m_bone_id, sound.m_synchro_mask, sound_single.m_start_time); // coop: the other players hear it
 	string256 name;
 	xr_sprintf(name, "%s%s%i", *sound.m_sound_player_prefix, *sound.m_sound_prefix, (random_id + 1));
 	//Msg("Sound name \"%s\"", name);

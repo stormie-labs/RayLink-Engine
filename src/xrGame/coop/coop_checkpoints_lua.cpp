@@ -2,15 +2,11 @@
 #include "pch_script.h"
 #include "coop_checkpoints.h"
 #include "coop_checkpoint_sources.h"
-#include "coop_rest.h"
-#include "coop_autosave.h"
+#include "coop_lua.h" // lua_api: the registrar, the argument readers
 
-#include <cmath>
-
-// Lua side of the F3 modules: coop.checkpoint (here, F3 Tasks 6 and 7), coop.rest (coop_rest.cpp, F3 Task 11) and
-// coop.autosave (coop_autosave.cpp, F3 Task 12).
+// Lua side of the checkpoints: coop.checkpoint (registered by script::register_raw, with coop.rest and coop.autosave).
 // Functions with arguments are plain C functions, as in coop_script.cpp: a wrong argument from an addon returns
-// nil / false instead of a luabind "no matching overload" error, which is fatal in this engine (R-11.4).
+// nil / false instead of a luabind "no matching overload" error, which is fatal in this engine.
 
 namespace coop
 {
@@ -20,17 +16,6 @@ namespace
 {
 constexpr size_t kMaxReason = 128; // a story reason is a string id ("st_save_..."), only logged
 
-// A character id from argument `idx`: a whole number 0..0xfffe (0xffff is "no object").
-bool arg_character(lua_State* L, int idx, u16& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v) || v < 0.0 || v >= double(0xffff) || v != std::floor(v))
-		return false;
-	out = u16(v);
-	return true;
-}
 
 // coop.checkpoint.get(local_id) -> nil | {kind = "campfire"|"rest"|"tent"|"arrival"|"story"|"mod", level, x, y, z,
 // source = local id | nil}: this player's own checkpoint (0 = me) or another one the host shares.
@@ -38,7 +23,7 @@ int l_get(lua_State* L)
 {
 	u16 id = 0;
 	checkpoint::Record r;
-	if (!arg_character(L, 1, id) || !get(id, r) || !r.valid())
+	if (!lua_api::arg_object_id(L, 1, id) || !get(id, r) || !r.valid())
 	{
 		lua_pushnil(L);
 		return 1;
@@ -87,25 +72,23 @@ int l_story(lua_State* L)
 	return 1;
 }
 
-// A finite number from argument `idx`.
+// A finite number within +-checkpoint::kMaxCoord from argument `idx`.
 bool arg_number(lua_State* L, int idx, float& out)
 {
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v) || std::fabs(v) > double(checkpoint::kMaxCoord))
+	double v = 0.0;
+	if (!lua_api::arg_number_in(L, idx, -double(checkpoint::kMaxCoord), double(checkpoint::kMaxCoord), v))
 		return false;
 	out = float(v);
 	return true;
 }
 
-// coop.checkpoint.register_source(id, radius) -> bool: a mod object counts as a camp within `radius` metres (F3 Task
-// 7; the host, or the game before it hosts; false on a client, for no such object or a radius outside (0, 500]).
+// coop.checkpoint.register_source(id, radius) -> bool: a mod object counts as a camp within `radius` metres (the
+// host, or the game before it hosts; false on a client, for no such object or a radius outside (0, 500]).
 int l_register_source(lua_State* L)
 {
 	u16 id = 0;
 	float radius = 0.0f;
-	const bool ok = arg_character(L, 1, id) && arg_number(L, 2, radius) && sources::host_register_source(id, radius);
+	const bool ok = lua_api::arg_object_id(L, 1, id) && arg_number(L, 2, radius) && sources::host_register_source(id, radius);
 	lua_pushboolean(L, ok ? 1 : 0);
 	return 1;
 }
@@ -114,11 +97,11 @@ int l_register_source(lua_State* L)
 int l_unregister_source(lua_State* L)
 {
 	u16 id = 0;
-	lua_pushboolean(L, arg_character(L, 1, id) && sources::host_unregister_source(id) ? 1 : 0);
+	lua_pushboolean(L, lua_api::arg_object_id(L, 1, id) && sources::host_unregister_source(id) ? 1 : 0);
 	return 1;
 }
 
-// The kind of a claim from argument `idx`: nothing or nil is a tent, else "tent" | "sleepbag" | "pack" (F3 T7 round 1).
+// The kind of a claim from argument `idx`: nothing or nil is a tent, else "tent" | "sleepbag" | "pack".
 bool arg_claim_what(lua_State* L, int idx, checkpoint::ClaimWhat& out)
 {
 	const int t = lua_type(L, idx);
@@ -141,7 +124,7 @@ bool arg_claim_what(lua_State* L, int idx, checkpoint::ClaimWhat& out)
 }
 
 // coop.checkpoint.claim_tent(x, y, z [, what]) -> bool: "I put up a tent (a sleeping bag) here" or "pack mine up at
-// this spot" (F3 Task 7; what "tent" (default) | "sleepbag" | "pack"). Host: checked at once; client: sent to the host (at
+// this spot" (what "tent" (default) | "sleepbag" | "pack"). Host: checked at once; client: sent to the host (at
 // most one per 2 s). The answer is his Tent checkpoint (coop_checkpoint_changed), the item back for a pack-up, or
 // coop_checkpoint_refused(reason, what); false outside a session, for a position or kind that is not one, or a claim
 // sent too soon.
@@ -160,12 +143,12 @@ int l_claim_tent(lua_State* L)
 	return 1;
 }
 
-// coop.checkpoint.tent_owner(id) -> character id | nil: host, whose tent or sleeping bag `id` is (F3 T7 round 1, for
-// T13: the host's Lua adds a client's tent to item_tent's list); nil on a client, for nobody's or an absent owner's.
+// coop.checkpoint.tent_owner(id) -> character id | nil: host, whose tent or sleeping bag `id` is (the host's Lua adds
+// a client's tent to item_tent's list); nil on a client, for nobody's or an absent owner's.
 int l_tent_owner(lua_State* L)
 {
 	u16 id = 0;
-	const u16 owner = arg_character(L, 1, id) ? sources::host_tent_owner(id) : u16(0xffff);
+	const u16 owner = lua_api::arg_object_id(L, 1, id) ? sources::host_tent_owner(id) : u16(0xffff);
 	if (owner == 0xffff)
 		lua_pushnil(L);
 	else
@@ -174,59 +157,19 @@ int l_tent_owner(lua_State* L)
 }
 } // namespace
 
-// Fills coop.checkpoint (made here if no one made it yet: F3 Task 7 adds its functions to the same table).
+// Fills coop.checkpoint (made here if no one made it yet).
 void register_lua(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
 		{"get", &l_get},
 		{"story", &l_story},
-		{"register_source", &l_register_source}, // F3 Task 7
+		{"register_source", &l_register_source}, // a mod's API: mod_system_coop_checkpoints.ltx
 		{"unregister_source", &l_unregister_source},
 		{"claim_tent", &l_claim_tent},
-		{"tent_owner", &l_tent_owner}, // F3 T7 round 1
+		{"tent_owner", &l_tent_owner},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // the registrator logs it
-	}
-	lua_pushstring(L, "checkpoint");
-	lua_rawget(L, -2);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_newtable(L);
-		lua_pushstring(L, "checkpoint");
-		lua_pushvalue(L, -2);
-		lua_rawset(L, -4); // coop.checkpoint = the new table
-	}
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_pop(L, 2); // coop.checkpoint, coop
+	lua_api::fill(L, "checkpoint", fns);
 }
 } // namespace checkpoints
 } // namespace coop
-
-#pragma optimize("s", on)
-void coop_checkpoints_script_registrator::script_register(lua_State* L)
-{
-	// export_classes runs this right after coop_script_registrator, which made the `coop` table.
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	const bool have_coop = lua_istable(L, -1);
-	lua_pop(L, 1);
-	if (!have_coop)
-	{
-		::Msg("! [coop] script namespace 'coop' was not created, coop.checkpoint and coop.rest unavailable");
-		return;
-	}
-	coop::checkpoints::register_lua(L);
-	coop::rest::register_lua(L);
-	coop::autosave::register_lua(L); // F3 T12: coop.autosave.suspend (the Restore window, coop_saves.script)
-}

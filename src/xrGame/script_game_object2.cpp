@@ -38,8 +38,8 @@
 #include "movement_manager.h"
 #include "detail_path_manager.h"
 #include "Inventory.h"
-#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12)
-#include "coop/coop_objects.h" // Anomaly Coop: script cycles of world physic objects (levers)
+#include "coop/coop_callgate.h"
+#include "coop/coop_objects.h" // coop: script cycles of world physic objects (levers)
 #include "InventoryOwner.h"
 #include "CharacterPhysicsSupport.h"
 
@@ -150,7 +150,7 @@ void CScriptGameObject::set_item(MonsterSpace::EObjectAction object_action, CScr
 
 void CScriptGameObject::play_cycle(LPCSTR anim, bool mix_in)
 {
-	if (coop::objects::script_cycle_blocked(&object())) // Anomaly Coop: a client's copy of a lever shows the host's cycle
+	if (coop::objects::script_cycle_blocked(&object())) // coop: a client's copy of a lever shows the host's cycle
 		return;
 	IKinematicsAnimated* sa = smart_cast<IKinematicsAnimated*>(object().Visual());
 	if (sa)
@@ -159,7 +159,7 @@ void CScriptGameObject::play_cycle(LPCSTR anim, bool mix_in)
 		if (m)
 		{
 			sa->PlayCycle(m, (BOOL)mix_in);
-			coop::objects::on_script_cycle(&object(), anim, mix_in); // Anomaly Coop: the host's cycle goes to the players
+			coop::objects::on_script_cycle(&object(), anim, mix_in); // coop: the host's cycle goes to the players
 		}
 		else
 		{
@@ -399,7 +399,7 @@ void CScriptGameObject::SetActorPosition(Fvector pos, bool bskip_collision_corre
 
 void CScriptGameObject::SetNpcPosition(Fvector pos)
 {
-	coop::callgate::Args coop_args; // Anomaly Coop (F2 T12 gate): the host moves another's NPC; a NaN never moves one
+	coop::callgate::Args coop_args; // coop: the host moves another's NPC; a NaN never moves one
 	coop_args.pos = &pos;
 	if (coop::callgate::client_gate("game_object:set_npc_position", &object(), coop_args) == coop::calls::Gate::Refuse)
 		return;

@@ -9,11 +9,13 @@
 #include "coop_world.h"
 #include "coop_events.h"
 #include "coop_sync.h"
-#include "coop_debug.h" // protocol 29: the gate of coop.dbg.* requests
+#include "coop_debug.h" // the gate of coop.dbg.* requests
 #include "xrCoop/coop_limits.h"
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_syncnet.h"
 #include "xrCoop/coop_lua_fn.h" // kept Lua functions in a table of their own (luabind shares the registry's slots)
+#include "xrCoop/coop_lua_errors.h" // lua_errors::line_allowed: the log budget
+#include "coop_lua.h" // lua_api: the registrar, the argument readers
 
 #include "ai_space.h"
 #include "script_engine.h"
@@ -100,7 +102,7 @@ struct Call
 // Host: a request waiting for the host's Lua.
 struct HostCall
 {
-	PeerId from = kHostPeer; // the player who asked (F3a T7: kHostPeer is the host player, over the internal channel)
+	PeerId from = kHostPeer; // the player who asked (kHostPeer is the host player, over the internal channel)
 	u32 id = 0;
 	std::string name;
 	Value args;
@@ -123,7 +125,7 @@ struct Stats
 	u64 host_requests = 0, no_handler = 0, rate_limited = 0, busy = 0, not_in_world = 0, bad_requests = 0;
 	u64 handler_errors = 0, bad_results = 0, results_out = 0; // host
 	u64 client_sets = 0, client_sets_not_in_world = 0; // host: changes of clients taken
-	u64 client_refused = 0, host_keys_refused = 0; // host: client changes refused (fix 1: of them the host's keys)
+	u64 client_refused = 0, host_keys_refused = 0; // host: client changes refused (of them the host's keys)
 	u64 casts = 0, cast_machines = 0, casts_in = 0, effects = 0; // broadcast
 	u64 calls = 0, lua_errors = 0, calls_dropped = 0, calls_stale = 0;
 	u64 bad_messages = 0;
@@ -139,7 +141,7 @@ sn::Requests<Waiting> g_requests; // client: requests in flight
 limits::Pacer g_pacer; // client
 std::deque<Out> g_out;
 std::deque<Out> g_level_out; // a map server: casts for the players of its level; g_out is what it says to the world
-std::deque<Writer> g_player_out; // F3a T7, host: the host player's SyncRequests for his world server (sent by frame())
+std::deque<Writer> g_player_out; // host: the host player's SyncRequests for his world server (sent by frame())
 std::deque<Call> g_calls;
 std::deque<HostCall> g_host_calls;
 std::vector<Watch> g_watches;
@@ -150,12 +152,12 @@ std::string g_own_digest;
 u32 g_lua_gen = 0; // register_lua calls: a reference of another generation belongs to a closed Lua state
 bool g_resync = false; // host: import replaced the store: every client gets a new full copy
 bool g_was_live = false; // client: in the world at the last frame
-u32 g_join_saves = 0; // fix 1: SavingForJoin guards alive (the host writes a join save)
+u32 g_join_saves = 0; // SavingForJoin guards alive (the host writes a join save)
 Stats g_stats;
 
-bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+constexpr u64 kLogBurst = 10; // the log budget of each counted kind of line (lua_errors::line_allowed)
 
-// Calls of kept Lua functions that did not run, by why (luafn::Fail): each kind logged by log_allowed of its own count.
+// Calls of kept Lua functions that did not run, by why (luafn::Fail): each kind logged by the budget of its own count.
 u64 g_not_called[luafn::kFailKinds] = {};
 
 // --- roles and players ----------------------------------------------------------------------------
@@ -253,7 +255,7 @@ PeerId player_peer_of(const ScopeId& s)
 	return kInvalidPeer;
 }
 
-// Host: a client that is in the world (not loading it). F3a T7: the host player (peer 0, over the internal channel)
+// Host: a client that is in the world (not loading it). The host player (peer 0, over the internal channel)
 // while the host's level and actor are up.
 bool in_world(PeerId peer)
 {
@@ -278,7 +280,7 @@ bool position_of(u16 id, Fvector& out)
 			out = o->Position();
 			return true;
 		}
-	if (CSE_Abstract* e = events::find_entity(root))
+	if (CSE_Abstract* e = world::server_entity(root))
 	{
 		out = e->o_Position;
 		return true;
@@ -296,7 +298,7 @@ bool within(PeerId peer, u16 id, float dist)
 bool owns(PeerId peer, u16 item)
 {
 	const u16 who = character_of(peer);
-	return who != kNone && item != kNone && events::find_entity(item) && events::root_of(item) == who;
+	return who != kNone && item != kNone && world::server_entity(item) && events::root_of(item) == who;
 }
 
 bool is_container(CSE_Abstract* e)
@@ -308,8 +310,8 @@ bool is_container(CSE_Abstract* e)
 
 bool in_container(PeerId peer, u16 item, u16 box)
 {
-	CSE_Abstract* e = item == kNone ? nullptr : events::find_entity(item);
-	CSE_Abstract* b = box == kNone ? nullptr : events::find_entity(box);
+	CSE_Abstract* e = item == kNone ? nullptr : world::server_entity(item);
+	CSE_Abstract* b = box == kNone ? nullptr : world::server_entity(box);
 	return e && b && e->ID_Parent == box && is_container(b) && within(peer, box, kContainerReach);
 }
 
@@ -319,7 +321,7 @@ bool held_by(u32 id, PeerId peer)
 	if (id >= kNone)
 		return false;
 	const u16 proxy = join::proxy_of_peer(peer);
-	return proxy != kNone && events::find_entity(u16(id)) && events::root_of(u16(id)) == proxy;
+	return proxy != kNone && world::server_entity(u16(id)) && events::root_of(u16(id)) == proxy;
 }
 
 // The player scope of a character (host numbering): by the key on its custom data (sn::player_scope_of); 0 is the
@@ -334,7 +336,7 @@ bool character_scope(u16 character, ScopeId& out)
 		out = ScopeId::player(own);
 		return true;
 	}
-	CSE_Abstract* e = events::find_entity(character);
+	CSE_Abstract* e = world::server_entity(character);
 	return e && e->m_ini_string.size() && sn::player_scope_of(e->m_ini_string.c_str(), out);
 }
 
@@ -400,7 +402,7 @@ const Fvector* as_vector(lua_State* L, int idx)
 		return nullptr;
 	const luabind::detail::object_rep* o = static_cast<const luabind::detail::object_rep*>(lua_touserdata(L, idx));
 	const luabind::detail::class_rep* c = o ? o->crep() : nullptr;
-	// Fix 1 (review M6): the C++ class Fvector itself, not a class that is only named "vector" (a Lua class could be).
+	// The C++ class Fvector itself, not a class that is only named "vector" (a Lua class could be).
 	if (!c || c->get_class_type() != luabind::detail::class_rep::cpp_class ||
 	    !(LUABIND_TYPE_INFO_EQUAL(c->type(), LUABIND_TYPEID(Fvector))) || !o->ptr())
 		return nullptr;
@@ -485,7 +487,7 @@ bool scalar(lua_State* L, int idx, Value& out, size_t& size, bool copy, std::str
 {
 	switch (lua_type(L, idx))
 	{
-	case LUA_TNONE: // fix 1 (review I2): a value left out, coop.sync.request("x") / set(scope, key): nil, as in Lua
+	case LUA_TNONE: // a value left out, coop.sync.request("x") / set(scope, key): nil, as in Lua
 	case LUA_TNIL:
 		out = Value();
 		size += 1;
@@ -600,35 +602,9 @@ bool to_value(lua_State* L, int idx, Value& out, std::string& why)
 
 // --- calling Lua ------------------------------------------------------------------------------------
 
-int traceback(lua_State* L)
-{
-	const char* msg = lua_tostring(L, 1);
-	if (!msg)
-		msg = "(error object is not a string)";
-	lua_pushstring(L, "debug");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_getfield(L, -1, "traceback");
-	if (!lua_isfunction(L, -1))
-	{
-		lua_pop(L, 2);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_pushstring(L, msg);
-	lua_pushinteger(L, 2);
-	lua_call(L, 2, 1);
-	return 1;
-}
-
 lua_State* lua() { return ai().script_engine().lua(); }
 
-// Lua may be called: a level with the actor; a client only once it is in the world (P6).
+// Lua may be called: a level with the actor; a client only once it is in the world.
 bool lua_ready()
 {
 	if (!g_pGameLevel || !g_actor || !lua())
@@ -644,20 +620,20 @@ template <class Push, class Read>
 bool pcall_ref(int ref, const char* what, const char* name, Push push, int nres, Read read, std::string* why = nullptr)
 {
 	std::string error;
-	const luafn::Fail f = luafn::call(lua(), ref, &traceback, push, nres, read, error);
+	const luafn::Fail f = luafn::call(lua(), ref, &luafn::traceback, push, nres, read, error);
 	if (f == luafn::Fail::None)
 		return true;
 	if (f == luafn::Fail::LuaError)
 	{
 		++g_stats.lua_errors;
-		if (log_allowed(g_stats.lua_errors))
+		if (lua_errors::line_allowed(g_stats.lua_errors, kLogBurst))
 			::Msg("! [coop] lua error in coop.sync %s '%s' (#%llu, session continues): %s", what, name, g_stats.lua_errors,
 			    error.c_str());
 	}
 	else
 	{
 		const u64 n = ++g_not_called[size_t(f)];
-		if (log_allowed(n))
+		if (lua_errors::line_allowed(n, kLogBurst))
 			::Msg("! [coop] coop.sync %s '%s' not called (#%llu of this kind): %s", what, name, n,
 			    luafn::reason(f, error).c_str());
 	}
@@ -708,7 +684,7 @@ void queue_call(Call&& c)
 	{
 		g_calls.pop_front();
 		++g_stats.calls_dropped;
-		if (log_allowed(g_stats.calls_dropped))
+		if (lua_errors::line_allowed(g_stats.calls_dropped, kLogBurst))
 			::Msg("! [coop] coop.sync: the queue of Lua calls is full, the oldest one dropped");
 	}
 	g_calls.push_back(std::move(c));
@@ -755,7 +731,7 @@ void cast_to(PeerId peer, Writer&& w)
 	if (g_level_out.size() >= kMaxOutbox)
 	{
 		++g_stats.calls_dropped;
-		if (log_allowed(g_stats.calls_dropped))
+		if (lua_errors::line_allowed(g_stats.calls_dropped, kLogBurst))
 			::Msg("! [coop] coop.sync: the casts for the players of this level pile up, one for #%u dropped", peer);
 		return;
 	}
@@ -839,7 +815,7 @@ void answer_refused(PeerId to, u32 seq, SetResult why)
 void bad_message(PeerId from, const char* what)
 {
 	++g_stats.bad_messages;
-	if (log_allowed(g_stats.bad_messages))
+	if (lua_errors::line_allowed(g_stats.bad_messages, kLogBurst))
 		::Msg("! [coop] coop.sync: malformed %s from #%u dropped", what, from);
 }
 
@@ -857,12 +833,12 @@ void host_flush()
 		g_out.pop_front();
 		if (o.everyone)
 			net::host_broadcast(o.type, o.payload, Lane::Reliable, o.except);
-		else if (o.peer != kHostPeer || o.type == Msg::SyncResult) // F3a T7: the host player's answers over the link
+		else if (o.peer != kHostPeer || o.type == Msg::SyncResult) // the host player's answers over the link
 			net::host_send(o.peer, o.type, o.payload, Lane::Reliable);
 	}
 }
 
-// Client: what waits for the host goes out as fast as the host takes it (Ruling F2-14), once we are in the world.
+// Client: what waits for the host goes out as fast as the host takes it, once we are in the world.
 void client_flush(u64 now)
 {
 	if (!mgr().is_live_client())
@@ -880,7 +856,7 @@ void client_flush(u64 now)
 	}
 }
 
-// F3a T7: the host player's requests go to his world server over the internal channel (main thread); one not answered in
+// The host player's requests go to his world server over the internal channel (main thread); one not answered in
 // time gets false, "timeout", as a client's.
 void host_player_frame(u64 now)
 {
@@ -961,7 +937,7 @@ void host_on_set(PeerId from, Reader& r)
 	else if (m.scope.kind == ScopeId::Object)
 		owner = held_by(m.scope.arg, from);
 	++g_stats.client_sets;
-	const bool reserved = sn::host_key(m.scope, m.key); // F2 T14 fix 1 (Ruling F2-31)
+	const bool reserved = sn::host_key(m.scope, m.key);
 	const std::string key = reserved ? m.key : std::string();
 	const SetResult result = host_change(m.scope, m.key, std::move(m.value), from, owner, &m.seq);
 	if (result == SetResult::Ok || result == SetResult::Same)
@@ -970,7 +946,7 @@ void host_on_set(PeerId from, Reader& r)
 	if (reserved)
 	{
 		++g_stats.host_keys_refused; // an honest client refuses it itself (l_set): a modified one
-		if (log_allowed(g_stats.host_keys_refused))
+		if (lua_errors::line_allowed(g_stats.host_keys_refused, kLogBurst))
 			::Msg("! [coop] coop.sync: #%u wrote '%s' of his player scope, a key of the host's (coop.*): refused", from,
 			    key.c_str());
 	}
@@ -1030,7 +1006,7 @@ void on_request(PeerId from, Reader& r)
 		++g_stats.not_in_world;
 	}
 	else if (debug::refuses_request(q.name))
-		refusal = debug::kRefusedOff; // protocol 29: while the server's debug is off only coop.dbg.view passes (counted there)
+		refusal = debug::kRefusedOff; // while the server's debug is off only coop.dbg.view passes (counted there)
 	else if (g_handlers.find(q.name) == g_handlers.end())
 	{
 		refusal = "no handler"; // before the limits: a name nobody handles makes no bucket
@@ -1059,7 +1035,7 @@ void on_request(PeerId from, Reader& r)
 	g_host_calls.push_back(std::move(h));
 }
 
-// A player: the answer to his request (F3a T7: the host player's over the internal channel).
+// A player: the answer to his request (the host player's over the internal channel).
 void on_result(PeerId from, Reader& r)
 {
 	follow_role();
@@ -1271,7 +1247,7 @@ void run_host_calls()
 				ok = false;
 				result = ss::make_string("bad result: " + why);
 				++g_stats.bad_results;
-				if (log_allowed(g_stats.bad_results))
+				if (lua_errors::line_allowed(g_stats.bad_results, kLogBurst))
 					::Msg("! [coop] coop.sync handler '%s' returned a result that cannot travel: %s", h.name.c_str(),
 					    why.c_str());
 			}
@@ -1286,7 +1262,7 @@ void run_host_calls()
 			queue_call(std::move(c));
 		}
 		else
-			send_result(h.from, h.id, ok, std::move(result)); // F3a T7: the host player's over the link
+			send_result(h.from, h.id, ok, std::move(result)); // the host player's over the link
 	}
 }
 
@@ -1340,19 +1316,6 @@ bool arg_prefix(lua_State* L, int idx, std::string& out)
 
 bool arg_name(lua_State* L, int idx, std::string& out) { return arg_text(L, idx, out, sn::kMaxName) && sn::name_ok(out); }
 
-bool arg_number(lua_State* L, int idx, double& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	out = double(lua_tonumber(L, idx));
-	return std::isfinite(out);
-}
-
-bool arg_whole(lua_State* L, int idx, double lo, double hi, double& out)
-{
-	return arg_number(L, idx, out) && out == std::floor(out) && out >= lo && out <= hi;
-}
-
 // The Lua function at idx kept (coop_lua_fn.h: a table of its own, not the registry luabind shares); LUA_NOREF for nil.
 bool arg_function(lua_State* L, int idx, int& ref)
 {
@@ -1389,7 +1352,7 @@ int l_set(lua_State* L)
 	}
 	if (!client())
 	{
-		if (scope.kind == ScopeId::Object && !events::find_entity(u16(scope.arg)))
+		if (scope.kind == ScopeId::Object && !world::server_entity(u16(scope.arg)))
 			return fail(L, "no such object");
 		const SetResult r = host_change(scope, key, std::move(v), kHostPeer, false, nullptr);
 		if (r != SetResult::Ok && r != SetResult::Same)
@@ -1400,7 +1363,7 @@ int l_set(lua_State* L)
 		++g_stats.lua_sets;
 		return done(L);
 	}
-	// F2 T14 fix 1 (Ruling F2-31): keys coop.* of a player scope are the host's.
+	// Keys coop.* of a player scope are the host's.
 	if (sn::host_key(scope, key))
 	{
 		++g_stats.lua_refused;
@@ -1408,11 +1371,11 @@ int l_set(lua_State* L)
 	}
 	// Client: his own player scope, or an object he holds.
 	const bool owner = (scope.kind == ScopeId::Player) ||
-	    (scope.kind == ScopeId::Object && events::find_entity(n.id) && events::root_of(n.id) == 0);
+	    (scope.kind == ScopeId::Object && world::server_entity(n.id) && events::root_of(n.id) == 0);
 	if (!ss::may_set(scope.kind, false, owner))
 	{
 		++g_stats.lua_refused;
-		return fail(L, scope.kind == ScopeId::Object && !events::find_entity(n.id) ? "no such object" : "not allowed");
+		return fail(L, scope.kind == ScopeId::Object && !world::server_entity(n.id) ? "no such object" : "not allowed");
 	}
 	if (!g_core.view().pending(scope, key))
 	{
@@ -1572,7 +1535,7 @@ int l_request(lua_State* L)
 		return fail(L, why);
 	if (!(lua_isnoneornil(L, 3) || lua_type(L, 3) == LUA_TFUNCTION))
 		return fail(L, "bad arguments");
-	// A player asks the world server: a client over the net, F3a T7 the host player over the internal channel (sent by
+	// A player asks the world server: a client over the net, the host player over the internal channel (sent by
 	// frame()); its handler, its limits and its answer are the same. Outside a session the machine runs its own handler.
 	const bool player = client() || decides_sync_store();
 	if (player)
@@ -1641,7 +1604,7 @@ int l_broadcast(lua_State* L)
 		lua_pushstring(L, "to");
 		lua_rawget(L, 3);
 		const bool has_to = !lua_isnil(L, -1);
-		const bool to_ok = has_to && arg_whole(L, -1, 0, double(kInvalidPeer - 1), to);
+		const bool to_ok = has_to && lua_api::arg_whole(L, -1, 0, double(kInvalidPeer - 1), to);
 		lua_pop(L, 1);
 		lua_pushstring(L, "pos");
 		lua_rawget(L, 3);
@@ -1651,12 +1614,12 @@ int l_broadcast(lua_State* L)
 		lua_pop(L, 1);
 		lua_pushstring(L, "radius");
 		lua_rawget(L, 3);
-		const bool radius_ok = arg_number(L, -1, radius) && radius > 0 && radius <= kMaxRadius;
+		const bool radius_ok = lua_api::arg_number(L, -1, radius) && radius > 0 && radius <= kMaxRadius;
 		lua_pop(L, 1);
 		lua_pushstring(L, "level");
 		lua_rawget(L, 3);
 		const bool has_level = !lua_isnil(L, -1);
-		const bool level_ok = has_level && arg_whole(L, -1, 0, double(sn::kNoCastLevel - 1), named);
+		const bool level_ok = has_level && lua_api::arg_whole(L, -1, 0, double(sn::kNoCastLevel - 1), named);
 		lua_pop(L, 1);
 		if (has_level && !level_ok)
 			return fail(L, "bad target");
@@ -1776,8 +1739,8 @@ int l_on(lua_State* L)
 int l_near(lua_State* L)
 {
 	double peer = 0, id = 0, dist = 0;
-	const bool ok = arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && arg_whole(L, 2, 0, double(kNone - 1), id) &&
-	    arg_number(L, 3, dist) && dist >= 0;
+	const bool ok = lua_api::arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && lua_api::arg_whole(L, 2, 0, double(kNone - 1), id) &&
+	    lua_api::arg_number(L, 3, dist) && dist >= 0;
 	lua_pushboolean(L, ok && within(PeerId(peer), u16(id), float(dist)) ? 1 : 0);
 	return 1;
 }
@@ -1789,7 +1752,7 @@ int l_player_digest(lua_State* L)
 	follow_role();
 	double peer = 0;
 	std::string digest;
-	if (!mgr().active() || !arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) ||
+	if (!mgr().active() || !lua_api::arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) ||
 	    (PeerId(peer) != self_peer() && !in_world(PeerId(peer))) || !peer_digest(PeerId(peer), digest))
 		lua_pushnil(L);
 	else
@@ -1800,7 +1763,7 @@ int l_player_digest(lua_State* L)
 int l_owns(lua_State* L)
 {
 	double peer = 0, id = 0;
-	const bool ok = arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && arg_whole(L, 2, 0, double(kNone - 1), id);
+	const bool ok = lua_api::arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && lua_api::arg_whole(L, 2, 0, double(kNone - 1), id);
 	lua_pushboolean(L, ok && owns(PeerId(peer), u16(id)) ? 1 : 0);
 	return 1;
 }
@@ -1809,8 +1772,8 @@ int l_owns(lua_State* L)
 int l_in_container(lua_State* L)
 {
 	double peer = 0, id = 0, box = 0;
-	const bool ok = arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && arg_whole(L, 2, 0, double(kNone - 1), id) &&
-	    arg_whole(L, 3, 0, double(kNone - 1), box);
+	const bool ok = lua_api::arg_whole(L, 1, 0, double(kInvalidPeer - 1), peer) && lua_api::arg_whole(L, 2, 0, double(kNone - 1), id) &&
+	    lua_api::arg_whole(L, 3, 0, double(kNone - 1), box);
 	lua_pushboolean(L, ok && in_container(PeerId(peer), u16(id), u16(box)) ? 1 : 0);
 	return 1;
 }
@@ -1821,7 +1784,7 @@ int l_limit(lua_State* L)
 	follow_role();
 	std::string name;
 	double burst = 0, per_sec = 0;
-	if (!arg_name(L, 1, name) || !arg_whole(L, 2, 1, sn::RequestLimits::kMaxBurst, burst) || !arg_number(L, 3, per_sec))
+	if (!arg_name(L, 1, name) || !lua_api::arg_whole(L, 2, 1, sn::RequestLimits::kMaxBurst, burst) || !lua_api::arg_number(L, 3, per_sec))
 		return fail(L, "bad arguments");
 	if (client())
 		return fail(L, "host only");
@@ -1916,7 +1879,7 @@ int l_import(lua_State* L)
 	lua_pushstring(L, "format");
 	lua_rawget(L, 1);
 	double format = 0;
-	const bool format_ok = arg_number(L, -1, format) && format == double(kExportFormat);
+	const bool format_ok = lua_api::arg_number(L, -1, format) && format == double(kExportFormat);
 	lua_pop(L, 1);
 	lua_pushstring(L, "data");
 	lua_rawget(L, 1);
@@ -1942,7 +1905,7 @@ int l_import(lua_State* L)
 	return done(L);
 }
 
-// coop.saving_for_join() -> bool (F2 T14 fix 1, review I1)
+// coop.saving_for_join() -> bool
 int l_saving_for_join(lua_State* L)
 {
 	lua_pushboolean(L, g_join_saves != 0 ? 1 : 0);
@@ -2191,23 +2154,12 @@ void register_lua(lua_State* L)
 		{"import", &l_import},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_createtable(L, 0, int(sizeof(fns) / sizeof(fns[0])));
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_setfield(L, -2, "sync");
-	lua_pushcfunction(L, &l_saving_for_join); // fix 1: coop.saving_for_join() (scripts\coop_sync.script)
-	lua_setfield(L, -2, "saving_for_join");
-	lua_pop(L, 1);
+	static const luaL_Reg own[] = {
+		{"saving_for_join", &l_saving_for_join}, // scripts\coop_sync.script
+		{nullptr, nullptr},
+	};
+	if (lua_api::fill(L, "sync", fns)) // coop_script logs a missing coop
+		lua_api::fill(L, nullptr, own);
 }
 
 std::optional<std::string> player_get(u16 character, std::string_view key)

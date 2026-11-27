@@ -11,7 +11,7 @@
 #include "ai_monster_squad_manager.h"
 #include "../../Actor.h"
 #include "../../actor_memory.h"
-#include "../../coop/coop_ai.h" // Anomaly Coop: players_near, player_sees_now
+#include "../../coop/coop_ai.h" // coop: players_near, player_sees_now
 
 CMonsterEnemyMemory::CMonsterEnemyMemory()
 {
@@ -62,7 +62,7 @@ void CMonsterEnemyMemory::update()
 		}
 	}
 
-	// Anomaly Coop (audit A6, 2026-10-24): the stock remembers a dangerous sound only while the host's actor looks at the
+	// coop: the stock remembers a dangerous sound only while the host's actor looks at the
 	// monster; any player who makes the sound and sees it counts (a client's shots woke nothing far from the host).
 	CEntityAlive* const sound_who =
 	    monster->SoundMemory.IsRememberSound() ? smart_cast<CEntityAlive*>(monster->SoundMemory.GetSound().who) : nullptr;
@@ -112,7 +112,7 @@ void CMonsterEnemyMemory::update()
 	}
 
 	float const feel_enemy_max_distance = monster->get_feel_enemy_max_distance();
-	// Anomaly Coop (audit A6): every player who walks up to the monster and sees it, not only the host's actor.
+	// coop: every player who walks up to the monster and sees it, not only the host's actor.
 	CEntityAlive* near_players[coop::npc_ai::kMaxNearPlayers];
 	const u32 near_count = coop::npc_ai::players_near(monster->Position(), feel_enemy_max_distance + 10.f, near_players);
 	for (u32 i = 0; i < near_count; ++i)

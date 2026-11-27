@@ -18,7 +18,9 @@
 #include "coop_autosave.h"
 #include "coop_worldstate.h"
 #include "coop_alife.h" // alife_rw: the clock is changed through mutable ALife
-#include "xrCoop/coop_limits.h" // limits::Pacer (Ruling F2-14)
+#include "xrCoop/coop_limits.h" // limits::Pacer
+#include "xrCoop/coop_lua_errors.h" // lua_errors::line_allowed
+#include "coop_lua.h"
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -45,7 +47,6 @@ namespace
 {
 using checkpoints::sources::Place;
 
-constexpr u16 kNoId = 0xffff;
 constexpr u64 kTickMs = 500; // the host looks at the players present (plan F3 Task 11, step 3)
 constexpr u64 kRefreshMs = 5000; // RestState goes out at least this often (step 4)
 constexpr size_t kMaxWorldReason = 64; // set_world_block: a short reason ("emission"), only logged
@@ -55,14 +56,14 @@ constexpr const char* kSkippedCallback = "coop_rest_skipped"; // the world serve
 constexpr const char* kRefusedCallback = "coop_rest_refused";
 constexpr size_t kRefusals = size_t(Refusal::Camp) + 1;
 
-bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+constexpr u64 kLogBurst = 10; // a repeating line of this module: the first ones in full, then one in a hundred
 
 // This machine's own word (lie down / get up). Lua may call coop.rest from anywhere, so the word is only recorded
-// here; frame() sends it to the world server (F3a T7: the host player's over the internal channel). The newest word
+// here. frame() sends it to the world server, over the internal channel for the host player. The newest word
 // wins: a lie-down and a get-up before the next frame (or before the pacer lets one out) are a get-up. A word of an
 // older world is dropped.
-// F3a T7 R1: the word is written first and g_pending_on says it is there after it (release / acquire): say() may run on
-// the game thread, player_frame on the main thread.
+// say() writes the word before publishing g_pending_on (release / acquire) because say() may run on the game thread
+// and player_frame runs on the main thread.
 struct Pending
 {
 	Request rq;
@@ -124,14 +125,6 @@ struct Stats
 Stats g_stat;
 
 // ---------------------------------------------------------------- helpers
-
-CGameObject* object_here(u16 id)
-{
-	if (!g_pGameLevel || id == kNoId)
-		return nullptr;
-	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return o && !o->getDestroy() ? o : nullptr;
-}
 
 // This machine is in its world: the level and its actor are up (Lua callbacks go out only then).
 bool in_world() { return g_pGameLevel && g_actor; }
@@ -224,8 +217,8 @@ void host_send_state(u64 now, bool force)
 	++g_stat.sent;
 }
 
-// The player of `character` learns why in his copy of RestState (F3a T7: the host player too, over the internal channel;
-// his Lua hears it from his copy at the next pump, the changes first, as on a client: M4).
+// The player of `character` gets the reason in his copy of RestState, over the internal channel for the host player.
+// His Lua gets the state changes first and the reason from his copy at the next pump.
 void tell_owner(u16 character, Refusal why)
 {
 	const PeerId peer = survival::peer_of_character(character);
@@ -244,7 +237,7 @@ void refuse(u16 character, Refusal why)
 	const bool ended = g_host.group.on_refused(character);
 	u64& n = g_stat.refused[size_t(why)];
 	++n;
-	if (log_allowed(n))
+	if (lua_errors::line_allowed(n, kLogBurst))
 		::Msg("[coop] rest: character %u may not lie down (%s)%s", character, refusal_name(why),
 		    ended ? ", his earlier rest ends" : "");
 	tell_owner(character, why);
@@ -259,13 +252,13 @@ void host_request(u16 character, const Request& rq)
 		if (g_host.group.get_up(character))
 		{
 			++g_stat.get_ups;
-			if (log_allowed(g_stat.get_ups))
+			if (lua_errors::line_allowed(g_stat.get_ups, kLogBurst))
 				::Msg("[coop] rest: character %u got up", character);
 		}
 		return;
 	}
 	++g_stat.lie_downs;
-	CGameObject* obj = host_world_ready() ? object_here(character) : nullptr;
+	CGameObject* obj = host_world_ready() ? world::object_here(character) : nullptr;
 	levels::BodyFacts there; // a player on a map server's level: his body is no object here, its authority says what it sees
 	const bool elsewhere = !obj && host_world_ready() && mode().facts_of(character, there);
 	if (!obj && !elsewhere)
@@ -312,7 +305,7 @@ void host_request(u16 character, const Request& rq)
 		++g_stat.camps;
 	}
 	g_host.group.lie_down(character, int(rq.hours), rq.forced, fight, bag); // may_lie_down said it takes him
-	if (log_allowed(g_stat.lie_downs))
+	if (lua_errors::line_allowed(g_stat.lie_downs, kLogBurst))
 		::Msg("[coop] rest: character %u rests %u h (%s%s%s)", character, u32(g_host.group.hours_of(character)),
 		    rq.forced ? "passed out" : checkpoints::sources::place_name(place), fight ? ", in a fight" : "",
 		    bag != kNoBag ? ", on a sleeping bag" : "");
@@ -350,7 +343,7 @@ void start_sleep(u64 now, u8 hours)
 		if (e.state != State::Sleeping)
 			continue;
 		++sleepers;
-		const PeerId peer = survival::peer_of_character(e.character); // F3a T7: the host player's over the link
+		const PeerId peer = survival::peer_of_character(e.character); // the host player receives RestSleep over the internal channel
 		if (peer != kInvalidPeer)
 			net::host_send(peer, Msg::RestSleep, w);
 	}
@@ -377,7 +370,7 @@ void host_tick(u64 now)
 		const survival::Life life = survival::life_of(c);
 		if (life == survival::Life::Spectating)
 			continue; // out of a hardcore run: not one of the group (rest::decide)
-		const CGameObject* obj = object_here(c);
+		const CGameObject* obj = world::object_here(c);
 		levels::BodyFacts there;
 		const bool elsewhere = !obj && mode().facts_of(c, there); // on a map server's level he is one of the group all the same
 		if (!obj && !elsewhere)
@@ -392,7 +385,7 @@ void host_tick(u64 now)
 	// once per sleep, not on every tick): one who walked away from his camp loses his rest ("place").
 	const Group::PlaceCheck at_place = [](uint16_t id) {
 		levels::BodyFacts there;
-		if (!object_here(id) && mode().facts_of(id, there))
+		if (!world::object_here(id) && mode().facts_of(id, there))
 			return Place(there.place) != Place::None;
 		u16 source = checkpoint::kNoSource;
 		return checkpoints::sources::rest_place(id, source) != Place::None;
@@ -403,13 +396,13 @@ void host_tick(u64 now)
 		if (c.reason == Refusal::None)
 		{
 			++g_stat.left;
-			if (log_allowed(g_stat.left))
+			if (lua_errors::line_allowed(g_stat.left, kLogBurst))
 				::Msg("[coop] rest: character %u is not in the world any more, his rest ends", c.id);
 			continue;
 		}
 		u64& n = g_stat.cancelled[size_t(c.reason)];
 		++n;
-		if (log_allowed(n))
+		if (lua_errors::line_allowed(n, kLogBurst))
 			::Msg("[coop] rest: the rest of character %u ends (%s)", c.id, refusal_name(c.reason));
 		tell_owner(c.id, c.reason);
 	}
@@ -422,8 +415,8 @@ void host_tick(u64 now)
 		start_sleep(now, t.hours);
 }
 
-// The world server's book. F3a T7: the host player's word is no longer taken here: it comes as his RestRequest over the
-// internal channel (player_frame), and his Lua hears the book from his copy of RestState (client_on_state).
+// The world server's book. The host player sends RestRequest over the internal channel (player_frame), and his Lua
+// hears the book from his copy of RestState (client_on_state).
 void host_frame()
 {
 	host_sync_world();
@@ -438,7 +431,7 @@ void host_frame()
 	host_send_state(now, false);
 }
 
-// A player's lie-down or get-up (F3a T7: the host player's from peer 0 over the internal channel).
+// A player's lie-down or get-up. The host player sends it from peer 0 over the internal channel.
 void host_on_request(PeerId from, Reader& rd)
 {
 	if (!mode().decides_world())
@@ -447,7 +440,7 @@ void host_on_request(PeerId from, Reader& rd)
 	if (!read_request(rd, rq))
 	{
 		++g_stat.malformed;
-		if (log_allowed(g_stat.malformed))
+		if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 			::Msg("! [coop] rest: malformed RestRequest from #%u ignored", from);
 		return;
 	}
@@ -455,14 +448,14 @@ void host_on_request(PeerId from, Reader& rd)
 	if (character == kNoId || !survival::player_in_world(character))
 	{
 		++g_stat.not_in_world;
-		if (log_allowed(g_stat.not_in_world))
+		if (lua_errors::line_allowed(g_stat.not_in_world, kLogBurst))
 			::Msg("[coop] rest: RestRequest from #%u without a character in the world ignored", from);
 		return;
 	}
 	host_request(character, rq);
 }
 
-// ---------------------------------------------------------------- a player (a client, and the host player: F3a T7)
+// ---------------------------------------------------------------- a player (a client or the host player)
 
 // The mirror belongs to one world: a newly loaded world starts with everybody awake (the host's next RestState fills
 // it), and a word said in the old one is dropped.
@@ -494,7 +487,7 @@ void client_on_state(PeerId from, Reader& rd)
 	if (!read_state(rd, m))
 	{
 		++g_stat.malformed;
-		if (log_allowed(g_stat.malformed))
+		if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 			::Msg("! [coop] rest: malformed RestState from the host ignored");
 		return;
 	}
@@ -519,7 +512,7 @@ void client_on_sleep(PeerId from, Reader& rd)
 	if (!read_sleep(rd, hours))
 	{
 		++g_stat.malformed;
-		if (log_allowed(g_stat.malformed))
+		if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 			::Msg("! [coop] rest: malformed RestSleep from the host ignored");
 		return;
 	}
@@ -528,7 +521,7 @@ void client_on_sleep(PeerId from, Reader& rd)
 	{
 		// The RestState that put me to sleep comes first on the same lane: without it this is not my sleep.
 		++g_stat.sleeps_ignored;
-		if (log_allowed(g_stat.sleeps_ignored))
+		if (lua_errors::line_allowed(g_stat.sleeps_ignored, kLogBurst))
 			::Msg("! [coop] rest: RestSleep %u h while I do not sleep, ignored", u32(hours));
 		return;
 	}
@@ -536,8 +529,8 @@ void client_on_sleep(PeerId from, Reader& rd)
 	script::queue_callback(kSleepCallback, {script::cb_int(hours)});
 }
 
-// This machine's player: his word goes to the world server (F3a T7: the host player's over the internal channel, at the
-// pace a client keeps), his Lua hears his copy of the book.
+// This machine's player sends his word to the world server at the client pace, over the internal channel for the host
+// player. His Lua hears his copy of the book.
 bool player_live() { return mode().decides_world() || mgr().is_live_client(); }
 
 void player_frame()
@@ -614,18 +607,6 @@ bool set_world_block(const char* reason)
 
 // ---------------------------------------------------------------- Lua
 
-// A character id from argument `idx`: a whole number 0..0xfffe.
-bool arg_id(lua_State* L, int idx, u16& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v) || v < 0.0 || v >= double(kNoId) || v != std::floor(v))
-		return false;
-	out = u16(v);
-	return true;
-}
-
 // coop.rest.lie_down(hours [, forced [, bag]]) -> bool; bag: the local id of the sleeping bag he lies on (protocol 14)
 int l_lie_down(lua_State* L)
 {
@@ -658,7 +639,7 @@ int l_get_up(lua_State* L)
 int l_state_of(lua_State* L)
 {
 	u16 id = 0;
-	lua_pushstring(L, state_name(arg_id(L, 1, id) ? state_of(id) : State::Awake));
+	lua_pushstring(L, state_name(lua_api::arg_object_id(L, 1, id) ? state_of(id) : State::Awake));
 	return 1;
 }
 
@@ -666,7 +647,7 @@ int l_state_of(lua_State* L)
 int l_hours_of(lua_State* L)
 {
 	u16 id = 0;
-	lua_pushnumber(L, lua_Number(arg_id(L, 1, id) ? hours_of(id) : 0));
+	lua_pushnumber(L, lua_Number(lua_api::arg_object_id(L, 1, id) ? hours_of(id) : 0));
 	return 1;
 }
 
@@ -756,6 +737,7 @@ void reset()
 
 void frame()
 {
+	PROF_EVENT("coop/coop_rest/frame");
 	if (mode().decides_world())
 		host_frame();
 	if (is_player())
@@ -806,7 +788,7 @@ void print_status()
 
 void register_console() { CMD1(CCC_CoopRestStatus, "coop_rest_status"); }
 
-// Fills coop.rest (made here: the table is ours).
+// Fills coop.rest (made here once per Lua state: the table is ours).
 void register_lua(lua_State* L)
 {
 	static const luaL_Reg fns[] = {
@@ -819,21 +801,7 @@ void register_lua(lua_State* L)
 		{"set_world_block", &l_set_world_block},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // the registrator logs it
-	}
-	lua_newtable(L);
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_setfield(L, -2, "rest"); // coop.rest = { ... }
-	lua_pop(L, 1); // coop
+	lua_api::fill(L, "rest", fns); // no table coop: the registrator logs it
 }
 
 // ---------------------------------------------------------------- public
@@ -880,7 +848,7 @@ void host_cancel(u16 character, const char* reason)
 	const Refusal why = refusal_from_name(reason);
 	u64& n = g_stat.cancelled[size_t(why)];
 	++n;
-	if (log_allowed(n))
+	if (lua_errors::line_allowed(n, kLogBurst))
 		::Msg("[coop] rest: the rest of character %u ends (%s, host_cancel '%.32s')", character, refusal_name(why),
 		    reason ? reason : "");
 	tell_owner(character, why);

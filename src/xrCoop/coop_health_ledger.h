@@ -1,7 +1,6 @@
-// Anomaly Coop — the health ledger of this machine's own actor (a diagnostic: it only logs). Live 2026-11-09 (G.A.M.M.A., 6
-// players): after a reconnect a client's health fell at a steady 0.018/s for 2.5 min, through two revives, until he died;
-// the host sent him no hit, bleeding, radiation, psy and thirst were normal, and no log said who lowered it. In G.A.M.M.A.
-// some 19 scripts write the actor's health themselves (game_object:set_health_ex / change_health / health = v), and the
+// Anomaly Coop — the health ledger of this machine's own actor (a diagnostic: it only logs). A player's health can fall
+// steadily with no hit from the host and nothing in the log saying who lowers it: in a modded game many scripts write the
+// actor's health themselves (game_object:set_health_ex / change_health / health = v), and the
 // engine's own condition update changes it too.
 //
 // Each machine (host, client, any role with a real actor) keeps a ledger of its own actor over kWindowMs windows. A window
@@ -79,7 +78,7 @@ inline std::string num(float v, int decimals = 3)
 	return s;
 }
 
-// Build 51 live: a client lost 0.017-0.018 every 15 s for minutes and no line came (each window under kReportDrop). A window
+// A client lost 0.017-0.018 every 15 s for minutes and no line came (each window under kReportDrop). A window
 // with a drop of kSlowFloor or more but under kReportDrop is part of a slow drain; kSlowRun such windows in a row write one
 // "slow drain:" line with the breakdown summed over the run, then again after twice as many windows, four times as many
 // ... while it goes on (windows 4, 12, 28, 60, ...: hunger alone is a drain for hours). A rise, a window under kSlowFloor

@@ -1,6 +1,6 @@
-// Anomaly Coop: "viewers" of the host's scheduler (owner, live test of build 10, 2026-10-24).
+// Anomaly Coop: "viewers" of the host's scheduler.
 //
-// The bug: "far from the host A-Life lives wrongly: when a client walks up to somebody, they walk slowly". The host
+// Far from the host A-Life must not live wrongly (a client walks up to somebody and they walk slowly). The host
 // simulates the whole world and a client only mirrors it, but the engine decides how often an object is updated by its
 // distance to ONE point, the host's camera:
 //   - CObject::shedule_Scale() = distance to the camera / 200; the scheduler turns the scale into the time between two
@@ -33,14 +33,13 @@ struct Point
 	float x, y, z;
 };
 
-constexpr unsigned kMaxViewers = 16; // the clients: 7 of a co-op host, 16 of a server (kMaxPlayers, F5-SEAT-1); the host's camera is not in the list
+constexpr unsigned kMaxViewers = 16; // the clients: 7 of a co-op host, 16 of a server (kMaxPlayers); the host's camera is not in the list
 constexpr float kScaleDistance = 200.f; // CObject::shedule_Scale: distance / 200
 constexpr float kDefaultRange = 100.f; // m: a viewer matters for objects this close to it (console coop_viewer_range)
 constexpr float kMaxRange = 300.f;
 constexpr float kDefaultFrameRadius = 60.f; // m: NPCs this close are updated every frame (CROW_RADIUS2: the camera's circle)
 constexpr float kMaxFrameRadius = 150.f; // the engine's online radius (alife switch_distance) is 150 m
 constexpr unsigned kFreshMs = 1000; // the list is rewritten every frame; older than this it is not used
-constexpr unsigned kMovementStepCapMs = 100; // CCustomMonster::UpdateCL: one movement step is at most this long
 
 inline float distance_sqr(const Point& a, const Point& b)
 {

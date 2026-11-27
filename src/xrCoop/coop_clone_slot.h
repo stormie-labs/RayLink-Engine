@@ -1,5 +1,5 @@
 // Anomaly Coop — the slot a client's clone of its weapon takes (scope, upgrade kit, detach: alife_clone_weapon).
-// Live report 2026-11-08 (stable 41.6, G.A.M.M.A.): a client fitted a scope to the SR-3M in his slot and the new weapon
+// A client fitted a scope to the SR-3M in his slot and the new weapon
 // went into the backpack. Stock _g.alife_clone_weapon releases the old weapon before it registers the clone, so in single
 // player the clone finds the slot free and takes it (and the hands, when they held the old one). On a client the clone is
 // made at once under a leased id while the old weapon's release goes with it to the host (coop_requests.cpp
@@ -13,11 +13,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "coop_ids.h"
+
 namespace coop
 {
 namespace cloneslot
 {
-constexpr std::uint16_t kNone = 0xFFFF;
+constexpr std::uint16_t kNone = kNoId;
 constexpr std::uint64_t kKeepMs = 60000; // a refused, removed clone leaves this long to restore its source
 
 class Book

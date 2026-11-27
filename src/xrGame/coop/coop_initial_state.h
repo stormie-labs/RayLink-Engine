@@ -1,5 +1,5 @@
-// Anomaly Coop - TZ R32 W8.4 (temp/r30/design/R32-final.md §1 W8.4, §8): the initial state of an item rides its create. Core: no mode
-// check here; whether this process is the item's decider or its owner is asked of the item engine (coop_items.h item_versions).
+// Anomaly Coop - the initial state of an item rides its create. Core: no mode check here; whether this process is the item's
+// decider or its owner is asked of the item engine (coop_items.h item_versions).
 // The wire layout and the stock client_data are pure rules (xrCoop/coop_initial_rules.h).
 //
 // write_initial: the uses, the condition, the ammo count and the decider's field versions of item `e` as this process has them (the
@@ -7,9 +7,9 @@
 // read_initial: the same into the entity `e` of a create that has no game object yet: the condition and the ammo count into the
 // entity, the uses into its client_data (the object that comes online reads them as a stock save), or, for a scripted section with no
 // client_data yet (its binder's bytes cannot be made here), staged for its next game object here (coop_items.h stage_uses), the
-// versions into the item engine (§8a A12: they travel with the item). Uses only for an eatable section (is_eatable_section), never
+// versions into the item engine (they travel with the item). Uses only for an eatable section (is_eatable_section), never
 // read from or written into another item's client_data. False: a malformed tail (nothing applied).
-// Wired (R32 WP5): EntitySpawn's tail carries it after the clone's replacement state. coop_entities.cpp write_spawn (the world's
+// Wired: EntitySpawn's tail carries it after the clone's replacement state. coop_entities.cpp write_spawn (the world's
 // spawns and repairs) and write_entity (a map server's journal Spawn) write it; client_on_spawn reads it whole, applies it to a new
 // entity before register_object, and to a known one only where this process is not its writer and has no game object for it
 // (reconcile::repeat_takes_state: a repeat leaves the writer's own state alone, and a game object's state stands, so its versions are

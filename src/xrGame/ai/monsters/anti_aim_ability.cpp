@@ -7,8 +7,8 @@
 #include "control_animation_base.h"
 #include "../../Inventory.h"
 #include "../../Weapon.h"
-#include "../../coop/coop_ai.h" // Anomaly Coop (audit A5): players, their view
-#include "../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5): the effect on a remote player's machine
+#include "../../coop/coop_ai.h" // coop: players, their view
+#include "../../coop/coop_monster_fx.h" // coop: the effect on a remote player's machine
 
 namespace detail
 {
@@ -173,7 +173,7 @@ void anti_aim_ability::start_camera_effector()
 	CEntityAlive const* who = aim_target();
 	if (who && who != Actor())
 	{
-		// Anomaly Coop (audit A5): a remote player aims at us - his machine shakes his aim and takes the blow
+		// coop: a remote player aims at us - his machine shakes his aim and takes the blow
 		m_effector_id = Actor() ? Actor()->Cameras().RequestCamEffectorId() : 1; // "started"; nothing to remove here
 		m_camera_effector_end_tick = m_animation_end_tick;
 		coop::monster_fx::host_send(who, m_object, coop::monster_fx::kAntiAim, u8(index), 0.f);
@@ -267,7 +267,7 @@ float anti_aim_ability::calculate_angle() const
 {
 	float const opposite_angle_return_value = M_PI;
 
-	CEntityAlive const* who = aim_target(); // Anomaly Coop (audit A5): the actor or a remote player's character
+	CEntityAlive const* who = aim_target(); // coop: the actor or a remote player's character
 	if (!who || !m_object->EnemyMan.see_enemy_now(who))
 	{
 		return opposite_angle_return_value;
@@ -312,7 +312,7 @@ bool anti_aim_ability::check_update_condition() const
 	if (!m_object->g_Alive())
 		return false;
 
-	// Anomaly Coop (audit A5): the enemy is a player - this machine's actor or a remote player's character
+	// coop: the enemy is a player - this machine's actor or a remote player's character
 	CEntityAlive const* who = aim_target();
 	if (!who || !who->g_Alive())
 		return false;

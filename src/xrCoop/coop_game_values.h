@@ -28,9 +28,8 @@ namespace game
 // limits, the sounds, coop_max_map_servers and coop_mapserver_linger of the host's PC) is the machine's own and stays out
 // of a game. coop_death_share is registered by the death build, coop_npc_finish_downed (stalkers finish a downed player, on
 // by default) by the AI; a command the console does not know is refused by CvarLayer::apply, so the list may run ahead of
-// the console. Owner 2026-11-18: no hybrid, so "split levels", "story maps together" and "the world as a process of its
-// own" are no rules any more. Their keys stay in the records of old worlds (tools/persisted_keys.txt): they are refused
-// (NotAllowed), never fatal.
+// the console. The keys of rules that are gone stay in the records of old worlds (tools/persisted_keys.txt): they are
+// refused (NotAllowed), never fatal.
 inline constexpr std::string_view kGameCvars[] = {
 	"coop_friendly_fire",
 	"coop_max_new_characters",
@@ -52,7 +51,7 @@ inline constexpr std::string_view kGameCvars[] = {
 	"coop_npc_finish_downed",
 };
 inline constexpr size_t kGameCvarCount = sizeof(kGameCvars) / sizeof(kGameCvars[0]);
-static_assert(kGameCvarCount == 18, "docs/GAME_SETTINGS.md §1.2: 18 game rules since build 57 (no hybrid)");
+static_assert(kGameCvarCount == 18, "docs/GAME_SETTINGS.md §1.2: 18 game rules");
 
 // The longest value of a rule: a number or a token name (the longest of them, "checkpoint", has ten characters).
 constexpr size_t kMaxCvarValue = 64;
@@ -101,7 +100,7 @@ inline bool cvar_value_valid(std::string_view value)
 }
 
 // The world's group (docs §8): a character name, 1..64 of [A-Za-z0-9_.-] (the same check the join flow makes of the
-// faction it sends: protocol 9, CharOfferMsg.faction).
+// faction it sends: CharOfferMsg.faction).
 inline bool world_faction_valid(const std::string& faction) { return coop::char_name_valid(faction); }
 
 // ---------------------------------------------------------------- the layer over the machine's console

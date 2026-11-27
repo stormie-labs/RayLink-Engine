@@ -40,7 +40,7 @@
 #include "UIPropertiesBox.h"
 #include "UIMainIngameWnd.h"
 #include "../Trade.h"
-#include "../coop/coop_trade.h" // Anomaly Coop
+#include "../coop/coop_trade.h"
 
 void CUIActorMenu::SetActor(CInventoryOwner* io)
 {
@@ -181,7 +181,7 @@ void CUIActorMenu::SendMessage(CUIWindow* pWnd, s16 msg, void* pData)
 
 void CUIActorMenu::Show(bool status)
 {
-	coop::trade::on_actor_menu_shown(*this, status); // Anomaly Coop: shared container / trader window open-close
+	coop::trade::on_actor_menu_shown(*this, status); // coop: shared container / trader window open-close
 	inherited::Show(status);
 	if (status)
 	{
@@ -209,7 +209,7 @@ void CUIActorMenu::Draw()
 
 void CUIActorMenu::Update()
 {
-	if (coop::trade::refresh_actor_menu(*this)) // Anomaly Coop: content changed elsewhere, lists rebuilt
+	if (coop::trade::refresh_actor_menu(*this)) // coop: content changed elsewhere, lists rebuilt
 		UpdateItemsPlace();
 	{
 		// all mode
@@ -281,7 +281,7 @@ void CUIActorMenu::CheckDistance()
 	{
 		if ((pActorGO->Position().distance_to(pPartnerGO->Position()) > 3.0f) &&
 			!m_pPartnerInvOwner->NeedOsoznanieMode() &&
-			!coop::trade::keeps_trade_window(m_pPartnerInvOwner)) // Anomaly Coop G6-3: a trading computer's permit
+			!coop::trade::keeps_trade_window(m_pPartnerInvOwner)) // coop: a trading computer's permit
 		{
 			g_btnHint->Discard();
 			HideDialog();

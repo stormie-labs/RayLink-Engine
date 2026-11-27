@@ -168,12 +168,9 @@ XRCORE_API extern intrusive_ptr<str_container> g_pStringContainer;
 class shared_str
 {
 private:
-	// One pointer. RayLink 2026-11-13: a second one, to the container, stood here so that the container outlived every handle. It was
-	// 8 bytes in each of about 26 million handles of a process with G.A.M.M.A. (the engine's own "shared_str objects[...]" line: about
-	// 210 MB a process, the game client and every server alike), and every copy of a string changed the container's non-atomic
-	// counter from whatever thread made the copy. The container now lives as long as the process (xrMemory.cpp _initialize keeps a
-	// reference that is never released), so a handle needs none. Strings were never removed before either (str_container::erase
-	// and str_value::on_deferred_release do nothing): what a handle means is unchanged.
+	// One pointer, no reference to the container: the container lives as long as the process (xrMemory.cpp _initialize keeps a
+	// reference that is never released), and strings are never removed (str_container::erase and str_value::on_deferred_release do
+	// nothing). A second pointer would cost 8 bytes in each of tens of millions of handles, and its counter is not atomic.
 	intrusive_ptr<str_value> p_ = nullptr;
 
 public:

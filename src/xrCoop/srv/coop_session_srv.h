@@ -1,5 +1,4 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the server's part of a session (docs/MODES.md section 4, critique H10).
+// Anomaly Coop — the server's part of a session (docs/MODES.md section 4).
 //
 // A world server's Session takes the bridges of its map servers (Hello role MapServer, a token issued here, from this PC only, no
 // player slot) and an operator (the creator's game from this PC with the token of the server's -coop_operator holds the host's
@@ -47,14 +46,14 @@ namespace coop
 namespace srv
 {
 static_assert(mapserver::kMaxBridges <= kTrunkSlots, "the session keeps a transport slot for every map server of its world");
-static_assert(sizeof(op::Token) == kHelloTokenSize && sizeof(mapserver::Token) == kHelloTokenSize, "a token travels in HelloMsg::token");
+static_assert(kTokenSize == kHelloTokenSize, "a token travels in HelloMsg::token");
 static_assert(std::is_same<op::Key, PlayerKey>::value, "the operator's token is bound to a player key");
 static_assert(mapserver::kBridgeBase >= kMaxPeerSlots, "a bridge's id is no player slot (SessionPart::Admission::id)");
 
 class ServerPart final : public SessionPart
 {
 public:
-	using Token = std::array<uint8_t, kHelloTokenSize>;
+	using Token = srv::Token;
 	using BridgeJoined = std::function<void(PeerId bridge)>;
 	using BridgeLeft = std::function<void(PeerId bridge, const std::string& reason)>;
 	using OperatorLine = std::function<void(PeerId from, const std::string& line)>;
@@ -126,7 +125,7 @@ public:
 		wipe(m_token);
 	}
 
-	// F3a: a map server of this PC, with the token issued for it, once. It takes the place of an old connection of the same number:
+	// A map server of this PC, with the token issued for it, once. It takes the place of an old connection of the same number:
 	// a new process started for it.
 	Admission admit(const std::string& address, const HelloMsg& hello) override
 	{
@@ -179,14 +178,14 @@ public:
 	// A map server is a client of the world (mapserver::bridge_takes).
 	bool trunk_takes(Msg type) const override { return mapserver::bridge_takes(type); }
 
-	// While an operator's token is set and its holder is not in, the last place is his (security review 2026-11-12).
+	// While an operator's token is set and its holder is not in, the last place is his.
 	bool holds_place(const std::string& address, const HelloMsg& hello, bool holder_in) const override
 	{
 		return configured() && !holder_in && !would_be_operator(address, hello);
 	}
 
-	// Protocol 31 (coop_operator.h, plan §2.2): does this player's Hello make him the operator? Every answer lets him in the same way;
-	// only the server's log tells the verdicts apart, and never with the token.
+	// coop_operator.h supplies the operator verdict for this player's Hello. Every verdict admits the player the same way.
+	// Only the server log distinguishes the verdicts, and it omits the token.
 	bool rights_of(const PeerInfo& player, const HelloMsg& hello) override
 	{
 		const bool presented = !op::token_none(hello.token, kHelloTokenSize);
@@ -225,9 +224,9 @@ public:
 		return false;
 	}
 
-	// Protocol 31, plan §2.3: after the rate, the sender, the length and the list (op::command_verdict). A refusal is counted and
+	// After the rate, the sender, the length and the list (op::command_verdict). A refusal is counted and
 	// logged (the first and every 100th: a player cannot fill the log), the sender is not kicked and gets no answer. What passes goes
-	// to operator_line (stage 3: dedicated::run_for), never to a console from here.
+	// to operator_line (dedicated::run_for), never to a console from here.
 	void console_line(const PeerInfo& from, bool may, const std::string& line) override
 	{
 		const op::Command v = op::command_verdict(may, line);

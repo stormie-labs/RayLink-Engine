@@ -129,7 +129,7 @@ protected:
 
 	xr_vector<CUIMessageBoxEx*> m_pMB_ErrDlgs;
 	bool ReloadUI();
-	// Anomaly Coop (2026-11-17, RL-K958-GVST): the menu's script failed in the Lua state an ended world left
+	// coop: the menu's script failed in the Lua state an ended world left
 	bool m_lua_retry; // set by Activate: OnFrame makes a new Lua state and opens the menu again
 	bool m_lua_retried; // once: a menu that fails in a new state too is not asked for again
 public:

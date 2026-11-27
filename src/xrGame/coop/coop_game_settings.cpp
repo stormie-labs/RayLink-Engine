@@ -3,6 +3,8 @@
 #include "pch_script.h"
 #include "coop_game_settings.h"
 #include "xrCoop/coop_game_values.h"
+#include "xrCoop/coop_lua_fn.h" // luafn::call_named: the hook before a world starts
+#include "coop_lua.h" // lua_api::fill
 
 #include "../../xrEngine/IGame_Persistent.h"
 #include "../../xrEngine/XR_IOConsole.h"
@@ -70,47 +72,6 @@ EngineConsole g_console;
 
 // ---------------------------------------------------------------- the Lua call of the hook
 
-// debug.traceback of the error that came out of the hook.
-int hook_traceback(lua_State* L)
-{
-	const char* msg = lua_tostring(L, 1);
-	if (!msg)
-		msg = "(error object is not a string)";
-	lua_getglobal(L, "debug");
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_getfield(L, -1, "traceback");
-	if (!lua_isfunction(L, -1))
-	{
-		lua_pop(L, 2);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_pushstring(L, msg);
-	lua_pushinteger(L, 2);
-	lua_call(L, 2, 1);
-	return 1;
-}
-
-// coop_game_settings.before_world_start, or nil. Runs in a protected call (call_hook): the first lookup loads the script
-// through _G.__index (gamedata/scripts/<name>.script), and a script that fails to load, or an addon's strict _G metatable,
-// raises there. No C++ object lives here: a Lua error leaves this frame without running destructors.
-int hook_lookup(lua_State* L)
-{
-	lua_getglobal(L, kHookScript);
-	if (!lua_istable(L, -1))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_getfield(L, -1, kHookFunction);
-	return 1;
-}
-
 enum class HookCall
 {
 	Done,
@@ -118,39 +79,25 @@ enum class HookCall
 	Failed, // it raised an error (logged)
 };
 
+// coop_game_settings.before_world_start(mode, save), protected; the first lookup loads the script (luafn::call_named).
 HookCall call_hook(const char* mode, const char* save)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L || !lua_checkstack(L, 8))
+	const auto push = [mode, save](lua_State* L)
+	{
+		lua_pushstring(L, mode);
+		lua_pushstring(L, save);
+		return 2;
+	};
+	std::string error;
+	const luafn::Fail f = luafn::call_named(ai().script_engine().lua(), kHookScript, kHookFunction, &luafn::traceback, push, 0,
+	    [](lua_State*) {}, error);
+	if (f == luafn::Fail::None)
+		return HookCall::Done;
+	if (f != luafn::Fail::LuaError)
 		return HookCall::Missing;
-	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &hook_traceback);
-	const int errfunc = lua_gettop(L);
-	lua_pushcfunction(L, &hook_lookup);
-	if (lua_pcall(L, 0, 1, errfunc) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		::Msg("! [coop] game settings: lua error looking up %s.%s: %s", kHookScript, kHookFunction, err ? err : "?");
-		lua_settop(L, top);
-		return HookCall::Failed;
-	}
-	if (!lua_isfunction(L, -1))
-	{
-		lua_settop(L, top);
-		return HookCall::Missing;
-	}
-	lua_pushstring(L, mode);
-	lua_pushstring(L, save);
-	if (lua_pcall(L, 2, 0, errfunc) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		::Msg("! [coop] game settings: lua error in %s.%s(%s, %s), the world starts without the game's values: %s",
-		    kHookScript, kHookFunction, mode, save, err ? err : "?");
-		lua_settop(L, top);
-		return HookCall::Failed;
-	}
-	lua_settop(L, top);
-	return HookCall::Done;
+	::Msg("! [coop] game settings: lua error in %s.%s(%s, %s), the world starts without the game's values: %s", kHookScript,
+	    kHookFunction, mode, save, error.c_str());
+	return HookCall::Failed;
 }
 
 // ---------------------------------------------------------------- Lua API
@@ -305,13 +252,6 @@ size_t release_cvars(const char* why)
 	return restored;
 }
 
-// coop.game.release_cvars() -> restored
-int l_release_cvars(lua_State* L)
-{
-	lua_pushnumber(L, lua_Number(release_cvars("released by a script")));
-	return 1;
-}
-
 // coop.game.machine_cvar(name) -> string|nil
 int l_machine_cvar(lua_State* L)
 {
@@ -415,27 +355,12 @@ void register_lua(lua_State* L)
 		{"stage_new", &l_stage_new},
 		{"take_new", &l_take_new},
 		{"set_cvars", &l_set_cvars},
-		{"release_cvars", &l_release_cvars},
 		{"machine_cvar", &l_machine_cvar},
 		{"set_world_faction", &l_set_world_faction},
 		{"world_faction", &l_world_faction},
 		{nullptr, nullptr},
 	};
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_createtable(L, 0, 8);
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_setfield(L, -2, "game"); // coop.game
-	lua_pop(L, 1); // coop
+	lua_api::fill(L, "game", fns); // coop_script logs a missing coop
 }
 } // namespace game
 } // namespace coop

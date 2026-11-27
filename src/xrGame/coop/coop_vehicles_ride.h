@@ -1,5 +1,5 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, passengers (F5-VEH-5, docs/VEHICLES.md sections 4, 5 and 12): beyond the module API of
+// Anomaly Coop — vehicles for players, passengers (docs/VEHICLES.md sections 4, 5 and 12): beyond the module API of
 // coop_vehicles.h, the hooks of the stock actor and what the decider's half (coop_vehicles_seat.cpp) asks of the places. All of it is
 // implemented in coop_vehicles_ride.cpp; the pure half is xrCoop/coop_vehicle_seats.h.
 #pragma once

@@ -32,9 +32,10 @@
 #include "alife_simulator.h"
 #include "alife_time_manager.h"
 #include "coop/coop_worldstate.h" // Anomaly Coop: host-owned clock and weather
-#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
+#include "coop/coop_callgate.h" // Anomaly Coop
 #include "coop/coop_join.h"
-#include "coop/coop_levels.h" // Anomaly Coop (R32 W2a): the loaded map of a spawn with no parent
+#include "coop/coop_levels.h" // Anomaly Coop: the loaded map of a spawn with no parent
+#include "coop/coop_router.h" // Anomaly Coop: the writer gate of a script write
 #include "UI/UIGameTutorial.h"
 #include "string_table.h"
 #include "ui/UIInventoryUtilities.h"
@@ -174,14 +175,14 @@ float get_weather_weight()
 
 void set_weather_weight(float weight)
 {
-	if (coop::worldstate::refuse_script_weather("level:set_weather_weight")) // Anomaly Coop (F2 T12 gate): the host decides the weather
+	if (coop::worldstate::refuse_script_weather("level:set_weather_weight")) // Anomaly Coop: the host decides the weather
 		return;
     g_pGamePersistent->Environment().set_lerp(weight);
 }
 
 void set_weather(LPCSTR weather_name, bool forced)
 {
-	if (coop::worldstate::refuse_script_weather("level:set_weather")) // Anomaly Coop (F2 T12 gate): the host decides the weather
+	if (coop::worldstate::refuse_script_weather("level:set_weather")) // Anomaly Coop: the host decides the weather
 		return;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
@@ -192,7 +193,7 @@ void set_weather(LPCSTR weather_name, bool forced)
 // demonized: Sets weather and force updates next environment so the interpolation will happen between current environment and next weather's environment
 void set_weather_smooth(LPCSTR weather_name)
 {
-	if (coop::worldstate::refuse_script_weather("level:set_weather_smooth")) // Anomaly Coop (F2 T12 gate): the host decides the weather
+	if (coop::worldstate::refuse_script_weather("level:set_weather_smooth")) // Anomaly Coop: the host decides the weather
 		return;
 #ifdef INGAME_EDITOR
     if (!Device.editor())
@@ -210,7 +211,7 @@ void set_weather_smooth(LPCSTR weather_name)
 
 bool set_weather_fx(LPCSTR weather_name)
 {
-	if (coop::worldstate::refuse_script_weather("level:set_weather_fx")) // Anomaly Coop (F2 T12 gate): the host decides the weather
+	if (coop::worldstate::refuse_script_weather("level:set_weather_fx")) // Anomaly Coop: the host decides the weather
 		return false;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
@@ -224,7 +225,7 @@ bool set_weather_fx(LPCSTR weather_name)
 
 bool start_weather_fx_from_time(LPCSTR weather_name, float time)
 {
-	if (coop::worldstate::refuse_script_weather("level:start_weather_fx_from_time")) // Anomaly Coop (F2 T12 gate): the host decides
+	if (coop::worldstate::refuse_script_weather("level:start_weather_fx_from_time")) // Anomaly Coop: the host decides
 		return false;
 #ifdef INGAME_EDITOR
 	if (!Device.editor())
@@ -248,7 +249,7 @@ float get_wfx_time()
 
 void stop_weather_fx()
 {
-	if (coop::worldstate::refuse_script_weather("level:stop_weather_fx")) // Anomaly Coop (F2 T12 gate): the host decides the weather
+	if (coop::worldstate::refuse_script_weather("level:stop_weather_fx")) // Anomaly Coop: the host decides the weather
 		return;
 	g_pGamePersistent->Environment().StopWFX();
 }
@@ -294,9 +295,9 @@ float get_time_factor()
 
 void set_game_difficulty(ESingleGameDifficulty dif)
 {
-	// Anomaly Coop (F2 T12 round 1 gate): the difficulty is the host's. Nothing in Lua calls this export: the stock sets
+	// Anomaly Coop: the difficulty is the host's. Nothing in Lua calls this export: the stock sets
 	// it with the console command g_game_difficulty (game_difficulties.script, exec_console_cmd), and that console path
-	// carries the host's factors (W3d coop_settings); CConsole:execute is a world row without a gate (review R1-M6).
+	// carries the host's factors (coop_settings); CConsole:execute is a world row without a gate.
 	if (coop::callgate::client_gate("level:set_game_difficulty", nullptr) == coop::calls::Gate::Refuse)
 		return;
 	g_SingleGameDifficulty = dif;
@@ -336,7 +337,7 @@ u32 get_time_minutes()
 
 void change_game_time(u32 days, u32 hours, u32 mins)
 {
-	if (coop::worldstate::intercept_time_jump(days, hours, mins)) // Anomaly Coop (F2 T12 gate): a client asks the host instead
+	if (coop::worldstate::intercept_time_jump(days, hours, mins)) // Anomaly Coop: a client asks the host instead
 		return;
 	game_sv_Single* tpGame = smart_cast<game_sv_Single *>(Level().Server->game);
 	if (tpGame && ai().get_alife())
@@ -748,7 +749,7 @@ void enable_input()
 
 void spawn_phantom(const Fvector& position)
 {
-	coop::callgate::Args coop_args; // Anomaly Coop (F2 T12 round 1 gate): a world spawn (filter_spawn refused it too)
+	coop::callgate::Args coop_args; // Anomaly Coop: a world spawn (filter_spawn refused it too)
 	coop_args.pos = &position;
 	if (coop::callgate::client_gate_own("level:spawn_phantom", false, coop_args) == coop::calls::Gate::Refuse)
 		return;
@@ -1692,9 +1693,7 @@ void hud_adj_state(bool state)
 
 LPCSTR vid_modes_string()
 {
-	// Anomaly Coop (reports RL-MSYY-7HAC, RL-NBSV-UM22, RL-U48B-CSHH, 2026-11): stock returned c_str() of a local string, a
-	// pointer to freed memory; the options menu (ui_options cont_vid_mode) sometimes read garbage there and the game ended
-	// in "attempt to perform arithmetic on local 'w'". The string now lives between calls (luabind copies it at once).
+	// coop: Keep the resolution string alive so luabind can copy it after this function returns.
 	static xr_string resolutions;
 	resolutions.clear();
 
@@ -2018,29 +2017,18 @@ void g_send(NET_Packet& P, bool bReliable = 0, bool bSequential = 1, bool bHighP
 	Level().Send(P, net_flags(bReliable, bSequential, bHighPriority, bSendImmediately));
 }
 
-// Anomaly Coop (R32 W2a, temp/r30/design/R32-final.md): the writer gate of a script write, defined in coop/coop_router.cpp (declared
-// here until coop_router.h gets it): census under coop_writer_gate log, a refusal under enforce; on the world server and a map server
-// only.
-namespace coop
-{
-namespace router
-{
-bool writer_refuses(const char* call, writer::WriteOp op, const calls::WriteTarget& target);
-} // namespace router
-} // namespace coop
-
 //can spawn entities like bolts, phantoms, ammo, etc. which normally crash when using alife():create()
 void spawn_section(LPCSTR sSection, Fvector3 vPosition, u32 LevelVertexID, u16 ParentID, bool bReturnItem = false)
 {
-	// Anomaly Coop (F2 T12 round 1 gate): as alife():create - into our own inventory a ReqSpawn (filter_spawn), a world
+	// Anomaly Coop: as alife():create - into our own inventory a ReqSpawn (filter_spawn), a world
 	// spawn is the host's (filter_spawn refused it too)
 	coop::callgate::Args coop_args;
 	coop_args.pos = &vPosition;
 	coop_args.what = sSection;
 	if (coop::callgate::client_gate_own("level:spawn_item", coop::calls::own_spawn(true, coop::callgate::is_own(ParentID)), coop_args) == coop::calls::Gate::Refuse)
 		return;
-	// Anomaly Coop (R32 W2a): the writer of the parent's root; no parent: a new root of the section's kind on the loaded map. The id is
-	// taken by xrServer::Process_spawn, which asks the own pool (W9).
+	// Anomaly Coop: the writer gate (coop_router.h writer_refuses) of the parent's root; no parent: a new root of the section's kind on
+	// the loaded map. The id is taken by xrServer::Process_spawn, which asks the own pool.
 	coop::calls::WriteTarget coop_target;
 	coop_target.what = sSection;
 	if (ParentID != u16(-1))

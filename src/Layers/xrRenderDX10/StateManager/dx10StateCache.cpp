@@ -5,6 +5,19 @@ dx10StateCache<ID3DRasterizerState, D3D_RASTERIZER_DESC> RSManager;
 dx10StateCache<ID3DDepthStencilState, D3D_DEPTH_STENCIL_DESC> DSSManager;
 dx10StateCache<ID3DBlendState, D3D_BLEND_DESC> BSManager;
 
+void dx10_state_create_failed(LPCSTR kind, long code)
+{
+	static volatile LONG failures = 0;
+	const unsigned int count = static_cast<unsigned int>(InterlockedIncrement(&failures));
+	if (!dx10_state_records::log_failure(count))
+		return;
+	char note[256];
+	Debug.device_lost_note_of(code, note, sizeof(note)); // empty unless the device was lost
+	Msg("! [render] the device did not create a %s state: 0x%08X%s (failure %u of D3D states); drawn without it, the next "
+		"shader with that state asks the device again",
+		kind, static_cast<unsigned int>(code), note, count);
+}
+
 template <class IDeviceState, class StateDecs>
 dx10StateCache<IDeviceState, StateDecs>
 ::dx10StateCache()
@@ -45,42 +58,42 @@ dx10StateCache<IDeviceState, StateDecs>
 }
 
 template <>
-void
+HRESULT
 dx10StateCache<ID3DRasterizerState, D3D_RASTERIZER_DESC>
 ::CreateState(D3D_RASTERIZER_DESC desc, ID3DRasterizerState** ppIState)
 {
-	CHK_DX(HW.pDevice->CreateRasterizerState( &desc, ppIState));
+	*ppIState = nullptr;
+	const HRESULT code = HW.pDevice->CreateRasterizerState(&desc, ppIState);
 
 	//	TODO: DX10: Remove this.
 #ifdef	DEBUG
 	Msg("ID3DRasterizerState #%d created.", m_StateArray.size());
 #endif	//	DEBUG
+	return code;
 }
 
 template <>
-void
+HRESULT
 dx10StateCache<ID3DDepthStencilState, D3D_DEPTH_STENCIL_DESC>
 ::CreateState(D3D_DEPTH_STENCIL_DESC desc, ID3DDepthStencilState** ppIState)
 {
-	CHK_DX(HW.pDevice->CreateDepthStencilState( &desc, ppIState));
-
-	//	TODO: DX10: Remove this.
-#ifdef	DEBUG
-	//Msg("ID3DDepthStencilState #%d created.", m_StateArray.size());
-#endif	//	DEBUG
+	*ppIState = nullptr;
+	return HW.pDevice->CreateDepthStencilState(&desc, ppIState);
 }
 
 template <>
-void
+HRESULT
 dx10StateCache<ID3DBlendState, D3D_BLEND_DESC>
 ::CreateState(D3D_BLEND_DESC desc, ID3DBlendState** ppIState)
 {
-	CHK_DX(HW.pDevice->CreateBlendState( &desc, ppIState));
+	*ppIState = nullptr;
+	const HRESULT code = HW.pDevice->CreateBlendState(&desc, ppIState);
 
 	//	TODO: DX10: Remove this.
 #ifdef	DEBUG
 	Msg("ID3DBlendState #%d created.", m_StateArray.size());
 #endif	//	DEBUG
+	return code;
 }
 
 /*

@@ -7,7 +7,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
-#include "coop/coop_join.h" // Anomaly Coop: received worlds use a private cache, outside campaign saves
+#include "coop/coop_join.h" // coop: received worlds use a private cache, outside campaign saves
 #include "saved_game_wrapper.h"
 #include "alife_time_manager.h"
 #include "alife_object_registry.h"

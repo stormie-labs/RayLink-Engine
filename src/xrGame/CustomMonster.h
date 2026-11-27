@@ -156,7 +156,7 @@ public:
 	};
 	virtual void shedule_Update(u32 DT);
 	virtual void UpdateCL();
-	// Anomaly Coop: a living NPC within the every-frame radius of a player's character (host) is a crow, as within the
+	// coop: a living NPC within the every-frame radius of a player's character (host) is a crow, as within the
 	// camera's circle (CObject::UpdateCL); without a session never. See xrEngine/sheduler_viewers.h.
 	virtual BOOL AlwaysTheCrow();
 

@@ -4,6 +4,7 @@
 #include "xrdebug.h"
 #include "os_clipboard.h"
 #include "raylink_version.h" // the crash dialogs name the engine and its build
+#include "gpu_device_lost.h" // RayLink: why a D3D device was lost (xrDebug::set_device_lost_note)
 
 #include <sal.h>
 #include <dxerr.h>
@@ -87,8 +88,10 @@ namespace crash_saving
 #include "mezz_stringbuffer.h"
 #include "../3rd party/stackwalker/include/StackWalker.h"
 #include <psapi.h> // Anomaly Coop: GetProcessMemoryInfo (K32GetProcessMemoryInfo in kernel32, _WIN32_WINNT is Windows 7)
+#include <chrono>
+#include <mutex>
 
-// Anomaly Coop (2026-11, crash triage): "<module file name>+0x<offset>" of an address, "0x<address>" outside any module.
+// Anomaly Coop: "<module file name>+0x<offset>" of an address, "0x<address>" outside any module.
 // Fixed buffers, no allocation: the unhandled exception filter calls it too. GetModuleFileNameA may wait for the loader lock
 // when another thread holds it (as the symbol engine of the stack trace below does anyway).
 static void describe_code_address(const void* address, LPSTR out, size_t out_size)
@@ -120,9 +123,9 @@ public:
         | StackWalker::StackWalkOptions::SymBuildPath
     ) {}
 protected:
-    // Anomaly Coop (2026-11, crash triage): the players have no PDB and OnOutput below drops every frame without a file and
-    // a line, so 29 reports said "stack trace:" and nothing more. Such a frame is printed as module+0xOFFSET, with the symbol
-    // when an export named it; a frame with a file and a line goes the stock way, unchanged.
+    // Anomaly Coop: the players have no PDB, and OnOutput below drops every frame without a file and a line, which left a report
+    // with an empty stack. Such a frame is printed as module+0xOFFSET, with the symbol when an export named it; a frame with a
+    // file and a line goes the stock way, unchanged.
     virtual void OnCallstackEntry(CallstackEntryType eType, CallstackEntry& entry) {
         if (eType != lastEntry && entry.offset != 0 && entry.lineFileName[0] == 0) {
             char where[MAX_PATH + 32];
@@ -154,10 +157,17 @@ protected:
 static bool no_dialog(); // Anomaly Coop: below, by silent_fatal_begin
 
 extern void printLuaStack();
-void LogStackTrace(LPCSTR header = nullptr, bool printStack = false)
+// Anomaly Coop: DbgHelp is single-threaded, so one walk runs at a time, under the one lock of this function. It is recursive and
+// bounded because the crash handler calls this too: on the thread whose walk failed inside DbgHelp (re-entry), or while the
+// thread that holds it waits for something the crashing thread holds (the log). After the bound the walk goes on without it.
+void LogStackTrace(LPCSTR header, bool printStack)
 {
 	if (!shared_str_initialized)
 		return;
+
+	static std::recursive_timed_mutex* const walk_lock = new std::recursive_timed_mutex(); // never freed: a crash at exit uses it
+	std::unique_lock<std::recursive_timed_mutex> one_walk(*walk_lock, std::defer_lock);
+	one_walk.try_lock_for(std::chrono::seconds(2));
 
     if (header)
 	    Msg("%s", header);
@@ -252,9 +262,8 @@ void xrDebug::gather_info(const char* expression, const char* description, const
     memory_monitor::flush_each_time(false);
 #endif //-USE_MEMORY_MONITOR
 
-	// Anomaly Coop (TZ R38): with the launcher's key the debugger is its watcher (it answers DebugBreak "handled" and shows nothing),
-	// not a developer at a call stack: the stack goes into the log as with no debugger. Before, every FATAL under the watcher ended
-	// with no stack, and one after the log closed with nothing at all.
+	// Anomaly Coop: with the launcher's key the debugger is its watcher (it answers DebugBreak "handled" and shows nothing), not a
+	// developer at a call stack: the stack goes into the log as with no debugger.
 	if ((!IsDebuggerPresent() || no_dialog()) && !strstr(GetCommandLine(), "-no_call_stack_assert"))
 	{
 		if (shared_str_initialized)
@@ -330,7 +339,7 @@ void xrDebug::do_exit(const std::string& message)
 		handler();
 	if (m_silent_fatal && shared_str_initialized)
 		Msg("! FATAL: %s", message.c_str());
-	else if (no_dialog() && shared_str_initialized)
+	else if (shared_str_initialized) // with the dialog too: the log is the only record a process stopped from outside leaves
 		Msg("FATAL ERROR\n\n[error]Description   : %s\n", message.c_str()); // what the launcher's window reads
 	xrLogger::FlushLog();
 	if (!no_dialog())
@@ -502,10 +511,56 @@ LPCSTR xrDebug::error2string(long code)
 #endif
 	if (0 == result)
 	{
-		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, 0, code, 0, desc_storage, sizeof(desc_storage) - 1, 0);
+		const DWORD written = FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, 0, code, 0, desc_storage, sizeof(desc_storage) - 1, 0);
 		result = desc_storage;
+		// RayLink: a lost D3D device says why, on the description's own line (the renderer's note,
+		// set_device_lost_note). Every other code, and a lost device with no note to ask, keeps the system's text as it was.
+		char note[256];
+		if (device_lost_note_of(code, note, sizeof(note)))
+		{
+			if (0 == written) // no system text: the code's name, not what the buffer held before
+				xr_gpu::reason_text(code, desc_storage, sizeof(desc_storage));
+			xr_gpu::append_before_line_end(desc_storage, sizeof(desc_storage), note);
+		}
 	}
 	return result;
+}
+
+// RayLink: xrDebug::set_device_lost_note. The renderer's thread sets and clears it, a crash on any
+// thread reads it: a pointer-sized store, volatile so every read goes to memory.
+static device_lost_note* volatile s_device_lost_note = nullptr;
+
+void xrDebug::set_device_lost_note(device_lost_note* note)
+{
+	s_device_lost_note = note;
+}
+
+// SEH only, no C++ object in this function: a driver that faults on its lost device costs the note, not the FATAL that asked.
+static bool call_device_lost_note(device_lost_note* note, long code, char* out, unsigned int out_size)
+{
+	__try
+	{
+		return note(code, out, out_size);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+bool xrDebug::device_lost_note_of(long code, char* out, unsigned int out_size)
+{
+	if (!out || !out_size)
+		return false;
+	out[0] = 0;
+	device_lost_note* const note = s_device_lost_note;
+	if (!note || !xr_gpu::is_device_lost(code))
+		return false;
+	const bool written = call_device_lost_note(note, code, out, out_size);
+	out[out_size - 1] = 0;
+	if (!written)
+		out[0] = 0;
+	return written && out[0] != 0;
 }
 
 void xrDebug::error(long hr, const char* expr, const char* file, int line, const char* function, bool& ignore_always)
@@ -808,7 +863,7 @@ void save_mini_dump (_EXCEPTION_POINTERS* pExceptionInfo)
             xr_strcat ( szDumpPath, t_stemp );
             xr_strcat ( szDumpPath, ".mdmp" );
 
-            // Anomaly Coop (TZ R38): after the core's teardown there is no FS: the dump goes next to the log (its path stays), not
+            // Anomaly Coop: after the core's teardown there is no FS: the dump goes next to the log (its path stays), not
             // into the game's working folder, where nobody looked for it
             const string_path& log_path = xrLogger::GetLogPath();
             LPCSTR log_slash = strrchr(log_path, '\\');
@@ -917,7 +972,7 @@ void format_message(LPSTR buffer, const u32& buffer_size)
 #endif //-!_EDITOR
 
 #ifdef NO_BUG_TRAP
-// Anomaly Coop (2026-11, crash triage): the first lines of a crash: the exception's code and place (module+offset, the
+// Anomaly Coop: the first lines of a crash: the exception's code and place (module+offset, the
 // players have no PDB), what an access violation touched, and the memory of that moment (the machines of the reports are
 // often at their commit limit). Fixed buffers, no Lua, no lock of ours; Msg itself (immediate mode) copies the line into a
 // string and takes the logger's critical sections, as every other line of this handler does.

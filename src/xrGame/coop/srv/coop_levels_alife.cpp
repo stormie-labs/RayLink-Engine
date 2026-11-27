@@ -1,8 +1,8 @@
 #include "stdafx.h"
 #include "pch_script.h"
-// F3a split levels: "online at a map server" on the host's ALife, and the state a transfer carries (docs/SPLIT_LEVELS.md §3).
+// "Online at a map server" on the host's ALife, and the state a transfer carries (docs/SPLIT_LEVELS.md §3).
 //
-// Host. A creature or a squad a map server took is marked online without a game object (recon §2.1, variant A): m_bOnline, out of the
+// Host. A creature or a squad a map server took is marked online without a game object: m_bOnline, out of the
 // offline scheduler and out of the graph registry, the same as the registry half of switch_online. Everything in the stock that
 // understands "online" leaves it alone: the offline scheduler, the offline combat of sim_offline_combat, .online in Lua.
 // Only coop_levels_xfer.cpp calls host_mark and host_unmark, from what the ledger says (xrCoop/coop_levels_keeper.h).
@@ -15,7 +15,7 @@
 #include "coop_levels_alife.h"
 #include "../coop_checkpoint_sources.h"
 #include "../coop_entities.h"
-#include "../coop_events.h" // R32 W3: the relay of a Parent or Died the world applies (apply_entry)
+#include "../coop_events.h" // the relay of a Parent or Died the world applies (apply_entry)
 #include "../coop_items.h"
 #include "../coop_join.h"
 #include "../coop_manager.h"
@@ -27,8 +27,9 @@
 #include "../coop_world.h"
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/srv/coop_levels_accept.h"
-#include "xrCoop/srv/coop_levels_journal.h" // O6: object_note, the uses refusal's branch
+#include "xrCoop/srv/coop_levels_journal.h" // object_note, the uses refusal's branch
 #include "xrCoop/srv/coop_levels_keeper.h"
+#include "xrCoop/srv/coop_levels_root_gen.h" // the gen at a root, one rule with the map servers (held_gen_of)
 
 #include "ai_space.h"
 #include "game_graph.h"
@@ -409,19 +410,6 @@ void host_apply_death(u16 victim, u16 killer, const std::vector<u8>& state)
 	tell_tasks_of_death(victim, killer);
 }
 
-void host_apply_release(u16 id, LevelId level)
-{
-	CSE_ALifeDynamicObject* e = object_of(id);
-	if (!e || e->m_bOnline || id == 0 || world::is_player_character(e))
-		return;
-	// A carried item keeps the vertex it was taken on, whatever level its holder stands on: the root says where it is.
-	const CSE_ALifeDynamicObject* root = e;
-	for (int depth = 0; depth < 8 && root && root->ID_Parent != 0xffff; ++depth)
-		root = object_of(root->ID_Parent);
-	if (root && level_of_vertex(root->m_tGraphID) == level)
-		alife_rw().release(e, true);
-}
-
 void host_reserve_leader_ids(bool say_so)
 {
 	settle_machine_settings(); // the ceiling counted below may still be an earlier build's default
@@ -558,7 +546,7 @@ bool host_apply_logic(u16 id, const std::vector<u8>& bytes, LevelId level)
 	return true;
 }
 
-// ---------------------------------------------------------------- R32 W2b / W3: the world's one apply of a map server's journal
+// ---------------------------------------------------------------- the world's one apply of a map server's journal
 
 namespace
 {
@@ -567,6 +555,9 @@ struct AcceptStats
 	u32 applied[journal::kLastOp + 1] = {};
 	u32 refused[journal::kLastWhy + 1] = {};
 	u32 repeats = 0;
+	// Parents into the holder the object has here already (accept::unchanged_parent), and those of
+	// them from a map server that does not write it: the stragglers its snapshot should have left out (client_remember_held)
+	u32 parents_unchanged = 0, parents_unchanged_foreign = 0;
 };
 AcceptStats g_accept;
 
@@ -577,7 +568,7 @@ ApplyVerdict applied(uint8_t op)
 	return ApplyVerdict::Applied;
 }
 
-// O6 (reports #1644-#1649): what a refusal line says of its object besides the id, so a refusal that needs data carries it: the section
+// What a refusal line says of its object besides the id, so a refusal that needs data carries it: the section
 // crc its entry's head named (0: none; the line names the section as this world has it when the object is here) and, for a move, where
 // the entry puts it.
 struct Seen
@@ -585,11 +576,15 @@ struct Seen
 	uint16_t crc = 0;
 	bool move = false;
 	u16 to = wire::kNoObject;
+	// An Identity refusal names the gen of the root on both sides (this world's, the head's), so the next one in a log shows
+	// which side named what instead of leaving it to the code
+	bool gens = false;
+	u32 gen_here = 0;
+	u32 gen_sent = 0;
 };
 
 // One log line for the first refusals of each reason, then every 100th. It names the object as this world sees it now (its section and
-// parent, journal::object_note), or the section crc of its entry when this world has no such object. O6 (#1644/#1645): the item engine
-// names both refusals of an ItemFacts by the uses store with one text; the world's object tells which branch it was.
+// parent, journal::object_note), or the section crc of its entry when this world has no such object.
 ApplyVerdict refuse(PeerId author, uint8_t op, u16 id, uint8_t why_code, uint8_t& why, const char* detail = nullptr,
     const Seen& seen = Seen())
 {
@@ -598,10 +593,14 @@ ApplyVerdict refuse(PeerId author, uint8_t op, u16 id, uint8_t why_code, uint8_t
 	if (n <= 8 || n % 100 == 0)
 	{
 		const CSE_ALifeDynamicObject* here = id != wire::kNoObject ? object_of(id) : nullptr;
-		if (op == wire::LevelEntityHead::Item && journal::is_uses_refusal(detail))
-			detail = journal::uses_refusal_text(journal::uses_refusal_of(here && !here->client_data.empty()));
-		const std::string note = journal::object_note(here != nullptr, here ? here->s_name.c_str() : nullptr, seen.crc,
+		std::string note = journal::object_note(here != nullptr, here ? here->s_name.c_str() : nullptr, seen.crc,
 		    here ? here->ID_Parent : u16(wire::kNoObject), seen.move, seen.to);
+		if (why_code == journal::Identity && seen.gens)
+		{
+			char gens[64];
+			std::snprintf(gens, sizeof(gens), ", root gen here %u, sent %u", seen.gen_here, seen.gen_sent);
+			note += gens;
+		}
 		::Msg("! [coop] levels: %s of object %u from map server %u refused (%u so far): %s%s%s; %s", journal::op_name(op), u32(id),
 		    mapserver::bridge_index(author), n, journal::why_name(why_code), detail ? ", " : "", detail ? detail : "", note.c_str());
 	}
@@ -611,6 +610,25 @@ ApplyVerdict refuse(PeerId author, uint8_t op, u16 id, uint8_t why_code, uint8_t
 ApplyVerdict refused_by(PeerId author, uint8_t op, u16 id, const accept::Verdict& v, uint8_t& why, const Seen& seen = Seen())
 {
 	return refuse(author, op, id, v.why, why, nullptr, seen);
+}
+
+// A Parent into the holder the object has here already, taken as a repeat (accept::accepts). One
+// from a map server that does not write the object would have been refused as not the writer before, and its repair would have made
+// the item again there: the first 8 and then every 100th are named, so a log shows whether a map server still sends them (its
+// snapshot of its players' characters, client_remember_held, should leave them out).
+ApplyVerdict parent_unchanged(PeerId author, u16 item, u16 holder, bool sender_writes)
+{
+	++g_accept.repeats;
+	++g_accept.parents_unchanged;
+	if (!sender_writes)
+	{
+		const u32 n = ++g_accept.parents_unchanged_foreign;
+		if (n <= 8 || n % 100 == 0)
+			::Msg("[coop] levels: Parent of object %u from map server %u puts it into %u, where it is here already; that map server does "
+			      "not write it: taken as a repeat, not refused (%u so far)",
+			    u32(item), mapserver::bridge_index(author), u32(holder), n);
+	}
+	return applied(wire::LevelEntityHead::Parent);
 }
 
 uint16_t crc_of(const CSE_ALifeDynamicObject* e) { return journal::section_crc(e->s_name.c_str()); }
@@ -632,23 +650,29 @@ RootSeen root_seen(u16 id)
 	return s;
 }
 
-// The object here against a head (A6): its section crc, and the keeper generation of the unit at its root as `author` holds it.
-bool same_as(const CSE_ALifeDynamicObject* e, const RootSeen& root, const journal::ObjectHead& h, PeerId author)
+// The object here against a head: its section crc, and the keeper generation of its root as `author` holds it, whatever the root
+// is now (levels::root_gen, the map server's rule as well: the body of a held lone unit and its loot). `gen_here`: what this
+// world named.
+bool same_as(const CSE_ALifeDynamicObject* e, const RootSeen& root, const journal::ObjectHead& h, PeerId author, u32& gen_here)
 {
 	u32 spawn_gen = 0;
-	const u32 gen_here = root.facts.kind == writer::RootKind::Unit ? xfer_held_gen(root.facts.root, author, spawn_gen) : 0;
+	gen_here = root_gen(root.facts.kind, xfer_held_gen(root.facts.root, author, spawn_gen));
 	return accept::identity(crc_of(e), h.crc, gen_here, h.gen, spawn_gen);
 }
 
-// The facts of an object the entry names, through its root.
-void object_facts(accept::Facts& f, const CSE_ALifeDynamicObject* e, const journal::ObjectHead& h, PeerId author, RootSeen& root)
+// The facts of an object the entry names, through its root; `seen` gets both gens of its root for an Identity refusal line.
+void object_facts(accept::Facts& f, const CSE_ALifeDynamicObject* e, const journal::ObjectHead& h, PeerId author, RootSeen& root,
+    Seen& seen)
 {
 	f.exists = e != nullptr;
 	if (!e)
 		return;
 	root = root_seen(e->ID);
 	f.ghost = root.ghost;
-	f.same = same_as(e, root, h, author);
+	f.character = root.facts.kind == writer::RootKind::Character;
+	f.same = same_as(e, root, h, author, seen.gen_here);
+	seen.gens = true;
+	seen.gen_sent = h.gen;
 	f.writer = root.writer;
 	f.fence = host_fence_of(author, root.facts.root);
 }
@@ -677,10 +701,10 @@ void set_info(u16 id, const std::string& info, bool on)
 		known->erase(it);
 }
 
-// The world releases what a map server that writes it destroyed (W2b: whatever m_bOnline says, W3). A member of a squad that server
+// The world releases what a map server that writes it destroyed, whatever m_bOnline says. A member of a squad that server
 // holds is marked online elsewhere with its squad: it is taken off that mark first, and the stock release takes it out of its squad
 // (on_unregister), into the graph at a vertex and out again. Without a vertex for it nothing is released (the graph would be read
-// out of its range). The decision is accept::release_plan (fix A5: tests/test_levels_accept.cpp).
+// out of its range). The decision is accept::release_plan (tests/test_levels_accept.cpp).
 bool release_here(CSE_ALifeDynamicObject* e, const char*& why)
 {
 	CSE_ALifeMonsterAbstract* m = smart_cast<CSE_ALifeMonsterAbstract*>(e);
@@ -704,7 +728,7 @@ bool release_here(CSE_ALifeDynamicObject* e, const char*& why)
 	return true;
 }
 
-// A player's money from a map server: a deal of a player of its map (Review A-S6-E-econ2: a larger delta than a u32 balance takes
+// A player's money from a map server: a deal of a player of its map (a larger delta than a u32 balance takes
 // is capped, so that money::adjust's s64(balance) + delta cannot overflow).
 ApplyVerdict apply_money(PeerId author, LevelId level, const journal::Entry& e, uint8_t& why)
 {
@@ -722,7 +746,7 @@ ApplyVerdict apply_money(PeerId author, LevelId level, const journal::Entry& e, 
 	return applied(e.op);
 }
 
-// Who raised an entry the world applies (fix round 2 of package A, verifier finding 4): the map server's own journal
+// Who raised an entry the world applies: the map server's own journal
 // (host_apply_fact), or the audit's heal of a member list in its name (host_apply_heal), which its Holder never adopted anybody at.
 enum class Origin : uint8_t
 {
@@ -732,15 +756,15 @@ enum class Origin : uint8_t
 
 // A member left a squad on the map server that writes the squad (its Left, accepted: the squad is a unit that map server holds). The
 // plan is accept::leave_plan (tests/test_levels_accept.cpp accept_fixa_leave_plan):
-//   R32 §8a A17: a living member stays with that map server, which holds it on its own from now on under the squad's gen (its Holder
+//   a living member stays with that map server, which holds it on its own from now on under the squad's gen (its Holder
 //   adopted it at the same Left: Holder::adopt; here Ledger::adopt): online elsewhere, out of the squad, in no registry of this world,
 //   so the world never simulates a creature that map server has, and it comes home once, by its hand-back or the loss of that map
 //   server, like any held unit. One the keeper cannot give it (somebody else's, in a transfer of its own) takes today's way, a
 //   creature of its own at home here (coop_leave_member); the audit heals that map server's side.
-//   Fix round 2, finding 2: a member a newer squad bound already (that squad's Spawn listed it: the map server made the squad and moved
+//   a member a newer squad bound already (that squad's Spawn listed it: the map server made the squad and moved
 //   the member in one frame) leaves only this squad's list (coop_unlist_member): its binding, its m_bOnline and its registries are its
 //   new squad's.
-//   Fix round 2, finding 4: the audit's heal takes the member home (coop_leave_member): the map server has no hold of it.
+//   the audit's heal takes the member home (coop_leave_member): the map server has no hold of it.
 // False: it was no member here.
 bool leave_squad(PeerId author, CSE_ALifeOnlineOfflineGroup& squad, CSE_ALifeMonsterAbstract& member, Origin origin)
 {
@@ -871,7 +895,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		{
 			if (!squad->coop_join_member(b.member))
 				return refuse(author, e.op, b.member, journal::Refused, why, "no living creature of its own to join");
-			host_member_joined(author, b.member); // §8a A17: a creature it held on its own goes with the squad now (Holder::forget there)
+			host_member_joined(author, b.member); // a creature it held on its own goes with the squad now (Holder::forget there)
 			return applied(e.op);
 		}
 		if (!leave_squad(author, *squad, *member, origin))
@@ -909,7 +933,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		return refuse(author, e.op, wire::kNoObject, journal::Malformed, why);
 	Reader lr = journal::layout_of(e);
 	RootSeen root;
-	Seen seen; // O6: the refusal lines name the section crc of the head
+	Seen seen; // the refusal lines name the section crc of the head
 	seen.crc = h.crc;
 
 	if (e.op == H::Spawn)
@@ -925,7 +949,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		if (!lr.ok() || id != h.id)
 			return refuse(author, e.op, h.id, journal::Malformed, why, nullptr, seen);
 		const CSE_ALifeDynamicObject* here = object_of(id);
-		f.id_in_slice = host_id_is_senders(author, id); // W9 (fix A1): its slice, or a block this world gave it
+		f.id_in_slice = host_id_is_senders(author, id); // its slice, or a block this world gave it
 		f.exists = here != nullptr;
 		f.same = here && crc_of(here) == h.crc;
 		if (parent != 0xffff)
@@ -939,7 +963,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		}
 		else
 		{
-			// Fix A2 (W1.2c, §8a A4): what stands nowhere but where it is made is written by the server that leads that map (or stops),
+			// What stands nowhere but where it is made is written by the server that leads that map (or stops),
 			// as its residents are: a map server still Starting writes none, and one that leads another map writes no object here
 			const LevelId at = ai().game_graph().valid_vertex_id(graph) ? level_of_vertex(graph) : wire::kNoLevel;
 			const writer::Writer of_senders_map = level != wire::kNoLevel ?
@@ -972,7 +996,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 	}
 
 	CSE_ALifeDynamicObject* obj = object_of(h.id);
-	object_facts(f, obj, h, author, root);
+	object_facts(f, obj, h, author, root, seen);
 	switch (e.op)
 	{
 	case H::Destroy:
@@ -1004,7 +1028,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		const CSE_ALifeCreatureAbstract* dying = smart_cast<const CSE_ALifeCreatureAbstract*>(object_of(victim));
 		const bool was_alive = dying && dying->g_Alive();
 		host_apply_death(victim, killer, st); // a body that is dead here already: nothing changes
-		// R32 W3 (D finding 1): the stock on_death runs no server event; recorded here, under the EchoOf above, the death reaches the
+		// The stock on_death runs no server event; recorded here, under the EchoOf above, the death reaches the
 		// players and map servers of the other levels at the flush, and not the level that reported it (to_bridges, passes_to)
 		if (was_alive)
 			events::host_on_death(victim, killer);
@@ -1020,7 +1044,7 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		pos.set(p[0], p[1], p[2]);
 		if (!lr.ok() || !_valid(pos))
 			return refuse(author, e.op, item, journal::Malformed, why, nullptr, seen);
-		Seen to_seen = seen; // O6 (#1646/#1649): where its entry puts it
+		Seen to_seen = seen; // where its entry puts it
 		to_seen.move = true;
 		to_seen.to = parent;
 		f.two_roots = true;
@@ -1034,13 +1058,17 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		}
 		else
 			f.writer_new = writer::other(author); // put down: it lies on the sender's map, where it was dropped
+		// into the holder it has here already, it changes nothing whoever sent it
+		f.unchanged = obj && item == h.id && accept::unchanged_parent(obj->ID_Parent, parent);
 		const accept::Verdict v = accept::accepts(f);
 		if (!v.ok)
 			return refused_by(author, e.op, item, v, why, to_seen);
+		if (v.repeat)
+			return parent_unchanged(author, item, parent, accept::sender_writes(f));
 		const CSE_ALifeDynamicObject* moved = object_of(item);
 		const u16 old_parent = moved ? moved->ID_Parent : u16(0xffff);
 		host_apply_parent(item, parent, pos);
-		// R32 W3 (D finding 1): the stock attach / detach run no server event; a real change is recorded here, under the EchoOf above,
+		// The stock attach / detach run no server event; a real change is recorded here, under the EchoOf above,
 		// for the other levels (the reporting one has it: to_bridges, passes_to)
 		const u16 now_parent = moved ? moved->ID_Parent : u16(0xffff);
 		if (now_parent != old_parent)
@@ -1049,15 +1077,19 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 	}
 	case H::State:
 	{
-		const accept::Verdict v = accept::accepts(f);
-		if (!v.ok)
-			return refused_by(author, e.op, h.id, v, why, seen);
-		if (!host_take_body(author, level, lr))
+		// One decision (accept::body_report). A report that crossed his move is a fact applied without effect: no refusal goes
+		// back in the Ack, so its sender prints no "!" and repairs nothing; host_take_body wrote its bounded line.
+		const accept::BodyDecision d = host_take_body(author, level, lr, f);
+		switch (d.outcome)
 		{
-			why = journal::Refused; // host_take_body wrote its own line
-			return ApplyVerdict::Refused;
+		case accept::BodyOutcome::Taken: return applied(e.op);
+		case accept::BodyOutcome::Crossed: return ApplyVerdict::Applied;
+		case accept::BodyOutcome::Refused: break;
 		}
-		return applied(e.op);
+		if (d.by_acceptance)
+			return refused_by(author, e.op, h.id, accept::Verdict{false, d.why, false}, why, seen);
+		why = d.why; // journal::Refused: host_take_body wrote its own line
+		return ApplyVerdict::Refused;
 	}
 	case H::Item:
 	{
@@ -1068,14 +1100,14 @@ ApplyVerdict apply_entry(PeerId author, const journal::Entry& e, uint8_t& why, u
 		if (!v.ok)
 			return refused_by(author, e.op, h.id, v, why, seen);
 		const char* no = nullptr;
-		// W8.3: the writer's deliberate write (Decider) or the owner's report it took (Owner) goes into the world's entity, players'
+		// The writer's deliberate write (Decider) or the owner's report it took (Owner) goes into the world's entity, players'
 		// items included (the acceptance above checked that the author writes the item); loot keeps its wear-only path. Decider and
 		// Owner are taken alike: the blob is the writer's capture of its own copy. A fact the world cannot store is Refused whole.
 		const bool taken = b.source == journal::ItemFactsBody::Loot
 		    ? items::host_take_level_state(b.item, b.section.c_str(), b.blob.data(), b.blob.size(), no)
 		    : items::host_take_item_facts(b.item, b.section.c_str(), b.blob.data(), b.blob.size(), no);
 		if (!taken)
-			return refuse(author, e.op, h.id, journal::Refused, why, no); // refuse() tells the uses refusal's branch (O6)
+			return refuse(author, e.op, h.id, journal::Refused, why, no); // refuse() tells the uses refusal's branch
 		return applied(e.op);
 	}
 	case H::Tent:
@@ -1148,11 +1180,15 @@ void host_accept_print_status()
 	for (uint8_t w = 1; w <= journal::kLastWhy; ++w)
 		if (g_accept.refused[w])
 			::Msg("[coop] levels:   refused, %s: %u", journal::why_name(w), g_accept.refused[w]);
+	if (g_accept.parents_unchanged)
+		::Msg("[coop] levels:   Parent into the holder it has here already, taken as a repeat: %u (%u from a map server that does not "
+		      "write it)",
+		    g_accept.parents_unchanged, g_accept.parents_unchanged_foreign);
 }
 } // namespace levels
 } // namespace coop
 
-// Anomaly Coop (R32 §8a A17), declared in xrServer_Objects_ALife_Monsters.h: the world server, a member left this squad on the map
+// Declared in xrServer_Objects_ALife_Monsters.h: the world server, a member left this squad on the map
 // server that holds it and is held by that map server on its own now (coop_levels_alife.cpp leave_squad). Out of the squad as
 // unregister_member takes it, but not into this world's graph and scheduler, and still online elsewhere: the world does not simulate
 // it. Its vertex is set by the caller (where it comes home); it is in no registry here, as a marked object is (mark_object).
@@ -1179,10 +1215,9 @@ bool CSE_ALifeOnlineOfflineGroup::coop_leave_member_held(ALife::_OBJECT_ID membe
 	return true;
 }
 
-// Anomaly Coop (R32 §8a A17, fix round 2 of package A, verifier finding 2), declared in xrServer_Objects_ALife_Monsters.h: the world
-// server, a Left of a member another squad bound before it (that squad's Spawn listed it and coop_bind_members bound it there: the map
-// server made that squad and moved the member into it in one frame). Only this squad's list forgets it; the member is left as its new
-// squad has it (m_group_id, m_bOnline, out of the graph and the scheduler). False: it is not listed.
+// Declared in xrServer_Objects_ALife_Monsters.h: the world server, a Left of a member another squad bound before it (that squad's
+// Spawn listed it and coop_bind_members bound it there: the map server made that squad and moved the member into it in one frame).
+// Only this squad's list forgets it; the member is left as its new squad has it (m_group_id, m_bOnline, out of the graph and the scheduler). False: it is not listed.
 bool CSE_ALifeOnlineOfflineGroup::coop_unlist_member(ALife::_OBJECT_ID member_id)
 {
 	const MEMBERS::iterator I = m_members.find(member_id);

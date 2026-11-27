@@ -72,8 +72,9 @@ struct Event
 	std::vector<uint8_t> bytes; // Receive: full packet (u16 type + payload)
 };
 
-// Thread safety: every call that touches ENet state takes one process-wide lock, so the owner thread and the
-// keep-alive thread never run ENet at the same time. Everything else (events, Session) stays on the owner thread.
+// Thread safety: every call that touches the ENet state of this transport takes its I/O lock, so the owner thread and the
+// keep-alive thread never run its host at the same time. ENet hosts share no state, so each transport has a lock of its own; a
+// peer is only ever handed to the transport whose host it belongs to. Everything else (events, Session) stays on the owner thread.
 class Transport
 {
 public:
@@ -96,8 +97,30 @@ public:
 	// Builds [u16 type][a][b] with the right ENet flags for the lane. `counter` (optional) tracks live bytes.
 	static Packet make_packet(Lane lane, uint16_t type, const uint8_t* a, size_t na, const uint8_t* b, size_t nb,
 		const ByteCounterPtr& counter);
-	// Submits the packet. Ownership passes to ENet on success; on failure the packet is destroyed. false = not sent.
+	// Submits the packet. Ownership passes to ENet on success; on failure the packet is destroyed. false = not sent (also for a
+	// peer of another transport).
 	bool send(PeerHandle peer, Lane lane, Packet&& packet);
+
+	// One packet of `lane` (make_packet) for several peers of this transport, a broadcast's: built once, it goes to each peer
+	// as send() would hand it over. ENet counts the peers that still need it and frees it after the last one; the Fanout holds
+	// one more reference until it goes.
+	class Fanout
+	{
+	public:
+		Fanout(Transport& transport, Lane lane, Packet&& packet);
+		~Fanout();
+		Fanout(const Fanout&) = delete;
+		Fanout& operator=(const Fanout&) = delete;
+
+		explicit operator bool() const { return m_p != nullptr; }
+		// false = not sent: no packet, or the peer is not a connected peer of this transport.
+		bool send(PeerHandle peer);
+
+	private:
+		Transport& m_tp;
+		Lane m_lane;
+		_ENetPacket* m_p = nullptr;
+	};
 
 	struct Traffic
 	{
@@ -108,22 +131,23 @@ public:
 	// All peers share the same window, ending on the last completed 250 ms boundary.
 	std::vector<Traffic> traffic(const std::vector<PeerHandle>& peers) const;
 
+	// The calls on one peer take a peer of this transport.
 	// Silence timeout for the peer; also switches ENet's unreliable-dropping congestion throttle off.
-	static void set_timeouts(PeerHandle peer, uint32_t timeout_ms);
-	static void disconnect_later(PeerHandle peer);
-	static void disconnect_now(PeerHandle peer);
-	static void reset(PeerHandle peer);
+	void set_timeouts(PeerHandle peer, uint32_t timeout_ms);
+	void disconnect_later(PeerHandle peer);
+	void disconnect_now(PeerHandle peer);
+	void reset(PeerHandle peer);
 
-	static void* user(PeerHandle peer);
-	static void set_user(PeerHandle peer, void* p);
-	static bool outgoing_idle(PeerHandle peer); // every queued command was transmitted at least once
-	static bool all_acked(PeerHandle peer); // idle and no reliable command awaiting acknowledgement
-	static uint32_t rtt_ms(PeerHandle peer);
-	static float packet_loss(PeerHandle peer); // 0..1
+	void* user(PeerHandle peer) const;
+	void set_user(PeerHandle peer, void* p);
+	bool outgoing_idle(PeerHandle peer) const; // every queued command was transmitted at least once
+	bool all_acked(PeerHandle peer) const; // idle and no reliable command awaiting acknowledgement
+	uint32_t rtt_ms(PeerHandle peer) const;
+	float packet_loss(PeerHandle peer) const; // 0..1
 	// Milliseconds since the peer last acknowledged anything; UINT32_MAX if it never did. ENet pings an idle link
 	// every 500 ms, so a live peer stays under a second plus its RTT; a process that is gone or stuck goes silent.
-	static uint32_t ms_since_receive(PeerHandle peer);
-	static std::string address_of(PeerHandle peer); // "ip:port"
+	uint32_t ms_since_receive(PeerHandle peer) const;
+	std::string address_of(PeerHandle peer) const; // "ip:port"
 
 	// A helper thread services ENet every millisecond while the owner lives (it called service() within the last
 	// 1 s) or while held: acks and pings go out at once, so the RTT is the network's, not the frame times'. Events it
@@ -154,6 +178,10 @@ private:
 		std::atomic<uint64_t> out_bytes{0}, in_bytes{0};
 		std::array<Bucket, kTrafficBuckets> buckets{};
 	};
+	using IoLock = std::lock_guard<std::mutex>;
+	// Under the I/O lock.
+	bool owns(PeerHandle peer) const;
+	bool submit(PeerHandle peer, Lane lane, _ENetPacket* packet);
 	void count_traffic(PeerHandle peer, uint64_t out, uint64_t in);
 	void count_traffic_event(const _ENetEvent& event);
 
@@ -161,6 +189,7 @@ private:
 	void keepalive_stop();
 	void keepalive_loop();
 
+	mutable std::mutex m_io; // the I/O lock: this transport's ENet host, its traffic slots and the inbox
 	_ENetHost* m_host = nullptr;
 	std::unique_ptr<TrafficSlot[]> m_traffic;
 	bool m_enet_ref = false;
@@ -170,7 +199,7 @@ private:
 	std::condition_variable m_ka_cv;
 	bool m_ka_stop = false;
 	std::atomic<uint64_t> m_last_service_ms{0}; // steady clock of the owner's last service()
-	// Events the helper took out of ENet, in ENet's order (2026-10-24: the helper pumps between the owner's frames).
+	// Events the helper took out of ENet, in ENet's order (the helper pumps between the owner's frames).
 	// `link` is the peer's ENet connectID then: a packet of a link the owner has since reset is not handed out.
 	// Guarded by the I/O lock.
 	struct Taken

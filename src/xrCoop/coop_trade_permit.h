@@ -1,5 +1,5 @@
-// Anomaly Coop - remote trade through a concrete trading computer (Dev 57 G6-3, review m23:3; Gadgets for Hideout Furniture,
-// bind_trading_computer.script: it lists traders up to 150 m away and opens the stock trade with one of them).
+// Anomaly Coop - remote trade through a concrete trading computer (a mod's computer that lists
+// traders far away and opens the stock trade with one of them).
 //
 // Without a permit nothing changes: a client's deal needs the stock talk and his character by the trader on the decider
 // (coop_trade.cpp host_apply: kTradeReach), and his window closes 3 m from the trader (CUIActorMenu::CheckDistance). Remote
@@ -26,11 +26,13 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "coop_ids.h"
+
 namespace coop
 {
 namespace trade_permit
 {
-constexpr uint16_t kNoObject = 0xffff;
+constexpr uint16_t kNoObject = kNoId;
 constexpr uint32_t kNoPlayer = 0xFFFFFFFFu;
 constexpr uint64_t kMaxTtlMs = 600000; // 10 min: a trade window after a talk lives as long (talks::kTradeAfterTalkMs)
 constexpr float kMaxReach = 6.f; // the player's character by the computer on the decider: the window's 3 m and the lag (kTradeReach)

@@ -3,7 +3,7 @@
 #include "ParticlesObject.h"
 #include "GamePersistent.h"
 #include "../xrEngine/LightAnimLibrary.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 #include "coop/coop_manager.h"
 
 /*
@@ -74,7 +74,7 @@ void CZoneCampfire::GoDisabledState()
 
 void CZoneCampfire::turn_on_script()
 {
-	if (coop::objects::campfire_turn_blocked(this, true)) return; // Anomaly Coop: the host lights fires
+	if (coop::objects::campfire_turn_blocked(this, true)) return; // coop: the host lights fires
 	if (psDeviceFlags.test(rsR2 | rsR3 | rsR4))
 	{
 		m_turn_time = Device.dwTimeGlobal + OVL_TIME;
@@ -85,7 +85,7 @@ void CZoneCampfire::turn_on_script()
 
 void CZoneCampfire::turn_off_script()
 {
-	if (coop::objects::campfire_turn_blocked(this, false)) return; // Anomaly Coop: the host puts fires out
+	if (coop::objects::campfire_turn_blocked(this, false)) return; // coop: the host puts fires out
 	if (psDeviceFlags.test(rsR2 | rsR3 | rsR4))
 	{
 		m_turn_time = Device.dwTimeGlobal + OVL_TIME;

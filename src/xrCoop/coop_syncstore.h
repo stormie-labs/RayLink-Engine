@@ -1,5 +1,5 @@
-// Anomaly Coop — the coop.sync store: shared variables by scope, their value format on the wire and their limits
-// (SYNC_SPEC §6.1, §6.5; F2 T13). Mods declare shared data through it without network code; coop::syncapi (F2 T14)
+// Anomaly Coop — the coop.sync store: shared variables by scope, their value format on the wire and their limits.
+// Mods declare shared data through it without network code; coop::syncapi
 // wires it to Lua, the network and the host save.
 //
 // Scopes (ScopeId):
@@ -7,7 +7,7 @@
 //   - Session: one; only the host writes it; lives for the session;
 //   - Player: one per player, keyed by his player key digest (player_key: ledger::character_key of his character, the
 //     "key" line of its custom data), not by a peer id or an entity id: a player who reconnects (a new peer id) or a
-//     save that gives his character another id still finds his data (Rulings F2-13, F2-18). Written by his player or
+//     save that gives his character another id still finds his data. Written by his player or
 //     the host; kept in the host save;
 //   - Object: one per object, by its id in the host's numbering (arg); written by the host or the object's owner; it
 //     goes with the object and is dropped when the object is destroyed.
@@ -18,14 +18,14 @@
 // it would leave no room for the next). A change is applied only if it is newer than the key's last change, or, for a
 // key that is not there, than the last removal in its scope (else Stale). The contract for syncapi: versions are
 // stamped by the host from one counter that only grows (top_version() + 1 for the next change), so every change in a
-// scope is newer than every change before it. F2 T13 fix 1: the counter is not saved by itself. After the host loads
+// scope is newer than every change before it. The counter is not saved by itself. After the host loads
 // its save (clear(), then decode_scope of every saved scope) top_version() is the newest version in the save and the
 // counter goes on from there; that is safe because every client starts again from the host's copies too (clear() at
 // join) and the session drops changes of the old epoch. A client's store holds only what the host sent. A full copy
 // (encode_scope / decode_scope) carries the versions, so after a client takes it, a change from before the copy is
-// Stale (Review Focus 2).
+// Stale.
 //
-// Scope lifetime (F2 T13 fix 1). A scope exists while it holds a key: removing its last key frees it, its slot among
+// Scope lifetime. A scope exists while it holds a key: removing its last key frees it, its slot among
 // kMaxPlayerScopes / kMaxObjectScopes too. The version of that removal (and of a nil set on a scope that is not there)
 // stays in a small table of at most kMaxFreedScopes scopes, so that an older change does not bring a key back; the
 // oldest record goes first, counted in Stats::freed_evicted. syncapi calls drop() when an object is destroyed: its
@@ -90,8 +90,6 @@ struct Value
 	std::vector<std::pair<std::string, Value>> table;
 };
 
-inline Value make_nil() { return Value(); }
-
 inline Value make_number(double x)
 {
 	Value r;
@@ -123,14 +121,6 @@ inline Value make_vec3(float x, float y, float z)
 	r.v[0] = x;
 	r.v[1] = y;
 	r.v[2] = z;
-	return r;
-}
-
-inline Value make_table(std::vector<std::pair<std::string, Value>> fields)
-{
-	Value r;
-	r.type = ValueType::Table;
-	r.table = std::move(fields);
 	return r;
 }
 
@@ -196,22 +186,20 @@ constexpr size_t kMaxWorldBytes = size_t(4) << 20;
 constexpr size_t kMaxSessionBytes = size_t(1) << 20;
 constexpr size_t kMaxPlayerBytes = size_t(1) << 20;
 constexpr size_t kMaxObjectBytes = size_t(64) << 10;
-// F2 T13: bounds of the whole store (lesson of the F2 reviews: every container is bounded per key, per scope and in
-// total). 256 players over the life of one host save (a session admits at most 64 new characters, Ruling F2-10);
-// 65536 objects: the whole id space of ALife (u16).
+// Bounds of the whole store (every container is bounded per key, per scope and in total). 256 players over the life of one host
+// save (a session admits at most 64 new characters); 65536 objects: the whole id space of ALife (u16).
 constexpr size_t kMaxPlayerScopes = 256;
 constexpr size_t kMaxObjectScopes = 65536;
 constexpr size_t kMaxPoolBytes = size_t(16) << 20; // all Player and Object scopes together
-constexpr size_t kMaxTotalBytes = kMaxWorldBytes + kMaxSessionBytes + kMaxPoolBytes;
 // What a key and a table field take in memory beyond their bytes (a map node, a string, a Value), counted in the scope.
 constexpr size_t kEntryOverhead = 64;
 constexpr size_t kFieldOverhead = 32;
 // A player key digest: sha256 as lowercase hex (coop::kKeyDigestHexDigits).
 constexpr size_t kPlayerKeyDigits = 64;
-// F2 T13 fix 1: versions are 1..kMaxVersion. The host's counter never gets there (2^62 changes); a version above it
+// Versions are 1..kMaxVersion. The host's counter never gets there (2^62 changes); a version above it
 // from a peer or a copy would leave no room for the next change (top_version() + 1), so it is refused.
 constexpr uint64_t kMaxVersion = uint64_t(1) << 62;
-// F2 T13 fix 1: removal versions of freed scopes kept (see "Scope lifetime").
+// Removal versions of freed scopes kept (see "Scope lifetime").
 constexpr size_t kMaxFreedScopes = 4096;
 
 inline size_t scope_limit(ScopeId::Kind kind)
@@ -435,7 +423,7 @@ inline bool same(const Value& a, const Value& b)
 	return false;
 }
 
-// F2 T13 fix 1: clears the members a value's type does not use, in its table's fields too. A Number that also carried an
+// Clears the members a value's type does not use, in its table's fields too. A Number that also carried an
 // 8 MiB string would keep it in the store outside every limit (encoded_size counts only the members of the type).
 // Called on a value check_value accepted (so a table's fields are scalars: no deeper recursion).
 inline void strip(Value& v)
@@ -798,7 +786,7 @@ public:
 		}
 		const auto it = m_scopes.find(id);
 		const size_t old = it == m_scopes.end() ? 0 : it->second.bytes;
-		const bool keep = !fresh.entries.empty(); // F2 T13 fix 1: a scope without keys is not kept, its record is
+		const bool keep = !fresh.entries.empty(); // A scope without keys is not kept, its record is
 		if ((pooled(id.kind) && m_pool - old + fresh.bytes > kMaxPoolBytes) ||
 		    (keep && it == m_scopes.end() && m_count[size_t(id.kind)] >= max_scopes(id.kind)))
 		{
@@ -921,7 +909,7 @@ private:
 		if (!scope_ok(scope) || !key_ok(key))
 			return SetResult::BadKey;
 		if (version > kMaxVersion)
-			return SetResult::BadValue; // F2 T13 fix 1: no room for the next change after it
+			return SetResult::BadValue; // No room for the next change after it
 		canonicalize(value);
 		const SetResult form = check_value(value);
 		if (form != SetResult::Ok)
@@ -940,7 +928,7 @@ private:
 			m_top = std::max(m_top, version);
 			if (!e)
 			{
-				// F2 T13 fix 1: a missing key remembers the removal too, in a scope that is not there as well.
+				// A missing key remembers the removal too, in a scope that is not there as well.
 				if (sc)
 					sc->removed = std::max(sc->removed, version);
 				else
@@ -954,7 +942,7 @@ private:
 			sc->entries.erase(eit);
 			if (sc->entries.empty())
 			{
-				// F2 T13 fix 1: the last key went: the scope is freed (its slot too), its removal version is kept.
+				// The last key went: the scope is freed (its slot too), its removal version is kept.
 				note_freed(scope, sc->removed);
 				m_scopes.erase(sit);
 				--m_count[size_t(scope.kind)];

@@ -48,7 +48,7 @@ public:
 	void set_callback(hit_callback callback) { m_callback = callback; }
 	void on_monster_death();
 	virtual bool check_start_condition();
-	// Anomaly Coop (audit A5): the host's ability hit a remote player - his machine shakes its actor's aim with
+	// coop: the host's ability hit a remote player - his machine shakes its actor's aim with
 	// effector `index` and takes the blow (the callback: a burer's stamina hit, the weapon knocked out)
 	void coop_play(u8 index);
 	//@	bool						is_active				() const { return m_is_activated; }
@@ -61,7 +61,7 @@ private:
 	bool check_update_condition() const;
 	float calculate_angle() const;
 	void start_camera_effector();
-	CEntityAlive const* aim_target() const; // Anomaly Coop: the enemy when it is a player (any machine's)
+	CEntityAlive const* aim_target() const; // coop: the enemy when it is a player (any machine's)
 	TTime play_effector_on_actor(u32 index); // the effector on this machine's actor; its end tick
 };
 

@@ -53,11 +53,11 @@ public:
 	virtual ~CHangingLamp();
 	void SetLanim(LPCSTR name, bool bFlicker, int flickerChance, float flickerDelay, float framerate);
 	void ResetLanim();
-	void TurnOn();
+	void TurnOn(bool relay = true); // coop: relay=false when the switch is not a word to other machines
 	void TurnOff();
 	bool IsOn() { return m_bState; }
 	bool IsFlickering() { return isFlickering; }
-	// Anomaly Coop (audit W2): the host's word on this lamp (coop_lamps.h)
+	// coop: the host's word on this lamp (coop_lamps.h)
 	bool coop_dead() { return !Alive(); }
 	void coop_set(bool on, bool dead);
 	virtual void Load(LPCSTR section);

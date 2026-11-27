@@ -30,7 +30,7 @@ void CScriptSound::script_register(lua_State* L)
 			value("looped", sm_Looped),
 			value("s2d", sm_2D),
 			value("s3d", 0),
-			// Anomaly Coop: a stereo file plays positional, mixed down to mono (TZ R59); add to s3d / looped. Stock stereo is flat.
+			// coop: a stereo file plays positional, mixed down to mono; add to s3d / looped. Stock stereo is flat.
 			value("mono3d", sm_Mono3D)
 		]
 		.property("frequency", &CScriptSound::GetFrequency, &CScriptSound::SetFrequency)

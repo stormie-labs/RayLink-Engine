@@ -620,7 +620,7 @@ CUICellItem* CUICellContainer::FindSimilar(CUICellItem* itm)
 #endif
 		if (i == itm)
 			continue;
-		// Anomaly Coop: the cheap section/condition compare first; the ini lookups below ran for every pair of cells,
+		// coop: the cheap section/condition compare first; the ini lookups below ran for every pair of cells,
 		// O(n^2) per list fill of a large trader stock.
 		if (!i->EqualTo(itm))
 			continue;

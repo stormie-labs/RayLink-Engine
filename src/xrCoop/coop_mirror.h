@@ -1,5 +1,5 @@
 // Anomaly Coop - a co-op client's mirror of the host's world: where an entity from the host goes on this machine, and
-// what a holder does when it leaves the server listing a child that has no server entity here (B2, live 2026-10-23:
+// what a holder does when it leaves the server listing a child that has no server entity here (without it:
 // FATAL "child registered but not found" in xrServer::Perform_destroy on a client leaving the game).
 // The server keeps online entities only; ALife and the server share one `children` list per holder. A holder on the
 // server may list only children that are on the server too: Perform_destroy (the holder switches offline, the level is
@@ -29,14 +29,13 @@ enum class Placement : uint8_t
 // keeps a player's character offline until he has loaded the world while our actor is online here from the start, and
 // an NPC that switched offline in the same host frame is still online here until its EntitySwitch.
 // in_level_registry: a free entity is in this level's ALife registry (CALifeGraphRegistry::add puts it there only with a
-// valid game vertex), the only one CALifeUpdateManager::update_switch walks. Build 51 live: a psy phantom spawned by
-// level.spawn_item has no game vertex; it stayed offline here for ever, invisible, while the host's copy hit the player.
+// valid game vertex), the only one CALifeUpdateManager::update_switch walks. A psy phantom spawned by level.spawn_item
+// has no game vertex: without this it would stay offline here for ever, invisible, while the host's copy hits the player.
 // flag_of_this_level: the host's online flag is a word about the level this machine has loaded (false on a map server,
 // and for a player on another level than the host's under split levels: the flag is about the host's level there).
 // switches_alone: the entity goes online by its own switch_online and is still offline after register_object. False
 // for a squad (CSE_ALifeOnlineOfflineGroup): it comes online with its members, and here it has no game vertex as a
-// rule. Builds 52-54 live (issue 1293): OnlineNow took squads, their second switch_online failed
-// R_ASSERT(!m_bOnline) and every client of an ordinary session crashed. A squad stays on the vote, as in build 51.
+// rule: taken online now, its second switch_online would fail R_ASSERT(!m_bOnline). A squad stays on the vote.
 inline Placement placement(bool has_holder, bool host_online, bool holder_online, bool holder_on_server,
                            bool in_level_registry, bool flag_of_this_level, bool switches_alone)
 {

@@ -1,5 +1,5 @@
-// Anomaly Coop — which of a dead character's things a death may take, and where they land (F3 Task 9,
-// CHECKPOINTS_DEATH.md §3.3). The engine layer (xrGame/coop/coop_death.cpp) reads the facts of every item and the
+// Anomaly Coop — which of a dead character's things a death may take, and where they land
+// (CHECKPOINTS_DEATH.md §3.3). The engine layer (xrGame/coop/coop_death.cpp) reads the facts of every item and the
 // tables of configs\mod_system_coop_death.ltx; this header turns them into the candidates of pick_losses (quest items
 // out, a stable order), checks the drop point and carries Msg::DeathMarker.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "coop_death_rules.h"
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -77,7 +78,7 @@ private:
 // What the engine knows of one item the dead character carries.
 struct ItemFacts
 {
-	uint16_t id = 0xffff;
+	uint16_t id = kNoId;
 	std::string kind; // the item's ltx `kind`, empty if none
 	bool ammo = false; // CWeaponAmmo
 	bool outfit = false; // CCustomOutfit or CHelmet
@@ -86,7 +87,7 @@ struct ItemFacts
 	bool helper = false; // is_helper_item(): the engine's own, never a world object
 	bool world = true; // an ALife entity: in the save and on every machine (false: host only, e.g. an NPC's supply bolt)
 	bool wearable = false; // its owner can have it in a slot or on the belt (a base slot, or the `belt` flag)
-	bool worn = false; // F3 T8b: the owner reported it in a slot or on the belt (mark_worn): never lost
+	bool worn = false; // the owner reported it in a slot or on the belt (mark_worn): never lost
 };
 
 // At most this many items are offered (the lowest ids): the whole set goes to pick_losses in one vector.
@@ -102,10 +103,10 @@ inline bool kept_kind(const std::string& kind)
 // not world objects.
 inline bool never_lost(const ItemFacts& f)
 {
-	return f.id == 0xffff || f.quest || f.pda || f.helper || !f.world || kept_kind(f.kind);
+	return f.id == kNoId || f.quest || f.pda || f.helper || !f.world || kept_kind(f.kind);
 }
 
-// The loss category (plan T9 step 2): ammo -> Ammo; else the kind in `kinds`; else an outfit or a helmet -> Gear; else
+// The loss category: ammo -> Ammo; else the kind in `kinds`; else an outfit or a helmet -> Gear; else
 // Other.
 inline uint8_t category_of(const ItemFacts& f, const KindTable& kinds)
 {
@@ -130,10 +131,10 @@ void sort_unique_bounded(std::vector<T>& v, Id id_of)
 }
 } // namespace detail
 
-// F3 T8b (Ruling F3-4): applies the list of what the owner of a client's proxy reported on him (his slots and belt, host
+// Applies the list of what the owner of a client's proxy reported on him (his slots and belt, host
 // numbering, as survival::host_worn_items gives it) to the proxy's items: `worn` is set on the items named in it and
 // cleared on all the others, so a second list replaces the first. The order of the list, repeated ids and ids the proxy
-// does not carry do not matter; 0xffff is no id; an item that cannot be worn is never marked. Returns how many items
+// does not carry do not matter; kNoId is no id; an item that cannot be worn is never marked. Returns how many items
 // are marked.
 inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_t>& worn)
 {
@@ -142,8 +143,8 @@ inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_
 	size_t marked = 0;
 	for (ItemFacts& f : items)
 	{
-		// T8b review N1: only a wearable item can be worn - a client naming his parts and ammo keeps nothing by it
-		f.worn = f.wearable && f.id != 0xffff && std::binary_search(ids.begin(), ids.end(), f.id);
+		// Only a wearable item can be worn - a client naming his parts and ammo keeps nothing by it
+		f.worn = f.wearable && f.id != kNoId && std::binary_search(ids.begin(), ids.end(), f.id);
 		if (f.worn)
 			++marked;
 	}
@@ -156,7 +157,7 @@ inline size_t mark_worn(std::vector<ItemFacts>& items, const std::vector<uint16_
 // — an NPC cannot wear an outfit, has no belt and fills its slots in the order it took the items — so whatever the
 // player may have on (wearable) stays with him.
 // `layout_known` true: the host's own actor (`items` is its exact backpack), or a client's proxy whose owner reported
-// what he has on (F3 T8b: `items` is everything the proxy carries, mark_worn has set `worn`); the items marked `worn`
+// what he has on (`items` is everything the proxy carries, mark_worn has set `worn`); the items marked `worn`
 // stay with him, the rest — wearable or not — can be taken.
 inline std::vector<Candidate> loss_candidates(const std::vector<ItemFacts>& items, const KindTable& kinds,
 	bool layout_known)
@@ -187,13 +188,13 @@ inline std::vector<uint16_t> stash_ids(const std::vector<ItemFacts>& items, cons
 		return out;
 	}
 	for (const ItemFacts& f : items)
-		if (f.id != 0xffff && !f.helper && f.world)
+		if (f.id != kNoId && !f.helper && f.world)
 			out.push_back(f.id);
 	detail::sort_unique_bounded(out, [](uint16_t id) { return id; });
 	return out;
 }
 
-// The seed of one death's pick (plan T9 step 2): character ^ (seq << 16) ^ the low 32 bits of the game time.
+// The seed of one death's pick: character ^ (seq << 16) ^ the low 32 bits of the game time.
 inline uint32_t loss_seed(uint16_t character, uint16_t seq, uint64_t game_time)
 {
 	return uint32_t(character) ^ (uint32_t(seq) << 16) ^ uint32_t(game_time & 0xffffffffull);
@@ -213,7 +214,7 @@ struct DropPlace
 constexpr float kBelowVertexM = 1.0f; // a body this far below its level vertex fell through the ground
 constexpr float kAboveVertexM = 0.3f; // moved items appear this far above the vertex
 
-// Review Focus 4: dropped items must stay where the player can reach them. They fall from the body, unless its own
+// Dropped items must stay where the player can reach them. They fall from the body, unless its own
 // level vertex is not valid, the body is more than kBelowVertexM below that vertex (fell through the ground) or its
 // position is not a number; then they go kAboveVertexM above `vertex` — the body's own vertex, or the nearest one when
 // the own is not valid.
@@ -254,11 +255,11 @@ inline Point spread(size_t i)
 }
 
 // Msg::DeathMarker (host -> all): u16 character, u16 marker object, u8 drop mode; host numbering. Only Drop (the
-// marker is the first dropped item) and Corpse (the stash) have a marker; Lose and Keep (build 10) leave nothing.
+// marker is the first dropped item) and Corpse (the stash) have a marker; Lose and Keep leave nothing.
 struct Marker
 {
-	uint16_t character = 0xffff;
-	uint16_t object = 0xffff;
+	uint16_t character = kNoId;
+	uint16_t object = kNoId;
 	Drop drop = Drop::Drop;
 };
 
@@ -271,7 +272,7 @@ inline void write(Writer& w, const Marker& m)
 	w.u8(static_cast<uint8_t>(m.drop));
 }
 
-// False on a short packet, a missing id (0xffff) or a mode without a marker (Lose, Keep, unknown); `m` is then
+// False on a short packet, a missing id (kNoId) or a mode without a marker (Lose, Keep, unknown); `m` is then
 // unchanged.
 inline bool read(Reader& r, Marker& m)
 {
@@ -279,7 +280,7 @@ inline bool read(Reader& r, Marker& m)
 	n.character = r.u16();
 	n.object = r.u16();
 	const uint8_t d = r.u8();
-	if (!r.ok() || n.character == 0xffff || n.object == 0xffff)
+	if (!r.ok() || n.character == kNoId || n.object == kNoId)
 		return false;
 	if (d != static_cast<uint8_t>(Drop::Drop) && d != static_cast<uint8_t>(Drop::Corpse))
 		return false;
@@ -294,7 +295,7 @@ inline const char* marker_kind(Drop d)
 	return d == Drop::Corpse ? "corpse" : "drop";
 }
 
-// ---------------------------------------------------------------- a stash waiting for its items (T9 fix round 1)
+// ---------------------------------------------------------------- a stash waiting for its items
 
 // Who a death stash is for: taken when it is spawned and checked again before the items move, because the character id
 // alone can be given to another character once this one is released.
@@ -304,13 +305,13 @@ struct StashOwner
 	std::string key; // the player key digest on the character's custom data ([coop] key), empty if none
 };
 
-// Still the same character. Both sides have a key: the same key (R1). Otherwise the same player still plays it. So a
-// hardcore retirement (Task 10) can rewrite the key while its player is still there (review I1: the key is gone, the
-// peer stays), and a player who leaves keeps the key on his parked character but not his peer (review minor 1: the key
+// Still the same character. Both sides have a key: the same key. Otherwise the same player still plays it. So a
+// hardcore retirement can rewrite the key while its player is still there (the key is gone, the
+// peer stays), and a player who leaves keeps the key on his parked character but not his peer (the key
 // stays, the peer is gone).
 inline bool same_owner(const StashOwner& then, const StashOwner& now)
 {
-	// T8b, review R1: two keys decide alone. A different key is another character even when the peer number matches
+	// Two keys decide alone. A different key is another character even when the peer number matches
 	// (the id was released and given to a new proxy of a player who took the same number).
 	if (!then.key.empty() && !now.key.empty())
 		return then.key == now.key;
@@ -337,7 +338,7 @@ enum class StashStep : uint8_t
 	GiveUp // another character now, the character is gone, or his player stayed away: the items stay, the stash goes
 };
 
-constexpr uint64_t kStashWaitMs = 5000; // plan T9 step 3: while the character is here, the stash has this long
+constexpr uint64_t kStashWaitMs = 5000; // while the character is here, the stash has this long
 constexpr uint64_t kStashAwayWaitMs = 600000; // a player who left: his parked character waits this long for the move
 
 // What a pending stash does this frame. `deadline`: the 5 s of the stash (see stash_presence); `give_up_at`: its
@@ -358,7 +359,7 @@ inline StashStep stash_step(bool owner_same, Presence character, Presence stash,
 	return stash == Presence::Gone || now >= give_up_at ? StashStep::GiveUp : StashStep::Wait;
 }
 
-constexpr float kDropReachM = 3.0f; // Review Focus 4: what fell lies within this distance of the death spot
+constexpr float kDropReachM = 3.0f; // dropped items lie within this distance of the death spot
 
 // Where the items of a stash that did not come online drop (StashStep::DropAtBody). They belong where he died: `died`
 // is the place the stash was made for, `now` the drop place of the body as it is, `body` its position. A body within
@@ -395,10 +396,10 @@ inline void stash_presence(uint64_t& deadline, bool& away, Presence character, u
 	}
 }
 
-// ---------------------------------------------------------------- Ruling L-1: the lost share goes into a bag (2026-10-23)
+// ---------------------------------------------------------------- the lost share goes into a bag
 
-// What a death does with the things it takes (the owner's playtest of build 7: seven small items in the grass are hard
-// to find and to pick up, one bag with a PDA mark is what he expects). Drop: the share pick_losses takes goes into a
+// What a death does with the things it takes: one bag with a PDA mark, not loose small items in the grass that are hard
+// to find and to pick up. Drop: the share pick_losses takes goes into a
 // coop_death_stash at the body; Corpse: the whole backpack (stash_ids) goes there; Lose: the share is destroyed. The
 // engine carries the plan out (coop_death.cpp); every fallback of a stash (no [coop_death_stash], a stash that does not
 // come online in time) still lets the items fall at the body.
@@ -418,7 +419,7 @@ struct LossPlan
 };
 
 // `items`, `kinds` and `layout_known` as for loss_candidates; `shares` and `seed` as for pick_losses (Corpse uses
-// neither). Build 10: `share_pct` is coop_death_share, the shares of Drop and Lose are scale_shares(shares, share_pct);
+// neither). `share_pct` is coop_death_share, the shares of Drop and Lose are scale_shares(shares, share_pct);
 // Keep takes nothing (LossMove::None, marker Keep: no marker). A mode byte Rules::read would never give acts as Drop,
 // the default mode. No item to take: LossMove::None.
 inline LossPlan plan_losses(Drop mode, const std::vector<ItemFacts>& items, const KindTable& kinds, bool layout_known,
@@ -450,7 +451,7 @@ inline LossPlan plan_losses(Drop mode, const std::vector<ItemFacts>& items, cons
 	return p;
 }
 
-// What the host sees of one box on its level, once a second (carried from F3 T15, concern 3: the stock
+// What the host sees of one box on its level, once a second (the stock
 // item_backpack.actor_on_item_take_from_box releases only inv_backpack, so an emptied death bag stayed for ever).
 struct BagState
 {
@@ -459,20 +460,20 @@ struct BagState
 	bool empty = false; // nothing in it: the server entity has no child and the box lists no item
 	bool pending = false; // a death still waits to move its items into it (host_stash_pending of the stash)
 	bool in_use = false; // the host has it open in his own window
-	// L-1 round 1, I1: a player has it open in his window, as the host knows from ReqContainer (trade::host_container_open).
+	// A player has it open in his window, as the host knows from ReqContainer (trade::host_container_open).
 	// His window keeps a raw pointer to the box (CUIActorMenu::m_pInvBox) and reads it every frame.
 	bool open_by_player = false;
 };
 
 // The host releases a death bag that is empty and online, and only that: never one that still waits for its items, has
 // something in it, is offline (nobody can empty it there; it is looked at again when it is online), is open in the
-// host's window or in a player's (L-1 round 1, I1; it goes when he closes it), or is not a death bag.
+// host's window or in a player's (it goes when he closes it), or is not a death bag.
 inline bool release_empty_bag(const BagState& s)
 {
 	return s.death_stash && s.online && s.empty && !s.pending && !s.in_use && !s.open_by_player;
 }
 
-// The owner of a bag in its custom data (carried from F3 T15, concern 4), written by the host when it spawns the bag:
+// The owner of a bag in its custom data, written by the host when it spawns the bag:
 //   [coop_death_stash]
 //   nick = "<nick>"
 //   key = <the player key digest of the character, none for the host's actor>
@@ -521,21 +522,5 @@ inline void stash_owner_to_ini(std::string& text, const std::string& nick, const
 		checkpoint::ini_set(text, kStashIniSection, kStashIniKey, key);
 }
 
-// The owner of a bag: false if its custom data names none (an older bag, or none was known). The nick comes without
-// the quotes it was written in; a key that is not a key digest reads as none.
-inline bool stash_owner_from_ini(const std::string& text, std::string& nick, std::string& key)
-{
-	std::string n, k;
-	if (checkpoint::ini_get(text, kStashIniSection, kStashIniNick, n) && n.size() >= 2 && n.front() == '"' &&
-		n.back() == '"')
-		n = n.substr(1, n.size() - 2);
-	if (!checkpoint::ini_get(text, kStashIniSection, kStashIniKey, k) || !detail::is_key_digest(k))
-		k.clear();
-	if (n.empty() && k.empty())
-		return false;
-	nick = n;
-	key = k;
-	return true;
-}
 } // namespace death
 } // namespace coop

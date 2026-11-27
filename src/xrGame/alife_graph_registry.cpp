@@ -103,7 +103,7 @@ void CALifeGraphRegistry::setup_current_level()
 	}
 	R_ASSERT2(ai().game_graph().header().levels().end() != I, "Graph point level ID not found!");
 
-	// Anomaly Coop: the level was set at the top of this function, before level_load started; here stood a second
+	// coop: the level was set at the top of this function, before level_load started; here stood a second
 	// Level_ID(..., true). It set the same level again on this thread while the task was loading it: Level_Set on two
 	// threads at once freed "$level$" twice (IGame_Level::Load has the whole story), and even alone it replaced the path
 	// the task was reading. The id is the one found above.
@@ -180,7 +180,7 @@ void CALifeGraphRegistry::add(CSE_ALifeDynamicObject* object, GameGraph::_GRAPH_
 	if (!object->m_bOnline && object->used_ai_locations() /**&& object->interactive()/**/)
 	{
 		VERIFY(ai().game_graph().valid_vertex_id(game_vertex_id));
-		// Anomaly Coop: an entity with no game vertex (0xFFFF: e.g. level.spawn_item from a script) and used_ai_locations()
+		// coop: an entity with no game vertex (0xFFFF: e.g. level.spawn_item from a script) and used_ai_locations()
 		// indexed far outside m_objects here (register_object, and the coop switch_online / switch_offline of
 		// Placement::OnlineNow). It is not put on any graph point; for a valid vertex nothing changes.
 		if (ai().game_graph().valid_vertex_id(game_vertex_id))
@@ -206,13 +206,13 @@ void CALifeGraphRegistry::remove(CSE_ALifeDynamicObject* object, GameGraph::_GRA
 			Msg					("[LSS] removing object [%s][%d] from graph point %d",object->name_replace(),object->ID,game_vertex_id);
 		}
 #endif
-		// Anomaly Coop: no game vertex -> it was never put on a graph point (see add); do not index outside m_objects.
+		// coop: no game vertex -> it was never put on a graph point (see add); do not index outside m_objects.
 		if (ai().game_graph().valid_vertex_id(game_vertex_id))
 			m_objects[game_vertex_id].objects().remove(object->ID);
 	}
 	if (update && m_level)
 	{
-		// Anomaly Coop: vertex() of an invalid id reads outside the graph too; such an object is on no level by its
+		// coop: vertex() of an invalid id reads outside the graph too; such an object is on no level by its
 		// vertex, so it is removed without the "must be here" assert. A valid vertex keeps the stock test.
 		if (ai().game_graph().valid_vertex_id(game_vertex_id))
 			level().remove(object, ai().game_graph().vertex(game_vertex_id)->level_id() != level().level_id());

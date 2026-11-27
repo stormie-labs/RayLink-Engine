@@ -1,12 +1,14 @@
 #include "stdafx.h"
 #include "coop_mapserver.h"
+#include "xrCoop/coop_mode_stamp.h"
 #include "../coop_autosave.h"
 #include "../coop_join.h"
 #include "../coop_levels.h"
 #include "../coop_manager.h"
 #include "../coop_net.h"
 #include "../coop_sync.h"
-#include "xrCoop/srv/coop_levels_memory.h" // O6: the commit guard (report #938)
+#include "coop_levels_alife.h" // levels::xfer_replay_heard
+#include "xrCoop/srv/coop_levels_memory.h" // the commit guard
 #include "xrCoop/srv/coop_operator.h" // op::redact
 #include "xrCoop/srv/coop_session_srv.h"
 
@@ -26,17 +28,10 @@
 
 #pragma comment(lib, "psapi.lib")
 
-// F3a split levels: the map-server processes (T9): see coop_mapserver.h.
+// See coop_mapserver.h.
 
 namespace coop
 {
-namespace levels
-{
-// O6 (§8a A22 open item a), srv/coop_levels_xfer.cpp: the done-records the replay raised reached this map server's Lua (or there were
-// none). Declared here until coop_levels.h, not O6's file, takes it.
-bool xfer_replay_heard();
-} // namespace levels
-
 namespace mapserver
 {
 namespace
@@ -62,8 +57,8 @@ struct Server
 	wire::ServerState said = wire::ServerState::Loading;
 	wire::MapServerStateMsg last; // its last report
 	bool gave_up_told = false;
-	levels::StartWait start_wait; // O6: the clock of its start's wait for the commit (levels::start_room)
-	levels::StartRoom start_told = levels::StartRoom::Go; // O6: why its start waits, as last said (once per reason)
+	levels::StartWait start_wait; // the clock of its start's wait for the commit (levels::start_room)
+	levels::StartRoom start_told = levels::StartRoom::Go; // why its start waits, as last said (once per reason)
 };
 
 struct Host
@@ -72,8 +67,8 @@ struct Host
 	std::vector<PeerId> bridges; // Server::k of those that run (host_bridges)
 	HANDLE job = nullptr; // the processes end with this one, however it ends
 	u32 started = 0, crashed = 0;
-	// the memory guard (build 50): short of free physical memory, no empty map server lingers (levels::memory_low); O6 (report #938):
-	// short of commit, no map server starts either (xrCoop/srv/coop_levels_memory.h)
+	// The memory guard stops empty map servers when physical memory runs low (levels::memory_low).
+	// It also prevents map servers from starting when commit is low (xrCoop/srv/coop_levels_memory.h).
 	levels::MemoryLook memory; // the last look, each border with its band
 	bool low_memory = false; // levels::short_of_memory(memory)
 	u64 memory_at = 0; // the next look
@@ -196,7 +191,7 @@ const char* name_of(u16 level)
 	return name ? name : "?";
 }
 
-// The memory guard: a look every kMemoryEveryMs at the physical memory and (O6, report #938) the commit left, one line when either turns
+// The memory guard: a look every kMemoryEveryMs at the physical memory and the commit left, one line when either turns
 // low and one when it is over. The operator's notices, no fault: no '!' after the tag.
 void check_memory(u64 now)
 {
@@ -231,7 +226,7 @@ void check_memory(u64 now)
 	g.low_memory = levels::short_of_memory(g.memory);
 }
 
-// O6 fix round: the map servers launched and still loading. Their commit comes over their load, so the look does not have it yet
+// The map servers launched and still loading. Their commit comes over their load, so the look does not have it yet
 // (levels::start_room counts each as if it had it). Counted when a start asks, so one started earlier in the same pass counts.
 u32 starting_now()
 {
@@ -241,7 +236,7 @@ u32 starting_now()
 	return n;
 }
 
-// O6: why a start waits, said once per reason. The operator's notice, no fault: no '!' after the tag.
+// Log each reason a map server waits to start once. These are operator notices and use the [coop] tag without '!'.
 void tell_wait(u16 level, Server& s, levels::StartRoom room)
 {
 	if (s.start_told == room)
@@ -361,7 +356,7 @@ bool launch(u16 level, Server& s, u32 epoch)
 	si.cb = sizeof(si);
 	PROCESS_INFORMATION pi;
 	ZeroMemory(&pi, sizeof(pi));
-	// MO2's virtual files reach a child by themselves (USVFS hooks CreateProcess): plan §1.8, a live check
+	// MO2's virtual files reach a child by themselves (USVFS hooks CreateProcess)
 	if (!CreateProcessA(exe, &line[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
 	{
 		::Msg("! [coop] map server: cannot start it for level %u: error %lu", u32(level), GetLastError());
@@ -428,8 +423,8 @@ void watch_process(u16 level, Server& s)
 	if (!s.process || WaitForSingleObject(s.process, 0) != WAIT_OBJECT_0)
 		return;
 	// What it ended with tells a fault from an order: 1 is the engine's own end after a fatal error, 3 its watchdog after one, and
-	// 0xC0000005 and the like a fault nobody caught. Live 2026-11-13: the first map server of a world vanished in its load, its log
-	// cut in the middle of a line, no dump and nothing in Windows' own log - and the world server did not say how it had ended.
+	// 0xC0000005 and the like a fault nobody caught: a map server that vanishes in its load can leave a log cut in the middle of a line,
+	// no dump and nothing in Windows' own log, so the world server says how it ended.
 	DWORD code = 0;
 	if (GetExitCodeProcess(s.process, &code))
 		::Msg("[coop] map server %u: its process ended with code %lu (0x%08lX)", s.k, code, code);
@@ -466,6 +461,7 @@ void host_on_bridge_joined(PeerId bridge)
 {
 	if (Server* s = server_of_bridge(bridge))
 		s->link.joined();
+	g_mode_stamp.bump(); // a map-server link appeared
 	sync::host_begin_join(bridge);
 	list_bridges();
 	levels::host_map_changed(); // it learns its level's players and the rules from the table
@@ -476,6 +472,7 @@ void host_on_bridge_left(PeerId bridge, const std::string& reason)
 	u16 level = wire::kNoLevel;
 	Server* s = server_of_bridge(bridge, &level);
 	::Msg("[coop] map server %u left: %s", bridge_index(bridge), reason.c_str());
+	g_mode_stamp.bump(); // a map-server link is gone
 	if (s && s->link.left())
 		on_lost(level, *s);
 	list_bridges();
@@ -529,9 +526,9 @@ void say_state(wire::ServerState state)
 	me.frame_max = 0;
 }
 
-// Plan §1.6: nobody plays the actor of a map server. It has to exist (a level has one, the stock code asks for it), and that is all: no
-// AI sees or hears it (npc_ai::ghost), nothing hurts it, nothing bumps into it, no player sees it (it sends no stream at all,
-// net::client_send), it watches nothing and keeps nothing online (observer_distance, viewers), and it is nobody's seat.
+// A map server has an unplayed actor because stock code requires one per level. AI cannot see or hear it
+// (npc_ai::ghost). The actor takes no damage, collides with nothing and sends no stream to players (net::client_send).
+// It watches nothing, keeps nothing online (observer_distance, viewers) and occupies no seat.
 void server_on_order(PeerId from, Reader& r)
 {
 	wire::MapServerOrderMsg m;
@@ -548,6 +545,7 @@ void server_on_order(PeerId from, Reader& r)
 
 void ghost_frame()
 {
+	PROF_EVENT("coop/coop_mapserver/ghost_frame");
 	if (!g_actor)
 		return;
 	psActorFlags.set(AF_GODMODE, TRUE);
@@ -567,7 +565,7 @@ bool parsed_key()
 	{
 		me.parsed = true;
 		me.is = parse_args(Core.Params, me.args);
-		if (Core.Params && strstr(Core.Params, kKey) && !me.is)
+		if (ascii::find_key(Core.Params, kKey) && !me.is)
 			::Msg("! [coop] map server: the key -coop_mapserver cannot be read: '%s'", op::redact(Core.Params).c_str());
 	}
 	return me.is;
@@ -589,9 +587,10 @@ void install_client(Endpoint& e)
 	e.on(Msg::MapServerOrder, &server_on_order);
 }
 
-// levels::frame of the world server's mode (S4, A-S4H: it asks no mode itself)
+// levels::frame of the world server's mode (it asks no mode itself)
 void host_frame()
 {
+	PROF_EVENT("coop/coop_mapserver/host_frame");
 	const u64 now = mgr().now_ms();
 	for (const u16 level : levels::host_map_levels())
 		g.servers[level];
@@ -623,7 +622,7 @@ void host_frame()
 			s.gave_up_told = false;
 			if (!s.process && world_up() && has_number(s))
 			{
-				// O6 (report #938): out of commit a process dies, the world server first. The start waits (no failure: it does not count
+				// Out of commit a process dies, the world server first. The start waits (no failure: it does not count
 				// towards giving its level up, as a start that waits for a number) while the servers still loading would take the room, or
 				// the commit is low; an empty server, which stops at once while the commit is short, may give it back. A wait for the commit
 				// alone ends after levels::kCommitWaitMs unless the start would leave this PC under 0.5 GB (xrCoop/srv/coop_levels_memory.h).
@@ -811,11 +810,12 @@ void host_world_replaced(u32 epoch)
 	}
 }
 
-// levels::frame of a map server's mode (S4, A-S4H: it asks no mode itself)
+// levels::frame of a map server's mode (it asks no mode itself)
 void server_frame()
 {
 	if (!levels::split())
 		return; // its world's Welcome has not said the session's mode yet: nothing of its level runs, its frame times count from there
+	PROF_EVENT("coop/coop_mapserver/server_frame");
 	const u64 now = mgr().now_ms();
 	if (me.frame_at)
 	{
@@ -833,7 +833,7 @@ void server_frame()
 	me.in_world.clear();
 	if (world_up())
 		ghost_frame();
-	// O6 (§8a A22 open item a): and once the done-records its replay raised reached its Lua (levels::xfer_replay_heard), so a player
+	// and once the done-records its replay raised reached its Lua (levels::xfer_replay_heard), so a player
 	// that Ready lets in retries an op only after the ledger knows it
 	if (!me.ready_said && mgr().is_live_client() && world_up() && !Device.dwPrecacheFrame && levels::xfer_replay_heard())
 	{

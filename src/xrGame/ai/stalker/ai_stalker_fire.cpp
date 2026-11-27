@@ -54,7 +54,7 @@
 #include "../../trajectories.h"
 #include "script_hit.h"
 #include "../../xrServerEntities/script_engine.h"
-#include "../../coop/coop_requests.h" // Anomaly Coop
+#include "../../coop/coop_requests.h"
 
 using namespace StalkerSpace;
 
@@ -266,7 +266,7 @@ void CAI_Stalker::g_WeaponBones(int& L, int& R1, int& R2)
 
 void CAI_Stalker::Hit(SHit* pHDS)
 {
-	if (coop::requests::stalker_hit(this, pHDS)) return; // Anomaly Coop: player characters are hurt by their owner
+	if (coop::requests::stalker_hit(this, pHDS)) return; // coop: player characters are hurt by their owner
 	//хит может меняться в зависимости от ранга (новички получают больше хита, чем ветераны)
 	SHit HDS = *pHDS;
 	HDS.add_wound = true;

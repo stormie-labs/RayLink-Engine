@@ -1,93 +1,53 @@
-# Anomaly Coop — engine layer (src/xrGame/coop)
+# Anomaly Coop — the game side of the engine (src/xrGame/coop)
 
-Co-op for S.T.A.L.K.E.R. Anomaly 1.5.3 on the open xray-monolith engine (revision ad9d841660, branch `coop`).
-Project root: `D:\Projects\ForEverything\anomaly-coop` (docs: `DESIGN.md` §10, `SPEC.md`, `MODLOG.md`).
+Co-op and the server for S.T.A.L.K.E.R. Anomaly on the open xray-monolith engine. The rules of the code are
+`docs/CODE_RULES.md`; the two modes and the three layers are `docs/MODES.md`. This file is the map of this folder.
 
-## Rules for everyone working here
-- **Sources:** only this open engine, OpenXRay (MIT), ENet (MIT), GameNetworkingSockets (BSD-3), general knowledge,
-  and the project docs (`SPEC.md`, `DESIGN.md`, `logic-md/*.md` = behaviour notes). Never copy code from closed mods.
-- **Thin engine hooks.** Logic lives in new files under `src/xrGame/coop/`. Inside existing engine files add only short
-  calls into coop code, each marked with a comment containing `Anomaly Coop`. Never reformat engine code.
-- **Code style:** tabs, `m_` members, engine types (`u16`, `xr_vector`, `shared_str`), no exceptions, no `using namespace` in
-  headers. Inside `namespace coop`, call the engine logger as `::Msg(...)` — plain `Msg` is the `coop::Msg` enum.
-  Log lines start with `[coop]`. Errors start with `! [coop]`.
-- **Compile check (no link):** `bash D:/Projects/ForEverything/anomaly-coop/tools/compile_files.sh <paths relative to src/xrGame>`
-  e.g. `coop/coop_events.cpp Level_network.cpp`. It holds a lock (one compile at a time); a full build is done by the lead.
-  New `.cpp/.h` files must be added to `xrGame.vcxproj` with
-  `python D:/Projects/ForEverything/anomaly-coop/tools/vcxproj_add.py D:/Projects/ForEverything/anomaly-coop/engine/src/xrGame/xrGame.vcxproj Coop "coop\file.cpp" ...`
-  (the lead may have pre-registered your files; the script is idempotent).
-- Do not run git commands. Do not edit files owned by another work package (see the table at the end).
-
-## Architecture ("mirror world")
-- Every player runs a normal single-player Anomaly game (own `Actor()`, UI, PDA, scripts). The **host** is authoritative.
-- **Join:** the host writes a save (`.scop` + Anomaly's script storage `.scoc`) and streams it; the client loads it, so **all
-  server entity ids are identical** on both machines.
-- **Players:** a remote player is a stalker entity of section `coop_player_avatar` ("proxy") in the host world; it carries the
-  player's inventory as normal world items in the host save. On a client, right after the save is read, the local actor (id 0)
-  and the client's own proxy swap data (`coop_join.cpp: on_alife_objects_loaded`). Id mapping: only the pair (0, my_proxy) is
-  swapped: `join::to_local(host_id)`, `join::to_host(local_id)`. **All ids on the wire are in host numbering.**
-- **Absent players are not in the world** (W9): a player's character (`coop_player_avatar`, any machine) is online
-  only while its player is in the session: on the host from WorldLoaded until he leaves (`coop::switch_vote`,
-  `join::host_player_in_world`, `join::take_offline/bring_online`), never without a session. It stays in ALife and
-  in the save, offline, with its inventory. Nobody can talk to it (talk off in `coop_remote.cpp`, silent refusal
-  in `dialog::may_start_talk`).
-- **Link liveness** (W9): a silent peer is dropped after 10 s (`coop_manager.cpp kPeerTimeoutMs`). Code that blocks
-  the main thread for long (level teardown/load, writing a save) calls `coop::on_blocking_work()`; the transport
-  then answers ENet from a helper thread (`Session::hold_connection`) until the next normal frame.
-- **Client ALife is frozen** (no offline simulation). Online/offline is decided by the host (`coop_alife.cpp`,
-  `entities::client_wants_online`). Host-side switching uses the distance to the nearest player (`observer_distance`).
-- **Only the host creates/destroys server entities** (P7). Clients send requests; the host applies the first valid one and
-  broadcasts the result; clients apply results with the same ids.
-- **Remote-driven objects:** on clients every NPC/monster is driven by host snapshots (`coop_entities.cpp`), and every player
-  avatar (on host and clients) by its player's snapshots (`coop_players.cpp`). Remote-driven objects must not think, select
-  animations, run script binder logic or apply damage locally. `coop::sync::is_remote_driven(obj)` answers that.
-
-## Threading (verified by reading the engine)
-- Network pump: `coop::on_frame()` from `CGamePersistent::OnFrame` (main thread, FrameMove, also in the main menu).
-- ALife update, object `shedule_Update`, `xrServer::Process_spawn` and `CLevel::net_Update` run in `GameThread`
-  (worker) **while the main thread renders**; the worker is joined before the next FrameMove. So coop code called from either
-  side never runs concurrently with the network pump, but must not touch rendering state. Hooks called from the worker
-  should only record facts; sending happens in `frame()`.
-
-## Messaging
-- `xrCoop/coop_protocol.h` — `coop::Msg` types (append new ones only in the ranges there), `Writer`/`Reader` in `coop_wire.h`.
-- `coop_net.h` — `net::host_broadcast`, `net::host_send` (queued while a client loads, P6), `net::client_send`.
-- Register handlers in your module's `install_server(Session&)` (messages the world server handles) and
-  `install_client(Endpoint&)` (messages a player handles) via `on(Msg::X, handler)`; `coop_sync.cpp` installs the
-  server table in the host process and the client table everywhere (F3a: the host player is a client of his own
-  server over `xrCoop/coop_local_link.h`; until a message is in `link_enabled`, its client handler in the host
-  process gets nothing). Handlers get `(PeerId from, Reader& r)`. Check the role (`mgr().is_host()`, `mgr().is_live_client()`).
-- Every message must be idempotent (a repeat changes nothing) and must tolerate objects that do not exist yet (P6).
-
-## Diagnostics (P9)
-- `coop_status`, `coop_dump [id]`, `coop_netsim <lag> [jitter] [loss%]`. Add your counters to your module's
-  `print_status()`.
-
-## Work packages and file ownership
-| WP | Owner | Files |
+## The layers
+| Layer | Where | What |
 |---|---|---|
-| core | lead | coop_manager, coop_console, coop_join, coop_world, coop_sync, coop_net, coop_alife, coop_entities, coop_players; alife_* hooks, GamePersistent, console_commands, Actor.h |
-| net | agent | `src/xrCoop/*`, `src/3rd party/enet/*`, `tests/*` |
-| WP1 remote creatures | agent | coop_remote.*; ai/stalker/ai_stalker*.cpp/.h (except ai_stalker_fire.cpp), stalker_animation_manager*.cpp, CustomMonster.*, ai/monsters/basemonster/base_monster*.cpp, ai/monsters/control_animation_base*.cpp, Level_network_spawn.cpp, script_binder.cpp |
-| WP2 events & requests | agent | coop_events.*, coop_requests.*; Level_network.cpp, xrServer_process_event*.cpp, alife_simulator_script.cpp, level_script.cpp, ai/stalker/ai_stalker_fire.cpp, Actor.cpp (hit section only) |
-| WP3 world state | agent | coop_worldstate.*; alife_time_manager*, environment/weather hooks (xrEngine/Environment*.cpp only if unavoidable), game time console |
-| WP4 story & tasks | agent | coop_story.*; GameTaskManager.cpp, GameTask.cpp, Actor_Events / info portion code, relation_registry*.cpp, map_manager.cpp |
-| WP5 Lua & gamedata | agent | coop_script.* (luabind exports), script_engine hooks, `anomaly-coop/gamedata/**` |
-| WP6 dialogs, trade, containers | agent | coop_dialog.*, coop_trade.*; PhraseDialog*.cpp, AI_PhraseDialogManager.cpp, PhraseDialogManager.cpp, ui/UITalkWnd*.cpp, ui/UIActorMenuTrade.cpp, ui/UIActorMenuDeadBodySearch.cpp, ui/UIActorMenu.cpp (open/close hooks only), Trade*.cpp, ai/trader/ai_trader.cpp |
-| WP7 world objects | agent | coop_objects.*; PhysicObject.cpp, BreakableObject.cpp, DestroyablePhysicsObject.cpp, PHDestroyable.cpp, CustomZone.cpp, ZoneCampfire.cpp, Artefact.cpp, artefact_activation.cpp, Explosive.cpp, Missile.cpp, Grenade.cpp, Bolt.cpp, script door / interactable helpers (doors in Anomaly are CPhysicObject + scripts) |
-| WP8 player survival & presentation | agent | coop_survival.*, coop_presence.*; ActorCondition.cpp, HUDManager.cpp, ui/UIHudStatesWnd*.cpp, Spectator.cpp; Actor.cpp hooks are applied by the lead (WP2 owns Actor.cpp now) |
-| WP9 owned item state | agent | coop_items.*; Weapon.cpp, WeaponMagazined.cpp, WeaponMagazinedWGrenade.cpp, WeaponAmmo.cpp, inventory_item.cpp (state/condition only), eatable_item.cpp, ui/UIInvUpgrade.cpp, inventory_upgrade*.cpp |
+| Core (`core`) | `src/xrGame/coop/*.cpp`, `src/xrCoop/*.h` | what both modes need and do the same way: sync, items, death, money, tasks and checkpoints as rules, HUD, menus, the protocol |
+| Co-op (`hostplay`) | `hostplay/`, `src/xrCoop/hostplay/`, namespace `coop::hostplay` | only where the host plays himself: the host player's LocalLink, the group's level change, Steam |
+| Server (`srv`) | `srv/`, `src/xrCoop/srv/`, namespace `coop::srv` (and `coop::levels`, `coop::mapserver`, `coop::dedicated`) | only the world server and the map servers: seats, map servers, bridges, level transfer, the operator's console |
 
-Notes:
-- `level_script.cpp`: WP2 owns spawn functions, WP3 time/weather functions, WP4 map-spot functions — touch only yours.
-- `Actor.cpp`: WP2 hit section; anything else is requested from the lead.
-- `stalker_animation_script.cpp` belongs to WP1 (stalker animation files).
+- The Core never asks which mode it runs in. What depends on the mode it asks the session's mode (`mode()`, `xrCoop/coop_mode.h`):
+  `where(peer)`, `decider_of`, `decides_world()`, `leads_level()`, `actor_is_player()` (the full list: `docs/CODE_RULES.md`
+  LAYER-1). `is_host()` / `is_client()` and the role helpers of `coop_manager.h` are the old names; new Core code does not use them.
+- The Core reaches a layer only through the switchboard (`coop_mode.cpp`: `Layer` boots, `mode_for`, `register_layers_console`,
+  `register_layers_lua`). Layers do not name each other. `tools/check_layers.py` checks all of it.
+- Engine (stock) files get one-line hooks into a `coop::` function, marked `// coop:`, in the stock order of effects.
 
-### Wave 3 (2026-10-20 18:13)
-| WP | Files |
-|---|---|
-| W3a rockets + router bypasses | coop_events.*, coop_requests.* (rocket/launch parts and Lua bypass gates only), RocketLauncher.cpp, CustomRocket.cpp, ExplosiveRocket.cpp, WeaponMagazinedWGrenade.cpp (launch path only), script_game_object3.cpp (attach_vehicle gate), alife_simulator_script.cpp (teleport/kill/switch gates) |
-| W3b barter + money order | coop_trade.*, ui/UIActorMenuTrade.cpp, coop_requests.cpp (money/outbox flush only — coordinate with W3a: touch only ReqMoney/outbox functions) |
-| W3c story follow-ups | coop_story.*, relation_registry_actions.cpp, `gamedata/scripts/coop_main.script` (task routing section only) |
-| W3d host settings + mod diff screen | coop_script.*, `gamedata/scripts/coop_*.script` except coop_main.script task section, `gamedata/configs/**`, new `gamedata/configs/ui/*coop*.xml` |
-| lead (R1 review running) | coop_manager, coop_console, coop_join, coop_world, coop_sync, coop_net, coop_alife, coop_entities, coop_players, coop_equip, alife_* hooks |
+## The modules
+- `coop_manager.*` owns the network sessions, the phase and the roles of this process, and runs every frame
+  (`coop::on_frame()` from `CGamePersistent::OnFrame`, menu and game).
+- `coop_sync.cpp` is the module table: every pass (once per process, the handler tables, session start, a peer left, reset,
+  frame, `coop_status`) is a list of rows in its own order; a frame row has its gate (always, world up, world not up, no
+  level in the making). A new module adds its row to each pass it takes part in.
+- `coop_console.cpp` registers every command and setting once at the start of the process, before user.ltx is read; the
+  layers' own come through `register_layers_console`.
+
+## Threads
+- Manager::frame, every module's `frame()`, the handlers of messages and Lua run on the main thread.
+- ALife updates, `shedule_Update`, `xrServer::Process_spawn` and `CLevel::net_Update` may run on the game thread while the
+  main thread renders. The game thread is joined before the next frame, and ALife and server hooks may run on it.
+  Keep these hooks outside the co-op `frame()`. This rule has no runtime check.
+- Data a hook fills is guarded by one lock type, `xrCriticalSection`; under the lock a container is swapped or copied,
+  the sending happens in `frame()` (`docs/CODE_RULES.md` CPP-6, CPP-7). Hooks do not touch rendering state.
+- A thread we start (the transport's keep-alive, Steam, the console window) has an owner that stops and joins it at exit;
+  it touches neither D3D nor Lua.
+
+## Messages
+- `xrCoop/coop_protocol.h` holds the `coop::Msg` types, `xrCoop/coop_wire.h` the `Writer` / `Reader`; a new message follows
+  `docs/CODE_RULES.md` CPP-17.
+- `coop_net.h`: `net::host_broadcast`, `net::host_send` (queued while the peer loads the world), `net::client_send`.
+- A module installs its handlers in `install_server(Session&)` (what the deciding process takes) and
+  `install_client(Endpoint&)` (what a player's machine takes); the session's mode installs the tables when a session starts.
+  Handlers get `(PeerId from, Reader& r)`.
+- Every message is idempotent (a repeat changes nothing) and tolerates objects that do not exist yet. Ids on the wire are in
+  the host's numbering (`join::to_host` / `join::to_local`).
+
+## Diagnostics
+- `coop_status`, `coop_dump [id]`, `coop_netsim <lag> [jitter] [loss%]`, `coop_ini_stats`, `coop_memory_map`; a server's
+  process also `coop_mapserver_stats`. A module adds its counters to its `print_status()`.
+- Log lines start with `[coop]`, errors with `! [coop]`. Inside `namespace coop` the engine logger is `::Msg(...)`: plain `Msg`
+  is the `coop::Msg` enum.

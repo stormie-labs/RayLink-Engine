@@ -7,7 +7,7 @@
 #include "../../visual_memory_manager.h"
 #include "../../actor.h"
 #include "../../actor_memory.h"
-#include "../../coop/coop_ai.h" // Anomaly Coop
+#include "../../coop/coop_ai.h"
 
 CMonsterEnemyManager::CMonsterEnemyManager()
 {
@@ -40,7 +40,7 @@ void CMonsterEnemyManager::init_external(CBaseMonster* M)
 
 void CMonsterEnemyManager::update()
 {
-	// Anomaly Coop: a player who is down drops out like a dead one, he stays alive for the engine
+	// coop: a player who is down drops out like a dead one, he stays alive for the engine
 	if (m_script_enemy && (m_script_enemy->getDestroy() || !m_script_enemy->g_Alive() || coop::npc_ai::player_down(m_script_enemy)))
 	{
 		script_enemy();
@@ -244,9 +244,9 @@ bool CMonsterEnemyManager::see_enemy_recently(const CEntityAlive* enemy)
 
 bool CMonsterEnemyManager::enemy_see_me_now()
 {
-	bool coop_player_sees = false; // Anomaly Coop: a remote player's character has no vision of its own
-	if (coop::npc_ai::player_sees(enemy, monster, coop_player_sees)) // Anomaly Coop
-		return (coop_player_sees); // Anomaly Coop
+	bool coop_player_sees = false; // coop: a remote player's character has no vision of its own
+	if (coop::npc_ai::player_sees(enemy, monster, coop_player_sees))
+		return (coop_player_sees);
 
 	if (Actor() == enemy)
 	{

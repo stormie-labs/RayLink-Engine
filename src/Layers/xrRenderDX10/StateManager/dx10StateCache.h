@@ -2,6 +2,16 @@
 #define	dx10StateCache_included
 #pragma once
 
+#include "dx10StateRecords.h"
+
+// coop: the log line of a D3D state the device did not create (kind: "sampler", "rasterizer", ...; code: its HRESULT, with
+// the renderer's note when the device was lost). Counted, the first eight and then one in a thousand
+// (dx10_state_records::log_failure).
+void dx10_state_create_failed(LPCSTR kind, long code);
+inline LPCSTR dx10_state_kind(const ID3DRasterizerState*) { return "rasterizer"; }
+inline LPCSTR dx10_state_kind(const ID3DDepthStencilState*) { return "depth-stencil"; }
+inline LPCSTR dx10_state_kind(const ID3DBlendState*) { return "blend"; }
+
 template <class IDeviceState, class StateDecs>
 class dx10StateCache
 {
@@ -29,7 +39,7 @@ private:
 	};
 
 private:
-	void CreateState(StateDecs desc, IDeviceState** ppIState);
+	HRESULT CreateState(StateDecs desc, IDeviceState** ppIState);
 	IDeviceState* FindState(const StateDecs& desc, u32 StateCRC);
 
 	//	Private data

@@ -56,7 +56,7 @@ void CALifeSimulatorBase::register_object(CSE_ALifeDynamicObject* object, bool a
 		object->on_register();
 
 	if (add_object)
-		coop::entities::host_on_entity_registered(object); // Anomaly Coop: new entity -> clients
+		coop::entities::host_on_entity_registered(object); // coop: new entity -> clients
 }
 
 void CALifeSimulatorBase::unregister_object(CSE_ALifeDynamicObject* object, bool alife_query)

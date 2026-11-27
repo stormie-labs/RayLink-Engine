@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players (F5-VEH-3, build 57, docs/VEHICLES.md sections 5 and 7): a player's machine, the pure half.
+// Anomaly Coop — vehicles for players (docs/VEHICLES.md sections 5 and 7): a player's machine, the pure half.
 //
 // The player sits in the kinematic copy of the car on his own machine; the process that decides for his level (the co-op host,
 // in the Server mode the map server of his level) drives the real car. These rules are the same in both modes:
@@ -11,7 +10,7 @@
 //   - RequestTrack: one seat request at a time, never sooner than kRequestMinIntervalMs after the last one (the decider's trust
 //     check veh_request_rate), forgotten after kAnswerTimeoutMs without an answer (the HUD says so);
 //   - seat_step: what a VehicleSeat of the decider means for this machine's own actor.
-// Message layouts, the seat table and every constant named here: coop_vehicle_rules.h (F5-VEH-1).
+// Message layouts, the seat table and every constant named here: coop_vehicle_rules.h.
 //
 // Pure C++17, header-only, no engine dependencies: used by xrGame/coop/coop_vehicles_client.cpp and tests/test_vehicle_input.cpp.
 #pragma once
@@ -338,7 +337,7 @@ enum class SeatStep : uint8_t
 {
 	None, // not about me (the mirror table takes it), or my seat said again
 	Attach, // granted to me, seat 0: sit in the copy (the stock CActor::attach_Vehicle(car, true))
-	Ride, // granted to me, a seat >= 1: the passenger's ride (F5-VEH-5)
+	Ride, // granted to me, a seat >= 1: the passenger's ride (coop_vehicle_seats.h)
 	Leave, // released for me: out, at the decider's exit position
 	Lost, // granted to another character in the seat I hold: the decider has me out of it
 	Refused, // refused: RequestTrack says whether it was my request

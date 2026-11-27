@@ -16,8 +16,8 @@
 #include <unordered_map>
 #include <set>
 #include <luabind/class_info.hpp>
-#include "coop/coop_lua_errors.h" // Anomaly Coop (2026-11): Lua errors survived in a co-op session
-#include "script_file_rules.h" // Anomaly Coop (TZ R74): an empty script file is no module
+#include "coop/coop_lua_errors.h" // coop: Lua errors survived in a co-op session
+#include "script_file_rules.h" // coop: an empty script file is no module
 
 #ifdef USE_DEBUGGER
 #	ifndef USE_LUA_STUDIO
@@ -246,7 +246,7 @@ void CScriptEngine::lua_error(lua_State* L)
 #endif
 }
 
-// Anomaly Coop: how many times lua_error_not_crash met each Lua line in this Lua state (the limiter of its log)
+// coop: how many times lua_error_not_crash met each Lua line in this Lua state (the limiter of its log)
 static std::unordered_map<std::string, u32> s_not_crash_seen;
 // The scripts' handler is running (it may touch a destroyed object itself and come back: one call at a time)
 static thread_local bool s_in_not_crash_handler = false;
@@ -257,9 +257,9 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
     if (!lua_busy_hands_debug)
         return;
 
-    // Anomaly Coop (2026-11, crash triage): the stack of L, the state the error is in (a coroutine is not the main state;
-    // the main state's stack was printed before), and what is on top of L; the text is an argument, never a format, and
-    // cut to 2000 characters (Msg drops a whole line longer than its 4096 buffer)
+    // coop: the stack of L, the state the error is in (a coroutine is not the main state; the main state's stack was
+    // printed before), and what is on top of L; the text is an argument, never a format, and cut to 2000 characters (Msg
+    // drops a whole line longer than its 4096 buffer)
     auto stack = get_lua_stack(L);
 
     xr_string lua_error_line = "";
@@ -272,15 +272,13 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
         }
     }
 
-    // Anomaly Coop (2026-11-17, RL-K958-GVST): the call after "Accessing destroyed object" used to be the last one (the
-    // game died, or the engine dropped the binder). Under a Lua pcall() it is an error now (lj_err.c) and the script goes
-    // on: one that keeps a destroyed object comes here on every frame. A Lua line is written 3 times and then every
+    // coop: under a Lua pcall() the call after "Accessing destroyed object" is an error (lj_err.c) and the script goes
+    // on, so one that keeps a destroyed object comes here on every frame. A Lua line is written 3 times and then every
     // 1000th time. The line is counted without its depth in the stack; 512 different lines start the count again (a
     // new one is never silent), and so does every new Lua state (CScriptEngine::init).
-    // Build 54 skipped the scripts' own handler (_G.COnLuaBindFatalError) together with the log. One failing call
-    // comes here three times (SafeWrap, luabind's catch, SafeWrap of the repeated call), so after a reload the next
-    // failure at that line gave no "Busy Hands" window and no temporary save on the host and in single player.
-    // The handler is called every time, as in build 51 (G.A.M.M.A.'s acts once per Lua state by itself).
+    // The scripts' own handler (_G.COnLuaBindFatalError) is called every time, the log limit does not apply to it: one
+    // failing call comes here three times (SafeWrap, luabind's catch, SafeWrap of the repeated call), and a handler
+    // skipped with the log would give no "Busy Hands" window and no temporary save after a reload.
     bool quiet = false;
     {
         const size_t from = lua_error_line.find("[Lua]");
@@ -295,17 +293,17 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
 
     if (!quiet)
     {
-    ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
-    const int top_type = lua_type(L, -1);
-    if (top_type == LUA_TSTRING)
-        Msg("! LUA error [BusyHandsDebug] top of the stack: string: %.2000s", lua_tostring(L, -1));
-    else
-        Msg("! LUA error [BusyHandsDebug] top of the stack: %s", lua_typename(L, top_type));
+        ai().script_engine().script_log(ScriptStorage::eLuaMessageTypeError, "[BusyHandsDebug] Runtime Error");
+        const int top_type = lua_type(L, -1);
+        if (top_type == LUA_TSTRING)
+            Msg("! LUA error [BusyHandsDebug] top of the stack: string: %.2000s", lua_tostring(L, -1));
+        else
+            Msg("! LUA error [BusyHandsDebug] top of the stack: %s", lua_typename(L, top_type));
 
-    // Anomaly Coop: in the log too: script_log goes nowhere in a release, the launcher's reports read "LUA error"
-    Msg("! LUA error [BusyHandsDebug]: %s", lua_error_line.c_str());
-    for (auto const& s : stack)
-        Msg("!   %s", s.c_str());
+        // coop: in the log too: script_log goes nowhere in a release, the launcher's reports read "LUA error"
+        Msg("! LUA error [BusyHandsDebug]: %s", lua_error_line.c_str());
+        for (auto const& s : stack)
+            Msg("!   %s", s.c_str());
     }
 
     if (s_in_not_crash_handler)
@@ -319,7 +317,7 @@ void CScriptEngine::lua_error_not_crash(lua_State* L)
 
 void printLuaStack()
 {
-	// Anomaly Coop (TZ R38): the crash handlers call it in the end of the process too, after clean_game_globals deleted the AI space:
+	// coop: the crash handlers call it in the end of the process too, after clean_game_globals deleted the AI space:
 	// ai() would build a new one there, with a script engine that loads the scripts through an FS that is gone
 	if (!g_ai_space)
 		return;
@@ -328,7 +326,7 @@ void printLuaStack()
 
 int CScriptEngine::lua_pcall_failed(lua_State* L)
 {
-	// Anomaly Coop (2026-11): in a co-op session (coop_lua_errors 1) the error is logged here, while its stack still exists,
+	// coop: in a co-op session (coop_lua_errors 1) the error is logged here, while its stack still exists,
 	// and survived: the error goes back as the result and the call proxy returns a safe value (coop/coop_lua_errors.h)
 	if (coop::lua_errors::on_pcall_error(L))
 		return 1;
@@ -383,8 +381,8 @@ void CScriptEngine::setup_callbacks()
 #if !XRAY_EXCEPTIONS
 		::luabind::set_error_callback(CScriptEngine::lua_error);
         ::luabind::set_error_callback_not_crash(CScriptEngine::lua_error_not_crash);
-		::luabind::set_error_survive_callback(coop::lua_errors::take_token); // Anomaly Coop (2026-11)
-		::luabind::set_not_object_is_error(coop::lua_errors::survive_now); // Anomaly Coop (2026-11-18)
+		::luabind::set_error_survive_callback(coop::lua_errors::take_token); // coop: a Lua error survived in a session
+		::luabind::set_not_object_is_error(coop::lua_errors::survive_now); // coop: in a session a value that is no C++ object is a Lua error, survived
 #endif
 
 		::luabind::set_pcall_callback(CScriptEngine::lua_pcall_failed);
@@ -446,7 +444,7 @@ void CScriptEngine::init()
         m_lua_studio_world->remove		(lua());
 #endif // #ifdef USE_LUA_STUDIO
 
-	s_not_crash_seen.clear(); // Anomaly Coop: the log limiter of lua_error_not_crash counts per Lua state
+	s_not_crash_seen.clear(); // coop: the log limiter of lua_error_not_crash counts per Lua state
 	s_in_not_crash_handler = false; // and a handler call that was left by a fault does not block the new state
 
 	// Invalidate functor cache as the Lua state is being recreated
@@ -573,16 +571,15 @@ void CScriptEngine::process_file_if_exists(LPCSTR file_name, bool warn_if_not_ex
 	if (m_reload_modules || (*file_name && !namespace_loaded(file_name)))
 	{
 		FS.update_path(S, "$game_scripts$", strconcat(sizeof(S1), S1, file_name, ".script"));
-		// Anomaly Coop (TZ R74, section 6.16): a script of zero bytes is how GAMMA removes a module (axr_main skips such
-		// files); asked for by name, it is no module, like a missing file. Loading it stopped Stable 60 at the world start.
-		// The size is read under the FS guard (-1: no such file).
+		// coop: a script of zero bytes is how a mod pack removes a module (axr_main skips such files); asked for by name,
+		// it is no module, like a missing file. The size is read under the FS guard (-1: no such file).
 		const int script_size = FS.file_length(S);
 		if (!warn_if_not_exist && (script_size < 0 || !script_file_rules::is_module(u32(script_size))))
 		{
 			if (script_size == 0)
 			{
 				// Once per name (add_no_file below): which empty module was asked for, and by whom.
-				Msg("! [coop] script %s is an empty file: no module (GAMMA removes scripts this way); asked for by:", S1);
+				Msg("! [coop] empty script %s defines no module. Requested by:", S1);
 				print_stack();
 			}
 #ifdef DEBUG

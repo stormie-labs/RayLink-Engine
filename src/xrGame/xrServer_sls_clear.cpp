@@ -5,9 +5,9 @@
 #include "xrServer.h"
 #include "xrmessages.h"
 #include "ai_space.h"
-#include "coop/coop_entities.h" // Anomaly Coop
-#include "coop/coop_levels.h" // Anomaly Coop: the split levels' word on a lost child (Perform_destroy)
-#include "alife_object_registry.h" // Anomaly Coop: what ALife knows of a lost child
+#include "coop/coop_entities.h"
+#include "coop/coop_levels.h" // coop: the split levels' word on a lost child (Perform_destroy)
+#include "alife_object_registry.h" // coop: what ALife knows of a lost child
 
 void xrServer::Perform_destroy(CSE_Abstract* object, u32 mode)
 {
@@ -33,10 +33,10 @@ void xrServer::Perform_destroy(CSE_Abstract* object, u32 mode)
 	{
 		CSE_Abstract* child = game->get_entity_from_eid(object->children.back());
 		if (!child && coop::entities::mirror_lost_child(object, object->children.back()))
-			continue; // Anomaly Coop (B2): a co-op client's mirror logs it and takes it off the list, no FATAL
+			continue; // coop: a co-op client's mirror logs it and takes it off the list, no FATAL
 		if (!child)
 		{
-			// Anomaly Coop (crash triage RL-DNED-2WKU, build 50, a host with split levels): the FATAL below named only the
+			// coop: the FATAL below named only the
 			// id; the holder and what ALife and the split levels know of the child go first, so the next report names it
 			const u16 lost = object->children.back();
 			CSE_ALifeDynamicObject* known = ai().get_alife() ? ai().alife().objects().object(lost, true) : nullptr;

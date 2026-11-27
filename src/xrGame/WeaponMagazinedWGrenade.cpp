@@ -12,7 +12,7 @@
 #include "../xrphysics/MathUtils.h"
 #include "player_hud.h"
 #include "../build_config_defines.h"
-#include "coop/coop_items.h" // Anomaly Coop
+#include "coop/coop_items.h"
 
 #ifdef DEBUG
 #	include "phdebug.h"
@@ -141,7 +141,7 @@ void CWeaponMagazinedWGrenade::OnShot()
 {
 	if (m_bGrenadeMode)
 	{
-		coop::items::on_weapon_fired(this); // Anomaly Coop: launcher shot (WP8)
+		coop::items::on_weapon_fired(this); // coop: launcher shot (WP8)
 		PlayAnimShoot();
 		PlaySound("sndShotG", get_LastFP2());
 		AddShotEffector();
@@ -612,7 +612,7 @@ bool CWeaponMagazinedWGrenade::CanDetach(LPCSTR item_section_name)
 
 bool CWeaponMagazinedWGrenade::Attach(PIItem pIItem, bool b_send_event)
 {
-	coop::items::touch(this); // Anomaly Coop
+	coop::items::touch(this); // coop: the item changed: its copies follow
 	CGrenadeLauncher* pGrenadeLauncher = smart_cast<CGrenadeLauncher*>(pIItem);
 
 	if (pGrenadeLauncher &&
@@ -644,7 +644,7 @@ bool CWeaponMagazinedWGrenade::Attach(PIItem pIItem, bool b_send_event)
 
 bool CWeaponMagazinedWGrenade::Detach(LPCSTR item_section_name, bool b_spawn_item)
 {
-	coop::items::touch(this); // Anomaly Coop
+	coop::items::touch(this); // coop: the item changed: its copies follow
 	if (ALife::eAddonAttachable == m_eGrenadeLauncherStatus &&
 		0 != (m_flagsAddOnState & CSE_ALifeItemWeapon::eWeaponAddonGrenadeLauncher) &&
 		!xr_strcmp(*m_sGrenadeLauncherName, item_section_name))

@@ -1,8 +1,8 @@
-// Anomaly Coop — the revive hold made visible (HUD v2 part 2, docs/HUD_V2.md "Поднятие союзника").
+// Anomaly Coop — the revive hold made visible (docs/HUD_V2.md).
 // A teammate revives a wounded player by holding USE with a medkit for kHoldMs (coop_survival.cpp). The reviver's machine
 // counts the hold and the host checks the revive when it is over (Request). So that the wounded sees the hold while it
 // goes on (a ring in the reviver's colour), and the reviver gets a truthful "done", five ops join Msg::PlayerRevive
-// (`u8 op` first, all layouts below follow it; ids in host numbering; protocol 8, not released):
+// (`u8 op` first, all layouts below follow it; ids in host numbering):
 //   Begin    reviver -> host         {u16 target, u16 seq, u16 item, u16 held_ms}  USE was held held_ms when it went out
 //   Cancel   reviver -> host         {u16 target, u16 seq}                         he let go / went away / fell
 //   Reviving host -> target owner    {u16 target, u16 seq, u16 reviver, u32 reviver_peer, u32 total_ms, u32 held_ms}
@@ -28,13 +28,14 @@
 #include <cstdint>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_protocol.h" // Writer, Reader
 
 namespace coop
 {
 namespace revive
 {
-// The `u8 op` of Msg::PlayerRevive. Request .. Evacuate are F3 Task 8's (coop_survival.h).
+// The `u8 op` of Msg::PlayerRevive. Request .. Evacuate are the revive's own (coop_survival.h).
 enum Op : uint8_t
 {
 	OpRequest = 0, // reviver -> host: the hold is over, revive
@@ -88,7 +89,7 @@ inline float fraction(uint64_t elapsed_ms, uint32_t total_ms)
 
 struct BeginMsg
 {
-	uint16_t target = 0xffff, seq = 0, item = 0xffff, held_ms = 0;
+	uint16_t target = kNoId, seq = 0, item = kNoId, held_ms = 0;
 	void write(Writer& w) const
 	{
 		w.u8(OpBegin);
@@ -109,7 +110,7 @@ struct BeginMsg
 
 struct CancelMsg
 {
-	uint16_t target = 0xffff, seq = 0;
+	uint16_t target = kNoId, seq = 0;
 	void write(Writer& w) const
 	{
 		w.u8(OpCancel);
@@ -126,7 +127,7 @@ struct CancelMsg
 
 struct RevivingMsg
 {
-	uint16_t target = 0xffff, seq = 0, reviver = 0xffff;
+	uint16_t target = kNoId, seq = 0, reviver = kNoId;
 	uint32_t reviver_peer = 0xffffffffu, total_ms = kHoldMs, held_ms = 0;
 	void write(Writer& w) const
 	{
@@ -152,7 +153,7 @@ struct RevivingMsg
 
 struct StoppedMsg
 {
-	uint16_t target = 0xffff, seq = 0, reviver = 0xffff;
+	uint16_t target = kNoId, seq = 0, reviver = kNoId;
 	void write(Writer& w) const
 	{
 		w.u8(OpStopped);
@@ -171,7 +172,7 @@ struct StoppedMsg
 
 struct DoneMsg
 {
-	uint16_t target = 0xffff, seq = 0;
+	uint16_t target = kNoId, seq = 0;
 	void write(Writer& w) const
 	{
 		w.u8(OpDone);
@@ -199,7 +200,7 @@ struct Facts
 	bool has_item = true; // the item is a medkit / stimpack the reviver carries
 };
 
-// The first thing that fails, in the order of F3 Task 8's checks (self, wounded, down, busy, range, item).
+// The first thing that fails, in the order of the revive's checks (self, wounded, down, busy, range, item).
 inline Refusal verdict(const Facts& f)
 {
 	if (f.self)
@@ -226,8 +227,8 @@ inline Refusal verdict(const Facts& f)
 //  - A Begin opens the lock for the rest of the hold and the grace (`kHoldMs - held_ms + kGraceMs`). The same reviver may
 //    begin again inside his CHAIN (a Cancel got lost, he pressed again), but the lock never runs past the end of the chain:
 //    its first Begin + kHoldMs + kGraceMs (the ceiling).
-//  - A Cancel closes the lock, not the chain (round 2 of I-1: a Cancel sent right before each Begin kept the lock shut 99 %
-//    of the time). A Begin of the same reviver that comes less than kAnnounceGapMs after the lock was last his is still the
+//  - A Cancel closes the lock, not the chain (a Cancel sent right before each Begin would keep the lock shut almost all
+//    the time). A Begin of the same reviver that comes less than kAnnounceGapMs after the lock was last his is still the
 //    same chain, with the same ceiling. Once the lock has been free of him for a whole kAnnounceGapMs the others have had a
 //    window, and the next Begin starts a new chain; so does a revive (close) and a reviver who left (drop_reviver).
 //  - A chain that is used up (the ceiling is reached, or its lock ran out by itself without a Revive / Cancel) locks its
@@ -312,7 +313,7 @@ public:
 private:
 	bool m_open = false;
 	bool m_began = false; // a chain goes on: m_seq / m_reviver / m_first / m_last mean something (they outlive the lock)
-	uint16_t m_seq = 0, m_reviver = 0xffff;
+	uint16_t m_seq = 0, m_reviver = kNoId;
 	uint64_t m_end = 0; // the lock runs until here (never past m_first + the hold + kGraceMs)
 	uint64_t m_first = 0; // the first Begin of the chain the lock belongs to
 	uint64_t m_last = 0; // the last Begin taken (the host's pace)
@@ -371,14 +372,14 @@ public:
 
 private:
 	bool m_on = false;
-	uint16_t m_seq = 0, m_reviver = 0xffff;
+	uint16_t m_seq = 0, m_reviver = kNoId;
 	uint32_t m_peer = 0xffffffffu, m_total = kHoldMs;
 	int64_t m_start = 0;
 };
 
 // ---------------------------------------------------------------- the wounded's time while he is raised
 
-// Build 57 (owner 2026-11-18): "when another player raises somebody, his time must stop running for as long as he is being
+// "when another player raises somebody, his time must stop running for as long as he is being
 // raised". The wounded's owner keeps the end of his bleed-out on his own clock (coop_survival.cpp g_me.bleed_end), in the
 // co-op and in the server mode alike: the host only relays the hold. Every frame a teammate's hold is on him
 // (LiftView::active) the end moves on by the time that passed since the last such frame, so what is left stays what it
@@ -459,7 +460,7 @@ private:
 	uint64_t m_last = 0;
 };
 // ---------------------------------------------------------------- the target of F
-// Live 2026-10-25 (owner): "sometimes you cannot revive an ally when a corpse or something else clickable lies next to
+// "sometimes you cannot revive an ally when a corpse or something else clickable lies next to
 // him". F revived only what the crosshair hit (CActor::ActorUse, 2 m ray); a corpse or an item nearer along the ray took
 // the F (loot). A wounded teammate in reach and in front of the camera wins over them.
 struct Vec3
@@ -472,7 +473,7 @@ struct ReviveCandidate
 	Vec3 pos; // where he lies (the object's position: the ground under him)
 	bool wounded;
 };
-constexpr uint16_t kNoTarget = 0xffff;
+constexpr uint16_t kNoTarget = kNoId;
 constexpr float kPickRange = 2.5f; // reach from my feet (= kReviveRange, coop_survival.cpp: the hold needs the same)
 constexpr float kPickCone = 0.70710678f; // cos 45 degrees: in front of the camera
 constexpr float kBodyLift = 0.3f; // a lying body: aim a little above the ground under him

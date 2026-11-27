@@ -1,11 +1,11 @@
-// Anomaly Coop — TZ R32 W8.3/W8.4: the initial state of an item that rides its create, and the stock client_data of an eatable.
+// Anomaly Coop — the initial state of an item that rides its create, and the stock client_data of an eatable.
 // An item's portions (uses) live in its game object only (CEatableItem::m_iRemainingUses); the server entity keeps them in its
 // client_data, which is what the object's save wrote (CGameObject::net_Save; the world's CSE_Abstract::load takes that chunk) and
 // what its next net_Spawn reads back (CGameObject::net_Spawn -> net_Load). A process with no game object of the item (the world
 // server, a map server where it is offline) writes the uses into client_data in exactly that stock format, so the object that
 // comes online, a save and an older build read them as a stock save would.
 // The create of an item (EntitySpawn's tail, a script's coop.items.set_initial) carries uses, condition and ammo count, and the
-// decider's field versions of the item (coop_owner_rules.h arrive, §8a A12).
+// decider's field versions of the item (coop_owner_rules.h arrive).
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
 
@@ -65,17 +65,6 @@ inline std::vector<std::uint8_t> make_held_eatable(const HeldEatable& h)
 	return cd;
 }
 
-inline bool read_held_eatable(const std::vector<std::uint8_t>& cd, HeldEatable& h)
-{
-	if (!is_held_eatable(cd))
-		return false;
-	h.enable_state = cd[0];
-	h.place = std::uint16_t(cd[kPlaceAt] | (std::uint16_t(cd[kPlaceAt + 1]) << 8));
-	std::memcpy(&h.condition, &cd[kConditionAt], sizeof(float));
-	h.uses = cd[kUsesAt];
-	return true;
-}
-
 // Write `uses` (and, when `cond` is not null, the condition) into the client_data of an item that has a holder. Empty client_data
 // is made fresh only when `may_make` (the section has no script binding: no binder bytes would follow). False: client_data of an
 // item on the ground (physics state, not patched) or empty with !may_make; `cd` is unchanged then.
@@ -108,7 +97,7 @@ inline bool read_uses(const std::vector<std::uint8_t>& cd, std::uint8_t& uses)
 	return true;
 }
 
-// ---------------------------------------------------------------- which sections have portions (WP6 fix round, finding 5)
+// ---------------------------------------------------------------- which sections have portions
 // The layout above says nothing of the kind of item: every held inventory item's client_data starts the same way (CInventoryItem::save
 // writes 0 for a held item), and a weapon's continues with its rounds where an eatable has its uses byte. So whether an entity has
 // uses is decided by its section's `class`: the eatable classes of the object factory (CEatableItemObject's subclasses: engine
@@ -125,8 +114,8 @@ inline bool is_eatable_class(std::string_view clsid)
 	return false;
 }
 
-// ---------------------------------------------------------------- the writer's own bytes (WP6 fix round, finding 1)
-// A section with a script binding (G.A.M.M.A.'s whole multi-use family: [booster_multi] has script_binding = bind_item.bind) keeps
+// ---------------------------------------------------------------- the writer's own bytes
+// A section with a script binding (a mod's multi-use items: a section with script_binding = bind_item.bind) keeps
 // its binder's bytes after the uses, and a process with no game object cannot make them: a fresh client_data of such an item cannot be
 // built. The map server has the object: its ItemFacts carry the object's own client_data (coop_item_tags.h kClientDataTag), the
 // exact bytes its stock save leaves, and the world stores them.
@@ -198,7 +187,7 @@ inline bool store_uses(std::vector<std::uint8_t>& cd, UsesStore how, const std::
 	return false;
 }
 
-// ---------------------------------------------------------------- the initial state of a create (protocol 34)
+// ---------------------------------------------------------------- the initial state of a create
 // Wire: varu n (0: nothing), then n bytes: u8 flags (kHasUses 1, kHasCond 2, kHasAmmo 4, kHasVersions 8), u8 uses, u16 condition
 // (q 1/65535), u16 ammo count, the field versions (coop_item_tags.h write_versions), each only when its flag is set.
 enum Flag : std::uint8_t
@@ -311,16 +300,16 @@ inline bool uses_ok(std::uint32_t uses, std::uint32_t max_uses)
 	return uses <= max_uses && uses <= 255u;
 }
 
-// ---------------------------------------------------------------- who sets it (R32 §8a A21 E-2)
+// ---------------------------------------------------------------- who sets it
 // The way a script's coop.items.set_initial(id, t) goes in this process (items::set_initial):
-//   Object          it writes the item and has its game object: the setter's path, a deliberate write of the decider (W8.1);
+//   Object          it writes the item and has its game object: the setter's path, a deliberate write of the decider;
 //   Entity          into the server entity: it writes the item and has no game object of it; or it does not write the item, has no
 //                   game object of it, and the item is its own create whose spawn has not left it yet (the creator's create of this
 //                   frame: the world server's reward copy for a player on a map a map server leads). That spawn's tail (write_initial)
 //                   carries the state to the writer, whose read_initial applies it to its new entity;
-//   NotWrittenHere  anything else: the writer sets it, a copy asks (R32 W1).
+//   NotWrittenHere  anything else: the writer sets it, a copy asks.
 // `own_create_unsent` comes from this process's queue of world changes (coop_entities.cpp host_own_spawn_unsent). It changes nothing
-// for a process that writes the item: the co-op host writes everything it makes, its answer is the one before E-2.
+// for a process that writes the item: the co-op host writes everything it makes, its answer is Object.
 enum class SetPath : std::uint8_t
 {
 	Object,

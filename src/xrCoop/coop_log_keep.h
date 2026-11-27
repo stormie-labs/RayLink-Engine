@@ -1,5 +1,5 @@
 // Anomaly Coop: the game log of the last runs is kept (pure rules; the file work is xrCore log.cpp coop_keep_previous_log).
-// Live 2026-11-07: reports ("2 of my 3 artefacts vanished", "handler error") came after the next launch had overwritten
+// Reports ("2 of my 3 artefacts vanished", "handler error") came after the next launch had overwritten
 // logs\xray_<nick>.log. Before the new log truncates it, the old one moves to
 //   logs\old\<its name without .log>_<yyyy-mm-dd_hh-mm-ss of its last write, local time>.log
 // (a second launch within the same second gets _2 .. _9), and logs\old keeps the newest kKeep archives of that log. Nothing
@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+#include "coop_text.h"
 
 namespace coop
 {
@@ -31,27 +33,12 @@ inline std::string folder_of(const std::string& path)
 	return cut == std::string::npos ? std::string() : path.substr(0, cut + 1);
 }
 
-inline char lower(char c)
-{
-	return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
-}
-
-inline bool same_text(const std::string& a, size_t at, const std::string& b) // a[at..] starts with b, any letter case
-{
-	if (a.size() < at + b.size())
-		return false;
-	for (size_t i = 0; i < b.size(); ++i)
-		if (lower(a[at + i]) != lower(b[i]))
-			return false;
-	return true;
-}
-
 // "C:\\...\\logs\\xray_bob.log" -> "xray_bob"; "" when the name does not end in .log or is nothing but it.
 inline std::string stem_of(const std::string& path)
 {
 	const std::string name = path.substr(folder_of(path).size());
 	static const std::string ext = ".log";
-	if (name.size() <= ext.size() || !same_text(name, name.size() - ext.size(), ext))
+	if (name.size() <= ext.size() || !ascii::istarts_with(std::string_view(name).substr(name.size() - ext.size()), ext))
 		return std::string();
 	return name.substr(0, name.size() - ext.size());
 }
@@ -114,7 +101,7 @@ inline bool is_digit(char c)
 // Is `name` an archive_name of `stem` (any letter case)? Only those are ever pruned.
 inline bool is_archive_of(const std::string& name, const std::string& stem)
 {
-	if (stem.empty() || !same_text(name, 0, stem + "_"))
+	if (stem.empty() || !ascii::istarts_with(name, stem + "_"))
 		return false;
 	static const char kPattern[] = "dddd-dd-dd_dd-dd-dd"; // stamp_text
 	const size_t at = stem.size() + 1;
@@ -130,7 +117,7 @@ inline bool is_archive_of(const std::string& name, const std::string& stem)
 	std::string rest = name.substr(at + len);
 	if (rest.size() == 6 && rest[0] == '_' && rest[1] >= '2' && rest[1] <= char('0' + kMaxSameSecond))
 		rest = rest.substr(2);
-	return rest.size() == 4 && same_text(rest, 0, ".log");
+	return rest.size() == 4 && ascii::istarts_with(rest, ".log");
 }
 
 // The archives of `stem` among `names` that go: all but the newest `keep` (the names sort by their time).

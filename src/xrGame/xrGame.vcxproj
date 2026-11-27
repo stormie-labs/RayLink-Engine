@@ -436,6 +436,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="coop\srv\coop_srv_layer.h" />
+    <ClInclude Include="coop\srv\coop_mapserver_stats.h" />
+    <ClInclude Include="coop\coop_trade_impl.h" />
+    <ClInclude Include="coop\coop_survival_state.h" />
+    <ClInclude Include="coop\coop_story_impl.h" />
+    <ClInclude Include="coop\coop_squad_members.h" />
+    <ClInclude Include="coop\coop_requests_impl.h" />
+    <ClInclude Include="coop\coop_join_impl.h" />
+    <ClInclude Include="coop\coop_entities_impl.h" />
     <ClInclude Include="..\xrCoop\coop_fight_fact.h" />
     <ClInclude Include="coop\hostplay\coop_hostplay_steam.h" />
     <ClInclude Include="coop\coop_vehicles_ride.h" />
@@ -465,6 +474,9 @@
     <ClInclude Include="coop\coop_sound.h" />
     <ClInclude Include="coop\coop_objects.h" />
     <ClInclude Include="coop\coop_writer.h" />
+    <ClInclude Include="coop\coop_wire_vec.h" />
+    <ClInclude Include="coop\coop_lua.h" />
+    <ClInclude Include="coop\coop_hud_text.h" />
     <ClInclude Include="coop\coop_presence.h" />
     <ClInclude Include="coop\coop_lamps.h" />
     <ClInclude Include="coop\coop_survival.h" />
@@ -2130,6 +2142,34 @@
     <ClInclude Include="ZudaArtifact.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="coop\srv\coop_squad_journal.cpp" />
+    <ClCompile Include="coop\coop_trade_window_lua.cpp" />
+    <ClCompile Include="coop\coop_trade_views.cpp" />
+    <ClCompile Include="coop\coop_survival_newchar.cpp" />
+    <ClCompile Include="coop\coop_survival_hud.cpp" />
+    <ClCompile Include="coop\coop_survival_cam.cpp" />
+    <ClCompile Include="coop\coop_story_tasks.cpp" />
+    <ClCompile Include="coop\coop_story_targets.cpp" />
+    <ClCompile Include="coop\coop_story_spots.cpp" />
+    <ClCompile Include="coop\coop_story_relations.cpp" />
+    <ClCompile Include="coop\coop_story_progress.cpp" />
+    <ClCompile Include="coop\coop_squad_members.cpp" />
+    <ClCompile Include="coop\coop_snapshots.cpp" />
+    <ClCompile Include="coop\coop_roster.cpp" />
+    <ClCompile Include="coop\coop_requests_spawn.cpp" />
+    <ClCompile Include="coop\coop_requests_rockets.cpp" />
+    <ClCompile Include="coop\coop_requests_moves.cpp" />
+    <ClCompile Include="coop\coop_requests_lua.cpp" />
+    <ClCompile Include="coop\coop_requests_leases.cpp" />
+    <ClCompile Include="coop\coop_requests_item_events.cpp" />
+    <ClCompile Include="coop\coop_requests_hits.cpp" />
+    <ClCompile Include="coop\coop_requests_clone.cpp" />
+    <ClCompile Include="coop\coop_pose_diag.cpp" />
+    <ClCompile Include="coop\coop_local_zones.cpp" />
+    <ClCompile Include="coop\coop_join_transition_load.cpp" />
+    <ClCompile Include="coop\coop_join_transition.cpp" />
+    <ClCompile Include="coop\coop_join_swap.cpp" />
+    <ClCompile Include="coop\coop_join_characters.cpp" />
     <ClCompile Include="coop\hostplay\coop_hostplay_steam.cpp" />
     <ClCompile Include="coop\coop_vehicles_ride.cpp" />
     <ClCompile Include="coop\coop_vehicles_state.cpp" />
@@ -2165,6 +2205,7 @@
     <ClCompile Include="coop\coop_sound.cpp" />
     <ClCompile Include="coop\coop_objects.cpp" />
     <ClCompile Include="coop\coop_writer.cpp" />
+    <ClCompile Include="coop\coop_hud_text.cpp" />
     <ClCompile Include="coop\coop_presence.cpp" />
     <ClCompile Include="coop\coop_lamps.cpp" />
     <ClCompile Include="coop\coop_survival.cpp" />

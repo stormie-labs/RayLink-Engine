@@ -9,7 +9,7 @@
 #include "PHMovementControl.h"
 #include "CharacterPhysicsSupport.h"
 #include "entity_alive.h"
-#include "coop/coop_objects.h" // Anomaly Coop: zone_pull_blocked
+#include "coop/coop_objects.h" // coop: zone_pull_blocked
 
 
 CAmebaZone::CAmebaZone()
@@ -76,7 +76,7 @@ void CAmebaZone::PhTune(float step)
 	for (it = m_ObjectInfoMap.begin(); m_ObjectInfoMap.end() != it; ++it)
 	{
 		CEntityAlive* EA = smart_cast<CEntityAlive*>((*it).object);
-		// Anomaly Coop: no brake on a player's character on the authority; his own game slows its own actor
+		// coop: no brake on a player's character on the authority; his own game slows its own actor
 		if (EA && !coop::objects::zone_pull_blocked(EA->ID()))
 		{
 			CPHMovementControl* mc = EA->character_physics_support()->movement();

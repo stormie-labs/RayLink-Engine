@@ -1,12 +1,12 @@
 // Anomaly Coop — coop.sync for Lua: shared variables, actions through the host, effects for everybody (SYNC_SPEC
-// §6.1-6.3, for modders docs/COOP_API.md; F2 T14). The store is xrCoop/coop_syncstore.h (F2 T13), the messages and the
+// §6.1-6.3, for modders docs/COOP_API.md). The store is xrCoop/coop_syncstore.h, the messages and the
 // rules of who hears what are xrCoop/coop_syncnet.h; this is the glue to the engine, Lua and the host save.
 //
 // Roles. The host holds the store and stamps every change; so does a machine outside a session (single player: a mod
 // that uses coop.sync works there, and its world / player / object data go into the save the same way). A client holds
 // what the host sends it (world, session, every object, his own player scope) and shows his own changes at once until
 // the host answers them.
-// F3a T7: the host player is a client of the world server for requests: his coop.sync.request is a SyncRequest from peer
+// The host player is a client of the world server for requests: his coop.sync.request is a SyncRequest from peer
 // 0 over the internal channel, run by the same handler under the same limits, and answered by a SyncResult over the
 // link (a timeout as a client's). The store and the effects stay one copy in the host's process: his set / get / keys /
 // on_change / broadcast work on it directly (SyncSet, SyncFull and SyncCast are not on the link).
@@ -28,14 +28,14 @@
 // player, on the host), "object:<id>" (local numbering; the host or the player who holds it writes it), "object" (every
 // object: on_change only, its handler gets the object id as a fifth argument). Values: nil, number, string, boolean,
 // vector, a flat table (string keys and array indices; values number / string / boolean / vector). Ids inside values
-// are not translated. Fix 1 (Ruling F2-31): keys "coop.*" of a player scope are the host's; a client's writes keep off
+// are not translated. Keys "coop.*" of a player scope are the host's; a client's writes keep off
 // the room the host keeps in every player and object scope and in the pool (coop_syncnet.h client_check).
 // coop.saving_for_join() -> bool: the host writes the world save of a joining player now (scripts\coop_sync.script
 // leaves coop.sync out of it).
 //
 // Threading: Lua may call coop.sync.* on the game thread, which never runs during FrameMove; those calls change the
 // store and queue messages, frame() (main thread) sends them. Lua functions are kept as references in the Lua registry
-// and called from frame() under pcall with a traceback: an error is logged and counted, the session goes on (R-11.4).
+// and called from frame() under pcall with a traceback. An error is logged and counted so the session can continue.
 // A new Lua state (a load) forgets every registration of the old one (register_lua).
 #pragma once
 
@@ -51,9 +51,9 @@ namespace coop
 {
 namespace syncapi
 {
-// The five sync messages (F3a T4: installed by role when a session starts, Manager::install_handlers).
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+// The five sync messages (installed by role when a session starts, Manager::install_handlers).
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 // The session started or ended, or a client's world is replaced: a client forgets everything of the host's, the host
 // keeps world / player / object (the game's data) and drops the session scope. Requests in flight are answered
 // false, "session ended".
@@ -71,7 +71,7 @@ void print_status();
 void host_send_full(PeerId peer);
 // Host: the world save for a joining player is being written while one of these lives (coop_join host_send_save, around
 // its M_SAVE_GAME); coop.saving_for_join() says so to Lua, and scripts\coop_sync.script leaves coop.sync out of that save
-// (F2 T14 fix 1, review I1: the save goes to the joining client whole, other players' scopes must not).
+// (the save goes to the joining client whole, other players' scopes must not).
 class SavingForJoin
 {
 public:
@@ -89,17 +89,17 @@ void on_peer_left(PeerId id);
 // A new Lua state: puts the coop.sync table into `coop` and forgets the registrations of the old state.
 void register_lua(lua_State* L);
 
-// --- C++ for the engine's own player data (F3 checkpoints) ---
+// --- C++ for the engine's own player data (the checkpoints) ---
 // The player scope of `character` (an entity id, host numbering; 0 = the host's own actor), the scope coop.sync knows
 // as "player" on that player's machine: by the player key on the character (ledger::character_key, as money and the
 // spawn budget find it). Strings only. Host (and single player); nullopt / false on a client, for a character without
 // a player key, a missing key or a value that is not a string.
 std::optional<std::string> player_get(u16 character, std::string_view key);
 // Sets it (nil is not taken: use an empty string or another key); the player gets it if he is connected. true if the
-// store took it (changed or the same). F2 T14 fix 1 (Ruling F2-31): use keys "coop.*" (sn::kHostKeyPrefix): only the
+// store took it (changed or the same). Use keys "coop.*" (sn::kHostKeyPrefix): only the
 // host writes those, the player cannot forge or remove them, and no client takes the room the host keeps in every player
 // scope and in the pool (coop_syncnet.h kHostPlayerReserve, kHostPoolReserve). false only when the host's own data
-// passes the limits: then F3 keeps its custom data as before.
+// passes the limits: then the checkpoints keep their custom data as before.
 bool player_set(u16 character, std::string_view key, std::string_view value);
 } // namespace syncapi
 } // namespace coop

@@ -1,14 +1,12 @@
 // Anomaly Coop — the game log's close (xrCore log.cpp), pure rules. Tests: tests/test_log_close.cpp.
 // Pure C++17, header-only, no engine dependencies.
 //
-// TZ R38 (RL-N8HP-7FDG, 2026-11-22): a normal quit, and the launcher said "abnormal, exit code 1". The log ended as a clean one
-// does ("[xrLogger] InternalCloseLog called"), and there was no dump. The log closes early in the end of the process
+// The log closes early in the end of the process
 // (CLocatorAPI::_destroy); everything after it - the rest of the core's teardown, the static destructors of the CRT's exit, the
 // DLLs' detach - wrote into a logger that dropped every line. A failure there (an assert, a pure call, abort, an invalid
 // parameter) still went through xrDebug::backend: the launcher's watcher answers its DebugBreak "handled", and the backend ends
-// the process with TerminateProcess(1). Shown on the stand: a pure call in ExitProcess after the log closed, exit code 1, the log
-// as complete as the owner's (temp/r38). From now on what comes after the close is written straight into the file (late), so
-// such an end says why.
+// the process with TerminateProcess(1): a normal quit then ends with exit code 1 and a log that looks clean. So what comes after the
+// close is written straight into the file (late), and such an end says why.
 #pragma once
 
 #include <cstddef>
@@ -28,7 +26,7 @@ enum class Route
 inline Route route(bool alive) { return alive ? Route::Queue : Route::Late; }
 
 // A late line has no time stamp: the stamp (logTimestamps) is std::put_time, and the CRT's exit tears down the C++ locale under
-// it (the stand, 2026-11-22: a FATAL's Msg after the close faulted inside std::time_put).
+// it (a FATAL's Msg after the close would fault inside std::time_put).
 inline bool stamp(bool timestamps, bool alive) { return timestamps && alive; }
 
 // Takes the record at the front, if there is one. The caller holds the queue's lock: the test for an empty queue and the pop are

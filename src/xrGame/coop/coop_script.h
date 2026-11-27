@@ -1,53 +1,18 @@
-// Anomaly Coop — Lua bridge.
+// Anomaly Coop: the Lua bridge. Registers the `coop` script namespace (export_classes, script_engine_export.cpp): its own functions
+// (register_raw in coop_script.cpp) and the tables of the other modules (each module's register_lua, called from there).
 //
-// Exports the `coop` script namespace (registered from export_classes, script_engine_export.cpp)
-// and carries Lua RPC between machines as Msg::ScriptEvent:
-//   coop.send_event(name, payload, target)   target: -1 everyone else, 0 host, N peer N
-//   coop.reserve_world_event(name) -> bool  block relays that would rewrite this event's sender to peer 0
-//   -> coop_main.on_event(name, payload, from) on the receiving machine(s).
-// Clients talk only to the host; the host relays client -> client events (star topology).
-// F3a T7: in the host's process 0 is the world server and the host player at once (one Lua state): an event to 0 there
-// goes over the internal channel (peer 0 -> the world server) and comes back to that Lua once, with from = 0, at the next
-// pump. Its -1 goes to every other player (the host player is the sender).
+// Threading: Lua may call coop.* from the GameThread worker, so nothing that sends or calls Lua runs there: coop.send_event and
+// the engine's events only queue, and frame() (main thread, after the network pump) sends the queue and delivers to Lua.
 //
-// Threading: Lua may call coop.* from the GameThread worker, so send_event only queues; frame()
-// (main thread, after Session::update) sends the queue and delivers received events to Lua.
-// Incoming events and chat lines wait in a queue until this machine is in the world (P6).
-// A missing coop_main function or a Lua error is logged and counted, never fatal (R-11.4).
+// Lua RPC between machines (Msg::ScriptEvent): coop.send_event(name, payload, target), target -1 every other player, 0 the world
+// server, N player N -> coop_main.on_event(name, payload, from) on the receiving machine(s). Clients talk to the world server only,
+// it relays client -> client events (star topology). In the co-op host's process 0 is the world server and the host player at once
+// (one Lua state): an event to 0 there goes over the internal channel and comes back to that Lua once, with from = 0.
+// coop.reserve_world_event(name) keeps a relay from rewriting that event's sender to peer 0. Events and chat lines wait in a queue
+// until this machine is in the world.
 //
-// Also (W3d):
-//   coop.world_epoch() -> number | nil          the world this machine is in (build 56; nil outside a session)
-//   coop.condition_carried() -> bool            client: the engine put this player's own condition back after the load
-//   coop.event_tick() -> arrival, now           F4 G3-1c: the tick of the event being delivered (now outside one), the latest
-//   coop.released_after(local_id, tick) -> bool  this process released that entity after the tick (note_released)
-//   coop.stash_set(key, value) / coop.stash_get(key)  strings kept for the whole session on this machine,
-//     across level loads and Lua state rebuilds (coop_settings keeps the host's settings there).
-//   on_rejected() -> coop_ui.on_rejected(info): the host's refusal (mod-list diff, duplicate key, ...)
-//     shown in a window in the main menu or in game (R-1.3, R-1.4).
-//
-// Co-op menu (W4 menu, scripts\coop_menu.script):
-//   coop.session_info() -> { phase, active, host, client, live, self_id, nick, port, address, players = {...},
-//     max_players, default_port, last_error, last_error_code, last_error_age, last_by_user, pending_host,
-//     pending_age }
-//   coop.host(port) / coop.connect("ip[:port]") -> true | false, reason      coop.disconnect() -> bool
-//   coop.host_when_ready(port | nil)  host as soon as the next world is loaded (save, last save, new game);
-//     nil or 0 cancels. Kept by a frame pump that also runs in the main menu.
-//
-// Glue for the W4 scripts (W5 C1):
-//   coop.spot_is_local(type) -> bool            map spot type never replicated (engine-local, prefix "coop_")
-//   coop.story_hold_infos(on) -> bool           client: infos given while on stay on this machine (coop_story.h)
-//   coop.story_local_task(id[, on=true]) -> bool  personal engine task, never routed to / mirrored from the host
-//   coop.life_of(local_id) -> "alive"|"wounded"|"dead"|"spectating"|"respawning"   (0 = me; nil if no session)
-//   coop.bleed_left(local_id) -> ms             bleed-out left of a wounded player, 0 otherwise
-//   coop.player_safemode(peer) -> bool | nil    weapon lowered (Anomaly safe mode); nil if not known yet
-//   coop.revive_progress() -> nil | { reviving = {peer, avatar_id, nick, progress, ms_left, item, section},
-//     revived_by = {peer, avatar_id, nick, progress, ms_left}, give_up = {progress, ms_left}, bleed = {left_ms, total_ms} }
-//     (HUD v2 part 2: the USE holds of a revive; parts that do not apply are absent; nil: nothing to show / no session;
-//     calling it tells the engine a Lua HUD draws the down / revive state, its own text steps aside)
-// Engine callbacks fired from frame(): coop_main.on_transition_vote(nick) (host), SendScriptCallback
-// "coop_actor_revived" (reviver_peer, medkit_section), "coop_revive_done" (target_peer, medkit_section: the reviver's
-// machine, his revive went through; HUD v2 part 2) and "coop_on_container_opened" (peer, container_id).
-// F3 modules fire their own through queue_callback(name, {cb_int(..), cb_str(..), ...}).
+// Engine -> Lua callbacks: queue_callback(name, {cb_int(..), cb_str(..), ...}) queues SendScriptCallback(name, args...), delivered
+// by frame() in the order queued. A missing Lua function or a Lua error is logged and counted, never fatal.
 #pragma once
 
 #include <cstdint>
@@ -123,12 +88,12 @@ private:
 	std::set<std::string, std::less<>> m_names;
 };
 
-// The Msg::ScriptEvent handler, in both tables (F3a T4: installed by role when a session starts).
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+// The Msg::ScriptEvent handler, in both tables (installed by role when a session starts).
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 // Session ended: drops queued events and chat lines, clears counters.
 void reset();
-// F4 G3-1c (xrCoop/coop_item_rider_rules.h): the entity under local id `id` was released on this process
+// The entity under local id `id` was released on this process (xrCoop/coop_item_rider_rules.h)
 // (coop_entities.cpp host_on_entity_released; any game thread). It takes the next tick of the counter that numbers the
 // inbox's arrivals: coop.released_after(id, tick) answers from it. Outside a session: nothing.
 void note_released(u16 id);
@@ -141,7 +106,7 @@ void frame();
 void print_status();
 // The console command coop_parity [tag]: scripts\coop_parity.script (host: every machine dumps, client: refuses).
 void parity_command(const char* tag);
-// coop_dbg (coop_debug.cpp, protocol 29): <module>.<fn>(the arguments `push` puts on the stack, their count returned) now, protected,
+// coop_dbg (coop_debug.cpp): <module>.<fn>(the arguments `push` puts on the stack, their count returned) now, protected,
 // if this machine's Lua is up in a co-op world. NotReady: nothing called; Failed: the function is missing or Lua raised an error (both
 // logged). Main thread.
 enum class CallResult : u8
@@ -160,7 +125,7 @@ void on_chat(const char* nick, const char* text, uint32_t from = 0xffffffffu);
 // Main thread (Session callback). Survives reset(); a newer refusal replaces an unshown one.
 void on_rejected(RejectReason reason, const char* text, const ManifestDiff& diff);
 
-// --- co-op menu (W4) ---
+// --- co-op menu ---
 // A session was started from the console or Lua: remembered for coop.session_info (address nullptr = host).
 void note_start(const char* address, u16 port);
 // Starting a session failed before it existed (port busy, no game loaded...): shown as the last error.
@@ -171,16 +136,13 @@ void note_user_stop();
 // (Session::end_code), nullptr when this machine stopped it. A client it sends out of a world reads why in the main menu.
 void on_session_end(const char* reason, const char* code = nullptr);
 
-// --- engine events for Lua (W5). Called on the main thread; queued, delivered by frame() in game. ---
-// Host: a client stands at a level exit -> coop_main.on_transition_vote(nick).
-void on_transition_vote(const char* nick);
+// --- engine -> Lua callbacks. Called on the main thread; queued, delivered by frame() in game. ---
 // This machine's player was revived -> SendScriptCallback("coop_actor_revived", reviver_peer, medkit_section)
-// (peer id: 0 = host; section nil if unknown).
+// (peer id: 0 = host; nil if not known; section nil if unknown).
 void on_actor_revived(uint32_t reviver_peer, const char* medkit_section);
 // Host: a client opened a box or a corpse -> SendScriptCallback("coop_on_container_opened", peer, container_id).
 void on_container_opened(uint32_t peer, u16 container_id);
 
-// --- engine -> Lua callbacks of the F3 modules (checkpoints, death, rest, autosave) ---
 // One argument of SendScriptCallback: nil, a boolean, an integer or a string.
 struct CallbackArg
 {

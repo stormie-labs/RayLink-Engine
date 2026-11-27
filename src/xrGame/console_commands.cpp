@@ -314,9 +314,9 @@ xr_token dead_body_collision_tokens[] =
 
 void register_mp_console_commands();
 #include "coop/coop_manager.h"
-#include "coop/coop_join.h" // Anomaly Coop: save ownership includes mirror teardown
-#include "coop/coop_worldstate.h" // Anomaly Coop: time_factor gating
-#include "coop/coop_debug.h" // Anomaly Coop: the -dbg cheats in a session (protocol 29)
+#include "coop/coop_join.h" // coop: save ownership includes mirror teardown
+#include "coop/coop_worldstate.h" // coop: time_factor gating
+#include "coop/coop_debug.h" // coop: the -dbg cheats in a session
 //-----------------------------------------------------------
 
 BOOL g_bCheckTime = FALSE;
@@ -1093,12 +1093,12 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
-		if (!coop::join::may_save_world()) // Anomaly Coop: includes mirror teardown after disconnect (R-9.2)
+		if (!coop::join::may_save_world()) // coop: includes mirror teardown after disconnect
 			{ Msg("[coop] saving is disabled on a co-op client, the host saves the world"); return; }
-		// Anomaly Coop: a world server keeps its world in the autosaves of its game (coop_autosave: by time, when a map server starts or
+		// coop: a world server keeps its world in the autosaves of its game (coop_autosave: by time, when a map server starts or
 		// stops, at the end of the session; its operator saves with coop_autosave_now). A stock save asked by a script would land in
-		// the savedgames it shares with its creator's game under its ghost's name: itms_manager's new game save was there as
-		// "server - autosave" in his own load menu (live 2026-11-13).
+		// the savedgames it shares with its creator's game under its ghost's name: a new game save would show up as
+		// "server - autosave" in the creator's own load menu.
 		if (g_coop_dedicated)
 		{
 			Msg("[coop] dedicated: the stock save '%s' is not written: a world server's world is in the autosaves of its game", args ? args : "");
@@ -1191,7 +1191,7 @@ public:
 
 	virtual void Execute(LPCSTR args)
 	{
-		if (coop::mgr().is_client()) // Anomaly Coop: a client cannot load a save inside a session (R-9.2)
+		if (coop::mgr().is_client()) // coop: a client cannot load a save inside a session
 			{ Msg("! [coop] loading is disabled on a co-op client, use coop_disconnect first"); return; }
 		string_path saved_game;
 		strncpy_s(saved_game, sizeof(saved_game), args, _MAX_PATH - 1);
@@ -1283,7 +1283,7 @@ public:
 			xr_strcpy(g_last_saved_game, saved_game);
 			return;
 		}
-		if (coop::mgr().is_client()) // Anomaly Coop: quick load is disabled inside a session (R-9.2)
+		if (coop::mgr().is_client()) // coop: quick load is disabled inside a session
 			{ Msg("! [coop] loading is disabled on a co-op client, use coop_disconnect first"); return; }
 
 		if (!*g_last_saved_game)
@@ -1998,7 +1998,7 @@ public:
 			return;
 		}
 
-		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // Anomaly Coop: no slow motion in a session
+		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // coop: no slow motion in a session
 			return;
 		Device.time_factor(time_factor);
 	}
@@ -2019,7 +2019,7 @@ public:
 	{
 		float time_factor = (float)atof(args);
 		clamp(time_factor, EPS, 1000.f);
-		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // Anomaly Coop: no slow motion in a session
+		if (coop::worldstate::refuse_engine_time_factor(time_factor)) // coop: no slow motion in a session
 			return;
 		Device.time_factor(time_factor);
 		if (!Core.ParamsData.test(ECoreParams::sound_constant_speed))
@@ -2617,8 +2617,8 @@ public:
     }
 };
 
-// Anomaly Coop (docs/DEBUG_DESIGN.md §B.8): the engine's cheats of the -dbg key. In a co-op session a player's machine refuses them (the
-// server's debug decides, coop_debug on), the world server's g_god / g_unlimitedammo point at the personal flags (F7, coop_dbg god);
+// coop: the engine's cheats of the -dbg key. In a co-op session a player's machine refuses them (the
+// server's debug decides, coop_debug on), the world server's g_god / g_unlimitedammo point at the personal flags (coop_dbg god);
 // outside a session they run as the stock. coop::debug::refuse_local_cheat says why in the log.
 template <class Base>
 class CCC_CoopCheat : public Base
@@ -2853,14 +2853,14 @@ void CCC_RegisterCommands()
 	CMD1(CCC_PHIterations, "ph_iterations");
 
 #ifdef DEBUG
-	CMD1(CCC_CoopCheatPHGravity, "ph_gravity"); // Anomaly Coop: refused on a player's machine in a session
+	CMD1(CCC_CoopCheatPHGravity, "ph_gravity"); // coop: refused on a player's machine in a session
 	CMD4(CCC_FloatBlock, "ph_timefactor", &phTimefactor, 0.000001f, 1000.f);
 	CMD4(CCC_FloatBlock, "ph_break_common_factor", &ph_console::phBreakCommonFactor, 0.f, 1000000000.f);
 	CMD4(CCC_FloatBlock, "ph_rigid_break_weapon_factor", &ph_console::phRigidBreakWeaponFactor, 0.f, 1000000000.f);
 	CMD4(CCC_Integer, "ph_tri_clear_disable_count", &ph_console::ph_tri_clear_disable_count, 0, 255);
 	CMD4(CCC_FloatBlock, "ph_tri_query_ex_aabb_rate", &ph_console::ph_tri_query_ex_aabb_rate, 1.01f, 3.f);
 	CMD3(CCC_Mask, "g_no_clip", &psActorFlags, AF_NO_CLIP);
-	CMD1(CCC_CoopCheatJumpToLevel, "jump_to_level"); // Anomaly Coop: refused on a player's machine in a session
+	CMD1(CCC_CoopCheatJumpToLevel, "jump_to_level"); // coop: refused on a player's machine in a session
 	CMD3(CCC_CoopCheatMask, "g_god", &psActorFlags, AF_GODMODE);
 	CMD3(CCC_CoopCheatMask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
 	CMD1(CCC_CoopCheatScript, "run_script");
@@ -2873,7 +2873,7 @@ void CCC_RegisterCommands()
 #ifdef MASTER_GOLD
 	if (0 != Core.isDebug())
 	{
-		// Anomaly Coop (protocol 29): the cheats refuse on a player's machine in a session (CCC_CoopCheat above)
+		// coop: the cheats refuse on a player's machine in a session (CCC_CoopCheat above)
 		CMD1(CCC_CoopCheatJumpToLevel, "jump_to_level");
 		CMD3(CCC_CoopCheatMask, "g_god", &psActorFlags, AF_GODMODE);
 		CMD3(CCC_CoopCheatMask, "g_unlimitedammo", &psActorFlags, AF_UNLIMITEDAMMO);
@@ -3462,6 +3462,5 @@ void CCC_RegisterCommands()
     CMD4(CCC_Integer, "show_actor_body", &showActorBody, 0, 2);
     CMD4(CCC_Integer, "disable_actor_body_rotation_delay", &disableActorBodyRotationDelay, 0, 1);
 
-	// Anomaly Coop
 	coop::register_console_commands();
 }

@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, a car's state on every copy (F5-VEH-4, build 57, docs/VEHICLES.md sections 3, 5.6, 11): the
+// Anomaly Coop — vehicles for players, a car's state on every copy (docs/VEHICLES.md sections 3, 5.6, 11): the
 // pure half.
 //
 // The process that decides for a level (the co-op host; in the Server mode the map server of the level) sends VehicleState for every
@@ -24,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "coop_validate.h"
 #include "coop_vehicle_rules.h"
 
 namespace coop
@@ -42,29 +42,23 @@ constexpr uint32_t kStateScanMs = 1000;
 // The decider's frames stopped for longer than this (no session, no world): what it sent before is forgotten, the players of the
 // next frames get every state again.
 constexpr uint32_t kStateGapMs = 2000;
-// Cars one machine keeps a state of (a level of GAMMA has a few dozen; a decider's word beyond this is dropped and counted).
+// Cars one machine keeps a state of (a modded level has a few dozen; a decider's word beyond this is dropped and counted).
 constexpr size_t kMaxStateCars = 512;
 
 // ---------------------------------------------------------------- quantization
-
-namespace detail
-{
-inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
-} // namespace detail
 
 // `value` of `of` as 0..255, rounded (0 when `of` is not a positive number or `value` is not a number).
 inline uint8_t fraction_byte(float value, float of)
 {
 	if (!std::isfinite(value) || !std::isfinite(of) || !(of > 0.f))
 		return 0;
-	return uint8_t(std::lround(detail::clamp01(value / of) * 255.f));
+	return uint8_t(std::lround(validate::clamp01(value / of) * 255.f));
 }
 
 inline float fraction_of(uint8_t q) { return float(q) / 255.f; }
 
 // rpm: CCar::m_current_rpm of m_max_rpm. Back: the copy's m_max_rpm (the same model) times the fraction.
 inline uint8_t rpm_byte(float rpm, float max_rpm) { return fraction_byte(rpm, max_rpm); }
-inline float rpm_of(uint8_t q, float max_rpm) { return fraction_of(q) * max_rpm; }
 
 // health: CEntity::GetfHealth, 1.0 a whole car.
 inline uint8_t health_byte(float health) { return fraction_byte(health, 1.f); }
@@ -75,7 +69,7 @@ inline uint8_t fuel_byte(float fuel, float tank)
 {
 	if (!std::isfinite(fuel) || !std::isfinite(tank) || !(fuel > 0.f) || !(tank > 0.f))
 		return 0;
-	const long q = long(std::ceil(detail::clamp01(fuel / tank) * 255.f));
+	const long q = long(std::ceil(validate::clamp01(fuel / tank) * 255.f));
 	return uint8_t(q < 1 ? 1 : (q > 255 ? 255 : q));
 }
 inline float fuel_of(uint8_t q, float tank) { return fraction_of(q) * tank; }
@@ -147,17 +141,6 @@ enum class StateSend : uint8_t
 	Change, // something but the rpm changed (or the first state of a car that became live)
 	Repeat, // the engine runs: the 2 Hz repeat, the rpm
 };
-
-inline const char* send_name(StateSend s)
-{
-	switch (s)
-	{
-	case StateSend::None: return "none";
-	case StateSend::Change: return "change";
-	case StateSend::Repeat: return "repeat";
-	}
-	return "?";
-}
 
 // One car on the decider. A car that was never live is silent (a parked car nobody used: its copies are as the stock spawned them).
 // Once its state went out, every change goes (its copies show the last state they were told: lights left on, an engine that

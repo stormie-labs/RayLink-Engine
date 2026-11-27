@@ -2,7 +2,7 @@
 #include "ui_base.h"
 #include "GamePersistent.h"
 #include "UICursor.h"
-#include "../xrEngine/ui_size_policy.h" // Anomaly Coop
+#include "../xrEngine/ui_size_policy.h"
 
 CUICursor& GetUICursor() { return UI().GetUICursor(); };
 ui_core& UI() { return *GamePersistent().m_pUI_core; };
@@ -213,16 +213,8 @@ void ui_core::PopScissor()
 
 ui_core::ui_core()
 {
-	if (!g_dedicated_server || g_coop_headless)
-	{
-		m_pUICursor = xr_new<CUICursor>();
-		m_pFontManager = xr_new<CFontManager>();
-	}
-	else
-	{
-		m_pUICursor = NULL;
-		m_pFontManager = NULL;
-	}
+	m_pUICursor = xr_new<CUICursor>();
+	m_pFontManager = xr_new<CFontManager>();
 	m_bPostprocess = false;
 
 	OnDeviceReset();
@@ -275,7 +267,7 @@ bool ui_core::is_widescreen()
 
 u8 ui_core::screenmode()
 {
-	// Anomaly Coop: the stock thresholds (> 1.8: _21, > 1024/768 + 0.01: _16), tested in tests/test_ui_size_policy.cpp
+	// coop: the stock thresholds (> 1.8: _21, > 1024/768 + 0.01: _16), tested in tests/test_ui_size_policy.cpp
 	return ui_size_policy::layout_family(Device.dwWidth, Device.dwHeight);
 }
 

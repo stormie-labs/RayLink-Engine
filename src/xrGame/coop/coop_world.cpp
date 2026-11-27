@@ -6,6 +6,10 @@
 #include "alife_object_registry.h"
 #include "xrServer_Objects_ALife_Monsters.h"
 #include "GameObject.h"
+#include "InventoryOwner.h"
+#include "entity_alive.h"
+#include "Level.h"
+#include "xrServer.h"
 
 namespace coop
 {
@@ -13,6 +17,8 @@ namespace world
 {
 namespace
 {
+constexpr u16 kNoId = 0xffff; // "no object"
+
 struct Avatar
 {
 	PeerId peer = kInvalidPeer; // kInvalidPeer = parked (player offline)
@@ -20,6 +26,7 @@ struct Avatar
 
 xr_map<u16, Avatar> g_avatars;
 bool g_owners_known = false; // client: an AvatarList was applied since reset() (F0 final review, task 8)
+} // namespace
 
 // Docked once: a section compare is then a pointer compare (the ALife switch asks for every object).
 const shared_str& avatar_section()
@@ -27,7 +34,6 @@ const shared_str& avatar_section()
 	static const shared_str s("coop_player_avatar");
 	return s;
 }
-} // namespace
 
 void host_scan_proxies()
 {
@@ -37,7 +43,7 @@ void host_scan_proxies()
 	for (const auto& it : ai().alife().objects().objects())
 	{
 		const CSE_ALifeDynamicObject* e = it.second;
-		if (e && !xr_strcmp(e->s_name, "coop_player_avatar"))
+		if (is_player_character(e))
 			g_avatars[e->ID] = Avatar();
 	}
 	if (!g_avatars.empty())
@@ -94,6 +100,48 @@ bool is_parked(u16 id)
 {
 	auto it = g_avatars.find(id);
 	return it != g_avatars.end() && it->second.peer == kInvalidPeer;
+}
+
+CGameObject* object_here(u16 id)
+{
+	if (!g_pGameLevel || id == kNoId)
+		return nullptr;
+	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
+	return o && !o->getDestroy() ? o : nullptr;
+}
+
+CSE_Abstract* alife_entity(u16 id)
+{
+	if (id == kNoId || !ai().get_alife())
+		return nullptr;
+	return ai().alife().objects().object(id, true);
+}
+
+CSE_Abstract* server_entity(u16 id)
+{
+	if (CSE_Abstract* e = alife_entity(id))
+		return e;
+	if (id != kNoId && g_pGameLevel && Level().Server)
+		return Level().Server->ID_to_entity(id);
+	return nullptr;
+}
+
+CInventoryOwner* find_owner(u16 id)
+{
+	CObject* o = g_pGameLevel && id != kNoId ? Level().Objects.net_Find(id) : nullptr;
+	return o ? smart_cast<CInventoryOwner*>(o) : nullptr;
+}
+
+bool alive(CInventoryOwner* io)
+{
+	CEntityAlive* e = io ? smart_cast<CEntityAlive*>(io) : nullptr;
+	return e && e->g_Alive();
+}
+
+u16 id_of(CInventoryOwner* io)
+{
+	CGameObject* go = io ? smart_cast<CGameObject*>(io) : nullptr;
+	return go ? go->ID() : kNoId;
 }
 
 void reset()

@@ -1,5 +1,4 @@
-// Anomaly Coop — the scope of every message and the route a process gives it (F3a split levels; docs/plans/
-// 2026-10-24-f3a-split-levels.md §2.2).
+// Anomaly Coop — the scope of every message and the route a process gives it (docs/SPLIT_LEVELS.md).
 //
 // Every player may be on another level. The host's process holds the world and leads its own level; a background map
 // server (Mk) leads each other level that has players. A message a player sends goes to whoever has to act on it:
@@ -13,7 +12,7 @@
 //   Trunk  the link between the host's process and a map server (Level* except the three a player sees, Tunnel,
 //          MapServer*): taken from the bridge of a map server alone.
 //
-// route() is the whole decision and a pure function; the game passes what it knows (coop_trunk.cpp, F3a T9). A message that
+// route() is the whole decision and a pure function; the game passes what it knows (coop_trunk.cpp). A message that
 // the Tunnel carries is taken out by the trunk code and handed to the handler of the process that leads the level: it is not
 // routed again, so Map messages cannot go round between the two processes.
 //
@@ -74,7 +73,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::OperatorCommand:
 	case Msg::WorldEpoch: out = Scope::Core; return true;
 
-	// --- the world server: the join and the world's lifecycle (Join*, Transition*), the level moves of F3a
+	// --- the world server: the join and the world's lifecycle (Join*, Transition*), the level moves
 	case Msg::JoinRequest: // Msg::GameBase has the same value
 	case Msg::WorldBlob:
 	case Msg::WorldLoaded:
@@ -117,7 +116,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::SyncRequest:
 	case Msg::SyncResult:
 	case Msg::SyncCast:
-	// F3: checkpoints, the shared sleep, hardcore
+	// Checkpoints, the shared sleep, hardcore
 	case Msg::CheckpointState:
 	case Msg::CheckpointClaim:
 	case Msg::RestRequest:
@@ -126,7 +125,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::NewCharacter:
 	// the Lua RPC of mods runs in the world server's Lua
 	case Msg::ScriptEvent:
-	// protocol 29: the server's debug is the world server's; every player and every map server gets it
+	// The server's debug is the world server's; every player and every map server gets it
 	case Msg::DebugState: out = Scope::World; return true;
 
 	// --- the authority of the sender's level: the stream of the body, the entities, the requests on them, dialogs, trade
@@ -180,11 +179,11 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::IdLease:
 	case Msg::IdLeaseAck:
 	case Msg::DeathMarker:
-	case Msg::MonsterEffect: // audit A5: the authority of the monster's level decides
+	case Msg::MonsterEffect: // the authority of the monster's level decides
 	// a client asks for an entity it misses: the authority of its level answers with the spawn
 	case Msg::StateDumpRequest:
 	case Msg::StateDump:
-	// F5 (docs/VEHICLES.md): a car and the bodies in it are objects of the sender's level; its authority seats, drives and tells
+	// Cars (docs/VEHICLES.md): a car and the bodies in it are objects of the sender's level; its authority seats, drives and tells
 	// the players of that level. Not every level's, not kept by the world server (reaches_every_level, kept_from_every_level)
 	case Msg::VehicleReq:
 	case Msg::VehicleSeat:
@@ -203,7 +202,7 @@ inline bool scope_row(Msg type, Scope& out)
 	case Msg::Tunnel:
 	case Msg::MapServerState:
 	case Msg::MapServerOrder:
-	// R32 (protocol 34): the journal of a map server and the world server's answer to it
+	// The journal of a map server and the world server's answer to it
 	case Msg::LevelJournal:
 	case Msg::LevelJournalAck: out = Scope::Trunk; return true;
 	}
@@ -212,13 +211,6 @@ inline bool scope_row(Msg type, Scope& out)
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
-
-// True if `type` has a row in scope_row (the tests ask this to find a message without a decision).
-inline bool scope_listed(Msg type)
-{
-	Scope s = Scope::Core;
-	return scope_row(type, s);
-}
 
 // The scope of a message. A value that is no message of the protocol (no handler takes it) is the world server's: the
 // side that neither tunnels nor refuses.
@@ -229,11 +221,11 @@ inline Scope scope_of(Msg type)
 	return s;
 }
 
-// F3a multilevel: a message of the host's level and a player who stands on another one. The stream of a level (bodies, entities,
+// multilevel: a message of the host's level and a player who stands on another one. The stream of a level (bodies, entities,
 // zones) means nothing there, but every machine keeps the same registry under the same ids (spec §2, recon §3.1): what is
 // created, destroyed, handed over or regrouped anywhere reaches everybody, whichever level it happens on. These are the Map
 // messages that do.
-// Build 57, S3 (protocol 33, the psy phantoms): one exception, made where the spawn is sent, not here. What the map server of a
+// One exception (the psy phantoms), made where the spawn is sent, not here. What the map server of a
 // player's own level spawned he has from it, up the trunk and marked online at his level (coop_levels_wire.h
 // mark_spawn_of_your_level, coop_trunk.cpp); the world server's copy of that spawn goes out under the EchoOf of that level
 // (coop_entities.cpp host_spawn_from_leader) and so to the players of the other levels and to the map servers only.
@@ -245,7 +237,7 @@ inline bool reaches_every_level(Msg type)
 	case Msg::EntityDestroy:
 	case Msg::EntityParent:
 	case Msg::EntitySquad: return true;
-	default: break; // F5 VehicleSeat / VehicleState too: who sits in a car of a level is news for the players there only
+	default: break; // VehicleSeat / VehicleState too: who sits in a car of a level is news for the players there only
 	}
 	return false;
 }
@@ -257,7 +249,7 @@ inline bool level_passes(Msg type, bool split, bool same_level)
 	return !split || same_level || scope_of(type) != Scope::Map || reaches_every_level(type);
 }
 
-// F3a, the other way: what a player on another level sends. Map messages go to the authority of HIS level (route(),
+// The other way: what a player on another level sends. Map messages go to the authority of HIS level (route(),
 // Route::TunnelToServer), the map server of that level: nobody here is to act on them, his body is no object on this level.
 // These stay here too: they are his own data, and the world keeps them for the save and for the others' HUD.
 inline bool kept_from_every_level(Msg type)
@@ -268,17 +260,13 @@ inline bool kept_from_every_level(Msg type)
 	case Msg::PlayerEquip:
 	case Msg::ItemState:
 	case Msg::IdLeaseAck:
-	case Msg::StateDumpRequest: // the repair of his registry: an entity he misses comes from the world's copy
+	case Msg::StateDumpRequest: // the repair of his registry: the world's copy answers it only while the map server of his level is
+		                        // not connected; with it, that map server alone answers (coop_mapserver_rules.h
+		                        // answered_by_his_map_server, route_incoming)
 		return true;
-	default: break; // F5 VehicleReq / VehicleInput too: only the decider of his level acts on them; the world server keeps nothing
+	default: break; // VehicleReq / VehicleInput too: only the decider of his level acts on them; the world server keeps nothing
 	}
 	return false;
-}
-
-// Does the world server take this message of a player? `same_level` = he stands on the host's level.
-inline bool level_takes(Msg type, bool split, bool same_level)
-{
-	return !split || same_level || scope_of(type) != Scope::Map || kept_from_every_level(type);
 }
 
 // What a process does with a message of scope `s` that it has received.
@@ -294,9 +282,8 @@ enum class Route : uint8_t
 //
 //   Core   always here;
 //   World  always here: the process that receives a world message is the world server, wherever the sender stands;
-//   Map    through the tunnel to the map server of the sender's level: the world server leads no level (owner 2026-11-18, no
-//          hybrid); `from_trunk` does not change it (the trunk code unwraps a Tunnel and calls the handler itself, the unwrapped
-//          message is not routed again);
+//   Map    through the tunnel to the map server of the sender's level: the world server leads no level; `from_trunk` does not
+//          change it (the trunk code unwraps a Tunnel and calls the handler itself, the unwrapped message is not routed again);
 //   Trunk  here from the bridge, refused from anybody else.
 inline Route route(Scope s, bool from_trunk)
 {
@@ -317,8 +304,7 @@ inline Route route(Scope s, bool from_trunk)
 //                                            (the bleed-out clock, the revive hold, the death drop run at the body);
 //   CheckpointClaim                          the tent a player placed is an object of his map: the authority finds it and
 //                                            vouches for the spot;
-//   RestRequest                              the place to lie down is checked by the authority of the player's level
-//                                            (plan §1.9, sleep).
+//   RestRequest                              the place to lie down is checked by the authority of the player's level.
 inline bool also_to_level_authority(Msg type)
 {
 	switch (type)

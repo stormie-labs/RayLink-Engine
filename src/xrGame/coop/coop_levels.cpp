@@ -9,8 +9,11 @@
 #include "coop_money.h"
 #include "coop_net.h"
 #include "xrCoop/srv/coop_scope.h"
-#include "xrCoop/coop_roster.h" // who is a player (plan 2026-11-12 stage 3)
+#include "xrCoop/coop_roster.h" // who is a player
+#include "xrCoop/coop_lua_fn.h" // luafn::call_named: the trust verdicts of LevelMap
+#include "coop_lua.h" // lua_api: the registrar, the argument readers
 #include "xrCoop/coop_mode.h" // coop.levels.online_at_server asks the mode's hook
+#include "xrCoop/coop_mode_stamp.h"
 #include "srv/coop_levels_map.h" // the rows of the LevelMap
 
 #include "../../xrEngine/XR_IOConsole.h"
@@ -24,23 +27,20 @@
 #include "xrServer_Objects_ALife.h"
 #include "xrServer_Objects_ALife_Items.h"
 
-#include <cmath>
 #include <limits>
-#include <map>
 #include <string>
 
-// F3a split levels: the switches, the questions "which level" and "who is on it", the host's table and LevelMap, the gates, the
+// Split levels: the switches, the questions "which level" and "who is on it", the host's table and LevelMap, the gates, the
 // console and the Lua side. See coop_levels.h.
 
 namespace coop
 {
 namespace levels
 {
-int g_coop_max_map_servers = int(kDefaultMaxMapServers); // build 50: the ceiling of the PC, the cap itself follows the players
+int g_coop_max_map_servers = int(kDefaultMaxMapServers); // the ceiling of the PC, the cap itself follows the players
 int g_coop_mapserver_linger = int(kDefaultLingerMs / 1000);
-// Both settings above are saved in user.ltx, so a new default in the code never reaches a machine that ran an earlier build: the
-// owner's own world server kept 3 servers and 60 s (seen 2026-11-14). The old defaults move to the new ones once a machine; this
-// number is saved with them, and a value somebody sets after that is his.
+// Both settings above are saved in user.ltx, so a new default in the code never reaches a machine that saved the old one. The old
+// defaults move to the new ones once a machine; this number is saved with them, and a value somebody sets after that is his.
 int g_coop_map_servers_rev = 0;
 
 void settle_machine_settings()
@@ -67,20 +67,13 @@ namespace
 constexpr u32 kMapEveryMs = 5000; // the table goes out when it changes and at least this often
 static_assert(kMaxLevelId == (std::numeric_limits<GameGraph::_LEVEL_ID>::max)());
 
-struct GateRow
-{
-	Gate gate = Gate::Free;
-	std::string reason;
-};
-
 struct State
 {
 	// host
 	Table table;
 	bool map_due = false;
 	u64 map_sent_at = 0;
-	bool host_split = false; // the server mode as the world took it: it applies at the world's start (plan §3)
-	std::map<std::string, GateRow> gates; // by level name, from Lua (coop_levels.script)
+	bool host_split = false; // the server mode as the world took it: it applies at the world's start
 	// client: the host's last table
 	wire::LevelMapMsg view;
 	bool view_known = false;
@@ -88,7 +81,7 @@ struct State
 	LevelId echo = wire::kNoLevel; // EchoOf
 } g;
 
-// Split levels are the server mode's (owner 2026-11-18, no hybrid): a dedicated host has no level to play on, every level with
+// Split levels are the server mode's: a dedicated host has no level to play on, every level with
 // players has a map server. The co-op never splits.
 bool game_split() { return dedicated::on(); }
 
@@ -102,17 +95,6 @@ const char* level_name_of(LevelId level)
 	return it == gg->header().levels().end() ? nullptr : it->second.name().c_str();
 }
 
-LevelId level_by_name(const char* name)
-{
-	const CGameGraph* gg = ai().get_game_graph();
-	if (!gg || !name)
-		return wire::kNoLevel;
-	for (const auto& it : gg->header().levels())
-		if (!xr_strcmp(it.second.name(), name))
-			return LevelId(it.first);
-	return wire::kNoLevel;
-}
-
 // The world server's own seat: its level (fake_start), and no player on it (it plays nobody, it leads no level).
 void host_seat_self()
 {
@@ -123,12 +105,14 @@ void host_seat_self()
 	if (s && s->level == mine)
 		return;
 	g.table.set({kHostPeer, mine, true, false});
+	g_mode_stamp.bump(); // the host's own seat: where and decider of him
 	g.map_due = true;
 }
 
 void host_seat(PeerId peer, LevelId level, bool in_world)
 {
 	g.table.set({peer, level, in_world, true});
+	g_mode_stamp.bump(); // a character changed its level or entered the world
 	g.map_due = true;
 }
 
@@ -136,7 +120,7 @@ void host_send_map()
 {
 	wire::LevelMapMsg m;
 	m.flags = wire::LevelMapMsg::Split; // only split levels have a map (frame, host_send_map_now)
-	// plan 2026-11-12 stage 3: a seat that plays no character (the dedicated host's own) is on no map: no row, no server row for its level
+	// a seat that plays no character (the dedicated host's own) is on no map: no row, no server row for its level
 	for (const Seat& s : map_rows::listed_seats(g.table.seats()))
 	{
 		wire::LevelMapMsg::Player p;
@@ -153,19 +137,6 @@ void host_send_map()
 		row.level = level;
 		row.state = u8(mapserver::host_state_of(level));
 		m.servers.push_back(row);
-	}
-	for (const auto& it : g.gates)
-	{
-		if (it.second.gate == Gate::Free)
-			continue;
-		const LevelId level = level_by_name(it.first.c_str());
-		if (level == wire::kNoLevel)
-			continue;
-		wire::LevelMapMsg::Gate row;
-		row.level = level;
-		row.gate = u8(it.second.gate);
-		row.reason = it.second.reason;
-		m.gates.push_back(row);
 	}
 	Writer w(64 + m.players.size() * 8 + m.servers.size() * 4 + m.gates.size() * 32);
 	if (!m.write(w))
@@ -195,23 +166,17 @@ void account_level_map(PeerId from, LevelMapCheck check, bool ok)
 {
 	const char* name = level_map_check_name(check);
 	lua_State* L = g_ai_space ? ai().script_engine().lua() : nullptr;
-	if (L)
+	const auto push = [name, ok, from](lua_State* L)
 	{
-		constexpr char chunk[] = "local name, ok, from = ...\n"
-		                         "coop_trust.pass(name, ok, 'LevelMap from transport peer %u', from)";
-		const int top = lua_gettop(L);
-		bool reported = false;
-		if (luaL_loadbuffer(L, chunk, sizeof(chunk) - 1, "@coop_level_map_trust") == 0)
-		{
-			lua_pushstring(L, name);
-			lua_pushboolean(L, ok);
-			lua_pushnumber(L, lua_Number(from));
-			reported = lua_pcall(L, 3, 0, 0) == 0;
-		}
-		lua_settop(L, top);
-		if (reported)
-			return;
-	}
+		lua_pushstring(L, name);
+		lua_pushboolean(L, ok);
+		lua_pushstring(L, "LevelMap from transport peer %u");
+		lua_pushnumber(L, lua_Number(from));
+		return 4;
+	};
+	std::string error;
+	if (L && luafn::call_named(L, "coop_trust", "pass", nullptr, push, 0, [](lua_State*) {}, error) == luafn::Fail::None)
+		return;
 	if (!ok && ++g.map_trust_fallbacks <= 3)
 		::Msg("! [coop-trust] %s: dropped LevelMap from transport peer %u", name, from);
 }
@@ -222,6 +187,7 @@ void client_on_level_map(PeerId from, Reader& r)
 	        [from](LevelMapCheck check, bool ok) { account_level_map(from, check, ok); }))
 		return;
 	g.view_known = true;
+	g_mode_stamp.bump(); // this process's view of the levels and their split
 	mapserver::server_on_map(g.view);
 }
 } // namespace
@@ -231,7 +197,7 @@ const char* level_name(LevelId level) { return level_name_of(level); }
 bool split()
 {
 	if (net::client())
-		return mgr().world_session().session_mode() == SessionMode::Server; // S4: the Welcome says it, not the first LevelMap
+		return mgr().world_session().session_mode() == SessionMode::Server; // the Welcome says it, not the first LevelMap
 	return mgr().is_host() ? g.host_split : game_split();
 }
 
@@ -369,7 +335,7 @@ void host_player_in_world(PeerId peer)
 MoveVerdict host_judge_move(PeerId peer, LevelId target)
 {
 	host_seat_self();
-	const Gate gate = effective_gate(gate_of_level(target), true);
+	const Gate gate = effective_gate(gate_of_level(target));
 	const bool new_server = !mapserver::host_serves(target);
 	std::vector<uint16_t> stop;
 	const MoveVerdict verdict = decide_move(gate, new_server, mapserver::host_slots(), host_map_cap(peer), stop);
@@ -425,6 +391,7 @@ void host_world_replaced()
 		return;
 	const bool was = g.host_split;
 	g.host_split = game_split();
+	g_mode_stamp.bump(); // the split of the new world
 	if (!was && !g.host_split)
 		return;
 	xfer_reset(); // the simulator that had the marks is gone; the map servers connect anew when they are Ready
@@ -447,12 +414,10 @@ Gate gate_of_level(LevelId level)
 				return Gate(row.gate);
 		return Gate::Free;
 	}
-	const char* name = level_name_of(level);
-	const auto it = name ? g.gates.find(name) : g.gates.end();
-	return it == g.gates.end() ? Gate::Free : it->second.gate;
+	return Gate::Free; // the world server names no gate
 }
 
-// S4 (docs/MODES.md section 4, P-E): the server's tables are the server modes' (srv/coop_srv_mode.cpp): the world server's in-filter
+// The server's tables are the server modes' (srv/coop_srv_mode.cpp): the world server's in-filter
 // (mapserver::host_incoming) and the transfers' tables (xfer_install_server / xfer_install_client). A co-op process installs none.
 void install_server(Session&) {}
 
@@ -464,9 +429,9 @@ void reset()
 	g.map_due = false;
 	g.map_sent_at = 0;
 	g.host_split = game_split();
-	g.gates.clear();
 	g.view = wire::LevelMapMsg();
 	g.view_known = false;
+	g_mode_stamp.bump(); // no table, no view
 	mapserver::reset();
 	xfer_reset();
 }
@@ -476,11 +441,12 @@ void on_peer_left(PeerId id)
 	if (!mgr().active() || !mode().decides_world())
 		return;
 	g.table.remove(id);
+	g_mode_stamp.bump(); // his seat is gone
 	if (split())
 		g.map_due = true;
 }
 
-// The server modes' frame (srv/coop_srv_mode.cpp; S4, A-S4H): a co-op process never runs it. A map server's step waits for its world's
+// The server modes' frame (srv/coop_srv_mode.cpp): a co-op process never runs it. A map server's step waits for its world's
 // Welcome itself (mapserver::server_frame).
 void frame()
 {
@@ -520,24 +486,14 @@ void print_status()
 }
 
 // The console commands of the levels (srv_levels_status, srv_levels_audit, srv_max_map_servers, srv_mapserver_linger,
-// srv_map_servers_rev and their old coop_* names) are the server's: srv/coop_srv_console.cpp (S4, A-S4H).
+// srv_map_servers_rev and their old coop_* names) are the server's: srv/coop_srv_console.cpp.
 
 // ---------------------------------------------------------------- Lua
 // Plain C functions, as in coop_script.cpp: a wrong argument from an addon returns nil / false instead of a luabind "no
-// matching overload" error, which is fatal in this engine (R-11.4).
+// matching overload" error, which is fatal in this engine.
 namespace
 {
-// A whole number 0..max from argument `idx`.
-bool arg_whole(lua_State* L, int idx, double max, u32& out)
-{
-	if (lua_type(L, idx) != LUA_TNUMBER)
-		return false;
-	const double v = double(lua_tonumber(L, idx));
-	if (!std::isfinite(v) || v < 0.0 || v > max || v != std::floor(v))
-		return false;
-	out = u32(v);
-	return true;
-}
+using lua_api::arg_whole_u32;
 
 void push_level(lua_State* L, LevelId level)
 {
@@ -551,11 +507,6 @@ void push_level(lua_State* L, LevelId level)
 int l_is_world_server(lua_State* L)
 {
 	lua_pushboolean(L, mgr().active() && mode().decides_world());
-	return 1;
-}
-int l_is_map_authority(lua_State* L)
-{
-	lua_pushboolean(L, net::host());
 	return 1;
 }
 int l_is_player(lua_State* L)
@@ -590,15 +541,10 @@ int l_split(lua_State* L)
 	lua_pushboolean(L, split());
 	return 1;
 }
-int l_my_level(lua_State* L)
-{
-	push_level(L, my_level());
-	return 1;
-}
 int l_level_of_player(lua_State* L)
 {
 	u32 peer = 0;
-	if (!arg_whole(L, 1, double(kMaxPeerSlots - 1), peer))
+	if (!arg_whole_u32(L, 1, double(kMaxPeerSlots - 1), peer))
 		lua_pushnil(L);
 	else
 		push_level(L, level_of_player(PeerId(peer)));
@@ -607,25 +553,18 @@ int l_level_of_player(lua_State* L)
 int l_players_on(lua_State* L)
 {
 	u32 level = 0;
-	lua_pushnumber(L, arg_whole(L, 1, double(0xfffe), level) ? lua_Number(players_on(LevelId(level))) : lua_Number(0));
+	lua_pushnumber(L, arg_whole_u32(L, 1, double(0xfffe), level) ? lua_Number(players_on(LevelId(level))) : lua_Number(0));
 	return 1;
 }
 // coop.levels.level_name(level id): "l01_escape"; nil for no level
 int l_level_name(lua_State* L)
 {
 	u32 level = 0;
-	const char* name = arg_whole(L, 1, double(0xfffe), level) ? level_name_of(LevelId(level)) : nullptr;
+	const char* name = arg_whole_u32(L, 1, double(0xfffe), level) ? level_name_of(LevelId(level)) : nullptr;
 	if (name)
 		lua_pushstring(L, name);
 	else
 		lua_pushnil(L);
-	return 1;
-}
-// coop.levels.on_host_level(peer): he stands on the host's level (the host's process; elsewhere always true)
-int l_on_host_level(lua_State* L)
-{
-	u32 peer = 0;
-	lua_pushboolean(L, !arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) || on_host_level(PeerId(peer)));
 	return 1;
 }
 // coop.levels.squads_at(bridge) -> the host's process: the ids of the squads that map server holds
@@ -633,7 +572,7 @@ int l_squads_at(lua_State* L)
 {
 	u32 bridge = 0;
 	lua_newtable(L);
-	if (arg_whole(L, 1, double(0xffff), bridge))
+	if (arg_whole_u32(L, 1, double(0xffff), bridge))
 	{
 		int n = 0;
 		for (const u16 id : squads_at(PeerId(bridge)))
@@ -650,7 +589,7 @@ int l_carried(lua_State* L)
 {
 	u32 id = 0;
 	lua_newtable(L);
-	const CSE_ALifeDynamicObject* e = arg_whole(L, 1, double(0xfffe), id) && ai().get_alife() ? ai().alife().objects().object(u16(id), true) : nullptr;
+	const CSE_ALifeDynamicObject* e = arg_whole_u32(L, 1, double(0xfffe), id) && ai().get_alife() ? ai().alife().objects().object(u16(id), true) : nullptr;
 	if (!e)
 		return 1;
 	int n = 0;
@@ -706,7 +645,7 @@ int l_map_servers(lua_State* L)
 int l_bridge_of_player(lua_State* L)
 {
 	u32 peer = 0;
-	const PeerId bridge = arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && !on_host_level(PeerId(peer)) ?
+	const PeerId bridge = arg_whole_u32(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && !on_host_level(PeerId(peer)) ?
 	    mapserver::bridge_of(level_of_player(PeerId(peer))) :
 	    kInvalidPeer;
 	if (bridge == kInvalidPeer)
@@ -718,12 +657,12 @@ int l_bridge_of_player(lua_State* L)
 // coop.levels.talking(peer) -> the host's process: he holds a talk lock on a map server's level, as that server last said of his body
 // (LevelBodyFacts); false on the host's level, and when it has said nothing for a while
 // coop.levels.talk_partner(peer) -> the host's process: the id of the NPC he talks to there (the world server's numbering), as that
-// server last said (LevelBodyFacts.partner, build 57, protocol 33); nil when he talks to nobody there, or it has said nothing for a while
+// server last said (LevelBodyFacts.partner); nil when he talks to nobody there, or it has said nothing for a while
 int push_talk(lua_State* L, bool partner)
 {
 	u32 peer = 0;
 	BodyFacts facts;
-	const bool told = arg_whole(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && body_facts(join::proxy_of_peer(PeerId(peer)), facts);
+	const bool told = arg_whole_u32(L, 1, double(kMaxPeerSlots - 1), peer) && mgr().is_host() && body_facts(join::proxy_of_peer(PeerId(peer)), facts);
 	if (!partner)
 		lua_pushboolean(L, told && facts.talking);
 	else if (told && facts.talking && facts.partner != wire::kNoObject)
@@ -747,7 +686,7 @@ int l_far_place(lua_State* L)
 	u32 id = 0, node = 0, graph = 0;
 	if (!net::client() || mode().leads_level() || !ai().get_alife() || !lua_isnumber(L, 2) || !lua_isnumber(L, 3) || !lua_isnumber(L, 4))
 		return 0;
-	if (!arg_whole(L, 1, double(0xfffe), id) || !arg_whole(L, 5, double(0xffffffff), node) || !arg_whole(L, 6, double(0xfffe), graph))
+	if (!arg_whole_u32(L, 1, double(0xfffe), id) || !arg_whole_u32(L, 5, double(0xffffffff), node) || !arg_whole_u32(L, 6, double(0xfffe), graph))
 		return 0;
 	CSE_ALifeDynamicObject* e = ai().alife().objects().object(u16(id), true);
 	if (!e || e->m_bOnline || !ai().game_graph().valid_vertex_id(u16(graph)))
@@ -758,18 +697,18 @@ int l_far_place(lua_State* L)
 	return 0;
 }
 // coop.levels.online_at_server(id): the object is online at a map server, nothing of it is here (the mode's hook, as the switch manager
-// asks it: S4, A-S4H)
+// asks it)
 int l_online_at_server(lua_State* L)
 {
 	u32 id = 0;
-	lua_pushboolean(L, arg_whole(L, 1, double(0xfffe), id) && mode().online_elsewhere(u16(id)));
+	lua_pushboolean(L, arg_whole_u32(L, 1, double(0xfffe), id) && mode().online_elsewhere(u16(id)));
 	return 1;
 }
 // coop.levels.holder_of(id) -> the host's process: the bridge of the map server that holds the object or its squad, nil when none does
 int l_holder_of(lua_State* L)
 {
 	u32 id = 0;
-	const PeerId bridge = arg_whole(L, 1, double(0xfffe), id) ? holder_of(u16(id)) : kInvalidPeer;
+	const PeerId bridge = arg_whole_u32(L, 1, double(0xfffe), id) ? holder_of(u16(id)) : kInvalidPeer;
 	if (bridge == kInvalidPeer)
 		lua_pushnil(L);
 	else
@@ -781,7 +720,7 @@ int l_holder_of(lua_State* L)
 int l_recall(lua_State* L)
 {
 	u32 id = 0, ms = kRecallPinMs;
-	const bool args = arg_whole(L, 1, double(0xfffe), id) && (lua_isnoneornil(L, 2) || arg_whole(L, 2, double(kRecallPinMaxMs), ms));
+	const bool args = arg_whole_u32(L, 1, double(0xfffe), id) && (lua_isnoneornil(L, 2) || arg_whole_u32(L, 2, double(kRecallPinMaxMs), ms));
 	lua_pushboolean(L, args && recall(u16(id), ms));
 	return 1;
 }
@@ -790,76 +729,12 @@ int l_logic_look(lua_State* L)
 	lua_pushboolean(L, logic_looking());
 	return 1;
 }
-// coop.levels.set_gate(level name, "free"|"suggest"|"together", reason id): the world server, coop_levels.script
-int l_set_gate(lua_State* L)
-{
-	Gate gate = Gate::Free;
-	const char* name = lua_type(L, 1) == LUA_TSTRING ? lua_tostring(L, 1) : nullptr;
-	const char* word = lua_type(L, 2) == LUA_TSTRING ? lua_tostring(L, 2) : nullptr;
-	const char* reason = lua_type(L, 3) == LUA_TSTRING ? lua_tostring(L, 3) : "";
-	if (!name || !word || !parse_gate(word, gate) || !mgr().active() || !mode().decides_world())
-	{
-		lua_pushboolean(L, 0);
-		return 1;
-	}
-	GateRow& row = g.gates[name];
-	const bool changed = row.gate != gate || row.reason != reason;
-	row.gate = gate;
-	row.reason = reason;
-	g.map_due = g.map_due || changed;
-	lua_pushboolean(L, 1);
-	return 1;
-}
-// coop.levels.gate_of(level name): the gate as split levels fold it, a word; nil for a level that does not exist
-int l_gate_of(lua_State* L)
-{
-	const LevelId level = lua_type(L, 1) == LUA_TSTRING ? level_by_name(lua_tostring(L, 1)) : wire::kNoLevel;
-	if (level == wire::kNoLevel)
-		lua_pushnil(L);
-	else
-		lua_pushstring(L, gate_name(effective_gate(gate_of_level(level), true)));
-	return 1;
-}
-
-// Sets `fns` on the table `name` of coop (made here if it is not there), or on coop itself when `name` is null.
-void fill(lua_State* L, const char* name, const luaL_Reg* fns)
-{
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // the registrator logs it
-	}
-	int pops = 1; // coop
-	if (name)
-	{
-		lua_pushstring(L, name);
-		lua_rawget(L, -2);
-		if (!lua_istable(L, -1))
-		{
-			lua_pop(L, 1);
-			lua_newtable(L);
-			lua_pushstring(L, name);
-			lua_pushvalue(L, -2);
-			lua_rawset(L, -4); // coop.<name> = the new table
-		}
-		++pops;
-	}
-	for (const luaL_Reg* f = fns; f->name; ++f)
-	{
-		lua_pushcfunction(L, f->func);
-		lua_setfield(L, -2, f->name);
-	}
-	lua_pop(L, pops);
-}
 } // namespace
 
 void register_lua(lua_State* L)
 {
 	static const luaL_Reg roles[] = {
 		{"is_world_server", &l_is_world_server},
-		{"is_map_authority", &l_is_map_authority},
 		{"is_player", &l_is_player},
 		{"is_dedicated", &l_is_dedicated},
 		{"dedicated_new_world", &l_dedicated_new_world},
@@ -869,7 +744,7 @@ void register_lua(lua_State* L)
 	};
 	static const luaL_Reg registry[] = {
 		{"split", &l_split},
-		{"my_level", &l_my_level},
+		{"my_level", &lua_my_level},
 		{"level_of_player", &l_level_of_player},
 		{"players_on", &l_players_on},
 		{"online_at_server", &l_online_at_server},
@@ -878,7 +753,6 @@ void register_lua(lua_State* L)
 		{"far_place", &l_far_place},
 		{"body_stays", &l_body_stays},
 		{"level_name", &l_level_name},
-		{"on_host_level", &l_on_host_level},
 		{"map_servers", &l_map_servers},
 		{"squads_at", &l_squads_at},
 		{"carried", &l_carried},
@@ -888,12 +762,16 @@ void register_lua(lua_State* L)
 		{"bridge_of_player", &l_bridge_of_player},
 		{"talking", &l_talking},
 		{"talk_partner", &l_talk_partner},
-		{"set_gate", &l_set_gate},
-		{"gate_of", &l_gate_of},
 		{nullptr, nullptr},
 	};
-	fill(L, nullptr, roles);
-	fill(L, "levels", registry);
+	lua_api::fill(L, nullptr, roles);
+	lua_api::fill(L, "levels", registry);
+}
+
+int lua_my_level(lua_State* L)
+{
+	push_level(L, my_level());
+	return 1;
 }
 } // namespace levels
 } // namespace coop

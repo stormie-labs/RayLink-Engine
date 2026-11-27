@@ -2,8 +2,7 @@
 // it shows and how strongly. Pure C++17, header-only, no engine dependencies: used by coop_presence.cpp and by the
 // unit-test exe (tests/test_nametag.cpp).
 //
-// Owner 2026-10-23 19:40 on build 9: the old tag ("player_b  2 m" on one line, small blue Arial, alpha in three steps)
-// should be presentable, the distance under the nick, prettier, and its transparency should "play". Look (HUD v2
+// The tag: the distance under the nick, and a transparency that eases. Look (HUD v2
 // language: flat, no glow, a dark 1 px edge; docs/hud/hud_v21_mockup.png), from the head upwards:
 //   - an icon: a chevron in the player's colour pointing at him (the compass marks allies the same way); wounded: the
 //     red ring with a cross, pulsing at 1 Hz and a bit bigger; dead / spectating / returning: a grey skull;
@@ -21,6 +20,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+#include "coop_validate.h"
 
 namespace coop
 {
@@ -61,11 +62,9 @@ struct Params
 	float gap_px = 2.f; // between the icon and the line (screen px at 768 high)
 };
 
-inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
-
 inline float smoothstep01(float t)
 {
-	t = clamp01(t);
+	t = validate::clamp01(t);
 	return t * t * (3.f - 2.f * t);
 }
 
@@ -156,7 +155,7 @@ inline Look look(State s, float dist_m, bool behind_wall, uint64_t now_ms, uint3
 
 inline uint32_t argb(float a01, uint32_t rgb)
 {
-	const uint32_t a = uint32_t(clamp01(a01) * 255.f + 0.5f);
+	const uint32_t a = uint32_t(validate::clamp01(a01) * 255.f + 0.5f);
 	return (a << 24) | (rgb & 0xFFFFFFu);
 }
 
@@ -278,7 +277,7 @@ inline bool set_param(Params& p, const char* key, float v)
 	return false;
 }
 
-// Owner 2026-10-29 (build 29): "remove the random names on each other". A player's character carries his nick as its
+// A player's character carries his nick as its
 // character name (coop_equip.cpp apply_name: CInventoryOwner::ChangeName and the server entity's display copy), the
 // text of this tag, instead of the random stalker name of the avatar profile. ChangeName passes it through
 // TranslateName, which splits a "name:lname_x" pair at ':' and asserts on any other count of parts, so ':' goes; '%'

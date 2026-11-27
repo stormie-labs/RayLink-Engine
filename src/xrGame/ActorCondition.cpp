@@ -21,10 +21,10 @@
 #include "UIGameCustom.h"
 #include "ui/UIMainIngameWnd.h"
 #include "ui/UIStatic.h"
-#include "coop/coop_survival.h" // Anomaly Coop
-#include "coop/coop_players.h" // Anomaly Coop (build 56): own_condition_held
-#include "coop/coop_ai.h" // Anomaly Coop: player_down
-#include "coop/coop_health_ledger.h" // Anomaly Coop (live 2026-11-09): the condition in the own actor's health ledger
+#include "coop/coop_survival.h"
+#include "coop/coop_players.h" // coop: own_condition_held
+#include "coop/coop_ai.h" // coop: player_down
+#include "coop/coop_health_ledger.h" // coop: the condition in the own actor's health ledger
 
 #define MAX_SATIETY					1.0f
 #define START_SATIETY				0.5f
@@ -199,10 +199,10 @@ float CActorCondition::GetZoneMaxPower(ALife::EHitType hit_type) const
 
 void CActorCondition::UpdateCondition()
 {
-	// Anomaly Coop (build 56): a client that is still loading the host's world (precache, the held screen)
+	// coop: a client that is still loading the host's world (precache, the held screen)
 	if (coop::players::own_condition_held(this))
 		return;
-	coop::survival::actor_condition_hook(*this); // Anomaly Coop: in a session zero health means wounded, not dead
+	coop::survival::actor_condition_hook(*this); // coop: in a session zero health means wounded, not dead
 	float v_alcohol = IsSleeping() ? m_fV_AlcoholSleep : m_fV_Alcohol;
 	
 	if (psActorFlags.test(AF_GODMODE_RT))
@@ -308,15 +308,15 @@ void CActorCondition::UpdateCondition()
 	UpdateSatiety();
 	UpdateBoosters();
 
-	const float coop_ledger_was = GetHealth(); // Anomaly Coop (live 2026-11-09): the health ledger, a diagnostic
+	const float coop_ledger_was = GetHealth(); // coop: the health ledger, a diagnostic
 	inherited::UpdateCondition();
 	coop::health_ledger::condition_update(*this, coop_ledger_was);
-	coop::survival::actor_condition_hook(*this); // Anomaly Coop
+	coop::survival::actor_condition_hook(*this);
 
 	if (IsGameTypeSingle())
 		UpdateTutorialThresholds();
 
-	if (GetHealth() < 0.05f && m_death_effector == NULL && IsGameTypeSingle() && !coop::survival::suppress_death_effector()) // Anomaly Coop
+	if (GetHealth() < 0.05f && m_death_effector == NULL && IsGameTypeSingle() && !coop::survival::suppress_death_effector()) // coop: no death effector in a session, it would end in health -1 and the stock game over
 	{
 		if (pSettings->section_exist("actor_death_effector"))
 			m_death_effector = xr_new<CActorDeathEffector>(this, "actor_death_effector");
@@ -391,7 +391,7 @@ void CActorCondition::AffectDamage_InjuriousMaterialAndMonstersInfluence()
 	// Add Radiation and Psy Level from Monsters
 	CPda* const pda = m_object->GetPDA();
 
-	// Anomaly Coop (audit F9): an aura leaves a player who is down, as the monsters do: each of its hits shortened his bleed-out
+	// coop: an aura leaves a player who is down, as the monsters do: each of its hits shortened his bleed-out
 	if (m_object && m_object->g_Alive() && !coop::npc_ai::player_down(m_object))
 	{
 		typedef xr_vector<CObject*> monsters;
@@ -516,7 +516,7 @@ void CActorCondition::UpdateSatiety()
 	{
 		float v_satiety_health = IsSleeping() ? m_fV_SatietyHealthSleep : m_fV_SatietyHealth;
 		m_fDeltaHealth += v_satiety_health * satiety_health_koef * m_fDeltaTime;
-		if (coop::health_ledger::is_own_condition(this)) // Anomaly Coop (build 51): another actor pays one compare
+		if (coop::health_ledger::is_own_condition(this)) // coop: another actor pays one compare
 			coop::health_ledger::condition_satiety(*this, v_satiety_health * satiety_health_koef * m_fDeltaTime);
 		m_fDeltaPower += v_satiety_power * m_fSatiety * m_fDeltaTime;
 	}
@@ -1072,7 +1072,7 @@ bool CActorCondition::ApplyBooster(const SBooster& B, const shared_str& sect)
 	return true;
 }
 
-// Anomaly Coop (build 56): see ActorCondition.h. The same two steps UpdateBoosters does for one booster that ran out.
+// coop: see ActorCondition.h. The same two steps UpdateBoosters does for one booster that ran out.
 void CActorCondition::ClearBoosters()
 {
 	for (BOOSTER_MAP::const_iterator it = m_booster_influences.begin(); it != m_booster_influences.end(); ++it)
@@ -1080,7 +1080,7 @@ void CActorCondition::ClearBoosters()
 	m_booster_influences.clear();
 }
 
-// Anomaly Coop (build 56): see ActorCondition.h. The values a new game starts with (the constructor, reinit).
+// coop: see ActorCondition.h. The values a new game starts with (the constructor, reinit).
 void CActorCondition::DropLoadedExtras()
 {
 	ClearBoosters();

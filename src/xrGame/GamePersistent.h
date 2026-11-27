@@ -59,7 +59,7 @@ public:
 	virtual bool OnThunderboltFollows();
 	virtual void OnThunderbolt(LPCSTR id, float period, float duration, u32 seed);
 	virtual float OnRainSound(LPCSTR file);
-	virtual void OnDeviceResetBegin(); // Anomaly Coop: keep the session link alive through the reset
+	virtual void OnDeviceResetBegin(); // coop: keep the session link alive through the reset
 
 private:
 

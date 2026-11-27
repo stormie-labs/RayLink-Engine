@@ -1,5 +1,5 @@
 #pragma once
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit A5)
+#include "../../../coop/coop_monster_fx.h"
 
 template <typename Object>
 CStateBurerAttackGravi<Object>::CStateBurerAttackGravi(Object* obj) : inherited(obj), m_action()
@@ -136,7 +136,7 @@ void CStateBurerAttackGravi<Object>::ExecuteGraviFire()
 	target_pos.y += 0.5f;
 
 	object->m_gravi_object.activate(object->EnemyMan.get_enemy(), from_pos, target_pos);
-	// Anomaly Coop (audit A5): a remote player sees the wave come at him (the strike comes as PlayerHit)
+	// coop: a remote player sees the wave come at him (the strike comes as PlayerHit)
 	coop::monster_fx::host_send(object->EnemyMan.get_enemy(), object, coop::monster_fx::kBurerGravi, 0, 0.f);
 
 	object->StopGraviPrepare();

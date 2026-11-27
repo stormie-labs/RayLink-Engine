@@ -1,4 +1,4 @@
-// Anomaly Coop — the host's emergency autosaves coop_auto_N (F3 Task 12). See coop_autosave.h.
+// Anomaly Coop — the host's emergency autosaves coop_auto_N. See coop_autosave.h.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_autosave.h"
@@ -6,6 +6,8 @@
 #include "xrCoop/coop_mode.h"
 #include "coop_survival.h"
 #include "coop_rest.h"
+#include "coop_lua.h" // lua_api::fill
+#include "xrCoop/coop_lua_fn.h" // luafn::call_named: coop_game_settings.on_autosave
 
 #include "../../xrEngine/XR_IOConsole.h"
 #include "../../xrEngine/xr_ioc_cmd.h"
@@ -14,7 +16,6 @@
 #include "Level.h"
 #include "Actor.h"
 
-#include <cmath>
 #include <string>
 #include <vector>
 
@@ -39,12 +40,12 @@ constexpr u32 kMaxPostponeMs = 120000;
 constexpr u64 kRequestLifeMs = 300000;
 // CALifeStorageManager::save starts the file with u32(-1), the version and the size: less is not a save.
 constexpr int kMinSaveBytes = 12;
-// Moving a finished file can meet a virus scanner or a sync client that holds it for a moment (review M1).
+// Moving a finished file can meet a virus scanner or a sync client that holds it for a moment.
 constexpr u32 kMoveTries = 8;
 constexpr DWORD kMoveRetryMs = 50;
-// A save whose slot cannot be replaced goes to the next one, this many slots at most (review M2).
+// A save whose slot cannot be replaced goes to the next one, this many slots at most.
 constexpr u32 kSlotTries = 3;
-// The Restore window renews its pause every frame; a pause nobody renewed for this long is over (review I1).
+// The Restore window renews its pause every frame; a pause nobody renewed for this long is over.
 constexpr u32 kPauseLeaseMs = 3000;
 
 constexpr size_t kReasonCount = size_t(Reason::Manual) + 1;
@@ -184,7 +185,7 @@ void list_slots(const std::string& game, std::vector<SlotInfo>& out)
 	out.insert(out.end(), mine.begin(), mine.end());
 }
 
-// The slot a save of `game` goes to: a free one, else the oldest, except those that failed before (review M2). 0 when every
+// The slot a save of `game` goes to: a free one, else the oldest, except those that failed before. 0 when every
 // place has failed.
 uint32_t pick_untried_slot(const std::string& game)
 {
@@ -233,7 +234,7 @@ bool move_over(LPCSTR from, LPCSTR to)
 	return false;
 }
 
-// Writes the data of a closed file to the disk (review M3). The M_SAVE_GAME path gives no handle: CFileWriter closes the
+// Writes the data of a closed file to the disk. The M_SAVE_GAME path gives no handle: CFileWriter closes the
 // .scop with fclose and Lua closes the .scoc, neither flushes the system cache. Without this a power cut after the
 // rename can leave a slot of the right size with the body not written.
 void flush_to_disk(LPCSTR path)
@@ -268,7 +269,7 @@ void send_save(LPCSTR stem)
 }
 
 // What an earlier crash or a failed save left of coop_auto_tmp must not pass for the save that is about to be written
-// (review M4): a leftover .scoc that Lua could not overwrite would be moved to the new world. false = it cannot be cleared.
+//: a leftover .scoc that Lua could not overwrite would be moved to the new world. false = it cannot be cleared.
 bool begin_temp()
 {
 	Pair tmp;
@@ -283,7 +284,7 @@ bool begin_temp()
 	return true;
 }
 
-// Puts the finished pair `from` in the place of the pair `to` as one change (review M1). The old pair is put aside under
+// Puts the finished pair `from` in the place of the pair `to` as one change. The old pair is put aside under
 // kBackupStem first (the slot is then out of the Restore list), the new one moved in, the old one deleted. Any failure
 // puts it all back: `to` holds the old pair or the new one, never one file of each, and `from` is whole again.
 bool swap_in(const Pair& from, bool has_scoc, const Pair& to)
@@ -379,7 +380,7 @@ Commit commit_to(const std::string& game, uint32_t slot)
 }
 
 // The finished save goes to `first`; if its files cannot be replaced (read-only, held by another process), to the next
-// slot, a few times (review M2). Slots that failed are remembered for the session. Returns the slot, 0 when none took
+// slot, a few times. Slots that failed are remembered for the session. Returns the slot, 0 when none took
 // it, with `result` saying whether the save is still in coop_auto_tmp.
 uint32_t commit_somewhere(const std::string& game, uint32_t first, Commit& result)
 {
@@ -422,42 +423,22 @@ void prune_surplus(const std::string& game, uint32_t written)
 }
 
 // coop_game_settings.on_autosave, or nil; run protected (the lookup of a script's table may load the script).
-int journal_lookup(lua_State* L)
-{
-	lua_getglobal(L, "coop_game_settings");
-	if (!lua_istable(L, -1))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_getfield(L, -1, "on_autosave");
-	return 1;
-}
-
 // The journal of the world's saves (gamedata\scripts\coop_saves_journal.script, the launcher's chronicle of a world): the script
 // could not name this save while it was written, it went through coop_auto_tmp, so the engine tells it the slot and why. A script
 // without on_autosave (a mod from before the journal) is told nothing; a Lua error is a line of the log. The save is on disk
 // whatever the journal says.
 void tell_script(const std::string& name, Reason why)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L || !lua_checkstack(L, 8))
-		return;
-	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &journal_lookup);
-	if (lua_pcall(L, 0, 1, 0) != 0 || !lua_isfunction(L, -1))
+	const auto push = [&name, why](lua_State* L)
 	{
-		lua_settop(L, top);
-		return;
-	}
-	lua_pushlstring(L, name.data(), name.size());
-	lua_pushnumber(L, lua_Number(int(why)));
-	if (lua_pcall(L, 2, 0, 0) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		::Msg("! [coop] autosave: lua error in coop_game_settings.on_autosave(%s): %s", name.c_str(), err ? err : "?");
-	}
-	lua_settop(L, top);
+		lua_pushlstring(L, name.data(), name.size());
+		lua_pushnumber(L, lua_Number(int(why)));
+		return 2;
+	};
+	std::string error;
+	if (luafn::call_named(ai().script_engine().lua(), "coop_game_settings", "on_autosave", nullptr, push, 0, [](lua_State*) {}, error) ==
+	    luafn::Fail::LuaError)
+		::Msg("! [coop] autosave: lua error in coop_game_settings.on_autosave(%s): %s", name.c_str(), error.c_str());
 }
 
 // One more save counted: the interval of the timer starts from here, and a request waiting for this save is served.
@@ -485,8 +466,7 @@ bool save(Reason why)
 		::Msg("! [coop] autosave (%s) skipped: the host's level cannot be saved now", reason_name(why));
 		return false;
 	}
-	// Live 2026-10-25 (owner: "loaded the game from the moment I quit dead: a black screen"). A down host is alive for the
-	// engine with 1% health; a save then (the end of the session when he quits dead, or a timed one past its postpone)
+	// A down host is alive for the engine with 1% health; a save then (the end of the session when he quits dead, or a timed one past its postpone)
 	// loads him dying: no health, no limbs, the screen black. No save of any reason while the host's character is down:
 	// the last good one stays.
 	if (survival::life_of(0) != survival::Life::Alive)
@@ -625,27 +605,6 @@ std::string game_arg(lua_State* L, int idx, bool& ok)
 	return effective_game(std::string(s, len));
 }
 
-// coop.autosave.slot_name(index[, id]) -> string | nil: "coop_auto_<id>_<index>" ("coop_auto_<index>" in the old ring) for the
-// game that is set, or for `id`. nil for an index that is not 1..999999999.
-int l_slot_name(lua_State* L)
-{
-	bool ok = true;
-	const std::string game = game_arg(L, 2, ok);
-	if (!ok || lua_type(L, 1) != LUA_TNUMBER)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	const lua_Number n = lua_tonumber(L, 1);
-	if (!(n >= 1 && n <= 999999999) || n != std::floor(n))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_pushstring(L, slot_name(uint32_t(n), game).c_str());
-	return 1;
-}
-
 // coop.autosave.parse_slot(stem[, id]) -> number | nil: the slot number of a save file name without extension in the ring
 // of the game that is set, or of `id`; nil when it is not a slot of that ring. The one rule the engine and Lua share (the
 // Restore list must not guess it with a Lua pattern: ids hold '-', which is magic there).
@@ -698,29 +657,16 @@ void register_console()
 	CMD1(CCC_CoopAutosaveNow, "coop_autosave_now");
 }
 
-// Fills coop.autosave (made here: the table is ours).
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // the registrator logs it
-	}
-	lua_newtable(L);
-	lua_pushcfunction(L, &l_suspend);
-	lua_setfield(L, -2, "suspend");
-	lua_pushcfunction(L, &l_set_game);
-	lua_setfield(L, -2, "set_game");
-	lua_pushcfunction(L, &l_game);
-	lua_setfield(L, -2, "game");
-	lua_pushcfunction(L, &l_slot_name);
-	lua_setfield(L, -2, "slot_name");
-	lua_pushcfunction(L, &l_parse_slot);
-	lua_setfield(L, -2, "parse_slot");
-	lua_setfield(L, -2, "autosave"); // coop.autosave = { suspend, set_game, game, slot_name, parse_slot }
-	lua_pop(L, 1); // coop
+	static const luaL_Reg fns[] = {
+		{"suspend", &l_suspend},
+		{"set_game", &l_set_game},
+		{"game", &l_game},
+		{"parse_slot", &l_parse_slot},
+		{nullptr, nullptr},
+	};
+	lua_api::fill(L, "autosave", fns); // coop_script logs a missing coop
 }
 
 bool set_game(const std::string& id)

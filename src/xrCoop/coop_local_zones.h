@@ -13,6 +13,7 @@
 #pragma once
 
 #include "coop_id_lease.h"
+#include "coop_ids.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +25,7 @@ namespace coop
 {
 namespace zones
 {
-constexpr uint16_t kNoId = lease::kNoId;
+using coop::kNoId;
 // Ids of the lease a zone never takes: the player's own items (alife():create into his actor) need them at once.
 constexpr size_t kKeepForItems = 8;
 

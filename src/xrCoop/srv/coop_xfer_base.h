@@ -1,10 +1,10 @@
-// Anomaly Coop - F3a split levels: ownership transfer, the shared part - keys, ops, packets, timings, digests (plan
-// 2026-10-24-f3a §1.7). The protocol and its rulings are described in coop_xfer.h; the map server's side is
-// coop_xfer_holder.h, the journal's text coop_xfer_journal.h.
-// Pure C++17, header-only, no engine dependencies: used by the engine and the unit-test exe.
+// Anomaly Coop - ownership transfer, the shared part - keys, ops, packets, timings, digests. The protocol and its rules are
+// described in coop_xfer.h; the map server's side is coop_xfer_holder.h, the journal's text coop_xfer_journal.h. Pure C++17,
+// header-only, no engine dependencies: used by the engine and the unit-test exe.
 #pragma once
 
-#include "coop_level_hash.h"
+#include "../coop_hash.h"
+#include "../coop_level_hash.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -83,12 +83,7 @@ inline const char* op_name(Op op)
 // FNV-1a 64 of a state; never 0 (0 means "not compared" in an Entry).
 inline uint64_t digest(const std::vector<uint8_t>& state)
 {
-	uint64_t h = 0xCBF29CE484222325ull;
-	for (uint8_t b : state)
-	{
-		h ^= b;
-		h *= 0x100000001B3ull;
-	}
+	const uint64_t h = fnv1a64(state.data(), state.size());
 	return h ? h : 1;
 }
 

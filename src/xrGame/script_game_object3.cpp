@@ -59,10 +59,10 @@
 
 #include "Torch.h"
 #include "Flashlight.h"
-#include "coop/coop_events.h" // Anomaly Coop
-#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12 round 1)
-#include "coop/coop_items.h" // Anomaly Coop: TZ R32 W8.1, a setter on the decider is the item's new baseline
-#include "coop/coop_ai.h" // Anomaly Coop: get_luminocity of a player's character (the light estimate)
+#include "coop/coop_events.h"
+#include "coop/coop_callgate.h"
+#include "coop/coop_items.h" // coop: a setter on the decider is the item's new baseline
+#include "coop/coop_ai.h" // coop: get_luminocity of a player's character (the light estimate)
 
 namespace MemorySpace
 {
@@ -1467,7 +1467,7 @@ void CScriptGameObject::buy_supplies(CScriptIniFile* ini_file, LPCSTR section)
 	}
 
 	if (coop::callgate::client_gate("game_object:buy_supplies", &object()) == coop::calls::Gate::Refuse)
-		return; // Anomaly Coop (F2 T12 round 1 gate): a trader's stock is a world spawn (the event router refused it too)
+		return; // coop: a trader's stock is a world spawn (the event router refused it too)
 	inventory_owner->buy_supplies(
 		*ini_file,
 		section
@@ -1761,7 +1761,7 @@ void CScriptGameObject::SetArtefactAdditionalInventoryWeight(float value)
 
 void CScriptGameObject::AttachVehicle(CScriptGameObject* veh, bool bForce)
 {
-	if (veh && coop::events::client_refuse_vehicle(&veh->object())) return; // Anomaly Coop: the host drives cars (F2 T12 gate inside)
+	if (veh && coop::events::client_refuse_vehicle(&veh->object())) return; // coop: the host drives cars
 	CActor* actor = smart_cast<CActor*>(&object());
 	if (actor)
 	{
@@ -1950,10 +1950,10 @@ float CScriptGameObject::GetLuminocityHemi()
 
 float CScriptGameObject::GetLuminocity()
 {
-	// Anomaly Coop: the render's light of an object nobody draws here is stale, and on a map server it is 0 for ever
-	// (CROS_impl starts at 0 and is refreshed when the object is drawn). A script that judges vision by it - G.A.M.M.A.'s
-	// Stealth Overhaul reads who:get_luminocity() and ignores the luminocity the engine hands it - saw a player's
-	// character in pitch dark: live 2026-11-15, the arena's opponents turned on the fighter only once he shot. The
+	// coop: the render's light of an object nobody draws here is stale, and on a map server it is 0 for ever
+	// (CROS_impl starts at 0 and is refreshed when the object is drawn). A script that judges vision by it - a stealth mod
+	// may read who:get_luminocity() and ignore the luminocity the engine hands it - would see a player's character in
+	// pitch dark. The
 	// estimate the engine's own vision takes (visual_memory_manager.cpp object_luminocity) answers here too: a remote
 	// player's character, and a creature near a player who is not the host.
 	float estimate = 0.f;
@@ -2059,7 +2059,7 @@ void CScriptGameObject::SetRemainingUses(u8 value)
 		return;
 
 	eItm->SetRemainingUses(value);
-	coop::items::decider_wrote(IItm, coop::owner::Setter::Uses); // Anomaly Coop: TZ R32 W8.1, the decider's write
+	coop::items::decider_wrote(IItm, coop::owner::Setter::Uses); // coop: the decider's write
 }
 
 u8 CScriptGameObject::GetRemainingUses()
@@ -2116,7 +2116,7 @@ u32 CScriptGameObject::GetSpatialType()
 
 void CScriptGameObject::DestroyObject()
 {
-	// Anomaly Coop (F2 T12 round 1 gate): counted with the other calls; the decision is the event router's on_destroy
+	// coop: counted with the other calls; the decision is the event router's on_destroy
 	// (an own or free item goes to the host, an object outside the host's world is local, the rest is the host's)
 	if (coop::callgate::client_gate_own("game_object:destroy_object", coop::callgate::own_destroy(object().ID())) == coop::calls::Gate::Refuse)
 		return;

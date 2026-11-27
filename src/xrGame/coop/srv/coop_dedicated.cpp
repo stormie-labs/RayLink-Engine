@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_dedicated.h"
+#include "../coop_lua.h"
 #include "../coop_autosave.h"
 #include "../coop_levels.h"
 #include "../coop_manager.h"
@@ -23,6 +24,7 @@
 #include "xrCoop/srv/coop_world_server_rules.h"
 #include "xrCoop/srv/coop_operator.h"
 #include "xrCoop/srv/coop_world_stage.h"
+#include "xrCoop/coop_lua_fn.h"
 #include "../coop_net.h"
 #include "script_engine.h"
 
@@ -60,7 +62,7 @@ struct State
 	bool quit_sent = false;
 	u64 title_at = 0;
 	bool usage_said = false;
-	// plan 2026-11-12 stage 2: what the parent of a -coop_hidden server was last told
+	// what the parent of a -coop_hidden server was last told
 	u64 counts_at = 0;
 	u32 players_said = u32(-1);
 	std::map<u16, world_server::MapState> mapservers_said;
@@ -71,7 +73,7 @@ void rl(const world_server::Record& r) { coop_console::rl_line(world_server::for
 
 // The answer to the operator's command that runs now (run_for): its lines, and whether a command runs. A vector of this file, not a
 // pointer to one of run_for's own: xrGame is built without unwinding, a command that throws would leave a pointer to a dead frame
-// behind, and the next line anybody says would be written there (security review 2026-11-12).
+// behind, and the next line anybody says would be written there.
 std::vector<std::string> g_answer;
 bool g_answering = false;
 
@@ -143,7 +145,7 @@ void start_world(World world, std::string save)
 			rl(world_server::Record::of_error("no_save", "no save '" + save + "'"));
 			return;
 		}
-		// owner 2026-11-13 (the old split mode stays): never the world of a host who plays in it
+		// never the world of a host who plays in it
 		std::string why;
 		if (!load_allowed(save, why))
 		{
@@ -159,59 +161,12 @@ void start_world(World world, std::string save)
 	Console->Execute(start_line(world, save).c_str());
 }
 
-// ---------------------------------------------------------------- plan 2026-11-12 stage 5: a new world from coop_new_world.ltx (-coop_stage)
-
-// debug.traceback of an error in coop_srv_dedicated.stage_new_world.
-int stage_traceback(lua_State* L)
-{
-	const char* msg = lua_tostring(L, 1);
-	if (!msg)
-		msg = "(error object is not a string)";
-	lua_getglobal(L, "debug");
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_getfield(L, -1, "traceback");
-	if (!lua_isfunction(L, -1))
-	{
-		lua_pop(L, 2);
-		lua_pushstring(L, msg);
-		return 1;
-	}
-	lua_pushstring(L, msg);
-	lua_pushinteger(L, 2);
-	lua_call(L, 2, 1);
-	return 1;
-}
-
-// coop_srv_dedicated.stage_new_world, or nil. Protected (call_stage): the first lookup loads the script through _G.__index, which may raise.
-int stage_lookup(lua_State* L)
-{
-	lua_getglobal(L, "coop_srv_dedicated");
-	if (!lua_istable(L, -1))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_getfield(L, -1, "stage_new_world");
-	return 1;
-}
-
-void stage_text(lua_State* L, const char* field, const std::string& v)
-{
-	lua_pushlstring(L, v.data(), v.size());
-	lua_setfield(L, -2, field);
-}
+// ---------------------------------------------------------------- a new world from coop_new_world.ltx (-coop_stage)
 
 void stage_flag(lua_State* L, const char* field, world_stage::Flag f)
 {
-	if (f == world_stage::Flag::Absent)
-		return; // nil: the game's default
-	lua_pushboolean(L, f == world_stage::Flag::On ? 1 : 0);
-	lua_setfield(L, -2, field);
+	if (f != world_stage::Flag::Absent) // nil: the game's default
+		lua_api::set_bool(L, field, f == world_stage::Flag::On);
 }
 
 // The parsed file as the table coop_srv_dedicated.stage_new_world takes (its comment): one parser (coop_world_stage.h), not a second one in Lua.
@@ -219,10 +174,10 @@ void push_stage(lua_State* L, const world_stage::Stage& s)
 {
 	lua_createtable(L, 0, 3);
 	lua_createtable(L, 0, 8);
-	stage_text(L, "id", s.world.id);
-	stage_text(L, "name", s.world.name);
-	stage_text(L, "title", s.world.title);
-	stage_text(L, "faction", s.world.faction);
+	lua_api::set_str(L, "id", s.world.id);
+	lua_api::set_str(L, "name", s.world.name);
+	lua_api::set_str(L, "title", s.world.title);
+	lua_api::set_str(L, "faction", s.world.faction);
 	stage_flag(L, "story", s.world.story);
 	stage_flag(L, "routes", s.world.routes);
 	if (s.world.difficulty > 0)
@@ -247,9 +202,9 @@ void push_stage(lua_State* L, const world_stage::Stage& s)
 	if (s.creator.present)
 	{
 		lua_createtable(L, 0, 6);
-		stage_text(L, "name", s.creator.name);
-		stage_text(L, "icon", s.creator.icon);
-		stage_text(L, "map", s.creator.map);
+		lua_api::set_str(L, "name", s.creator.name);
+		lua_api::set_str(L, "icon", s.creator.icon);
+		lua_api::set_str(L, "map", s.creator.map);
 		lua_createtable(L, int(s.creator.loadout.size()), 0);
 		for (size_t i = 0; i < s.creator.loadout.size(); ++i)
 		{
@@ -268,50 +223,29 @@ void push_stage(lua_State* L, const world_stage::Stage& s)
 // coop_srv_dedicated.stage_new_world(path, stage) in a protected call. False with `why`.
 bool call_stage(const std::string& path, const world_stage::Stage& s, std::string& why)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L || !lua_checkstack(L, 24))
+	bool found = false; // a Lua error before the arguments are pushed is the script's load or lookup
+	bool ok = false;
+	std::string error;
+	const auto push = [&](lua_State* L) {
+		found = true;
+		lua_pushlstring(L, path.data(), path.size());
+		push_stage(L, s);
+		return 2;
+	};
+	const auto read = [&](lua_State* L) {
+		ok = lua_toboolean(L, -2) != 0;
+		if (!ok)
+			why = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "refused by coop_srv_dedicated.stage_new_world";
+	};
+	switch (luafn::call_named(ai().script_engine().lua(), "coop_srv_dedicated", "stage_new_world", &luafn::traceback, push, 2, read, error))
 	{
-		why = "no Lua state";
+	case luafn::Fail::None: return ok;
+	case luafn::Fail::Missing: why = "coop_srv_dedicated.stage_new_world is missing"; return false;
+	case luafn::Fail::LuaError:
+		why = found ? "lua error in coop_srv_dedicated.stage_new_world: " + error : "coop_srv_dedicated.stage_new_world is missing: " + error;
 		return false;
+	default: why = "no Lua state"; return false;
 	}
-	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &stage_traceback);
-	const int errfunc = lua_gettop(L);
-	lua_pushcfunction(L, &stage_lookup);
-	if (lua_pcall(L, 0, 1, errfunc) != 0 || !lua_isfunction(L, -1))
-	{
-		const char* err = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr;
-		why = std::string("coop_srv_dedicated.stage_new_world is missing") + (err ? std::string(": ") + err : std::string());
-		lua_settop(L, top);
-		return false;
-	}
-	lua_pushlstring(L, path.data(), path.size());
-	push_stage(L, s);
-	if (lua_pcall(L, 2, 2, errfunc) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		why = std::string("lua error in coop_srv_dedicated.stage_new_world: ") + (err ? err : "?");
-		lua_settop(L, top);
-		return false;
-	}
-	const bool ok = lua_toboolean(L, -2) != 0;
-	if (!ok)
-		why = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "refused by coop_srv_dedicated.stage_new_world";
-	lua_settop(L, top);
-	return ok;
-}
-
-// coop_srv_dedicated.load_allowed, or nil; protected as stage_lookup.
-int load_lookup(lua_State* L)
-{
-	lua_getglobal(L, "coop_srv_dedicated");
-	if (!lua_istable(L, -1))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_getfield(L, -1, "load_allowed");
-	return 1;
 }
 
 // May this world server load the save? coop_srv_dedicated.load_allowed(save) in a protected call: false with `why` only when the script
@@ -319,32 +253,26 @@ int load_lookup(lua_State* L)
 // missing script or a Lua error lets the save through with a line in the log: the guard is not a gate the server depends on.
 bool load_allowed(const std::string& save, std::string& why)
 {
-	lua_State* L = ai().script_engine().lua();
-	if (!L || !lua_checkstack(L, 16))
-		return true;
-	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &stage_traceback);
-	const int errfunc = lua_gettop(L);
-	lua_pushcfunction(L, &load_lookup);
-	if (lua_pcall(L, 0, 1, errfunc) != 0 || !lua_isfunction(L, -1))
-	{
+	bool found = false; // as in call_stage
+	bool ok = true;
+	std::string error;
+	const auto push = [&](lua_State* L) {
+		found = true;
+		lua_pushlstring(L, save.data(), save.size());
+		return 1;
+	};
+	const auto read = [&](lua_State* L) {
+		ok = lua_toboolean(L, -2) != 0;
+		if (!ok)
+			why = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "refused by coop_srv_dedicated.load_allowed";
+	};
+	const luafn::Fail f =
+	    luafn::call_named(ai().script_engine().lua(), "coop_srv_dedicated", "load_allowed", &luafn::traceback, push, 2, read, error);
+	if (f == luafn::Fail::Missing || (f == luafn::Fail::LuaError && !found))
 		::Msg("! [coop] dedicated: coop_srv_dedicated.load_allowed is missing: the save '%s' is not checked", save.c_str());
-		lua_settop(L, top);
-		return true;
-	}
-	lua_pushlstring(L, save.data(), save.size());
-	if (lua_pcall(L, 1, 2, errfunc) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		::Msg("! [coop] dedicated: lua error in coop_srv_dedicated.load_allowed, the save '%s' is not checked: %s", save.c_str(), err ? err : "?");
-		lua_settop(L, top);
-		return true;
-	}
-	const bool ok = lua_toboolean(L, -2) != 0;
-	if (!ok)
-		why = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "refused by coop_srv_dedicated.load_allowed";
-	lua_settop(L, top);
-	return ok;
+	else if (f == luafn::Fail::LuaError)
+		::Msg("! [coop] dedicated: lua error in coop_srv_dedicated.load_allowed, the save '%s' is not checked: %s", save.c_str(), error.c_str());
+	return f == luafn::Fail::None ? ok : true;
 }
 
 // The whole file, or false. Reading stops past the limit: parse refuses the size.
@@ -404,7 +332,7 @@ void first_frame()
 		rl(world_server::Record::of_error("bad_args", why));
 	}
 	::Msg("[coop] dedicated host, port %u, the build '%s'", u32(g.args.port), Manager::build_id());
-	// stage 5: Core.Params is lower-cased; the path keeps the letters of the raw command line where it can
+	// Core.Params is lower-cased; the path keeps the letters of the raw command line where it can
 	if (g.args.world == World::New && !g.args.stage.empty())
 	{
 		std::string stage = stage_original_case(Core.Params, GetCommandLineA(), g.args.stage);
@@ -461,12 +389,15 @@ void quit_now()
 		mgr().stop("the server is shutting down");
 	rl(world_server::Record::of_phase(world_server::Phase::Down));
 	coop_console::flush_output(2000); // the parent waits for "down": it must leave before the process does
+	coop_console::flush_window(500); // the operator sees the last lines; a paused window holds the quit no longer than this
+	// The parent needs nothing after "down" but the end of the process; the engine's shutdown lines stay in the log file only.
+	coop_console::stop_output();
 	coop_console::quit_done();
 	Console->Execute("quit");
 }
 
 // The parent's header: the players of the session, the state of every map server; a line when one changes. The session's peers without the
-// map servers' bridges (stage 1's coop_roster.h will say who plays; until then a bridge is the one peer here that is not a player).
+// map servers' bridges (a bridge is the one peer here that is not a player).
 void report_counts()
 {
 	if (!coop_console::output_on())
@@ -572,8 +503,7 @@ bool kick_line(const std::string& args, PeerId by)
 	}
 	const std::vector<PeerInfo> peers = mgr().session().peers();
 	// The players only: a map server's bridge is none (a kicked bridge breaks its level for everybody on it), nor is a seat that plays no
-	// character. An id wins over a nick that reads as the number; a nick two players have is nobody (op::kick_pick, security review
-	// 2026-11-12).
+	// character. An id wins over a nick that reads as the number; a nick two players have is nobody (op::kick_pick).
 	std::vector<op::KickRow> rows;
 	std::vector<const PeerInfo*> of_row;
 	for (const PeerInfo& p : peers)
@@ -767,7 +697,7 @@ public:
 
 bool on() { return g_coop_dedicated; }
 
-// ---------------------------------------------------------------- the operator (plan 2026-11-12 §2.3)
+// ---------------------------------------------------------------- the operator
 
 void answer_line(const char* line)
 {
@@ -792,20 +722,7 @@ void send_answer(PeerId to, const std::string& cmd, bool ok, const std::vector<s
 	net::host_send(to, Msg::ScriptEvent, w);
 }
 
-// coop_game_settings.operator_set looked up inside the protected call (the first use of the script loads it through _G.__index).
-int game_set_lookup(lua_State* L)
-{
-	lua_getglobal(L, "coop_game_settings");
-	if (!lua_istable(L, -1))
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-	lua_getfield(L, -1, "operator_set");
-	return 1;
-}
-
-// coop_game_set <key> <value> of the operator (plan §2.4): the key and the value go to coop_game_settings.operator_set(key, raw, peer)
+// coop_game_set <key> <value> of the operator: the key and the value go to coop_game_settings.operator_set(key, raw, peer)
 // as Lua strings in a protected call, never as a console line; it finds the key in the catalog, checks that it may change on an existing
 // world and that the value is one of the item's, and applies it as the host's own change. `text`: its answer (the key and the canonical
 // value) or the reason of a refusal.
@@ -817,39 +734,37 @@ bool game_set(PeerId from, const std::string& rest, std::string& text)
 		text = "usage: coop_game_set <key> <value>";
 		return false;
 	}
-	lua_State* L = ai().script_engine().lua();
-	if (!L || !lua_checkstack(L, 8))
+	bool found = false; // as in call_stage
+	bool ok = false;
+	std::string error;
+	const auto push = [&](lua_State* L) {
+		found = true;
+		lua_pushlstring(L, rest.data(), blank);
+		lua_pushlstring(L, rest.data() + blank + 1, rest.size() - blank - 1);
+		lua_pushnumber(L, lua_Number(from));
+		return 3;
+	};
+	const auto read = [&](lua_State* L) {
+		ok = lua_toboolean(L, -2) != 0;
+		size_t len = 0;
+		const char* s = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &len) : nullptr;
+		text = s ? std::string(s, len > 512 ? size_t(512) : len) : std::string(ok ? "done" : "refused");
+	};
+	switch (luafn::call_named(ai().script_engine().lua(), "coop_game_settings", "operator_set", &luafn::traceback, push, 2, read, error))
 	{
-		text = "no Lua state";
-		return false;
-	}
-	const int top = lua_gettop(L);
-	lua_pushcfunction(L, &stage_traceback);
-	const int errfunc = lua_gettop(L);
-	lua_pushcfunction(L, &game_set_lookup);
-	if (lua_pcall(L, 0, 1, errfunc) != 0 || !lua_isfunction(L, -1))
-	{
-		lua_settop(L, top);
-		text = "coop_game_settings.operator_set is missing";
-		return false;
-	}
-	lua_pushlstring(L, rest.data(), blank);
-	lua_pushlstring(L, rest.data() + blank + 1, rest.size() - blank - 1);
-	lua_pushnumber(L, lua_Number(from));
-	if (lua_pcall(L, 3, 2, errfunc) != 0)
-	{
-		const char* err = lua_tostring(L, -1);
-		::Msg("! [coop] coop_game_set: lua error in coop_game_settings.operator_set: %s", err ? err : "?");
-		lua_settop(L, top);
+	case luafn::Fail::None: return ok;
+	case luafn::Fail::Missing: text = "coop_game_settings.operator_set is missing"; return false;
+	case luafn::Fail::LuaError:
+		if (!found)
+		{
+			text = "coop_game_settings.operator_set is missing";
+			return false;
+		}
+		::Msg("! [coop] coop_game_set: lua error in coop_game_settings.operator_set: %s", error.c_str());
 		text = "the server's script failed (see its log)";
 		return false;
+	default: text = "no Lua state"; return false;
 	}
-	const bool ok = lua_toboolean(L, -2) != 0;
-	size_t len = 0;
-	const char* s = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &len) : nullptr;
-	text = s ? std::string(s, len > 512 ? size_t(512) : len) : std::string(ok ? "done" : "refused");
-	lua_settop(L, top);
-	return ok;
 }
 } // namespace
 
@@ -884,7 +799,7 @@ void run_for(PeerId from, const std::string& line)
 		debug::operator_dbg(from, rest);
 	else if (cmd == "coop_game_set")
 	{
-		// plan §2.4: the value goes into the game's record through its table of values (coop_game_settings.operator_set). Never a
+		// the value goes into the game's record through its table of values (coop_game_settings.operator_set). Never a
 		// console line.
 		std::string text;
 		ok = game_set(from, rest, text);
@@ -918,6 +833,7 @@ bool quitting() { return g.quitting; }
 
 void frame()
 {
+	PROF_EVENT("coop/coop_dedicated/frame");
 	if (!on())
 		return;
 	if (!g.parsed)

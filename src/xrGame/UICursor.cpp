@@ -11,7 +11,7 @@ CUICursor::CUICursor()
 	: m_static(NULL), m_b_use_win_cursor(false)
 {
 	bVisible = false;
-	Device.m_ui_cursor_visible = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	Device.m_ui_cursor_visible = false; // coop: free cursor in windowed menus
 	vPrevPos.set(0.0f, 0.0f);
 	vPos.set(0.f, 0.f);
 	InitInternal();
@@ -22,13 +22,13 @@ CUICursor::CUICursor()
 //--------------------------------------------------------------------
 CUICursor::~CUICursor()
 {
-	Device.m_ui_cursor_visible = false; // Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+	Device.m_ui_cursor_visible = false; // coop: free cursor in windowed menus
 	xr_delete(m_static);
 	Device.seqRender.Remove(this);
 	Device.seqResolutionChanged.Remove(this);
 }
 
-// Anomaly Coop: free cursor in windowed menus (owner, 2026-10-23)
+// coop: free cursor in windowed menus
 // bVisible is the one fact "a menu / inventory / PDA / dialog is open" (the main menu, StartMenu / StopMenu,
 // CleanInternals and the scripts all go through Show / Hide). xrEngine cannot see xrGame, so the device keeps a copy:
 // CRenderDevice::UpdateCursorClip lets the system cursor out of a windowed game window while it is set. Show and Hide
@@ -151,6 +151,6 @@ void CUICursor::SetUICursorPosition(Fvector2 pos)
 	p.y = iFloor(vPos.y / (UI_BASE_HEIGHT / (float)Device.clientHeight));
 	if (m_b_use_win_cursor)
 		ClientToScreen(Device.m_hWnd, (LPPOINT)&p);
-	if (!g_coop_headless) // Anomaly Coop: the cursor of the desktop is the player's
+	if (!g_dedicated_server) // coop: the cursor of the desktop is the player's
 		SetCursorPos(p.x, p.y);
 }

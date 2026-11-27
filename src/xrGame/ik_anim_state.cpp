@@ -47,7 +47,7 @@ bool blend_in(const CBlend& b, const motion_marks& marks)
 	return NULL != marks.pick_mark(blend_time(b));
 }
 
-// Anomaly Coop (RL-4BXZ-R24J, build 51: AV at ik_anim_state.cpp:80 after 151 stalker animation resets): current_blend is
+// coop: current_blend is
 // a raw pointer into the blend pool kept across frames; a blend that was freed and taken again, or one started with a
 // MotionID this visual has not, indexed m_Motions[slot] and its defs out of range. Valid blends get the very same def.
 CMotionDef* checked_motion_def(IKinematicsAnimated* K, const MotionID& id)
@@ -88,7 +88,7 @@ void ik_anim_state::update(IKinematicsAnimated* K, const CBlend* b, u16 i)
 		current_blend = 0;
 		return;
 	}
-	CMotionDef* const def_new = ik_blend_motion_def(K, b); // Anomaly Coop: checked (RL-4BXZ-R24J)
+	CMotionDef* const def_new = ik_blend_motion_def(K, b); // coop: a motion the visual has not is checked
 	if (!def_new)
 	{
 		current_blend = 0;
@@ -101,7 +101,7 @@ void ik_anim_state::update(IKinematicsAnimated* K, const CBlend* b, u16 i)
 
 	CMotionDef* const def_cur = b_is_blending(current_blend, b) ? ik_blend_motion_def(K, current_blend) : NULL;
 	if (b_is_blending(current_blend, b) && !def_cur)
-		current_blend = 0; // Anomaly Coop: a kept blend that names no def of this skeleton is dropped
+		current_blend = 0; // coop: a kept blend that names no def of this skeleton is dropped
 	if (def_cur)
 	{
 		is_blending = true;
@@ -132,7 +132,7 @@ void ik_anim_state::update(IKinematicsAnimated* K, const CBlend* b, u16 i)
 bool ik_anim_state::time_step_begin(IKinematicsAnimated* K, const CBlend& B, u16 limb_id, float& time)
 {
 	time = 0;
-	CMotionDef* const def_cur = ik_blend_motion_def(K, &B); // Anomaly Coop: checked (RL-4BXZ-R24J)
+	CMotionDef* const def_cur = ik_blend_motion_def(K, &B); // coop: a motion the visual has not is checked
 	if (!def_cur)
 		return false;
 	CMotionDef& m_def_cur = *def_cur;

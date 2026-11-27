@@ -1,4 +1,4 @@
-// Anomaly Coop — autosave rotation (F3, CHECKPOINTS_DEATH.md §7). The host writes emergency saves `coop_auto_1` ..
+// Anomaly Coop — autosave rotation (CHECKPOINTS_DEATH.md §7). The host writes emergency saves `coop_auto_1` ..
 // `coop_auto_N` in turn: a new level, after a shared sleep, on a timer and at the end of the session. With a game id the
 // ring is that game's own: `coop_auto_<id>_<N>`. These are the rules only (names, which slot is next, when the timer is
 // due); writing the files is the engine's job.
@@ -268,7 +268,7 @@ inline std::vector<uint32_t> slots_to_prune(const std::vector<SlotInfo>& existin
 	return gone;
 }
 
-// A pause of the autosaves that has to be renewed (F3 T12 fix round 1, review I1). The Restore window holds it while it
+// A pause of the autosaves that has to be renewed. The Restore window holds it while it
 // is open, so the timer cannot write into the slot the host is about to pick; the window renews it every frame, so a
 // window closed in any way (a button, Escape, the main menu switched off) ends the pause by itself a lease later.
 struct Pause
@@ -325,7 +325,7 @@ static_assert(int(Reason::Timer) == 0 && int(Reason::Sleep) == 1 && int(Reason::
               int(Reason::Transfer) == 4 && int(Reason::Manual) == 5,
               "the script's journal reads a reason by its number");
 
-// Requirement 8: before a map server starts or stops the world is saved, unless a save of any reason is this fresh: a wave of players
+// Before a map server starts or stops the world is saved, unless a save of any reason is this fresh: a wave of players
 // through a transition starts several at once, and one save serves them all. last_ms 0 = none yet.
 constexpr uint64_t kTransferSaveFreshMs = 60 * 1000;
 inline bool transfer_save_needed(uint64_t last_ms, uint64_t now_ms)

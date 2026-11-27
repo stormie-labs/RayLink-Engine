@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coop_ids.h"
 #include "coop_spawn.h"
 #include <string>
 #include <vector>
@@ -12,7 +13,7 @@ constexpr uint8_t kMarker = 0xE1;
 
 struct Snapshot
 {
-	uint16_t source = 0xffff, target = 0xffff;
+	uint16_t source = kNoId, target = kNoId;
 	uint64_t nonce = 0;
 	std::string source_name;
 	std::string metadata;
@@ -22,7 +23,7 @@ struct Snapshot
 inline bool encode(const Snapshot& value, std::vector<uint8_t>& out)
 {
 	out.clear();
-	if (value.target == 0 || value.target == 0xffff || !value.nonce || value.source_name.size() > 255 ||
+	if (value.target == 0 || value.target == kNoId || !value.nonce || value.source_name.size() > 255 ||
 	    value.metadata.empty() || value.metadata.size() > kMaxItemState || value.native.size() > kMaxItemState)
 		return false;
 	Writer w;
@@ -57,7 +58,7 @@ inline bool decode(const uint8_t* bytes, size_t size, Snapshot& out)
 	value.metadata = r.str();
 	const uint64_t count = r.varu();
 	if (!r.ok() || count > r.remaining() || count > kMaxItemState || value.source_name.size() > 255 ||
-	    value.metadata.empty() || !value.nonce || value.target == 0 || value.target == 0xffff)
+	    value.metadata.empty() || !value.nonce || value.target == 0 || value.target == kNoId)
 		return false;
 	value.native.assign(r.cursor(), r.cursor() + size_t(count));
 	if (!r.skip(size_t(count)) || r.remaining())

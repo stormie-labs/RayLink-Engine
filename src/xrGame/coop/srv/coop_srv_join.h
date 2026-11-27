@@ -1,5 +1,4 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — the server's part of the join (S6 pattern P-G, unit A-S6J): srv/coop_srv_join.cpp. Called by the server's modes
+// Anomaly Coop — the server's part of the join: srv/coop_srv_join.cpp. Called by the server's modes
 // (srv/coop_srv_mode.cpp) only: the Core reaches none of it (it asks the session's mode, xrCoop/coop_mode.h H-JOIN).
 #pragma once
 
@@ -31,7 +30,7 @@ void join_world_frame();
 // SessionReset ends this process (its world is gone; a new process comes for the new one).
 void join_install_map(Endpoint& world);
 
-// --- a player of a server world: the feed lines (S5, xrCoop/srv/coop_srv_feed_rules.h)
+// --- a player of a server world: the feed lines (xrCoop/srv/coop_srv_feed_rules.h)
 // A session starts (his Welcome said it is a server's): nobody is known yet.
 void feed_start();
 // Every frame of his session: "<nick> went to <level>" / "<nick> came from <level>" in his PDA feed, from the changes of the world server's

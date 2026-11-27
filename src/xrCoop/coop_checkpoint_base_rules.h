@@ -1,15 +1,13 @@
-// Anomaly Coop — the checkpoint of a base (Build 57, owner 2026-11-18; docs/CHECKPOINTS_DEATH.md §2.4).
-// The owner: "on a base, when you come to any base, the final respawn point must be at the bed, not at the campfire; at a
-// campfire on a base no new checkpoint is set; and it must not say every N-th time that the checkpoint was updated while
-// we are on a base." Later: "for the bases that are not covered, just put the point at the place of the first spawn on that
-// base"; "a hostile base too: there the campfires of that base may work as usual"; "in split maps in the console form this
-// must be done too".
+// The checkpoint of a base (docs/CHECKPOINTS_DEATH.md §2.4). On a base the respawn point is its bed, not a campfire: a
+// campfire on a base sets no checkpoint, and walking about the base does not repeat "checkpoint updated". A base without a
+// sleep zone takes the place of the first spawn on it; on a hostile base the campfires work as usual. The same holds in the
+// server mode.
 //
 // A base is either
 //   - a row of [coop_bases] (configs\mod_system_coop_checkpoints.ltx): a stock sleep zone that stands in a real base, the
 //     radius of its ground and the communities that own it (up to kMaxOwners). Its record is kind Rest with the zone as its
-//     object (saves of build 56 read it the same way). Key: the zone's object id (0..0xfffe);
-//   - a row of [coop_start_bases] (round 2, lead 2026-11-18: opt-in, only real bases without a sleep zone): a start location
+//     object. Key: the zone's object id (0..0xfffe);
+//   - a row of [coop_start_bases]: a start location
 //     of new_game_start_locations.ltx ("the place of the first spawn on that base") with the owners of its row, when no sleep
 //     zone base or earlier start base already covers its ground. Its record is kind Rest WITHOUT an object, at the location's
 //     point. Key: kStartKeyBase + its index in the list every process builds the same way (start_bases, merge_starts).
@@ -23,11 +21,13 @@
 
 #include <cmath>
 #include <cstdint>
-#include <iterator>
 #include <string>
 #include <vector>
 
 #include "coop_checkpoint_rules.h"
+#include "coop_ids.h"
+#include "coop_text.h"
+#include "coop_validate.h"
 
 namespace coop
 {
@@ -43,12 +43,12 @@ constexpr float kHeightLeaveMargin = 5.0f; // ... and he leaves it beyond kHeigh
 constexpr uint32_t kDefaultDwellMs = 3000; // on a base this long, not in a fight, and its record is his checkpoint
 constexpr size_t kMaxBases = 64; // rows of [coop_bases] a process keeps (stock: 15)
 constexpr size_t kMaxStarts = 64; // start bases a process keeps (rows of [coop_start_bases]: 20)
-constexpr size_t kMaxOwners = 6; // Build 57 round 2: owners of one row ([coop_bases], [coop_start_bases])
+constexpr size_t kMaxOwners = 6; // owners of one row ([coop_bases], [coop_start_bases])
 constexpr size_t kMaxStartOwners = 16; // owners of one start base after merge_starts gave it those of the merged ones
 constexpr float kDefaultStartRadius = 50.0f; // base_start_radius
 constexpr float kMaxStartCoord = 100000.0f; // a start location's x and z (and y) are within this
 constexpr int kEnemies = -1000; // stock game_relations.ENEMIES: a sum at or below it is an enemy
-constexpr uint16_t kNoLevel = 0xffff; // a start location whose game vertex names no level
+using coop::kNoLevel; // a start location whose game vertex names no level
 
 // ---------------------------------------------------------------- the key of a base
 
@@ -68,9 +68,9 @@ inline size_t start_of(Key k) { return is_start_key(k) ? size_t(k - kStartKeyBas
 
 // ---------------------------------------------------------------- [coop_bases]
 
-// One row: <sleep zone name> = <radius in m>, <owner community>[, <owner>...] or none. Build 57 round 2 (lead 2026-11-18): up
+// One row: <sleep zone name> = <radius in m>, <owner community>[, <owner>...] or none. Up
 // to kMaxOwners owners, as the game's simulation data names several factions for one camp. owners empty = none (never
-// hostile). Round 3 (review B1): owners keep the row's order, and the first one is the holder (base_hostile).
+// hostile). Owners keep the row's order, and the first one is the holder (base_hostile).
 struct Row
 {
 	std::string zone;
@@ -80,18 +80,6 @@ struct Row
 
 namespace detail
 {
-inline std::string trimmed(const std::string& s)
-{
-	size_t b = 0, e = s.size();
-	while (b < e && (s[b] == ' ' || s[b] == '\t'))
-		++b;
-	while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t'))
-		--e;
-	return s.substr(b, e - b);
-}
-
-inline bool finite3(const float p[3]) { return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]); }
-
 // The comma-separated fields of a value, each trimmed (at least one, maybe empty). At most `max` + 1 are cut: a longer
 // list gives max + 1 fields and is refused by the caller.
 inline std::vector<std::string> fields_of(const std::string& value, size_t max)
@@ -101,7 +89,8 @@ inline std::vector<std::string> fields_of(const std::string& value, size_t max)
 	for (;;)
 	{
 		const size_t comma = value.find(',', pos);
-		fields.push_back(trimmed(value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos)));
+		const std::string_view field = std::string_view(value).substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+		fields.emplace_back(ascii::trim(field, ascii::space_or_tab));
 		if (comma == std::string::npos || fields.size() > max)
 			break;
 		pos = comma + 1;
@@ -176,7 +165,7 @@ struct Spot
 // already) widens both by the leave margins. A position that is not a number is on no base, nor is a spot of no base.
 inline bool inside(const Spot& s, const std::string& level, const float at[3], bool entered, float leave_margin = kLeaveMargin)
 {
-	if (!is_base_key(s.id) || s.level != level || !detail::finite3(at) || !detail::finite3(s.pos))
+	if (!is_base_key(s.id) || s.level != level || !validate::finite3(at) || !validate::finite3(s.pos))
 		return false;
 	const double r = double(s.radius) + (entered ? double(leave_margin) : 0.0);
 	const double h = double(kHeight) + (entered ? double(kHeightLeaveMargin) : 0.0);
@@ -226,7 +215,7 @@ inline bool is_base_record(const Record& r, const Spot& s)
 		return false;
 	if (is_zone_key(s.id))
 		return s.bed != kNoSource && r.source == s.bed;
-	if (!is_start_key(s.id) || r.source != kNoSource || r.level != s.level || !detail::finite3(s.pos))
+	if (!is_start_key(s.id) || r.source != kNoSource || r.level != s.level || !validate::finite3(s.pos))
 		return false;
 	double d2 = 0;
 	for (int i = 0; i < 3; ++i)
@@ -237,7 +226,7 @@ inline bool is_base_record(const Record& r, const Spot& s)
 	return d2 <= double(kSamePlaceM) * double(kSamePlaceM);
 }
 
-// Build 57 round 3 (lead 2026-11-18, review S6): what a record is for the text its player reads. The engine of the machine
+// What a record is for the text its player reads. The engine of the machine
 // that tells its Lua (coop_checkpoint_changed) says it, so a client needs no ALife: Bed, the record of a sleep zone base ("a
 // sleeping place"); Base, the record of a start base ("a base"); None, neither ("a resting place" for any other rest record);
 // Unknown, this machine cannot tell (the script falls back to its own lookup). `zone_base` (a record with an object): 1 its
@@ -273,7 +262,7 @@ inline const char* mark_name(Mark m)
 	}
 }
 
-// Build 57 round 3 (lead 2026-11-18, review S3): checkpoint::set for the record of base `ground` (its key, object, level, point
+// checkpoint::set for the record of base `ground` (its key, object, level, point
 // and radius). An arrival onto a base (a level change, the first sight of him on a level) wrote an Arrival record that pushed
 // the record before it down; 3 s later the base's record pushed the arrival down again: prev held a worthless arrival at the
 // same base and the older record (his tent, the base he came from) was lost, on every arrival there. Now: when `r` is the
@@ -319,29 +308,14 @@ inline Step step(Visit& v, Key base, bool settled, bool in_combat, uint64_t now_
 		v = Visit();
 		return Step::Outside;
 	}
-	if (v.base != base)
-	{
-		v.base = base;
-		v.since = now_ms;
-		v.fired = false;
-	}
-	else if (now_ms < v.since) // the clock went back: count from here
-		v.since = now_ms;
+	stay_moves(v, &Visit::base, base, now_ms);
 	if (settled)
 	{
 		v.since = now_ms;
 		v.fired = false;
 		return Step::OnBase;
 	}
-	if (in_combat)
-	{
-		v.since = now_ms;
-		return Step::OnBase;
-	}
-	if (v.fired || now_ms - v.since < dwell_ms)
-		return Step::OnBase;
-	v.fired = true;
-	return Step::SetBed;
+	return stay_fires(v, in_combat, now_ms, dwell_ms) ? Step::SetBed : Step::OnBase;
 }
 
 // ---------------------------------------------------------------- lying down on a base
@@ -362,7 +336,7 @@ inline Record lie_down_record(const Record& where, bool at_own_tent, const Recor
 // height a base reaches (with its leave margin). A player could walk from one to the other without leaving a base.
 inline bool overlaps(const Spot& a, const Spot& b, float margin)
 {
-	if (a.level.empty() || a.level != b.level || !detail::finite3(a.pos) || !detail::finite3(b.pos))
+	if (a.level.empty() || a.level != b.level || !validate::finite3(a.pos) || !validate::finite3(b.pos))
 		return false;
 	const double dx = double(a.pos[0]) - double(b.pos[0]);
 	const double dz = double(a.pos[2]) - double(b.pos[2]);
@@ -376,11 +350,10 @@ constexpr size_t kNotAdded = size_t(-2); // accept(): it names no base, its poin
 
 // The list of one level, built in order (the [coop_bases] rows first, then the start locations): a candidate that overlaps an
 // accepted base makes no base of its own (the index of that base is returned: two sleep zones of one camp, a start location
-// in a camp that has a bed). Build 57: the reviewers' "two zones of one camp gave 'checkpoint updated' every time he walked
-// across it" is gone with this.
+// in a camp that has a bed), so two zones of one camp do not repeat "checkpoint updated" when he walks across it.
 inline size_t accept(std::vector<Spot>& accepted, const Spot& candidate, float margin)
 {
-	if (!is_base_key(candidate.id) || !detail::finite3(candidate.pos) || candidate.level.empty())
+	if (!is_base_key(candidate.id) || !validate::finite3(candidate.pos) || candidate.level.empty())
 		return kNotAdded;
 	for (size_t i = 0; i < accepted.size(); ++i)
 		if (accepted[i].id == candidate.id || overlaps(accepted[i], candidate, margin))
@@ -393,8 +366,8 @@ inline size_t accept(std::vector<Spot>& accepted, const Spot& candidate, float m
 
 // ---------------------------------------------------------------- hostility
 
-// The NPC community an actor community stands for: "actor_<faction>" -> <faction>; anything else as it is. Round 3 (review
-// S4): only the fallback of judged_community, when the relation table has no row for his own community.
+// The NPC community an actor community stands for: "actor_<faction>" -> <faction>; anything else as it is. Only
+// the fallback of judged_community, when the relation table has no row for his own community.
 inline std::string true_faction(const std::string& community)
 {
 	static const char kPrefix[] = "actor_";
@@ -418,7 +391,7 @@ inline bool all_hostile(size_t valid_owners, size_t hostile_owners)
 	return valid_owners > 0 && hostile_owners == valid_owners;
 }
 
-// Build 57 round 3 (lead 2026-11-18, review B1): a row's owners are every faction its smart terrain admits (the game's
+// A row's owners are every faction its smart terrain admits (the game's
 // simulation data), not only the guards, so "hostile only when ALL owners are enemies" made Rookie Village (stalker, csky,
 // ecolog) a friendly base for a mercenary or a soldier whom its stalker guards shoot. The FIRST owner of a row is its holder:
 // the faction whose guards hold the place. A base is hostile to him when its holder is his enemy (`holder_hostile`; false
@@ -429,7 +402,7 @@ inline bool base_hostile(bool holder_hostile, size_t valid_owners, size_t hostil
 	return valid_owners > 0 && (holder_hostile || all_hostile(valid_owners, hostile_owners));
 }
 
-// Build 57 round 3 (lead 2026-11-18, review S4): the community a base's guards judge a player by is his own as the game keeps
+// The community a base's guards judge a player by is his own as the game keeps
 // it: an actor community "actor_<f>" is its own column of [communities_relations] (dynamic relations may change that column
 // alone). `own`: his server entity's community index; `npc`: the index of the NPC community <f> it stands for (true_faction;
 // < 0 when there is none); `rows`: the rows of the relation table. His own index while the table has a row for it, else the NPC
@@ -468,8 +441,8 @@ inline bool parse_start(const std::string& id, const std::string& lvid, const st
 	if (!level_ok(id))
 		return false;
 	uint64_t lv = 0, gv = 0;
-	if (!checkpoint::detail::parse_uint(detail::trimmed(lvid), 0xfffffffeull, lv) ||
-		!checkpoint::detail::parse_uint(detail::trimmed(gvid), 0xfffeull, gv))
+	if (!checkpoint::detail::parse_uint(std::string(ascii::trim(lvid, ascii::space_or_tab)), 0xfffffffeull, lv) ||
+		!checkpoint::detail::parse_uint(std::string(ascii::trim(gvid, ascii::space_or_tab)), 0xfffeull, gv))
 		return false;
 	Start s;
 	s.id = id;
@@ -477,7 +450,7 @@ inline bool parse_start(const std::string& id, const std::string& lvid, const st
 	for (int i = 0; i < 3; ++i)
 	{
 		float f = 0;
-		if (!checkpoint::detail::parse_float(detail::trimmed(*v[i]), f) || !(std::fabs(f) < kMaxStartCoord))
+		if (!checkpoint::detail::parse_float(std::string(ascii::trim(*v[i], ascii::space_or_tab)), f) || !(std::fabs(f) < kMaxStartCoord))
 			return false;
 		s.pos[i] = f;
 	}
@@ -496,10 +469,10 @@ inline size_t find_start(const std::vector<Start>& list, const std::string& id)
 	return list.size();
 }
 
-// Build 57 round 2 (lead 2026-11-18, review B1): a start location is a base only by a row of [coop_start_bases]
+// A start location is a base only by a row of [coop_start_bases]
 // (configs\mod_system_coop_checkpoints.ltx): <start location id> = <owner community>[, <owner>...] or none. Only real bases
 // without a sleep zone are listed (the lead curated them); the factions whose new-game lists name a place are not its owners.
-// Round 3 (review B1): the first owner is the holder, as in [coop_bases]; merge_starts appends the merged ones' owners after it.
+// The first owner is the holder, as in [coop_bases]; merge_starts appends the merged ones' owners after it.
 struct StartRow
 {
 	std::string id;
@@ -601,19 +574,19 @@ constexpr uint8_t kFootStart = 2; // ref: the start location's index
 struct Footing
 {
 	uint8_t kind = kFootNone;
-	uint16_t ref = 0xffff;
+	uint16_t ref = kNoId;
 	float pos[3] = {0, 0, 0}; // the base's point (where its record lies)
 	uint32_t lv = 0xffffffffu; // its level vertex
 	uint16_t gv = 0xffff; // its game vertex
 };
 
-// The form is sound: a known kind; "none" names nothing (ref 0xffff), a zone names an object id, a start an index below
+// The form is sound: a known kind; "none" names nothing (ref kNoId), a zone names an object id, a start an index below
 // kMaxStarts; the point is a number a record may hold. Whether it names a base of the world is the world server's check.
 inline bool footing_ok(const Footing& f)
 {
 	if (f.kind > kFootStart)
 		return false;
-	if (f.kind == kFootNone && f.ref != 0xffff)
+	if (f.kind == kFootNone && f.ref != kNoId)
 		return false;
 	if (f.kind == kFootZone && f.ref == kNoSource)
 		return false;
@@ -644,7 +617,7 @@ inline bool footing_of(Key k, Footing& out)
 	if (k == kNoBase)
 	{
 		out.kind = kFootNone;
-		out.ref = 0xffff;
+		out.ref = kNoId;
 		return true;
 	}
 	if (is_zone_key(k))
@@ -662,7 +635,7 @@ inline bool footing_of(Key k, Footing& out)
 	return false;
 }
 
-// Build 57 round 2 (lead 2026-11-18, review S5): the world server's check of a footing a map server reported. `sender_level`:
+// The world server's check of a footing a map server reported. `sender_level`:
 // the level of the map server it came from; `gv_level`: the level of the footing's game vertex in this world's game graph
 // (kNoLevel: not a game vertex); `base`: what this process's own tables say of the base the footing names (`known` false: no
 // [coop_bases] zone of this world, or no start base that is not merged); its level, authored point and radius. A start
@@ -685,7 +658,7 @@ enum class FootCheck : uint8_t
 	NoBase, // it names no base of this world
 	OtherLevel, // the base is on another level than the sender's
 	OffGround, // its point is not on the base's ground
-	BodyOff // round 3: the body position of the same report is not on the base's ground
+	BodyOff // the body position of the same report is not on the base's ground
 };
 
 inline const char* foot_check_name(FootCheck c)
@@ -721,7 +694,7 @@ inline FootCheck footing_check(const Footing& f, uint16_t sender_level, uint16_t
 	if (base.level != sender_level)
 		return FootCheck::OtherLevel;
 	const bool zone = f.kind == kFootZone;
-	if ((!zone && !detail::finite3(base.pos)) || !std::isfinite(base.radius) || !std::isfinite(leave_margin))
+	if ((!zone && !validate::finite3(base.pos)) || !std::isfinite(base.radius) || !std::isfinite(leave_margin))
 		return FootCheck::OffGround;
 	const double h = 2.0 * double(kHeight); // no fabs: the engine marks it deprecated (C4995)
 	if (!zone)
@@ -733,7 +706,7 @@ inline FootCheck footing_check(const Footing& f, uint16_t sender_level, uint16_t
 		if (!(dx * dx + dz * dz <= r * r) || !(dy <= h && dy >= -h))
 			return FootCheck::OffGround;
 	}
-	if (!body || !detail::finite3(body))
+	if (!body || !validate::finite3(body))
 		return FootCheck::BodyOff;
 	const float* ground = zone ? f.pos : base.pos;
 	const double bx = double(body[0]) - double(ground[0]);
@@ -745,7 +718,7 @@ inline FootCheck footing_check(const Footing& f, uint16_t sender_level, uint16_t
 	return FootCheck::Ok;
 }
 
-// Build 57 round 2 (lead 2026-11-18, review S1): what the world server keeps of a map server's body report (the footing with
+// What the world server keeps of a map server's body report (the footing with
 // the rest) is usable only while it is fresh (`fresh_ms` since `at_ms`) and came from `facts_level`, the level he is on now
 // (`level_now`): a report of the level he has just left says nothing of where he is.
 inline bool facts_current(uint16_t facts_level, uint16_t level_now, uint64_t at_ms, uint64_t now_ms, uint32_t fresh_ms)
@@ -772,7 +745,7 @@ inline Step far_step(Visit& v, const Footing& f, bool usable, bool hostile, bool
 	return step(v, k, on && settled, on && !settled && in_combat, now_ms, dwell_ms);
 }
 
-// Build 57 round 2 (lead 2026-11-18, review S4): the record of the base could not be written (no record, the store refused):
+// The record of the base could not be written (no record, the store refused):
 // the visit counts again from now, so the base is tried again after another dwell, not only after he leaves and comes back.
 inline void retry_visit(Visit& v, uint64_t now_ms)
 {
@@ -780,27 +753,13 @@ inline void retry_visit(Visit& v, uint64_t now_ms)
 	v.since = now_ms;
 }
 
-// Build 57 round 2 (compile review S4): a map server keeps, per character, the base whose ground he is on (for the leave
-// margin); characters that are no longer on its level are forgotten. `Map`: a map of character id -> anything.
-template <class Map>
-inline void forget_absent(Map& current, const std::vector<uint16_t>& present)
-{
-	for (auto it = current.begin(); it != current.end();)
-	{
-		bool here = false;
-		for (const uint16_t id : present)
-			here = here || id == it->first;
-		it = here ? std::next(it) : current.erase(it);
-	}
-}
-
 // ---------------------------------------------------------------- respawn
 
-// Build 57 round 2 (lead 2026-11-18, review S2 of the compile review): what a respawn does with a current record that is the
+// What a respawn does with a current record that is the
 // record of a base hostile to him now. Keep: it is not such a record, or it is not on `level` (no place here anyway). UsePrev:
 // the previous record is on `level`. DropCur: there is none on `level`: the hostile record is not used, he comes back where a
 // player without a checkpoint does (resolve: the anchor, the arrival point, the body). The slot in the store stays as it is.
-// Round 3 (lead 2026-11-18, review S1): the previous record is used only when it is not itself the record of a base hostile to
+// The previous record is used only when it is not itself the record of a base hostile to
 // him (`prev_hostile_bed`): a Freedom player with the Bar's bed and the Duty post's bed before it comes back at neither. The
 // same when the current record is on another level and resolve would take the previous one of `level`: DropPrev.
 enum class BedChoice : uint8_t
@@ -808,7 +767,7 @@ enum class BedChoice : uint8_t
 	Keep,
 	UsePrev,
 	DropCur,
-	DropPrev // round 3: the current record is not on `level`, the previous one is, and it is a hostile base's
+	DropPrev // the current record is not on `level`, the previous one is, and it is a hostile base's
 };
 
 inline BedChoice hostile_bed_choice(const Slot& s, const std::string& level, bool cur_hostile_bed, bool prev_hostile_bed)
@@ -823,7 +782,7 @@ inline BedChoice hostile_bed_choice(const Slot& s, const std::string& level, boo
 }
 
 // Applies hostile_bed_choice to `s` (the respawn's copy of the slot) and returns it. DropCur also drops a previous record on
-// `level` (round 3: it is a hostile base's too, or resolve would take it); one on another level stays (resolve skips it).
+// `level`; one on another level stays (resolve skips it).
 inline BedChoice skip_hostile_bed(Slot& s, const std::string& level, bool cur_hostile_bed, bool prev_hostile_bed)
 {
 	const BedChoice c = hostile_bed_choice(s, level, cur_hostile_bed, prev_hostile_bed);
@@ -843,7 +802,7 @@ inline BedChoice skip_hostile_bed(Slot& s, const std::string& level, bool cur_ho
 	return c;
 }
 
-// Round 3 review S1 (lead 2026-11-18): after a hostile base's record was dropped, a fallback point of the respawn (his anchor,
+// After a hostile base's record was dropped, a fallback point of the respawn (his anchor,
 // the host's arrival, his body) is used only when it is not on that base's ground (with the leave margin: he was on it).
 // `dropped`: the ground of the dropped record, nullptr when nothing was dropped. A missing point is never usable.
 inline bool fallback_ok(const Spot* dropped, const std::string& level, const float* pos)

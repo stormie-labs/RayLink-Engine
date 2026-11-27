@@ -172,7 +172,8 @@ void CUIGameSP::StartTrade(CInventoryOwner* pActorInv, CInventoryOwner* pOtherOw
 
 	//---- before trade mode ---------------------------
 	::luabind::functor<bool> funct1;
-	// Anomaly Coop: on a client the engine trade window is used: Anomaly's Lua window moves money locally
+	// coop: Anomaly's Lua window wherever its trades reach the decider (a copy: scripts\coop_trade_window.script),
+	// else the engine window below; coop::trade::lua_trade_window_allowed logs which one and why
 	if (coop::trade::lua_trade_window_allowed() && ai().script_engine().functor("actor_menu_inventory.CUIActorMenu_OnMode_Trade", funct1))
 	{
 		CGameObject* GO = smart_cast<CGameObject*>(pOtherOwner);
@@ -347,7 +348,7 @@ bool CChangeLevelWnd::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 }
 
 bool g_block_pause = false;
-static BOOL g_coop_change_level_timer = TRUE; // Anomaly Coop: Show paused the game timer (no session when it opened)
+static BOOL g_coop_change_level_timer = TRUE; // coop: Show paused the game timer (no session when it opened)
 
 void CChangeLevelWnd::Show()
 {
@@ -362,13 +363,13 @@ void CChangeLevelWnd::Show()
 
 
 	g_block_pause = true;
-	g_coop_change_level_timer = coop::mgr().active() ? FALSE : TRUE; // Anomaly Coop: no world pause in a session
-	Device.Pause(TRUE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_show"); // Anomaly Coop
+	g_coop_change_level_timer = coop::mgr().active() ? FALSE : TRUE; // coop: no world pause in a session
+	Device.Pause(TRUE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_show");
 	bShowPauseString = FALSE;
 }
 
 void CChangeLevelWnd::Hide()
 {
 	g_block_pause = false;
-	Device.Pause(FALSE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_hide"); // Anomaly Coop: undo what Show did
+	Device.Pause(FALSE, g_coop_change_level_timer, TRUE, "CChangeLevelWnd_hide"); // coop: undo what Show did
 }

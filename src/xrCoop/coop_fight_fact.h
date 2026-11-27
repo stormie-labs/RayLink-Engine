@@ -1,6 +1,5 @@
-// Ядро: без проверок режима (docs/MODES.md)
 // Anomaly Coop — a fight fact: the reputation a fight on a level gave a player, told by the process that leads that level to the keeper
-// of his record (F5-PRG-4, rv_F5-PRG-4 blocker 2; INTEG-C). Pure C++17 (tests/test_fight_fact.cpp).
+// of his record. Pure C++17 (tests/test_fight_fact.cpp).
 //
 // Who does what: the engine's relation action on his character (coop_story.cpp RelationActionScope) counts the change where the fight
 // is. The co-op host keeps the record itself: it applies the change to its book and tells his machine (RelReputationDelta). A map server
@@ -12,6 +11,7 @@
 
 #include <cstdint>
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -29,7 +29,7 @@ struct FactMsg
 {
 	uint32_t epoch = 0;
 	uint32_t fact = 0;
-	uint16_t character = 0xffff;
+	uint16_t character = kNoId;
 	int32_t delta = 0;
 
 	void write(Writer& w) const
@@ -60,7 +60,7 @@ struct FactMsg
 
 	static bool valid(const FactMsg& m)
 	{
-		return m.fact != 0 && m.character != 0 && m.character != 0xffff && m.delta != 0 && m.delta >= -kMaxDelta &&
+		return m.fact != 0 && m.character != 0 && m.character != kNoId && m.delta != 0 && m.delta >= -kMaxDelta &&
 		       m.delta <= kMaxDelta;
 	}
 };

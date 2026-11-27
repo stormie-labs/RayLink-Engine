@@ -1,4 +1,4 @@
-// Anomaly Coop — creature sounds across machines (W5 C2). See coop_sound.h.
+// Anomaly Coop — creature sounds across machines. See coop_sound.h.
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_sound.h"
@@ -11,6 +11,10 @@
 #include "coop_remote.h"
 #include "coop_players.h"
 #include "xrCoop/coop_relay_rules.h"
+#include "xrCoop/coop_frame_queue.h"
+#include "xrCoop/coop_hash.h"
+#include "xrCoop/coop_ids.h"
+#include "xrCoop/coop_lua_errors.h" // lua_errors::LogBudget
 
 #include "../xrEngine/XR_IOConsole.h"
 #include "../xrEngine/xr_ioc_cmd.h"
@@ -31,7 +35,6 @@ namespace sound
 {
 namespace
 {
-constexpr u16 kNoId = 0xffff;
 constexpr size_t kMaxOutQueue = 256; // host: sounds recorded between two frames
 constexpr size_t kMaxOutStops = 64; // host: stops still queued past a full queue of starts (a squad dying at once)
 constexpr u64 kDedupMs = 150; // host: same object + same file again within this: dropped
@@ -43,8 +46,8 @@ constexpr float kMaxRadius = 300.f;
 constexpr size_t kMaxPlaying = 48; // client
 constexpr u32 kMaxPerObject = 4;
 constexpr size_t kMaxExistCache = 2048;
-constexpr size_t kMaxLuaQueue = 64;
-constexpr u32 kLuaPerFrame = 32;
+constexpr size_t kMaxLuaQueue = 64; // Lua callbacks waiting; past it the oldest are lost, and counted
+constexpr size_t kLuaPerFrame = 32; // fired in one frame; the rest wait for the next
 constexpr u64 kLuaCheckMs = 2000; // how long "is the callback registered" is trusted
 constexpr u64 kGroundCacheMs = 400;
 constexpr float kGroundCacheMove = 0.3f;
@@ -60,7 +63,7 @@ struct Outgoing
 	NpcSound s;
 	Fvector pos{};
 	float radius = 100.f;
-	bool matters = false; // audit M5: a lost one has no repeat
+	bool matters = false; // a lost one has no repeat
 	u16 skip = kNoId; // the player's character whose own machine plays this one
 };
 xrCriticalSection g_out_lock; // the hooks may run on the game thread
@@ -115,7 +118,7 @@ struct LuaEvent
 	xr_string b; // move state
 	float power = 0.f;
 };
-xr_vector<LuaEvent> g_lua;
+FrameQueue<LuaEvent> g_lua(kMaxLuaQueue, kLuaPerFrame);
 struct Registered
 {
 	bool yes = false;
@@ -144,25 +147,14 @@ struct Stats
 	// footsteps and Lua
 	u64 ground_picks = 0, avatar_steps = 0, avatar_jumps = 0, lua_fired = 0, lua_unregistered = 0, lua_errors = 0;
 } g_st;
-u32 g_log_count = 0;
-bool log_allowed() { return ++g_log_count <= kLogBurst || (g_log_count % 100) == 0; }
+lua_errors::LogBudget g_log{kLogBurst};
 
-CGameObject* object_here(u16 local_id)
-{
-	if (!g_pGameLevel || local_id == kNoId)
-		return nullptr;
-	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(local_id));
-	return o && !o->getDestroy() ? o : nullptr;
-}
-
+// The dedup key of a sound: FNV-1a of its path, the basis mixed with the object id.
 u32 fnv(const char* s, u16 id)
 {
-	u32 h = 2166136261u ^ id;
+	u32 h = kFnv32Basis ^ id;
 	for (; *s; ++s)
-	{
-		h ^= u8(*s);
-		h *= 16777619u;
-	}
+		h = fnv1a32_step(h, u8(*s));
 	return h;
 }
 
@@ -202,7 +194,7 @@ LPCSTR relay_path(const ref_sound& snd)
 	return name && name[0] ? name : nullptr;
 }
 
-// A long line, a dying creature's last sound: a lost one is not covered by what follows (audit M5).
+// A long line, a dying creature's last sound: a lost one is not covered by what follows.
 bool matters(const ref_sound& snd, CGameObject* go)
 {
 	const CSound_source* src = snd._handle();
@@ -280,6 +272,7 @@ void record_stop(CGameObject* go, u32 mask)
 
 void host_frame()
 {
+	PROF_EVENT("coop/coop_sound/host_frame");
 	g_have_clients = false;
 	struct Target
 	{
@@ -287,21 +280,24 @@ void host_frame()
 		Fvector pos;
 		u16 proxy;
 	};
-	xr_vector<Target> targets;
+	// Scratch of this frame: cleared, not freed, so a frame allocates nothing once they have grown.
+	static xr_vector<Target> targets;
+	static xr_vector<Outgoing> out;
+	targets.clear();
+	out.clear();
 	if (g_pGameLevel)
 	{
-		for (const PeerInfo& p : mgr().session().peers())
+		mgr().session().for_each_joined([](const PeerInfo& p)
 		{
 			if (p.state != PeerState::Joined || sync::host_peer_joining(p.id))
-				continue;
+				return;
 			const u16 proxy = join::proxy_of_peer(p.id);
 			CObject* o = proxy != kNoId ? Level().Objects.net_Find(proxy) : nullptr;
 			if (o)
 				targets.push_back({p.id, o->Position(), proxy});
-		}
+		});
 	}
 	g_have_clients = !targets.empty() && g_npc_sounds;
-	xr_vector<Outgoing> out;
 	{
 		xrCriticalSectionGuard guard(&g_out_lock);
 		out.swap(g_out);
@@ -404,7 +400,7 @@ bool sound_exists(const xr_string& path)
 	if (g_exists->size() >= kMaxExistCache)
 		g_exists->clear();
 	(*g_exists)[path] = yes;
-	if (!yes && log_allowed())
+	if (!yes && g_log.allow())
 		::Msg("! [coop] relayed NPC sound '%s' is not in this game's files", path.c_str());
 	return yes;
 }
@@ -433,17 +429,10 @@ void start(Playing& p, CGameObject* go)
 	++g_st.played;
 }
 
-void queue_lua(LuaEvent&& e)
-{
-	if (g_lua.size() >= kMaxLuaQueue)
-		g_lua.erase(g_lua.begin());
-	g_lua.push_back(std::move(e));
-}
-
 void client_play(const NpcSound& s)
 {
 	const u16 id = join::to_local(s.object);
-	CGameObject* go = object_here(id);
+	CGameObject* go = world::object_here(id);
 	if (!go || id == 0 || world::is_player_proxy(id) || !remote::is_remote_creature(go))
 	{
 		++g_st.no_object; // not online here (yet), or not a host creature
@@ -504,7 +493,7 @@ void client_play(const NpcSound& s)
 	e.kind = LuaKind::NpcSound;
 	e.id = id;
 	e.a = path;
-	queue_lua(std::move(e));
+	g_lua.push(std::move(e));
 }
 
 // The authority's CSoundPlayer dropped the creature's sounds overlapping s.mask: so do we, and Lua stops its own copy.
@@ -530,13 +519,13 @@ void client_stop(const NpcSound& s)
 			++i;
 		}
 	}
-	CGameObject* go = object_here(id);
+	CGameObject* go = world::object_here(id);
 	if (!go || world::is_player_proxy(id) || !remote::is_remote_creature(go))
 		return;
 	LuaEvent e;
 	e.kind = LuaKind::NpcSoundStop;
 	e.id = id;
-	queue_lua(std::move(e));
+	g_lua.push(std::move(e));
 }
 
 void client_on_sound(PeerId, Reader& r)
@@ -562,6 +551,7 @@ void client_on_sound(PeerId, Reader& r)
 
 void client_frame()
 {
+	PROF_EVENT("coop/coop_sound/client_frame");
 	if (!g_playing)
 		return;
 	xr_vector<Playing>& list = *g_playing;
@@ -569,7 +559,7 @@ void client_frame()
 	for (size_t i = 0; i < list.size();)
 	{
 		Playing& p = list[i];
-		CGameObject* go = object_here(p.id);
+		CGameObject* go = world::object_here(p.id);
 		bool drop = !go;
 		if (go)
 		{
@@ -656,7 +646,7 @@ void queue_step(CGameObject* avatar, SGameMtlPair* pair, float power, LPCSTR sta
 	e.a = material_name(pair);
 	e.b = state;
 	e.power = power;
-	queue_lua(std::move(e));
+	g_lua.push(std::move(e));
 }
 
 // ---------------------------------------------------------------- Lua
@@ -748,7 +738,7 @@ bool fire(lua_State* L, const LuaEvent& e)
 	{
 		ok = false;
 		++g_st.lua_errors;
-		if (log_allowed())
+		if (g_log.allow())
 		{
 			const char* err = lua_tostring(L, -1);
 			::Msg("! [coop] lua error in %s (session continues): %s", name, err ? err : "?");
@@ -762,6 +752,7 @@ bool fire(lua_State* L, const LuaEvent& e)
 
 void lua_frame()
 {
+	PROF_EVENT("coop/coop_sound/lua_frame");
 	if (g_lua.empty())
 		return;
 	if (!lua_ready())
@@ -775,15 +766,7 @@ void lua_frame()
 		g_lua.clear();
 		return;
 	}
-	xr_vector<LuaEvent> now;
-	now.swap(g_lua); // a handler may cause new events: they wait for the next frame
-	u32 budget = kLuaPerFrame;
-	for (const LuaEvent& e : now)
-	{
-		if (!budget--)
-			break;
-		fire(L, e);
-	}
+	g_lua.run([L](const LuaEvent& e) { fire(L, e); });
 }
 } // namespace
 
@@ -811,11 +794,12 @@ void reset()
 	g_reg_snd = Registered();
 	g_reg_stop = Registered();
 	g_ground.clear();
-	g_log_count = 0;
+	g_log = lua_errors::LogBudget(kLogBurst);
 }
 
 void frame()
 {
+	PROF_EVENT("coop/coop_sound/frame");
 	if (owns_sound_sync())
 		host_frame();
 	else
@@ -853,9 +837,9 @@ void print_status()
 		    g_st.cut, g_st.no_object, g_st.missing_files, g_st.malformed, g_st.muted_local, g_st.stops_in,
 		    g_st.stopped);
 	::Msg("[coop]   steps: %llu ground picks, avatar steps %llu, jumps/landings %llu; lua callbacks %llu fired, %llu "
-	      "not registered, %llu errors",
+	      "not registered, %llu errors, %llu lost to a full queue",
 	    g_st.ground_picks, g_st.avatar_steps, g_st.avatar_jumps, g_st.lua_fired, g_st.lua_unregistered,
-	    g_st.lua_errors);
+	    g_st.lua_errors, g_lua.dropped());
 }
 
 bool player_sound_blocked(CObject* owner)

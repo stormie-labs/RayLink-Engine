@@ -350,7 +350,7 @@ void CObjectList::net_Unregister(CObject* O)
 
 int g_Dump_Export_Obj = 0;
 
-u32 CObjectList::net_Export(NET_Packet* _Packet, u32 start, u32 max_object_size)
+u32 CObjectList::net_Export(NET_Packet* _Packet, u32 start, u32 max_object_size, bool (*relevant)(CObject*))
 {
 	if (g_Dump_Export_Obj) Msg("---- net_export --- ");
 
@@ -361,7 +361,7 @@ u32 CObjectList::net_Export(NET_Packet* _Packet, u32 start, u32 max_object_size)
 		CObject* P = (start < objects_active.size())
 			             ? objects_active[start]
 			             : objects_sleeping[start - objects_active.size()];
-		if (P->net_Relevant() && !P->getDestroy())
+		if (P->net_Relevant() && !P->getDestroy() && (!relevant || relevant(P)))
 		{
 			Packet.w_u16(u16(P->ID()));
 			Packet.w_chunk_open8(position);

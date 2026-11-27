@@ -8,7 +8,7 @@
 #include "../../level.h"
 #include "../../gameobject.h"
 #include "telekinesis.h"
-#include "../../coop/coop_sound.h" // Anomaly Coop (audit M2)
+#include "../../coop/coop_sound.h"
 
 
 #define KEEP_IMPULSE_UPDATE 200
@@ -232,7 +232,7 @@ void CTelekineticObject::fire_t(const Fvector& target, float time)
 	if (sound_throw._handle())
 	{
 		sound_throw.play_at_pos(object, object->Position());
-		coop::sound::on_ability_sound(dynamic_cast<CObject*>(telekinesis), sound_throw, object->Position()); // Anomaly Coop (audit M2)
+		coop::sound::on_ability_sound(dynamic_cast<CObject*>(telekinesis), sound_throw, object->Position()); // coop: the clients hear it
 	}
 
 	if (sound_hold._handle() && sound_hold._feedback())
@@ -312,6 +312,6 @@ void CTelekineticObject::update_hold_sound()
 	else
 	{
 		sound_hold.play_at_pos(object, object->Position());
-		coop::sound::on_ability_sound(dynamic_cast<CObject*>(telekinesis), sound_hold, object->Position()); // Anomaly Coop (audit M2)
+		coop::sound::on_ability_sound(dynamic_cast<CObject*>(telekinesis), sound_hold, object->Position()); // coop: the clients hear it
 	}
 }

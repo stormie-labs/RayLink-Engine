@@ -14,7 +14,7 @@
 #include "../ai_monster_squad_manager.h"
 
 #include "../../../actor.h"
-#include "../../../coop/coop_ai.h" // Anomaly Coop: is_player
+#include "../../../coop/coop_ai.h" // coop: is_player
 
 #define TEMPLATE_SPECIALIZATION template <\
 	typename _Object\
@@ -188,7 +188,7 @@ bool CStateMonsterAttackAbstract::check_run_away_state()
 			return true;
 		else m_time_next_run_away = Device.dwTimeGlobal + 10000;
 	}
-	// Anomaly Coop (audit F3a): a monster never flees a player: it fled clients and never the host
+	// coop: a monster never flees a player: it fled clients and never the host
 	else if (!coop::npc_ai::is_player(object->EnemyMan.get_enemy()) && object->Morale.is_despondent() && (m_time_next_run_away <
 		Device.dwTimeGlobal))
 	{

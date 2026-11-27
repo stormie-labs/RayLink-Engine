@@ -1,9 +1,8 @@
 // Anomaly Coop — shared group story after join: info portions, tasks, relations, PDA map spots,
-// and each player's rank / reputation / community for its character on the other machines
-// (SPEC R-7.1..R-7.8, R-1.7, R-3.4, P1, P5, P6).
+// and each player's rank / reputation / community for its character on the other machines.
 //
 // The join save gives a client the host's story as of the save. This module keeps it in sync after that.
-// The host is the only authority (P1):
+// The host is the only authority:
 //   host change    -> applied on the host -> broadcast to every client.
 //   client change  -> made by the client's own scripts (dialogs, PDA, binders) -> NOT applied there,
 //                     sent to the host as a request -> host applies -> broadcast to everybody,
@@ -13,14 +12,14 @@
 // host's own reaction arrives as its own broadcast. Nothing done inside the guard is sent to the host.
 // Exceptions, by design:
 //   - Map spots are applied locally at once (the engine API must return the new spot) and forwarded.
-//   - Task texts, targets and spots are computed by the host only (R-7.3): a client's own script
+//   - Task texts, targets and spots are computed by the host only: a client's own script
 //     updates of an existing task are dropped and overwritten with the host values.
 //   - A client evaluates task completion only for tasks its own scripts track (tasks it had at join or
-//     asked for itself); the result goes to the host as a request. With coop_tasks.script installed (W3c)
+//     asked for itself); the result goes to the host as a request. With coop_tasks.script installed
 //     the client's Lua never completes a task itself: task_manager calls are routed to the host and the
 //     host's Lua task state (stage, status, giver, task vars) is mirrored into the client's task_manager.
-// Every 10 s the host sends a count + hash per domain; a client that differs asks for the full list
-// (P5). Ids on the wire are in host numbering (join::to_host / join::to_local).
+// Every 10 s the host sends a count + hash per domain; a client that differs asks for the full list.
+// Ids on the wire are in host numbering (join::to_host / join::to_local).
 //
 // This header is included from engine files (info portions, tasks, relations, map spots):
 // it has no includes, only forward declarations and engine base types.
@@ -37,9 +36,9 @@ class Endpoint;
 
 namespace story
 {
-void init(); // F3a T4: once per process (sync::init): the console commands
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void register_console(); // once per process (coop_console.cpp): coop_tasks_resync, coop_share_rewards
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void frame(); // main thread, every frame while a session is active
 void reset(); // session started / ended / world replaced
 void print_status();
@@ -83,7 +82,7 @@ bool on_community_goodwill(int community, u16 to, int value, GoodwillOp op);
 bool on_community_relation(int community_from, int community_to, int value);
 // Engine combat bookkeeping (RELATION_REGISTRY::Action): its goodwill changes are computed by the host
 // from the replicated hit/kill, so a client drops its own.
-// Host (W3c, R-3.4): a player proxy is treated like the actor inside Action() (acts_as_actor), so NPC
+// Host: a player proxy is treated like the actor inside Action() (acts_as_actor), so NPC
 // goodwill toward that player changes from its attacks too. The reputation the engine changes on the proxy
 // for an attack / fight help (not a kill: the player's own machine counts kills) is sent to that player.
 // `action` is RELATION_REGISTRY::ERelationAction.
@@ -108,12 +107,12 @@ void on_spot_added(const shared_str& spot_type, u16 id); // after the spot is in
 void on_spot_remove(const shared_str& spot_type, u16 id); // before it is removed
 void on_spots_remove_all(u16 id); // before every spot of the object is removed
 
-// R-7.6 support for reward routing (host): the client peer whose request finished the task last,
+// Reward routing (host): the client peer whose request finished the task last,
 // 0xffffffff if no client did (the host's own completion). The host's scripts still run the reward;
 // who receives it is a script-side decision (coop_tasks.script, told through coop_tasks.host_note).
 u32 task_finisher(LPCSTR task_id);
 
-// --- Lua (coop_script.cpp, W5) ---
+// --- Lua (coop_script.cpp) ---
 // coop.spot_is_local: spot types that never leave this machine (engine-local markers, prefix "coop_").
 bool spot_is_local(LPCSTR type);
 // coop.story_hold_infos (client): while on, info portions this machine's own scripts give apply here only
@@ -124,7 +123,7 @@ bool hold_infos(bool on);
 // coop.story_local_task: an engine task with this id is given / finished on this machine only, never
 // routed to the host, mirrored or hashed (addon personal tasks). Kept for the whole process.
 bool set_local_task(LPCSTR id, bool on);
-// coop.story_task_audience (host, docs/plans/2026-11-16-task-audience.md B): task `id` is sent, listed and hashed only for the
+// coop.story_task_audience (host, xrCoop/coop_task_audience.h): task `id` is sent, listed and hashed only for the
 // players whose character (0 = the host's, else a player's proxy, host numbering) is among `members` (`count` ids, at most
 // task_audience::kMaxMembers; 0 = nobody but the map servers), and for every map server. Replaces an earlier audience of `id`.
 // False and no change off the host or for a bad id / list. The new audience reaches a player who held the task or should now
@@ -138,7 +137,8 @@ bool resend_tasks(u32 peer);
 } // namespace story
 } // namespace coop
 
-// Host setting (console coop_share_rewards 0/1, R-7.6): 0 = task money goes to the player who turned the
-// task in, 1 = money is split equally among the online players. Items always go to the finisher.
+// Host setting (console coop_share_rewards 0..3): 0 = task money goes to the player who turned the
+// task in, 1 = money is split equally among the online players, 2 = everyone who played the task shares it, 3 = everyone
+// who played it gets it in full. Items always go to the finisher.
 // Read by gamedata/scripts/coop_tasks.script through get_console():get_integer.
 extern int g_coop_share_rewards;

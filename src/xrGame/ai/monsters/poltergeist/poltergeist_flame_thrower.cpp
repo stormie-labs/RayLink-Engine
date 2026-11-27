@@ -9,9 +9,9 @@
 #include "../../../actor.h"
 #include "../../../actorEffector.h"
 #include "../ai_monster_effector.h"
-#include "../../../coop/coop_remote.h" // Anomaly Coop
-#include "../../../coop/coop_ai.h" // Anomaly Coop: player_down
-#include "../../../coop/coop_monster_fx.h" // Anomaly Coop (audit F5c)
+#include "../../../coop/coop_remote.h"
+#include "../../../coop/coop_ai.h" // coop: player_down
+#include "../../../coop/coop_monster_fx.h"
 
 CPolterFlame::CPolterFlame(CPoltergeist* polter) : inherited(polter)
 {
@@ -88,7 +88,7 @@ void CPolterFlame::load(LPCSTR section)
 
 void CPolterFlame::create_flame(const CObject* target_object)
 {
-	if (coop::remote::is_remote_creature(m_object)) return; // Anomaly Coop: the host decides
+	if (coop::remote::is_remote_creature(m_object)) return; // coop: the host decides
 	Fvector position;
 	if (!get_valid_flame_position(target_object, position)) return;
 
@@ -101,7 +101,7 @@ void CPolterFlame::create_flame(const CObject* target_object)
 
 	m_time_flame_started = time();
 
-	// Anomaly Coop (audit F5c): the particles were host-only, a client burned from nothing
+	// coop: the particles were host-only, a client burned from nothing
 	coop::monster_fx::host_flame(m_object, position, target_dir);
 }
 
@@ -122,7 +122,7 @@ void CPolterFlame::start_flame(const CObject* target_object, const Fvector& posi
 	select_state(element, ePrepare);
 }
 
-// Anomaly Coop (audit F5c): the flame the host lit. update_schedule takes it through its stages by the same times; a
+// coop: the flame the host lit. update_schedule takes it through its stages by the same times; a
 // puppet deals no damage, so it needs no target.
 void CPolterFlame::coop_play(const Fvector& position, const Fvector& dir)
 {
@@ -188,12 +188,12 @@ void CPolterFlame::update_schedule()
 			if (elem->time_started + m_time_fire_delay < time()) select_state(elem, eFire);
 			break;
 		case eFire:
-			// Anomaly Coop: a flame already burning goes out on a player who is down, its hits skip HitEntity
+			// coop: a flame already burning goes out on a player who is down, its hits skip HitEntity
 			if (elem->time_started + m_time_fire_play < time() || coop::npc_ai::player_down(elem->target_object)) select_state(elem, eStop);
 			else
 			{
 				// check if we need test hit to enemy
-				if (elem->time_last_hit + m_hit_delay < time() && !coop::remote::is_remote_creature(m_object)) // Anomaly Coop: no local damage
+				if (elem->time_last_hit + m_hit_delay < time() && !coop::remote::is_remote_creature(m_object)) // coop: no local damage
 				{
 					// test hit
 					collide::rq_result rq;
@@ -248,7 +248,7 @@ void CPolterFlame::update_schedule()
 
 	bool const detected = m_object->get_current_detection_level() >= m_object->get_detection_success_level();
 
-	CEntityAlive const* enemy = m_object->detection_target(); // Anomaly Coop: the player it senses
+	CEntityAlive const* enemy = m_object->detection_target(); // coop: the player it senses
 	// check if we can create another flame
 	if (m_object->g_Alive() &&
 		enemy &&

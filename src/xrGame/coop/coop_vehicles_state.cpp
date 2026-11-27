@@ -1,5 +1,5 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players, a car's state on every copy and the dolls of sitters (F5-VEH-4, build 57, docs/VEHICLES.md
+// Anomaly Coop — vehicles for players, a car's state on every copy and the dolls of sitters (docs/VEHICLES.md
 // sections 3, 5.4, 5.6 and 11). Declarations: coop_vehicles.h (state_frame, state_on_state) and coop_vehicles_state.h (the stock hooks);
 // the pure half: xrCoop/coop_vehicle_state_rules.h.
 //
@@ -11,7 +11,8 @@
 // lights, the damage particles of the stages (Play1 / Play2, as ApplyDamage), the transmission switch sound. Its physics and health are
 // the stock's own (coop_objects.cpp poses the copy).
 // The doll of a seated player on another machine (coop_players.cpp drive_avatar -> doll_frame): at his seat of the car's copy, in the
-// vehicle idle of its own animations, else hidden; on the decider his proxy stands where F5-VEH-2 parks it and is posed the same way.
+// vehicle idle of its own animations, else hidden; on the decider his proxy stands where coop_vehicles_seat.cpp
+// parks it and is posed the same way.
 // Nothing here knows the mode: who decides answers mode().leads_level(), a player's machine is_mirror(). Main thread only.
 #include "stdafx.h"
 #include "coop_vehicles.h"
@@ -21,6 +22,7 @@
 #include "coop_net.h"
 #include "coop_join.h"
 #include "coop_players.h"
+#include "coop_world.h"
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_vehicle_state_rules.h"
 #include "xrCoop/coop_vehicle_drive_rules.h" // Arrivals
@@ -183,25 +185,19 @@ struct Doll
 	IKinematicsAnimated* visual = nullptr; // the visual the pose was played on (a changed visual is posed again)
 	bool idle = false; // plays the vehicle idle
 	bool hidden = false; // hidden by this module (shown again on release)
-	bool collision_off = false; // its character controller off (a player's machine; on the decider F5-VEH-2 parks the proxy)
+	// Its character controller is off on a player's machine.
+	// On the decider, coop_vehicles_seat.cpp parks the proxy.
+	bool collision_off = false;
 	bool placed = false; // put at its seat by this module
 };
 
 Decider g_dec;
 Copies g_copies;
 xr_map<u16, Doll> g_dolls;
-u32 g_dolls_world = 0; // F5-REV-1 note 3: join::world_generation() of the world the dolls' ids belong to
+u32 g_dolls_world = 0; // join::world_generation() of the world the dolls' ids belong to
 Counters g_c;
 
-u64 now_ms() { return mgr().now_ms(); }
-
-CCar* car_by_id(u16 id)
-{
-	if (id == kNoCar || !g_pGameLevel)
-		return nullptr;
-	CObject* o = Level().Objects.net_Find(id);
-	return o && !o->getDestroy() ? smart_cast<CCar*>(o) : nullptr;
-}
+CCar* car_by_id(u16 id) { return smart_cast<CCar*>(world::object_here(id)); }
 
 bool has_driver_place(CCar* car)
 {
@@ -242,7 +238,8 @@ void scan_cars()
 	}
 }
 
-// A sitter: the stock Owner (the decider's own actor: the co-op host's) or a client in seat 0 of the seat table (F5-VEH-2).
+// A sitter: the stock Owner (the decider's own actor: the co-op host's) or a client in seat 0 of the seat table
+// (coop_vehicles_seat.cpp).
 bool has_sitter(CCar* car) { return car->Engaged() || driver_of(car->ID()) != kNoCharacter; }
 
 void decider_frame(u64 now)
@@ -282,9 +279,10 @@ void decider_frame(u64 now)
 		++it;
 	}
 	// a player who came to the map or finished loading it: the last state of every car that has one, to him
-	std::vector<std::pair<PeerId, bool>> peers;
-	for (const PeerInfo& p : mgr().session().peers())
-		peers.push_back({p.id, p.state == PeerState::Joined && mode().where(p.id) == Where::Here});
+	static std::vector<std::pair<PeerId, bool>> peers; // scratch of this frame: cleared, not freed
+	peers.clear();
+	mgr().session().for_each_joined(
+	    [](const PeerInfo& p) { peers.push_back({p.id, p.state == PeerState::Joined && mode().where(p.id) == Where::Here}); });
 	for (const PeerId peer : g_dec.arrivals.update(peers))
 		for (const auto& it : g_dec.cars)
 			if (it.second.cadence.known())
@@ -311,7 +309,7 @@ void play(u16 host_id, Copy& c)
 	CCar* car = car_by_id(join::to_local(host_id));
 	if (!car)
 		return; // not spawned here yet (or on another level): played when it comes (copies_frame)
-	const CopyPlan p = c.track.apply(c.pending, CoopCarState::facts(*car), u32(now_ms()));
+	const CopyPlan p = c.track.apply(c.pending, CoopCarState::facts(*car), u32(mgr().now_ms()));
 	CoopCarState::apply(*car, c.pending, p);
 	c.due = false;
 	++g_c.applied;
@@ -332,12 +330,13 @@ void copies_frame()
 // ---------------------------------------------------------------- dolls
 
 // Where `doll` sits now on this machine: true and the car's local id, the seat and the car's anim type. The decider: its seat table
-// (F5-VEH-2 seated(); the car by driver_of, a passenger's car is not told). A player's machine: the mirror of the decider's table.
+// (seated(); the car by driver_of, a passenger's car is not told). A player's machine: the mirror of the decider's table.
 struct DollSeat
 {
 	CCar* car = nullptr;
 	u8 seat = kNoSeat;
-	bool placed_here = false; // this module puts it at its seat (a player's machine); else F5-VEH-2 parks it (the decider)
+	// This module puts it at its seat on a player's machine. On the decider, coop_vehicles_seat.cpp parks it.
+	bool placed_here = false;
 };
 
 bool doll_seat(CAI_Stalker* doll, DollSeat& out)
@@ -398,7 +397,8 @@ void pose_doll(CAI_Stalker* doll, Doll& d, const DollSeat& where, bool placed)
 	DollPose pose = doll_pose(where.seat, place, idle.valid());
 	if (where.placed_here && !placed)
 		pose = DollPose::Hidden;
-	// the decider: without driver_place F5-VEH-2 hid the proxy already (as the stock Owner), it is not ours to show or hide
+	// On the decider, coop_vehicles_seat.cpp hides the proxy without driver_place, as it does for the stock Owner.
+	// Only that code controls its visibility.
 	if (!where.placed_here && !place && where.seat == kDriverSeat)
 		pose = DollPose::Idle;
 	if (pose == DollPose::Idle && idle.valid())
@@ -423,7 +423,7 @@ void pose_doll(CAI_Stalker* doll, Doll& d, const DollSeat& where, bool placed)
 	}
 }
 
-// F5-REV-1 note 3 (should-fix of rv_F5-VEH-4): the dolls of another world (a load, a level change) are forgotten without touching any
+// The dolls of another world (a load, a level change) are forgotten without touching any
 // object: an id of the old world can name another stalker here, which release_doll would show and give its collision back.
 void dolls_world()
 {
@@ -458,7 +458,7 @@ void dolls_sweep()
 
 void state_frame()
 {
-	const u64 now = now_ms();
+	const u64 now = mgr().now_ms();
 	if (mode().leads_level())
 		decider_frame(now);
 	if (is_mirror())
@@ -505,14 +505,14 @@ void copy_sound_scale(CCar* car, float& scale)
 	auto it = g_copies.cars.find(join::to_host(car->ID()));
 	if (it == g_copies.cars.end() || !it->second.track.known() || g_copies.world != join::world_generation())
 		return;
-	scale = CoopCarState::sound_scale(*car, it->second.track.rpm_fraction(u32(now_ms())));
+	scale = CoopCarState::sound_scale(*car, it->second.track.rpm_fraction(u32(mgr().now_ms())));
 }
 
 bool doll_frame(CAI_Stalker* doll)
 {
 	if (!doll || !mgr().active() || !world_up())
 		return false;
-	dolls_world(); // F5-REV-1 note 3: no doll of another world is let go here
+	dolls_world(); // no doll of another world is let go here
 	DollSeat where;
 	const bool sits = doll_seat(doll, where);
 	auto it = g_dolls.find(doll->ID());
@@ -531,14 +531,16 @@ bool doll_frame(CAI_Stalker* doll)
 	{
 		if (!d.collision_off)
 		{
-			doll->set_enable_movement_collision(false); // a car would push its own sitter (as F5-VEH-2 parks the decider's proxy)
+			// A car would push its own sitter.
+			// coop_vehicles_seat.cpp parks the decider's proxy for the same reason.
+			doll->set_enable_movement_collision(false);
 			d.collision_off = true;
 		}
 		Fmatrix seat;
 		placed = seat_transform(where.car, where.seat, seat);
 		if (placed)
 			doll->XFORM().set(seat); // as CCar::VisualUpdate puts its Owner: XFORM * the seat bone
-		// no transform for that seat yet (passengers: F5-VEH-5): hidden where his snapshots say, not standing in the car
+		// no transform for that seat yet (passengers: coop_vehicles_ride.cpp): hidden where his snapshots say, not standing in the car
 	}
 	pose_doll(doll, d, where, placed);
 	return true;

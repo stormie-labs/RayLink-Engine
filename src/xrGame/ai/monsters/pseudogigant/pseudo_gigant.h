@@ -56,9 +56,9 @@ public:
 	virtual void on_activate_control(ControlCom::EControlType);
 
 	virtual void on_threaten_execute();
-	// the kick's effects on this machine's actor (Anomaly Coop: also played for a remote player on his machine)
+	// the kick's effects on this machine's actor (coop: also played for a remote player on his machine)
 	void kick_actor(CActor* pA, float hit_value);
-	void coop_dust(const Fvector& at, const Fvector& dir); // Anomaly Coop (audit F11): its stomp's dust, on a puppet
+	void coop_dust(const Fvector& at, const Fvector& dir); // coop: its stomp's dust, on a puppet
 
 	virtual void HitEntityInJump(const CEntity* pEntity);
 	virtual void TranslateActionToPathParams();

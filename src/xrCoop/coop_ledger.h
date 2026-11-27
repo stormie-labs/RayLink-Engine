@@ -1,4 +1,4 @@
-// Anomaly Coop — player money on the host (F2 T1, review R4 7; fix round 1: Ruling F2-1).
+// Anomaly Coop — player money on the host.
 //
 // The host owns every player's balance: the money of his character on the host (the proxy's m_dwMoney, kept in the
 // host save). A client never sends an amount, only a change with a cause (Msg::ReqMoney = MoneyReq); the host checks
@@ -10,14 +10,14 @@
 //     bucket (Policy::dialog_gain_cap in a row, dialog_gain_per_min per minute), anything else and the rest of a
 //     payout from the script bucket (script_gain_burst in a row, script_gain_per_min per minute). Changing the NPC
 //     or leaving the session refills nothing; a character made in this session (a new player key) starts with both
-//     buckets empty (Ruling F2-10), and they refill from the moment it is live in the game (Ruling F2-20);
+//     buckets empty, and they refill from the moment it is live in the game;
 //   - no balance goes above Policy::max_money;
 //   - a transfer to another player is a spend for the giver; the receiver is credited (check_transfer), and only while
-//     the host's session rules allow it: money_transfer on, at most max_money_transfer at a time (F2 T6b: the host's Lua
+//     the host's session rules allow it: money_transfer on, at most max_money_transfer at a time (the host's Lua
 //     pushes them into Policy with coop.money_set_rules; a client's own Lua checks them too, but the host's answer counts);
 //   - a change of zero is malformed: a client never sends one.
 // Trades, transfers and host grants change the balance on the host itself (coop_money host_adjust). The client shows
-// the host's balance plus its own changes the host has not answered yet (client_view). F2 T6b: an answer may carry a note
+// the host's balance plus its own changes the host has not answered yet (client_view). An answer may carry a note
 // (MoneyNote): what the host refused and why, or who gave this player money; the client tells its player.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
 #pragma once
@@ -32,6 +32,8 @@
 #include <utility>
 #include <vector>
 
+#include "coop_bucket.h"
+#include "coop_ids.h"
 #include "coop_session.h" // find_key_value, migrate_key_value: the player key line of a character
 #include "coop_wire.h"
 
@@ -47,11 +49,11 @@ enum class Cause : uint8_t
 };
 constexpr uint8_t kCauseCount = 3;
 
-// The most one transfer may give before the host's Lua says otherwise (F2 T6b review M1): keep it equal to the default of
+// The most one transfer may give before the host's Lua says otherwise: keep it equal to the default of
 // the option max_money_transfer (coop_economy_core.script RULES.max_money_transfer).
 constexpr uint32_t kDefaultTransferMax = 1000000;
 
-// Host settings (configs\coop_money.ltx [coop_money], console coop_money_*; Ruling 21, Ruling F2-1).
+// Host settings (configs\coop_money.ltx [coop_money], console coop_money_*).
 struct Policy
 {
 	uint32_t script_gain_burst = 50000; // money a client may gain without the host in a row
@@ -61,11 +63,11 @@ struct Policy
 	// gains no more than 1.2 M RU an hour on top of the cap
 	uint32_t dialog_gain_per_min = 20000;
 	uint32_t max_money = 100000000; // no balance goes above this
-	// F2 T6b, the session's transfer rules between players (options money_transfer, max_money_transfer). Set by the host's
+	// The session's transfer rules between players (options money_transfer, max_money_transfer). Set by the host's
 	// Lua; before it has, the options' defaults hold: transfers on, kDefaultTransferMax at a time.
 	bool transfer_on = true;
 	uint64_t transfer_max = kDefaultTransferMax; // the most one transfer may give
-	// T6b review I1: how fast one character may give money away. Each transfer the host applies is a news line for its
+	// How fast one character may give money away. Each transfer the host applies is a news line for its
 	// receiver, and a modified client could send 1 RU transfers without end. transfer_burst in a row, then
 	// transfer_per_min a minute (a token bucket per character). A player at the inventory menu gives a few times a minute.
 	uint32_t transfer_burst = 10;
@@ -73,12 +75,7 @@ struct Policy
 };
 
 // An allowance: a bucket of money, full at its first use, refilled per minute up to its size.
-struct Allowance
-{
-	double tokens = 0;
-	uint64_t at = 0; // ms of the last refill
-	bool started = false;
-};
+using Allowance = TokenBucket;
 
 enum class Verdict : uint8_t
 {
@@ -87,9 +84,9 @@ enum class Verdict : uint8_t
 	NoAllowance, // a gain above what the allowances hold now
 	OverMax, // the balance (the giver's or a transfer's receiver's) would go above max_money
 	Malformed, // unknown cause, a change of zero, a transfer that gives nothing or to nobody
-	TransfersOff, // F2 T6b: money_transfer is off in this session
-	OverTransferLimit, // F2 T6b: a transfer above max_money_transfer
-	TransferRate, // T6b review I1: this character has given money away too fast (Policy::transfer_burst)
+	TransfersOff, // money_transfer is off in this session
+	OverTransferLimit, // a transfer above max_money_transfer
+	TransferRate, // this character has given money away too fast (Policy::transfer_burst)
 };
 constexpr uint8_t kVerdictCount = uint8_t(Verdict::TransferRate) + 1;
 
@@ -97,18 +94,7 @@ constexpr uint8_t kVerdictCount = uint8_t(Verdict::TransferRate) + 1;
 // refills nothing.
 inline void refill(Allowance& a, uint32_t burst, uint32_t per_min, uint64_t now_ms)
 {
-	if (!a.started)
-	{
-		a.started = true;
-		a.tokens = double(burst);
-		a.at = now_ms;
-		return;
-	}
-	if (now_ms <= a.at)
-		return;
-	const double gained = double(now_ms - a.at) * double(per_min) / 60000.0;
-	a.tokens = std::min(double(burst), a.tokens + gained);
-	a.at = now_ms;
+	a.refill(now_ms, double(burst), [per_min](uint64_t ms) { return double(ms) * double(per_min) / 60000.0; });
 }
 
 // The refill is fractional: whole RU must not miss by a rounding error.
@@ -170,7 +156,7 @@ struct Receiver
 
 // The giver's side of a transfer of -delta from player `from` (balance `balance`) to `to`. Applied: `balance` is the
 // giver's new balance and `credit` what the receiver gets; else both stay. Malformed: no receiver (nobody, himself) or
-// nothing given. In this order (F2 T6b): the form, the session's rules (TransfersOff, OverTransferLimit), then the
+// nothing given. In this order: the form, the session's rules (TransfersOff, OverTransferLimit), then the
 // state (Insufficient, OverMax): a player over the limit is told about the limit, not about his purse.
 inline Verdict check_transfer(uint32_t from, const Receiver& to, int64_t delta, uint32_t& balance, uint32_t& credit,
     const Policy& p)
@@ -207,7 +193,7 @@ struct Pending
 inline bool seq_newer(uint32_t a, uint32_t b) { return int32_t(a - b) > 0; }
 
 // What the client shows: the host's balance plus its changes the host has not answered yet (seq newer than
-// `acked_seq`), less `held` (F2 T5: upgrades it paid whose requests the host has not answered, UpgradeHolds), within
+// `acked_seq`), less `held` (upgrades it paid whose requests the host has not answered, UpgradeHolds), within
 // [0, max(max_money, host_balance)] — the host's own figure is never cut.
 inline uint32_t client_view(uint32_t host_balance, uint32_t acked_seq, const std::vector<Pending>& pending,
     uint32_t max_money = Policy().max_money, uint64_t held = 0)
@@ -251,14 +237,14 @@ struct MoneyReq
 };
 constexpr size_t kMoneyReqSize = 13;
 
-// What the host tells the player besides his balance (F2 T6b). The protocol is 8 and not released: the note is part of
-// the balance message, not a message of its own.
+// What the host tells the player besides his balance: the note is part of the balance
+// message, not a message of its own.
 enum class NoteKind : uint8_t
 {
 	None = 0, // only a balance
 	Received = 1, // another player gave this one `amount` RU (`peer` is the giver)
 	Refused = 2, // the host refused a change of his (`cause`, `verdict`, `amount`; a transfer: `peer` is the receiver)
-	Gap = 3, // parity audit D11: the host never saw `amount` of his changes from seq `peer` on: he sends them again
+	Gap = 3, // the host never saw `amount` of his changes from seq `peer` on: he sends them again
 };
 constexpr uint8_t kNoteKindCount = 4;
 
@@ -271,7 +257,7 @@ struct MoneyNote
 	int32_t amount = 0; // Received: RU credited; Refused: the change asked for (negative: a spend or a transfer); Gap: seqs
 };
 
-// Parity audit D11: a ReqMoney over the host's rate row (Session::limit_rate) is dropped before its handler, with no
+// A ReqMoney over the host's rate row (Session::limit_rate) is dropped before its handler, with no
 // answer. The next one to pass set `acked` past it, the client forgot it as answered and the change was gone. `seq` came
 // after `acked`: how many seqs between them the host never saw. The first request of a connection has nothing to compare
 // with, and a hole wider than kMaxGap is no lost burst: the changes of a world that was replaced went with it.
@@ -351,7 +337,7 @@ private:
 	uint64_t m_dropped = 0;
 };
 
-// Client: one NoticeGate per cause (T6b review M2): a refusal of a transfer the player asked for is not muted by a refusal
+// Client: one NoticeGate per cause: a refusal of a transfer the player asked for is not muted by a refusal
 // of a mod's income a second ago, and a mod's loop is muted without silencing his transfers.
 class RefusalGate
 {
@@ -447,7 +433,7 @@ inline uint32_t capped_balance(uint32_t balance, int64_t delta, uint32_t max_mon
 // The key the host knows a character by: the digest on the "key" line of its custom data ([coop] key = <sha256 hex>),
 // the line by which coop_join binds the character to its player (find_proxy_by_key). A save from before R1 I1 still
 // holds the key itself: its digest is returned, as coop_join migrates it (here on a copy). Empty if there is none.
-// Not the entity id: an id freed and given to another character later says nothing about who plays it (F2-13).
+// Not the entity id: an id freed and given to another character later says nothing about who plays it.
 inline std::string character_key(std::string custom_data)
 {
 	migrate_key_value(custom_data);
@@ -458,9 +444,9 @@ inline std::string character_key(std::string custom_data)
 // The allowances of one character (by its key, character_key). Kept for the whole session: a player who leaves and
 // joins again (a new connection, maybe a new peer id) finds them as he left them. A character that was in the save
 // when the session started gets full allowances at its first change; one made in this session (a new player key)
-// starts empty and only gets the refills (Ruling F2-10). They refill only while the character is in the game: its
-// player leaving freezes them (Ruling F2-13), and the clock runs from the moment he is live again — his join is complete,
-// peer_online — not from his first gain: the time in the game before it is credited, the time away is not (Ruling F2-20).
+// starts empty and only gets the refills. They refill only while the character is in the game: its
+// player leaving freezes them, and the clock runs from the moment he is live again — his join is complete,
+// peer_online — not from his first gain: the time in the game before it is credited, the time away is not.
 struct CharacterAllowances
 {
 	Allowance script;
@@ -477,7 +463,7 @@ struct Decision
 	uint32_t credit = 0; // a transfer applied: what the receiver gets
 	uint32_t acked = 0; // MoneyBalance::acked_seq of the answer
 	uint32_t gain_script = 0, gain_dialog = 0; // an applied gain, by the allowance that paid it
-	MoneyNote note; // F2 T6b: what the answer tells the player about a refused change (none for a repeat or an applied one)
+	MoneyNote note; // what the answer tells the player about a refused change (none for a repeat or an applied one)
 };
 
 // The host's state of the players' money changes: per connection (peer id) the newest answered change, per character
@@ -506,13 +492,13 @@ public:
 	    bool dialog_lock, const Receiver& to, const Policy& p, uint64_t now_ms)
 	{
 		Decision d = decide(peer, character, q, balance, dialog_lock, to, p, now_ms);
-		// No note for a repeat, and none for a transfer to himself (T6b review M7): that is his own mistake.
+		// No note for a repeat, and none for a transfer to himself: that is his own mistake.
 		if (!d.stale && !(q.cause == Cause::Transfer && q.ref == peer))
 			d.note = note_refused(q, d.verdict);
 		return d;
 	}
 
-	// Connection `peer` is live in the world with `character` (its join is complete; Ruling F2-20): the refill clock of
+	// Connection `peer` is live in the world with `character` (its join is complete): the refill clock of
 	// the character runs from now, not from its first income.
 	//   - a character made in this session: both buckets exist now, empty, clock at `now_ms`;
 	//   - a character from the save that has not been here yet this session: full at its first income (a full bucket
@@ -534,7 +520,7 @@ public:
 		return it == m_acked.end() ? 0u : it->second;
 	}
 	// A connection ended: its numbering goes (a new one starts at 1); the character's allowances stay, frozen until
-	// he is back (Ruling F2-13).
+	// he is back.
 	void peer_left(uint32_t peer)
 	{
 		m_acked.erase(peer);
@@ -578,7 +564,7 @@ private:
 			d.verdict = check_transfer(peer, to, q.delta, after, credit, p);
 			if (d.verdict != Verdict::Applied)
 				return d; // refused for what it is: it costs no token
-			// T6b review I1: only a transfer that would be applied counts against the rate, and a refusal changes nothing
+			// Only a transfer that would be applied counts against the rate, and a refusal changes nothing
 			if (!take_transfer_token(character, p, now_ms))
 			{
 				d.verdict = Verdict::TransferRate;
@@ -588,7 +574,7 @@ private:
 			d.credit = credit;
 			return d;
 		}
-		// Ruling F2-13: the form first. A request refused by it, and a spend, touch no allowance and start no clock.
+		// The form first. A request refused by it, and a spend, touch no allowance and start no clock.
 		if (uint8_t(q.cause) >= kCauseCount || q.delta <= 0)
 		{
 			Allowance untouched_dialog, untouched_script; // a spend never draws on them
@@ -621,7 +607,7 @@ private:
 	}
 
 	// The allowances of `character`, made if there are none yet. Called when the character goes live (peer_online, the
-	// normal way: Ruling F2-20) and by a request (the fallback for a connection that was never marked online). The
+	// normal way) and by a request (the fallback for a connection that was never marked online). The
 	// clock of a character that is back starts now, so what was spent away stays spent and the time away pays nothing.
 	CharacterAllowances& allowances_of(const std::string& character, uint64_t now_ms)
 	{
@@ -631,7 +617,7 @@ private:
 			CharacterAllowances& a = found->second;
 			if (a.away)
 			{
-				// Ruling F2-13: back in the game. The clock goes on from now; the time away pays nothing.
+				// Back in the game. The clock goes on from now; the time away pays nothing.
 				a.away = false;
 				for (Allowance* x : {&a.script, &a.dialog})
 					if (x->started && now_ms > x->at)
@@ -643,24 +629,24 @@ private:
 		a.script.at = a.dialog.at = now_ms;
 		if (!from_save(character))
 		{
-			// Ruling F2-10: made in this session. Started and empty: refill() gives no burst, only the refills from now.
+			// Made in this session. Started and empty: refill() gives no burst, only the refills from now.
 			a.script.started = a.dialog.started = true;
 		}
-		// else: from the save, not started: the first refill() makes it full (Ruling F2-10), whatever `at` is.
+		// else: from the save, not started: the first refill() makes it full, whatever `at` is.
 		return a;
 	}
 
 	std::map<uint32_t, uint32_t> m_acked; // peer -> newest answered seq
 	std::map<uint32_t, std::string> m_character_of; // peer -> the key of his character (its last request)
 	std::map<std::string, CharacterAllowances> m_characters; // character key -> allowances
-	std::map<std::string, Allowance> m_transfer_rate; // character key -> its transfer bucket (T6b review I1)
+	std::map<std::string, Allowance> m_transfer_rate; // character key -> its transfer bucket
 	std::set<std::string> m_from_save; // keys of the characters in the world when the session started
 };
 
 // Settles an applied transfer (Decision::balance, Decision::credit) in `b`, which has set(peer, RU) and add(peer, RU):
 // the giver's new balance first, then the receiver gets the credit on top of what he holds at that moment. So two
 // connections on one character (a fair game never has them) keep exactly the money they had: crediting first and then
-// writing the giver's figure, taken before, would lose the credit. Nothing ever prints money (review round 2).
+// writing the giver's figure, taken before, would lose the credit. Nothing ever prints money.
 template <class Balances>
 void settle_transfer(Balances& b, uint32_t giver, uint32_t giver_balance, uint32_t receiver, uint32_t credit)
 {
@@ -668,7 +654,7 @@ void settle_transfer(Balances& b, uint32_t giver, uint32_t giver_balance, uint32
 	b.add(receiver, credit);
 }
 
-// ---------------------------------------------------------------- a trade's shortfall (review A-REV-E-2 finding 2)
+// ---------------------------------------------------------------- a trade's shortfall
 // Server: a map server judges a deal by the balance its world server last named (LevelMap) and sends the deal's change up at once
 // (LevelEntity Money); a debit the world server made meanwhile (a transfer settled there, a world script's charge) can leave the deal's
 // charge larger than the balance the world holds when the change arrives. The goods have moved on the map server already, so the
@@ -744,7 +730,7 @@ private:
 	uint64_t m_untracked = 0; // RU of shortfalls no entry could keep
 };
 
-// ---------------------------------------------------------------- upgrades at a mechanic (F2 T5)
+// ---------------------------------------------------------------- upgrades at a mechanic
 // A client installs an upgrade on its machine; the stock Lua effect pays for it there
 // (inventory_upgrades.effect_functor_a: give_money(-price), price = floor(cost x mech_discount x eco `upgrade`)). That
 // spend is not sent as a ReqMoney: the upgrade's request (Msg::ReqItemEvent GE_INSTALL_UPGRADE) carries it with the
@@ -772,7 +758,7 @@ enum class UpgradeVerdict : uint8_t
 	Scripted, // no mechanic named (a script installed it) and the host does not take those (scripted_upgrades)
 	NoMechanic, // not a live NPC with an inventory whose talk lock the player holds and stalkers_upgrade_info names
 	TooFar, // the player's character on the host stands farther than the reach from the mechanic
-	UnknownCost, // fix round 1 (review 4): the host cannot read the upgrade's cost (never priced at 0)
+	UnknownCost, // the host cannot read the upgrade's cost (never priced at 0)
 	Underpaid, // paid less than floor(cost x upgrade_min_percent)
 	Insufficient, // the player's balance on the host does not cover what he paid
 };
@@ -781,14 +767,14 @@ constexpr uint8_t kUpgradeVerdictCount = uint8_t(UpgradeVerdict::Insufficient) +
 // What the host knows about one upgrade request.
 struct UpgradeFacts
 {
-	bool mechanic_named = false; // the request names a mechanic (not 0xffff)
+	bool mechanic_named = false; // the request names a mechanic (not kNoId)
 	bool scripted_allowed = false; // host setting scripted_upgrades
 	bool mechanic_ok = false; // see UpgradeVerdict::NoMechanic
 	float distance = 0.f; // player character <-> mechanic on the host
 	float reach = 6.f;
 	uint32_t paid = 0; // what the client's game charged for it
 	uint32_t cost = 0; // `cost` of the upgrade's section
-	bool cost_known = false; // the host read `cost` (fix round 1, review 4)
+	bool cost_known = false; // the host read `cost`
 	float min_percent = 0.f;
 	uint32_t balance = 0; // the player's balance on the host
 };
@@ -816,7 +802,7 @@ inline UpgradeVerdict judge_upgrade(const UpgradeFacts& f)
 	return UpgradeVerdict::Ok;
 }
 
-// The NPC an upgrade names, as the host sees him (fix round 1, review 3). A mechanic is any live NPC with an inventory
+// The NPC an upgrade names, as the host sees him. A mechanic is any live NPC with an inventory
 // (CInventoryOwner: a stalker, or a trader class like the Forester, m_lesnik : m_trader, CAI_Trader) whose talk lock the
 // player holds (the stock upgrade windows run inside the mechanic's dialog) and whose section the mechanics' settings
 // name (misc\stalkers_upgrade_info.ltx [<section>] or [<section>_upgr]); never a player's character.
@@ -848,7 +834,7 @@ inline MechanicCheck check_mechanic(const MechanicFacts& m)
 	return MechanicCheck::Ok;
 }
 
-// Fix round 1 (review 1): an owner's item state (Msg::ItemState) never brings an upgrade to the host. The host copy of
+// An owner's item state (Msg::ItemState) never brings an upgrade to the host. The host copy of
 // a player's item takes upgrades only from a purchase the host accepted (ReqItemEvent, judge_upgrade) and from its own
 // entity: an owner's list taken onto it would put unpaid upgrades into its price (the section's cost plus each upgrade's,
 // CInventoryItem::Cost), which a trade on the host pays. `State` is the item layer's ItemData (has_upgrades, upgrades);
@@ -860,10 +846,10 @@ void host_keeps_own_upgrades(State& owner_state)
 	owner_state.upgrades.clear();
 }
 
-// Msg::ReqItemEvent ends with this (F2 T5), after the event bytes. Wire: u16 mechanic, u32 paid (6 bytes).
+// Msg::ReqItemEvent ends with this, after the event bytes. Wire: u16 mechanic, u32 paid (6 bytes).
 struct UpgradePayment
 {
-	uint16_t mechanic = 0xFFFF; // host numbering; 0xffff: none (an upgrade a script installed)
+	uint16_t mechanic = kNoId; // host numbering; kNoId: none (an upgrade a script installed)
 	uint32_t paid = 0; // RU the client's game charged for it
 };
 constexpr size_t kUpgradePaymentSize = 6;

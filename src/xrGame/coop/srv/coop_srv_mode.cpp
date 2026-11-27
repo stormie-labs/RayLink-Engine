@@ -23,11 +23,13 @@
 #include "coop/coop_join.h"
 #include "coop/coop_levels.h"
 #include "coop/srv/coop_mapserver.h"
+#include "coop/srv/coop_mapserver_stats.h" // the stats line of a server's process
 #include "coop/coop_net.h"
-#include "coop/coop_script.h" // H-DEATHMARK: the marker's Lua callback
+#include "coop/coop_script.h" // the marker's Lua callback
 #include "coop/coop_sync.h"
 #include "coop/coop_world.h"
-#include "coop/srv/coop_srv_join.h" // A-S6J: the server's part of the join, the feed lines
+#include "coop/srv/coop_srv_join.h" // the server's part of the join, the feed lines
+#include "coop/srv/coop_srv_layer.h" // register_console, register_lua
 #include "coop_host_console.h" // the @rl lines of the dedicated autostart; H-SAY: the window
 #include "ai_space.h" // place_ghost: the game graph
 #include "alife_object_registry.h"
@@ -81,9 +83,6 @@ void up_item_facts(u16 id);
 
 namespace srv
 {
-void register_console(); // srv/coop_srv_console.cpp: srv_* and the old coop_* names
-void register_lua(lua_State* L); // srv/coop_srv_script.cpp: the table srv.*
-
 namespace
 {
 // tests/test_mode_answers.cpp reads these rows and compares them with the table of tests/support/fake_mode.h
@@ -98,9 +97,10 @@ constexpr ModeAnswers kServerClient{/*actor_is_player*/ true, /*decides_world*/ 
 // on another one does not), queued while one loads the world.
 void to_players(Msg type, const Writer& payload, Lane lane, PeerId except)
 {
-	for (const PeerInfo& p : mgr().session().peers())
+	mgr().session().for_each_joined([&](const PeerInfo& p) {
 		if (p.id != except && p.state == PeerState::Joined && levels::passes_to(type, p.id))
 			net::to_peer(p.id, type, payload, lane);
+	});
 }
 
 void stream_to_players(Msg type, const Writer& payload, PeerId except)
@@ -111,9 +111,10 @@ void stream_to_players(Msg type, const Writer& payload, PeerId except)
 		s.broadcast(Lane::Unreliable, type, payload, except);
 		return;
 	}
-	for (const PeerInfo& p : s.peers())
+	s.for_each_joined([&](const PeerInfo& p) {
 		if (p.id != except && p.state == PeerState::Joined && levels::passes_to(type, p.id))
 			s.send(p.id, Lane::Unreliable, type, payload);
+	});
 }
 
 // The world server: the map servers are clients of the world: what reaches every level reaches them, a bridge that loads its world
@@ -188,7 +189,7 @@ public:
 	{
 		const auto& on = mapserver::trunk_peers().on();
 		const auto it = on.find(peer);
-		return it == on.end() ? u16(0xffff) : u16(it->second.proxy);
+		return it == on.end() ? kNoId : u16(it->second.proxy);
 	}
 	PeerId level_peer_of(u16 character) const override
 	{
@@ -291,6 +292,13 @@ struct WorldTables
 	writer::MapLead lead_of_map(u16 level) const { return world_lead_of(level); }
 	PeerId holder_of(u16 root) const { return levels::holder_of(root); } // a squad, or a living monster, granted to a map server
 	u16 map_of_bridge(PeerId bridge) const { return mapserver::level_of_bridge(bridge); }
+	PeerId maker_of(u16 root) const // the map server whose ids it has: what it made (at no map: a psy phantom)
+	{
+		for (const PeerId bridge : mapserver::host_bridges())
+			if (levels::host_id_is_senders(bridge, root))
+				return bridge;
+		return kInvalidPeer;
+	}
 };
 
 writer::Writer world_writer_of(const writer::RootFacts& r)
@@ -304,6 +312,7 @@ struct MapTables
 	bool plays_here(u16 character) const { return played_by(character) != kInvalidPeer; } // a player of its session (his virtual peer)
 	bool authors(u16 root) const { return levels::xfer_authors(root); } // granted to it, or born and flushed (W1.2b)
 	bool born(u16 root) const { return levels::xfer_born(root); } // made under its slice, not flushed yet (review R32 B3)
+	bool made_here(u16 root) const { return levels::xfer_made_here(root); } // an id of its own pool
 };
 
 writer::Writer map_writer_of(const writer::RootFacts& r)
@@ -380,6 +389,7 @@ public:
 	}
 	void frame() override
 	{
+		PROF_EVENT("coop/coop_srv_mode/WorldServerMode::frame");
 		levels::frame(); // the seats, LevelMap, the map servers, the transfers
 		join_world_frame(); // A-S6J: the map servers that wait for a world to load
 	}
@@ -391,9 +401,9 @@ public:
 	void held_update() override {}
 	void switched_offline(u16) override {}
 	bool takes_own_ids() const override { return false; }
-	u16 own_free_id() override { return 0xffff; }
+	u16 own_free_id() override { return kNoId; }
 
-	// A-S6-IF (S6): no map of a player here. A map's message reaches the players on that map only; what touches a player's character
+	// No map of a player here. A map's message reaches the players on that map only; what touches a player's character
 	// goes to the map server of his map; the links are the bridges; a player of a map that has a map server joins there.
 	LevelSide* level() override { return nullptr; }
 	bool reaches(PeerId peer, Msg type) const override { return levels::passes_to(type, peer); }
@@ -498,6 +508,7 @@ public:
 	}
 	void frame() override
 	{
+		PROF_EVENT("coop/coop_srv_mode/MapServerMode::frame");
 		levels::frame();
 		if (world_up())
 			worldstate::level_sky_frame(mgr().now_ms()); // time is the world server's, the sky of its map its own
@@ -569,6 +580,7 @@ public:
 	void install(ModeTables&) override { feed_start(); }
 	void frame() override
 	{
+		PROF_EVENT("coop/coop_srv_mode/ServerClientMode::frame");
 		levels::frame();
 		feed_frame(); // A-S6J (S5): "went to" / "came from" in his PDA feed, from the world server's table
 	}
@@ -580,9 +592,9 @@ public:
 	void held_update() override {}
 	void switched_offline(u16) override {}
 	bool takes_own_ids() const override { return false; }
-	u16 own_free_id() override { return 0xffff; }
+	u16 own_free_id() override { return kNoId; }
 
-	// A-S6-IF (S6): a player's machine sends nobody anything of the world and joins nobody; its loading screen waits for the map
+	// A player's machine sends nobody anything of the world and joins nobody; its loading screen waits for the map
 	// server of its level.
 	LevelSide* level() override { return nullptr; }
 	bool reaches(PeerId, Msg) const override { return true; }

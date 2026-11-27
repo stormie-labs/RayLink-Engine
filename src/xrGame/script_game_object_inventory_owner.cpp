@@ -66,16 +66,16 @@
 
 #include "Flashlight.h"
 #include "CharacterPhysicsSupport.h"
-#include "coop/coop_items.h" // Anomaly Coop (F2 T5): an upgrade bought at a mechanic
-#include "coop/coop_callgate.h" // Anomaly Coop (F2 T12): the call gate of a client
-#include "coop/coop_manager.h" // Anomaly Coop (build 56): Weapon_AddonAttach
-#include "coop/coop_world.h" // Anomaly Coop (build 56): whose character holds the weapon
+#include "coop/coop_items.h" // coop: an upgrade bought at a mechanic
+#include "coop/coop_callgate.h" // coop: the call gate of a client
+#include "coop/coop_manager.h" // coop: Weapon_AddonAttach
+#include "coop/coop_world.h" // coop: whose character holds the weapon
 
 bool CScriptGameObject::GiveInfoPortion(LPCSTR info_id)
 {
 	CInventoryOwner* pInventoryOwner = smart_cast<CInventoryOwner*>(&object());
 	if (!pInventoryOwner) return false;
-	if (coop::callgate::client_gate("game_object:give_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // Anomaly Coop (F2 T12 gate): story path below
+	if (coop::callgate::client_gate("game_object:give_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // coop: story path below
 	pInventoryOwner->TransferInfo(info_id, true);
 	return true;
 }
@@ -84,7 +84,7 @@ bool CScriptGameObject::DisableInfoPortion(LPCSTR info_id)
 {
 	CInventoryOwner* pInventoryOwner = smart_cast<CInventoryOwner*>(&object());
 	if (!pInventoryOwner) return false;
-	if (coop::callgate::client_gate("game_object:disable_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // Anomaly Coop (F2 T12 gate): story path below
+	if (coop::callgate::client_gate("game_object:disable_info_portion", &object()) == coop::calls::Gate::Refuse) return false; // coop: story path below
 	pInventoryOwner->TransferInfo(info_id, false);
 	return true;
 }
@@ -623,7 +623,7 @@ void CScriptGameObject::TransferItem(CScriptGameObject* pItem, CScriptGameObject
 		return;
 	}
 
-	// Anomaly Coop (F2 T12 gate): a client moves an item only with its own actor on one side (the item is ours, or it
+	// coop: a client moves an item only with its own actor on one side (the item is ours, or it
 	// comes to us: a mechanic or a box handing it back); the event router sends it as ReqTransfer / ReqTake / ReqDrop
 	// and the host checks owner and reach. Between two others' inventories it is the host's.
 	if (coop::callgate::client_gate_own("game_object:transfer_item",
@@ -660,7 +660,7 @@ void CScriptGameObject::TakeItem(CScriptGameObject* pItem)
 		return;
 	}
 
-	// Anomaly Coop (F2 T12 round 1 gate, review I2): as transfer_item - the taker or the item is ours (a ReqTake /
+	// coop: as transfer_item - the taker or the item is ours (a ReqTake /
 	// ReqTransfer the host checks), else the host's
 	if (coop::callgate::client_gate_own("game_object:take_item",
 			coop::calls::own_move(coop::callgate::is_own(pIItem->object().ID()), coop::callgate::is_own(object().ID()))) == coop::calls::Gate::Refuse)
@@ -748,8 +748,8 @@ void CScriptGameObject::TransferMoney(int money, CScriptGameObject* pForWho)
 		return;
 	}
 
-	// Anomaly Coop (F2 T12 round 1 gate, review I2): on a client only our actor pays: its side goes to the host's money
-	// journal (GE_MONEY, F2 T1); the receiver's money is the host's and is not changed here. Another payer: refused (the
+	// coop: on a client only our actor pays: its side goes to the host's money
+	// journal (GE_MONEY); the receiver's money is the host's and is not changed here. Another payer: refused (the
 	// same as give_money on an NPC).
 	switch (coop::callgate::client_gate("game_object:transfer_money", &object()))
 	{
@@ -769,7 +769,7 @@ void CScriptGameObject::GiveMoney(int money)
 {
 	CInventoryOwner* pOurOwner = smart_cast<CInventoryOwner*>(&object());
 	VERIFY(pOurOwner);
-	// Anomaly Coop (F2 T12 gate): our actor's money goes to the host's journal (GE_MONEY, F2 T1); an NPC's is the host's
+	// coop: our actor's money goes to the host's journal (GE_MONEY); an NPC's is the host's
 	if (coop::callgate::client_gate("game_object:give_money", &object()) == coop::calls::Gate::Refuse)
 		return;
 
@@ -802,7 +802,7 @@ void CScriptGameObject::SetGoodwill(int goodwill, CScriptGameObject* pWhoToSet)
 		                                "SetGoodwill available only for InventoryOwner");
 		return;
 	}
-	if (coop::callgate::client_gate("game_object:set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
+	if (coop::callgate::client_gate("game_object:set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // coop: story Relation path below
 	RELATION_REGISTRY().SetGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), goodwill);
 }
 
@@ -816,7 +816,7 @@ void CScriptGameObject::ForceSetGoodwill(int goodwill, CScriptGameObject* pWhoTo
 		                                "ForceSetGoodwill available only for InventoryOwner");
 		return;
 	}
-	if (coop::callgate::client_gate("game_object:force_set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
+	if (coop::callgate::client_gate("game_object:force_set_goodwill", &object()) == coop::calls::Gate::Refuse) return; // coop: story Relation path below
 	RELATION_REGISTRY().ForceSetGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), goodwill);
 }
 
@@ -830,7 +830,7 @@ void CScriptGameObject::ChangeGoodwill(int delta_goodwill, CScriptGameObject* pW
 		                                "ChangeGoodwill available only for InventoryOwner");
 		return;
 	}
-	if (coop::callgate::client_gate("game_object:change_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
+	if (coop::callgate::client_gate("game_object:change_goodwill", &object()) == coop::calls::Gate::Refuse) return; // coop: story Relation path below
 	RELATION_REGISTRY().ChangeGoodwill(pInventoryOwner->object_id(), pWhoToSet->object().ID(), delta_goodwill);
 }
 
@@ -855,7 +855,7 @@ void CScriptGameObject::SetRelation(ALife::ERelationType relation, CScriptGameOb
 		                                "SetRelation available only for InventoryOwner");
 		return;
 	}
-	if (coop::callgate::client_gate("game_object:set_relation", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
+	if (coop::callgate::client_gate("game_object:set_relation", &object()) == coop::calls::Gate::Refuse) return; // coop: story Relation path below
 	RELATION_REGISTRY().SetRelationType(pInventoryOwner, pOthersInventoryOwner, relation);
 }
 
@@ -914,7 +914,7 @@ void CScriptGameObject::SetCommunityGoodwill_obj(LPCSTR community, int goodwill)
 	CHARACTER_COMMUNITY c;
 	c.set(community);
 
-	if (coop::callgate::client_gate("game_object:set_community_goodwill", &object()) == coop::calls::Gate::Refuse) return; // Anomaly Coop (F2 T12 gate): story Relation path below
+	if (coop::callgate::client_gate("game_object:set_community_goodwill", &object()) == coop::calls::Gate::Refuse) return; // coop: story Relation path below
 	RELATION_REGISTRY().SetCommunityGoodwill(c.index(), pInventoryOwner->object_id(), goodwill);
 }
 
@@ -2341,12 +2341,11 @@ void CScriptGameObject::Weapon_AddonAttach(CScriptGameObject* item)
 		                                "CWeaponMagazined : trying to attach non-CInventoryItem!");
 		return;
 	}
-	// Anomaly Coop (build 56; live, builds 54-55: "many silencers are not made"; found on the stand 2026-11-18). An NPC that
-	// takes an item tries to mount it on his best weapon (stock xr_gather_items.script, npc_on_item_take). Where a player's
-	// character is led it is such an NPC: a silencer, a scope or a launcher that came to a player holding the gun it fits
-	// was mounted on that machine's copy of the gun (the item is used up), and the gun's state from its player (no addon)
-	// took it off again: the addon was gone for good. A player's things are mounted by the player's own machine; the scripts
-	// of another machine leave them alone.
+	// coop: an NPC that takes an item tries to mount it on his best weapon (stock xr_gather_items.script,
+	// npc_on_item_take). Where a player's character is led it is such an NPC: a silencer, a scope or a launcher that came to
+	// a player holding the gun it fits would be mounted on that machine's copy of the gun (the item is used up), and the
+	// gun's state from its player (no addon) would take it off again: the addon would be gone for good. A player's things
+	// are mounted by the player's own machine; the scripts of another machine leave them alone.
 	// (a character of section coop_player_avatar: another player's on any machine, never this machine's own actor)
 	if (coop::mgr().active() && coop::world::is_player_character(smart_cast<const CGameObject*>(weapon->H_Parent())))
 	{
@@ -2416,7 +2415,7 @@ bool CScriptGameObject::InstallUpgrade(LPCSTR upgrade)
 	if (!pSettings->section_exist(upgrade))
 		return false;
 
-	// Anomaly Coop (F2 T5): Anomaly's own upgrade window (ui_inventory.script, inside the mechanic's dialog) installs
+	// coop: Anomaly's own upgrade window (ui_inventory.script, inside the mechanic's dialog) installs
 	// with this; on a client the price goes to the host with the upgrade, bought from the actor's talk partner.
 	coop::items::UpgradePurchase purchase(item, coop::items::actor_talk_partner());
 	return ai().alife().inventory_upgrade_manager().upgrade_install(*item, upgrade, false);

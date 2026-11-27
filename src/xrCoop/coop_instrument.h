@@ -1,5 +1,6 @@
 // Bounded instrument intent. Resource paths and motion names never come from the peer.
 #pragma once
+#include "coop_validate.h"
 #include "coop_wire.h"
 #include <cmath>
 #include <cstdint>
@@ -66,10 +67,7 @@ inline State interpolate(const State& a, const State& b, float factor)
     }
     return out;
 }
-inline bool finite3(float x, float y, float z)
-{
-    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
-}
+using validate::finite3;
 inline bool stationary(uint32_t movement, float x, float y, float z, bool alive)
 {
     // actor_defs.h: direction 0..3, jump/fall/landing/climb 7..11. Crouch/turn alone are allowed.
@@ -81,7 +79,7 @@ inline bool prefer_blend(bool live, bool fading, float weight, bool best_live, b
 {
     return live && (!best_live || (best_fading && !fading) || (fading == best_fading && weight >= best_weight));
 }
-// Live b29 (2026-10-29): client NPC puppets flashed a T-pose in fights. A stalker's hit flinch (character_hit_animations.cpp)
+// Client NPC puppets flashed a T-pose in fights. A stalker's hit flinch (character_hit_animations.cpp)
 // plays hit_downl/r, hitback17... on channels 2 and 3 with weight = hit power (1..3), and those channels ADD key deltas
 // over the motion's first frame (Animation.cpp: {lerp, add}); the motions themselves are authored on the bind pose. The
 // host picked the heavier/later flinch, the client replayed it as a channel-0 cycle: the bind pose. Only channel 0 is a pose.

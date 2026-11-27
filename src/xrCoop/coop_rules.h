@@ -26,10 +26,10 @@ inline bool is_machine_info(const char* id)
 		return false;
 	const std::string_view s(id);
 
-	// force_slp2 / force_slp (G.A.M.M.A. actor_status_sleep / actor_status_thirst): given and taken away in one call
+	// force_slp2 / force_slp (a mod's actor status scripts): given and taken away in one call
 	// when a player is too tired or too thirsty; while one is held, actor_on_sleep gives no rest. As a world info a
 	// client's give went to the host and to everybody, its take-away went nowhere (the client did not hold it yet):
-	// the whole group kept it and a sleep lowered nobody's need for sleep (live, build 54).
+	// the whole group kept it and a sleep lowered nobody's need for sleep.
 	constexpr std::string_view kExact[] = {"ui_pda", "ui_pda_hide", "actor_is_sleeping", "sleep_active", "force_slp2", "force_slp"};
 	for (const std::string_view e : kExact)
 		if (s == e)
@@ -54,11 +54,11 @@ inline bool puppet_binder_runs(bool is_mutant, bool alive)
 	return is_mutant && !alive;
 }
 
-// R2 I2: a world message (host -> clients) that a client applies only in the Live phase. Before Live the client is in
+// A world message (host -> clients) that a client applies only in the Live phase. Before Live the client is in
 // its own world or loading the host's: such a message comes from the window between Welcome and JoinRequest, or from
 // a world it has left. It is dropped: what the host did before host_begin_join is in the save the client loads, what
 // it does after is queued for that client until WorldLoaded (P6). The join lifecycle (Welcome, WorldBlob,
-// SessionReset, ...), AvatarList (it may come before the proxies exist, F0 Task 8) and time are not world messages.
+// SessionReset, ...), AvatarList (it may come before the proxies exist) and time are not world messages.
 inline bool live_only(Msg type)
 {
 	switch (type)
@@ -89,10 +89,10 @@ inline bool live_only(Msg type)
 // change itself (a host command, entities::ClientApply) or runs the same story with its own reactions (an addon's
 // info callback while story::applying()). Such a reaction is dropped instead of being forwarded to the host: forwarded,
 // it would happen twice.
-// Ruling F2-12: the host runs those reactions on its own actor only. Nobody but this player touches the items this
+// The host runs those reactions on its own actor only. Nobody but this player touches the items this
 // player holds, so `own_item` — an existing item held by this player's actor (root), or one it gives away from its
 // inventory — still goes to the host from the story's reactions, which checks ownership as for any request. A new
-// object (a spawn, our inventory included) is never `own_item`: shared rewards are routed by the task layer (W3c).
+// object (a spawn, our inventory included) is never `own_item`: shared rewards are routed by the task layer.
 // A host command's own events are never requests, whatever they touch.
 enum class Echo : uint8_t
 {
@@ -105,6 +105,26 @@ inline Echo client_echo(bool story_applying, bool entities_applying, bool own_it
 	if (entities_applying)
 		return Echo::Drop;
 	return story_applying && !own_item ? Echo::Drop : Echo::Forward;
+}
+
+// When a player's avatar takes its player's PlayerEquip (coop_equip.cpp apply_equip), on every machine. The server keeps online
+// entities only (coop_mirror.h): ALife takes an entity offline or releases it through Perform_destroy, which takes the server
+// entity away at once and sends GE_DESTROY to the game object, which reads it on a later frame. Until then the object is found
+// and not destroying, but has no server entity: the avatar's GE_CHANGE_VISUAL would reach xrServer::Process_event with no
+// receiver, which the stock reads unchecked (an access violation). Such an avatar is not online here: its equip waits, as for
+// one not spawned yet, and the engine counts and logs the case.
+enum class AvatarEquip : uint8_t
+{
+	Apply, // the game object and its server entity are here
+	Wait, // no game object, or it is being destroyed
+	WaitNoEntity, // a game object whose server entity is not on this machine's server
+};
+
+inline AvatarEquip avatar_equip(bool object_found, bool destroying, bool server_entity)
+{
+	if (!object_found || destroying)
+		return AvatarEquip::Wait;
+	return server_entity ? AvatarEquip::Apply : AvatarEquip::WaitNoEntity;
 }
 } // namespace rules
 } // namespace coop

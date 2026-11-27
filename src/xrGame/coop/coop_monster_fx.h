@@ -1,13 +1,15 @@
-// Anomaly Coop — a monster's special ability against a remote player (audit A5, 2026-10-24: "A-Life must live around
-// every player"). The stock abilities (a giant's kick, a controller's psy tube, a burer's gravi ...) address the host's own
-// actor only: a client next to such a monster got plain hits at most. Here the host decides the ability for the monster's
-// enemy - a player's character - and the player's machine plays its effects on its own actor (camera and PP effectors,
+// Anomaly Coop — a monster's special ability against a remote player: A-Life lives around every player.
+// The stock abilities (a giant's kick, a controller's psy tube, a burer's gravi ...) address the host's own actor only;
+// a nearby client gets plain hits at most. Here the host decides the ability for the monster's enemy (a player's
+// character), and the player's machine plays its effects on its own actor (camera and PP effectors,
 // the slow-down, the damage: each machine hurts its own actor).
 //
 // Wire: MonsterEffect (host -> the targeted player) u16 monster (host numbering), u8 kind, u8 phase, f32 value. A flame
 // (kPolterFlame) goes to every client, with its vec3 position and vec3 direction after the value; so does what anybody near
-// can see of a monster (audit F11: kBurerTeleGlow, kGiantDust, kPhantomAppear; dust has a place too).
+// can see of a monster (kBurerTeleGlow, kGiantDust, kPhantomAppear; dust has a place too).
 #pragma once
+
+#include "xrCoop/coop_enemy_rules.h"
 
 class CObject;
 class CBaseMonster;
@@ -32,12 +34,12 @@ enum Kind : u8
 	kBloodsuckerVampire = 7, // a bloodsucker's grip: phase 0 grabs (view turned to it, HUD and weapon away), 1 lets go
 	kPsyDogAppear = 8, // a psy dog's phantom leaps out at the player: camera and post-process shake
 	kMeleeHit = 9, // a monster's blow landed (its damage comes as PlayerHit): value = its damage. Claw marks, stagger, shove
-	kPolterFlame = 10, // a fire poltergeist lit a flame (audit F5c): its particles and sound on every client
-	kBurerGraviPrepare = 11, // a burer gathers a wave on the player (audit F11): phase 1 starts the glow on his actor, 0 stops it
-	kBurerTeleGlow = 12, // a burer holds an object (audit F11): phase 1 lights it, 0 puts it out, value = its id (host numbering)
-	kGiantDust = 13, // a pseudogiant's stomp raises dust (audit F11)
-	kPhantomAppear = 14, // a psy dog's phantom shows itself (audit F11): its particles
-	kActorSeen = 15, // how close NPCs are to noticing the player (audit F11): value 0..1, for his stealth indicator; no monster
+	kPolterFlame = 10, // a fire poltergeist lit a flame: its particles and sound on every client
+	kBurerGraviPrepare = 11, // a burer gathers a wave on the player: phase 1 starts the glow on his actor, 0 stops it
+	kBurerTeleGlow = 12, // a burer holds an object: phase 1 lights it, 0 puts it out, value = its id (host numbering)
+	kGiantDust = 13, // a pseudogiant's stomp raises dust
+	kPhantomAppear = 14, // a psy dog's phantom shows itself: its particles
+	kActorSeen = 15, // how close NPCs are to noticing the player: value 0..1, for his stealth indicator; no monster
 	kKinds = 32,
 };
 
@@ -46,18 +48,20 @@ enum Kind : u8
 bool host_send(const CObject* target, const CObject* monster, u8 kind, u8 phase, float value);
 // Host: `monster`, a fire poltergeist, lit a flame at `at`, burning along `dir`: every client plays it on the puppet.
 void host_flame(const CObject* monster, const Fvector& at, const Fvector& dir);
-// Audit F11: host: what everybody near sees of `monster`, whoever it is after: every client plays `kind` on the puppet. A
+// Host: what everybody near sees of `monster`, whoever it is after: every client plays `kind` on the puppet. A
 // start and its stop must both arrive, so this one is reliable; _at is a picture of a moment with a place, as a flame.
 void host_shown(const CObject* monster, u8 kind, u8 phase = 0, float value = 0.f);
 void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fvector& dir);
-// Audit F11: host, from an NPC's vision: `observer` has `value` (0..1) of what it takes to notice `player`. The strongest
+// Host, from an NPC's vision: `observer` has `value` (0..1) of what it takes to notice `player`. The strongest
 // of these goes to a remote player's machine, for his stealth indicator.
 void host_seen(const CCustomMonster* observer, const CObject* player, float value);
+// A process that decides the world or leads the level takes host_seen. The vision loop can check once for all objects.
+bool host_wants_seen();
 
-// Audit F4 (2026-10-31): host: `monster` threw `object` with telekinesis. A player's proxy takes no collision damage (a
+// Host: `monster` threw `object` with telekinesis. A player's proxy takes no collision damage (a
 // puppet skips the movement update that applies it), so its flight is followed and a remote player it passes gets the
 // hit, as the monster's, once. `power`: the monster's own hit value; below zero, as hard as the object flies (burer).
-void host_throw(CPhysicsShellHolder* object, const CObject* monster, float power = -1.f);
+void host_throw(CPhysicsShellHolder* object, const CObject* monster, float power = enemy_rules::kThrowPowerBySpeed);
 
 // Host: a monster's grip on a remote player's character (a controller's tube, a bloodsucker's vampire). One at a time
 // per player, as the stock checks make it on the actor (the camera effector, the input handler). A hold whose

@@ -1,4 +1,4 @@
-// Anomaly Coop - a client catches up by itself: the host's roster of entities (parity audit 2026-10-31, D1, F1-F3, F5).
+// Anomaly Coop - a client catches up by itself: the host's roster of entities .
 //
 // A change of the world reaches a client once (EntitySpawn / Destroy / Switch / Parent / Died, ItemState). A client that
 // misses one (its world was not Up: world gate, Hold on a client drops; a death that waited too long for its object; an
@@ -27,8 +27,8 @@
 //   EntityResync  u8 bucket
 //   EntityTraits  u16 object, i32 community, i32 rank, i32 reputation
 //   EntitySquad   u16 squad, u16 n, n x u16 member
-// R32 W3 (at the end): what every copy does with a spawn of an id it has (spawn_of_known), when a squad from the wire is whole
-// (squad_whole), and the echo of a fact a map server reported (merged_echo, echo_reaches; tests/test_relay_echo.cpp). WP5 fix round:
+// At the end: what every copy does with a spawn of an id it has (spawn_of_known), when a squad from the wire is whole
+// (squad_whole), and the echo of a fact a map server reported (merged_echo, echo_reaches; tests/test_relay_echo.cpp):
 // a stale spawn never replaces the writer's own object (Known::Keep), a repeat's item state goes into an offline copy only
 // (repeat_takes_state), a stalled move asks Spawn only for what is missing (stalled_ask), a map server compares its world's digest
 // mapless (mapless), coop_squad_complete is raised where the squad's map is led (squad_complete_here).
@@ -42,7 +42,9 @@
 #include <map>
 #include <vector>
 
-#include "srv/coop_level_hash.h"
+#include "coop_ids.h"
+#include "coop_level_hash.h"
+#include "coop_hash.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -90,10 +92,7 @@ struct Row
 // A section as a kind: never 0 (a row without one).
 inline uint16_t kind_of(const char* section)
 {
-	uint32_t h = 2166136261u;
-	for (const char* c = section; c && *c; ++c)
-		h = (h ^ uint8_t(*c)) * 16777619u;
-	const uint16_t folded = uint16_t(h ^ (h >> 16));
+	const uint16_t folded = fold16(fnv1a32(section));
 	return folded ? folded : uint16_t(1);
 }
 
@@ -366,7 +365,7 @@ private:
 	uint64_t m_refused = 0;
 };
 
-// D3: an EntitySpawn that found its id taken here (a local object, our id generator). The id frees by itself in a moment
+// An EntitySpawn that found its id taken here (a local object, our id generator). The id frees by itself in a moment
 // (a bolt in flight, a lease given back): the entity is asked for again a few times; the roster takes it from there.
 constexpr uint32_t kRetryGapMs = 2000;
 constexpr uint32_t kRetryForMs = 20000;
@@ -410,7 +409,7 @@ private:
 	std::map<uint16_t, Entry> m_ids;
 };
 
-// F2: what a client's copy of an NPC should say about its community, rank and reputation.
+// What a client's copy of an NPC should say about its community, rank and reputation.
 inline uint32_t traits_digest(int32_t community, int32_t rank, int32_t reputation)
 {
 	const uint64_t a = xfer::mix64(uint64_t(uint32_t(community)) + 0x2545F4914F6CDD1Dull);
@@ -420,7 +419,7 @@ inline uint32_t traits_digest(int32_t community, int32_t rank, int32_t reputatio
 
 struct TraitsMsg
 {
-	uint16_t object = 0xFFFF;
+	uint16_t object = kNoId;
 	int32_t community = 0;
 	int32_t rank = 0;
 	int32_t reputation = 0;
@@ -443,7 +442,7 @@ inline bool read(Reader& r, TraitsMsg& m)
 	return r.ok();
 }
 
-// F5: the set of a squad's members (order-independent: a squad's list is a map here and there).
+// The set of a squad's members (order-independent: a squad's list is a map here and there).
 inline uint32_t members_digest(const std::vector<uint16_t>& members)
 {
 	uint64_t sum = 0x9E3779B97F4A7C15ull;
@@ -456,7 +455,7 @@ struct SquadMsg
 {
 	static constexpr size_t kMaxMembers = 256;
 
-	uint16_t squad = 0xFFFF;
+	uint16_t squad = kNoId;
 	std::vector<uint16_t> members;
 };
 
@@ -482,9 +481,9 @@ inline bool read(Reader& r, SquadMsg& m)
 	return r.ok();
 }
 
-// ---------------------------------------------------------------- R32 W3: the receive of every copy (design R32-final.md §1 W3)
+// ---------------------------------------------------------------- the receive of every copy
 
-// npc-cleanup F5: what a copy does with an EntitySpawn of an id it already has. The same kind is a repeat (P6: harmless, nothing
+// What a copy does with an EntitySpawn of an id it already has. The same kind is a repeat (harmless, nothing
 // changes); another kind is another object under that id now (the copy missed a release and the id was given again): the copy's
 // object goes and the writer's comes (Replace), at once, not a roster round later. Kind 0 is a player's character (kind_of never
 // gives 0): its section differs between the machines (a client's own actor, the proxies), it is never replaced.
@@ -505,7 +504,7 @@ inline Known spawn_of_known(uint16_t kind_here, uint16_t kind_spawn, bool writes
 	return writes_known ? Known::Keep : Known::Replace;
 }
 
-// W8.4 (verify-D finding 6): the item state of a repeated spawn (the initial-state tail) goes into the copy's entity, and the decider's
+// The item state of a repeated spawn (the initial-state tail) goes into the copy's entity, and the decider's
 // versions with it, only where both can be taken: this process does not write the object (`writes_it`: its own state stands) and has no
 // game object for it (`object_here`: the object's own state stands, and versions without their values would claim a write it has not
 // applied, so the decider's push of that write would be dropped as known).
@@ -514,7 +513,7 @@ inline bool repeat_takes_state(bool writes_it, bool object_here)
 	return !writes_it && !object_here;
 }
 
-// npc-alife F4: a squad from the wire lists its members by id, and they may come after it. It is whole when it lists somebody and
+// A squad from the wire lists its members by id, and they may come after it. It is whole when it lists somebody and
 // every listed id is here (`here(id)`). A copy that runs the world's logic (not a mirror) raises coop_squad_complete(squad) at the
 // spawn that makes it whole: the squad's own (its members came first) or its last missing member's. A repeated spawn changes
 // nothing, so it raises nothing.
@@ -529,13 +528,13 @@ inline bool squad_whole(const std::vector<uint16_t>& members, Here here)
 	return true;
 }
 
-// ---------------------------------------------------------------- R32 W3: the relay down (design R32-final.md §1 W3)
+// ---------------------------------------------------------------- the relay down
 
 // A fact a map server reported reaches every other copy once. The world applies it under the EchoOf of the reporting level
 // (levels::echo_now); what it records then (a holder change, a death, a release) keeps that level until the frame's flush sends it,
 // when the scope is over. That level's players and its map server have it already: the broadcast skips them (the players: the
-// passes_to of an EchoOf; the bridge: echo_reaches below, in the mode's delivery). kNoEcho = levels::wire::kNoLevel: no echo.
-constexpr uint16_t kNoEcho = 0xFFFF;
+// passes_to of an EchoOf; the bridge: echo_reaches below, in the mode's delivery).
+constexpr uint16_t kNoEcho = kNoLevel;
 
 // Two records of one object in a frame keep the level only when both came from it: a change of the world's own in between (or one
 // from another level) goes to everybody, the last state of the object is in the flush.
@@ -550,17 +549,17 @@ inline bool echo_reaches(uint16_t echo, uint16_t at)
 	return echo == kNoEcho || at != echo;
 }
 
-// ---------------------------------------------------------------- R32 WP5 fix round (the verify-D findings 2, 3, 4)
+// ---------------------------------------------------------------- repairs
 
-// D5 (coop_events.cpp client_step_parents): a holder change that did not finish in time asks for the item and for its holder.
-// An EntitySpawn answer is the object's whole subtree (W5.1: a player's character with all he carries), so Spawn is asked only for
+// A holder change (coop_events.cpp client_step_parents) that did not finish in time asks for the item and for its holder.
+// An EntitySpawn answer is the object's whole subtree (a player's character with all he carries), so Spawn is asked only for
 // an id this copy lacks (`here` false); in that case Gone lets the authority confirm the id was destroyed.
 inline uint8_t stalled_ask(bool here)
 {
 	return here ? uint8_t(Parent | State) : uint8_t(Spawn | Parent | State | Gone);
 }
 
-// W5.1 (finding 3): a row as a copy that leads a map of its own compares it with its world (a map server). What is online on its map is
+// A row as a copy that leads a map of its own compares it with its world (a map server). What is online on its map is
 // its own business: its world holds such an object offline (online_here is false there) and cannot say it. The online flag goes; a
 // player's character (kind 0) keeps the flag row_of gives it at both ends. The other half of the mapless row, an item state without the
 // uses only a game object shows, is the engine's (coop_entities.cpp mapless_row). The world sends its links the digest of mapless rows.
@@ -571,12 +570,23 @@ inline Row mapless(Row r)
 	return r;
 }
 
-// npc-alife F4 (finding 4): coop_squad_complete makes the srv Lua put a squad in its smart, a write to the smart. It is raised where the
+// coop_squad_complete makes the srv Lua put a squad in its smart, a write to the smart. It is raised where the
 // smart is written: by the process that leads the squad's map apart from its world (`leads_apart`: Mode::level() is a level side, a map
 // server), for a squad standing on that map (`squad_level` == `my_level`, both known; kNoEcho is no level).
 inline bool squad_complete_here(bool leads_apart, uint16_t squad_level, uint16_t my_level)
 {
 	return leads_apart && my_level != kNoEcho && squad_level == my_level;
+}
+
+// An ItemState that came to a deciding process over its link to its own host: a map server's, from its world (no other process both
+// decides and has that link). The world sends it one alone: its answer to the map server's repair of an item row (State, coop_roster.cpp
+// host_on_entity_request -> items::host_send_state), for an object the map server does not write (client_on_roster asks nothing of
+// what it writes). It is the writer's word: the map server's copy takes it as any mirror does (`mirror`, coop_items.cpp client_on_state).
+// It is no player's report: taken as one (host_on_state) it was refused "no character", peer 0 having no character there (stand
+// dev65b, dev66c). The object that has become the map server's own between the ask and the answer keeps its own state.
+inline bool link_state_mirrors(bool is_state, bool writes_here)
+{
+	return is_state && !writes_here;
 }
 } // namespace reconcile
 } // namespace coop

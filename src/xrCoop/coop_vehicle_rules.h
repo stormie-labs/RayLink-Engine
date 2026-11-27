@@ -1,5 +1,4 @@
-// Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop — vehicles for players (F5, build 57, docs/VEHICLES.md): the pure half.
+// Anomaly Coop — vehicles for players (docs/VEHICLES.md): the pure half.
 //
 // A player drives a car, rides in it and gets in and out through the process that decides for his level: the co-op host, or
 // in the Server mode the map server of his level (the world server only tunnels the messages, Scope::Map). These rules are
@@ -14,8 +13,8 @@
 //   - the verdicts enter / exit / switch_to on plain facts, the game rules first and the checks of the client's word
 //     (coop_trust, shipped in "log") last;
 //   - the input rules: sequence with wrap, press counters, stale input (every key released, the hand brake held), rate cap.
-// What the decider calls on the car for a held key is F5-VEH-2's (coop_vehicle_drive_rules.h); the key -> bit mapping of a
-// player's machine is F5-VEH-3's (coop_vehicle_input_rules.h); state quantization is F5-VEH-4's.
+// What the decider calls on the car for a held key is in coop_vehicle_drive_rules.h; the key -> bit mapping of a player's
+// machine in coop_vehicle_input_rules.h; the state quantization in coop_vehicle_state_rules.h.
 //
 // Pure C++17, header-only, no engine dependencies: used by the engine (xrGame/coop/coop_vehicles_*.cpp) and by the unit-test
 // exe (tests/test_vehicle_rules.cpp).
@@ -28,6 +27,7 @@
 #include <map>
 #include <vector>
 
+#include "coop_ids.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -36,13 +36,12 @@ namespace vehicles
 {
 // ---------------------------------------------------------------- ids and seats
 
-// No car / no character: the u16 object ids of the protocol (host numbering) never use 0xffff (ALife's invalid id).
-constexpr uint16_t kNoCar = 0xffff;
-constexpr uint16_t kNoCharacter = 0xffff;
+constexpr uint16_t kNoCar = kNoId;
+constexpr uint16_t kNoCharacter = kNoId;
 // Seat 0 is the driver's: the one place a stock car has (car_definition driver_place, Car.cpp attach_Actor).
 constexpr uint8_t kDriverSeat = 0;
 // Seats a car may have in the table. Stock cars have only the driver's place; the passenger places come from
-// configs/coop_vehicles.ltx (F5-VEH-5). 8 is a driver and seven passengers: more than any car body of GAMMA seats (not
+// configs/coop_vehicles.ltx. 8 is a driver and seven passengers: more than any stock car body seats (not
 // counted per model here), and it keeps a broken ltx line from making a car of 255 seats.
 constexpr uint8_t kMaxSeats = 8;
 // Not a seat (a lookup that found none). Never on the wire.
@@ -72,8 +71,8 @@ constexpr uint32_t kInputMinIntervalMs = 33;
 // arrive bunched; the burst covers ~400 ms of them after a hitch. Over it: trust check veh_input_rate.
 constexpr uint32_t kInputRatePerSec = 40;
 constexpr uint32_t kInputBurst = 12;
-// A request with no answer for this long: the player's machine says so on the HUD and forgets the request (F5-VEH-3; in
-// the Server mode the level's process may still be starting).
+// A request with no answer for this long: the player's machine says so on the HUD and forgets the request (in the
+// Server mode the level's process may still be starting).
 constexpr uint32_t kAnswerTimeoutMs = 3000;
 // An exit position farther than this from the origin is garbage: the levels of the game lie within a few km of theirs.
 constexpr float kMaxCoord = 100000.f;
@@ -111,7 +110,7 @@ enum class Refusal : uint8_t
 {
 	None = 0, // granted
 	NoCar = 1, // the id is not a car on this level (not online here, not a CCar)
-	Unsupported = 2, // a car the coop cannot drive for a client in build 57 (remote control, drone: CarDrone)
+	Unsupported = 2, // a car the coop cannot drive for a client (remote control, drone: CarDrone)
 	Destroyed = 3, // the car is dead or exploded (CPHDestroyable::Destroyed, b_exploded)
 	Dead = 4, // the asker is dead
 	Wounded = 5, // the asker is wounded (coop_survival)
@@ -148,7 +147,7 @@ enum class Edge : uint8_t
 {
 	Engine = 0, // kDETECTOR: SwitchEngine()
 	Lights = 1, // kTORCH: m_lights.SwitchHeadLights()
-	Horn = 2, // no stock key: reserved, the decider calls nothing in build 57
+	Horn = 2, // no stock key: reserved, the decider calls nothing
 };
 
 inline const char* refusal_name(Refusal r)
@@ -396,7 +395,7 @@ inline bool read(Reader& r, SeatMsg& out)
 // ---------------------------------------------------------------- VehicleInput (driver -> decider, Unreliable)
 
 // Held bits: the keys of CarInput.cpp OnKeyboardPress / OnKeyboardRelease the driver holds now. The decider turns a change
-// of a bit into the stock call of that key (F5-VEH-2, coop_vehicle_drive_rules.h).
+// of a bit into the stock call of that key (coop_vehicle_drive_rules.h).
 constexpr uint16_t kHeldForward = 1u << 0; // kFWD: PressForward / ReleaseForward
 constexpr uint16_t kHeldBack = 1u << 1; // kBACK: PressBack / ReleaseBack
 constexpr uint16_t kHeldLeft = 1u << 2; // kL_STRAFE: PressLeft / ReleaseLeft
@@ -536,7 +535,7 @@ constexpr uint8_t kStateFlagsAll = kStateEngine | kStateLights | kStateHandbrake
 
 // Wire: u16 car, u8 flags, u8 rpm, i8 gear, u8 health, u8 fuel, u8 damage. 8 bytes.
 // rpm: m_current_rpm of m_max_rpm, 0..255; gear: -1 reverse, 0 neutral, 1..kMaxGear; health: of 1.0, 0..255; fuel: of the
-// tank, 0..255; damage: 0..kMaxDamageStage. The quantization and the cadence are F5-VEH-4's (coop_vehicle_state_rules.h).
+// tank, 0..255; damage: 0..kMaxDamageStage. The quantization and the cadence: coop_vehicle_state_rules.h.
 struct StateMsg
 {
 	uint16_t car = kNoCar;
@@ -804,7 +803,7 @@ private:
 // The order of every verdict: the game rules first, the checks of the client's word (is_trust) last. A trust refusal ships
 // in "log" and is then granted, so it may only be reached when no rule refuses.
 
-// Facts of an enter request, read by the decider from its own objects (F5-VEH-2): the car, the asker's body, the table.
+// Facts of an enter request, read by the decider from its own objects: the car, the asker's body, the table.
 struct EnterFacts
 {
 	bool car_known = false; // the id is a CCar online on this level
@@ -924,7 +923,7 @@ enum class InputDrop : uint8_t
 };
 
 // What one input (or the stale tick) changes. The caller turns it into the stock calls in plan_drive's order
-// (coop_vehicle_drive_rules.h, F5-VEH-2): the releases of `before` -> `held`, then the engine and lights toggles, then the
+// (coop_vehicle_drive_rules.h): the releases of `before` -> `held`, then the engine and lights toggles, then the
 // presses, then the aim.
 struct InputStep
 {

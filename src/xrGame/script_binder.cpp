@@ -20,21 +20,18 @@
 #include <atomic> // Anomaly Coop
 #include <mutex> // Anomaly Coop
 
-// Anomaly Coop: xrCore's stack printer (xrDebugNew.cpp); xrDebug.h declares only a one-argument one that has no definition
-void LogStackTrace(LPCSTR header, bool printStack);
-
 // comment next string when commiting
 //#define DBG_DISABLE_SCRIPTS
 
 namespace
 {
-// Anomaly Coop (F2 T11): one call of a Lua method of the binder, unless the binder router says a client does not make it
+// Anomaly Coop: one call of a Lua method of the binder, unless the binder router says a client does not make it
 // (coop_router.h, [binder_host]).
 //   Done     - the method ran
 //   Skipped  - HostOnly: a client does not call it (the C++ default stands)
 //   Dropped  - the call threw: the caller clear()s the binder, as the stock engine does. In the Release build (no C++
 //              exceptions) this catches structured exceptions only, not Lua errors: those are fatal, and a binder that
-//              must survive them is wrapped in pcall by scripts\coop_client_binders.script (Ruling F2-35)
+//              must survive them is wrapped in pcall by scripts\coop_client_binders.script.
 enum class Call
 {
 	Done,
@@ -42,11 +39,9 @@ enum class Call
 	Dropped
 };
 
-// Anomaly Coop (2026-11-17, RL-K958-GVST): what the dropped call was. The stock engine swallows a native exception inside a
-// binder's Lua call and deletes the binder without a word. When it is the actor's, no actor_on_update runs any more: the
-// player sees a game that stopped working, and the log held nothing. The exception filter runs before the stack is
-// unwound, so the Lua stack and the C++ stack it prints are the place of the exception. It only looks: the call is
-// dropped as before. Nothing is printed for a stack overflow (there is no stack to print with).
+// coop: Log dropped binder calls before stack unwinding so the Lua and C++ traces identify the native exception.
+// The caller still clears the binder, which stops actor_on_update when the actor's binder fails.
+// A stack overflow leaves no stack space for diagnostics, so the filter skips logging it.
 int dropped_call(const char* binding, coop::router::BinderMethod method, const EXCEPTION_POINTERS* info)
 {
 	const EXCEPTION_RECORD* r = info ? info->ExceptionRecord : nullptr;
@@ -77,8 +72,6 @@ int dropped_call(const char* binding, coop::router::BinderMethod method, const E
 		Msg("!   %s", line.c_str());
 	if (n < 3)
 	{
-		static std::mutex s_stack_lock; // DbgHelp behind the stack walker is single-threaded
-		std::lock_guard<std::mutex> lock(s_stack_lock);
 		LogStackTrace("! [binder] C++ stack of that exception:", true);
 	}
 	return EXCEPTION_EXECUTE_HANDLER;
@@ -139,7 +132,7 @@ void CScriptBinder::reinit()
 #endif // DEBUG_MEMORY_MANAGER
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11)
+		// Anomaly Coop: the call goes through the binder router
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Reinit,
 				[&] { m_object->reinit(); }) == Call::Dropped)
 			clear();
@@ -180,7 +173,7 @@ void CScriptBinder::reload(LPCSTR section)
 
 	CGameObject* game_object = smart_cast<CGameObject*>(this);
 
-	m_script_binding = pSettings->r_string(section, "script_binding"); // Anomaly Coop: the key of the binder router (F2 T11)
+	m_script_binding = pSettings->r_string(section, "script_binding"); // Anomaly Coop: the key of the binder router
 
 	try
 	{
@@ -194,7 +187,7 @@ void CScriptBinder::reload(LPCSTR section)
 
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11)
+		// Anomaly Coop: the call goes through the binder router
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Reload,
 				[&] { m_object->reload(section); }) == Call::Dropped)
 			clear();
@@ -221,7 +214,7 @@ BOOL CScriptBinder::net_Spawn(CSE_Abstract* DC)
 	CSE_ALifeObject* object = smart_cast<CSE_ALifeObject*>(abstract);
 	if (object && m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped net_spawn answers what the binder
+		// Anomaly Coop: the call goes through the binder router; a skipped net_spawn answers what the binder
 		// object does without one: true
 		BOOL result = TRUE;
 		switch (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetSpawn,
@@ -256,7 +249,7 @@ void CScriptBinder::net_Destroy()
 #ifdef _DEBUG
 		Msg						("* Core object %s is UNbinded from the script object",smart_cast<CGameObject*>(this) ? *smart_cast<CGameObject*>(this)->cName() : "");
 #endif // _DEBUG
-		// Anomaly Coop: the call goes through the binder router (F2 T11)
+		// Anomaly Coop: the call goes through the binder router
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetDestroy,
 				[&] { m_object->net_Destroy(); }) == Call::Dropped)
 			clear();
@@ -287,7 +280,7 @@ void CScriptBinder::shedule_Update(u32 time_delta)
 	{
 		if (coop::remote::suspend_binder(this)) // Anomaly Coop: no Lua logic for puppets
 			return; // Anomaly Coop
-		// Anomaly Coop: host-only bindings do not update on a client (F2 T11)
+		// Anomaly Coop: host-only bindings do not update on a client
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Update,
 				[&] { m_object->shedule_Update(time_delta); }) == Call::Dropped)
 			clear();
@@ -299,7 +292,7 @@ void CScriptBinder::save(NET_Packet& output_packet)
 	PROF_EVENT("CScriptBinder::save");
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11)
+		// Anomaly Coop: the call goes through the binder router
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Save,
 				[&] { m_object->save(&output_packet); }) == Call::Dropped)
 			clear();
@@ -311,7 +304,7 @@ void CScriptBinder::load(IReader& input_packet)
 	PROF_EVENT("CScriptBinder::load");
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11)
+		// Anomaly Coop: the call goes through the binder router
 		if (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::Load,
 				[&] { m_object->load(&input_packet); }) == Call::Dropped)
 			clear();
@@ -322,7 +315,7 @@ BOOL CScriptBinder::net_SaveRelevant()
 {
 	if (m_object)
 	{
-		// Anomaly Coop: the call goes through the binder router (F2 T11); a skipped one answers false
+		// Anomaly Coop: the call goes through the binder router; a skipped one answers false
 		BOOL result = FALSE;
 		switch (call_routed(m_script_binding.c_str(), coop::router::BinderMethod::NetSaveRelevant,
 			[&] { result = (BOOL)m_object->net_SaveRelevant(); }))

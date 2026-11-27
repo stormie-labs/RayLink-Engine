@@ -1,4 +1,4 @@
-// Anomaly Coop — the pure part of the checkpoint sources on the host (F3 Task 7, CHECKPOINTS_DEATH.md §2.2): the
+// Anomaly Coop — the pure part of the checkpoint sources on the host (CHECKPOINTS_DEATH.md §2.2): the
 // settings of mod_system_coop_checkpoints.ltx and their bounds, the CheckpointClaim message, the nearest source a
 // player stands at, the objects mods declare as camps, the mark a tent carries in its custom data (whose it is and
 // the item it was made from), the item a tent is paid with, the sections behind the ids of sources and the book of
@@ -18,6 +18,7 @@
 
 #include "coop_checkpoint_rules.h"
 #include "coop_checkpoint_store.h"
+#include "coop_text.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -30,9 +31,6 @@ namespace checkpoint
 constexpr float kMaxSourceRadius = 500.0f;
 // A period of a source: 0..kMaxSourcePeriodMs (10 minutes).
 constexpr uint32_t kMaxSourcePeriodMs = 600000;
-// R1 M-11: a claim waits at least this long — the host's scan runs once a second and the stock tent animation takes
-// 4 s, so a shorter wait never finds the tent. F3a T7 R1: LEGACY with tent_claim_ms (no claim waits any more).
-constexpr uint32_t kMinClaimMs = 5000;
 // tent_sections keeps at most this many names; a name is 1..64 characters of [A-Za-z0-9_].
 constexpr size_t kMaxTentSections = 16;
 
@@ -42,14 +40,11 @@ struct SourceSettings
 	uint32_t campfire_dwell_ms = 5000; // stood by it this long, not in a fight
 	float combat_radius = 50.0f; // an enemy that picked the player this close is a fight
 	std::vector<std::string> tent_sections{"ph_tent", "ph_sleepbag"}; // the objects that are tents
-	// R1 (Ruling F3-6): what the host puts up for a client's claim, one of tent_sections each.
+	// What the host puts up for a client's claim, one of tent_sections each.
 	std::string tent_section = "ph_tent";
 	std::string sleepbag_section = "ph_sleepbag";
 	float tent_rest_radius = 2.0f; // the own tent this close is a rest place
 	float tent_claim_radius = 4.0f; // a claimed spot: this close to the player, the tent this close to the spot
-	// LEGACY (F3a T7 R1): the host's own claim waited this long for the tent the stock put up. Every player's tent is put
-	// up by the host at once now (coop_checkpoint_sources place_for): neither read from the ltx nor used.
-	uint32_t tent_claim_ms = 15000;
 	std::string cover_list = "misc\\surge_manager.ltx"; // its [list]: the stock surge covers (rest places too)
 	// R1 I-1: its [tent_i_bag_sections] and [sleeping_bag_sections] (the stock TentBagSections / SleepBagSections):
 	// the items a client pays for a tent / a sleeping bag with.
@@ -58,11 +53,6 @@ struct SourceSettings
 
 inline bool radius_ok(float r) { return std::isfinite(r) && r > 0.0f && r <= kMaxSourceRadius; }
 inline bool period_ok(double ms) { return std::isfinite(ms) && ms >= 0.0 && ms <= double(kMaxSourcePeriodMs); }
-// tent_claim_ms (LEGACY, see there): a whole number of ms in kMinClaimMs..kMaxSourcePeriodMs.
-inline bool claim_period_ok(double ms)
-{
-	return period_ok(ms) && ms >= double(kMinClaimMs) && ms == std::floor(ms);
-}
 
 // "ph_tent, ph_sleepbag" -> {"ph_tent", "ph_sleepbag"}: split at commas, blanks trimmed; an empty, overlong or
 // malformed name and a repeated one are skipped; at most `max_names` are kept, in order.
@@ -108,7 +98,7 @@ struct ModSource
 class ModSources
 {
 public:
-	// False for "no object" (0xffff), a radius that is not radius_ok, or a new id over kMaxModSources; a known id takes
+	// False for "no object" (kNoId), a radius that is not radius_ok, or a new id over kMaxModSources; a known id takes
 	// the new radius and section.
 	bool add(uint16_t id, float radius, const std::string& section);
 	bool remove(uint16_t id);
@@ -144,10 +134,10 @@ private:
 
 // ---------------------------------------------------------------- the mark of a tent (its custom data)
 
-// R1 I-2: whose a tent is and what it was made from lives on the tent itself, so it outlasts a load and a level change:
+// Whose a tent is and what it was made from lives on the tent itself, so it outlasts a load and a level change:
 // section [coop_tent] of its custom data, `owner` = the player key digest of the owner (ledger::character_key) or
-// kHostOwner, `item` = the item section the host took for it (given back when it is packed up; none on the host's own
-// tents the stock item_tent put up before F3a T7 - they give back the stock item of their kind).
+// kHostOwner, `item` = the item section the host took for it (given back when it is packed up; none on a tent the
+// stock item_tent put up - it gives back the stock item of its kind).
 constexpr const char* kTentIniSection = "coop_tent";
 constexpr const char* kTentIniOwner = "owner";
 constexpr const char* kTentIniItem = "item";
@@ -168,10 +158,10 @@ void tent_mark_to_ini(std::string& text, const TentMark& m);
 // The mark of a tent; false if it has no owner (or a malformed one). A malformed item reads as none.
 bool tent_mark_from_ini(const std::string& text, TentMark& out);
 
-// F3a T7 R1: may the player whose owner key is `key` pack up a tent whose owner (the book's, from its mark) is `owner`
+// May the player whose owner key is `key` pack up a tent whose owner (the book's, from its mark) is `owner`
 // (empty: nobody's)? His own tent, always. A tent nobody owns only the host player (kHostOwner): the stock put every
-// unmarked tent up for the host (in single player, or before a claim named it) - a client's tent always carries his mark
-// (Ruling F3-6). Another player's tent, never.
+// unmarked tent up for the host (in single player, or before a claim named it) - a client's tent always carries his mark.
+// Another player's tent, never.
 inline bool may_pack(const std::string& key, const std::string& owner)
 {
 	return owner_key_ok(key) && (owner == key || (owner.empty() && key == kHostOwner));
@@ -200,8 +190,7 @@ struct TentSeen
 };
 
 // What the host knows of the tents of a world: when each one appeared on the level and whose it is (by owner key: the
-// engine fills it from the tents' marks). F3a T7 R1: the claims that waited for a tent the stock put up (the host's own,
-// before F3a T7) are gone - the host puts every player's tent up at once.
+// engine fills it from the tents' marks). The host puts every player's tent up at once: no claim waits for a tent.
 class TentBook
 {
 public:
@@ -238,8 +227,6 @@ private:
 
 namespace detail
 {
-inline bool blank(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-
 // Squared distance in double: no overflow for coordinates within kMaxCoord; NaN stays NaN (every comparison fails).
 inline double dist2(const float a[3], const float b[3])
 {
@@ -271,13 +258,8 @@ inline std::vector<std::string> split_names(const std::string& list, size_t max_
 	while (out.size() < max_names)
 	{
 		const size_t comma = list.find(',', pos);
-		size_t b = pos;
-		size_t e = comma == std::string::npos ? list.size() : comma;
-		while (b < e && detail::blank(list[b]))
-			++b;
-		while (e > b && detail::blank(list[e - 1]))
-			--e;
-		const std::string name = list.substr(b, e - b);
+		const size_t e = comma == std::string::npos ? list.size() : comma;
+		const std::string name(ascii::trim(std::string_view(list).substr(pos, e - pos), ascii::space_or_eol));
 		// a section name has the alphabet of a level name: 1..64 characters of [A-Za-z0-9_]
 		if (level_ok(name) && std::find(out.begin(), out.end(), name) == out.end())
 			out.push_back(name);

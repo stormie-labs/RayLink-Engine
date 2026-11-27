@@ -1,4 +1,4 @@
-// Anomaly Coop - where a task's target is, for a client's frozen ALife (tasks audit C1): when the host sends a new place.
+// Anomaly Coop - where a task's target is, for a client's frozen ALife: when the host sends a new place.
 // Pure C++17, header-only, no engine dependencies: used by xrGame/coop/coop_story.cpp and by the unit-test exe
 // (tests/test_task_target.cpp).
 //
@@ -64,7 +64,7 @@ enum class Take : uint8_t
 	Online, // online here without a game object: the copy goes to the host's place; online it is in no graph registry
 };
 
-// Owner 2026-11-07 (GAMMA "General cleanup", the markers differ): a squad is online without a game object of its own
+// a squad is online without a game object of its own
 // (CSE_ALifeOnlineOfflineGroup::switch_online brings its members online, not itself). Its spot and the compass read the
 // squad's entity, and on a client nothing moves an online squad's entity: the commander's binder that copies his place
 // into it (sim_squad_scripted:update) is suspended there. A dominance task keeps its target squad online

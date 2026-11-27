@@ -5,9 +5,6 @@
 #include <atomic>
 #include <memory>
 
-#include <atomic>
-#include <memory>
-
 // refs
 class CInifile;
 struct xr_token;
@@ -97,11 +94,11 @@ public:
 
 private:
 	string_path m_file_name;
-	// Anomaly Coop 2026-11-13: the parsed data of a file is shared. Every CInifile had a copy of its own, and the cache of parsed
-	// files one more: with G.A.M.M.A. system.ltx (1.9 million items) was in memory four times, in pSettings, pSettingsAuth, an
-	// addon's ini_file("system.ltx") and the cache (the console's coop_ini_stats says who holds what). Now an object made from a
-	// file shares one read-only Root with the cache and with every other object of that file, and takes a copy of its own the first
-	// time it is written to (w_string, remove_line, the non-const sections()): what each object reads is what it read before.
+	// Anomaly Coop: the parsed data of a file is shared, so a large system.ltx is in memory once, not once in pSettings, once in
+	// pSettingsAuth, once per script's ini_file() and once in the cache (the console's coop_ini_stats says who holds what). An
+	// object made from a file shares one read-only Root with the cache and with every other object of that file, and takes a copy
+	// of its own the first time it is written to (w_string, remove_line, the non-const sections()): each object reads what a copy
+	// of its own would hold.
 	//   m_shared  the root shared with the cache; kept for the object's whole life, so a reference a caller took before the
 	//             object's first write stays valid
 	//   DATA      the object's own data: an object read from a reader, a file the cache does not hold, or one written to

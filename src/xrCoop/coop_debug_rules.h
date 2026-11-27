@@ -1,4 +1,4 @@
-// Anomaly Coop — the server's debug (docs/DEBUG_DESIGN.md §B, protocol 29): the pure half.
+// Anomaly Coop — the server's debug (docs/DEBUG_DESIGN.md §B): the pure half.
 //
 // Debug is a right of the server, as sv_cheats: the world server (the host's process, or the dedicated host) keeps it on or off, the
 // key -dbg of that process or its console (coop_debug on|off) switches it. Every player, the host player too, and every map server gets
@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "coop_protocol.h"
+#include "coop_text.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -266,8 +267,8 @@ inline uint8_t wanted_local(const StateMsg& m, PeerId self, bool has_player)
 
 // What a reset of this machine's state (sync::reset) takes off its actor of the flags it set (`applied`). The debug is the server's
 // and goes on through a world replaced inside the session (a trip, a rejoin, a save the host loaded): those keep them, and the
-// DebugState at the end of the join decides (apply_local). Only the session's end takes them. b57i creator10_server: every trip
-// took god off and the end of the join gave it back, 3.4-6.3 s after the client was live.
+// DebugState at the end of the join decides (apply_local). Only the session's end takes them: a trip must not take god off
+// until the end of its join gives it back.
 inline uint8_t flags_taken_at_reset(uint8_t applied, bool session_goes_on)
 {
 	return session_goes_on ? uint8_t(0) : uint8_t(applied & kLocalFlags);
@@ -291,7 +292,7 @@ enum class Cheat : uint8_t
 {
 	Run, // as the stock: out of a session, or not one of these
 	RefuseClient, // a process without the world server in a session (a client, a map server): the server's debug decides
-	ServerFlags, // the world server in a session: g_god / g_unlimitedammo go through the personal flags (F7, coop_dbg god)
+	ServerFlags, // the world server in a session: g_god / g_unlimitedammo go through the personal flags (coop_dbg god)
 };
 
 // What the key -dbg registers in the engine's console (console_commands.cpp, MASTER_GOLD); log_missing_ini is no cheat.
@@ -314,27 +315,8 @@ inline Cheat local_cheat(std::string_view cmd, bool in_session, bool world_serve
 
 namespace detail
 {
-inline bool blank(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-
-inline std::string_view trim(std::string_view s)
-{
-	while (!s.empty() && blank(s.front()))
-		s.remove_prefix(1);
-	while (!s.empty() && blank(s.back()))
-		s.remove_suffix(1);
-	return s;
-}
-
-inline bool ident_char(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
-
-inline std::string lower(std::string_view s)
-{
-	std::string out(s);
-	for (char& c : out)
-		if (c >= 'A' && c <= 'Z')
-			c = char(c - 'A' + 'a');
-	return out;
-}
+// Transitional: coop_debug.cpp still calls it; it goes when that file calls ascii::trim.
+inline std::string_view trim(std::string_view s) { return ascii::trim(s, ascii::space_or_eol); }
 } // namespace detail
 
 // coop_debug [on | off]: what its argument says.
@@ -348,7 +330,7 @@ enum class Switch : uint8_t
 
 inline Switch parse_switch(std::string_view arg)
 {
-	arg = detail::trim(arg);
+	arg = ascii::trim(arg, ascii::space_or_eol);
 	if (arg.empty())
 		return Switch::Status;
 	if (arg == "on" || arg == "1")
@@ -363,8 +345,8 @@ enum class Operator : uint8_t
 	Ok,
 	NoSession, // no co-op session
 	NotServer, // a process without the world server: a client, a map server
-	DebugOff, // coop_dbg while the debug is off (owner 2026-11-07: as sv_cheats)
-	ToServer, // plan 2026-11-12 §2.3: the operator of a world server (a client): the line goes to the server as an OperatorCommand
+	DebugOff, // coop_dbg while the debug is off
+	ToServer, // the operator of a world server (a client): the line goes to the server as an OperatorCommand
 	ServerConsoleOnly, // a command only the world server's own console runs (the Lua of `coop_dbg lua`): never over the network
 };
 
@@ -444,10 +426,10 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 	}
 	// the command: the first word
 	size_t i = 0;
-	while (i < line.size() && detail::blank(line[i]))
+	while (i < line.size() && ascii::space_or_eol(line[i]))
 		++i;
 	const size_t cmd_from = i;
-	while (i < line.size() && !detail::blank(line[i]))
+	while (i < line.size() && !ascii::space_or_eol(line[i]))
 		++i;
 	const std::string_view cmd = line.substr(cmd_from, i - cmd_from);
 	if (cmd.empty())
@@ -456,7 +438,7 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 		return false;
 	}
 	for (const char c : cmd)
-		if (!detail::ident_char(c))
+		if (!ascii::ident_char(c))
 		{
 			why = "a command is letters, digits and '_': '" + std::string(cmd) + "'";
 			return false;
@@ -466,8 +448,8 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 		why = "the command is longer than " + std::to_string(kMaxCommand);
 		return false;
 	}
-	out.cmd = detail::lower(cmd);
-	out.rest = std::string(detail::trim(line.substr(i)));
+	out.cmd = ascii::lowered(cmd);
+	out.rest = std::string(ascii::trim(line.substr(i), ascii::space_or_eol));
 	if (raw_command(out.cmd))
 		return true;
 
@@ -475,14 +457,14 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 	const size_t n = line.size();
 	while (i < n)
 	{
-		while (i < n && detail::blank(line[i]))
+		while (i < n && ascii::space_or_eol(line[i]))
 			++i;
 		if (i >= n)
 			break;
 		// a token: up to a blank outside quotes; quoted parts lose their quotes; quote_at: where the first quoted part begins in it
 		std::string text;
 		size_t quote_at = npos;
-		while (i < n && !detail::blank(line[i]))
+		while (i < n && !ascii::space_or_eol(line[i]))
 		{
 			if (line[i] != '"')
 			{
@@ -529,7 +511,7 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 		}
 		else if (eq != npos && (quote_at == npos || eq < quote_at))
 		{
-			const std::string key = detail::lower(text.substr(0, eq));
+			const std::string key = ascii::lowered(text.substr(0, eq));
 			std::string value = text.substr(eq + 1);
 			if (key.empty())
 			{
@@ -537,7 +519,7 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 				return false;
 			}
 			for (const char c : key)
-				if (!detail::ident_char(c))
+				if (!ascii::ident_char(c))
 				{
 					why = "a key is letters, digits and '_': '" + key + "'";
 					return false;
@@ -587,7 +569,7 @@ inline bool parse_console_line(std::string_view line, ConsoleLine& out, std::str
 	return true;
 }
 
-// ---------------------------------------------------------------- the AI and the monsters' blows (§B.9, A.2 p. 7; work package 4)
+// ---------------------------------------------------------------- the AI and the monsters' blows (§B.9)
 
 // Who a body the AI looks at, or a monster's blow lands on, is on this machine.
 enum class Body : uint8_t

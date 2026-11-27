@@ -1,4 +1,4 @@
-// Anomaly Coop — the operator of a world server (docs/plans/2026-11-12-split-levels-native.md §2).
+// Anomaly Coop — the operator of a world server.
 // The world server's own seat plays no character; the game of the world's creator on the same PC holds the host's rights
 // instead. The process that starts the server makes a one-time 128-bit token and gives it to the server on its command
 // line (-coop_operator <32 hex digits>) and to the creator's game, which presents it in Hello::token with role Player.
@@ -15,75 +15,25 @@
 #include <string>
 #include <vector>
 
+#include "../coop_text.h"
+#include "coop_token.h"
+
 namespace coop
 {
 namespace op
 {
-using Token = std::array<uint8_t, 16>; // the size of HelloMsg::token (kHelloTokenSize)
+using srv::Token;
+using srv::token_equal;
+using srv::token_none;
 using Key = std::array<uint8_t, 16>; // the same type as PlayerKey
 
 constexpr const char* kKey = "-coop_operator";
 // The longest console line an operator may send: the same as debug::kMaxConsoleLine (coop_debug_rules.h).
 constexpr size_t kMaxLine = 1024;
 
-// All zeros is no token: a player's Hello carries zeros, and a server started without the key has none.
-inline bool token_none(const uint8_t* t, size_t size = 16)
-{
-	uint8_t any = 0;
-	for (size_t i = 0; i < size; ++i)
-		any |= t[i];
-	return any == 0;
-}
-inline bool token_none(const Token& t) { return token_none(t.data(), t.size()); }
-
-// Constant time: how long the compare takes says nothing of how many bytes matched.
-inline bool token_equal(const uint8_t* a, const uint8_t* b, size_t size = 16)
-{
-	uint8_t diff = 0;
-	for (size_t i = 0; i < size; ++i)
-		diff |= uint8_t(a[i] ^ b[i]);
-	return diff == 0;
-}
-
-namespace detail
-{
-inline int hex_digit(char c)
-{
-	if (c >= '0' && c <= '9')
-		return c - '0';
-	if (c >= 'a' && c <= 'f')
-		return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F')
-		return c - 'A' + 10;
-	return -1;
-}
-} // namespace detail
-
-// Exactly 32 hex digits (either case), ending at a blank or at the end of the text; not all zeros. false leaves `out` alone.
-inline bool parse_token(const char* p, Token& out)
-{
-	if (!p)
-		return false;
-	Token t{};
-	for (size_t i = 0; i < t.size(); ++i)
-	{
-		const int hi = detail::hex_digit(p[i * 2]);
-		const int lo = hi < 0 ? -1 : detail::hex_digit(p[i * 2 + 1]);
-		if (lo < 0)
-			return false;
-		t[i] = uint8_t(hi << 4 | lo);
-	}
-	const char end = p[t.size() * 2];
-	if ((end && end != ' ' && end != '\t') || token_none(t))
-		return false;
-	out = t;
-	return true;
-}
-
 // The token of `-coop_operator <hex>` in a command line: the key as a whole word (not a prefix of a longer one), one or more
 // blanks, the token. false if the key is not there or its token is not valid, and if the key is there twice: the engine reads its
-// command line as raw text, quotes mean nothing to it, so a value that reads as the key (a save's name) must not choose the operator
-// (security review 2026-11-12).
+// command line as raw text, quotes mean nothing to it, so a value that reads as the key (a save's name) must not choose the operator.
 inline bool find_token(const char* cmdline, Token& out)
 {
 	if (!cmdline)
@@ -102,12 +52,12 @@ inline bool find_token(const char* cmdline, Token& out)
 		while (*value == ' ' || *value == '\t')
 			++value;
 	}
-	return value && parse_token(value, out);
+	return value && srv::parse_operator_token(value, out);
 }
 
 // Is `host` this PC, written as a literal 127.a.b.c? The creator's game presents its token only there. The text comes from an
 // invite, a console line or Lua and is resolved by name later: "127.0.0.1.evil.example" begins with "127." and is another
-// machine (security review 2026-11-12). Four decimal octets 0..255 with no leading zero, the first one 127, nothing else.
+// machine. Four decimal octets 0..255 with no leading zero, the first one 127, nothing else.
 inline bool loopback_literal(const char* host)
 {
 	if (!host)
@@ -155,7 +105,7 @@ inline std::string redact(const char* cmdline)
 			++end;
 		bool hex = end - from == 32;
 		for (size_t i = from; hex && i < end; ++i)
-			hex = detail::hex_digit(out[i]) >= 0;
+			hex = srv::hex_digit(out[i], true) >= 0;
 		if (hex)
 		{
 			out.replace(from, 32, "<hidden>");
@@ -186,7 +136,7 @@ inline std::string redact(const char* cmdline)
 	return out;
 }
 
-// What a player's Hello makes of him (plan §2.2 step 4). Only Operator gives the host's rights; every other verdict lets him
+// What a player's Hello makes of him. Only Operator gives the host's rights; every other verdict lets him
 // in as an ordinary player, and his answer (the Welcome) is the same for all of them: a remote client never learns whether a
 // token exists or matched.
 enum class Verdict : uint8_t
@@ -250,7 +200,7 @@ inline size_t count_words(const std::string& rest)
 }
 } // namespace detail
 
-// True if the operator may run `line` on the server (plan §2.3): one of
+// True if the operator may run `line` on the server: one of
 //   coop_kick <args>, coop_time [args], coop_restore [args], coop_autosave_now, coop_players, coop_status,
 //   coop_debug on|off, coop_dbg [args], /go, say <text>, coop_game_set <key> <value>.
 // Never quit, coop_world, coop_host or any other line of the engine's console. The line itself: 1..kMaxLine bytes, no control
@@ -280,18 +230,14 @@ inline bool allowed(const std::string& line)
 	{
 		// The debug command is an id of coop_debug_cmds.script: letters, digits, '_'. "lua" (its one command of class "operator",
 		// for the server's own console) never comes over the network, in any letter case: coop_debug_server lowercases the id.
-		// The server checks the class again when it runs the line (security review 2026-11-12).
+		// The server checks the class again when it runs the line.
 		if (words == 0)
 			return true;
 		const std::string id = rest.substr(0, rest.find(' '));
-		std::string lower;
-		for (char c : id)
-		{
-			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+		for (const char c : id)
+			if (!ascii::ident_char(c))
 				return false;
-			lower += (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
-		}
-		return lower != "lua";
+		return !ascii::iequals(id, "lua");
 	}
 	if (cmd == "coop_kick" || cmd == "say")
 		return words >= 1;
@@ -313,7 +259,7 @@ inline bool allowed(const std::string& line)
 }
 
 // What the server does with one Msg::OperatorCommand that passed the rate limit.
-// ---------------------------------------------------------------- what the server does with a command (security review 2026-11-12)
+// ---------------------------------------------------------------- what the server does with a command
 
 // coop_kick <id|nick>: which player it means. `rows`: the session's players only (the caller leaves out the map servers' bridges and a
 // seat that plays no character). An id that is a player's wins over a nick that reads as the same number; an id is written as decimal
@@ -345,15 +291,10 @@ inline int kick_pick(const std::vector<KickRow>& rows, const std::string& who)
 		for (size_t i = 0; i < rows.size(); ++i)
 			if (rows[i].id == id)
 				return int(i);
-	const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c; };
 	int found = kKickNobody;
 	for (size_t i = 0; i < rows.size(); ++i)
 	{
-		const std::string& nick = rows[i].nick;
-		bool same = nick.size() == who.size();
-		for (size_t k = 0; same && k < nick.size(); ++k)
-			same = lower(nick[k]) == lower(who[k]);
-		if (!same)
+		if (!ascii::iequals(rows[i].nick, who))
 			continue;
 		if (found != kKickNobody)
 			return kKickAmbiguous;
@@ -402,7 +343,7 @@ inline std::string answer_text(const std::vector<std::string>& lines, size_t cap
 
 enum class Command : uint8_t
 {
-	Run, // hand it to the console of the server (stage 3: dedicated::run_for)
+	Run, // hand it to the console of the server (dedicated::run_for)
 	NotOperator, // the sender holds no host's rights: refused, counted
 	TooLong, // over kMaxLine: refused, counted
 	NotAllowed, // not on the list: refused, counted

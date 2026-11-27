@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "coop_protocol.h"
@@ -246,6 +247,14 @@ public:
 	PeerId self() const; // host: 0; client: slot from Welcome, kInvalidPeer before
 	bool is_active() const; // host listening, or client joined
 	std::vector<PeerInfo> peers() const; // host: all clients; client: host + list from PeerList
+	// The peers of peers(), in its order, without the copy: f(const PeerInfo&) for each. f must not end the session or change who
+	// is joined (no kick, no disconnect): the walk reads the session's own table.
+	template <class F> void for_each_joined(F&& f) const
+	{
+		visit_joined([](void* fn, const PeerInfo& p) { (*static_cast<std::remove_reference_t<F>*>(fn))(p); },
+			const_cast<void*>(static_cast<const void*>(std::addressof(f))));
+	}
+	size_t joined_count() const; // peers().size() without the copy
 	const PeerInfo* peer(PeerId id) const; // one of peers(): the host player (local) is not one
 	// F3a T4. Host: the host player (peer 0, `local`, joined, the host's nick) while a LocalLink is attached, then every
 	// joined client. Client: the same as peers() (the host, who is a player, and the others). peers() stays the remote
@@ -337,7 +346,7 @@ public:
 	void set_world_epoch(uint32_t epoch);
 	uint32_t world_epoch() const;
 
-	// Level-change review (owner 2026-10-23): a game message is for a world, and the world is not always there (a level
+	// A game message is for a world, and the world is not always there (a level
 	// is built or torn down, a client is in the menu or loading). `gate` tells the world of this machine whenever a
 	// handler is due; with none every message runs (the library's tests, a session before the game sets it). The rule
 	// and the table are in coop_world_gate.h: a message whose handler needs a world waits (host) or is dropped (client)
@@ -365,7 +374,7 @@ public:
 
 	void send_chat(const std::string& text); // client -> host -> all; host -> all
 
-	// Protocol 31, a console line of a player for the host (docs/plans/2026-11-12-split-levels-native.md §2.3).
+	// A console line of a player for the host.
 	// Client: sends one console line to the host as Msg::OperatorCommand. false if this is not a joined client. It does not check
 	// the rights or the line: the host is the judge (Lua checks has_host_rights before, stage 3). The host's side is its part's
 	// (SessionPart::console_line); a host without one refuses every line.
@@ -386,6 +395,8 @@ public:
 	void reset_stats();
 
 private:
+	void visit_joined(void (*visit)(void* fn, const PeerInfo& p), void* fn) const;
+
 	struct Impl;
 	std::unique_ptr<Impl> m;
 };

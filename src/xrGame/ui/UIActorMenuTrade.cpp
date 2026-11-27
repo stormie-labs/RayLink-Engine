@@ -25,7 +25,7 @@
 #include "../UIGameSP.h"
 #include "UITalkWnd.h"
 #include "eatable_item.h"
-#include "../coop/coop_trade.h" // Anomaly Coop
+#include "../coop/coop_trade.h"
 
 // -------------------------------------------------
 
@@ -136,7 +136,7 @@ void CUIActorMenu::FilterActorTradeBagList(int mode)
 
 void CUIActorMenu::InitPartnerInventoryContents()
 {
-	if (coop::trade::deal_list_stale(m_pTradePartnerList, m_pPartnerInvOwner)) // Anomaly Coop: sold to another player
+	if (coop::trade::deal_list_stale(m_pTradePartnerList, m_pPartnerInvOwner)) // coop: sold to another player
 	{
 		m_pTradePartnerList->ClearAll(true);
 		UpdatePrices();
@@ -558,7 +558,7 @@ void CUIActorMenu::OnBtnPerformTradeBuy(CUIWindow* w, void* d)
 
 	int actor_money = (int)m_pActorInvOwner->get_money();
 	int partner_money = (int)m_pPartnerInvOwner->get_money();
-	actor_money += coop::trade::client_money_in_flight(); // Anomaly Coop: a sale still on the way pays for this (host checks)
+	actor_money += coop::trade::client_money_in_flight(); // coop: a sale still on the way pays for this (host checks)
 	int actor_price = 0; //(int)CalcItemsPrice( m_pTradeActorList,   m_partner_trade, true  );
 	int partner_price = (int)CalcItemsPrice(m_pTradePartnerList, m_partner_trade, false);
 
@@ -621,7 +621,7 @@ void CUIActorMenu::OnBtnPerformTradeSell(CUIWindow* w, void* d)
 
 	int actor_money = (int)m_pActorInvOwner->get_money();
 	int partner_money = (int)m_pPartnerInvOwner->get_money();
-	partner_money += coop::trade::client_trader_money_in_flight(m_pPartnerInvOwner); // Anomaly Coop: purchases on the way
+	partner_money += coop::trade::client_trader_money_in_flight(m_pPartnerInvOwner); // coop: purchases on the way
 	int actor_price = (int)CalcItemsPrice(m_pTradeActorList, m_partner_trade, true);
 	int partner_price = 0; //(int)CalcItemsPrice( m_pTradePartnerList, m_partner_trade, false );
 
@@ -678,7 +678,7 @@ void CUIActorMenu::OnBtnPerformTradeSell(CUIWindow* w, void* d)
 void CUIActorMenu::TransferItems(CUIDragDropListEx* pSellList, CUIDragDropListEx* pBuyList, CTrade* pTrade,
                                  bool bBuying)
 {
-	if (coop::trade::client_transfer(pSellList, pBuyList, pTrade, bBuying)) // Anomaly Coop: the host performs the deal
+	if (coop::trade::client_transfer(pSellList, pBuyList, pTrade, bBuying)) // coop: the host performs the deal
 		return;
 	while (pSellList->ItemsCount())
 	{
@@ -702,7 +702,7 @@ void CUIActorMenu::TransferItems(CUIDragDropListEx* pSellList, CUIDragDropListEx
 	}
 	pTrade->pThis.inv_owner->set_money(pTrade->pThis.inv_owner->get_money(), true);
 	pTrade->pPartner.inv_owner->set_money(pTrade->pPartner.inv_owner->get_money(), true);
-	coop::trade::on_local_trade_done(pTrade); // Anomaly Coop: clients learn the trader's money
+	coop::trade::on_local_trade_done(pTrade); // coop: clients learn the trader's money
 }
 
 //Alundaio: Donate current item while in trade menu
@@ -730,7 +730,7 @@ void CUIActorMenu::DonateCurrentItem(CUICellItem* cell_item)
 
 	CUICellItem* itm = invlist->RemoveItem(cell_item, false);
 
-	if (!coop::trade::client_donate(m_partner_trade, item)) // Anomaly Coop: on a client the host moves the item
+	if (!coop::trade::client_donate(m_partner_trade, item)) // coop: on a client the host moves the item
 		m_partner_trade->TransferItem(item, true, true);
 
 	m_pTradePartnerList->SetItem(itm);

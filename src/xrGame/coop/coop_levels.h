@@ -1,6 +1,6 @@
-// Anomaly Coop — split levels, "multilevel" (F3a, docs/SPLIT_LEVELS.md): the registry of who stands on which level.
+// Anomaly Coop — split levels, "multilevel" (docs/SPLIT_LEVELS.md): the registry of who stands on which level.
 //
-// Every player may be on another map (the server mode only: owner 2026-11-18, no hybrid). The world server holds the world, offline
+// Every player may be on another map (the server mode only). The world server holds the world, offline
 // for every map, and leads no level itself: every level with players is computed by a background map server on the world server's PC
 // (coop_mapserver.h): a client never computes anything, he mirrors the authority of his level. This module answers "which level is
 // this?" and "who is on it?" for the rest of the coop layer; the roles of a process (who may act as the world server, as the
@@ -12,9 +12,9 @@
 // with one level for everybody.
 //
 // Lua: coop.levels.split(), my_level(), level_of_player(peer), players_on(level), online_at_server(id), holder_of(id),
-// recall(squad[, ms]); coop.is_world_server(), is_map_authority(), is_player(), is_mirror() (the co-op host's process is the world
-// server, the authority of its map and a player; a client is a player and a mirror; a map server is the authority of its map).
-// Console: coop_max_map_servers, coop_mapserver_linger, coop_levels_status, coop_levels_audit.
+// recall(squad[, ms]); coop.is_world_server(), is_player(), is_mirror() (the co-op host's process is the world server and a player;
+// a client is a player and a mirror; a map server is the authority of its map).
+// Console: the server's (srv/coop_srv_console.cpp): srv_max_map_servers, srv_mapserver_linger, srv_levels_status, srv_levels_audit.
 #pragma once
 
 #include "xrCoop/srv/coop_levels_logic.h"
@@ -40,6 +40,12 @@ namespace levels
 // not repeated here.
 using LevelId = u16;
 
+namespace accept // xrCoop/srv/coop_levels_accept.h: the facts of a journal entry and the decision on a body report (host_take_body)
+{
+struct Facts;
+struct BodyDecision;
+} // namespace accept
+
 // Machine settings (console variables).
 // 0..7, default 6 (xrCoop/coop_levels_dynamic.h says why not 7): the most background map servers the host's PC may run (its ceiling);
 // the cap in force is host_map_cap
@@ -47,7 +53,7 @@ extern int g_coop_max_map_servers;
 // seconds the map emptied last stays after its last player left, default 600; every other empty map at most 60 s
 // (xrCoop/coop_levels_dynamic.h linger_of)
 extern int g_coop_mapserver_linger;
-// The two settings above are saved: the old defaults (3 servers, 60 s) of a machine that ran an earlier build move to build 50's, once.
+// Migrate the saved defaults in user.ltx once per machine to preserve subsequent player settings.
 void settle_machine_settings();
 
 // A client learns whether levels are split from the world's Welcome and answers false until then.
@@ -74,14 +80,16 @@ bool online_at_server(u16 id);
 // Host: the bridge of the map server that holds the object, or the squad it is a member of; kInvalidPeer when none does.
 PeerId holder_of(u16 id);
 // A map server: its holder authors the object (a unit granted to it or born under its slice, also while it is frozen for its
-// release): the writer rule's Hold of a unit here (R32 W1.2b). False anywhere else, and while its holder is of an earlier world (R32
-// fix A6). True also while it hands everything back: a unit on its way home is its until the world's Ack, as the world's keeper says
-// (W1.3; fix round 2 of package A). Any thread: it takes the transfers' lock.
+// release): the writer rule's Hold of a unit here. False anywhere else, and while its holder is of an earlier world. True also while it hands
+// everything back: a unit on its way home is its until the world's Ack, as the world's keeper says. Any thread: it takes the transfers' lock.
 bool xfer_authors(u16 local_id);
-// R32 fix A7: a map server made this unit (a squad, a living creature) and its Spawn waits in this frame's journal: the holder
+// A map server made this unit (a squad, a living creature) and its Spawn waits in this frame's journal: the holder
 // registers it at the flush (Holder::spawned -> SpawnPrepare), until then it is its own from birth all the same (writer::Hold::Born).
 // False anywhere else, once the holder has it (xfer_authors answers), and on the same terms as xfer_authors. Any thread.
 bool xfer_born(u16 local_id);
+// A map server: the id is of its own pool, its slice or a block its world gave it: an object under it was made here (writer::map_seat:
+// what it made at no map, a psy phantom, is its map's resident). False anywhere else. Any thread: it takes the transfers' lock.
+bool xfer_made_here(u16 local_id);
 // A map server: the world server recalls a squad (coop_npc_companions.script on_recall, the world server's word only): it goes offline
 // here now whoever stands by it, goes home, and is not asked for again for `ms` (a pin, kept short so that nothing stays offline for
 // good). `ms` 0 lifts the pin. False anywhere else, or for an object that is no creature or squad. Main thread or the game thread.
@@ -127,28 +135,43 @@ struct EchoOf
 	~EchoOf();
 
 private:
-	LevelId m_outer; // R32 W3: one inside another (the journal's receiver around host_apply_fact) gives the outer one back
+	LevelId m_outer; // one inside another (the journal's receiver around host_apply_fact) gives the outer one back
 };
-// The level an EchoOf names now, wire::kNoLevel outside one. Build 57 (S3): a spawn the world server sends later (its events go out
+// The level an EchoOf names now, wire::kNoLevel outside one. A spawn the world server sends later (its events go out
 // at its frame, coop_entities.cpp) keeps the EchoOf it was made under.
 LevelId echo_now();
+// Runs `f` under the EchoOf of `echo`; as it is when `echo` names no level (wire::kNoLevel).
+template <class F>
+void with_echo(LevelId echo, F&& f)
+{
+	if (echo == wire::kNoLevel)
+	{
+		f();
+		return;
+	}
+	const EchoOf scope(echo);
+	f();
+}
 // Host: a new world came up, every mark of the old one is gone with it.
 void host_world_replaced();
 // Host: the table goes out now: a player is on his way to a level, its map server takes him from the table.
 void host_send_map_now();
 
-// --- the gates (Lua: coop.levels.set_gate, gate_of)
+// --- the gates: a level's gate as the world server's LevelMap carries it (Gate::Free when it names none)
 Gate gate_of_level(LevelId level);
 
 // Module lifecycle, as every coop module (sync::install_server / install_client ...).
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void on_peer_left(PeerId id); // sync::on_peer_left
 void frame(); // main thread, every frame (sync::frame)
 void print_status(); // coop_status section (sync::print_status), console srv_levels_status (srv/coop_srv_console.cpp)
 // Fills coop.levels and the role functions of coop.*; called by script::register_raw once the `coop` table exists.
 void register_lua(lua_State* L);
+// coop.levels.my_level() and coop.my_level() -> my_level(), nil for wire::kNoLevel (the Core's scripts ask coop.my_level, without
+// the server's table coop.levels).
+int lua_my_level(lua_State* L);
 
 // --- coop_levels_xfer.cpp, the transfers (see there)
 void xfer_install_server(Session& s);
@@ -163,34 +186,35 @@ struct BodyFacts
 {
 	bool fight = false;
 	bool talking = false;
-	// Build 57 (protocol 33): the NPC he talks to there, the world server's numbering; 0xffff when he talks to nobody (Lua
+	// The NPC he talks to there, the world server's numbering; 0xffff when he talks to nobody (Lua
 	// coop.levels.talk_partner)
 	u16 partner = 0xffff;
 	u8 place = 0; // checkpoints::sources::Place
 	u16 source = 0xffff;
-	// Build 57 (owner 2026-11-18): the base whose ground he stands on, as the map server's geometry says, checked by the world
+	// The base whose ground he stands on, as the map server's geometry says, checked by the world
 	// server against its own tables when it came (checkpoints::sources::host_footing); kind none when nothing or refused.
 	checkpoint::base::Footing footing;
 };
 bool body_facts(u16 proxy, BodyFacts& out);
-// The world server, R32 A6: the keeper generation of a unit while the map server behind `bridge` holds it (0: it does not), and the
+// The world server: the keeper generation of a unit while the map server behind `bridge` holds it (0: it does not), and the
 // gen its SpawnPrepare registered the unit under when that server made it (0: it did not).
 u32 xfer_held_gen(u16 root, PeerId bridge, u32& spawn_gen);
-// The world server, R32 W9 (fix A1): may the map server behind `bridge` make an object under `id`? Of its slice, or of a block this
+// The world server: may the map server behind `bridge` make an object under `id`? Of its slice, or of a block this
 // world gave it for an IdAsk. The acceptance of its Spawn asks it.
 bool host_id_is_senders(PeerId bridge, u16 id);
-// The world server, R32 §8a A17: the map server behind `bridge` holds `squad`, and `member` left it there alive (its journal's Left,
+// The world server: the map server behind `bridge` holds `squad`, and `member` left it there alive (its journal's Left,
 // accept::leave_plan Adopt):
 // the member is held by that map server from now on, under the squad's gen, with `state` (the world's copy of it now). False: that
 // map server does not hold the squad, or the member is somebody else's (the Left then takes today's way home).
 bool host_adopt_member(PeerId bridge, u16 squad, u16 member, const std::vector<u8>& state);
-// The world server, R32 §8a A17: a creature the map server behind `bridge` held on its own joined a squad it writes (its journal's
+// The world server: a creature the map server behind `bridge` held on its own joined a squad it writes (its journal's
 // Joined): its own hold ends, its mark goes without bringing it home (it is a member of a squad held away now). No hold: nothing.
 void host_member_joined(PeerId bridge, u16 member);
-// The world server: a map server's report of a player's body (the State layout after its op: proxy, placement, LevelBodyFacts), taken
-// once the acceptance said its sender writes him (srv/coop_levels_alife.cpp host_apply_fact). False: refused here (a move it crossed,
-// a body that is not here); the log says why.
-bool host_take_body(PeerId from, LevelId level, Reader& r);
+// The world server: a map server's report of a player's body (the State layout after its op: proxy, placement, LevelBodyFacts) with
+// the acceptance's facts of its entry (srv/coop_levels_alife.cpp host_apply_fact). It reads the report, decides it by
+// accept::body_report and places his character when Taken; a Crossed or a Refused by the verdict on the body writes its own line
+// (a Refused by the acceptance is the caller's).
+accept::BodyDecision host_take_body(PeerId from, LevelId level, Reader& r, const accept::Facts& f);
 void xfer_print_status();
 void xfer_save(IWriter& out); // requirement 2: the journal of the transfers in flight, a chunk of the save (CALifeStorageManager::save)
 void xfer_load(IReader& in); // of the save being loaded; the world server takes it on its first frame in that world
@@ -205,7 +229,7 @@ void xfer_on_released(u16 local_id);
 // online squad is updated by its commander's binder as in the stock game; one that is held and offline has nobody else: the host left
 // it the moment it was marked. Without this update nothing says it may not come online (sim_squad_scripted:check_online_status).
 void xfer_scheduled();
-// A map server: what it holds, and everything of it goes back to the world server (plan §1.1: it stops only with nothing left).
+// A map server counts what it holds and hands it all back to the world server. It stops only when nothing remains.
 u32 xfer_held();
 void xfer_hand_back(u64 now);
 // What the binders of a level's static objects keep (xrCoop/coop_levels_logic.h).
@@ -215,8 +239,7 @@ bool logic_may_update(CGameObject* object);
 // A map server, the last thing of its hand-over: what changed since the last round goes to the world server, no binder runs after it.
 void logic_hand_over();
 bool logic_looking(); // Lua coop.levels.logic_look: the save a binder is asked for now is a look, not a save
-// The world server: `level` said what its objects keep at `at` or later, or gave a Done record of a numbered op then (R32 §8a
-// A22): a save of that moment does not have it, so the level's next map server is served a fresh save.
+// The world server: `level` said what its objects keep at `at` or later, or gave a Done record of a numbered op then: a save of that moment does not have it, so the level's next map server is served a fresh save.
 bool logic_came_since(LevelId level, u64 at);
 // A map server: what happened on its level (the engine's hooks of the host). No effect anywhere else, nor while it applies what the
 // world server told it.
@@ -251,7 +274,6 @@ void host_gone(u16 id); // its map server destroyed it
 void host_apply_parent(u16 item, u16 parent, const Fvector& pos);
 void host_apply_death(u16 victim, u16 killer, const std::vector<u8>& state);
 bool host_body_stays(u16 id); // host_apply_death of this object is running and its body stands on a map server
-void host_apply_release(u16 id, LevelId level);
 // Host: what the binder of a static object of `level` would save goes into its entity, as xrServer::Process_save would put it there. False:
 // it does not (the line in the log says why).
 bool host_apply_logic(u16 id, const std::vector<u8>& bytes, LevelId level);

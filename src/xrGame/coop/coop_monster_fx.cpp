@@ -56,7 +56,7 @@ struct Pending
 xr_vector<Pending> g_pending;
 bool g_playing = false;
 
-// Audit F4: an object a monster threw, followed until it hits a remote player or its flight ends.
+// An object a monster threw, followed until it hits a remote player or its flight ends.
 struct Throw
 {
 	u16 object, monster;
@@ -69,7 +69,7 @@ xrCriticalSection g_thrown_lock; // AI think, which throws, may run on the game 
 xr_vector<Throw> g_thrown; // under the lock, frame() takes them
 xr_vector<Throw> g_flights;
 
-// Audit F11: the strongest NPC about to notice each remote player, since the last look.
+// The strongest NPC about to notice each remote player, since the last look.
 constexpr u16 kSeenSource = 0xfffe; // the key of the host's word in the actor's table of who notices it: no object has it
 xrCriticalSection g_seen_lock; // vision runs in AI think, frame() takes them
 float g_seen_top[kMaxPeerSlots] = {};
@@ -363,7 +363,7 @@ bool flight_over(Throw& t, u32 now)
 	return false;
 }
 
-// Audit F11: twice a second at most, what the NPCs of the last moment make of each remote player.
+// Twice a second at most, what the NPCs of the last moment make of each remote player.
 void host_seen_frame(bool world_up)
 {
 	const u32 now = Device.dwTimeGlobal;
@@ -534,9 +534,11 @@ void host_shown_at(const CObject* monster, u8 kind, const Fvector& at, const Fve
 	++g_sent;
 }
 
+bool host_wants_seen() { return mode().decides_world() || mode().leads_level(); }
+
 void host_seen(const CCustomMonster* observer, const CObject* player, float value)
 {
-	if (!(mode().decides_world() || mode().leads_level()) || !npc_ai::is_remote_player(player))
+	if (!host_wants_seen() || !npc_ai::is_remote_player(player))
 		return;
 	const CEntityAlive* body = smart_cast<const CEntityAlive*>(player);
 	const PeerId peer = world::avatar_peer(player->ID());

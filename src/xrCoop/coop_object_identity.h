@@ -1,5 +1,5 @@
-// Anomaly Coop - one id, one object (live RL-UGYE-3WGE 2026-11-09, a client at X-16: FATAL "Beer from the creator of
-// 'AMMO_S'" in xrServer::Process_update, object 52480, 3 bytes read where the game object wrote 1).
+// Anomaly Coop - one id, one object (without it: FATAL "Beer from the creator of ..." in xrServer::Process_update, more
+// bytes read than the game object wrote).
 // A client's level writes the update of every local game object under its id (CObjectList::net_Export) and its own
 // server reads it with the entity that has that id now (xrServer::Process_update). A game object that outlived its
 // entity (a stale spawn, an orphan) writes in the format of ITS class: once the id belongs to another entity (the host
@@ -36,8 +36,10 @@ enum class Spawn : uint8_t
 
 // mirror: join::world_is_mirror(); entity_here: the level's server has an entity under the spawn's id;
 // same_section: its section is the spawn's; live_same_kind: the level has a game object of the spawn's section under the
-// id, not being destroyed. A live object of ANOTHER section under the id does not hold the new one back: it is a stale
-// object that outlived its entity; the new one registers under the id and the stale one falls silent (export_verdict).
+// id, not being destroyed. A live object of ANOTHER section under the id is no Duplicate: it is a stale object that
+// outlived its entity, and it falls silent (export_verdict). Make is not the last word: the stock CGameObject::net_Spawn
+// refuses a spawn while ANY object holds the id (the stale one, or one that GE_DESTROY marked in this frame), after
+// half-making the new one; coop_spawn_wait_rules.h holds such a spawn back until the id is free.
 inline Spawn spawn_verdict(bool mirror, bool entity_here, bool same_section, bool live_same_kind)
 {
 	if (!mirror)

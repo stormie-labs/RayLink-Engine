@@ -1,8 +1,8 @@
-// Anomaly Coop — the host's own autosaves (F3, docs/CHECKPOINTS_DEATH.md §7): players have no save menu; the host
+// Anomaly Coop — the host's own autosaves (docs/CHECKPOINTS_DEATH.md §7): players have no save menu; the host
 // writes coop_auto_N on a level change, after the shared sleep, every 10 minutes and at the end of the session, keeping
 // the newest 10. Slot names, rotation and the timer: xrCoop/coop_autosave_rules.h.
 //
-// How a save is written (F3 Task 12): the world goes out as the same M_SAVE_GAME the join flow sends, to the temporary
+// How a save is written: the world goes out as the same M_SAVE_GAME the join flow sends, to the temporary
 // name coop_auto_tmp (.scop from the engine, .scoc from Anomaly's Lua), and only a finished pair is moved to
 // coop_auto_N. The move is one change for the pair: the slot's old pair is put aside, the new one moved in, the old one
 // deleted; a failure puts it all back, so a slot holds the old pair or the new one, never one file of each. A crash in
@@ -12,7 +12,7 @@
 // CALifeUpdateManager::change_level itself, to the same temporary name, and moved by level_change_commit().
 // After a save the oldest slot files beyond coop_autosave_count are deleted (slots_to_prune).
 //
-// One ring per game (menu Task 1): set_game(id) puts the ring in the namespace of a game, coop_auto_<id>_<N>; the ring, the
+// One ring per game: set_game(id) puts the ring in the namespace of a game, coop_auto_<id>_<N>; the ring, the
 // choice of the next slot, the pruning and the Restore list see that game's slots only. No game = the old shared
 // coop_auto_<N>, which are never touched while a game is set. coop_auto_tmp / coop_auto_bak stay shared.
 //
@@ -23,7 +23,6 @@
 //                                  accepted; false = not a valid id (logged), the old shared ring is used. Idempotent, safe at
 //                                  any time (before a level exists, in a session, from a save callback).
 //   game() -> string               the game that is set ("" = none).
-//   slot_name(index[, id]) -> string | nil   "coop_auto_<id>_<index>" (id defaults to the game that is set).
 //   parse_slot(stem[, id]) -> number | nil   the slot number of a file name without extension in that ring, else nil.
 #pragma once
 
@@ -40,13 +39,13 @@ class Endpoint;
 
 namespace autosave
 {
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session started / ended (sync::on_session_started, sync::reset)
 void frame(); // main thread, every frame (sync::frame)
 void print_status(); // coop_status section (sync::print_status)
 void register_console(); // from coop::register_console_commands
-// Fills coop.autosave (suspend); called by coop_checkpoints_script_registrator once the `coop` table exists.
+// Fills coop.autosave; called by script::register_raw once the `coop` table exists.
 void register_lua(lua_State* L);
 
 // The game whose ring the host's autosaves use ("" = the old shared one; Lua: coop.autosave.set_game). Returns false when
@@ -89,7 +88,7 @@ const char* level_change_commit();
 // A world server's own level change outside a session (its ghost goes to the service level while the world is made): the name the
 // world is written to and the new level loads from, nullptr in any other process. The server's savedgames are its creator's own
 // (xrCoop/coop_world_server_rules.h rewrite_saves): the stock "<user> - autosave" would replace the player's own autosave there, and
-// with a mod that names saves after the character it stayed in his load menu as "server - autosave" (live 2026-11-13). The
+// with a mod that names saves after the character it stayed in his load menu as "server - autosave". The
 // autosaves' temporary name is nobody's save: every list hides it and the next autosave clears it.
 const char* world_server_level_change_name();
 

@@ -58,9 +58,9 @@
 #include "../../agent_member_manager.h"
 #include "../../location_manager.h"
 #include "smart_cover_animation_selector.h"
-#include "../../coop/coop_remote.h" // Anomaly Coop
-#include "../../coop/coop_ai.h" // Anomaly Coop
-#include "../../coop/coop_join.h" // Anomaly Coop
+#include "../../coop/coop_remote.h"
+#include "../../coop/coop_ai.h"
+#include "../../coop/coop_join.h"
 #include "smart_cover_animation_planner.h"
 #include "smart_cover_planner_target_selector.h"
 #include "../../../xrEngine/CameraBase.h"
@@ -606,7 +606,7 @@ void CAI_Stalker::reload(LPCSTR section)
 
 void CAI_Stalker::Die(CObject* who)
 {
-	coop::remote::on_puppet_die(this); // Anomaly Coop: a puppet's hands are emptied before its ragdoll is built
+	coop::remote::on_puppet_die(this); // coop: a puppet's hands are emptied before its ragdoll is built
 
 	movement().on_death();
 
@@ -832,7 +832,7 @@ BOOL CAI_Stalker::net_Spawn(CSE_Abstract* DC)
 
 void CAI_Stalker::net_Destroy()
 {
-	// Anomaly Coop: a mirror's level goes down with a puppet ahead of the torch it wears (apply_creature_flags), and
+	// coop: a mirror's level goes down with a puppet ahead of the torch it wears (apply_creature_flags), and
 	// CAttachmentOwner::net_Destroy asserts on what is still attached. The visual is needed here, so before inherited.
 	if (coop::join::world_is_mirror())
 		while (!attached_objects().empty())
@@ -1026,7 +1026,7 @@ void CAI_Stalker::UpdateCL()
 	START_PROFILE("stalker")
 		START_PROFILE("stalker/client_update")
 			VERIFY2(PPhysicsShell()||getEnabled(), *cName());
-			const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
+			const bool coop_remote = coop::remote::is_remote_creature(this); // coop: puppet
 
 			if (g_Alive())
 			{
@@ -1068,21 +1068,23 @@ void CAI_Stalker::UpdateCL()
 
 			if (g_Alive())
 			{
-				if (!coop_remote) // Anomaly Coop: puppets do not look around
-				START_PROFILE("stalker/client_update/sight_manager")
-					VERIFY(!m_pPhysicsShell);
-					try
-					{
-						sight().update();
-					}
-					catch (...)
-					{
-						sight().setup(CSightAction(SightManager::eSightTypeCurrentDirection));
-						sight().update();
-					}
+				if (!coop_remote) // coop: a copy of another machine's stalker does not look around
+				{
+					START_PROFILE("stalker/client_update/sight_manager")
+						VERIFY(!m_pPhysicsShell);
+						try
+						{
+							sight().update();
+						}
+						catch (...)
+						{
+							sight().setup(CSightAction(SightManager::eSightTypeCurrentDirection));
+							sight().update();
+						}
 
-					Exec_Look(client_update_fdelta());
-				STOP_PROFILE
+						Exec_Look(client_update_fdelta());
+					STOP_PROFILE
+				}
 
 				START_PROFILE("stalker/client_update/step_manager")
 					CStepManager::update(false);
@@ -1123,7 +1125,7 @@ void CAI_Stalker::shedule_Update(u32 DT)
 	START_PROFILE("stalker")
 		START_PROFILE("stalker/schedule_update")
 			VERIFY2(getEnabled()||PPhysicsShell(), *cName());
-			const bool coop_remote = coop::remote::is_remote_creature(this); // Anomaly Coop: puppet
+			const bool coop_remote = coop::remote::is_remote_creature(this); // coop: puppet
 
 			if (!CObjectHandler::planner().initialized())
 			{
@@ -1146,7 +1148,7 @@ void CAI_Stalker::shedule_Update(u32 DT)
 
             CScriptEntity::process_sound_callbacks();
 
-			if (g_Alive() && !coop_remote) // Anomaly Coop: puppets do not perceive or decide
+			if (g_Alive() && !coop_remote) // coop: puppets do not perceive or decide
 			{
 				animation().play_delayed_callbacks();
 
@@ -1155,6 +1157,7 @@ void CAI_Stalker::shedule_Update(u32 DT)
 				auto luaObject = lua_game_object();
 				if (luaObject && distance < NPCsLookAtActorMinDistance && ai().script_engine().functor("_G.CNPCBeforeLookAtActor", funct))
 				{
+					PROF_EVENT("lua/_G.CNPCBeforeLookAtActor");
 					LookAtActorLuaResult = funct(luaObject, distance);
 				}
 
@@ -1181,8 +1184,8 @@ void CAI_Stalker::shedule_Update(u32 DT)
 
 				STOP_PROFILE
 			}
-			else if (g_Alive()) // Anomaly Coop: a puppet NPC still turns its head to this machine's player
-				LookAtActorLuaResult = coop::npc_ai::puppet_may_look_at_actor(this, NPCsLookAtActorMinDistance); // Anomaly Coop
+			else if (g_Alive()) // coop: a puppet NPC still turns its head to this machine's player
+				LookAtActorLuaResult = coop::npc_ai::puppet_may_look_at_actor(this, NPCsLookAtActorMinDistance);
 
 			START_PROFILE("stalker/schedule_update/inherited")
 				inherited::inherited::shedule_Update(DT);
@@ -1537,7 +1540,7 @@ void CAI_Stalker::aim_target(Fvector& result, const CGameObject* object)
 BOOL CAI_Stalker::AlwaysTheCrow()
 {
 	VERIFY(character_physics_support ());
-	return (character_physics_support()->interactive_motion() || inherited::AlwaysTheCrow()); // Anomaly Coop: near a player's character
+	return (character_physics_support()->interactive_motion() || inherited::AlwaysTheCrow()); // coop: near a player's character
 }
 
 smart_cover::cover const* CAI_Stalker::get_current_smart_cover()
@@ -1661,9 +1664,9 @@ void CAI_Stalker::LookAtActor(CBoneInstance* headBone) {
 		return LookAtActorSoftReset(headBone);
 
 	// soft reset if can't see actor
-	if (coop::remote::is_remote_creature(this)) // Anomaly Coop: a puppet has no visual memory, LookAtActorLuaResult carries its line of sight
+	if (coop::remote::is_remote_creature(this)) // coop: a puppet has no visual memory, LookAtActorLuaResult carries its line of sight
 	{
-		if (coop::npc_ai::is_player(this)) // Anomaly Coop: a player character's head follows its player
+		if (coop::npc_ai::is_player(this)) // coop: a player character's head follows its player
 			return LookAtActorSoftReset(headBone);
 	}
 	else if (!memory().visual().visible_right_now(Actor()))

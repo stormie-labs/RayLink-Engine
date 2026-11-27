@@ -1,10 +1,11 @@
-// Anomaly Coop - TZ R32 W8.4: the initial state of an item rides its create (coop_initial_state.h).
+// Anomaly Coop - the initial state of an item rides its create (coop_initial_state.h).
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_initial_state.h"
 #include "coop_items.h"
-#include "coop_writer.h" // R32 W1: writing::writes (this process writes the item)
-#include "coop_entities.h" // R32 §8a A21 E-2: entities::host_own_spawn_unsent (this process's own create, its spawn not sent yet)
+#include "coop_lua.h" // lua_api::fill
+#include "coop_writer.h" // writing::writes (this process writes the item)
+#include "coop_entities.h" // entities::host_own_spawn_unsent (this process's own create, its spawn not sent yet)
 
 #include "ai_space.h"
 #include "Level.h"
@@ -199,7 +200,7 @@ bool set_initial(u16 id, const initial::State& s, const char*& why)
 		return false;
 	}
 	CInventoryItem* const item = object_of(id);
-	// The writer sets it (R32 W1); so does the creator of this frame's create in a process that does not write the item, while its spawn
+	// The writer sets it; so does the creator of this frame's create in a process that does not write the item, while its spawn
 	// has not left (§8a A21 E-2: the world server's reward copy for a player on a map a map server leads): into the entity, and the
 	// EntitySpawn tail (write_initial) carries it to the writer, whose read_initial applies it (coop_initial_rules.h set_path).
 	const initial::SetPath path = initial::set_path(writing::writes(id), item != nullptr, entities::host_own_spawn_unsent(id));
@@ -210,7 +211,7 @@ bool set_initial(u16 id, const initial::State& s, const char*& why)
 	}
 	if (path == initial::SetPath::Object)
 	{
-		// The game object is the item: the setter's path, a deliberate write of the decider (W8.1).
+		// The game object is the item: the setter's path, a deliberate write of the decider.
 		if (s.has_uses)
 		{
 			CEatableItem* eat = item->cast_eatable_item();
@@ -257,26 +258,11 @@ bool set_initial(u16 id, const initial::State& s, const char*& why)
 
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_pushstring(L, "items");
-	lua_rawget(L, -2);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		lua_newtable(L);
-		lua_pushstring(L, "items");
-		lua_pushvalue(L, -2);
-		lua_rawset(L, -4); // coop.items = {}
-	}
-	lua_pushcfunction(L, &l_set_initial);
-	lua_setfield(L, -2, "set_initial");
-	lua_pop(L, 2);
+	static const luaL_Reg fns[] = {
+		{"set_initial", &l_set_initial},
+		{nullptr, nullptr},
+	};
+	lua_api::fill(L, "items", fns); // coop_script logs a missing coop
 }
 } // namespace items
 } // namespace coop

@@ -19,13 +19,13 @@
 #include "UI/UIGameTutorial.h"
 #include "ui/UIPdaWnd.h"
 #include "../xrNetServer/NET_AuthCheck.h"
-#include "coop/coop_events.h" // Anomaly Coop
-#include "coop/coop_join.h" // Anomaly Coop: world_is_mirror (RL-UGYE-3WGE)
-#include "coop/coop_manager.h" // Anomaly Coop
-#include "coop/coop_autosave.h" // Anomaly Coop
-#include "coop/coop_game_settings.h" // Anomaly Coop
-#include "UICursor.h" // Anomaly Coop
-#include "xrCoop/coop_ui_rules.h" // Anomaly Coop
+#include "coop/coop_events.h"
+#include "coop/coop_join.h" // coop: world_is_mirror
+#include "coop/coop_manager.h"
+#include "coop/coop_autosave.h"
+#include "coop/coop_game_settings.h"
+#include "UICursor.h"
+#include "xrCoop/coop_ui_rules.h"
 
 #include "../xrphysics/physicscommon.h"
 extern ENGINE_API bool g_dedicated_server;
@@ -125,17 +125,17 @@ extern CUISequencer* g_tutorial2;
 void CLevel::net_Stop()
 {
 	Msg("- Disconnect");
-	coop::on_blocking_work(); // Anomaly Coop: tearing the level down blocks the frame, keep the session link alive
-	coop::autosave::host_on_level_exit(); // Anomaly Coop: the host's last world save, while the level and ALife still run
-	coop::game::on_level_exit(); // Anomaly Coop: machine console values back
+	coop::on_blocking_work(); // coop: tearing the level down blocks the frame, keep the session link alive
+	coop::autosave::host_on_level_exit(); // coop: the host's last world save, while the level and ALife still run
+	coop::game::on_level_exit(); // coop: machine console values back
 
 	if (CurrentGameUI())
 	{
 		CurrentGameUI()->HideShownDialogs();
 		CurrentGameUI()->GetPdaMenu().Reset();
 	}
-	// Anomaly Coop: a PDA or a script's window open at the go dies with the level without closing, and its cursor stayed over
-	// the next level, a free system cursor with it (live 2026-10-31; a group moves whatever a player has open)
+	// coop: a PDA or a script's window open at the go dies with the level without closing, and its cursor would stay over
+	// the next level, a free system cursor with it (a group moves whatever a player has open)
 	if (!coop::ui_rules::cursor_outlives_level(MainMenu()->IsActive()))
 		GetUICursor().Hide();
 
@@ -186,28 +186,6 @@ void CLevel::net_Stop()
 }
 
 
-// Anomaly Coop (RL-UGYE-3WGE): CObjectList::net_Export on a co-op client, where an object that does not speak for its id
-// (another object is the level's one for it, or the entity there is of another kind) writes no update: its server would
-// read the chunk in the entity's format (xrServer::Process_update, "Beer from the creator").
-static u32 coop_client_net_Export(CObjectList& objects, NET_Packet& Packet, u32 start, u32 max_object_size)
-{
-	u32 position;
-	for (; start < objects.o_count(); start++)
-	{
-		CObject* P = objects.o_get_by_iterator(start);
-		if (P->net_Relevant() && !P->getDestroy() && coop::events::client_export_allowed(P))
-		{
-			Packet.w_u16(u16(P->ID()));
-			Packet.w_chunk_open8(position);
-			P->net_Export(Packet);
-			Packet.w_chunk_close8(position);
-			if (max_object_size >= (NET_PacketSizeLimit - Packet.w_tell()))
-				break;
-		}
-	}
-	return start + 1;
-}
-
 void CLevel::ClientSend()
 {
 	if (GameID() != eGameIDSingle && OnClient())
@@ -256,8 +234,11 @@ void CLevel::ClientSend()
 	while (1)
 	{
 		P.w_begin(M_UPDATE);
-		start = coop::join::world_is_mirror() ? coop_client_net_Export(Objects, P, start, max_objects_size) // Anomaly Coop
-		                                      : Objects.net_Export(&P, start, max_objects_size);
+		// coop: on a mirror an object that does not speak for its id (another object is the level's one for it, or the
+		// entity there is of another kind) writes no update: its server would read the chunk in the entity's format
+		// (xrServer::Process_update)
+		start = Objects.net_Export(&P, start, max_objects_size,
+		    coop::join::world_is_mirror() ? &coop::events::client_export_allowed : nullptr);
 
 		if (P.B.count > 2)
 		{
@@ -327,7 +308,7 @@ extern BOOL g_SV_Disable_Auth_Check;
 void CLevel::Send(NET_Packet& P, u32 dwFlags, u32 dwTimeout)
 {
 	if (IsDemoPlayStarted() || IsDemoPlayFinished()) return;
-	if (coop::events::client_filter(P)) return; // Anomaly Coop: on a client world changes go through the host
+	if (coop::events::client_filter(P)) return; // coop: on a client world changes go through the host
 	// optimize the case when server located in our memory
 	if (psNET_direct_connect)
 	{
@@ -565,11 +546,10 @@ void CLevel::OnConnectResult(NET_Packet* P)
 void CLevel::ClearAllObjects()
 {
 	u32 CLObjNum = Level().Objects.o_count();
-	Msg("[coop] ClearAllObjects: %u object(s), no server here", CLObjNum); // a live check sees that this path ran
 
 	bool ParentFound = true;
 
-	// Anomaly Coop: the lock holds the queue alone. ProcessGameEvents takes it itself and an SRW lock is no recursive one: a client that lost
+	// coop: the lock holds the queue alone. ProcessGameEvents takes it itself and an SRW lock is no recursive one: a client that lost
 	// its session while its world loaded stood here for good. And a rejection may not arrive (a coop event filter): the passes end.
 	u32 passes = 0;
 	while (ParentFound && passes++ < 32)
@@ -604,7 +584,7 @@ void CLevel::ClearAllObjects()
 
 	CLObjNum = Level().Objects.o_count();
 
-	const bool gave_up = ParentFound; // Anomaly Coop
+	const bool gave_up = ParentFound; // coop: the passes above gave up with parents left: no fatal then
 	for (u32 i = 0; i < CLObjNum; i++)
 	{
 		CObject* pObj = Level().Objects.o_get_by_iterator(i);

@@ -58,8 +58,6 @@ class Endpoint;
 
 namespace death
 {
-constexpr u16 kNoSeq = 0xffff; // no death seq (the owner's seq counter skips it)
-
 void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
 void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
 void reset(); // session started / ended (sync::on_session_started, sync::reset)

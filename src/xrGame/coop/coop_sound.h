@@ -1,19 +1,19 @@
-// Anomaly Coop — creature sounds across machines (W5 C2).
+// Anomaly Coop — creature sounds across machines.
 //
-// NPC voices and sounds (C2.4). On a client every NPC and monster is a puppet: it does not think, so the AI voice
+// NPC voices and sounds. On a client every NPC and monster is a puppet: it does not think, so the AI voice
 // lines, Lua sound themes and monster growls that the host plays on it never happen there. The host records the
 // sounds its creatures play and sends each client the ones within that client's hearing range:
 //   - CSoundPlayer::play (stalker AI voices, Lua npc:play_sound themes, monster sounds): follows the bone, keeps
 //     the synchro mask so a newer line of the same creature cuts an older one, as on the host;
 //   - CScriptSound play / play_at_pos / play_no_feedback on a creature (Lua sound_object): played once where it
 //     started (3D only, never 2D or looped sounds);
-//   - the abilities that play a ref_sound of their own (audit M2: a burer's wave, telekinesis, a giant's threat and stomp),
+//   - the abilities that play a ref_sound of their own (a burer's wave, telekinesis, a giant's threat and stomp),
 //     from one line at each site: played once where they started.
 // Player characters (the host's actor, client proxies, avatars) are never relayed. On a client, CSoundPlayer::play
 // on a host-driven creature is muted (the host is authoritative for creature sounds, no doubles from local paths
 // such as Die() or Lua relays); avatars keep their own sounds.
 // Wire: Msg::EntitySound, host -> one client: u8 count, count x NpcSound (xrCoop/coop_protocol.h). Lane::Unreliable, a long
-// line and a creature's last sound Lane::Reliable while a small bucket per client holds (audit M5, xrCoop/coop_relay_rules.h).
+// line and a creature's last sound Lane::Reliable while a small bucket per client holds (xrCoop/coop_relay_rules.h).
 // Stops: when the authority's CSoundPlayer drops a creature's sounds by mask (npc_sound:stop = set_sound_mask(-1), a scheme's
 // remove_active_sounds, a death cry), a stop entry (NpcSound::Stop) goes to every client of the process on Lane::Reliable,
 // sent after the starts recorded before it and before those after it; the client releases that creature's relayed sounds
@@ -23,7 +23,7 @@
 // 300 m) from the client's character, one entry per object+file within 150 ms; on a client at most 48 relayed
 // sounds play at once, 4 per creature.
 //
-// Footsteps (C2.2). Creatures driven from the network keep the engine's own footsteps (CStepManager follows the
+// Footsteps. Creatures driven from the network keep the engine's own footsteps (CStepManager follows the
 // motions they play; avatars play the owner's exact motions). For stalker puppets and avatars the ground under the
 // feet is picked by a ray (their physics capsule is placed, not simulated, so the engine's "last material" is
 // stale). Steps, jumps and landings of other players' characters raise Lua
@@ -50,8 +50,8 @@ namespace coop
 {
 namespace sound
 {
-void install_server(Session& s); // F3a T4: the world server's handlers (on the hosting session)
-void install_client(Endpoint& e); // F3a T4: the client's (a remote client's session, the host player's LocalLink)
+void install_server(Session& s); // the world server's handlers (on the hosting session)
+void install_client(Endpoint& e); // the client's (a remote client's session, the host player's LocalLink)
 void reset();
 void frame();
 void print_status();

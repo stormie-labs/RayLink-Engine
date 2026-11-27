@@ -1,4 +1,4 @@
-// Anomaly Coop - a task's audience: who sees a task in a split-levels world (docs/plans/2026-11-16-task-audience.md, B.1).
+// Anomaly Coop - a task's audience: who sees a task in a split-levels world.
 // Pure C++17, header-only, no engine dependencies: used by xrGame/coop/coop_story.cpp and by the unit-test exe
 // (tests/test_task_audience.cpp).
 //
@@ -22,11 +22,13 @@
 #include <utility>
 #include <vector>
 
+#include "coop_ids.h"
+
 namespace coop
 {
 namespace task_audience
 {
-constexpr uint16_t kNoCharacter = 0xffff; // no character (kNoId): never a member
+constexpr uint16_t kNoCharacter = kNoId; // never a member
 constexpr size_t kMaxMembers = 64; // per task
 constexpr size_t kMaxIdLength = 256; // a task id, as coop.story_local_task takes it (story::set_local_task)
 constexpr size_t kMaxEntries = 4096; // a broken script must not fill the memory

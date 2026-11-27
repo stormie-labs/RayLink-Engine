@@ -27,8 +27,8 @@
 #include "client_spawn_manager.h"
 #include "memory_manager.h"
 #include "ai/monsters/basemonster/base_monster.h"
-#include "coop/coop_ai.h" // Anomaly Coop
-#include "coop/coop_monster_fx.h" // Anomaly Coop
+#include "coop/coop_ai.h"
+#include "coop/coop_monster_fx.h"
 
 float g_ai_vision_speed_boost = 1.0f;
 
@@ -325,8 +325,8 @@ float CVisualMemoryManager::object_luminocity(const CGameObject* game_object) co
 	if (!smart_cast<CEntityAlive const*>(game_object)) //Alundaio
 		return (1.f);
 	float luminocity;
-	if (!coop::npc_ai::player_luminocity(game_object, luminocity) && // Anomaly Coop: a remote player's render light is stale off the host's screen
-	    !coop::npc_ai::creature_luminocity(game_object, luminocity)) // audit A3: so is any creature's near a far player
+	if (!coop::npc_ai::player_luminocity(game_object, luminocity) && // coop: a remote player's render light is stale off the host's screen
+	    !coop::npc_ai::creature_luminocity(game_object, luminocity)) // coop: so is any creature's near a far player
 		luminocity = const_cast<CGameObject*>(game_object)->ROS()->get_luminocity();
 	float power = log(luminocity > .001f ? luminocity : .001f) * current_state().m_luminocity_factor;
 	return (exp(power));
@@ -368,9 +368,12 @@ float CVisualMemoryManager::get_visible_value(const CGameObject* game_object, fl
 	//Alundaio: hijack not_yet_visible_object to lua
 	::luabind::functor<float> funct;
 	if (ai().script_engine().functor("visual_memory_manager.get_visible_value", funct))
+	{
+		PROF_EVENT("lua/visual_memory_manager.get_visible_value");
 		return (funct(m_object ? m_object->lua_game_object() : 0, game_object ? game_object->lua_game_object() : 0,
-		              time_delta, current_state().m_time_quant, luminocity, current_state().m_velocity_factor,
-		              object_velocity, distance, object_distance, always_visible_distance)) * g_ai_vision_speed_boost * m_vision_speed;
+			              time_delta, current_state().m_time_quant, luminocity, current_state().m_velocity_factor,
+			              object_velocity, distance, object_distance, always_visible_distance)) * g_ai_vision_speed_boost * m_vision_speed;
+	}
 	//-Alundaio
 
 	return (
@@ -483,9 +486,9 @@ bool CVisualMemoryManager::should_ignore_object(CObject const* object) const
 		return true;
 	}
 
-	if (coop::npc_ai::ghost(object)) // Anomaly Coop: a map server's actor is nobody
+	if (coop::npc_ai::ghost(object)) // coop: a map server's actor is nobody
 		return true;
-	if (coop::npc_ai::debug_unseen(object)) // Anomaly Coop (protocol 29): the server's debug, invisible to the AI (ai_ignore_actor per player)
+	if (coop::npc_ai::debug_unseen(object)) // coop: the server's debug, invisible to the AI (ai_ignore_actor per player)
 		return true;
 
 #ifndef MASTER_GOLD
@@ -819,8 +822,8 @@ void CVisualMemoryManager::update(float time_delta)
 				SetActorVisibility(m_object->ID(), 0.f);
 		}
 
-		// Anomaly Coop (audit F11): the same for a remote player, whose machine has no vision to ask: the host tells it
-		if (m_object)
+		// coop: the same for a remote player, whose machine has no vision to ask: the host tells it
+		if (m_object && coop::monster_fx::host_wants_seen())
 			for (const CNotYetVisibleObject& seen : m_not_yet_visible_objects)
 				coop::monster_fx::host_seen(m_object, seen.m_object,
 				                            clampr(seen.m_value / visibility_threshold(), 0.f, 1.f));
@@ -969,8 +972,7 @@ void CVisualMemoryManager::load(IReader& packet)
 			delayed_object.m_object_id,
 			m_object->ID());
 		if (!spawn_callback || !spawn_callback->m_object_callback)
-			if (!g_dedicated_server || g_coop_headless)
-				Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
+			Level().client_spawn_manager().add(delayed_object.m_object_id, m_object->ID(), callback);
 #ifdef DEBUG
 		else {
 			if (spawn_callback && spawn_callback->m_object_callback) {

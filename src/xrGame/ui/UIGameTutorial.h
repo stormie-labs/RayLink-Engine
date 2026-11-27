@@ -23,7 +23,7 @@ protected:
 public:
 	IInputReceiver* m_pStoredInputReceiver;
 	CUISequencer();
-	static void PreloadXml(); // Anomaly Coop: a load with no "press any key" reads the file at the same point (GamePersistent)
+	static void PreloadXml(); // coop: a load with no "press any key" reads the file at the same point (GamePersistent)
 	void Start(LPCSTR tutor_name);
 	void Stop();
 	void Next();

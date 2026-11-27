@@ -1,12 +1,11 @@
 // Anomaly Coop — a client's character arriving on a new level: where it stands, how healthy it is, and the journal of the
-// transition window (live report 2026-11-07: a G.A.M.M.A. client walked through a level changer with the group, lost
-// health and broke a leg).
+// transition window (a client that walks through a level changer with the group must not lose health or break a leg).
 //
 // Where. The host puts each moving client's character beside the level changer's point (coop_join.cpp host_place_movers,
 // 1.5 m around it) and a late one beside the host (bring_proxy_to_level) at the height of that point: the host still stands
 // on the old level and has no ground of the new one. Single player puts the actor on the designer's point itself. On a
-// slope, at a wall or at a cliff the point beside it is in the air (a fall: GAMMA's Body Health System gives a fall to a
-// leg) or under the ground (the actor's feet in the hill: he drops through the level). The host marks such a character
+// slope, at a wall or at a cliff the point beside it is in the air (a fall: a mod's body health
+// script gives a fall to a leg) or under the ground (the actor's feet in the hill: he drops through the level). The host marks such a character
 // (`placed = 1` in the [coop] block of its custom data, mark_placed); the client, once its new level graph is loaded
 // (alife_storage_manager.cpp, after the objects are registered), puts its actor on the ground with place(): its own point
 // when the AI map has ground under it within [-kMaxDrop, +kMaxRise], else the first of the host's ring around the level
@@ -14,8 +13,8 @@
 //
 // Health. The role swap gave the client's actor the health of its NPC proxy on the host (an unharmable stalker, 1.0) and
 // only after the client went live coop_equip.cpp client_restore_vitals set the player's own health: a drop of up to 0.95
-// in one frame, which every script that watches the health (GAMMA's Body Health System: a hit on a random body part, 5
-// points break a leg) takes for damage. The actor now spawns with the health of the player's last report (spawn_health).
+// in one frame, which every script that watches the health (a mod's body health script: a hit on a random body part
+// that may break a leg) takes for damage. The actor now spawns with the health of the player's last report (spawn_health).
 //
 // Journal. One line per player per transition (rate-limited by the caller): the vitals before leaving and kWindowMs after
 // arriving, and where the health went in between: hits (what, how much, by whom, which bone; dropped ones counted), co-op
@@ -37,7 +36,7 @@ namespace coop
 {
 namespace arrival
 {
-constexpr float kLift = 0.2f; // above the AI map's plane: a drop of 0.2 m (2 m/s), far below GAMMA's crash speed of 15 m/s
+constexpr float kLift = 0.2f; // above the AI map's plane: a drop of 0.2 m (2 m/s), far below a fall that hurts
 constexpr float kMaxRise = 1.5f; // ground this much above the point still counts (the point is inside the slope)
 constexpr float kMaxDrop = 3.f; // ... and this much below it (the point is above the slope); further: another floor or a cliff
 constexpr float kRing = 1.5f; // the host's ring around the level changer's point (coop_join.cpp host_place_movers)
@@ -169,7 +168,7 @@ inline float spawn_health(const char* proxy_ini, float proxy_health)
 	return std::fmin(std::fmax(v[0], kMinSpawnHealth), 1.f);
 }
 
-// --- wounds (live 2026-11-07, round 2)
+// --- wounds
 
 constexpr float kWoundMax = 10.f; // CWound::AddHit clamps a wound's size there (Wound.cpp WOUND_MAX)
 

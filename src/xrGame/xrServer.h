@@ -194,7 +194,7 @@ public:
 		return (m_tID_Generator.tfGetID(ID));
 	}
 
-	// Anomaly Coop (R32 W9, xrCoop/coop_calls.h no_id): may a create start here (a script create before its stock code, a new entity of a
+	// Anomaly Coop (xrCoop/coop_writer_gate.h no_id; the setting is coop/coop_router.h writer_gate()): may a create start here (a script create before its stock code, a new entity of a
 	// spawn packet)? False only on a map server whose own pool has no id left under coop_writer_gate = enforce: the caller refuses it
 	// with the stock "nothing" (nil to Lua, NULL from Process_spawn). Under log it is logged and goes on. The empty pool asks the world
 	// for a block at once (Mode::own_free_id). True everywhere else.

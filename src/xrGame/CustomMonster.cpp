@@ -36,7 +36,7 @@
 #include "PHMovementControl.h"
 #include "profiler.h"
 #include "date_time.h"
-#include "../xrEngine/sheduler_viewers.h" // Anomaly Coop
+#include "../xrEngine/sheduler_viewers.h"
 #include "characterphysicssupport.h"
 #include "ai/monsters/snork/snork.h"
 #include "ai/monsters/burer/burer.h"
@@ -47,7 +47,7 @@
 #include "client_spawn_manager.h"
 #include "moving_object.h"
 #include "level_path_manager.h"
-#include "coop/coop_remote.h" // Anomaly Coop
+#include "coop/coop_remote.h"
 
 // Lain: added
 #include "../xrEngine/IGame_Level.h"
@@ -125,8 +125,7 @@ CCustomMonster::~CCustomMonster()
 	if(!g_dedicated_server)
 		Level().client_spawn_manager().dump	(ID());
 #endif // DEBUG
-	if (!g_dedicated_server || g_coop_headless)
-		Level().client_spawn_manager().clear(ID());
+	Level().client_spawn_manager().clear(ID());
 }
 
 void CCustomMonster::Load(LPCSTR section)
@@ -338,7 +337,7 @@ void CCustomMonster::shedule_Update(u32 DT)
     CScriptEntity::process_sound_callbacks();
 
 	// *** general stuff
-	if (g_Alive() && !coop::remote::is_remote_creature(this)) // Anomaly Coop: puppets do not perceive
+	if (g_Alive() && !coop::remote::is_remote_creature(this)) // coop: puppets do not perceive
 	{
 		Exec_Visibility();
 		memory().update(dt);
@@ -412,7 +411,7 @@ void CCustomMonster::shedule_Update(u32 DT)
 	}
 }
 
-// Anomaly Coop. Movement is integrated in UpdateCL, with a step of at most 100 ms (client_update_fdelta), and UpdateCL runs
+// coop: movement is integrated in UpdateCL, with a step of at most 100 ms (client_update_fdelta), and UpdateCL runs
 // every frame only for crows. An NPC that is not one walks 100 ms per scheduler step (625 ms far from the camera): 1/6 of its
 // speed. The host's camera is not where the players are, so an NPC next to a client has to be a crow too. The same goes for
 // the client's own character on the host (a stalker, driven in UpdateCL): without it, it moved in jumps.
@@ -475,12 +474,12 @@ void CCustomMonster::UpdateCL()
 			STOP_PROFILE
 		}
 
-		if (coop::remote::update_cl(this)) // Anomaly Coop: puppet, placed and animated from snapshots
+		if (coop::remote::update_cl(this)) // coop: puppet, placed and animated from snapshots
 		{
-			if (g_Alive()) // Anomaly Coop
-				eye_pp_s0(); // Anomaly Coop
-			update_animation_movement_controller(); // Anomaly Coop
-			return; // Anomaly Coop
+			if (g_Alive())
+				eye_pp_s0();
+			update_animation_movement_controller();
+			return;
 		}
 
 		START_PROFILE("CustomMonster/client_update/network extrapolation")

@@ -15,6 +15,8 @@
 #include "coop_script.h"
 #include "coop_alife.h"
 #include "xrCoop/coop_checkpoint_source_rules.h"
+#include "xrCoop/coop_ids.h"
+#include "xrCoop/coop_lua_errors.h" // lua_errors::line_allowed
 #include "xrCoop/coop_checkpoint_base_rules.h" // Build 57: the checkpoint at the bed of a base
 #include "xrCoop/coop_ledger.h" // ledger::character_key: the owner key of a tent (R1 I-2, Ruling F2-18)
 
@@ -64,7 +66,6 @@ using checkpoint::Kind;
 using checkpoint::Refusal;
 using checkpoint::kNoSource;
 
-constexpr u16 kNoId = 0xffff;
 constexpr const char* kSection = "coop_checkpoints";
 constexpr const char* kRestZonesSection = "coop_rest_zones";
 constexpr const char* kBasesSection = "coop_bases"; // Build 57 (owner 2026-11-18): the bases whose bed is the checkpoint
@@ -113,7 +114,7 @@ struct Settings
 };
 Settings g_set;
 
-bool log_allowed(u64 count) { return count <= 10 || count % 100 == 0; }
+constexpr u64 kLogBurst = 10; // a repeating line of this module: the first ones in full, then one in a hundred
 
 float read_radius(LPCSTR key, float def)
 {
@@ -564,15 +565,6 @@ struct Stats
 };
 Stats g_stat;
 
-// The online object of `id` here, nullptr if it is not on this level.
-CGameObject* object_here(u16 id)
-{
-	if (!g_pGameLevel || id == kNoId)
-		return nullptr;
-	CGameObject* o = smart_cast<CGameObject*>(Level().Objects.net_Find(id));
-	return o && !o->getDestroy() ? o : nullptr;
-}
-
 CSE_ALifeDynamicObject* entity(u16 id)
 {
 	return id != kNoId && ai().get_alife() ? ai().alife().objects().object(id, true) : nullptr;
@@ -671,7 +663,7 @@ u16 character_of_key(const std::string& key)
 void refuse(u16 character, ClaimWhat what, Refusal reason)
 {
 	++g_stat.refused[size_t(reason)];
-	if (log_allowed(g_stat.refused[size_t(reason)]))
+	if (lua_errors::line_allowed(g_stat.refused[size_t(reason)], kLogBurst))
 		::Msg("[coop] checkpoint sources: the %s claim of character %u is refused (%s)",
 		    checkpoint::claim_what_name(what), character, checkpoint::refusal_name(reason));
 	const PeerId peer = survival::peer_of_character(character);
@@ -1097,7 +1089,7 @@ void scan_level(u64 now_ms)
 	if (!g.book.observe(g.tents, now_ms))
 	{
 		++g_stat.tents_over;
-		if (log_allowed(g_stat.tents_over))
+		if (lua_errors::line_allowed(g_stat.tents_over, kLogBurst))
 			::Msg("! [coop] checkpoint sources: more than %u tents are known, the newest are not kept",
 			    u32(checkpoint::kMaxTents));
 	}
@@ -1141,7 +1133,7 @@ std::vector<checkpoint::SourceSpot> current_spots()
 	std::vector<checkpoint::SourceSpot> spots;
 	for (u16 id : g.campfires)
 	{
-		CZoneCampfire* c = smart_cast<CZoneCampfire*>(object_here(id));
+		CZoneCampfire* c = smart_cast<CZoneCampfire*>(world::object_here(id));
 		if (!c || !c->is_on())
 			continue;
 		checkpoint::SourceSpot s;
@@ -1153,7 +1145,7 @@ std::vector<checkpoint::SourceSpot> current_spots()
 	}
 	for (const auto& it : mods().all())
 	{
-		const CGameObject* o = object_here(it.first);
+		const CGameObject* o = world::object_here(it.first);
 		if (!o)
 			continue;
 		checkpoint::SourceSpot s;
@@ -1303,9 +1295,9 @@ bool base_tick(u16 c, const CGameObject* obj, const std::string& here, const flo
 		checkpoint::Record r;
 		if (!bed_record(obj, *lb, r))
 		{
-			// Build 57 (owner 2026-11-18, review S3): host_set was never called, nothing else says why
+			// Log failures here because host_set only runs when bed_record succeeds.
 			++g_stat.beds_refused;
-			if (log_allowed(g_stat.beds_refused))
+			if (lua_errors::line_allowed(g_stat.beds_refused, kLogBurst))
 				::Msg("! [coop] checkpoint sources: character %u on base %s: no record of it (he stands where no record of "
 				      "this level can be made)",
 				    c, base_name(k));
@@ -1314,7 +1306,7 @@ bool base_tick(u16 c, const CGameObject* obj, const std::string& here, const flo
 		else if (host_set(c, r, false))
 		{
 			++g_stat.beds;
-			if (log_allowed(g_stat.beds))
+			if (lua_errors::line_allowed(g_stat.beds, kLogBurst))
 				::Msg("[coop] checkpoint sources: character %u is on base %s: its %s is his checkpoint", c, base_name(k),
 				    lb->spot.bed != kNoSource ? "bed" : "point");
 		}
@@ -1426,7 +1418,7 @@ bool far_base_tick(u16 c, const levels::BodyFacts& there, checkpoint::base::Visi
 		if (!far_record(c, fb, r))
 		{
 			++g_stat.beds_far_refused;
-			if (log_allowed(g_stat.beds_far_refused))
+			if (lua_errors::line_allowed(g_stat.beds_far_refused, kLogBurst))
 				::Msg("! [coop] checkpoint sources: character %u on base %s of a map server's level: no record of it (his "
 				      "entity has no game vertex)",
 				    c, base_name(fb.spot.id));
@@ -1435,7 +1427,7 @@ bool far_base_tick(u16 c, const levels::BodyFacts& there, checkpoint::base::Visi
 		else if (host_set(c, r, true))
 		{
 			++g_stat.beds_far;
-			if (log_allowed(g_stat.beds_far))
+			if (lua_errors::line_allowed(g_stat.beds_far, kLogBurst))
 				::Msg("[coop] checkpoint sources: character %u is on base %s of a map server's level: its %s is his checkpoint",
 				    c, base_name(fb.spot.id), fb.spot.bed != kNoSource ? "bed" : "point");
 		}
@@ -1460,19 +1452,19 @@ void tick_players(u64 now_ms)
 	{
 		if (!alive(c) || (c != 0 && world::is_parked(c)))
 			continue; // a visit ends with death or leaving
-		// Build 57 (owner 2026-11-18): the visit of the base rule, kept per player beside the campfire dwell
+		// Keep each player's base visit alongside the campfire dwell.
 		checkpoint::base::Visit visit;
 		const auto visit_was = g.base_visit.find(c);
 		if (visit_was != g.base_visit.end())
 			visit = visit_was->second;
-		const CGameObject* obj = object_here(c);
+		const CGameObject* obj = world::object_here(c);
 		if (!obj)
 		{
 			// a player on a map server's level: its authority says what he stands at, the camp is written here all the same
 			levels::BodyFacts there;
 			const bool told = mode().facts_of(c, there);
-			// Build 57 (owner 2026-11-18: "in split maps in the console form this must be done too"): the base before the
-			// campfire, the same rule as on this level (far_base_tick); the map server only said on which base's ground he is
+			// far_base_tick checks the base before the campfire, as on this level. The map server reports which base's
+			// ground the player stands on.
 			if (told && far_base_tick(c, there, visit, now_ms))
 			{
 				next_base.emplace(c, visit);
@@ -1557,7 +1549,7 @@ void sweep_lost(const xr_vector<SourceRef>& refs)
 			++g_stat.reused;
 		}
 		++g_stat.lost;
-		if (log_allowed(g_stat.lost))
+		if (lua_errors::line_allowed(g_stat.lost, kLogBurst))
 			::Msg("[coop] checkpoint sources: object %u is %s (%s%s%s)", id, e ? "another object now" : "gone",
 			    in_records.count(id) ? "a camp" : "", mods().has(id) ? " a mod source" : "",
 			    tents.count(id) ? " a tent" : "");
@@ -1636,7 +1628,7 @@ bool give_item(const std::string& section, u16 holder)
 // Releases an object the normal way: online through its game object, offline through ALife.
 void release_object(u16 id)
 {
-	if (CGameObject* go = object_here(id))
+	if (CGameObject* go = world::object_here(id))
 	{
 		go->DestroyObject();
 		return;
@@ -1673,10 +1665,10 @@ void place_for(u16 character, ClaimWhat what, CGameObject* obj, const Fvector& p
 	const u16 paid = carried_item(obj, character, tent ? g_set.tent_items : g_set.sleepbag_items);
 	if (paid == kNoId)
 		return refuse(character, what, Refusal::NoItem);
-	CGameObject* paid_obj = object_here(paid);
+	CGameObject* paid_obj = world::object_here(paid);
 	const std::string paid_section = paid_obj ? paid_obj->cNameSect().c_str() : "";
 	const std::string& section = tent ? g_set.v.tent_section : g_set.v.sleepbag_section;
-	// Everything a checkpoint needs is checked before anything is made (R1 M-2).
+	// Check everything the checkpoint needs before creating the tent or sleeping bag.
 	checkpoint::Record r = record_here(obj, Kind::Tent, kNoSource);
 	u32 lv = u32(-1);
 	GameGraph::_GRAPH_ID gv = GameGraph::_GRAPH_ID(-1);
@@ -1744,7 +1736,7 @@ void pack_for(u16 character, const Fvector& pos)
 	{
 		if (!checkpoint::may_pack(key, g.book.owner_of(id)))
 			continue;
-		const CGameObject* t = object_here(id);
+		const CGameObject* t = world::object_here(id);
 		if (!t)
 			continue;
 		float p[3];
@@ -1762,7 +1754,7 @@ void pack_for(u16 character, const Fvector& pos)
 	const bool marked = read_mark(tent, mark);
 	if (key == checkpoint::kHostOwner && (!marked || mark.item.empty()))
 	{
-		const CGameObject* t = object_here(tent);
+		const CGameObject* t = world::object_here(tent);
 		const bool bag = t && what_of(t->cNameSect()) == u8(ClaimWhat::Sleepbag);
 		mark.item = bag ? g_set.sleepbag_items.front() : g_set.tent_items.front(); // read_item_lists: never empty
 	}
@@ -1793,7 +1785,7 @@ void host_on_claim(PeerId from, Reader& rd)
 	if (!checkpoint::read_claim(rd, what, p))
 	{
 		++g_stat.malformed;
-		if (log_allowed(g_stat.malformed))
+		if (lua_errors::line_allowed(g_stat.malformed, kLogBurst))
 			::Msg("! [coop] checkpoint sources: malformed CheckpointClaim from #%u ignored", from);
 		return;
 	}
@@ -1801,7 +1793,7 @@ void host_on_claim(PeerId from, Reader& rd)
 	if (character == kNoId)
 	{
 		++g_stat.not_in_world;
-		if (log_allowed(g_stat.not_in_world))
+		if (lua_errors::line_allowed(g_stat.not_in_world, kLogBurst))
 			::Msg("[coop] checkpoint sources: CheckpointClaim from #%u without a character ignored", from);
 		return;
 	}
@@ -1976,7 +1968,7 @@ Place rest_place(u16 character, u16& source)
 	source = kNoSource;
 	if (!ensure_world())
 		return Place::None;
-	const CGameObject* obj = object_here(character);
+	const CGameObject* obj = world::object_here(character);
 	if (!obj)
 		return Place::None;
 	const Fvector& p = obj->Position();
@@ -1987,7 +1979,7 @@ Place rest_place(u16 character, u16& source)
 	probe.set(p, kRestProbe);
 	for (const auto& it : g.rest_zones)
 	{
-		const CSpaceRestrictor* zone = smart_cast<CSpaceRestrictor*>(object_here(it.first));
+		const CSpaceRestrictor* zone = smart_cast<CSpaceRestrictor*>(world::object_here(it.first));
 		if (zone && zone->inside(probe))
 		{
 			source = it.first;
@@ -2035,7 +2027,7 @@ bool host_register_source(u16 id, float radius)
 	if (why)
 	{
 		++g_stat.mods_refused;
-		if (log_allowed(g_stat.mods_refused))
+		if (lua_errors::line_allowed(g_stat.mods_refused, kLogBurst))
 			::Msg("! [coop] checkpoint sources: register_source(%u, %f) refused: %s", id, radius, why);
 		return false;
 	}
@@ -2050,7 +2042,7 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 	if (!ensure_world())
 		return;
 	++g_stat.claims;
-	CGameObject* obj = object_here(character);
+	CGameObject* obj = world::object_here(character);
 	LevelSide* const level = mode().level();
 	const bool in_world = level ? level->level_in_world(character) : survival::player_in_world(character);
 	const PeerId peer = survival::peer_of_character(character);
@@ -2064,7 +2056,7 @@ void host_claim_tent(u16 character, ClaimWhat what, const Fvector& pos)
 	if (!pos_ok(pos) || !obj || !in_world)
 	{
 		++g_stat.not_in_world;
-		if (log_allowed(g_stat.not_in_world))
+		if (lua_errors::line_allowed(g_stat.not_in_world, kLogBurst))
 			::Msg("[coop] checkpoint sources: %s claim of character %u ignored (%s)", checkpoint::claim_what_name(what),
 			    character, !pos_ok(pos) ? "not a position" : "he is not in the world");
 		return;
@@ -2169,7 +2161,7 @@ bool base_bed_record(u16 character, checkpoint::Record& out)
 	namespace base = checkpoint::base;
 	if (!mode().decides_world() || !ensure_world())
 		return false;
-	const CGameObject* obj = object_here(character);
+	const CGameObject* obj = world::object_here(character);
 	if (obj)
 	{
 		// the co-op path: his character is an object here, this process has his level's AI map

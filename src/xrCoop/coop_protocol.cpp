@@ -1,6 +1,8 @@
 // Anomaly Coop — protocol helpers: names, manifest fingerprint/diff, handshake structs.
 #include "coop_protocol.h"
 
+#include "coop_hash.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -141,7 +143,7 @@ const char* msg_name(Msg type)
 	case Msg::MapServerOrder: return "MapServerOrder";
 	case Msg::LoadWait: return "LoadWait";
 	case Msg::LoadReady: return "LoadReady";
-	case Msg::LevelJournal: return "LevelJournal"; // R32, protocol 34
+	case Msg::LevelJournal: return "LevelJournal";
 	case Msg::LevelJournalAck: return "LevelJournalAck";
 
 	case Msg::ScriptEvent: return "ScriptEvent";
@@ -149,7 +151,7 @@ const char* msg_name(Msg type)
 	case Msg::StateDumpRequest: return "StateDumpRequest";
 	case Msg::StateDump: return "StateDump";
 
-	case Msg::VehicleReq: return "VehicleReq"; // F5
+	case Msg::VehicleReq: return "VehicleReq";
 	case Msg::VehicleSeat: return "VehicleSeat";
 	case Msg::VehicleInput: return "VehicleInput";
 	case Msg::VehicleState: return "VehicleState";
@@ -163,10 +165,10 @@ const char* msg_name(Msg type)
 	return buf;
 }
 
-// F2 T3: every game message has a direction, from its senders in the game layer (net::host_send / host_broadcast
+// Every game message has a direction, from its senders in the game layer (net::host_send / host_broadcast
 // against net::client_send); one without a sender yet takes the direction of its comment in coop_protocol.h. A new
 // message needs its row here: tests/test_session_limits.cpp game_messages_have_direction fails without it, and
-// (F2 T3 fix round 1) MSVC does not build it: an enumerator the switch misses is error C4062 (off by default).
+// MSVC does not build it: an enumerator the switch misses is error C4062 (off by default).
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(error : 4062)
@@ -181,8 +183,8 @@ MsgSender msg_sender(Msg type)
 	case Msg::SessionReset:
 	case Msg::LevelChange:
 	case Msg::AvatarList:
-	case Msg::CharOffer: // protocol 8: the host offers a new character before the world
-	case Msg::TransitionState: // protocol 10: the host's board of who waits at a level exit
+	case Msg::CharOffer: // the host offers a new character before the world
+	case Msg::TransitionState: // the host's board of who waits at a level exit
 	case Msg::PlayerHit:
 	case Msg::PlayerRules:
 	case Msg::EntitySpawn:
@@ -210,35 +212,35 @@ MsgSender msg_sender(Msg type)
 	case Msg::ZoneState:
 	case Msg::TaskList:
 	case Msg::StoryHash:
-	case Msg::IdLease: // F2 T12b: only the host leases ids
+	case Msg::IdLease: // only the host leases ids
 	case Msg::DialogLockResult:
 	case Msg::DialogPhrases:
-	case Msg::MoneyBalance: // F2 T1: only the host holds balances
-	case Msg::SyncFull: // F2 T14: the host's copy at join
-	case Msg::SyncResult: // F2 T14: the host's handler answers
-	case Msg::SyncCast: // F2 T14: only the host broadcasts effects
-	case Msg::CheckpointState: // F3: the host sets every checkpoint
-	case Msg::RestState: // F3: the host decides the shared sleep
+	case Msg::MoneyBalance: // only the host holds balances
+	case Msg::SyncFull: // the host's copy at join
+	case Msg::SyncResult: // the host's handler answers
+	case Msg::SyncCast: // only the host broadcasts effects
+	case Msg::CheckpointState: // the host sets every checkpoint
+	case Msg::RestState: // the host decides the shared sleep
 	case Msg::RestSleep:
-	case Msg::DeathMarker: // F3: the host moves a dead player's things
-	case Msg::MonsterEffect: // audit A5: the host's monsters decide their abilities
-	case Msg::LevelMap: // F3a: the world server's table of the levels
+	case Msg::DeathMarker: // the host moves a dead player's things
+	case Msg::MonsterEffect: // the host's monsters decide their abilities
+	case Msg::LevelMap: // the world server's table of the levels
 	case Msg::LevelMoveResult:
-	case Msg::LevelFlush: // F3a: orders and halves of the world server toward a map server
+	case Msg::LevelFlush: // orders and halves of the world server toward a map server
 	case Msg::LevelXferDown:
 	case Msg::LevelBrain:
 	case Msg::LevelResync:
 	case Msg::MapServerOrder:
-	case Msg::LevelJournalAck: // R32: the world server's answer to one bridge's journal
-	case Msg::LoadWait: // F3a: the barrier of a simultaneous load, the world server's word
-	case Msg::DebugState: // protocol 29: only the world server holds the debug state
-	case Msg::VehicleSeat: // F5: the decider of the level seats, releases and refuses
-	case Msg::VehicleState: // F5: the decider's car state to every copy
+	case Msg::LevelJournalAck: // the world server's answer to one bridge's journal
+	case Msg::LoadWait: // the barrier of a simultaneous load, the world server's word
+	case Msg::DebugState: // only the world server holds the debug state
+	case Msg::VehicleSeat: // the decider of the level seats, releases and refuses
+	case Msg::VehicleState: // the decider's car state to every copy
 	case Msg::StateDump: return MsgSender::HostOnly;
 
 	// a client's requests and reports
 	case Msg::JoinRequest:
-	case Msg::CharChoice: // protocol 8: the player's choice, the host makes the character
+	case Msg::CharChoice: // the player's choice, the host makes the character
 	case Msg::WorldLoaded:
 	case Msg::TransitionVote:
 	case Msg::PlayerVitals:
@@ -250,24 +252,24 @@ MsgSender msg_sender(Msg type)
 	case Msg::ReqTransfer:
 	case Msg::ReqUse:
 	case Msg::ReqHit:
-	case Msg::ReqMoney: // F2 T1: the host changes its own money directly
-	case Msg::SyncRequest: // F2 T14: the host runs its own handlers directly
+	case Msg::ReqMoney: // the host changes its own money directly
+	case Msg::SyncRequest: // the host runs its own handlers directly
 	case Msg::ReqContainer:
 	case Msg::ReqItemEvent:
 	case Msg::ReqLaunch:
 	case Msg::TimeRequest:
 	case Msg::StoryResync:
-	case Msg::IdLeaseAck: // F2 T12b: a client gives ids back
+	case Msg::IdLeaseAck: // a client gives ids back
 	case Msg::DialogLock:
 	case Msg::DialogSelect:
-	case Msg::CheckpointClaim: // F3: a player reports his tent, the host checks it
-	case Msg::RestRequest: // F3: a player lies down or gets up
-	case Msg::NewCharacter: // F3: hardcore, a dead player asks for a new character
-	case Msg::LevelMove: // F3a: a player asks to leave his level
-	case Msg::LoadReady: // F3a: a player's loading screen is up
+	case Msg::CheckpointClaim: // a player reports his tent, the host checks it
+	case Msg::RestRequest: // a player lies down or gets up
+	case Msg::NewCharacter: // hardcore, a dead player asks for a new character
+	case Msg::LevelMove: // a player asks to leave his level
+	case Msg::LoadReady: // a player's loading screen is up
 	case Msg::EntityResync: // a client's digest of a bucket differs
-	case Msg::VehicleReq: // F5: a player asks for a seat or out
-	case Msg::VehicleInput: // F5: the driver's keys, the decider applies them
+	case Msg::VehicleReq: // a player asks for a seat or out
+	case Msg::VehicleInput: // the driver's keys, the decider applies them
 	case Msg::StateDumpRequest: return MsgSender::ClientOnly;
 
 	// both: an owner's change the host relays, a client's request the host answers in kind; handlers check the sender
@@ -287,16 +289,16 @@ MsgSender msg_sender(Msg type)
 	case Msg::Progress:
 	case Msg::DialogUnlock:
 	case Msg::TradeOp:
-	case Msg::SyncSet: // F2 T14: a client's own data to the host (checked there), the host's changes to clients
-	case Msg::Tunnel: // F3a: both ways over the trunk; the host's process takes it from its bridge only (T9)
+	case Msg::SyncSet: // a client's own data to the host (checked there), the host's changes to clients
+	case Msg::Tunnel: // both ways over the trunk; the host's process takes it from its bridge only
 	case Msg::ScriptEvent: return MsgSender::Either;
 
-	// F3a: what a map server's bridge sends to the host's process
+	// What a map server's bridge sends to the host's process
 	case Msg::LevelSnapshot:
 	case Msg::LevelEntity:
 	case Msg::LevelXferUp:
 	case Msg::LevelHash:
-	case Msg::LevelJournal: // R32: the map server's facts, in order
+	case Msg::LevelJournal: // the map server's facts, in order
 	case Msg::MapServerState: return MsgSender::TrunkOnly;
 
 	// core messages: the Session's own dispatch checks them
@@ -393,14 +395,13 @@ bool manifest_game_written(const std::string& gamedata_rel)
 	std::string low = gamedata_rel;
 	for (char& c : low)
 		c = c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-	// localization.ltx: the game writes the chosen language at start (live check 2026-10-23: a second instance
-	// started after the host had it, the host did not, and the join was refused as a different mod list)
+	// localization.ltx: the game writes the chosen language at start (an instance started after
+	// another has a different one, and a join would be refused as a different mod list)
 	for (const char* exact : {"configs\\axr_options.ltx", "configs\\cache_dbg.ltx", "configs\\localization.ltx"})
 		if (low == exact)
 			return true;
-	// `*_cache.ltx` and any `\cached\` folder: settings caches a mod writes per player at run time (live 2026-11-06,
-	// b40.2: a client was refused for 3DSS's `ubgl_no_3db_settings_cache.ltx` and Experience Framework's
-	// `configs\experience_framework\cached\{configs,options}.ltx`, which his own game had written differently)
+	// `*_cache.ltx` and any `\cached\` folder: settings caches a mod writes per player at run time (each
+	// player's own game writes them differently)
 	for (const std::string tail : {".log", ".txt", ".bak", ".tmp", ".flag", "_user.ltx", "_cache.ltx"})
 		if (low.size() >= tail.size() && low.compare(low.size() - tail.size(), tail.size(), tail) == 0)
 			return true;
@@ -421,12 +422,8 @@ uint64_t manifest_fingerprint(const Manifest& m)
 		return c != 0 ? c < 0 : a->hash < b->hash;
 	});
 
-	constexpr uint64_t kPrime = 1099511628211ull;
-	uint64_t h = 14695981039346656037ull;
-	auto feed = [&](uint8_t byte) {
-		h ^= byte;
-		h *= kPrime;
-	};
+	uint64_t h = kFnv64Basis;
+	auto feed = [&](uint8_t byte) { h = fnv1a64_step(h, byte); };
 	auto feed64 = [&](uint64_t v) {
 		for (int i = 0; i < 8; ++i)
 			feed(uint8_t(v >> (8 * i)));
@@ -513,7 +510,7 @@ void HelloMsg::write(Writer& w) const
 	w.u64(content_fp);
 	w.bytes(key.data(), key.size());
 	w.str(nick);
-	w.u8(role); // protocol 11
+	w.u8(role);
 	w.bytes(token, kHelloTokenSize);
 }
 
@@ -536,8 +533,8 @@ void WelcomeMsg::write(Writer& w) const
 	w.str(host_nick);
 	w.u32(max_players);
 	w.u32(world_epoch);
-	w.u8(flags); // protocol 31
-	w.u8(static_cast<uint8_t>(mode)); // protocol 33
+	w.u8(flags);
+	w.u8(static_cast<uint8_t>(mode));
 }
 
 bool WelcomeMsg::read(Reader& r)
@@ -548,7 +545,7 @@ bool WelcomeMsg::read(Reader& r)
 	max_players = r.u32();
 	world_epoch = r.u32();
 	flags = r.u8();
-	const uint8_t raw_mode = r.u8(); // protocol 33: the host's word, checked before it becomes an enum
+	const uint8_t raw_mode = r.u8(); // the host's word, checked before it becomes an enum
 	mode = SessionMode::None;
 	if (!r.ok() || (flags & ~uint8_t(Known)) != 0)
 		return false;
@@ -566,7 +563,7 @@ void PeerListEntry::write(Writer& w) const
 	w.u32(slot);
 	w.str(nick);
 	w.u32(key_hash);
-	w.u8(flags); // protocol 31
+	w.u8(flags);
 }
 
 bool PeerListEntry::read(Reader& r)
@@ -604,7 +601,7 @@ bool RejectMsg::read(Reader& r)
 	return r.ok();
 }
 
-// ---------------------------------------------------------------- R3 В3: who plays each player character
+// ---------------------------------------------------------------- who plays each player character
 
 void AvatarListMsg::write(Writer& w) const
 {
@@ -630,7 +627,7 @@ bool AvatarListMsg::read(Reader& r)
 		AvatarOwner o;
 		o.avatar = r.u16();
 		o.peer = r.u32();
-		if (!r.ok() || o.avatar == 0xFFFF || o.peer >= kMaxPeerSlots)
+		if (!r.ok() || o.avatar == kNoId || o.peer >= kMaxPeerSlots)
 			return false;
 		// id 0 is the host's own actor, and the host plays nothing else
 		if ((o.avatar == 0) != (o.peer == kHostPeer))
@@ -643,7 +640,7 @@ bool AvatarListMsg::read(Reader& r)
 	owners = std::move(rows);
 	return true;
 }
-// ---------------------------------------------------------------- protocol 8: a new character before the world
+// ---------------------------------------------------------------- a new character before the world
 
 bool char_name_valid(const std::string& s, size_t max)
 {
@@ -684,7 +681,7 @@ bool CharOfferMsg::read(Reader& r)
 		return false;
 	if (!refusal.empty() && !char_name_valid(refusal, kMaxRefusal))
 		return false;
-	return char_name_valid(faction); // protocol 9: always there, always a name
+	return char_name_valid(faction); // always there, always a name
 }
 
 bool CharChoiceMsg::valid() const
@@ -725,7 +722,7 @@ bool CharChoiceMsg::read(Reader& r)
 	return true;
 }
 
-// ---------------------------------------------------------------- W5 C2: creature sounds
+// ---------------------------------------------------------------- creature sounds
 
 bool sound_path_valid(const std::string& path)
 {
@@ -787,7 +784,7 @@ bool NpcSound::read(Reader& r)
 	return true;
 }
 
-// ---------------------------------------------------------------- protocol 17: a host creature's new visual
+// ---------------------------------------------------------------- a host creature's new visual
 
 bool EntityVisualMsg::valid() const
 {

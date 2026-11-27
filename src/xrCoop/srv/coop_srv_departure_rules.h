@@ -1,5 +1,4 @@
-// Сервер: только сервер мира и серверы карт (docs/MODES.md)
-// Anomaly Coop — why a player left the level of a map server (VEH-DISC; docs/VEHICLES.md section 9; review rv_F5-VEH-7, blocker 2): he
+// Anomaly Coop — why a player left the level of a map server (docs/VEHICLES.md section 9): he
 // quit the world, or he went to another map of it.
 //
 // Who decides: the world server holds the session of the world and its table of seats; whenever that table changes it sends it to every
@@ -96,8 +95,8 @@ private:
 	std::vector<Fact> m_facts;
 };
 
-// Stand b57h creator10_server (2026-11-21): a stock ChangeLevel fades for 3 s before its message goes. The player went down and died
-// in that time; the world moved him all the same, and he arrived downed again (health 0.01, a new bleed-out), out of the evacuation and
+// A stock ChangeLevel fades for 3 s before its message goes. A player who goes down and dies in that time must not be
+// moved all the same and arrive downed again (health 0.01, a new bleed-out), out of the evacuation and
 // respawn of his death. Who decides: the world server, by the life his game reported (survival::Life, numbers of
 // xrCoop/coop_death_rules.h); his own game asks only standing (coop_join.cpp client_level_trip), the world does not take its word.
 // Only a standing player leaves his level, through an exit or on a trip. Co-op: none (its group transition counts the standing).

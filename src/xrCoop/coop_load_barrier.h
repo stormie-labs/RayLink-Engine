@@ -1,4 +1,4 @@
-// Anomaly Coop — the barrier of the simultaneous load (docs/plans/2026-10-24-f3a-split-levels.md §1.5). When players
+// Anomaly Coop — the barrier of the simultaneous load. When players
 // change level together (the group at the waiting point, the host's own move, a lone player whose map server is started
 // for him), the world server prepares the world and everybody who leaves goes to the loading screen at once. Each says
 // LoadReady {epoch} when his world is up; the host's own player is ready when his process's world is up (through the

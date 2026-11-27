@@ -9,8 +9,8 @@
 #include "client_spawn_manager.h"
 #include "../xrEngine/xr_object.h"
 #include "../xrEngine/IGame_Persistent.h"
-#include "coop/coop_remote.h" // Anomaly Coop
-#include "coop/coop_events.h" // Anomaly Coop
+#include "coop/coop_remote.h"
+#include "coop/coop_events.h"
 
 void CLevel::cl_Process_Spawn(NET_Packet& P)
 {
@@ -35,9 +35,26 @@ void CLevel::cl_Process_Spawn(NET_Packet& P)
 		F_entity_Destroy(E);
 		return;
 	}
-	// Anomaly Coop (RL-UGYE-3WGE): on a co-op client no game object for an entity that is gone or whose id another one has now
-	if (!coop::events::client_spawn_allowed(E))
+	// coop: on a co-op client no game object for an entity that is gone or whose id another one has now.
+	// Nor while a game object still holds its id (GE_DESTROY came in this frame, the destroy queue has
+	// not run) or its holder's object is on its way out: the stock net_Spawn below would refuse it after half-making the
+	// object and run its whole net_Destroy chain. The whole M_SPAWN goes back into the event queue and is decided again at a
+	// next frame, by the stock pipeline from the start (xrCoop/coop_spawn_wait_rules.h).
+	switch (coop::events::client_spawn_gate(E))
 	{
+	case coop::events::SpawnGate::Make:
+		break;
+	case coop::events::SpawnGate::Wait:
+		{
+#ifdef SPAWN_ANTIFREEZE
+			xrSRWLockGuard g(prefetch_lock);
+#endif
+			game_events->insert(P); // the packet is whole (reading moved only r_pos); this frame's events were taken already
+		}
+		F_entity_Destroy(E);
+		return;
+	case coop::events::SpawnGate::Refuse:
+	default:
 		F_entity_Destroy(E);
 		return;
 	}
@@ -135,8 +152,7 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 	{
         Msg("! Failed to spawn entity '%s', net_Spawn failed", *E->s_name);
 		O->net_Destroy();
-		if (!g_dedicated_server || g_coop_headless)
-			client_spawn_manager().clear(O->ID());
+		client_spawn_manager().clear(O->ID());
 		Objects.Destroy(O);
 		Msg("! Failed to spawn entity '%s'", *E->s_name);
 
@@ -147,14 +163,13 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 	}
 	else
 	{
-		coop::remote::on_net_spawn(O); // Anomaly Coop: remote-driven creatures become Remote puppets
+		coop::remote::on_net_spawn(O); // coop: remote-driven creatures become Remote puppets
 
 #ifdef DEBUG_MEMORY_MANAGER
 		mem_alloc_gather_stats	(!!psAI_Flags.test(aiDebugOnFrameAllocs));
 #endif // DEBUG_MEMORY_MANAGER
 
-		if (!g_dedicated_server || g_coop_headless)
-			client_spawn_manager().callback(O);
+		client_spawn_manager().callback(O);
 		//Msg			("--spawn--SPAWN: %f ms",1000.f*T.GetAsync());
 
 		if ((E->s_flags.is(M_SPAWN_OBJECT_LOCAL)) &&

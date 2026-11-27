@@ -27,6 +27,9 @@
 #include <map>
 #include <vector>
 
+#include "../coop_hash.h"
+#include "../coop_ids.h"
+
 namespace coop
 {
 namespace levels
@@ -53,13 +56,7 @@ inline bool watched(const Kind& k, bool binder, bool saves) { return binder && s
 // FNV-1a. `skip`: bytes at the start that say nothing of its logic: a physics object begins with its shell's sleep (CPhysicsShellHolder::save).
 inline uint64_t digest(const uint8_t* data, size_t size, size_t skip = 0)
 {
-	uint64_t h = 0xcbf29ce484222325ull;
-	for (size_t i = skip; i < size; ++i)
-	{
-		h ^= data[i];
-		h *= 0x100000001b3ull;
-	}
-	return h;
+	return skip < size ? fnv1a64(data + skip, size - skip) : kFnv64Basis;
 }
 
 // What CGameObject::net_Save leaves in a packet: u16 size, then what the entity keeps as client_data. False: it is not exactly that.
@@ -159,7 +156,7 @@ struct Entity
 	bool exists = false;
 	bool online = false; // here: it stands on the level of this process, whose own saves keep it
 	Kind kind;
-	uint16_t level = 0xFFFF; // the level of its game vertex, 0xFFFF for none
+	uint16_t level = kNoLevel; // the level of its game vertex, kNoLevel for none
 };
 
 enum class Verdict : uint8_t
@@ -179,7 +176,7 @@ inline Verdict host_verdict(const Entity& e, uint16_t level)
 		return Verdict::Online;
 	if (!stays_with_level(e.kind))
 		return Verdict::NotKept;
-	if (level == 0xFFFF || e.level != level)
+	if (level == kNoLevel || e.level != level)
 		return Verdict::OtherLevel;
 	return Verdict::Take;
 }

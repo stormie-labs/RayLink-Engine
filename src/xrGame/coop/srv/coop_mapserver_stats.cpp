@@ -1,11 +1,14 @@
+// Сервер: только сервер мира и серверы карт (docs/MODES.md)
+// Anomaly Coop — what a server's process costs: memory, Lua, ALife, the frame. One line in the log every 60 s on a server's
+// process, and the console command coop_mapserver_stats on any process, the host's too. The frame is the work between two reads
+// of the numbers, without a map server's sleep to its 30 frames a second: its budget is 33 ms.
 #include "stdafx.h"
 #include "pch_script.h"
-// F3a T5: what a map server costs (plan 1.8): memory, Lua, ALife, the frame. One line in the log every 60 s on a map server, and
-// the console command coop_mapserver_stats on any process, the host's too. The frame is the work between two reads of the
-// numbers, without a map server's sleep to its 30 frames a second: its budget is 33 ms.
+#include "coop_mapserver_stats.h"
 #include "../coop_manager.h"
 #include "../coop_levels.h"
 #include "../coop_ai.h" // print_tracks_status
+#include "../coop_debug.h" // log_address_space
 #include "../../../xrEngine/XR_IOConsole.h"
 #include "../../../xrEngine/xr_ioc_cmd.h"
 
@@ -20,81 +23,11 @@
 
 namespace coop
 {
+namespace srv
+{
 namespace
 {
 constexpr u32 kStatsPeriodMs = 60000;
-
-// What the process's memory is made of, as the system sees it (owner 2026-11-13: fewer gigabytes; a server's private memory is
-// some 700 MB more than the engine's own heap, and nothing said what that is). Committed memory by kind: private (heaps, stacks,
-// VirtualAlloc), mapped files, images of the exe and its DLLs; then the largest private allocations, each as the whole range one
-// VirtualAlloc made. A report for the log; it changes nothing.
-void log_address_space()
-{
-	struct Block
-	{
-		u64 base = 0;
-		u64 committed = 0;
-		u64 reserved = 0;
-	};
-	xr_vector<Block> blocks;
-	u64 private_mb = 0, mapped_mb = 0, image_mb = 0, reserved_mb = 0;
-	MEMORY_BASIC_INFORMATION info;
-	for (const u8* p = nullptr; VirtualQuery(p, &info, sizeof(info)) == sizeof(info);)
-	{
-		const u64 size = u64(info.RegionSize);
-		if (info.State == MEM_COMMIT)
-		{
-			if (info.Type == MEM_PRIVATE)
-				private_mb += size;
-			else if (info.Type == MEM_MAPPED)
-				mapped_mb += size;
-			else
-				image_mb += size;
-		}
-		else if (info.State == MEM_RESERVE)
-			reserved_mb += size;
-		if (info.State != MEM_FREE && info.Type == MEM_PRIVATE)
-		{
-			const u64 base = u64(reinterpret_cast<uintptr_t>(info.AllocationBase));
-			if (blocks.empty() || blocks.back().base != base)
-			{
-				Block b;
-				b.base = base;
-				blocks.push_back(b);
-			}
-			(info.State == MEM_COMMIT ? blocks.back().committed : blocks.back().reserved) += size;
-		}
-		const u8* next = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
-		if (next <= p)
-			break; // the end of the address space
-		p = next;
-	}
-	const u64 mb = 1024 * 1024;
-	::Msg("[coop] coop_memory_map: committed: private %llu MB, mapped files %llu MB, images %llu MB; reserved and not committed "
-	      "%llu MB; %u private allocations",
-	    private_mb / mb, mapped_mb / mb, image_mb / mb, reserved_mb / mb, u32(blocks.size()));
-	// by size: how many allocations of each size class, and how much they hold
-	static const u64 kClass[] = {1 * mb, 4 * mb, 16 * mb, 64 * mb, 256 * mb, ~u64(0)};
-	static const char* const kName[] = {"under 1 MB", "1-4 MB", "4-16 MB", "16-64 MB", "64-256 MB", "256 MB and more"};
-	u32 count[6] = {};
-	u64 total[6] = {};
-	for (const Block& b : blocks)
-		for (int i = 0; i < 6; ++i)
-			if (b.committed < kClass[i])
-			{
-				++count[i];
-				total[i] += b.committed;
-				break;
-			}
-	for (int i = 0; i < 6; ++i)
-		if (count[i])
-			::Msg("[coop]   private allocations %-15s %6u, %5llu MB", kName[i], count[i], total[i] / mb);
-	std::sort(blocks.begin(), blocks.end(), [](const Block& a, const Block& b) { return a.committed > b.committed; });
-	const size_t shown = blocks.size() < 12 ? blocks.size() : 12;
-	for (size_t i = 0; i < shown; ++i)
-		::Msg("[coop]   %5llu MB committed, %5llu MB more reserved, at %016llx", blocks[i].committed / mb, blocks[i].reserved / mb,
-		    blocks[i].base);
-}
 
 void log_stats()
 {
@@ -128,7 +61,7 @@ void log_stats()
 	if (g_coop_headless && !s_map_logged)
 	{
 		s_map_logged = true;
-		log_address_space();
+		debug::log_address_space();
 	}
 	::Msg("[coop] coop_mapserver_stats: private %llu MB, working set %llu MB, lua %d MB, alife %u objects, %u online, "
 	    "frame avg %.1f ms, worst %u ms, %u frames",
@@ -159,44 +92,11 @@ public:
 	void Execute(LPCSTR) override { log_stats(); }
 	void Info(TInfo& I) override { xr_strcpy(I, "this process: memory, Lua, ALife objects, the frame since the last line"); }
 };
-
-// Where the items of the configs live (owner 2026-11-13: fewer gigabytes): the CInifile objects alive now by file, the largest
-// first, and the DLTX cache of parsed files. A report for the log; it changes nothing.
-class CCC_CoopIniStats : public IConsole_Command
-{
-public:
-	CCC_CoopIniStats(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
-	void Execute(LPCSTR) override
-	{
-		xr_vector<CInifile::LiveRow> rows;
-		u64 instances = 0, sections = 0, items = 0, distinct = 0;
-		CInifile::LiveStats(rows, instances, sections, items, distinct);
-		u64 cache_files = 0, cache_bytes = 0, cache_sections = 0;
-		CInifile::GetCacheStats(cache_files, cache_bytes, cache_sections);
-		::Msg("[coop] coop_ini_stats: %llu ini objects alive in %u files: %llu sections, %llu items, of them %llu in memory once "
-		      "(%llu MB, %u bytes an item; the rest is shared with another object); the cache of parsed files: %llu files, "
-		      "%llu sections, %llu MB by its own count",
-		    instances, u32(rows.size()), sections, items, distinct, distinct * sizeof(CInifile::Item) / (1024 * 1024),
-		    u32(sizeof(CInifile::Item)), cache_files, cache_sections, cache_bytes / (1024 * 1024));
-		const size_t shown = rows.size() < 30 ? rows.size() : 30;
-		for (size_t i = 0; i < shown; ++i)
-			::Msg("[coop]   %9llu items %7llu sections x%-4u %s", rows[i].items, rows[i].sections, rows[i].instances, rows[i].file.c_str());
-	}
-	void Info(TInfo& I) override { xr_strcpy(I, "this process: the ini objects alive by file, the largest first, and the cache of parsed files"); }
-};
-
-class CCC_CoopMemoryMap : public IConsole_Command
-{
-public:
-	CCC_CoopMemoryMap(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; }
-	void Execute(LPCSTR) override { log_address_space(); }
-	void Info(TInfo& I) override { xr_strcpy(I, "this process: committed memory by kind and the largest private allocations"); }
-};
 } // namespace
 
-// Every frame of a server's process (a map server, the world server): the server's boot runs it (srv/coop_srv_mode.cpp; S4, A-S4H).
 void mapserver_stats_frame()
 {
+	PROF_EVENT("coop/coop_mapserver_stats/mapserver_stats_frame");
 	static u32 next_ms = 0;
 	const u32 now_ms = GetTickCount();
 	if (!next_ms)
@@ -208,10 +108,9 @@ void mapserver_stats_frame()
 	xrLogger::FlushLog(); // the stock flush waits for a freeze or the console: nobody reads this process but through its log
 }
 
-void mapserver_stats_register_console()
+void register_mapserver_stats_console()
 {
 	CMD1(CCC_CoopMapserverStats, "coop_mapserver_stats");
-	CMD1(CCC_CoopIniStats, "coop_ini_stats");
-	CMD1(CCC_CoopMemoryMap, "coop_memory_map");
 }
+} // namespace srv
 } // namespace coop

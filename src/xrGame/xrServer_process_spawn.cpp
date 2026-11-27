@@ -1,7 +1,7 @@
 #include "stdafx.h"
 #include "xrServer.h"
 #include "xrserver_objects.h"
-#include "xrCoop/coop_calls.h" // Anomaly Coop (R32 W9): coop_writer_gate and the id steps
+#include "coop/coop_router.h" // coop: coop_writer_gate (writer_gate) and the id steps (xrCoop/coop_writer_gate.h)
 
 #include <atomic>
 
@@ -9,20 +9,20 @@
 #	include "xrserver_objects_alife_items.h"
 #endif
 
-// Anomaly Coop (R32 W9): the first lines of a kind, then every 100th (a pool that stays empty must not flood the log).
+// coop: the first lines of a kind, then every 100th (a pool that stays empty must not flood the log).
 static bool coop_w9_line(std::atomic<u32>& count, u32& n)
 {
 	n = ++count;
 	return n <= 10 || n % 100 == 0;
 }
 
-// Anomaly Coop (R32 W9): see xrServer.h. A peek at the pool (Mode::own_free_id hands out the next free id without taking it; an empty
+// coop: see xrServer.h. A peek at the pool (Mode::own_free_id hands out the next free id without taking it; an empty
 // pool asks its world for a block at once): the stock code that follows takes its ids through PerformIDgen.
 bool xrServer::CoopMayCreate(const char* what)
 {
 	if (!coop::mode().takes_own_ids() || coop::mode().own_free_id() != 0xffff)
 		return true;
-	const coop::calls::WriterGate setting = coop::calls::writer_gate_setting().load();
+	const coop::calls::WriterGate setting = coop::router::writer_gate();
 	const bool refused = coop::calls::no_id(setting, coop::calls::IdStep::Start) == coop::calls::NoId::Refuse;
 	static std::atomic<u32> s_lines{0};
 	u32 n = 0;
@@ -35,7 +35,7 @@ bool xrServer::CoopMayCreate(const char* what)
 
 void xrServer::CoopTookStockId(u16 id)
 {
-	const coop::calls::WriterGate setting = coop::calls::writer_gate_setting().load();
+	const coop::calls::WriterGate setting = coop::router::writer_gate();
 	// under enforce every start that asked CoopMayCreate was refused there, so this is a create that did not ask: a stock chain that
 	// already runs (IdStep::Chain: the stock id in every setting) or a create of coop's own C++ that has no CoopMayCreate yet (the
 	// line cannot tell which); under log it may be any create
@@ -108,7 +108,7 @@ CSE_Abstract* xrServer::Process_spawn(NET_Packet& P, ClientID sender, BOOL bSpaw
 		}
 	}
 
-	// Anomaly Coop (R32 W9): a new entity takes its ids below (its own when it has none, a phantom's): a map server with no id left in its
+	// coop: a new entity takes its ids below (its own when it has none, a phantom's): a map server with no id left in its
 	// pool refuses it here under coop_writer_gate = enforce, before any id is taken, with the stock "not created" (as for a missing
 	// parent above); an existing entity (tpExistedEntity: a switch online) keeps the id it has
 	const bool coop_takes_ids = E->ID == 0xffff || (E->RespawnTime && 0xffff == E->ID_Phantom) || E->s_flags.is(M_SPAWN_OBJECT_PHANTOM);

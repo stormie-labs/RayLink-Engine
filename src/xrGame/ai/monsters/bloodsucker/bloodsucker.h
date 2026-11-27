@@ -7,6 +7,7 @@
 #include "../anim_triple.h"
 #include "../../../../xrServerEntities/script_export_space.h"
 #include "bloodsucker_alien.h"
+#include "xrCoop/coop_monster_fx_rules.h"
 
 
 class CAI_Bloodsucker : public CBaseMonster,
@@ -46,15 +47,14 @@ public:
 	//--------------------------------------------------------------------
 	void move_actor_cam(float angle);
 
-	// Anomaly Coop (audit A5): the host's vampire grip on this machine's actor (phase 0 grabs, 1 lets go)
+	// coop: the host's vampire grip on this machine's actor (phase 0 grabs, 1 lets go)
 	void coop_vampire(u8 phase);
 	void coop_vampire_release();
 	virtual void net_Destroy();
 
 private:
-	bool m_coop_vampire = false;
+	coop::monster_fx::ActorHold m_coop_vampire; // client: a host grip holds our actor
 	bool m_coop_vampire_effector = false;
-	u32 m_coop_vampire_deadline = 0;
 	void coop_vampire_update();
 
 public:

@@ -7,23 +7,24 @@
 #include "coop_requests.h"
 #include "coop_survival.h"
 #include "coop_presence.h"
-#include "coop_router.h" // R32 W2a: coop_writer_gate
+#include "coop_router.h" // coop_writer_gate
 #include "coop_script.h"
-#include "coop_checkpoints.h" // F3
+#include "coop_checkpoints.h"
 #include "coop_death.h"
 #include "coop_rest.h"
 #include "coop_autosave.h"
 #include "coop_ai.h" // scheduler viewers
-#include "coop_levels.h" // F3a
-#include "srv/coop_dedicated.h" // plan 12
-#include "coop_debug.h" // protocol 29
+#include "coop_levels.h"
+#include "coop_debug.h"
+#include "coop_entities.h"
+#include "coop_health_ledger.h"
 #include "coop_items.h"
-#include "coop_lua_errors.h" // 2026-11: coop_lua_errors
-#include "coop_money.h" // its commands are registered here, before user.ltx is read
-#include "coop_story.h" // the same: coop_share_rewards, coop_tasks_resync
-#include "coop_vehicles.h" // F5: the stand's vehicle commands
+#include "coop_lua_errors.h"
+#include "coop_money.h"
+#include "coop_story.h"
+#include "coop_vehicles.h"
 #include "xrCoop/coop_limits.h"
-#include "xrCoop/coop_mode.h" // S4: the layers' own commands
+#include "xrCoop/coop_mode.h" // the layers' own commands
 
 #include <cstdlib>
 
@@ -76,7 +77,7 @@ public:
 			return;
 		}
 		if (mgr().start_host(port))
-			script::note_start(nullptr, port); // co-op menu shows the port (W4)
+			script::note_start(nullptr, port); // the co-op menu shows the port
 		else if (!mgr().active())
 			script::note_start_failed("coop_host failed, see the log");
 	}
@@ -97,7 +98,7 @@ public:
 			return;
 		}
 		if (mgr().start_client(address.c_str(), port))
-			script::note_start(address.c_str(), port); // co-op menu shows the address (W4)
+			script::note_start(address.c_str(), port); // the co-op menu shows the address
 	}
 	void Info(TInfo& I) override { xr_strcpy(I, "join a co-op session: coop_connect <ip>[:port]"); }
 };
@@ -109,7 +110,7 @@ public:
 	void Execute(LPCSTR) override
 	{
 		if (mgr().active())
-			script::note_user_stop(); // co-op menu: not an error (W4)
+			script::note_user_stop(); // the co-op menu: not an error
 		mgr().stop("left the session");
 	}
 	void Info(TInfo& I) override { xr_strcpy(I, "leave or close the co-op session"); }
@@ -219,6 +220,8 @@ public:
 };
 } // namespace
 
+// Every command and setting of the co-op, once at the start of the process, before user.ltx is read: a command registered
+// later would be "Unknown command" for its saved line.
 void register_console_commands()
 {
 	CMD1(CCC_CoopHost, "coop_host");
@@ -239,24 +242,22 @@ void register_console_commands()
 	CMD4(CCC_Integer, "coop_diag_stacks", &g_coop_diag_stacks, 0, 1); // C++ stacks of coop::diag (stall 1-2 min)
 	CMD4(CCC_Integer, "coop_diag_fail_swap", &g_coop_diag_fail_swap, 0, 1); // a live check of a session lost while the world loads
 	CMD4(CCC_Integer, "coop_max_new_characters", &g_coop_max_new_characters, int(limits::kNewCharactersMin),
-	    int(limits::kNewCharactersMax)); // host setting (Ruling F2-10 b, F2 T3 fix round 1)
+	    int(limits::kNewCharactersMax)); // host setting
 	survival::register_console();
-	checkpoints::register_console(); // F3
+	checkpoints::register_console();
 	death::register_console();
 	rest::register_console();
 	autosave::register_console();
 	presence::register_console();
+	entities::register_console();
 	npc_ai::register_console(); // scheduler viewers: coop_viewer_range, coop_viewer_frame_radius
-	register_layers_console(); // S4 (A-S4H): the layers' own: the server's srv_max_map_servers, srv_mapserver_linger, srv_map_servers_rev,
-	                           // srv_levels_status, srv_levels_audit and their old coop_* names (srv/coop_srv_console.cpp)
-	mapserver_stats_register_console(); // F3a: coop_mapserver_stats
-	dedicated::register_console(); // plan 12: coop_players, coop_kick, coop_time, coop_world, coop_console_log
-	debug::register_console(); // protocol 29: coop_debug, coop_dbg
-	lua_errors::register_console(); // 2026-11: coop_lua_errors (Lua errors survived in a session)
-	vehicles::register_console(); // F5: coop_vehicle_enter, coop_vehicle_drive, coop_vehicle_exit, coop_vehicle_status
-	router::register_console(); // R32 W2a: coop_writer_gate (log until it is switched: the census only)
-	// Registered at sync::init until build 46: later than user.ltx is read, so each start said "Unknown command" for all eight.
+	register_layers_console(); // the layers' own commands and settings, in every process
+	debug::register_console(); // coop_debug, coop_dbg, coop_ini_stats, coop_memory_map
+	lua_errors::register_console(); // coop_lua_errors (Lua errors survived in a session)
+	health_ledger::register_console(); // coop_health_ledger (the own actor's health ledger, a diagnostic)
+	vehicles::register_console(); // coop_vehicle_enter, coop_vehicle_drive, coop_vehicle_exit, coop_vehicle_status
+	router::register_console(); // coop_writer_gate (log until it is switched: the census only)
 	money::register_commands(); // coop_money_*
-	story::init(); // coop_share_rewards, coop_tasks_resync: its init is the registration, once per process
+	story::register_console(); // coop_tasks_resync, coop_share_rewards
 }
 } // namespace coop

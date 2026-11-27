@@ -1,4 +1,4 @@
-// Anomaly Coop — the rules behind the fixes of the enemy audit (2026-10-31): what a monster does about a remote player.
+// Anomaly Coop — the rules behind the enemy rules: what a monster does about a remote player.
 // Pure C++17, no engine dependencies. Tests: tests/test_enemy_rules.cpp.
 #pragma once
 
@@ -14,7 +14,7 @@ namespace enemy_rules
 constexpr float kViewCos = 0.57f; // half view cone of a player ~55 degrees (screen plus a little side vision)
 constexpr float kAwareDistance = 2.f; // that close a player notices a creature whatever he looks at
 
-// F1: a player notices a monster. The stock asks the player's own eyes, never the monster's: a monster that sleeps or
+// A player notices a monster. The stock asks the player's own eyes, never the monster's: a monster that sleeps or
 // has its back turned sees nothing, and it is the one this alerts. A proxy has no eyes, so its reported view stands in
 // (distance and view_cos from the player's head to the monster; an unknown view counts as looking).
 inline bool player_notices(float distance, bool view_known, float view_cos, bool line_clear)
@@ -45,7 +45,7 @@ inline Point closest_on_segment(const Point& a, const Point& b, const Point& p)
 	return Point{a.x + dx * t, a.y + dy * t, a.z + dz * t};
 }
 
-// F4: a proxy takes no collision damage (a puppet skips the movement update that applies it), so the host measures a
+// A proxy takes no collision damage (a puppet skips the movement update that applies it), so the host measures a
 // thrown object's flight past him.
 constexpr float kThrowReach = 1.2f; // from the middle of the body: the capsule plus the object's own size
 constexpr float kThrowBodyHeight = 1.f;
@@ -75,7 +75,7 @@ inline float thrown_power(float contact, float min_crash, float max_crash, float
 	return power < 1.f ? power : 1.f;
 }
 
-// F5: how a monster looks, which only its AI on the host knows: a bloodsucker's cloak, a poltergeist or a psy dog's phantom
+// How a monster looks, which only its AI on the host knows: a bloodsucker's cloak, a poltergeist or a psy dog's phantom
 // out of sight. It rides in the snapshot's creature flags, in the two bits that mean something for stalkers only and
 // bring no data after the anims (CreatureHolds and CreatureAims do, for any creature).
 enum class MonsterLook : uint8_t
@@ -103,7 +103,7 @@ inline MonsterLook look_of(uint8_t flags)
 	return one && two ? MonsterLook::Hidden : one ? MonsterLook::CloakPartial : two ? MonsterLook::CloakFull : MonsterLook::Shown;
 }
 
-// F3c: the host hears when a client's reload starts (PlayerShot kind Reload), not when it ends. `reported_ms` 0: never.
+// The host hears when a client's reload starts (PlayerShot kind Reload), not when it ends. `reported_ms` 0: never.
 constexpr uint32_t kReloadShownMs = 2500;
 
 inline bool reload_shown(uint32_t now_ms, uint32_t reported_ms)

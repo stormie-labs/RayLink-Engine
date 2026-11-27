@@ -13,73 +13,12 @@ constexpr double kTwoPi = 6.283185307179586476925286766559;
 
 // ---------------------------------------------------------------- Writer
 
-void Writer::u8(uint8_t v)
-{
-	m_buf.push_back(v);
-}
-
-void Writer::u16(uint16_t v)
-{
-	m_buf.push_back(uint8_t(v));
-	m_buf.push_back(uint8_t(v >> 8));
-}
-
-void Writer::u32(uint32_t v)
-{
-	for (int i = 0; i < 4; ++i)
-		m_buf.push_back(uint8_t(v >> (8 * i)));
-}
-
-void Writer::u64(uint64_t v)
-{
-	for (int i = 0; i < 8; ++i)
-		m_buf.push_back(uint8_t(v >> (8 * i)));
-}
-
-void Writer::i32(int32_t v)
-{
-	u32(static_cast<uint32_t>(v));
-}
-
-void Writer::f32(float v)
-{
-	uint32_t bits;
-	static_assert(sizeof(bits) == sizeof(v), "float must be 32 bit");
-	std::memcpy(&bits, &v, sizeof(bits));
-	u32(bits);
-}
-
-void Writer::varu(uint64_t v)
-{
-	while (v >= 0x80)
-	{
-		m_buf.push_back(uint8_t(v) | 0x80);
-		v >>= 7;
-	}
-	m_buf.push_back(uint8_t(v));
-}
-
 void Writer::str(std::string_view s)
 {
 	if (s.size() > kMaxString)
 		s = s.substr(0, kMaxString);
 	varu(s.size());
 	bytes(s.data(), s.size());
-}
-
-void Writer::bytes(const void* data, size_t size)
-{
-	if (!size || !data)
-		return;
-	const uint8_t* p = static_cast<const uint8_t*>(data);
-	m_buf.insert(m_buf.end(), p, p + size);
-}
-
-void Writer::vec3(const float v[3])
-{
-	f32(v[0]);
-	f32(v[1]);
-	f32(v[2]);
 }
 
 void Writer::angle16(float radians)

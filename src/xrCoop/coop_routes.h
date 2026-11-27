@@ -1,4 +1,4 @@
-// Anomaly Coop - callback route table (MOD_LAYER.md §2.2, F2 T9). Decides on which machine a Lua callback handler
+// Anomaly Coop - callback route table (MOD_LAYER.md §2.2). Decides on which machine a Lua callback handler
 // runs: the key is the pair (callback name, script of the handler), the stock callbacks have defaults by callback, and
 // ltx sections override them.
 //   host  - only on the host (world events, spawn, story, emission, NPC death, saving)
@@ -6,13 +6,15 @@
 //           calls it makes into the world are gated by the call router (§2.3)
 //   view  - everywhere (HUD, sound, particles, UI, data that every machine reads)
 //   none  - nowhere in co-op (mechanics the engine replaced, debug tools); `blocked` is the old name
-//   level - the behaviour of an object online on a level: runs on the process that computes it (F3a): the host for its level
+//   level - the behaviour of an object online on a level: runs on the process that computes it: the host for its level
 //           and, with split levels, a map server
 // Names (callbacks and scripts) compare case-insensitively: an ltx reader may lowercase keys, Lua sends the real case.
-// F2 T10 adds what the router needs besides the table: script_key (a function's script from its Lua source) and the
-// call counters. F2 T11 adds the binder rules: whether a client calls a method the engine calls on a script binder.
+// Besides the table, what the router needs: script_key (a function's script from its Lua source), the call counters, and the
+// binder rules (whether a client calls a method the engine calls on a script binder).
 // Pure C++17, header-only, no engine dependencies: used by the engine, the unit-test exe and the Lua test runner.
 #pragma once
+
+#include "coop_text.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -52,48 +54,10 @@ inline const char* domain_name(Domain d)
 	return "owner";
 }
 
-namespace detail
-{
-inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
-
-inline bool iequals(std::string_view a, std::string_view b)
-{
-	if (a.size() != b.size())
-		return false;
-	for (size_t i = 0; i < a.size(); ++i)
-		if (lower(a[i]) != lower(b[i]))
-			return false;
-	return true;
-}
-
-inline bool istarts_with(std::string_view s, std::string_view prefix)
-{
-	return s.size() >= prefix.size() && iequals(s.substr(0, prefix.size()), prefix);
-}
-
-inline std::string lowered(std::string_view s)
-{
-	std::string r(s);
-	for (char& c : r)
-		c = lower(c);
-	return r;
-}
-
-inline std::string_view trimmed(std::string_view s)
-{
-	const std::string_view ws = " \t\r\n";
-	const size_t b = s.find_first_not_of(ws);
-	if (b == std::string_view::npos)
-		return {};
-	const size_t e = s.find_last_not_of(ws);
-	return s.substr(b, e - b + 1);
-}
-} // namespace detail
-
 // Accepts host, owner, view, none, blocked (= none), level; surrounding blanks and letter case are ignored.
 inline bool parse_domain(std::string_view text, Domain& out)
 {
-	const std::string_view t = detail::trimmed(text);
+	const std::string_view t = ascii::trim(text, ascii::space_or_eol);
 	struct Name
 	{
 		std::string_view name;
@@ -102,7 +66,7 @@ inline bool parse_domain(std::string_view text, Domain& out)
 	static constexpr Name kNames[] = {{"host", Domain::Host}, {"owner", Domain::Owner}, {"view", Domain::View},
 		{"none", Domain::None}, {"blocked", Domain::None}, {"level", Domain::Level}};
 	for (const Name& n : kNames)
-		if (detail::iequals(t, n.name))
+		if (ascii::iequals(t, n.name))
 		{
 			out = n.domain;
 			return true;
@@ -112,9 +76,9 @@ inline bool parse_domain(std::string_view text, Domain& out)
 
 // Pseudo-callback names the Lua shim uses for AddUniqueCall and CreateTimeEvent. They have no callback of their own:
 // the handler's script decides, owner by default: a timer follows its script like the script's callbacks, so a client
-// mod is never half on (fix round 2, review I2: a callback that starts an action and a time event that ends it). World
-// scripts (tasks_*, xr_effects, simulation_objects ...) are host by their generated rules (configs\coop_route_stock.ltx
-// / coop_route_gamma.ltx, Ruling F2-29), whatever registers them.
+// mod is never half on (a callback that starts an action and a time event that ends it). World scripts (tasks_*,
+// xr_effects, simulation_objects ...) are host by their generated rules (configs\coop_route_*.ltx), whatever registers
+// them.
 inline constexpr std::string_view kUniqueCall = "unique_call";
 inline constexpr std::string_view kTimeEvent = "time_event";
 
@@ -126,7 +90,7 @@ struct StockRoute
 
 // Every callback of axr_main.script's `intercepts` table (engine gamedata, lines 49-233), group by group in the file's
 // order: 140 live rows and the 7 rows the stock file has commented out (a mod that adds one of those gets its group's
-// domain). Then the names the brief adds. tests/test_routes.cpp checks this list against the file.
+// domain). Then the names axr_main does not list. tests/test_routes.cpp checks this list against the file.
 inline constexpr StockRoute kStockRoutes[] = {
 	// Player: the local actor -> owner
 	{"on_before_level_changing", Domain::Owner},
@@ -185,8 +149,8 @@ inline constexpr StockRoute kStockRoutes[] = {
 	{"actor_on_before_throwable_select", Domain::Owner},
 
 	// NPCs: AI and world -> host. Except the player's own use action (here and in Mutants, Physical objects): it fires
-	// on the machine whose actor pressed "use" (bind_monster.script:291 use_callback; GAMMA ui_mutant_loot.script:172
-	// sends monster_on_loot_init for that player's loot window), and only a CPhysicObject use is moved to the host
+	// on the machine whose actor pressed "use" (bind_monster.script:291 use_callback; a mod's loot window sends
+	// monster_on_loot_init for that player's window), and only a CPhysicObject use is moved to the host
 	// (client_intercept_use, coop_objects.cpp), where owner runs it as well. Host would drop the NPC and mutant ones
 	// for a client, so owner; world logic in those handlers stays on the host through script rules (treasure_manager,
 	// grok_stashes_on_corpses = host).
@@ -305,7 +269,7 @@ inline constexpr StockRoute kStockRoutes[] = {
 	{"on_get_item_cost", Domain::View},
 	{"bullet_on_hit", Domain::View},
 
-	// Not in intercepts, named by the brief
+	// Not in intercepts
 	{"on_xml_read", Domain::View}, // modxml_core
 	{kUniqueCall, Domain::Owner}, // see kUniqueCall
 	{kTimeEvent, Domain::Owner},
@@ -328,13 +292,11 @@ inline constexpr StockRoute kPrefixRoutes[] = {
 	{"on_key_", Domain::View},
 };
 
-inline size_t stock_count() { return sizeof(kStockRoutes) / sizeof(kStockRoutes[0]); }
-
 // The explicit entry of a known callback; false for a name only the prefixes or the fallback cover.
 inline bool stock_domain(std::string_view callback, Domain& out)
 {
 	for (const StockRoute& r : kStockRoutes)
-		if (detail::iequals(r.callback, callback))
+		if (ascii::iequals(r.callback, callback))
 		{
 			out = r.domain;
 			return true;
@@ -351,7 +313,7 @@ inline Domain default_of(std::string_view callback)
 	if (stock_domain(callback, d))
 		return d;
 	for (const StockRoute& r : kPrefixRoutes)
-		if (detail::istarts_with(callback, r.callback))
+		if (ascii::istarts_with(callback, r.callback))
 			return r.domain;
 	return Domain::Owner;
 }
@@ -392,11 +354,11 @@ inline std::vector<Override> parse_section(std::string_view section,
 	const std::vector<std::pair<std::string, std::string>>& lines, std::vector<std::string>* errors)
 {
 	std::vector<Override> out;
-	const std::string_view sec = detail::trimmed(section);
+	const std::string_view sec = ascii::trim(section, ascii::space_or_eol);
 	Override::Kind kind = Override::Script;
 	bool known = false;
 	for (const Override::Kind k : {Override::Script, Override::Callback, Override::Forced, Override::Pair})
-		if (detail::iequals(sec, section_of(k)))
+		if (ascii::iequals(sec, section_of(k)))
 		{
 			kind = k;
 			known = true;
@@ -411,8 +373,8 @@ inline std::vector<Override> parse_section(std::string_view section,
 
 	for (const std::pair<std::string, std::string>& line : lines)
 	{
-		const std::string_view key = detail::trimmed(line.first);
-		const std::string_view value = detail::trimmed(line.second);
+		const std::string_view key = ascii::trim(line.first, ascii::space_or_eol);
+		const std::string_view value = ascii::trim(line.second, ascii::space_or_eol);
 		const char* why = nullptr;
 		Override o;
 		o.kind = kind;
@@ -427,8 +389,8 @@ inline std::vector<Override> parse_section(std::string_view section,
 				why = "expected callback@script";
 			else
 			{
-				o.callback = std::string(detail::trimmed(key.substr(0, at)));
-				o.script = std::string(detail::trimmed(key.substr(at + 1)));
+				o.callback = std::string(ascii::trim(key.substr(0, at), ascii::space_or_eol));
+				o.script = std::string(ascii::trim(key.substr(at + 1), ascii::space_or_eol));
 				if (o.callback.empty() || o.script.empty())
 					why = "expected callback@script";
 				else if (o.callback.find('*') != std::string::npos || o.script.find('*') != std::string::npos)
@@ -463,13 +425,13 @@ inline std::vector<Override> parse_section(std::string_view section,
 	return out;
 }
 
-// --- F2 T11: the methods the engine itself calls on a script binder (CScriptBinder, xrGame/script_binder.cpp) ---
+// --- the methods the engine itself calls on a script binder (CScriptBinder, xrGame/script_binder.cpp) ---
 // Not callbacks: Anomaly's binders are Lua classes derived from object_binder, and the engine calls their methods by name
 // (update every shedule tick, net_spawn, save ...). The section of the object names the class's creator in
 // `script_binding = bind_camp.bind` (script.function); that string is the key here, so the engine decides whether a client
 // calls a method before it enters Lua. Lua-called methods (a binder's own helpers) cannot be reached from here and stay in
 // scripts\coop_client_binders.script, and so does every "keep running through a Lua error" rule: the Release engine has no C++
-// exceptions, a Lua error there is fatal, and only a Lua pcall around the method survives it (Ruling F2-35).
+// exceptions, a Lua error there is fatal, and only a Lua pcall around the method survives it.
 //   Run      - call it, as the stock game does: the host, single player, a binding no rule names
 //   HostOnly - do not call it on a client: world logic only the host runs ([binder_host]); a client keeps the C++ default
 enum class BinderAction : uint8_t
@@ -477,16 +439,6 @@ enum class BinderAction : uint8_t
 	Run,
 	HostOnly
 };
-
-inline const char* binder_action_name(BinderAction a)
-{
-	switch (a)
-	{
-	case BinderAction::Run: return "run";
-	case BinderAction::HostOnly: return "host";
-	}
-	return "run";
-}
 
 // The Lua names of the methods the engine calls, in the order of the engine enum coop::router::BinderMethod.
 // (net_Relcase is not among them: CScriptBinderObjectWrapper::net_Relcase does not call Lua, and the engine asks it of
@@ -520,7 +472,7 @@ inline bool is_binding_name(std::string_view s)
 			++parts;
 			len = 0;
 		}
-		else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
+		else if (ascii::ident_char(c))
 			++len;
 		else
 			return false;
@@ -531,7 +483,7 @@ inline bool is_binding_name(std::string_view s)
 inline int binder_method_index(std::string_view name)
 {
 	for (size_t i = 0; i < kBinderMethodCount; ++i)
-		if (iequals(name, kBinderMethodNames[i]))
+		if (ascii::iequals(name, kBinderMethodNames[i]))
 			return int(i);
 	return -1;
 }
@@ -544,8 +496,8 @@ inline std::vector<BinderRule> parse_binder_section(std::string_view section,
 	const std::vector<std::pair<std::string, std::string>>& lines, std::vector<std::string>* errors)
 {
 	std::vector<BinderRule> out;
-	const std::string_view sec = detail::trimmed(section);
-	if (!detail::iequals(sec, kBinderHostSection))
+	const std::string_view sec = ascii::trim(section, ascii::space_or_eol);
+	if (!ascii::iequals(sec, kBinderHostSection))
 	{
 		if (errors)
 			errors->push_back(std::string(sec) + ": unknown section (" + kBinderHostSection + ")");
@@ -554,8 +506,8 @@ inline std::vector<BinderRule> parse_binder_section(std::string_view section,
 
 	for (const std::pair<std::string, std::string>& line : lines)
 	{
-		const std::string_view key = detail::trimmed(line.first);
-		const std::string_view value = detail::trimmed(line.second);
+		const std::string_view key = ascii::trim(line.first, ascii::space_or_eol);
+		const std::string_view value = ascii::trim(line.second, ascii::space_or_eol);
 		BinderRule rule;
 		rule.action = BinderAction::HostOnly;
 		rule.binding = std::string(key);
@@ -617,24 +569,24 @@ public:
 			break;
 		case Override::Forced:
 			if (!o.callback.empty())
-				m_forced[detail::lowered(o.callback)] = o.domain;
+				m_forced[ascii::lowered(o.callback)] = o.domain;
 			break;
 		case Override::Callback:
 			if (!o.callback.empty())
-				m_callbacks[detail::lowered(o.callback)] = o.domain;
+				m_callbacks[ascii::lowered(o.callback)] = o.domain;
 			break;
 		case Override::Script:
 			if (o.script.empty())
 				break;
 			if (o.script.back() == '*')
-				add_prefix(detail::lowered(std::string_view(o.script).substr(0, o.script.size() - 1)), o.domain);
+				add_prefix(ascii::lowered(std::string_view(o.script).substr(0, o.script.size() - 1)), o.domain);
 			else
-				m_scripts[detail::lowered(o.script)] = o.domain;
+				m_scripts[ascii::lowered(o.script)] = o.domain;
 			break;
 		}
 	}
 
-	// F2 T11: a binder rule gives each of its methods the rule's action. Rules without a binding or a method are ignored
+	// A binder rule gives each of its methods the rule's action. Rules without a binding or a method are ignored
 	// (parse_binder_section never makes them).
 	void add(const BinderRule& r)
 	{
@@ -642,7 +594,7 @@ public:
 			return;
 		for (const std::string& m : r.methods)
 			if (!m.empty())
-				m_binders[detail::lowered(r.binding)][detail::lowered(m)] = r.action;
+				m_binders[ascii::lowered(r.binding)][ascii::lowered(m)] = r.action;
 	}
 
 	// Whether a client calls `method` of the binder created by `binding` (the object's script_binding, script.function).
@@ -650,10 +602,10 @@ public:
 	{
 		if (m_binders.empty() || binding.empty() || method.empty())
 			return BinderAction::Run;
-		const auto b = m_binders.find(detail::lowered(binding));
+		const auto b = m_binders.find(ascii::lowered(binding));
 		if (b == m_binders.end())
 			return BinderAction::Run;
-		const auto m = b->second.find(detail::lowered(method));
+		const auto m = b->second.find(ascii::lowered(method));
 		return m == b->second.end() ? BinderAction::Run : m->second;
 	}
 
@@ -683,26 +635,26 @@ public:
 		return m_pairs.size() + m_forced.size() + m_callbacks.size() + m_scripts.size() + m_prefixes.size();
 	}
 
-	// F3a multilevel: [level_scripts] and [level_callbacks] (configs\coop_compat_split_levels.ltx). They do not change route(): a
+	// [level_scripts] and [level_callbacks] (configs\coop_compat_split_levels.ltx). They do not change route(): a
 	// route says where a handler runs in a session with one level. They name, among the handlers that run on the host, the
 	// behaviour of an object online on a level (docs/SPLIT_LEVELS.md §4), which runs on the process that computes that level.
-	void add_level_script(std::string_view script) { m_level_scripts.insert(detail::lowered(detail::trimmed(script))); }
-	void add_level_callback(std::string_view callback) { m_level_callbacks.insert(detail::lowered(detail::trimmed(callback))); }
+	void add_level_script(std::string_view script) { m_level_scripts.insert(ascii::lowered(ascii::trim(script, ascii::space_or_eol))); }
+	void add_level_callback(std::string_view callback) { m_level_callbacks.insert(ascii::lowered(ascii::trim(callback, ascii::space_or_eol))); }
 	// A listed script, whatever the callback; a listed callback of a script that has no rule of its own (a world script keeps
 	// the host whatever it listens to).
 	bool level_behaviour(std::string_view callback, std::string_view script) const
 	{
-		const std::string sc = detail::lowered(script);
+		const std::string sc = ascii::lowered(script);
 		if (m_level_scripts.count(sc))
 			return true;
 		Domain by_script = Domain::Owner;
-		return !script_rule(sc, by_script) && m_level_callbacks.count(detail::lowered(callback)) != 0;
+		return !script_rule(sc, by_script) && m_level_callbacks.count(ascii::lowered(callback)) != 0;
 	}
 
 	Domain route(std::string_view callback, std::string_view script) const
 	{
-		const std::string cb = detail::lowered(callback);
-		const std::string sc = detail::lowered(script);
+		const std::string cb = ascii::lowered(callback);
+		const std::string sc = ascii::lowered(script);
 
 		if (!m_pairs.empty())
 		{
@@ -729,6 +681,14 @@ public:
 		return default_of(cb);
 	}
 
+	// Where a handler of (callback, script) runs: route(), raised to Level for the behaviour of an object online on a level
+	// (level_behaviour: it runs where Host runs, and on a map server). What coop.route.of and coop.route.rule_of answer.
+	Domain rule(std::string_view callback, std::string_view script) const
+	{
+		const Domain d = this->route(callback, script);
+		return d == Domain::Host && level_behaviour(callback, script) ? Domain::Level : d;
+	}
+
 private:
 	struct Prefix
 	{
@@ -738,9 +698,9 @@ private:
 
 	static std::string pair_key(std::string_view callback, std::string_view script)
 	{
-		std::string key = detail::lowered(callback);
+		std::string key = ascii::lowered(callback);
 		key += '@';
-		key += detail::lowered(script);
+		key += ascii::lowered(script);
 		return key;
 	}
 
@@ -779,8 +739,8 @@ private:
 	std::map<std::string, Domain> m_forced;    // callback, lowercase
 	std::map<std::string, Domain> m_callbacks; // callback, lowercase
 	std::map<std::string, Domain> m_scripts;   // exact script, lowercase
-	std::set<std::string> m_level_scripts;     // F3a multilevel, lowercase
-	std::set<std::string> m_level_callbacks;   // F3a multilevel, lowercase
+	std::set<std::string> m_level_scripts;     // lowercase
+	std::set<std::string> m_level_callbacks;   // lowercase
 	std::vector<Prefix> m_prefixes;            // script prefix without the *, lowercase
 	std::map<std::string, std::map<std::string, BinderAction>> m_binders; // binding -> method -> action, lowercase
 };
@@ -799,15 +759,15 @@ inline bool runs_here(Domain d, bool is_host, bool leads_level)
 	return false;
 }
 
-// --- F2 T10: what the router (xrGame/coop/coop_router.cpp) needs besides the table ---
+// --- what the router (xrGame/coop/coop_router.cpp) needs besides the table ---
 
 // The key of the script a Lua function comes from, given its lua_Debug::source:
 //   "@D:\...\gamedata\scripts\xr_combat_ignore.script"          -> "xr_combat_ignore"
 //     a .script by its base name: the engine loads them from the scripts root by name;
-//   "@.\gamedata\scripts\illish\patches\xr_combat_ignore.lua"   -> "illish.patches.xr_combat_ignore"
+//   "@.\gamedata\scripts\some_mod\patches\xr_combat_ignore.lua" -> "some_mod.patches.xr_combat_ignore"
 //     a .lua by its path under the scripts folder, folders joined by dots (the name require gives it). Never its bare
-//     base name: GAMMA's patch of a stock script is its own script, not the stock one (live bug 2026-10-23: the old
-//     Lua filter took illish\patches\xr_combat_ignore.lua for the stock host-only xr_combat_ignore). The folder is
+//     base name: a mod's patch of a stock script is its own script, not the stock one (taken by its base name, a
+//     patch of the host-only xr_combat_ignore would be host-only too). The folder is
 //     the part after the last "\gamedata\scripts\", else after the last "\scripts\", else the path itself without a
 //     drive and leading ".\" / "..\";
 //   anything else (no .script / .lua: a string chunk, "=[C]", "@console_command") -> "?".
@@ -816,7 +776,7 @@ inline std::string script_key(std::string_view source)
 {
 	if (!source.empty() && (source.front() == '@' || source.front() == '='))
 		source.remove_prefix(1);
-	std::string p = "\\" + detail::lowered(source); // a leading separator: "scripts\x.lua" matches "\scripts\" too
+	std::string p = "\\" + ascii::lowered(source); // a leading separator: "scripts\x.lua" matches "\scripts\" too
 	for (char& c : p)
 		if (c == '/')
 			c = '\\';
@@ -882,12 +842,12 @@ enum class Outcome : uint8_t
 // Accepts ran, skipped, error; surrounding blanks and letter case are ignored.
 inline bool parse_outcome(std::string_view text, Outcome& out)
 {
-	const std::string_view t = detail::trimmed(text);
-	if (detail::iequals(t, "ran"))
+	const std::string_view t = ascii::trim(text, ascii::space_or_eol);
+	if (ascii::iequals(t, "ran"))
 		out = Outcome::Ran;
-	else if (detail::iequals(t, "skipped"))
+	else if (ascii::iequals(t, "skipped"))
 		out = Outcome::Skipped;
-	else if (detail::iequals(t, "error"))
+	else if (ascii::iequals(t, "error"))
 		out = Outcome::Error;
 	else
 		return false;
@@ -896,7 +856,7 @@ inline bool parse_outcome(std::string_view text, Outcome& out)
 
 // Call counters of the router: per domain (ran, skipped, errors) and skips per (callback, script) pair, named like a
 // [route_pairs] key ("actor_on_update@guards_spawner"; the script alone when the callback is not given).
-// Review M2: a handler skipped every frame tops "the most skipped"; a rare one (a use, a key press) would never get
+// A handler skipped every frame tops "the most skipped"; a rare one (a use, a key press) would never get
 // there, so the pairs skipped for the first time most recently are kept too ("latest new skips").
 // The pair table is bounded (kMaxPairs); a pair past that counts in its domain only.
 class Counters
@@ -910,17 +870,20 @@ public:
 		uint64_t ran = 0, skipped = 0, errors = 0;
 	};
 
-	void note(Domain d, Outcome o, std::string_view script, std::string_view callback = {})
+	// `count` calls with that outcome, in one step: the same totals, pairs and order as `count` single notes.
+	void note(Domain d, Outcome o, std::string_view script, std::string_view callback = {}, uint64_t count = 1)
 	{
+		if (count == 0)
+			return;
 		Totals& t = m_totals[size_t(d) < kDomains ? size_t(d) : 0];
 		switch (o)
 		{
-		case Outcome::Ran: ++t.ran; break;
-		case Outcome::Error: ++t.errors; break;
+		case Outcome::Ran: t.ran += count; break;
+		case Outcome::Error: t.errors += count; break;
 		case Outcome::Skipped:
-			++t.skipped;
+			t.skipped += count;
 			if (!script.empty())
-				note_skip(script, callback);
+				note_skip(script, callback, count);
 			break;
 		}
 	}
@@ -980,7 +943,7 @@ private:
 	};
 	using Callbacks = std::map<std::string, Skip, std::less<>>; // std::less<>: find() by string_view, no allocation
 
-	void note_skip(std::string_view script, std::string_view callback)
+	void note_skip(std::string_view script, std::string_view callback, uint64_t count)
 	{
 		auto it = m_skips.find(script);
 		if (it != m_skips.end())
@@ -988,18 +951,18 @@ private:
 			const auto jt = it->second.find(callback);
 			if (jt != it->second.end())
 			{
-				++jt->second.count;
+				jt->second.count += count;
 				return;
 			}
 		}
 		if (m_pairs >= kMaxPairs)
 		{
-			++m_dropped;
+			m_dropped += count;
 			return;
 		}
 		if (it == m_skips.end())
 			it = m_skips.emplace(std::string(script), Callbacks()).first;
-		it->second.emplace(std::string(callback), Skip{1, ++m_seq});
+		it->second.emplace(std::string(callback), Skip{count, ++m_seq});
 		++m_pairs;
 	}
 

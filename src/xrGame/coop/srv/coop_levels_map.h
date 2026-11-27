@@ -1,4 +1,4 @@
-// Anomaly Coop - which seats of the world server's table a LevelMap lists (docs/plans/2026-11-12-split-levels-native.md §1.3).
+// Anomaly Coop - which seats of the world server's table a LevelMap lists.
 // A seat that plays no character (Seat::plays false: the world server's own seat on a dedicated host) is no player: it gets no player
 // row and its level no server row of its own, so a client's level_of_player(0) is "no level" there (no "Fake start" in the HUD).
 // Pure C++17, header-only, no engine dependencies: used by xrGame (coop/coop_levels.cpp, host_send_map) and by the unit-test exe.

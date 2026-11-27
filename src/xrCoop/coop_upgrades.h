@@ -1,4 +1,4 @@
-// Anomaly Coop — which upgrades of a list the engine can install, in that order, without a FATAL (R3 В6 review).
+// Anomaly Coop — which upgrades of a list the engine can install, in that order, without a FATAL.
 // CInventoryItem::net_Spawn and our ItemState apply install with loading = true, and there
 // inventory::upgrade::Group::can_install is FATAL instead of a refusal:
 //   result_e_parents  a non-root parent upgrade of the upgrade's group has no installed upgrade in its own group;
@@ -122,7 +122,7 @@ inline bool defaults_ok(const std::vector<Upgrade>& defaults)
 inline Verdict verdict_of_added(
     const std::vector<Upgrade>& entity, const Upgrade& added, const std::vector<Upgrade>& defaults)
 {
-	// F0 final review (task 10b): one the list names is there, whatever the replay makes of that mention (it may
+	// One the list names is there, whatever the replay makes of that mention (it may
 	// refuse an earlier mention and take this one): CSE add_upgrade is FATAL on a duplicate id.
 	for (const Upgrade& u : entity)
 		if (u.id == added.id)

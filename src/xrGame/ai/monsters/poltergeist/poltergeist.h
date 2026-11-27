@@ -36,7 +36,7 @@ class CPoltergeist : public CBaseMonster,
 
 	TTime m_last_detection_time;
 	Fvector m_last_actor_pos;
-	u16 m_target_id = u16(-1); // Anomaly Coop (audit A4): the player the senses follow (nearest); -1 = the actor
+	u16 m_target_id = u16(-1); // coop: the player the senses follow (nearest); -1 = the actor
 	char const* m_detection_pp_effector_name;
 	u32 m_detection_pp_type_index;
 	float m_detection_near_range_factor;
@@ -81,7 +81,7 @@ public:
 	virtual char* get_monster_class_name() { return "poltergeist"; }
 
 	bool detected_enemy();
-	void coop_flame(const Fvector& position, const Fvector& dir); // Anomaly Coop (audit F5c): the host's flame on a puppet
+	void coop_flame(const Fvector& position, const Fvector& dir); // coop: the host's flame on a puppet
 	float get_fly_around_distance() const { return m_fly_around_distance; }
 	float get_fly_around_change_direction_time() const { return m_fly_around_change_direction_time; }
 
@@ -131,7 +131,7 @@ private:
 	float m_fly_around_change_direction_time;
 
 	float get_current_detection_level() const { return m_current_detection_level; }
-	CEntityAlive* detection_target() const; // Anomaly Coop: the player it senses and attacks (the actor alone: as before)
+	CEntityAlive* detection_target() const; // coop: the player it senses and attacks (the actor alone: as before)
 	bool check_work_condition() const;
 	void remove_pp_effector();
 	void update_detection();
@@ -274,7 +274,7 @@ public:
 	virtual void update_schedule();
 	virtual void on_destroy();
 	virtual void on_die();
-	void coop_play(const Fvector& position, const Fvector& dir); // Anomaly Coop (audit F5c)
+	void coop_play(const Fvector& position, const Fvector& dir); // coop: a client plays the host's flame
 
 private:
 	void select_state(SFlameElement* elem, EFlameState state);

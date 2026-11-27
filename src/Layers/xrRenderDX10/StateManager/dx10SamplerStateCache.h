@@ -49,7 +49,7 @@ private:
 	};
 
 private:
-	void CreateState(StateDecs desc, IDeviceState** ppIState);
+	HRESULT CreateState(StateDecs desc, IDeviceState** ppIState);
 	SHandle FindState(const StateDecs& desc, u32 StateCRC);
 
 	void PrepareSamplerStates(

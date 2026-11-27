@@ -1,13 +1,16 @@
 // Ядро: без проверок режима (docs/MODES.md)
-// Anomaly Coop - TZ P50 (Dev 58): collision between players where they appear and at level exits (coop_player_touch.h; the
+// Anomaly Coop - collision between players where they appear and at level exits (coop_player_touch.h; the
 // rule and the thresholds: xrCoop/coop_player_touch_rules.h).
 //
 // Who decides: the machine that plays the actor, for its own actor (its CPHActorCharacter is the only body here that the
 // physics pushes on a player's behalf; the other players are avatars placed from their snapshots). What it uses: its actor, the
 // avatars (characters of the player section; each one's distance counts only once players::drive_avatar has placed it from
 // its player's snapshots since it spawned here, players::placed), the level's exits as this machine has them: the online
-// level changers (g_lchangers) and the route restrictors coop_transition_route.script lists (coop.player_touch_zones).
-// Nothing goes over the network: each player's machine decides for its own actor from the same facts.
+// level changers (g_lchangers) and the route restrictors coop_transition_route.script lists (coop.player_touch_zones), and
+// the arrival places of the level: the destination points (m_tNextPosition) of every level changer of the game that
+// leads here, read from this machine's ALife (all.spawn), the same on every machine. Nothing goes over the network: each
+// player's machine decides for its own actor from facts both machines of a pair hold alike (the places, the positions, the
+// appearance). Single player: no session, nothing here runs (on_here).
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_player_touch.h"
@@ -17,11 +20,18 @@
 #include "xrCoop/coop_mode.h"
 #include "xrCoop/coop_player_touch_rules.h"
 #include "xrCoop/coop_shapes.h"
+#include "coop_lua.h" // lua_api::fill
 
 #include "Level.h"
 #include "Actor.h"
 #include "GameObject.h"
 #include "level_changer.h"
+#include "ai_space.h"
+#include "alife_simulator.h"
+#include "alife_object_registry.h"
+#include "alife_graph_registry.h"
+#include "game_graph.h"
+#include "xrServer_Objects_ALife.h"
 #include "space_restrictor.h"
 #include "PhysicsShellHolder.h"
 #include "CharacterPhysicsSupport.h"
@@ -41,15 +51,14 @@ namespace
 constexpr u16 kNone = 0xffff;
 constexpr size_t kMaxZones = 256; // route restrictors of one level (a level has a dozen); more is not a list of exits
 constexpr u32 kLogLines = 32; // pair switches logged per session
+constexpr size_t kMaxPlaces = 256; // arrival places of one level (the game has 124 exits in all)
 
-struct Avatar
-{
-	bool off; // the pair of the actor and this character: no contacts
-	bool at_exit; // this character is at a level exit (near_exit)
-};
-
-xr_map<u16, Avatar> g_avatars; // this machine's numbering: the other players' characters seen in this world
+xr_map<u16, Pair> g_avatars; // this machine's numbering: the other players' characters in this world, the actor's pair with each
+// the actor's flags of its last frame with a body (where it stood then, no memory beyond it: near_exit, near_spawn)
 bool g_me_near = false; // the actor is at a level exit
+bool g_me_at_place = false; // the actor is at an arrival place
+xr_vector<float> g_places; // the arrival places of this level (x, y, z each), the same on every machine
+bool g_places_read = false; // ... read for this world (the actor's spawn reads them again)
 u16 g_me = kNone; // the actor whose body carries the player class
 xr_vector<u16> g_zones; // the route restrictors of the level (coop.player_touch_zones), this machine's numbering
 u32 g_logged = 0;
@@ -139,34 +148,68 @@ float exit_distance(const Fvector& p)
 	return best;
 }
 
-void log_switch(const CGameObject* obj, bool off, bool my_near, bool his_near, float apart)
+void log_switch(const CGameObject* obj, bool off, bool at_exit, bool at_spawn, float apart)
 {
 	++g_switches;
 	if (++g_logged > kLogLines)
 		return;
-	const char* why = !off ? "apart" : (my_near || his_near) ? "at a level exit" : "appeared";
+	const char* why = !off ? "apart" : at_exit ? "at a level exit" : at_spawn ? "at a spawn place" : "appeared";
 	::Msg("[coop] touch: player character %u '%s' %s my actor (%s, %.1f m)", obj->ID(), obj->cName().c_str(),
 	    off ? "passes through" : "collides with", why, apart);
 }
+
+void to_floats(const Fvector& v, float out[3])
+{
+	out[0] = v.x;
+	out[1] = v.y;
+	out[2] = v.z;
+}
+
+// The arrival places of this level, from this machine's ALife: the destination point of every level changer of the game
+// whose next vertex is on this level (the stock exit's m_tNextPosition: where a single player's level change, the host's ring of a
+// group transition and Server's arrival put who comes). all.spawn is the same on every machine, so are the places. No ALife
+// (not up yet): none, read again next frame.
+void read_places()
+{
+	g_places.clear();
+	g_places_read = false;
+	if (!ai().get_alife() || !ai().get_game_graph())
+		return;
+	const CGameGraph& gg = ai().game_graph();
+	const GameGraph::_LEVEL_ID here = ai().alife().graph().level().level_id();
+	for (const auto& it : ai().alife().objects().objects())
+	{
+		CSE_ALifeLevelChanger* lc = smart_cast<CSE_ALifeLevelChanger*>(it.second);
+		if (!lc || !gg.valid_vertex_id(lc->m_tNextGraphID) || gg.vertex(lc->m_tNextGraphID)->level_id() != here)
+			continue;
+		if (g_places.size() >= 3 * kMaxPlaces)
+			break;
+		g_places.push_back(lc->m_tNextPosition.x);
+		g_places.push_back(lc->m_tNextPosition.y);
+		g_places.push_back(lc->m_tNextPosition.z);
+	}
+	g_places_read = true;
+	if (++g_logged <= kLogLines)
+		::Msg("[coop] touch: %u arrival place(s) on this level: players pass through each other within %.0f m of them",
+		    u32(g_places.size() / 3), kSpawnFar);
+}
+
+float place_distance(const float p[3]) { return to_places(g_places.data(), g_places.size() / 3, p); }
 
 // A player character other than the actor: the pair starts off (new or appeared again) and the body passes players.
 void track(CGameObject* obj, bool appeared_now)
 {
 	auto it = g_avatars.find(obj->ID());
+	const bool start = it == g_avatars.end() || appeared_now;
 	if (it == g_avatars.end())
-	{
-		Avatar a;
-		a.off = false;
-		a.at_exit = false;
-		appeared(a.off);
-		it = g_avatars.emplace(obj->ID(), a).first;
-	}
-	else if (appeared_now)
-		appeared(it->second.off);
+		it = g_avatars.emplace(obj->ID(), Pair()).first;
+	if (start)
+		pair_start(it->second);
 	mark(body_of(obj), true, it->second.off);
 	if (appeared_now && ++g_logged <= kLogLines)
-		::Msg("[coop] touch: player character %u '%s' appeared here: passes through my actor until %.0f m apart", obj->ID(),
-		    obj->cName().c_str(), kApart);
+		::Msg("[coop] touch: player character %u '%s' appeared here: passes through my actor until both are %.0f m from the "
+		      "level's arrival places and %.0f m apart",
+		    obj->ID(), obj->cName().c_str(), kSpawnFar, kApart);
 }
 } // namespace
 
@@ -179,8 +222,10 @@ void on_spawn(CGameObject* obj)
 		// the actor came into this world (a load, an arrival): its spot may be any player's
 		++g_spawns;
 		for (auto& it : g_avatars)
-			appeared(it.second.off);
+			pair_start(it.second);
 		g_me_near = false;
+		g_me_at_place = false;
+		g_places_read = false; // a world of its own (another level): its arrival places are read on its first frame
 		g_me = obj->ID();
 		mark(body_of(obj), true, false);
 		for (auto& it : g_avatars)
@@ -210,10 +255,13 @@ void frame()
 		reset();
 		return;
 	}
+	if (!g_places_read)
+		read_places();
 	CGameObject* me = smart_cast<CGameObject*>(g_actor);
 	CPHObject* mine = body_of(me);
 	if (!mine)
-		return; // no actor here now, or no body (dead, in a vehicle): the pairs keep their state
+		return; // no actor here now, or no body (dead, in a vehicle): the pairs keep their state; the actor's flags are taken
+		        // anew from where it stands on its next frame with a body
 	if (g_me != me->ID())
 	{
 		unmark(g_me);
@@ -221,7 +269,11 @@ void frame()
 	}
 	mark(mine, true, false);
 	const Fvector at = me->Position();
+	float my_pos[3];
+	to_floats(at, my_pos);
+	// where the actor stands now (no band, no memory: the other machines take its avatar's flags from its position alike)
 	g_me_near = near_exit(g_me_near, exit_distance(at));
+	g_me_at_place = near_spawn(g_me_at_place, place_distance(my_pos));
 	for (auto it = g_avatars.begin(); it != g_avatars.end();)
 	{
 		CGameObject* obj = object_here(it->first);
@@ -230,23 +282,27 @@ void frame()
 			it = g_avatars.erase(it); // gone from this world: its next spawn is a new pair
 			continue;
 		}
-		Avatar& a = it->second;
+		Pair& a = it->second;
 		const Fvector& his = obj->Position();
-		a.at_exit = near_exit(a.at_exit, exit_distance(his));
+		float his_pos[3];
+		to_floats(his, his_pos);
 		const bool was_off = a.off;
-		const float apart = at.distance_to(his);
-		// his avatar counts from where his own snapshots put it, not from where it spawned here (the host's blind ring spot)
-		collides(a.off, g_me_near, a.at_exit, apart_known(players::placed(obj->ID()), apart));
+		// his avatar counts from where his own snapshots put it, not from where it spawned here (the host's blind ring spot): the
+		// distance, and whether he is at an arrival place
+		pair_frame(a, my_pos, g_me_near || g_me_at_place, his_pos, players::placed(obj->ID()), exit_distance(his),
+		    place_distance(his_pos));
 		mark(body_of(obj), true, a.off);
 		if (a.off != was_off)
-			log_switch(obj, a.off, g_me_near, a.at_exit, apart);
+			log_switch(obj, a.off, g_me_near || a.at_exit, g_me_at_place || a.at_place, at.distance_to(his));
 		++it;
 	}
 }
 
 void reset()
 {
-	if (g_me == kNone && g_avatars.empty() && g_zones.empty())
+	// nothing of a session left (single player every frame); the arrival places of the last level too (a session whose
+	// actor never got a body and saw nobody would leave them for the next one, on another level)
+	if (g_me == kNone && g_avatars.empty() && g_zones.empty() && g_places.empty() && !g_places_read)
 		return;
 	if (g_pGameLevel)
 	{
@@ -257,21 +313,27 @@ void reset()
 	g_avatars.clear();
 	g_me = kNone;
 	g_me_near = false;
+	g_me_at_place = false;
+	g_places.clear();
+	g_places_read = false;
 	g_zones.clear();
 	g_logged = 0;
 }
 
 void print_status()
 {
-	u32 off = 0, unplaced = 0;
+	u32 off = 0, unplaced = 0, at_place = 0;
 	for (const auto& it : g_avatars)
 	{
 		off += it.second.off ? 1 : 0;
 		unplaced += players::placed(it.first) ? 0 : 1;
+		at_place += it.second.at_place ? 1 : 0;
 	}
-	::Msg("[coop]   touch (TZ P50): %u player character(s) here (%u not placed by their player yet), %u passing through my actor, "
-	      "actor at an exit %s, %u route exit(s), %llu spawns, %llu switches",
-	    u32(g_avatars.size()), unplaced, off, g_me_near ? "yes" : "no", u32(g_zones.size()), g_spawns, g_switches);
+	::Msg("[coop]   touch (TZ P50, P75): %u player character(s) here (%u not placed by their player yet, %u at an arrival place), "
+	      "%u passing through my actor, actor at an exit %s, at an arrival place %s, %u route exit(s), %u arrival place(s)%s, "
+	      "%llu spawns, %llu switches",
+	    u32(g_avatars.size()), unplaced, at_place, off, g_me_near ? "yes" : "no", g_me_at_place ? "yes" : "no",
+	    u32(g_zones.size()), u32(g_places.size() / 3), g_places_read ? "" : " (not read yet)", g_spawns, g_switches);
 }
 
 namespace
@@ -303,16 +365,11 @@ int l_zones(lua_State* L)
 
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_pushcfunction(L, &l_zones);
-	lua_setfield(L, -2, "player_touch_zones"); // TZ P50
-	lua_pop(L, 1);
+	static const luaL_Reg fns[] = {
+		{"player_touch_zones", &l_zones},
+		{nullptr, nullptr},
+	};
+	lua_api::fill(L, nullptr, fns); // coop_script logs a missing coop
 }
 } // namespace player_touch
 } // namespace coop

@@ -21,7 +21,7 @@
 #include "patrol_path.h"
 #include "patrol_path_storage.h"
 #include "player_hud.h"
-#include "coop/coop_objects.h" // Anomaly Coop
+#include "coop/coop_objects.h"
 
 #define	FASTMODE_DISTANCE (50.f)	//distance to camera from sphere, when zone switches to fast update sequence
 
@@ -302,7 +302,7 @@ void CArtefact::ActivateArtefact()
 {
 	VERIFY(m_bCanSpawnZone);
 	VERIFY(H_Parent());
-	if (coop::objects::client_forward_artefact_activation(this)) return; // Anomaly Coop: the host activates it
+	if (coop::objects::client_forward_artefact_activation(this)) return; // coop: the host activates it
 	CreateArtefactActivation();
 	if (!m_activationObj)
 		return;

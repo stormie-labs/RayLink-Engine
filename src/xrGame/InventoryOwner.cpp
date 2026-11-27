@@ -1,6 +1,6 @@
 #include "pch_script.h"
 #include "InventoryOwner.h"
-#include "coop/coop_instrument.h" // Anomaly Coop: render-only instrument prop
+#include "coop/coop_instrument.h" // coop: render-only instrument prop
 #include "entity_alive.h"
 #include "pda.h"
 #include "actor.h"

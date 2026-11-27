@@ -78,10 +78,9 @@ CUIInventoryCellItem::CUIInventoryCellItem(CInventoryItem* itm)
 	LPCSTR condbar = READ_IF_EXISTS(pSettings, r_string, itm->m_section_id, "condition_bar", NULL);
 	if (condbar)
 	{
-		// Anomaly Coop: parsed once, as CUICellItem::init already does with the same file. A load per cell read the file
-		// and ran it through the script XML hook (G.A.M.M.A.'s DXML re-parses it in Lua) for every item of every list fill
-		// ([identity_immunities] gives nearly every item a condition_bar): a hitch on each trade window rebuild (live
-		// 2026-10-29, buying at a trader).
+		// coop: parsed once, as CUICellItem::init already does with the same file. A load per cell would read the file
+		// and run it through the script XML hook (a mod may re-parse it in Lua) for every item of every list fill (a mod
+		// may give nearly every item a condition_bar): a hitch on each trade window rebuild.
 		static CUIXml uiXml;
 		static bool isXmlReady = false;
 		if (!isXmlReady)

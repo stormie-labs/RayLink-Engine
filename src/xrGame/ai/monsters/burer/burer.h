@@ -143,12 +143,12 @@ public:
 	virtual void CheckSpecParams(u32 spec_params);
 
 	void UpdateGraviObject();
-	// Anomaly Coop (audit A5): the host's wave at us, shown on this machine (a puppet deals no damage)
+	// coop: the host's wave at us, shown on this machine (a puppet deals no damage)
 	void coop_gravi_at_actor();
 
 	void StartGraviPrepare();
 	void StopGraviPrepare();
-	// Anomaly Coop (audit F11): the host's word that a wave gathers on this machine's actor, or no more
+	// coop: the host's word that a wave gathers on this machine's actor, or no more
 	void coop_gravi_prepare(bool on);
 
 	void StartTeleObjectParticle(CGameObject* pO);
@@ -173,7 +173,7 @@ public:
 private:
 	bool m_force_gravi_attack;
 
-	u16 m_coop_prepare_target = u16(-1); // Anomaly Coop (audit F11): host: the remote player the wave gathers on
+	u16 m_coop_prepare_target = u16(-1); // coop: host: the remote player the wave gathers on
 	bool m_coop_prepare_shown = false; // client: it gathers on this machine's actor
 
 	void xr_stdcall StaminaHit();

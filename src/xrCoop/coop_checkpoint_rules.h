@@ -1,4 +1,4 @@
-// Anomaly Coop — checkpoint rules (F3, CHECKPOINTS_DEATH.md §2): the record of a player's camp, the two-deep slot with
+// Anomaly Coop — checkpoint rules (CHECKPOINTS_DEATH.md §2): the record of a player's camp, the two-deep slot with
 // its rollback, the respawn choice, the "stood by the fire long enough" timer and the ini helpers for the character's
 // custom data. The host decides everything here; the engine layer only feeds in what it sees.
 // Pure C++17, header-only, no engine dependencies: used by the engine and by the unit-test exe.
@@ -9,8 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "coop_ids.h"
+#include "coop_text.h"
 #include "coop_wire.h"
 
 namespace coop
@@ -45,7 +48,7 @@ inline const char* kind_name(Kind k)
 }
 
 // Arrival and story records come from no object.
-constexpr uint16_t kNoSource = 0xffff;
+constexpr uint16_t kNoSource = kNoId;
 
 // A coordinate of a record is within +-1e6 m. The game maps are a few kilometres across, so anything beyond is garbage
 // (a corrupt save, a hostile packet); it also keeps the text form short and exact (%.3f of 1e30 would run to 30 digits)
@@ -96,26 +99,8 @@ constexpr size_t kFields = 10;
 constexpr uint64_t kU64Max = ~uint64_t(0);
 constexpr double kFloatMax = 3.4028234663852886e+38;
 
-// Decimal digits only, no sign, no blanks, no overflow, at most `max`.
-inline bool parse_uint(const std::string& s, uint64_t max, uint64_t& out)
-{
-	if (s.empty() || s.size() > 20)
-		return false;
-	uint64_t v = 0;
-	for (const char c : s)
-	{
-		if (c < '0' || c > '9')
-			return false;
-		const uint64_t digit = uint64_t(c - '0');
-		if (v > (kU64Max - digit) / 10)
-			return false;
-		v = v * 10 + digit;
-	}
-	if (v > max)
-		return false;
-	out = v;
-	return true;
-}
+// A record's number: decimal digits only (leading zeros too), at most 20 of them, no overflow, at most `max`.
+inline bool parse_uint(const std::string& s, uint64_t max, uint64_t& out) { return ascii::parse_decimal(s, max, out, 20, true); }
 
 // A plain decimal number that fits a float. "nan", "inf", hex and blanks are not numbers here.
 inline bool parse_float(const std::string& s, float& out)
@@ -243,7 +228,7 @@ struct Slot
 	Record cur, prev;
 };
 
-// Build 57 (owner 2026-11-18): "checkpoint updated" came again and again at one and the same campfire: every new visit
+// "checkpoint updated" came again and again at one and the same campfire: every new visit
 // (he stepped out of its 3 m, it went out for a moment, he lay down at it) wrote the record again and announced it. A
 // record without an object (arrival, story) is the same place within this distance on the same level.
 constexpr float kSamePlaceM = 10.0f;
@@ -282,7 +267,7 @@ inline bool same_place(const Record& a, const Record& b)
 
 // A new camp. The same place again (same_place) changes nothing; an arrival or story record elsewhere (another level, or
 // farther than kSamePlaceM) only moves the current one of its kind; anything else pushes the current record down to
-// `prev`. Build 57 round 2 (lead 2026-11-18, reviews S1/S2): only arrival and story move; any other record without an object
+// `prev`. Only arrival and story move; any other record without an object
 // (a start base's: kind Rest, no object) somewhere else is New, so the base before it stays as `prev`. A record that is not
 // valid is ignored.
 inline SetOutcome set(Slot& s, const Record& r)
@@ -346,14 +331,14 @@ inline bool needs_arrival(const Slot& s, const std::string& level)
 	return !level.empty() && !(s.cur.valid() && s.cur.level == level) && !(s.prev.valid() && s.prev.level == level);
 }
 
-// The host's level change writes the arrival of who goes with him. With split levels who stays keeps his camps: a respawn looks
-// for a record on HIS level, an arrival on the host's would push it out and leave him the place of his body. `seat`: his level in the
-// table (a trip of the whole group seats everybody before the save), kNoSeat = none, nothing tells him apart from the group;
-// `stays`: the move leaves him in his world (softmove::stays).
-constexpr uint16_t kNoSeat = 0xffff;
-inline bool rides_with_host(bool split, bool stays, uint16_t seat, uint16_t target)
+// The host's level change writes the arrival of who goes with him. `group_travels` is the mode's answer (Mode::group_travels):
+// when the group moves together everybody goes. Otherwise who stays keeps his camps: a respawn looks for a record on HIS level,
+// an arrival on the host's would push it out and leave him the place of his body. `seat`: his level in the table (a trip of the
+// whole group seats everybody before the save), kNoSeat = none, nothing tells him apart from the group.
+constexpr uint16_t kNoSeat = kNoLevel;
+inline bool rides_with_host(bool group_travels, uint16_t seat, uint16_t target)
 {
-	return !split || (!stays && (seat == kNoSeat || seat == target));
+	return group_travels || seat == kNoSeat || seat == target;
 }
 
 // Where the record of a story checkpoint comes from. `elsewhere`: a map server leads his level, there is no object of his here.
@@ -375,7 +360,7 @@ inline StoryFrom story_from(bool living, bool elsewhere, bool object_here)
 // Where a player comes back to life on `level`: the current record, else the previous one, else the anchor, else the
 // arrival point, else where the body lies. `anchor` and `arrival` may be null. The anchor is the player's first living
 // position that the host recorded for them (HostRec), not the story spawn point of the level.
-// F3: a record on another level is skipped; F3a replaces this by a transition to that level (the one place is here).
+// A record on another level is skipped (the one place is here).
 inline Choice resolve(const Slot& s, const std::string& level, const float* anchor, const float* arrival,
 	const float body[3])
 {
@@ -406,6 +391,34 @@ struct Dwell
 	bool fired = false;
 };
 
+// The count of a stay at one place, shared by Dwell (a source) and base::Visit (a base): S has `since` and `fired`, and its place
+// in the field `place`. A new place starts a new count; a clock that went back counts from now.
+template <class S, class Key> void stay_moves(S& s, Key S::*place, Key here, uint64_t now_ms)
+{
+	if (s.*place != here)
+	{
+		s.*place = here;
+		s.since = now_ms;
+		s.fired = false;
+	}
+	else if (now_ms < s.since)
+		s.since = now_ms;
+}
+
+// After stay_moves: true once per stay, when `dwell_ms` have passed without a fight; a fight restarts the count.
+template <class S> bool stay_fires(S& s, bool in_combat, uint64_t now_ms, uint32_t dwell_ms)
+{
+	if (in_combat)
+	{
+		s.since = now_ms;
+		return false;
+	}
+	if (s.fired || now_ms - s.since < dwell_ms)
+		return false;
+	s.fired = true;
+	return true;
+}
+
 // Feed it every tick with the source the player stands at (kNoSource if none), whether they are in a fight and the host
 // clock. Returns true once per visit, when the player has been near the same source for `dwell_ms` without a fight.
 // A fight restarts the count (the fight itself does not end the visit, so a camp that was already set is not set
@@ -418,23 +431,8 @@ inline bool dwell_update(Dwell& d, uint16_t near_source, bool in_combat, uint64_
 		d = Dwell();
 		return false;
 	}
-	if (d.source != near_source)
-	{
-		d.source = near_source;
-		d.since = now_ms;
-		d.fired = false;
-	}
-	else if (now_ms < d.since) // the clock went back: count from here
-		d.since = now_ms;
-	if (in_combat)
-	{
-		d.since = now_ms;
-		return false;
-	}
-	if (d.fired || now_ms - d.since < dwell_ms)
-		return false;
-	d.fired = true;
-	return true;
+	stay_moves(d, &Dwell::source, near_source, now_ms);
+	return stay_fires(d, in_combat, now_ms, dwell_ms);
 }
 
 namespace detail
@@ -475,27 +473,18 @@ inline bool next_line(const std::string& t, size_t& pos, Line& l)
 	return true;
 }
 
+// Narrows t[b, e) past its spaces and tabs.
 inline void trim(const std::string& t, size_t& b, size_t& e)
 {
-	while (b < e && (t[b] == ' ' || t[b] == '\t'))
-		++b;
-	while (e > b && (t[e - 1] == ' ' || t[e - 1] == '\t'))
-		--e;
-}
-
-inline char lower(char c)
-{
-	return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+	const std::string_view v = ascii::trim(std::string_view(t).substr(b, e - b), ascii::space_or_tab);
+	b = size_t(v.data() - t.data());
+	e = b + v.size();
 }
 
 // t[b, e) equals s, ASCII case aside (section and key names are case-insensitive in the engine's ini).
 inline bool ieq(const std::string& t, size_t b, size_t e, const char* s)
 {
-	size_t i = 0;
-	for (; b + i < e && s[i]; ++i)
-		if (lower(t[b + i]) != lower(s[i]))
-			return false;
-	return b + i == e && s[i] == '\0';
+	return ascii::iequals(std::string_view(t).substr(b, e - b), s);
 }
 
 inline Parsed parse_line(const std::string& t, const Line& l)

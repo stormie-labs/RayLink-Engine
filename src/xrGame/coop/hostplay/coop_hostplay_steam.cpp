@@ -1,12 +1,13 @@
 // Кооп: только там, где хост играет сам (docs/MODES.md)
-// Anomaly Coop — Steam, the co-op's only (docs/MODES.md section 8; INTEG-C, rv_A-S6-E-net fix 1). Moved here as it was from the Core:
-// the invite polling of Manager::autostart, the two invite functions of coop_manager.cpp and the Lua exports of coop_script.cpp. The
-// co-op layer asks them (coop_hostplay_mode.cpp CoopLayer: join_request, register_lua); the Core's autostart keeps its retry queue and
-// its rules for an address a layer was asked to join (the same one while in that game changes nothing).
+// Anomaly Coop — Steam, the co-op's only (docs/MODES.md section 8): the invite polling of Manager::autostart, the two invite
+// functions and their Lua exports. The co-op layer asks them (coop_hostplay_mode.cpp CoopLayer: join_request, register_lua); the
+// Core's autostart keeps its retry queue and its rules for an address a layer was asked to join (the same one while in that game
+// changes nothing).
 #include "stdafx.h"
 #include "pch_script.h"
 #include "coop_hostplay_steam.h"
 #include "xrCoop/coop_steam_join.h"
+#include "coop/coop_lua.h" // lua_api::fill
 
 #include <cstdio>
 
@@ -109,18 +110,12 @@ bool invite_window()
 
 void register_lua(lua_State* L)
 {
-	lua_pushstring(L, "coop");
-	lua_rawget(L, LUA_GLOBALSINDEX);
-	if (!lua_istable(L, -1))
-	{
-		lua_pop(L, 1);
-		return; // coop_script logs it
-	}
-	lua_pushcfunction(L, &l_steam_invite_ready);
-	lua_setfield(L, -2, "steam_invite_ready");
-	lua_pushcfunction(L, &l_steam_invite);
-	lua_setfield(L, -2, "steam_invite");
-	lua_pop(L, 1);
+	static const luaL_Reg fns[] = {
+		{"steam_invite_ready", &l_steam_invite_ready},
+		{"steam_invite", &l_steam_invite},
+		{nullptr, nullptr},
+	};
+	lua_api::fill(L, nullptr, fns); // coop_script logs a missing coop
 }
 } // namespace steam
 } // namespace hostplay

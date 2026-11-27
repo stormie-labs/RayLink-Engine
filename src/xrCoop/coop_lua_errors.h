@@ -1,14 +1,14 @@
-// Anomaly Coop — Lua errors survived in a co-op session. Live 2026-11 (G.A.M.M.A., hundreds of mods): a Lua error inside
-// an engine->Lua call (a UI functor, a dialog precondition, a script callback, a binder method) went to luabind's pcall
-// callback CScriptEngine::lua_pcall_failed -> Debug.fatal and ended the session for that player (ui_options.script:912,
-// ssfx_weapons_dof.script:269, _g_patches.script:817, tasks_guide.script:447, ...). In a session, with the console variable
+// Anomaly Coop — Lua errors survived in a co-op session. A Lua error inside an engine->Lua call (a UI functor, a dialog
+// precondition, a script callback, a binder method) goes to luabind's pcall callback CScriptEngine::lua_pcall_failed ->
+// Debug.fatal and would end the session for that player; with hundreds of mods such errors happen. In a session, with the console variable
 // coop_lua_errors 1 (the default), the error is logged and the call returns a safe value instead (xrGame/coop/coop_lua_errors.cpp,
 // luabind's call proxies: functor.hpp, detail/call_member.hpp, detail/call_function.hpp, object.hpp).
 //
 // This file is the bookkeeping: the place of an error is the file:line of the first Lua frame of the erroring stack. The first
 // error of a place is logged in full (the error text, the Lua stack, one "survived" line); later ones only count, and one
 // summary line per place comes at most once per kRepeatMs. At most kMaxPlaces places are kept apart; the rest share one.
-// Pure C++17, header-only, no engine dependencies: tests/test_lua_errors.cpp tests it.
+// Beside it, LogBudget: the one budget of a log line that repeats by kind (why the two differ: at LogBudget).
+// Pure C++17, header-only, no engine dependencies: tests/test_lua_errors.cpp and tests/test_log_budget.cpp test it.
 #pragma once
 
 #include <algorithm>
@@ -191,6 +191,31 @@ inline std::string status_line(const Ledger& l, int coop_lua_errors, bool sessio
 	return "[coop] lua errors: coop_lua_errors " + std::to_string(coop_lua_errors) + " (" + mode + "), survived " +
 	    std::to_string(l.total()) + " at " + std::to_string(l.places()) + " place(s)";
 }
+
+// ---------------------------------------------------------------- the budget of a repeating log line
+// The Ledger above paces an error by its place and by time: it keeps a map of places and needs the clock, and its lines say "N more in
+// T s". A line that repeats by kind (a dropped event, a refused request, a missing handler) is paced by its count instead: the first
+// `burst` lines of the kind in full, then every kLineEvery-th, each carrying its number ("#N"). The two stay apart because the counted
+// lines are read by number in reports and tests: moving them to the Ledger's pacing changes the log, which a cleanup does not do.
+constexpr uint64_t kLineEvery = 100;
+
+// Is the `count`-th line of a kind (1 = the first) written?
+constexpr bool line_allowed(uint64_t count, uint64_t burst) { return count <= burst || count % kLineEvery == 0; }
+
+// The count of one kind of line and its budget.
+class LogBudget
+{
+public:
+	explicit constexpr LogBudget(uint64_t burst) : m_burst(burst) {}
+
+	// One more line of the kind: is it written?
+	bool allow() { return line_allowed(++m_count, m_burst); }
+	uint64_t count() const { return m_count; }
+
+private:
+	uint64_t m_burst;
+	uint64_t m_count = 0;
+};
 
 // "[coop]   lua errors x4 at b.script:2"
 inline std::string status_place_line(const Top& t)
